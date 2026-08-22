@@ -25,6 +25,10 @@ pub const Config = struct {
     source_revision: []const u8 = "unknown",
     target: []const u8 = "native",
     optimize: []const u8 = "unknown",
+    /// Optional diagnostic-only scenario dependency (for example, a formal
+    /// trace sink). It is intentionally absent from the replay artifact and
+    /// must not change choices, observations, properties, or failures.
+    scenario_context: ?*anyopaque = null,
 };
 
 const PropertyFailure = struct {
@@ -41,7 +45,7 @@ pub fn run(
     comptime scenario_contract.assertContract(Scenario);
     if (config.transition_budget == 0) return error.InvalidTransitionBudget;
 
-    var world = try Scenario.init(allocator);
+    var world = try initWorld(Scenario, allocator, config.scenario_context);
     defer Scenario.deinit(&world, allocator);
     var tracker = try property.Tracker.init(allocator, Scenario.properties);
     defer tracker.deinit();
@@ -68,7 +72,7 @@ pub fn captureCheckpoint(
     if (prefix_len > artifact.choices.items.len) return error.InvalidSnapshotPrefix;
 
     const config = configFromTrace(artifact);
-    var world = try Scenario.init(allocator);
+    var world = try initWorld(Scenario, allocator, config.scenario_context);
     defer Scenario.deinit(&world, allocator);
     var tracker = try property.Tracker.init(allocator, Scenario.properties);
     defer tracker.deinit();
@@ -127,7 +131,7 @@ pub fn resumeFromCheckpoint(
         return error.CheckpointPrefixObservationDiverged;
 
     const config = configFromTrace(artifact);
-    var world = try Scenario.init(allocator);
+    var world = try initWorld(Scenario, allocator, config.scenario_context);
     defer Scenario.deinit(&world, allocator);
     try snapshot.restore(Scenario, &world, checkpoint, allocator);
     var tracker = try property.Tracker.init(allocator, Scenario.properties);
@@ -296,6 +300,12 @@ fn initTrace(comptime Scenario: type, allocator: std.mem.Allocator, config: Conf
         .backend_ids = config.backend_ids,
         .scenario_parameters = config.scenario_parameters,
     });
+}
+
+fn initWorld(comptime Scenario: type, allocator: std.mem.Allocator, context: ?*anyopaque) !Scenario.World {
+    if (comptime @hasDecl(Scenario, "initWithContext")) return Scenario.initWithContext(allocator, context);
+    if (context != null) return error.ScenarioDoesNotAcceptContext;
+    return Scenario.init(allocator);
 }
 
 fn initTraceFromArtifact(allocator: std.mem.Allocator, artifact: *const trace.Trace) !trace.Trace {

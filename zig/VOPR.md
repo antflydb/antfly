@@ -1387,6 +1387,16 @@ zig build sim-tla -- \
   --domain raft \
   --out /tmp/metadata-raft.ndjson
 
+# Record and formally export a transaction history through the same CLI.
+zig build sim-run -- \
+  --scenario transaction \
+  --seed 0xa17f7a4a \
+  --trace-out /tmp/transaction.simtrace
+zig build sim-tla -- \
+  --trace /tmp/transaction.simtrace \
+  --domain transaction \
+  --out /tmp/transaction.ndjson
+
 # Exact-replay a failure and render a deterministic semantic causal slice.
 zig build sim-explain -- \
   --trace /tmp/metadata-reduced.simtrace \
@@ -1836,6 +1846,21 @@ pending-fault and rejected-operation state. A scripted regression forces both
 outcomes, checks that neither becomes a phantom acknowledgement, crashes and
 recovers the device, and exact-replays all five decisions.
 
+Scenario version 3 adds two uncertainty outcomes that exercise the modeled
+device rather than synthesizing a higher-level result. A partial-write fault
+writes a bounded prefix into volatile storage and returns
+`InjectedPartialWriteFault`; the operation is rejected, the torn bytes are not
+acknowledged, and immediate crash recovery must discard them. A dropped-sync
+fault consumes the real sync call but returns success. Its client response is
+recorded as an acknowledgement with uncertain durability, and recovery permits
+only a prefix of the modeled state: every required acknowledgement must remain,
+while uncertain tail entries may survive, disappear, or cause a recognized
+fail-closed WAL startup error. Fail-closed recovery is allowed only when no
+required entry is at risk and is emitted as an explicit client outcome rather
+than repaired by the harness. The modeled device counts fault consumption so a
+fault that misses its intended write or sync becomes a harness error. Both
+outcome sets exact-replay through the focused `wal-vopr-test` gate.
+
 Eligible metadata VOPR artifacts can also be exact-replayed with a formal Raft
 sidecar through `zig build sim-tla -- --trace ... --domain raft --out ...`.
 Replay attaches Antfly's existing `RaftNdjsonTraceLogger` only to the metadata
@@ -1847,10 +1872,22 @@ contains `InitState`. The resulting file is directly consumable by the
 existing `tla-trace-raft` validation target; formal output remains a derived
 sidecar, so it does not change the canonical `vopr-trace-v1` replay ABI.
 
+Transaction artifacts now use the same workflow. The three-transition
+`modeled-transaction` scenario runs the real memory-backed `TxnManager` through
+begin, write-intent, and a selected commit/abort decision. The runner's
+diagnostic-only scenario context attaches `AntflyNdjsonTraceWriter` during
+exact replay; byte equality of the complete VOPR artifact proves that adding the
+formal sink cannot influence choices or semantics. `sim-run --scenario
+transaction`, ordinary `sim-replay`, and `sim-tla --domain transaction` produce
+and consume these artifacts. The focused `transaction-vopr-test` validates the
+sidecar shape, and the emitted five-event commit history passes the real
+`make tla-trace-txn` segmentation and TLC refinement pipeline against
+`TraceAntflyTransaction.tla`.
+
 Phase 4's stated exit condition is now met. The phase remains open for modeled
-partial-write and dropped-sync outcome sets, migration of the fixed distributed
-scenario into generated/replayable VOPR choices, merge composition, and
-transaction-event TLA+ export.
+migration of the fixed distributed scenario into generated/replayable VOPR
+choices and merge composition. Modeled partial writes, dropped syncs, and both
+Raft and transaction TLA+ export are complete.
 
 ### Phase 5: Search and Snapshot Optimizations
 

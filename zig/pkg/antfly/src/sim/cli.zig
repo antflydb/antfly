@@ -25,15 +25,16 @@ pub fn main(init: std.process.Init) !void {
 
 fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var seed: u64 = 0xa17f_0001;
-    var transitions: usize = 64;
+    var transitions: ?usize = null;
+    var scenario: []const u8 = "metadata";
     var workload: antfly.metadata_sim_harness.MetadataVoprWorkload = .smoke;
     var trace_out: ?[]const u8 = null;
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--scenario")) {
-            const value = try nextValue(args, &index);
-            if (!std.mem.eql(u8, value, "metadata")) return error.UnsupportedScenario;
+            scenario = try nextValue(args, &index);
+            if (!std.mem.eql(u8, scenario, "metadata") and !std.mem.eql(u8, scenario, "transaction")) return error.UnsupportedScenario;
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -47,18 +48,24 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         index += 1;
     }
     const output_path = trace_out orelse return error.TraceOutputRequired;
-    if (transitions == 0) return error.InvalidTransitionBudget;
-    const base_id = 10_000 + seed % 1_000_000;
-    var artifact = try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
-        .seed = seed,
-        .operation_count = transitions,
-        .metadata_group_id = base_id,
-        .table_id = base_id + 1,
-        .range_group_id = base_id + 2,
-        .split_group_id = base_id + 3,
-        .split_transition_id = base_id + 4,
-        .workload = workload,
-    });
+    const transition_budget: usize = transitions orelse if (std.mem.eql(u8, scenario, "metadata")) 64 else 3;
+    if (transition_budget == 0) return error.InvalidTransitionBudget;
+    var artifact = if (std.mem.eql(u8, scenario, "metadata")) blk: {
+        const base_id = 10_000 + seed % 1_000_000;
+        break :blk try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+            .seed = seed,
+            .operation_count = transition_budget,
+            .metadata_group_id = base_id,
+            .table_id = base_id + 1,
+            .range_group_id = base_id + 2,
+            .split_group_id = base_id + 3,
+            .split_transition_id = base_id + 4,
+            .workload = workload,
+        });
+    } else blk: {
+        if (transition_budget != 3) return error.TransactionScenarioRequiresThreeTransitions;
+        break :blk try antfly.transaction_vopr.record(alloc, seed);
+    };
     defer artifact.deinit();
     const encoded = try artifact.renderAlloc(alloc);
     defer alloc.free(encoded);
@@ -83,9 +90,17 @@ fn replayCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
-    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &recorded);
+    var replayed = try replayKnownScenario(alloc, &recorded);
     defer replayed.deinit();
     report("replayed", path, &replayed);
+}
+
+fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
+    if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
+        return antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
+        return antfly.transaction_vopr.replay(alloc, recorded);
+    return error.UnsupportedScenario;
 }
 
 fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -103,7 +118,7 @@ fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         } else return error.UnknownArgument;
         index += 1;
     }
-    if (!std.mem.eql(u8, domain, "raft")) return error.UnsupportedTlaDomain;
+    if (!std.mem.eql(u8, domain, "raft") and !std.mem.eql(u8, domain, "transaction")) return error.UnsupportedTlaDomain;
     const input = trace_path orelse return error.TracePathRequired;
     const output = output_path orelse return error.TraceOutputRequired;
     const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
@@ -113,12 +128,19 @@ fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
 
     var ndjson: std.Io.Writer.Allocating = .init(alloc);
     defer ndjson.deinit();
-    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer);
+    var replayed = if (std.mem.eql(u8, domain, "raft"))
+        try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer)
+    else
+        try antfly.transaction_vopr.replayToTransactionTrace(alloc, &recorded, &ndjson.writer);
     defer replayed.deinit();
-    try validateRaftTraceNdjson(alloc, ndjson.written());
+    if (std.mem.eql(u8, domain, "raft"))
+        try validateRaftTraceNdjson(alloc, ndjson.written())
+    else
+        try validateTransactionTraceNdjson(alloc, ndjson.written());
     if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = ndjson.written() });
-    std.debug.print("VOPR TLA export domain=raft events={d} trace={s} out={s}\n", .{
+    std.debug.print("VOPR TLA export domain={s} events={d} trace={s} out={s}\n", .{
+        domain,
         countNonEmptyLines(ndjson.written()),
         input,
         output,
@@ -126,6 +148,14 @@ fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
 }
 
 fn validateRaftTraceNdjson(alloc: std.mem.Allocator, encoded: []const u8) !void {
+    return validateTlaTraceNdjson(alloc, encoded, "trace");
+}
+
+fn validateTransactionTraceNdjson(alloc: std.mem.Allocator, encoded: []const u8) !void {
+    return validateTlaTraceNdjson(alloc, encoded, "antfly-trace");
+}
+
+fn validateTlaTraceNdjson(alloc: std.mem.Allocator, encoded: []const u8, expected_tag: []const u8) !void {
     var event_count: usize = 0;
     var lines = std.mem.splitScalar(u8, encoded, '\n');
     while (lines.next()) |line| {
@@ -141,7 +171,7 @@ fn validateRaftTraceNdjson(alloc: std.mem.Allocator, encoded: []const u8) !void 
             .string => |value| value,
             else => return error.InvalidTlaTraceRecord,
         };
-        if (!std.mem.eql(u8, tag_text, "trace")) return error.InvalidTlaTraceRecord;
+        if (!std.mem.eql(u8, tag_text, expected_tag)) return error.InvalidTlaTraceRecord;
         const event_value = object.get("event") orelse return error.InvalidTlaTraceRecord;
         const event_object = switch (event_value) {
             .object => |value| value,
@@ -631,10 +661,19 @@ const CampaignContext = struct {
 
 fn ensureDir(io: std.Io, path: []const u8) !void {
     if (!std.fs.path.isAbsolute(path)) return try std.Io.Dir.cwd().createDirPath(io, path);
-    var root = try std.Io.Dir.openDirAbsolute(io, "/", .{});
-    defer root.close(io);
-    const relative = path[1..];
-    if (relative.len > 0) try root.createDirPath(io, relative);
+    if (std.Io.Dir.openDirAbsolute(io, path, .{})) |dir_value| {
+        var dir = dir_value;
+        dir.close(io);
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsoluteDirectory;
+    try ensureDir(io, parent);
+    var parent_dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
+    defer parent_dir.close(io);
+    try parent_dir.createDirPath(io, std.fs.path.basename(path));
 }
 
 fn nextValue(args: []const []const u8, index: *usize) ![]const u8 {
@@ -654,12 +693,12 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata --seed <u64> --transitions <n> [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
         \\  vopr campaign --scenario metadata --histories <n> --transitions <n> --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
-        \\  vopr tla --trace <path> --domain raft --out <path.ndjson>
+        \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\
     , .{});
@@ -727,4 +766,14 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
         var mutation_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &mutated);
         mutation_replay.deinit();
     } else return error.PersistentCorpusMutationRequired;
+
+    var transaction_artifact = try antfly.transaction_vopr.record(alloc, 0xA17F_7A4A);
+    defer transaction_artifact.deinit();
+    var transaction_ndjson: std.Io.Writer.Allocating = .init(alloc);
+    defer transaction_ndjson.deinit();
+    var transaction_replay = try antfly.transaction_vopr.replayToTransactionTrace(alloc, &transaction_artifact, &transaction_ndjson.writer);
+    transaction_replay.deinit();
+    try validateTransactionTraceNdjson(alloc, transaction_ndjson.written());
+    try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"InitTransaction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"WriteIntentOnShard\"") != null);
 }

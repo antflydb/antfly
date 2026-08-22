@@ -169,6 +169,7 @@ pub const shard = @import("storage/shard.zig");
 pub const enrichment = @import("storage/enrichment.zig");
 pub const ttl = @import("storage/ttl.zig");
 pub const transactions = @import("storage/transactions.zig");
+pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
 
@@ -323,6 +324,7 @@ test {
     _ = enrichment;
     _ = ttl;
     _ = transactions;
+    _ = transaction_vopr;
     _ = schema;
     _ = object_storage;
     _ = host_environment;

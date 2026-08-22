@@ -296,6 +296,9 @@ pub const ModeledDevice = struct {
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
     drop_next_sync: bool = false,
+    partial_next_write_bytes: ?usize = null,
+    partial_write_faults_consumed: u64 = 0,
+    dropped_syncs_consumed: u64 = 0,
     fail_next_write_path_contains: ?[]u8 = null,
     fail_next_sync_path_contains: ?[]u8 = null,
     fail_next_delete_path_contains: ?[]u8 = null,
@@ -376,6 +379,15 @@ pub const ModeledDevice = struct {
         self.fail_next_sync = true;
     }
 
+    /// The next write persists at most `bytes_written` volatile bytes and then
+    /// reports an error. A later sync may make that torn write durable; a crash
+    /// before sync discards it with the rest of volatile state.
+    pub fn injectPartialWrite(self: *ModeledDevice, bytes_written: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.partial_next_write_bytes = bytes_written;
+    }
+
     pub fn injectSyncFailureForPathContains(self: *ModeledDevice, needle: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -392,6 +404,18 @@ pub const ModeledDevice = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.drop_next_sync = true;
+    }
+
+    pub fn partialWriteFaultsConsumed(self: *ModeledDevice) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.partial_write_faults_consumed;
+    }
+
+    pub fn droppedSyncsConsumed(self: *ModeledDevice) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.dropped_syncs_consumed;
     }
 
     pub fn fileSize(self: *ModeledDevice, path: []const u8) !usize {
@@ -420,6 +444,13 @@ pub const ModeledDevice = struct {
             return error.InjectedWriteFault;
         }
         const file = try self.ensureFile(path);
+        if (self.takePartialWriteLimit()) |limit| {
+            const written = @min(limit, bytes.len);
+            const partial_end = offset + written;
+            try resizeBuffer(self.alloc, &file.volatile_bytes, partial_end);
+            @memcpy(file.volatile_bytes[offset..partial_end], bytes[0..written]);
+            return error.InjectedPartialWriteFault;
+        }
         const end = offset + bytes.len;
         try resizeBuffer(self.alloc, &file.volatile_bytes, end);
         @memcpy(file.volatile_bytes[offset..end], bytes);
@@ -441,6 +472,7 @@ pub const ModeledDevice = struct {
         const file = self.files.getPtr(path) orelse return error.FileNotFound;
         if (self.drop_next_sync) {
             self.drop_next_sync = false;
+            self.dropped_syncs_consumed +|= 1;
             return;
         }
         const durable = try DurableBytes.create(self.alloc, file.volatile_bytes);
@@ -716,6 +748,13 @@ pub const ModeledDevice = struct {
         slot.* = null;
         return true;
     }
+
+    fn takePartialWriteLimit(self: *ModeledDevice) ?usize {
+        const limit = self.partial_next_write_bytes;
+        self.partial_next_write_bytes = null;
+        if (limit != null) self.partial_write_faults_consumed +|= 1;
+        return limit;
+    }
 };
 
 const modeled_storage_vtable: lsm_storage.Storage.VTable = .{
@@ -796,6 +835,12 @@ fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
         return error.InjectedWriteFault;
     }
     const file = try self.ensureFile(path);
+    if (self.takePartialWriteLimit()) |limit| {
+        const written = @min(limit, contents.len);
+        try resizeBuffer(self.alloc, &file.volatile_bytes, written);
+        @memcpy(file.volatile_bytes[0..written], contents[0..written]);
+        return error.InjectedPartialWriteFault;
+    }
     try resizeBuffer(self.alloc, &file.volatile_bytes, contents.len);
     @memcpy(file.volatile_bytes, contents);
 }
@@ -810,6 +855,12 @@ fn modeledAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []cons
     }
     const file = try self.ensureFile(path);
     const old_len = file.volatile_bytes.len;
+    if (self.takePartialWriteLimit()) |limit| {
+        const written = @min(limit, contents.len);
+        try resizeBuffer(self.alloc, &file.volatile_bytes, old_len + written);
+        @memcpy(file.volatile_bytes[old_len..], contents[0..written]);
+        return error.InjectedPartialWriteFault;
+    }
     try resizeBuffer(self.alloc, &file.volatile_bytes, old_len + contents.len);
     @memcpy(file.volatile_bytes[old_len..], contents);
     if (should_sync) try self.syncContentsLocked(path);
@@ -1034,6 +1085,30 @@ test "modeled device preserves only synced bytes across crash" {
     const bytes = try device.readAlloc(std.testing.allocator, "wal", 0, 16);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("abc", bytes);
+}
+
+test "modeled device exposes torn writes and acknowledged dropped syncs" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const device = device_model.device();
+
+    try device.write("wal", 0, "abc");
+    try device.sync("wal");
+    device_model.injectPartialWrite(2);
+    try std.testing.expectError(error.InjectedPartialWriteFault, device.write("wal", 3, "WXYZ"));
+    try device.sync("wal");
+    try device.crash();
+    const torn = try device.readAlloc(std.testing.allocator, "wal", 0, 16);
+    defer std.testing.allocator.free(torn);
+    try std.testing.expectEqualStrings("abcWX", torn);
+
+    try device.write("wal", 5, "dirty");
+    device_model.dropNextSync();
+    try device.sync("wal");
+    try device.crash();
+    const dropped = try device.readAlloc(std.testing.allocator, "wal", 0, 16);
+    defer std.testing.allocator.free(dropped);
+    try std.testing.expectEqualStrings("abcWX", dropped);
 }
 
 test "modeled storage requires a directory sync for a newly created file" {

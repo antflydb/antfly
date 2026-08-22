@@ -11,6 +11,18 @@ const trace = @import("trace.zig");
 /// require the complete canonical artifact (events, observations, properties,
 /// failures, and summary included) to match byte for byte.
 pub fn exact(comptime Scenario: type, allocator: std.mem.Allocator, recorded: *const trace.Trace) !trace.Trace {
+    return exactWithContext(Scenario, allocator, recorded, null);
+}
+
+/// Exact replay with a diagnostic-only scenario context. The complete VOPR
+/// artifact must remain byte-identical, proving the side sink did not affect
+/// simulation semantics.
+pub fn exactWithContext(
+    comptime Scenario: type,
+    allocator: std.mem.Allocator,
+    recorded: *const trace.Trace,
+    scenario_context: ?*anyopaque,
+) !trace.Trace {
     comptime scenario_contract.assertContract(Scenario);
     try recorded.validate();
     if (!std.mem.eql(u8, recorded.header.scenario, Scenario.name)) return error.IncompatibleScenario;
@@ -29,6 +41,7 @@ pub fn exact(comptime Scenario: type, allocator: std.mem.Allocator, recorded: *c
         .source_revision = recorded.header.source_revision,
         .target = recorded.header.target,
         .optimize = recorded.header.optimize,
+        .scenario_context = scenario_context,
     });
     errdefer replayed.deinit();
 

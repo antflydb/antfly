@@ -6690,6 +6690,14 @@ pub fn build(b: *std.Build) void {
     const sim_meta_test_step = b.step("sim-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
     sim_meta_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
+    const transaction_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"transaction VOPR exactly replays and emits a formal sidecar"},
+    });
+    const run_transaction_vopr_tests = b.addRunArtifact(transaction_vopr_tests);
+    const transaction_vopr_test_step = b.step("transaction-vopr-test", "Run deterministic transaction VOPR and formal trace export tests");
+    transaction_vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
+
     const run_sim_cli = b.addRunArtifact(sim_cli);
     run_sim_cli.addArg("run");
     if (b.args) |args| run_sim_cli.addArgs(args);
@@ -6734,6 +6742,7 @@ pub fn build(b: *std.Build) void {
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);
+    sim_test_step.dependOn(&run_transaction_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
@@ -7186,11 +7195,13 @@ pub fn build(b: *std.Build) void {
             "wal group commit uses injected virtual clock",
             "wal can reopen on modeled storage device",
             "wal modeled storage survives crash before close after acknowledged append",
+            "modeled device exposes torn writes and acknowledged dropped syncs",
             "wal modeled replay runner uses virtual storage and time",
             "wal modeled crash runner preserves acknowledged public append",
             "wal modeled VOPR campaign stays green",
             "modeled WAL campaign records and exactly replays VOPR traces",
             "modeled WAL VOPR classifies injected write and sync outcomes",
+            "modeled WAL VOPR constrains partial-write and dropped-sync recovery outcomes",
             "wal modeled replay fixtures stay green",
             "wal modeled crash fixtures stay green",
             "wal modeled commit backend completion uses scheduled virtual time",
