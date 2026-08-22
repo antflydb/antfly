@@ -22,6 +22,7 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const cache_record_magic = "AFQCR001";
 const cache_record_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 const cache_record_header_len = cache_record_magic.len + @sizeOf(u64) + cache_record_digest_len;
+const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
 
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
@@ -126,6 +127,7 @@ const EvictableFile = struct {
 pub const QueryCache = struct {
     alloc: Allocator,
     root_dir: []u8,
+    instance_id: u128,
     cfg: QueryCacheConfig,
     stats_mu: std.atomic.Mutex = .unlocked,
     maintenance_mu: std.atomic.Mutex = .unlocked,
@@ -140,10 +142,13 @@ pub const QueryCache = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
-        try cleanupInterruptedCacheWrites(alloc, root_dir);
+        const startup_usage = try reconcileCacheOnStartup(alloc, root_dir);
+        var instance_id: u128 = undefined;
+        io_impl.io().random(std.mem.asBytes(&instance_id));
         var cache = QueryCache{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
+            .instance_id = instance_id,
             .cfg = cfg,
             .stats = .{
                 .max_bytes = cfg.max_bytes,
@@ -151,7 +156,7 @@ pub const QueryCache = struct {
             },
         };
         errdefer cache.deinit();
-        cache.usage = try cacheUsageNoLock(alloc, root_dir, .none);
+        cache.usage = startup_usage;
         applyUsageToStats(&cache.stats, cache.usage);
         try enforceStartupCapacity(&cache);
         return cache;
@@ -641,13 +646,14 @@ var nonce: std.atomic.Value(u64) = .init(0);
 fn writeTempFileWithCancellation(
     alloc: Allocator,
     path: []const u8,
+    instance_id: u128,
     contents: []const u8,
     lane: CacheWriteLane,
     cancellation: CancellationToken,
 ) ![]u8 {
     try cancellation.check();
     try ensureParentDir(path);
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-query-cache-{d}", .{ path, nonce.fetchAdd(1, .monotonic) });
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-query-cache-{x}-{d}", .{ path, instance_id, nonce.fetchAdd(1, .monotonic) });
     errdefer alloc.free(tmp_path);
 
     var io_impl = threadedIo();
@@ -655,8 +661,10 @@ fn writeTempFileWithCancellation(
     const io = io_impl.io();
     errdefer deleteFilePath(io, tmp_path) catch {};
     {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true, .exclusive = true });
         defer file.close(io);
+        try file.lock(io, .exclusive);
+        defer file.unlock(io);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
         if (usesVerifiedCacheRecord(lane)) {
@@ -722,7 +730,7 @@ fn publishCacheEntry(
         recordBypass(self);
         return false;
     }
-    const tmp_path = try writeTempFileWithCancellation(self.alloc, path, contents, lane, cancellation);
+    const tmp_path = try writeTempFileWithCancellation(self.alloc, path, self.instance_id, contents, lane, cancellation);
     defer self.alloc.free(tmp_path);
     defer {
         var cleanup_io = threadedIo();
@@ -885,38 +893,116 @@ fn cacheUsageNoLock(alloc: Allocator, root_dir: []const u8, cancellation: Cancel
         if (entry.kind != .file) continue;
         if (isTemporaryCachePath(entry.path)) continue;
         const stat = try dir.statFile(io_impl.io(), entry.path, .{});
-        usage.total_bytes += stat.size;
-        if (std.mem.startsWith(u8, entry.path, ".blocks-pinned/")) {
-            usage.pinned_bytes += stat.size;
-            usage.pinned_block_count += 1;
-        } else {
-            usage.payload_bytes += stat.size;
-            if (std.mem.startsWith(u8, entry.path, ".blocks/")) {
-                usage.payload_block_count += 1;
-            }
-        }
+        addScannedFileUsage(&usage, entry.path, stat.size);
     }
     return usage;
 }
 
-fn cleanupInterruptedCacheWrites(alloc: Allocator, root_dir: []const u8) !void {
+/// Reconciles the on-disk cache in one startup walk. Recent or locked staging
+/// files may belong to an overlapping process during a rolling restart and are
+/// never removed. Abandoned staging files and pre-record-format range/block
+/// entries are safe to discard because the authoritative artifact store can
+/// recreate them.
+fn reconcileCacheOnStartup(alloc: Allocator, root_dir: []const u8) !CacheUsage {
+    var usage = CacheUsage{};
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const io = io_impl.io();
+    var dir = std.Io.Dir.cwd().openDir(io, root_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return usage,
+        else => return err,
+    };
+    defer dir.close(io);
+    const cutoff_ns = std.Io.Timestamp.now(io, .real).toNanoseconds() - abandoned_cache_write_age_ns;
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const stat = dir.statFile(io, entry.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (isTemporaryCachePath(entry.path)) {
+            try removeAbandonedCacheWrite(io, dir, entry.path, stat.mtime.toNanoseconds(), cutoff_ns);
+            continue;
+        }
+        if (usesVerifiedCacheRecordPath(entry.path) and
+            !try cacheRecordFramingValid(io, dir, entry.path, stat.size))
+        {
+            dir.deleteFile(io, entry.path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            continue;
+        }
+        addScannedFileUsage(&usage, entry.path, stat.size);
+    }
+    return usage;
+}
+
+fn removeAbandonedCacheWrite(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    observed_mtime_ns: i128,
+    cutoff_ns: i128,
+) !void {
+    if (observed_mtime_ns > cutoff_ns) return;
+    var file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close(io_impl.io());
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
-        if (entry.kind != .file or !isTemporaryCachePath(entry.path)) continue;
-        const path = try std.fs.path.join(alloc, &.{ root_dir, entry.path });
-        defer alloc.free(path);
-        deleteFilePath(io_impl.io(), path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+    const locked = file.tryLock(io, .exclusive) catch |err| {
+        file.close(io);
+        return err;
+    };
+    if (!locked) {
+        file.close(io);
+        return;
+    }
+    defer {
+        file.unlock(io);
+        file.close(io);
+    }
+    const locked_stat = try file.stat(io);
+    if (locked_stat.mtime.toNanoseconds() > cutoff_ns) return;
+    dir.deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn usesVerifiedCacheRecordPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, ".ranges/") or
+        std.mem.startsWith(u8, path, ".blocks/") or
+        std.mem.startsWith(u8, path, ".blocks-pinned/");
+}
+
+fn cacheRecordFramingValid(io: std.Io, dir: std.Io.Dir, path: []const u8, file_size: u64) !bool {
+    if (file_size < cache_record_header_len) return false;
+    var file = dir.openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close(io);
+    var header: [cache_record_header_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &header, 0) != header.len) return false;
+    if (!std.mem.eql(u8, header[0..cache_record_magic.len], cache_record_magic)) return false;
+    const declared_len = std.mem.readInt(u64, header[cache_record_magic.len..][0..8], .little);
+    const framed_size = std.math.add(u64, cache_record_header_len, declared_len) catch return false;
+    return framed_size == file_size;
+}
+
+fn addScannedFileUsage(usage: *CacheUsage, path: []const u8, size: u64) void {
+    usage.total_bytes += size;
+    if (std.mem.startsWith(u8, path, ".blocks-pinned/")) {
+        usage.pinned_bytes += size;
+        usage.pinned_block_count += 1;
+    } else {
+        usage.payload_bytes += size;
+        if (std.mem.startsWith(u8, path, ".blocks/")) {
+            usage.payload_block_count += 1;
+        }
     }
 }
 
@@ -1572,7 +1658,7 @@ test "serverless query cache rejects same-size corrupted range and block records
     try std.testing.expect(!fileExists(block_path));
 }
 
-test "serverless query cache removes interrupted writes during startup" {
+test "serverless query cache preserves live writes and removes abandoned writes during startup" {
     const alloc = std.testing.allocator;
     var cache_root_buf: [256]u8 = undefined;
     const cache_root = tmpPath(&cache_root_buf, "cache-startup-temp");
@@ -1585,10 +1671,72 @@ test "serverless query cache removes interrupted writes during startup" {
     try overwriteFile(orphan_path, "incomplete");
     try std.testing.expect(fileExists(orphan_path));
 
+    var fresh_overlap = try QueryCache.init(alloc, std.mem.span(cache_root));
+    fresh_overlap.deinit();
+    try std.testing.expect(fileExists(orphan_path));
+
+    try setFileModifyTimestamp(orphan_path, 1);
+    {
+        var lock_io = threadedIo();
+        defer lock_io.deinit();
+        var locked_file = try std.Io.Dir.openFileAbsolute(lock_io.io(), orphan_path, .{ .mode = .read_write });
+        defer locked_file.close(lock_io.io());
+        try locked_file.lock(lock_io.io(), .exclusive);
+        defer locked_file.unlock(lock_io.io());
+
+        var locked_overlap = try QueryCache.init(alloc, std.mem.span(cache_root));
+        defer locked_overlap.deinit();
+        try std.testing.expect(fileExists(orphan_path));
+    }
+
     var recovered = try QueryCache.init(alloc, std.mem.span(cache_root));
     defer recovered.deinit();
     try std.testing.expect(!fileExists(orphan_path));
     try std.testing.expectEqual(@as(u64, 0), recovered.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache prunes legacy pinned block records during startup" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-legacy-pinned");
+    const cache_root = tmpPath(&cache_root_buf, "cache-legacy-pinned");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var meta = try artifact_store.put("hdr");
+    defer meta.deinit(alloc);
+    var initial = try QueryCache.init(alloc, std.mem.span(cache_root));
+    const current = try initial.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-header", 0, 3);
+    alloc.free(current);
+    initial.deinit();
+
+    const checksum = try artifacts_mod.sha256ChecksumFromArtifactId(meta.artifact_id);
+    var legacy_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("vector-header", &legacy_digest, .{});
+    const legacy_digest_hex = std.fmt.bytesToHex(legacy_digest, .lower);
+    const legacy_name = try std.fmt.allocPrint(alloc, "routing-{s}", .{legacy_digest_hex});
+    defer alloc.free(legacy_name);
+    const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), ".blocks-pinned", checksum, legacy_name });
+    defer alloc.free(legacy_path);
+    try ensureParentDir(legacy_path);
+    try overwriteFile(legacy_path, "legacy-raw-block");
+    try std.testing.expect(fileExists(legacy_path));
+
+    var migrated = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer migrated.deinit();
+    try std.testing.expect(!fileExists(legacy_path));
+    const stats = migrated.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, cache_record_header_len + 3), stats.pinned_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.pinned_block_count);
+
+    try artifact_store.delete(meta.artifact_id);
+    const preserved = try migrated.getBlockOrFetchRangeAlloc(&artifact_store, meta.artifact_id, "vector-header", 0, 3);
+    defer alloc.free(preserved);
+    try std.testing.expectEqualStrings("hdr", preserved);
 }
 
 test "serverless query cache enforces tighter budgets during startup" {

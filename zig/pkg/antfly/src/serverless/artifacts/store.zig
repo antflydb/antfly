@@ -203,6 +203,16 @@ pub const ArtifactStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
+        if (len == 0) {
+            _ = try sha256ChecksumFromArtifactId(artifact_id);
+            var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
+            defer metadata.deinit(result_alloc);
+            if (offset > metadata.byte_len) return error.InvalidRange;
+            const payload = try result_alloc.alloc(u8, 0);
+            errdefer result_alloc.free(payload);
+            try cancellation.check();
+            return payload;
+        }
         const payload = if (self.vtable.get_range_alloc_with_cancellation) |get_with_cancellation|
             try get_with_cancellation(self.ptr, result_alloc, artifact_id, offset, len, cancellation)
         else
@@ -354,4 +364,33 @@ test "serverless verified empty artifacts avoid invalid cloud ranges" {
     defer alloc.free(payload);
     try std.testing.expectEqual(@as(usize, 0), payload.len);
     try std.testing.expectEqual(@as(usize, 0), state.range_calls);
+
+    const empty_range = try store.getRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        empty_artifact_id,
+        0,
+        0,
+        .none,
+    );
+    defer alloc.free(empty_range);
+    try std.testing.expectEqual(@as(usize, 0), empty_range.len);
+    try std.testing.expectEqual(@as(usize, 0), state.range_calls);
+    try std.testing.expectError(
+        error.InvalidArtifactId,
+        store.getRangeAllocWithCancellationUsingAllocator(alloc, "not-an-artifact", 0, 0, .none),
+    );
+    try std.testing.expectError(
+        error.InvalidRange,
+        store.getRangeAllocWithCancellationUsingAllocator(alloc, empty_artifact_id, 1, 0, .none),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        store.getRangeAllocWithCancellationUsingAllocator(
+            alloc,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            0,
+            0,
+            .none,
+        ),
+    );
 }

@@ -1409,7 +1409,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, runtimeCoverageSourceTotal(item_runtime.stats), embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -1605,6 +1605,17 @@ fn statusFreshnessCountsAsRemoteUnknown(metadata: runtime_status.RuntimeStatusMe
     return metadata.freshness == .remote_unknown;
 }
 
+/// Source identity metadata is authoritative once observed, while derived
+/// visibility is a safe lower bound during the short publication window in
+/// which a fresh runtime snapshot can still carry an older zero source count.
+/// Using the floor prevents an index created on a populated table from
+/// transiently reporting complete zero-row coverage. After deletes, retaining
+/// the larger visibility count is fail-safe: readiness waits for the derived
+/// materialization to converge instead of returning early.
+fn runtimeCoverageSourceTotal(stats: db_mod.types.DBStats) u64 {
+    return @max(stats.source_doc_count, stats.doc_count);
+}
+
 fn aggregateIndexStatus(
     runtimes: []const runtime_status.LocalTableRuntimeStatus,
     index_name: []const u8,
@@ -1664,7 +1675,7 @@ fn aggregateIndexStatusIndexed(
         // remain visible in diagnostics but cannot contribute cardinality or
         // outcomes to a complete aggregate.
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
-            aggregate.table_doc_count +|= runtime.stats.source_doc_count;
+            aggregate.table_doc_count +|= runtimeCoverageSourceTotal(runtime.stats);
             if (!observation_current) {
                 aggregate.coverage_config_mismatch_count += 1;
             } else if (!item.coverage_summary_ready) {
@@ -2207,6 +2218,40 @@ test "settled terminal enrichment debt is degraded rather than rebuilding" {
     }, true);
     try std.testing.expect(!view.backfill_active);
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
+test "derived coverage source totals do not regress below visible documents" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            // A newly published catalog generation can briefly lag the
+            // cardinality snapshot even though an older derived index still
+            // proves that the table is populated.
+            .source_doc_count = 0,
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{1}, 42, 99, null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+    try std.testing.expect(!aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+
+    const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
+    try std.testing.expect(view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.0), view.backfill_progress);
 }
 
 test "derived coverage aggregation rejects mixed config observations" {
