@@ -154,6 +154,21 @@ jobs:
           grep -q '8.9' "${RUNNER_TEMP}/gpu-before.csv"
           ./zig-out/bin/antfly inference cuda-info --smoke
 
+      - name: Prefetch inference models before server startup
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.scope }}" == "smoke" ]]; then
+            ./zig-out/bin/antfly inference pull \
+              hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0 \
+              --tasks generate \
+              --projector Q8_0
+          else
+            uv run --project e2e/inference python -m e2e.inference.pull_models
+          fi
+
       - name: Run CUDA inference validation
         working-directory: zig
         env:
