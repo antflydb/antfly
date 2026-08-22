@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Field type annotations for schema fields
+/// Canonical Antfly field type used by compact `x-antfly-types` annotations and runtime capability reporting
 pub const AntflyType = enum {
     text,
     html,
@@ -59,12 +59,48 @@ pub const AntflyType = enum {
     }
 };
 
+/// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+pub const DocumentFieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
+    /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
+    fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
     schema: ?std.json.Value = null,
+};
+
+/// Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property.
+pub const DocumentSubfieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
@@ -82,6 +118,83 @@ pub const DynamicTemplate = struct {
     /// Filter by detected JSON type
     match_mapping_type: ?[]const u8 = null,
     mapping: ?TemplateFieldMapping = null,
+};
+
+/// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
+pub const FieldMappingType = enum {
+    text,
+    html,
+    keyword,
+    numeric,
+    number,
+    integer,
+    boolean,
+    bool,
+    datetime,
+    date,
+    timestamp,
+    geopoint,
+    geo_point,
+    geoshape,
+    geo_shape,
+    embedding,
+    blob,
+    link,
+    search_as_you_type,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .html => "html",
+            .keyword => "keyword",
+            .numeric => "numeric",
+            .number => "number",
+            .integer => "integer",
+            .boolean => "boolean",
+            .bool => "bool",
+            .datetime => "datetime",
+            .date => "date",
+            .timestamp => "timestamp",
+            .geopoint => "geopoint",
+            .geo_point => "geo_point",
+            .geoshape => "geoshape",
+            .geo_shape => "geo_shape",
+            .embedding => "embedding",
+            .blob => "blob",
+            .link => "link",
+            .search_as_you_type => "search_as_you_type",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "keyword", .keyword },
+            .{ "numeric", .numeric },
+            .{ "number", .number },
+            .{ "integer", .integer },
+            .{ "boolean", .boolean },
+            .{ "bool", .bool },
+            .{ "datetime", .datetime },
+            .{ "date", .date },
+            .{ "timestamp", .timestamp },
+            .{ "geopoint", .geopoint },
+            .{ "geo_point", .geo_point },
+            .{ "geoshape", .geoshape },
+            .{ "geo_shape", .geo_shape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+            .{ "link", .link },
+            .{ "search_as_you_type", .search_as_you_type },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Schema definition for a table with multiple document types
@@ -102,12 +215,12 @@ pub const TableSchema = struct {
     dynamic_templates: ?[]const DynamicTemplate = null,
 };
 
-/// Field mapping to apply when a dynamic template matches
+/// Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required.
 pub const TemplateFieldMapping = struct {
-    type: ?AntflyType = null,
+    type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,

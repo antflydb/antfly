@@ -80,7 +80,7 @@ fi
 
 antfly_status=0
 if [[ "$e2e_suite" != "inference" ]]; then
-  UV_PROJECT_ENVIRONMENT="$antfly_venv" uv run --project e2e/antfly pytest -q --continue-on-collection-errors "${antfly_args[@]}" || antfly_status=$?
+  UV_PROJECT_ENVIRONMENT="$antfly_venv" "$script_dir/zig-antfly-e2e-pytest.sh" "${antfly_args[@]}" || antfly_status=$?
 fi
 
 inference_status=0

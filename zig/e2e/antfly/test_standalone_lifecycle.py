@@ -25,7 +25,7 @@ import pytest
 import requests
 
 from conftest import ready_index_status
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 from test_standalone import (
     DEFAULT_ANTFLY_BIN,
     EmbeddedInferenceStandaloneServer,
@@ -122,7 +122,7 @@ def test_standalone_drop_drains_pending_enrichment_work(
                     },
                 },
             )
-            assert created_index == {}
+            assert_created_index(created_index, "semantic_idx", "embeddings")
             assert (
                 wait_until(
                     lambda table_name=table_name: ready_index_status(

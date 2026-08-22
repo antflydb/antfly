@@ -129,8 +129,10 @@ The shorthand shape should reuse Antfly's public enrichment config fields:
   "artifact": {
     "name": "relations_v1",
     "kind": "asset",
-    "field": "body",
-    "template": "",
+    "source": {
+      "type": "field",
+      "value": "body"
+    },
     "content_type": "application/json",
     "producer_json": {
       "type": "extractor",
@@ -441,7 +443,10 @@ Graph index shorthand may declare this dependency chain:
   "artifact": {
     "name": "relations_v1",
     "kind": "asset",
-    "field": "body",
+    "source": {
+      "type": "field",
+      "value": "body"
+    },
     "content_type": "application/json",
     "producer_json": {
       "type": "extractor",

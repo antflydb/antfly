@@ -2696,6 +2696,60 @@ fn appendRuntimeSchemaObject(
         try appendJsonString(alloc, out, tmpl.mapping.analyzer);
         try out.appendSlice(alloc, "}}");
     }
+    try out.appendSlice(alloc, "],\"exact_fields\":[");
+    for (schema.exact_fields, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "source_field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.source_field);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"mapping\":{");
+        try appendJsonString(alloc, out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, antflyTypeName(field.mapping.field_type));
+        try out.appendSlice(alloc, ",\"index\":");
+        try out.appendSlice(alloc, if (field.mapping.do_index) "true" else "false");
+        try out.appendSlice(alloc, ",\"store\":");
+        try out.appendSlice(alloc, if (field.mapping.store) "true" else "false");
+        try out.appendSlice(alloc, ",\"doc_values\":");
+        try out.appendSlice(alloc, if (field.mapping.doc_values) "true" else "false");
+        try out.appendSlice(alloc, ",\"sortable\":");
+        try out.appendSlice(alloc, if (field.mapping.sortable) "true" else "false");
+        try out.appendSlice(alloc, ",\"missing_null_policy\":");
+        try appendJsonString(alloc, out, runtime_schema_mod.missingNullPolicyName(field.mapping.missing_null_policy));
+        try out.appendSlice(alloc, ",\"include_in_all\":");
+        try out.appendSlice(alloc, if (field.mapping.include_in_all) "true" else "false");
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, out, field.mapping.analyzer);
+        try out.appendSlice(alloc, "}}");
+    }
+    try out.appendSlice(alloc, "],\"declared_fields\":[");
+    for (schema.declared_fields, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"mapping\":{");
+        try appendJsonString(alloc, out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, antflyTypeName(field.mapping.field_type));
+        try out.appendSlice(alloc, ",\"index\":");
+        try out.appendSlice(alloc, if (field.mapping.do_index) "true" else "false");
+        try out.appendSlice(alloc, ",\"store\":");
+        try out.appendSlice(alloc, if (field.mapping.store) "true" else "false");
+        try out.appendSlice(alloc, ",\"sortable\":");
+        try out.appendSlice(alloc, if (field.mapping.sortable) "true" else "false");
+        try out.appendSlice(alloc, ",\"missing_null_policy\":");
+        try appendJsonString(alloc, out, runtime_schema_mod.missingNullPolicyName(field.mapping.missing_null_policy));
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, out, field.mapping.analyzer);
+        try out.appendSlice(alloc, "}}");
+    }
     try out.appendSlice(alloc, "],\"field_capabilities\":[");
     try appendRuntimeFieldCapabilities(alloc, out, schema);
     try out.appendSlice(alloc, "],\"full_text_documents\":[");
@@ -3793,7 +3847,7 @@ test "metadata.table status promotes schema geo capability when runtime coverage
     try std.testing.expectEqualStrings("geopoint", location.object.get("type").?.string);
     try std.testing.expect(testJsonArrayContainsString(location.object.get("query_modes").?, "geo"));
     try std.testing.expect(!location.object.get("sortable").?.bool);
-    try std.testing.expectEqualStrings("dynamic_template", location.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("document_schema", location.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("unsupported", location.object.get("sort_lifecycle_state").?.string);
 }
 
@@ -4627,6 +4681,40 @@ test "metadata.schema update avoids a generation for semantically identical JSON
         std.testing.allocator,
         &table,
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"properties\":{\"body\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"body\",\"title\"],\"additionalProperties\":true,\"type\":\"object\"}}},\"version\":999,\"default_type\":\"doc\",\"enforce_types\":false}",
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
+    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
+    try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
+}
+
+test "metadata.schema update ignores shorthand capability declaration order" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","x-antfly-types":["text","keyword"]},
+        \\  "label":{"type":"string","x-antfly-types":["keyword"]},
+        \\  "size":{"type":"number","x-antfly-types":["numeric"]}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        \\{"version":999,"default_type":"doc","document_schemas":{"doc":{"schema":{"properties":{
+        \\  "size":{"x-antfly-types":["numeric"],"type":"number"},
+        \\  "label":{"x-antfly-types":["keyword"],"type":"string"},
+        \\  "title":{"x-antfly-types":["keyword","text"],"type":"string"}
+        \\},"type":"object"}}}}
+        ,
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 

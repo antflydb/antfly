@@ -8,6 +8,8 @@ from ...client import AuthenticatedClient, Client
 from ...models.cluster_backup_request import ClusterBackupRequest
 from ...models.cluster_backup_response import ClusterBackupResponse
 from ...models.error import Error
+from ...models.metadata_capability_unavailable_error import MetadataCapabilityUnavailableError
+from ...models.metadata_leader_unavailable_error import MetadataLeaderUnavailableError
 from ...types import Response
 
 
@@ -32,7 +34,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ClusterBackupResponse | Error | None:
+) -> ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
     if response.status_code == 200:
         response_200 = ClusterBackupResponse.from_dict(response.json())
 
@@ -53,6 +55,29 @@ def _parse_response(
 
         return response_500
 
+    if response.status_code == 503:
+
+        def _parse_response_503(data: object) -> MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_backup_metadata_unavailable_error_type_0 = (
+                    MetadataCapabilityUnavailableError.from_dict(data)
+                )
+
+                return componentsschemas_backup_metadata_unavailable_error_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_backup_metadata_unavailable_error_type_1 = MetadataLeaderUnavailableError.from_dict(data)
+
+            return componentsschemas_backup_metadata_unavailable_error_type_1
+
+        response_503 = _parse_response_503(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -61,7 +86,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ClusterBackupResponse | Error]:
+) -> Response[ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -74,7 +99,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: ClusterBackupRequest,
-) -> Response[ClusterBackupResponse | Error]:
+) -> Response[ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
     """Backup all tables or selected tables
 
      Creates a backup of all tables or specified tables. Each table's backup includes:
@@ -110,7 +135,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ClusterBackupResponse | Error]
+        Response[ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -128,7 +153,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: ClusterBackupRequest,
-) -> ClusterBackupResponse | Error | None:
+) -> ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
     """Backup all tables or selected tables
 
      Creates a backup of all tables or specified tables. Each table's backup includes:
@@ -164,7 +189,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ClusterBackupResponse | Error
+        ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError
     """
 
     return sync_detailed(
@@ -177,7 +202,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: ClusterBackupRequest,
-) -> Response[ClusterBackupResponse | Error]:
+) -> Response[ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]:
     """Backup all tables or selected tables
 
      Creates a backup of all tables or specified tables. Each table's backup includes:
@@ -213,7 +238,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ClusterBackupResponse | Error]
+        Response[ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -229,7 +254,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: ClusterBackupRequest,
-) -> ClusterBackupResponse | Error | None:
+) -> ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError | None:
     """Backup all tables or selected tables
 
      Creates a backup of all tables or specified tables. Each table's backup includes:
@@ -265,7 +290,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ClusterBackupResponse | Error
+        ClusterBackupResponse | Error | MetadataCapabilityUnavailableError | MetadataLeaderUnavailableError
     """
 
     return (

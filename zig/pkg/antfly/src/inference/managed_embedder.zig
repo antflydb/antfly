@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -1180,6 +1181,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1222,6 +1224,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer out.deinit(alloc);
             try out.appendSlice(alloc, "{\"field\":");
             try appendJsonString(alloc, &out, source_field);
+            try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
             try appendExecutionObjectIfPresent(alloc, &out, root);
             try out.append(alloc, '}');
             return try out.toOwnedSlice(alloc);
@@ -1240,6 +1243,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
         try out.appendSlice(alloc, "{\"field\":");
         try appendJsonString(alloc, &out, source_field);
+        try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
         if (cfg.top_k) |top_k| {
             try out.appendSlice(alloc, ",\"top_k\":");
             const top_k_json = try std.fmt.allocPrint(alloc, "{d}", .{top_k});
@@ -1314,6 +1318,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
 
     if (artifact_embedding_name != null) {
         if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
@@ -1349,7 +1354,64 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+fn normalizeAntflyChunkerDefaultModelJson(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]u8 {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const type_value = root.get("type") orelse return null;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) return null;
+
+    const chunker = switch (root.get("chunker") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const provider = chunker.get("provider") orelse return null;
+    if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) return null;
+    // Preserve explicit values, including null, so validation can reject them
+    // instead of silently changing caller intent.
+    if (chunker.get("model") != null) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first_root_field = true;
+    var root_it = root.iterator();
+    while (root_it.next()) |entry| {
+        if (!first_root_field) try out.append(alloc, ',');
+        first_root_field = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        if (!std.mem.eql(u8, entry.key_ptr.*, "chunker")) {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            continue;
+        }
+
+        try out.append(alloc, '{');
+        var first_chunker_field = true;
+        var chunker_it = chunker.iterator();
+        while (chunker_it.next()) |chunker_entry| {
+            if (!first_chunker_field) try out.append(alloc, ',');
+            first_chunker_field = false;
+            try appendJsonString(alloc, &out, chunker_entry.key_ptr.*);
+            try out.append(alloc, ':');
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(chunker_entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+        if (!first_chunker_field) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"model\":\"fixed\"}");
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     value: std.json.Value,
@@ -1376,9 +1438,8 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
         if (!sparse) _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
         return null;
     }
-    const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
-
     if (sparse) {
+        const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
         if (validation_value != null) return error.InvalidCreateTableRequest;
         try validateSparseEmbeddingForManagedConfig(alloc, index_name, cfg, embedder, options);
         return null;
@@ -1386,6 +1447,15 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
 
     const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
     if (validation == .defer_probe and declared_dims == null) return error.InvalidCreateTableRequest;
+    // Chunker-only dense indexes consume caller-supplied chunk embeddings and
+    // have no embedding provider to probe. Their declared dimension remains
+    // authoritative; the subsequent config translation validates that a
+    // chunker is actually present.
+    const embedder = embedder_value orelse {
+        if (validation_value != null) return error.InvalidCreateTableRequest;
+        _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+        return null;
+    };
     const dims = try resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, index_name, cfg, embedder, options, validation);
     if (cfg.dimension != null and validation_value == null) return null;
 
@@ -1412,6 +1482,25 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    options: InitOptions,
+) !?[]u8 {
+    if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(alloc, index_name, value, options)) |normalized_dimension| {
+        errdefer alloc.free(normalized_dimension);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized_dimension, .{});
+        defer parsed.deinit();
+        if (try normalizeAntflyChunkerDefaultModelJson(alloc, parsed.value)) |normalized_defaults| {
+            alloc.free(normalized_dimension);
+            return normalized_defaults;
+        }
+        return normalized_dimension;
+    }
+    return try normalizeAntflyChunkerDefaultModelJson(alloc, value);
 }
 
 fn parseManagedEmbeddingEntry(
@@ -2605,6 +2694,16 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
+fn appendCoveragePolicyIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: ?indexes_openapi.DerivedCoveragePolicy,
+) !void {
+    const value = policy orelse return;
+    try out.appendSlice(alloc, ",\"coverage_policy\":");
+    try appendJsonString(alloc, out, @tagName(value));
+}
+
 fn appendExecutionObjectIfPresent(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2842,6 +2941,29 @@ test "managed embedder rejects invalid execution batch policy" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+}
+
+test "managed embedder preserves coverage policy in storage config" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","coverage_policy":"partial","template":"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(
+        std.testing.allocator,
+        "thumbnail",
+        parsed.value,
+        .{ .antfly_provider = local.provider() },
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{"field":"body","dims":384,"embedding_name":"thumbnail","coverage_policy":"partial"}
+    ,
+        config_json,
+    );
 }
 
 test "managed embedder rejects unsupported execution namespaces" {
@@ -3551,6 +3673,42 @@ test "managed embedder defers operational dimension probe failure with explicit 
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
 }
 
+fn testChunkerOnlyDenseIndexPreservesDeclaredDimensions() !void {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        parsed.value,
+        .{},
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","model":"fixed","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ,
+        normalized,
+    );
+
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer normalized_parsed.deinit();
+
+    const translated = try translateEmbeddingsIndexConfigJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        normalized_parsed.value,
+        .{},
+    );
+    defer alloc.free(translated);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"dims\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"chunker\":") != null);
+}
+
 test "managed embedder strict dimension probe failure is retryable" {
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
 }
@@ -3560,6 +3718,7 @@ pub fn testDimensionProbeValidationModes() !void {
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
     try testManagedEmbedderDeferProbeRequiresDeclaredDimension();
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+    try testChunkerOnlyDenseIndexPreservesDeclaredDimensions();
 }
 
 fn testManagedEmbedderDefersOperationalDimensionProbeFailure() !void {

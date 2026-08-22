@@ -26,6 +26,9 @@ from helpers import wait_until
 from helpers import json_doc, upsert
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 def _raise_thread_errors(errors: list[Exception]) -> None:
     if errors:
         raise AssertionError("\n\n".join(str(err) for err in errors))
@@ -342,7 +345,7 @@ def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api
 
 
 def test_serverless_table_transforms_follow_latest_then_published(serverless_api):
-    def initial_document_published() -> dict | None:
+    def initial_snapshot_published() -> dict | None:
         try:
             published = serverless_api.query_published(table_name)
         except requests.HTTPError:
@@ -385,7 +388,11 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     # already consumed the WAL. Assert the durable state rather than which
     # builder won that race.
     serverless_api.build_table(table_name)
-    initial_published = wait_until(initial_document_published, timeout_s=10.0, interval_s=0.1)
+    initial_published = wait_until(
+        initial_snapshot_published,
+        timeout_s=10.0,
+        interval_s=0.1,
+    )
     assert initial_published is not None
 
     transformed = serverless_api.batch_table(
@@ -407,6 +414,20 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     latest_docs = _docs_by_id(latest)
     assert latest_docs["doc-a"]["status"] == "updated"
     assert latest_docs["doc-a"]["version"] == 3
+
+    published_before = serverless_api.query_published(table_name)
+    assert published_before["table_name"] == table_name
+    assert published_before["view"] == "published"
+    published_before_docs = _docs_by_id(published_before)
+    published_before_doc = published_before_docs["doc-a"]
+    # Automatic publication may win the race with this observation. Both the
+    # previous snapshot and the fully transformed snapshot are valid here;
+    # partial transform visibility is not.
+    if "status" in published_before_doc:
+        assert published_before_doc["status"] == "updated"
+        assert published_before_doc["version"] == 3
+    else:
+        assert published_before_doc["version"] == 1
 
     try:
         serverless_api.build_table(table_name)

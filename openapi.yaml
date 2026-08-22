@@ -184,6 +184,73 @@ tags:
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+
+      shorthand. Exact scalar names in that array describe how a field is
+
+      searched, but do not opt the field into the typed doc-value storage
+
+      required by production `order_by`.
+
+
+      ### `x-antfly-field`
+
+      Use an explicit field mapping for fields that participate in exact sort.
+
+      Set `sortable: true` on a keyword, numeric/number/integer,
+
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+
+      the internal typed doc values; `doc_values` is intentionally not a public
+
+      setting. The mapping type must accept the property's JSON Schema value
+
+      type. Explicit property mappings take precedence over dynamic templates.
+
+      When multiple document types declare the same dotted field path, their
+
+      normalized physical mappings must be identical.
+
+
+      ```json
+
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+
+      ```
+
+
+      Sort the examples above with `created_at` and `title.keyword`,
+
+      respectively. An analyzed `text` field is never directly sortable.
+
+      Adding `sortable: true` to an existing table is a physical mapping
+
+      change. Once the write or rebuild visibility barrier completes, clients
+
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+
+      first use and fails closed when it is incomplete; status reads do not
+
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+
+      validation succeeds.
+
+
       ### `x-antfly-index`
 
       Boolean to disable indexing for a field:
@@ -2964,6 +3031,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/BackupMetadataUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4042,7 +4111,9 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/TableBackupConflict'
+        '503':
+          $ref: '#/components/responses/BackupMetadataUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5195,12 +5266,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexConfig'
+              $ref: '#/components/schemas/CreateIndexRequest'
       responses:
         '201':
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedIndex'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/StorageResourceExhausted'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -7713,11 +7798,188 @@ components:
     Error:
       type: object
       properties:
+        code:
+          type: string
+          description: Optional stable machine-readable error code for programmatic handling.
         error:
           type: string
           example: An error message
+          description: Legacy human-readable error text.
+        message:
+          type: string
+          description: Human-readable error description when supplied by the endpoint.
+        retryable:
+          type: boolean
+          description: Whether retrying the operation may succeed without changing the request.
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Suggested minimum retry delay in milliseconds.
       required:
         - error
+    MetadataCapabilityUnavailableError:
+      type: object
+      additionalProperties: false
+      description: The metadata service does not yet provide the consistency capability required by backup.
+      required:
+        - code
+        - error
+        - message
+        - required_capability
+        - retryable
+        - retry_after_ms
+      properties:
+        code:
+          type: string
+          enum:
+            - metadata_capability_unavailable
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum:
+            - metadata capability unavailable
+        message:
+          type: string
+        required_capability:
+          type: string
+          enum:
+            - linearizable_snapshot
+        retryable:
+          type: boolean
+          enum:
+            - true
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+    MetadataLeaderUnavailableError:
+      type: object
+      additionalProperties: false
+      description: The request could not establish authority with the current metadata leader.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+        - retry_after_ms
+      properties:
+        code:
+          type: string
+          enum:
+            - metadata_leader_unavailable
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum:
+            - metadata leader unavailable
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+    BackupMetadataUnavailableError:
+      description: A retryable metadata-availability failure reported before backup side effects begin.
+      discriminator:
+        propertyName: code
+        mapping:
+          metadata_capability_unavailable: '#/components/schemas/MetadataCapabilityUnavailableError'
+          metadata_leader_unavailable: '#/components/schemas/MetadataLeaderUnavailableError'
+      oneOf:
+        - $ref: '#/components/schemas/MetadataCapabilityUnavailableError'
+        - $ref: '#/components/schemas/MetadataLeaderUnavailableError'
+    TableBackupConflictError:
+      description: A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup
+        ID and, when available, the opaque artifact generation retained for reconciliation.
+      discriminator:
+        propertyName: code
+        mapping:
+          backup_already_exists: '#/components/schemas/BackupAlreadyExistsConflict'
+          table_catalog_changed: '#/components/schemas/TableCatalogChangedConflict'
+          backup_outcome_ambiguous: '#/components/schemas/BackupOutcomeAmbiguousConflict'
+      oneOf:
+        - $ref: '#/components/schemas/BackupAlreadyExistsConflict'
+        - $ref: '#/components/schemas/TableCatalogChangedConflict'
+        - $ref: '#/components/schemas/BackupOutcomeAmbiguousConflict'
+    BackupAlreadyExistsConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - backup_already_exists
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    TableCatalogChangedConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - table_catalog_changed
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    BackupOutcomeAmbiguousConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - error
+        - message
+        - retryable
+        - backup_id
+      properties:
+        code:
+          type: string
+          enum:
+            - backup_outcome_ambiguous
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+        backup_id:
+          type: string
+          description: Logical backup ID whose outcome must be inspected before retrying.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation,
+            not as a replacement logical backup ID.
     InferenceCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -7749,6 +8011,34 @@ components:
           type: integer
           minimum: 1
           description: Minimum retry delay in milliseconds.
+    StorageResourceExhaustedError:
+      type: object
+      additionalProperties: false
+      description: Actionable retry contract for temporary storage descriptor exhaustion.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+        - retry_after_ms
+      properties:
+        code:
+          type: string
+          enum:
+            - storage_resource_exhausted
+        error:
+          type: string
+          enum:
+            - storage_resource_exhausted
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
+        retry_after_ms:
+          type: integer
+          minimum: 1
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -9717,7 +10007,11 @@ components:
         indexes:
           type: object
           description: >
-            Map of index name to index configuration. Indexes enable different query capabilities:
+            Map of index name to create-index configuration. The map key owns the
+
+            index name; do not repeat `name` inside the configuration. Indexes enable
+
+            different query capabilities:
 
             - Full-text indexes for BM25 search
 
@@ -9728,7 +10022,7 @@ components:
 
             You can add multiple indexes to support different query patterns.
           additionalProperties:
-            $ref: '#/components/schemas/IndexConfig'
+            $ref: '#/components/schemas/CreateIndexRequest'
           example:
             search_index:
               type: full_text
@@ -9844,9 +10138,9 @@ components:
           description: >
             Whether this concrete field is declared sortable in the effective
 
-            capability model. Public exact order_by accepts it only when
+            capability model. A cold declared field is validated on first
 
-            sort_lifecycle_state is queryable or accelerated.
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -9862,9 +10156,9 @@ components:
             - covered
             - queryable
             - accelerated
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by
-            public exact sort; accelerated fields are queryable and participate in the configured index_sort
-            tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields
+            are validated on first public exact-sort use; queryable fields have validated native coverage;
+            accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.
@@ -11710,15 +12004,31 @@ components:
           type: string
           enum:
             - completed
+            - successful
             - partial
             - failed
+            - ambiguous
           description: Overall backup status
           example: completed
     TableBackupStatus:
       type: object
+      additionalProperties: false
       required:
         - name
         - status
+      description: >
+        Outcome for one table in a cluster backup. `successful` is the legacy
+
+        spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+
+
+        An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+
+        `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+
+        generation without retrying blindly. Failed and skipped outcomes may include
+
+        `error`; other fields are omitted when they do not apply.
       properties:
         name:
           type: string
@@ -11728,13 +12038,28 @@ components:
           type: string
           enum:
             - completed
+            - successful
             - failed
             - skipped
-          description: Backup status for this table
+            - ambiguous
           example: completed
         error:
           type: string
-          description: Error message if backup failed
+          description: Human-readable failure, skip reason, or reconciliation guidance.
+        code:
+          type: string
+          enum:
+            - backup_outcome_ambiguous
+          description: Stable machine-readable code for an ambiguous outcome.
+        retryable:
+          type: boolean
+          description: False for an ambiguous outcome; inspect the retained attempt before retrying.
+        backup_id:
+          type: string
+          description: Logical per-table backup ID retained by an ambiguous cluster attempt.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous cluster attempt.
     ClusterRestoreRequest:
       type: object
       additionalProperties: false
@@ -13860,7 +14185,11 @@ components:
 
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
 
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+
+            `x-antfly-types` shorthand declarations alone are not sortable.
+
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
 
             blob, html, object, and array fields are not directly sortable; sort
 
@@ -16304,11 +16633,32 @@ components:
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Serialized asset producer configuration.
+          writeOnly: true
+          description: Write-only serialized asset producer configuration. It may contain provider credentials
+            and is never returned.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
             in generated artifact identity.
+    CreateIndexCommon:
+      type: object
+      description: Fields shared by every create-index variant. The index name is owned by the request
+        path.
+      properties:
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Inline managed enrichment definitions required by this index.
     FullTextIndexConfig:
       type: object
       properties:
@@ -16316,6 +16666,28 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether to use memory-only storage
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Document field indexed as text. Omit for the table's default full-document text
+            index.
+        artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Generated artifact stream indexed as text. Use with matching inline enrichments.
+    CreateFullTextIndexRequest:
+      description: Create a full-text index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
+        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - full_text
     DerivedCoveragePolicy:
       type: string
       enum:
@@ -16367,6 +16739,7 @@ components:
           default: 3072
         api_key:
           type: string
+          writeOnly: true
           description: The Google API key. Can also be set via GEMINI_API_KEY environment variable.
         url:
           type: string
@@ -16408,6 +16781,7 @@ components:
           default: us-central1
         credentials_path:
           type: string
+          writeOnly: true
           description: Path to service account JSON key file. Alternative to ADC for non-GCP environments.
         dimension:
           type: integer
@@ -16485,6 +16859,7 @@ components:
           example: https://api.openai.com
         api_key:
           type: string
+          writeOnly: true
           description: The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
         dimensions:
           type: integer
@@ -16521,6 +16896,7 @@ components:
           example: openai/text-embedding-3-small
         api_key:
           type: string
+          writeOnly: true
           description: The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
         dimensions:
           type: integer
@@ -16602,6 +16978,7 @@ components:
           example: embed-english-v3.0
         api_key:
           type: string
+          writeOnly: true
           description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
         input_type:
           type: string
@@ -17005,6 +17382,7 @@ components:
           description: Top-k sampling parameter.
         api_key:
           type: string
+          writeOnly: true
           description: The Google API key.
         url:
           type: string
@@ -17031,6 +17409,7 @@ components:
           default: us-central1
         credentials_path:
           type: string
+          writeOnly: true
           description: Path to service account JSON key file.
         temperature:
           type: number
@@ -17143,6 +17522,7 @@ components:
           description: The URL of the OpenAI API endpoint.
         api_key:
           type: string
+          writeOnly: true
           description: The OpenAI API key.
         temperature:
           type: number
@@ -17190,6 +17570,7 @@ components:
             Array of model identifiers for fallback routing. Either model or models must be provided.
         api_key:
           type: string
+          writeOnly: true
           description: The OpenRouter API key.
         temperature:
           type: number
@@ -17262,6 +17643,7 @@ components:
           example: claude-sonnet-4-5-20250929
         api_key:
           type: string
+          writeOnly: true
           description: The Anthropic API key.
         url:
           type: string
@@ -17299,6 +17681,7 @@ components:
           example: command-r-plus
         api_key:
           type: string
+          writeOnly: true
           description: The Cohere API key.
         temperature:
           type: number
@@ -17447,12 +17830,11 @@ components:
               example: http://localhost:8080
             model:
               type: string
-              description: The chunking model to use. Either 'fixed' for simple token-based chunking,
-                or a model name from models/chunkers/{name}/.
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
               default: fixed
               example: fixed
-          required:
-            - model
       example:
         provider: antfly
         api_url: http://localhost:8080
@@ -17473,9 +17855,9 @@ components:
     ChunkerConfig:
       description: A unified configuration for a chunking provider.
       allOf:
-        - oneOf:
-            - $ref: '#/components/schemas/AntflyChunkerConfig'
-        - properties:
+        - $ref: '#/components/schemas/AntflyChunkerConfig'
+        - type: object
+          properties:
             provider:
               $ref: '#/components/schemas/ChunkerProvider'
             store_chunks:
@@ -17496,6 +17878,30 @@ components:
 
                 When absent, chunks use :c: suffix and are only used for vector embeddings.
               additionalProperties: true
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
+            max_chunks:
+              type: integer
+              minimum: 1
+            threshold:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+            text:
+              $ref: '#/components/schemas/TextChunkOptions'
+            audio:
+              $ref: '#/components/schemas/AudioChunkOptions'
           required:
             - provider
       example:
@@ -17608,6 +18014,19 @@ components:
         execution:
           $ref: '#/components/schemas/IndexExecutionConfig'
           description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    CreateEmbeddingsIndexRequest:
+      description: Create a dense or sparse embeddings index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
+        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - embeddings
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -17661,6 +18080,216 @@ components:
             type: string
       required:
         - name
+    GraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - artifact
+      description: Artifact stream materialized into graph edges.
+      properties:
+        kind:
+          type: string
+          enum:
+            - artifact
+        artifact:
+          type: string
+          minLength: 1
+        path:
+          type: string
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+        mention_edge_type:
+          type: string
+    GraphArtifactProducerSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - value
+      description: Document input used by an artifact producer. Field sources read one document field;
+        template sources render a Handlebars template.
+      properties:
+        type:
+          type: string
+          enum:
+            - field
+            - template
+        value:
+          type: string
+          minLength: 1
+    GraphArtifactProducerConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+        - source
+      description: Asset producer used by an artifact-backed graph index.
+      properties:
+        name:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - asset
+        source:
+          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+        producer_json:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: Write-only producer configuration; it may contain credentials and is never returned.
+    GraphTemplateValue:
+      description: A literal numeric value or a Handlebars template evaluated for each materialized graph
+        item.
+      anyOf:
+        - type: string
+        - type: number
+          format: double
+    GraphArtifactNodeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to graph node identifiers.
+      properties:
+        model:
+          type: string
+          enum:
+            - document
+            - external
+          default: document
+        source:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        target:
+          $ref: '#/components/schemas/GraphTemplateValue'
+    GraphArtifactEdgeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to an edge type, weight, and public metadata.
+      properties:
+        type:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        weight:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        metadata:
+          type: object
+          additionalProperties: true
+          description: JSON metadata template copied onto each materialized edge. Sensitive keys are omitted
+            from create responses.
+    GraphArtifactContextConfig:
+      type: object
+      additionalProperties: false
+      description: Document fields made available to graph mapping templates through `_doc.value`.
+      properties:
+        doc_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    GraphBoundedTraversalConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - law
+      description: Algebraic law used to combine bounded graph traversal provenance.
+      properties:
+        law:
+          type: string
+          enum:
+            - provenance_semiring
+    GraphAlgebraicPlanningConfig:
+      type: object
+      additionalProperties: false
+      description: Optional algebraic planning features for graph traversal.
+      properties:
+        bounded_traversal:
+          $ref: '#/components/schemas/GraphBoundedTraversalConfig'
+    GraphResolverConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - table
+        - source_artifact
+        - resolution_artifact
+        - key_template
+      description: Versioned entity resolver attached to an artifact-backed graph index.
+      properties:
+        name:
+          type: string
+        table:
+          type: string
+        source_artifact:
+          type: string
+        source_artifact_kind:
+          type: string
+          enum:
+            - asset
+            - chunk
+            - any
+          default: asset
+        resolution_artifact:
+          type: string
+        key_template:
+          type: string
+        type_must_match:
+          type: boolean
+          default: true
+        scorer_json:
+          type: string
+        candidate_search:
+          type: string
+          enum:
+            - ''
+            - exact_key
+            - prefix
+            - ann
+        candidate_ann_index:
+          type: string
+        candidate_limit:
+          type: integer
+          format: uint
+          minimum: 0
+        name_embedding:
+          type: string
+        name_embedding_dims:
+          type: integer
+          format: uint
+          minimum: 0
+        fusion_combine:
+          type: string
+          enum:
+            - ''
+            - noisy_or
+            - max
+            - mean
+        fusion_trust:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        fusion_prior:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        fusion_prior_weight:
+          type: number
+          format: double
+          minimum: 0
+        config_generation:
+          type: integer
+          format: uint64
+          minimum: 0
     GraphIndexConfig:
       type: object
       description: Configuration for graph index type
@@ -17691,6 +18320,35 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Maximum number of edges per document (0 = unlimited)
+        source:
+          $ref: '#/components/schemas/GraphArtifactSourceConfig'
+        artifact:
+          $ref: '#/components/schemas/GraphArtifactProducerConfig'
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
+        algebraic_planning:
+          $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
+        resolvers:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResolverConfig'
+    CreateGraphIndexRequest:
+      description: Create a graph index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
+        - $ref: '#/components/schemas/GraphIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - graph
     AlgebraicIndexConfig:
       type: object
       description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
@@ -17701,58 +18359,157 @@ components:
           type: boolean
           description: When true, derive the algebraic capability sidecar from the table schema. Internal
             fields and materialization definitions are not public API.
-    IndexType:
-      type: string
-      enum:
-        - full_text
-        - embeddings
-        - graph
-        - algebraic
-      description: The type of the index.
-    IndexConfig:
-      type: object
-      description: Configuration for an index
-      oneOf:
-        - $ref: '#/components/schemas/FullTextIndexConfig'
-        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
-        - $ref: '#/components/schemas/GraphIndexConfig'
+    CreateAlgebraicIndexRequest:
+      description: Create a schema-derived algebraic index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
         - $ref: '#/components/schemas/AlgebraicIndexConfig'
-      required:
-        - name
-        - type
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - algebraic
+    CreateIndexRequest:
+      description: Type-safe configuration for a new index. The index name is owned by the request path.
+      oneOf:
+        - $ref: '#/components/schemas/CreateFullTextIndexRequest'
+        - $ref: '#/components/schemas/CreateEmbeddingsIndexRequest'
+        - $ref: '#/components/schemas/CreateGraphIndexRequest'
+        - $ref: '#/components/schemas/CreateAlgebraicIndexRequest'
+      discriminator:
+        propertyName: type
+        mapping:
+          full_text: '#/components/schemas/CreateFullTextIndexRequest'
+          embeddings: '#/components/schemas/CreateEmbeddingsIndexRequest'
+          graph: '#/components/schemas/CreateGraphIndexRequest'
+          algebraic: '#/components/schemas/CreateAlgebraicIndexRequest'
+    FieldMappingType:
+      type: string
+      description: >
+        Field types accepted by detailed `x-antfly-field` and dynamic-template
+
+        mappings. JSON-schema-oriented aliases are normalized to Antfly's
+
+        corresponding runtime type: number/integer to numeric, bool to boolean,
+
+        date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+
+        geoshape.
+      enum:
+        - text
+        - html
+        - keyword
+        - numeric
+        - number
+        - integer
+        - boolean
+        - bool
+        - datetime
+        - date
+        - timestamp
+        - geopoint
+        - geo_point
+        - geoshape
+        - geo_shape
+        - embedding
+        - blob
+        - link
+        - search_as_you_type
+    DocumentSubfieldMapping:
+      type: object
+      additionalProperties: false
+      description: Mapping for one named multifield emitted from its parent document property. Multifields
+        are intentionally one level deep and read the parent property's JSON value rather than a nested
+        JSON property.
       properties:
-        name:
-          type: string
-          description: Name of the index
-        description:
-          type: string
-          description: Optional description of the index and its purpose
         type:
-          $ref: '#/components/schemas/IndexType'
-        version:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          default: 0
-          description: Version of the index implementation. Defaults to 0.
-        enrichments:
-          type: array
-          items:
-            $ref: '#/components/schemas/EnrichmentConfig'
-          x-go-type-skip-optional-pointer: true
-          description: Inline managed enrichment definitions required by this index. Enrichments are table-level
-            generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact
-            stream.
-          example:
-            - name: document_chunks_v1
-              kind: chunk
-              field: text
-              source_artifact_name: document_units_v1
-              chunk_size: 512
-            - name: document_chunk_dense_v1
-              kind: embedding
-              field: text
-              source_artifact_name: document_chunks_v1
-              expected_dims: 768
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: Whether this exact scalar subfield can be used in order_by. Antfly derives the
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+    DocumentFieldMapping:
+      type: object
+      additionalProperties: false
+      description: Executable physical mapping used by a document property's `x-antfly-field` annotation.
+        The mapping must accept the JSON Schema value type. Declarations for the same dotted path across
+        document types must normalize to an identical physical mapping, and present values that cannot
+        be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize
+        to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+      properties:
+        type:
+          $ref: '#/components/schemas/FieldMappingType'
+        analyzer:
+          type: string
+          description: Analyzer name for text-oriented mappings.
+        index:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
+        store:
+          type: boolean
+          default: false
+          description: Whether to store the field value (default false)
+        include_in_all:
+          type: boolean
+          default: false
+          description: Whether to include in the _all field for cross-field search
+        sortable:
+          type: boolean
+          default: false
+          description: >
+            Whether this exact scalar field can be used in order_by. Supported
+
+            sortable mapping types are keyword, numeric/number/integer,
+
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. Antfly derives the
+
+            required typed doc values when enabled.
+        missing_null_policy:
+          type: string
+          enum:
+            - missing_rejected
+          default: missing_rejected
+          description: Missing/null sort policy. The current production policy rejects missing or null
+            native sort values.
+        fields:
+          type: object
+          description: Named one-level multifields emitted from this property's value. For example, a
+            text title can expose a sortable keyword subfield.
+          additionalProperties:
+            $ref: '#/components/schemas/DocumentSubfieldMapping'
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -17767,29 +18524,17 @@ components:
             A valid JSON Schema defining the document's structure.
 
             This is used to infer indexing rules and field types.
-    AntflyType-2:
-      type: string
-      description: Field type annotations for schema fields
-      enum:
-        - text
-        - html
-        - keyword
-        - numeric
-        - boolean
-        - datetime
-        - geopoint
-        - geoshape
-        - embedding
-        - blob
-        - link
-        - search_as_you_type
+          x-antfly-field-mapping-schema:
+            $ref: '#/components/schemas/DocumentFieldMapping'
     TemplateFieldMapping:
       type: object
       additionalProperties: false
-      description: Field mapping to apply when a dynamic template matches
+      description: Field mapping used by a dynamic template. Dynamic templates match one physical field
+        at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's
+        `x-antfly-field` annotation when named subfields are required.
       properties:
         type:
-          $ref: '#/components/schemas/AntflyType-2'
+          $ref: '#/components/schemas/FieldMappingType'
         analyzer:
           type: string
           description: >
@@ -17798,8 +18543,8 @@ components:
             Used for text fields to control tokenization and normalization.
         index:
           type: boolean
-          default: true
-          description: Whether to index the field (default true)
+          x-go-type-skip-optional-pointer: false
+          description: Whether to index the field. Omit to use the server default of true.
         store:
           type: boolean
           default: false
@@ -17927,6 +18672,58 @@ components:
             that don't have explicit mappings and dynamic mapping is enabled, templates are
 
             evaluated in order to determine how those fields should be indexed.
+    IndexType:
+      type: string
+      enum:
+        - full_text
+        - embeddings
+        - graph
+        - algebraic
+      description: The type of the index.
+    IndexConfig:
+      type: object
+      description: Configuration for an index
+      oneOf:
+        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
+        - $ref: '#/components/schemas/GraphIndexConfig'
+        - $ref: '#/components/schemas/AlgebraicIndexConfig'
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: Name of the index
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        type:
+          $ref: '#/components/schemas/IndexType'
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Inline managed enrichment definitions required by this index. Enrichments are table-level
+            generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact
+            stream.
+          example:
+            - name: document_chunks_v1
+              kind: chunk
+              field: text
+              source_artifact_name: document_units_v1
+              chunk_size: 512
+            - name: document_chunk_dense_v1
+              kind: embedding
+              field: text
+              source_artifact_name: document_chunks_v1
+              expected_dims: 768
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
@@ -21554,6 +22351,297 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
+    CreatedEnrichmentConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+      description: Credential-free normalized enrichment configuration returned after index creation.
+      properties:
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/EnrichmentKind'
+        field:
+          type: string
+        template:
+          type: string
+        source_artifact_name:
+          type: string
+        expected_dims:
+          type: integer
+          minimum: 0
+        chunk_size:
+          type: integer
+          minimum: 0
+        chunk_overlap:
+          type: integer
+          minimum: 0
+        chunker_json:
+          type: string
+        full_text_index:
+          type: boolean
+          default: false
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+    CreatedIndexCommon:
+      type: object
+      description: Fields returned for every newly created index. Provider credentials are write-only
+        and are never returned.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Name of the created index
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreatedEnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Normalized inline managed enrichment definitions required by this index.
+    CreatedFullTextIndex:
+      description: Normalized effective full-text index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - full_text
+    CreatedProviderConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - provider
+      description: Credential-free provider configuration returned after index creation. Only non-secret
+        provider settings are represented.
+      properties:
+        provider:
+          type: string
+          description: Configured provider discriminator.
+        model:
+          type: string
+          description: Configured provider model when applicable.
+        models:
+          type: array
+          items:
+            type: string
+        project_id:
+          type: string
+        location:
+          type: string
+        region:
+          type: string
+        url:
+          type: string
+          format: uri
+        api_url:
+          type: string
+          format: uri
+        dimension:
+          type: integer
+          minimum: 1
+        dimensions:
+          type: integer
+          minimum: 1
+        input_type:
+          type: string
+        truncate:
+          type: string
+        strip_new_lines:
+          type: boolean
+        batch_size:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+        max_tokens:
+          type: integer
+          minimum: 1
+        top_p:
+          type: number
+          format: float
+        top_k:
+          type: integer
+        frequency_penalty:
+          type: number
+          format: float
+        presence_penalty:
+          type: number
+          format: float
+        timeout:
+          type: integer
+          minimum: 1
+    CreatedEmbeddingsIndexConfig:
+      type: object
+      description: Credential-free normalized embeddings configuration returned after creation.
+      properties:
+        coverage_policy:
+          $ref: '#/components/schemas/DerivedCoveragePolicy'
+        external:
+          type: boolean
+          default: false
+        sparse:
+          type: boolean
+          default: false
+        dimension:
+          type: integer
+          minimum: 1
+        field:
+          type: string
+        embedding_name:
+          type: string
+        source_artifact_name:
+          type: string
+        template:
+          type: string
+        distance_metric:
+          $ref: '#/components/schemas/DistanceMetric'
+        mem_only:
+          type: boolean
+        embedder:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        chunker:
+          $ref: '#/components/schemas/ChunkerConfig'
+        top_k:
+          type: integer
+          minimum: 1
+          default: 10
+        min_weight:
+          type: number
+          format: float
+          default: 0.0
+        chunk_size:
+          type: integer
+          minimum: 64
+          default: 1024
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+    CreatedEmbeddingsIndex:
+      description: Normalized effective dense or sparse embeddings index configuration returned after
+        creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/CreatedEmbeddingsIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - embeddings
+    CreatedGraphArtifactProducerConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+        - source
+      description: Credential-free graph artifact producer configuration returned after creation.
+      properties:
+        name:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - asset
+        source:
+          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+    CreatedGraphIndexConfig:
+      type: object
+      description: Credential-free normalized graph configuration returned after creation.
+      properties:
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        template:
+          type: string
+        edge_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/EdgeTypeConfig'
+        max_edges_per_document:
+          type: integer
+        source:
+          $ref: '#/components/schemas/GraphArtifactSourceConfig'
+        artifact:
+          $ref: '#/components/schemas/CreatedGraphArtifactProducerConfig'
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
+        algebraic_planning:
+          $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
+        resolvers:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResolverConfig'
+    CreatedGraphIndex:
+      description: Normalized effective graph index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/CreatedGraphIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - graph
+    CreatedAlgebraicIndex:
+      description: Normalized effective schema-derived algebraic index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/AlgebraicIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - algebraic
+    CreatedIndex:
+      description: Discriminated normalized configuration returned after an index is created.
+      oneOf:
+        - $ref: '#/components/schemas/CreatedFullTextIndex'
+        - $ref: '#/components/schemas/CreatedEmbeddingsIndex'
+        - $ref: '#/components/schemas/CreatedGraphIndex'
+        - $ref: '#/components/schemas/CreatedAlgebraicIndex'
+      discriminator:
+        propertyName: type
+        mapping:
+          full_text: '#/components/schemas/CreatedFullTextIndex'
+          embeddings: '#/components/schemas/CreatedEmbeddingsIndex'
+          graph: '#/components/schemas/CreatedGraphIndex'
+          algebraic: '#/components/schemas/CreatedAlgebraicIndex'
     InferenceError:
       type: object
       required:
@@ -24590,6 +25678,46 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    BackupMetadataUnavailable:
+      description: Backup could not establish the required metadata authority before starting side effects.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+        X-Antfly-Metadata-Not-Leader:
+          required: false
+          description: Present with value `true` only when retrying against the current metadata leader
+            may succeed.
+          schema:
+            type: string
+            enum:
+              - 'true'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BackupMetadataUnavailableError'
+    TableBackupConflict:
+      description: Backup ID collision, catalog-incarnation change, or an outcome requiring reconciliation
+        before retry.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TableBackupConflictError'
+    StorageResourceExhausted:
+      description: Storage descriptors are temporarily exhausted
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StorageResourceExhaustedError'
     InferenceTransientCapacity:
       description: Inference capacity is temporarily unavailable
       headers:

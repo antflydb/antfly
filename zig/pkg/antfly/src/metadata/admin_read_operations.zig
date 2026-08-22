@@ -19,6 +19,8 @@ pub const Source = struct {
 
     pub const VTable = struct {
         head: *const fn (*anyopaque) anyerror!metadata_api.MetadataHead,
+        linearizable_head: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
+        linearizable_snapshot: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         status: *const fn (*anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (*anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (*anyopaque, *metadata_api.AdminSnapshot) void,
@@ -26,6 +28,16 @@ pub const Source = struct {
 
     fn head(self: Source) !metadata_api.MetadataHead {
         return self.vtable.head(self.ptr);
+    }
+
+    fn linearizableHead(self: Source, request: operation.RequestContext) !metadata_api.MetadataHead {
+        const fn_ptr = self.vtable.linearizable_head orelse return error.UnsupportedOperation;
+        return fn_ptr(self.ptr, request);
+    }
+
+    fn linearizableSnapshot(self: Source, request: operation.RequestContext) !metadata_api.AdminSnapshot {
+        const fn_ptr = self.vtable.linearizable_snapshot orelse return error.UnsupportedOperation;
+        return fn_ptr(self.ptr, request);
     }
 
     fn status(self: Source) !metadata_api.MetadataStatus {
@@ -89,6 +101,16 @@ pub const Operations = struct {
     pub fn head(self: Operations, request: operation.RequestContext) !metadata_api.MetadataHead {
         try request.ensureActive();
         return self.source.head();
+    }
+
+    pub fn linearizableHead(self: Operations, request: operation.RequestContext) !metadata_api.MetadataHead {
+        try request.ensureActive();
+        return self.source.linearizableHead(request);
+    }
+
+    pub fn linearizableSnapshot(self: Operations, request: operation.RequestContext) !metadata_api.AdminSnapshot {
+        try request.ensureActive();
+        return self.source.linearizableSnapshot(request);
     }
 
     pub fn status(self: Operations, request: operation.RequestContext) !metadata_api.MetadataStatus {
@@ -343,6 +365,74 @@ test "metadata admin read operations enforce cancellation and own aggregate resu
     try std.testing.expect(shutdown.safe_to_terminate);
     try std.testing.expectEqual(@as(usize, 1), source.snapshot_calls);
     try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+}
+
+test "metadata admin linearizable snapshot propagates request context" {
+    const FakeSource = struct {
+        linearizable_calls: usize = 0,
+        observed_deadline_ns: ?u64 = null,
+        observed_request_id: []const u8 = "",
+
+        fn iface(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .linearizable_snapshot = linearizableSnapshot,
+                    .status = status,
+                    .admin_snapshot = snapshot,
+                    .free_admin_snapshot = freeSnapshot,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn emptySnapshot() metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return emptySnapshot();
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_calls += 1;
+            self.observed_deadline_ns = request.deadline_ns;
+            self.observed_request_id = request.request_id;
+            return emptySnapshot();
+        }
+
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    const operations = Operations{ .source = source.iface() };
+    var snapshot_value = try operations.linearizableSnapshot(.{
+        .deadline_ns = std.math.maxInt(u64),
+        .request_id = "fenced-read-17",
+    });
+    operations.freeSnapshot(&snapshot_value);
+
+    try std.testing.expectEqual(@as(usize, 1), source.linearizable_calls);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), source.observed_deadline_ns);
+    try std.testing.expectEqualStrings("fenced-read-17", source.observed_request_id);
 }
 
 test "metadata shutdown status exposes pending finalization with shared store debt semantics" {

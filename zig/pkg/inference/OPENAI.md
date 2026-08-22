@@ -81,7 +81,7 @@ Operational endpoints are available outside `/api`:
 - `/readyz`
 
 `/healthz` reports basic liveness.  
-`/readyz` reports whether antfly-inference-zig can discover usable models and includes per-task counts.
+`/readyz` reports whether antfly-inference-zig can discover usable models and includes per-task counts. The server initializes this inventory before publishing its listener and refreshes it periodically; probes return the last successful snapshot without scanning model storage on the request path.
 
 ## Compatibility Notes
 

@@ -45,10 +45,12 @@ Type@75ms `antfly load -t wikipedia -f wiki-articles.json --id-field title`
 Enter
 Sleep 2s
 
-# Wait for embeddings to be indexed (hidden from gif)
-Hide
-Sleep 300s
-Show
+# Wait for embeddings to be queryable. This returns immediately on fast
+# machines and fails clearly instead of silently continuing after five minutes.
+Type@75ms `antfly index wait -t wikipedia -i title_body --timeout 20m`
+Enter
+Wait@1200s /ready/
+Sleep 1s
 
 # --- Full-text search ---
 

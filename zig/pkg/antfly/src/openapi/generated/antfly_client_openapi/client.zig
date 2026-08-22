@@ -1270,7 +1270,7 @@ pub const Client = struct {
 
     /// Add an index to a table
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}
-    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
+    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.CreateIndexRequest) !ApiResponse(types.CreatedIndex) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
@@ -1280,7 +1280,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CreatedIndex).fromResponse(self.allocator, &resp);
     }
 
     /// Drop an index from a table
