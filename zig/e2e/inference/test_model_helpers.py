@@ -41,6 +41,12 @@ from .test_generate import (
 
 
 def test_server_budget_args_validate_and_preserve_values(monkeypatch):
+    for env_name in (
+        "ANTFLY_INFERENCE_BACKEND_BUDGET_MB",
+        "ANTFLY_INFERENCE_COMBINED_BUDGET_MB",
+        "ANTFLY_INFERENCE_KV_BUDGET_MB",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", "7000")
     monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "0")
 
