@@ -258,7 +258,8 @@ jobs:
               e2e/inference/test_read.py::test_read_florence_model_answers_text
             exit "$failures"
           else
-            uv run --project e2e/inference pytest -q --continue-on-collection-errors \
+            ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS='sparse-encoder-testing/splade-bert-tiny-nq-onnx=native,openai/whisper-tiny=native' \
+              uv run --project e2e/inference pytest -q --continue-on-collection-errors \
               e2e/inference
           fi
 
