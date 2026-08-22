@@ -1292,7 +1292,7 @@ pub const DistributedDataVoprScenario = struct {
         }
     }
 
-    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !void {
+    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
         switch (world.stage) {
             .transport => {
                 world.delayed_transport = selected.id == delayed_on_id;
@@ -1373,6 +1373,10 @@ pub const DistributedDataVoprScenario = struct {
             .kind = if (world.completed) .client_response else .state_change,
             .payload_digest = @intFromEnum(world.stage),
         });
+        return if (world.completed)
+            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @intFromEnum(world.stage))
+        else
+            vopr.outcome.TransitionOutcome.applied();
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {

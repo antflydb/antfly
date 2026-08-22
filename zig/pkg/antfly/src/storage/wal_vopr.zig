@@ -226,7 +226,7 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
             selected: vopr.transition.Transition,
             events: *vopr.event.Sink,
             allocator: Allocator,
-        ) !void {
+        ) !vopr.outcome.TransitionOutcome {
             const state = world.state;
             if (selected.id == crash_id) {
                 try state.device.device().crash();
@@ -240,13 +240,13 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
                     state.recovery_error_digest = vopr.id.digest(@errorName(err));
                     state.recovered = true;
                     try events.emitNamed(allocator, .client_response, "storage.wal.recovery_rejected_uncertain_state", state.recovery_error_digest);
-                    return;
+                    return vopr.outcome.TransitionOutcome.rejected("storage.wal.recovery_rejected_uncertain_state", state.recovery_error_digest);
                 };
                 state.wal_open = true;
                 try reconcileRecoveredModel(state);
                 state.recovered = true;
                 try events.emitNamed(allocator, .state_change, "storage.wal.recovered", state.next_lsn);
-                return;
+                return vopr.outcome.TransitionOutcome.targetReached("storage.wal.recovered", state.next_lsn);
             }
 
             state.decisions += 1;
@@ -254,59 +254,71 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
                 state.device.injectWriteFailure();
                 state.pending_io_fault = .write;
                 try events.emitNamed(allocator, .injected_error, "storage.wal.write_failure_armed", state.decisions);
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == inject_sync_failure_id) {
                 state.device.injectSyncFailure();
                 state.pending_io_fault = .sync;
                 try events.emitNamed(allocator, .injected_error, "storage.wal.sync_failure_armed", state.decisions);
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == inject_partial_write_id) {
                 state.fault_consumptions_before = state.device.partialWriteFaultsConsumed();
                 state.device.injectPartialWrite(@intCast(selected.parameter));
                 state.pending_io_fault = .partial_write;
                 try events.emitNamed(allocator, .injected_error, "storage.wal.partial_write_armed", @intCast(selected.parameter));
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == inject_dropped_sync_id) {
                 state.fault_consumptions_before = state.device.droppedSyncsConsumed();
                 state.device.dropNextSync();
                 state.pending_io_fault = .dropped_sync;
                 try events.emitNamed(allocator, .injected_error, "storage.wal.dropped_sync_armed", state.decisions);
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == inject_device_full_id) {
                 state.fault_consumptions_before = state.device.deviceFullFaultsConsumed();
                 state.device.setCapacityBytes(state.device.usedBytes());
                 state.pending_io_fault = .device_full;
                 try events.emitNamed(allocator, .injected_error, "storage.wal.device_full_armed", state.decisions);
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == append_id) {
+                const rejected_before = state.rejected_operations;
+                const injected_before = state.dropped_sync_outcomes;
                 try appendOne(state, events, allocator, 0);
-                return;
+                if (state.rejected_operations != rejected_before)
+                    return vopr.outcome.TransitionOutcome.rejected("storage.wal.append_rejected", state.rejected_operations);
+                if (state.dropped_sync_outcomes != injected_before)
+                    return vopr.outcome.TransitionOutcome.injectedError("storage.wal.dropped_sync_consumed", state.dropped_sync_outcomes);
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (selected.id == vopr.id.derive("storage.wal.append_batch", append_batch_base, @intCast(selected.parameter))) {
+                const rejected_before = state.rejected_operations;
+                const injected_before = state.dropped_sync_outcomes;
                 try appendBatch(state, events, allocator, @intCast(selected.parameter));
-                return;
+                if (state.rejected_operations != rejected_before)
+                    return vopr.outcome.TransitionOutcome.rejected("storage.wal.append_batch_rejected", state.rejected_operations);
+                if (state.dropped_sync_outcomes != injected_before)
+                    return vopr.outcome.TransitionOutcome.injectedError("storage.wal.dropped_sync_consumed", state.dropped_sync_outcomes);
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (std.mem.eql(u8, selected.name, "storage.wal.reopen_and_verify_from")) {
                 try reopen(state);
                 state.reopens += 1;
                 try events.emitNamed(allocator, .state_change, "storage.wal.reopened", @intCast(selected.parameter));
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (std.mem.eql(u8, selected.name, "storage.wal.verify_from")) {
                 try events.emitNamed(allocator, .domain, "storage.wal.verified", @intCast(selected.parameter));
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             if (std.mem.eql(u8, selected.name, "storage.wal.truncate_and_verify_from")) {
                 const pair = unpackPair(@bitCast(selected.parameter));
                 try state.wal.truncate(pair.left);
                 truncateModel(state, pair.left);
                 try events.emitNamed(allocator, .state_change, "storage.wal.truncated", pair.left);
-                return;
+                return vopr.outcome.TransitionOutcome.applied();
             }
             return error.UnknownWalVoprTransition;
         }

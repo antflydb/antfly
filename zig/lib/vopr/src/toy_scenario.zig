@@ -5,6 +5,7 @@ const std = @import("std");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
+const outcome = @import("outcome.zig");
 const property = @import("property.zig");
 const transition = @import("transition.zig");
 
@@ -33,11 +34,15 @@ pub const ToyScenario = struct {
         if (world.counter > 0) try list.append(allocator, .{ .id = decrement_id, .name = "toy.decrement", .kind = .workload, .parameter = -1 });
     }
 
-    pub fn execute(world: *World, selected: transition.Transition, events: *event.Sink, allocator: std.mem.Allocator) !void {
+    pub fn execute(world: *World, selected: transition.Transition, events: *event.Sink, allocator: std.mem.Allocator) !outcome.TransitionOutcome {
         if (selected.id != increment_id and selected.id != decrement_id) return error.UnknownToyTransition;
         world.counter += selected.parameter;
         world.steps += 1;
         try events.emitNamed(allocator, .state_change, "toy.counter_changed", @bitCast(world.counter));
+        return if (world.steps == 4)
+            outcome.TransitionOutcome.targetReached("toy.transition_budget_reached", world.steps)
+        else
+            outcome.TransitionOutcome.applied();
     }
 
     pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {

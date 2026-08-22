@@ -13,6 +13,7 @@ pub const explorer = @import("explorer.zig");
 pub const id = @import("id.zig");
 pub const meta_test = @import("meta_test.zig");
 pub const observation = @import("observation.zig");
+pub const outcome = @import("outcome.zig");
 pub const property = @import("property.zig");
 pub const replay = @import("replay.zig");
 pub const reducer = @import("reducer.zig");
@@ -43,9 +44,10 @@ const FailingScenario = struct {
     pub fn enumerate(_: *World, list: *transition.List, allocator: std.mem.Allocator) !void {
         try list.append(allocator, .{ .id = fault_id, .name = "toy.injected_fault", .kind = .fault });
     }
-    pub fn execute(world: *World, _: transition.Transition, events: *event.Sink, allocator: std.mem.Allocator) !void {
+    pub fn execute(world: *World, _: transition.Transition, events: *event.Sink, allocator: std.mem.Allocator) !outcome.TransitionOutcome {
         world.complete = true;
         try events.emitNamed(allocator, .injected_error, "toy.fault_injected", 1);
+        return outcome.TransitionOutcome.injectedError("toy.fault_injected", 1);
     }
     pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {
         try builder.addNamed(allocator, "toy.complete", @intFromBool(world.complete));
@@ -180,6 +182,7 @@ test {
     _ = explorer;
     _ = id;
     _ = observation;
+    _ = outcome;
     _ = property;
     _ = replay;
     _ = reducer;

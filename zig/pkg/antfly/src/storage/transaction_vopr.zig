@@ -102,19 +102,19 @@ pub const Scenario = struct {
         }
     }
 
-    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: Allocator) !void {
+    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: Allocator) !vopr.outcome.TransitionOutcome {
         const state = world.state;
         if (selected.id == begin_id and state.phase == .begin) {
             try state.manager.initTransaction(txn_id, begin_timestamp);
             state.phase = .write;
             try events.emitNamed(allocator, .client_response, "storage.transaction.began", begin_timestamp);
-            return;
+            return vopr.outcome.TransitionOutcome.applied();
         }
         if (selected.id == write_id and state.phase == .write) {
             try state.manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "value-a" }}, &.{});
             state.phase = .decide;
             try events.emitNamed(allocator, .client_response, "storage.transaction.intent_written", vopr.id.digest("doc:a"));
-            return;
+            return vopr.outcome.TransitionOutcome.applied();
         }
         if (state.phase == .decide and (selected.id == commit_id or selected.id == abort_id)) {
             const status: transactions.TxnStatus = if (selected.id == commit_id) .committed else .aborted;
@@ -127,7 +127,10 @@ pub const Scenario = struct {
                 if (status == .committed) "storage.transaction.committed" else "storage.transaction.aborted",
                 commit_timestamp,
             );
-            return;
+            return vopr.outcome.TransitionOutcome.targetReached(
+                if (status == .committed) "storage.transaction.committed" else "storage.transaction.aborted",
+                commit_timestamp,
+            );
         }
         return error.InvalidTransactionVoprTransition;
     }

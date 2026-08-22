@@ -9,6 +9,7 @@ const choice = @import("choice.zig");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
+const outcome = @import("outcome.zig");
 const property = @import("property.zig");
 const reducer = @import("reducer.zig");
 const replay = @import("replay.zig");
@@ -85,7 +86,7 @@ pub fn Scenario(comptime bug: Bug) type {
             }
         }
 
-        pub fn execute(world: *World, selected: transition.Transition, events: *event.Sink, alloc: std.mem.Allocator) !void {
+        pub fn execute(world: *World, selected: transition.Transition, events: *event.Sink, alloc: std.mem.Allocator) !outcome.TransitionOutcome {
             switch (world.stage) {
                 0 => {
                     world.first_a = selected.id == first_a_id;
@@ -109,6 +110,10 @@ pub fn Scenario(comptime bug: Bug) type {
                 else => return error.MetaScenarioAlreadyComplete,
             }
             try events.emitNamed(alloc, if (world.triggered) .injected_error else .state_change, name ++ ".step", selected.id);
+            return if (world.complete)
+                outcome.TransitionOutcome.targetReached(name ++ ".complete", selected.id)
+            else
+                outcome.TransitionOutcome.applied();
         }
 
         pub fn observe(world: *World, builder: *observation.Builder, alloc: std.mem.Allocator) !void {

@@ -6,6 +6,7 @@ const choice = @import("choice.zig");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
+const outcome = @import("outcome.zig");
 const property = @import("property.zig");
 const scenario_contract = @import("scenario.zig");
 const scheduler = @import("scheduler.zig");
@@ -193,6 +194,12 @@ fn continueRun(
             .observation_digest = null,
         });
     }
+    std.mem.sort(trace.FailureRecord, result.failures.items, {}, struct {
+        fn lessThan(_: void, lhs: trace.FailureRecord, rhs: trace.FailureRecord) bool {
+            if (lhs.index != rhs.index) return lhs.index < rhs.index;
+            return lhs.fingerprint < rhs.fingerprint;
+        }
+    }.lessThan);
     result.summary = .{
         .transitions = transition_index,
         .final_observation_digest = last_digest,
@@ -247,7 +254,8 @@ fn executeStep(
     try scheduler.verifyStillEnabled(Scenario, world, allocator, enabled.items.items, selected_transition);
     var events = event.Sink{};
     defer events.deinit(allocator);
-    try Scenario.execute(world, selected_transition, &events, allocator);
+    var transition_outcome: outcome.TransitionOutcome = try Scenario.execute(world, selected_transition, &events, allocator);
+    try transition_outcome.validate();
     try result.addTransition(.{
         .index = transition_index.*,
         .id = selected_transition.id,
@@ -279,8 +287,45 @@ fn executeStep(
         });
     }
     last_digest.* = try recordObservation(Scenario, allocator, world, result, transition_index.*);
+    const prior_failure_count = tracker.failureCount();
     try evaluateProperties(Scenario, allocator, world, result, tracker, transition_index.*);
     if (@hasDecl(Scenario, "quiescent") and Scenario.quiescent(world)) tracker.beginQuiescence(transition_index.*);
+    if (Scenario.done(world)) tracker.finish(transition_index.*);
+    if (tracker.failureCount() > prior_failure_count) {
+        for (Scenario.properties, tracker.statuses) |declaration, status| {
+            if (status.first_failure_transition == transition_index.*) {
+                transition_outcome = outcome.TransitionOutcome.propertyViolation(
+                    declaration.id,
+                    declaration.name,
+                    last_digest.*,
+                );
+                break;
+            }
+        }
+    }
+    const outcome_event = transition_outcome.asEvent();
+    try result.addEvent(.{
+        .index = transition_index.*,
+        .ordinal = @intCast(events.events.items.len),
+        .id = outcome_event.id,
+        .name = outcome_event.name,
+        .kind = outcome_event.kind,
+        .actor_id = selected_transition.actor_id,
+        .resource_id = selected_transition.resource_id,
+        .payload_digest = outcome_event.payload_digest,
+    });
+    if (transition_outcome.failureClass()) |failure_class| {
+        // Property failures are materialized from the property tracker at the
+        // end so their first-failure identity remains the single authority.
+        if (failure_class != .property) try result.addFailure(.{
+            .index = transition_index.*,
+            .class = failure_class,
+            .property_id = transition_outcome.property_id,
+            .identity = transition_outcome.identity,
+            .fingerprint = transition_outcome.fingerprint(),
+            .observation_digest = last_digest.*,
+        });
+    }
 }
 
 fn initTrace(comptime Scenario: type, allocator: std.mem.Allocator, config: Config) !trace.Trace {

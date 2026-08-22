@@ -166,6 +166,7 @@ test "reducer shortens a history while preserving its failure fingerprint" {
     const event = @import("event.zig");
     const ids = @import("id.zig");
     const observation = @import("observation.zig");
+    const outcome = @import("outcome.zig");
     const property = @import("property.zig");
     const transition = @import("transition.zig");
     const Scenario = struct {
@@ -184,9 +185,13 @@ test "reducer shortens a history while preserving its failure fingerprint" {
             try list.append(allocator_, .{ .id = loop_id, .name = "reducer.loop", .kind = .workload });
             try list.append(allocator_, .{ .id = finish_id, .name = "reducer.finish", .kind = .workload });
         }
-        pub fn execute(world: *World, selected: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !void {
+        pub fn execute(world: *World, selected: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
             world.steps += 1;
             world.complete = selected.id == finish_id;
+            return if (world.complete)
+                outcome.TransitionOutcome.targetReached("reducer.complete", world.steps)
+            else
+                outcome.TransitionOutcome.applied();
         }
         pub fn observe(world: *World, builder: *observation.Builder, allocator_: std.mem.Allocator) !void {
             try builder.addNamed(allocator_, "reducer.steps", @intCast(world.steps));
