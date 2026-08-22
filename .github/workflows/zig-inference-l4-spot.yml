@@ -7,6 +7,11 @@ on:
         description: CUDA validation scope
         required: true
         type: string
+      artifact_run_id:
+        description: Existing CUDA artifact run for pre-merge validation
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       scope:
@@ -19,6 +24,7 @@ on:
           - inference-e2e
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -30,6 +36,7 @@ env:
 
 jobs:
   build:
+    if: inputs.artifact_run_id == ''
     name: Build CUDA E2E binary
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
@@ -87,6 +94,7 @@ jobs:
   inference:
     name: L4 Spot / ${{ inputs.scope }}
     needs: build
+    if: always() && (needs.build.result == 'success' || inputs.artifact_run_id != '')
     runs-on: arc-antfly-l4-spot
     timeout-minutes: 90
     env:
@@ -141,8 +149,10 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-cuda-${{ github.run_id }}
+          name: antfly-e2e-cuda-${{ inputs.artifact_run_id || github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-cuda
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
 
       - name: Install E2E executable
         run: |
