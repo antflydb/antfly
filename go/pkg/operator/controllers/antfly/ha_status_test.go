@@ -6125,6 +6125,26 @@ func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
 	}
 }
 
+func TestPeriodicRequeueObservesPeerSeedReceiptWhileStartupGateIsSuspended(t *testing.T) {
+	cluster := startupGatedStandaloneControllerCluster(false)
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
+
+	if got := periodicRequeueAfter(cluster); got != haStartupGateObservationRequeueAfter {
+		t.Fatalf("expected suspended exact startup gate requeue %s, got %s", haStartupGateObservationRequeueAfter, got)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("expected startup-gate observation polling to stop after declarative eligibility, got %s", got)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	cluster.Spec.HighAvailability.Runtime.StartupGate.Policy = antflyv1.HAStartupGatePolicySuspend
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("expected an intentionally suspended runtime not to poll peer seed receipts, got %s", got)
+	}
+}
+
 func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
 	now := time.Date(2026, 7, 14, 18, 0, 0, 0, time.UTC)
 	nextRetry := metav1.NewTime(now.Add(17 * time.Second))

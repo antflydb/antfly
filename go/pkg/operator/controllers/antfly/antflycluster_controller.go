@@ -100,6 +100,8 @@ const maxHASeededSlotActivationReceiptBytes = 64 * 1024
 // reconciliation promptly without consuming the error rate limiter.
 const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
 
+const haStartupGateObservationRequeueAfter = 5 * time.Second
+
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
@@ -2927,6 +2929,16 @@ func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time
 	}
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
+	}
+	// A suspended seeded runtime has no Pod, Job, or Lease event of its own
+	// after the primary checkpoints the final receipt. Re-observe peer status
+	// until Colony accepts that exact receipt and opens the declarative gate;
+	// otherwise a missed cross-CR event can leave a correctly seeded standby
+	// suspended forever. This bounded cadence stops as soon as eligibility is
+	// declared and avoids enqueueing every HA peer on every status write.
+	if gate := haRuntimeStartupGate(cluster); gate != nil &&
+		gate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && !gate.RuntimeEligible {
+		requeueAfter = minPositiveDuration(requeueAfter, haStartupGateObservationRequeueAfter)
 	}
 	if retryAfter := haDirectAdminRetryRequeueAfter(cluster, now); retryAfter > 0 {
 		requeueAfter = minPositiveDuration(requeueAfter, retryAfter)
