@@ -2514,6 +2514,7 @@ pub const LoadedModel = struct {
             &self.text_projection,
             &self.text_projection_resource_lease,
         );
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     /// Admit the reusable text/image sidecars transactionally. A failed
@@ -2578,6 +2579,11 @@ pub const LoadedModel = struct {
             &self.audio_session,
             &self.audio_resource_lease,
         );
+        // Audio sidecars are intentionally request-phased rather than cached.
+        // Their backend allocations can be large and differently shaped from
+        // the persistent vision/text sessions, so complete the physical
+        // release at this explicit cold boundary before admitting later work.
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
@@ -3124,13 +3130,23 @@ fn admittedSessionCudaLimit(
 }
 
 fn attachSessionRunAdmission(
+    allocator: std.mem.Allocator,
     session: *backends.Session,
     controller: *runtime.tier.memory.AdmissionController,
     backend_runtime: backends.BackendRuntime,
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
     man: ?*const manifest_mod.ModelManifest,
-) void {
+) !void {
+    const backend_class = admissionBackendClassForRuntime(backend_runtime);
+    try session_factory.configureSharedCacheAdmissionForSession(
+        session.*,
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        resident,
+    );
     const weight_bytes = std.math.add(
         usize,
         resident.host_weight_bytes,
@@ -3138,7 +3154,7 @@ fn attachSessionRunAdmission(
     ) catch std.math.maxInt(usize);
     session.run_admission = .{
         .controller = controller,
-        .backend_class = admissionBackendClassForRuntime(backend_runtime),
+        .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .backend_workspace_reserved = backend_runtime.backend == .onnx and
@@ -3221,7 +3237,7 @@ pub const WhisperCompositeAssets = struct {
     }
 
     fn reclaimableAdmission(self: *const WhisperCompositeAssets) ?runtime.tier.memory.AdmissionLease {
-        return self.managed_tokenizer.resource_lease;
+        return self.managed_tokenizer.reclaimableAdmission();
     }
 
     fn deinit(self: *WhisperCompositeAssets) void {
@@ -3250,8 +3266,207 @@ pub const WhisperAssetsHandle = struct {
     }
 };
 
+/// Declares who owns the process-wide physical memory budget. Direct inference
+/// uses its local admission controller. Embedded inference must attach the
+/// node ResourceManager bridge before any model can be loaded or served.
+pub const ResourceOwnership = enum {
+    local,
+    external_required,
+};
+
 pub const ModelManager = struct {
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
+    const tokenizer_cache_budget_shard_count = 16;
+    const tokenizer_cache_admission_quantum_bytes = 1024 * 1024;
+
+    const TokenizerCacheBudgetSource = enum {
+        none,
+        local_manager,
+        external_pair,
+    };
+
+    const TokenizerCacheBudgetRecord = struct {
+        actual_bytes: usize = 0,
+        reserved_bytes: usize = 0,
+        transitioning: bool = false,
+        credits: std.ArrayListUnmanaged(runtime.tier.memory.AdmissionLease) = .empty,
+    };
+
+    const TokenizerCacheBudgetShard = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        records: std.AutoHashMapUnmanaged(usize, *TokenizerCacheBudgetRecord) = .empty,
+    };
+
+    /// Ref-counted resource domain shared by ModelManager and every tokenizer
+    /// that adopts its budget capability. Admission state and tokenizer-cache
+    /// ledgers live here, rather than inside ModelManager, so physical memory
+    /// remains charged until the last escaped tokenizer is destroyed.
+    const ResourceDomain = struct {
+        allocator: std.mem.Allocator,
+        admission: runtime.tier.memory.AdmissionController = .{},
+        admission_limits: runtime.tier.memory.Limits = .{},
+        tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
+        external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
+        tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
+            [_]TokenizerCacheBudgetShard{.{}} ** tokenizer_cache_budget_shard_count,
+        references: std.atomic.Value(usize) = .init(1),
+        closing: std.atomic.Value(bool) = .init(false),
+        managed_mutex: std.atomic.Mutex = .unlocked,
+        managed_head: ?*ManagedTokenizerLifetime = null,
+
+        fn create(allocator: std.mem.Allocator) !*@This() {
+            const lifetime = try allocator.create(@This());
+            lifetime.* = .{
+                .allocator = allocator,
+            };
+            return lifetime;
+        }
+
+        fn retain(self: *@This()) bool {
+            if (self.closing.load(.acquire)) return false;
+            var current = self.references.load(.acquire);
+            while (current != 0 and current != std.math.maxInt(usize)) {
+                if (self.closing.load(.acquire)) return false;
+                if (self.references.cmpxchgWeak(
+                    current,
+                    current + 1,
+                    .acq_rel,
+                    .acquire,
+                )) |observed| {
+                    current = observed;
+                } else {
+                    if (self.closing.load(.acquire)) {
+                        self.release();
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn release(self: *@This()) void {
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                if (!self.closing.load(.acquire))
+                    @panic("inference resource domain lost its final live reference");
+                if (self.managed_head != null)
+                    @panic("inference resource domain closed with managed tokenizers");
+                for (&self.tokenizer_cache_budget_shards) |*shard| {
+                    if (shard.records.count() != 0)
+                        @panic("inference resource domain closed with tokenizer observers");
+                    shard.records.deinit(self.allocator);
+                }
+                if (!std.meta.eql(
+                    self.admission.snapshot(),
+                    runtime.tier.memory.AdmissionAmounts{},
+                )) @panic("inference resource domain closed with admission leases");
+                self.admission.deinit();
+                if (self.external_tokenizer_cache_budget) |budget| budget.releaseContext();
+                self.allocator.destroy(self);
+            }
+        }
+
+        fn close(self: *@This()) void {
+            const was_closing = self.closing.swap(true, .acq_rel);
+            if (was_closing) @panic("inference resource domain closed twice");
+        }
+
+        fn registerManagedTokenizer(
+            self: *@This(),
+            resource_lease: ?runtime.tier.memory.AdmissionLease,
+        ) !*ManagedTokenizerLifetime {
+            if (self.closing.load(.acquire)) return error.ResourceOwnerShuttingDown;
+            const managed = try self.allocator.create(ManagedTokenizerLifetime);
+            managed.* = .{
+                .lifetime = self,
+                .resource_lease = resource_lease,
+            };
+            if (!self.retain()) {
+                self.allocator.destroy(managed);
+                return error.ResourceOwnerShuttingDown;
+            }
+
+            spinLock(&self.managed_mutex);
+            if (self.closing.load(.acquire)) {
+                self.managed_mutex.unlock();
+                self.allocator.destroy(managed);
+                self.release();
+                return error.ResourceOwnerShuttingDown;
+            }
+            managed.next = self.managed_head;
+            if (self.managed_head) |head| head.previous = managed;
+            self.managed_head = managed;
+            self.managed_mutex.unlock();
+            return managed;
+        }
+
+        fn unregisterManagedTokenizer(
+            self: *@This(),
+            managed: *ManagedTokenizerLifetime,
+        ) void {
+            spinLock(&self.managed_mutex);
+            if (managed.previous) |previous| {
+                previous.next = managed.next;
+            } else {
+                std.debug.assert(self.managed_head == managed);
+                self.managed_head = managed.next;
+            }
+            if (managed.next) |next| next.previous = managed.previous;
+            if (managed.resource_lease) |*lease| lease.release();
+            managed.resource_lease = null;
+            managed.previous = null;
+            managed.next = null;
+            self.managed_mutex.unlock();
+
+            self.allocator.destroy(managed);
+            self.release();
+        }
+
+        fn resourceBudget(
+            self: *@This(),
+        ) hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+            return .{
+                .context = self,
+                .retain_context = retainContext,
+                .release_context = releaseContext,
+                .observe = observe,
+            };
+        }
+
+        fn retainContext(context: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.retain();
+        }
+
+        fn releaseContext(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.release();
+        }
+
+        fn observe(
+            context: *anyopaque,
+            observer_id: usize,
+            previous: usize,
+            next: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.closing.load(.acquire) and next > previous) return false;
+            return ModelManager.reconcileTokenizerCacheUsage(self, observer_id, previous, next);
+        }
+    };
+
+    const ManagedTokenizerLifetime = struct {
+        lifetime: *ResourceDomain,
+        resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+        previous: ?*ManagedTokenizerLifetime = null,
+        next: ?*ManagedTokenizerLifetime = null,
+
+        fn release(self: *@This()) void {
+            self.lifetime.unregisterManagedTokenizer(self);
+        }
+    };
 
     const EvictedModel = struct {
         key: []const u8,
@@ -3267,9 +3482,13 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
-    admission: runtime.tier.memory.AdmissionController = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
+    process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
+    forced_run_admission_denials_for_testing: usize = 0,
+    resource_ownership: ResourceOwnership = .local,
+    tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
@@ -3291,6 +3510,8 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
+    resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -3308,11 +3529,401 @@ pub const ModelManager = struct {
         std.debug.assert(self.whisper_assets.count() == 0);
         self.serving_policy = policy;
         self.admission_enabled = true;
-        self.admission.configureSharedLimits(
-            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(
+        if (self.resource_domain) |domain|
+            self.configureAdmissionController(domain);
+    }
+
+    pub fn configureResourceOwnership(
+        self: *ModelManager,
+        ownership: ResourceOwnership,
+    ) !void {
+        std.debug.assert(self.loaded.count() == 0);
+        std.debug.assert(self.whisper_assets.count() == 0);
+        spinLock(&self.tokenizer_cache_config_mutex);
+        defer self.tokenizer_cache_config_mutex.unlock();
+        if (self.tokenizer_cache_budget_source != .none)
+            return error.ResourceOwnershipAfterTokenizerBudgetConfiguration;
+        self.resource_ownership = ownership;
+    }
+
+    pub fn configureProcessMemoryLimit(
+        self: *ModelManager,
+        limit_bytes: usize,
+        provenance: runtime.tier.memory.ProcessMemoryLimitProvenance,
+    ) void {
+        std.debug.assert(self.loaded.count() == 0);
+        std.debug.assert(self.whisper_assets.count() == 0);
+        self.process_memory_limit_bytes = limit_bytes;
+        self.process_memory_limit_provenance = provenance;
+        if (self.resource_domain) |domain|
+            self.configureAdmissionController(domain);
+    }
+
+    pub fn ensureResourceOwnerReady(self: *ModelManager) !void {
+        spinLock(&self.tokenizer_cache_config_mutex);
+        defer self.tokenizer_cache_config_mutex.unlock();
+        switch (self.resource_ownership) {
+            .local => {
+                switch (self.tokenizer_cache_budget_source) {
+                    .none => {},
+                    .local_manager => return,
+                    .external_pair => return error.ExternalTokenizerBudgetInLocalOwnership,
+                }
+                if (self.tokenizer_cache_config.resource_budget != null)
+                    return error.UntrackedTokenizerResourceBudget;
+                const lifetime = try self.ensureResourceDomain();
+                lifetime.tokenizer_cache_budget_source = .local_manager;
+                self.tokenizer_cache_config.resource_budget = lifetime.resourceBudget();
+                self.tokenizer_cache_budget_source = .local_manager;
+            },
+            .external_required => {
+                if (self.tokenizer_cache_budget_source != .external_pair)
+                    return error.ExternalResourceManagerNotConfigured;
+                if (self.tokenizer_cache_config.resource_budget == null)
+                    return error.ExternalTokenizerResourceManagerNotConfigured;
+            },
+        }
+    }
+
+    fn ensureResourceDomain(
+        self: *ModelManager,
+    ) !*ResourceDomain {
+        if (self.resource_domain) |lifetime| return lifetime;
+        const lifetime = try ResourceDomain.create(self.allocator);
+        self.configureAdmissionController(lifetime);
+        self.resource_domain = lifetime;
+        return lifetime;
+    }
+
+    fn configureAdmissionController(
+        self: *const ModelManager,
+        domain: *ResourceDomain,
+    ) void {
+        domain.admission.configureSharedLimits(
+            runtime.tier.memory.sharedAdmissionLimitsWithOverridesAndProcessLimit(
                 self.admission_limit_overrides,
+                self.process_memory_limit_bytes,
             ),
         );
+        domain.admission.configureProcessMemoryLimit(
+            self.process_memory_limit_bytes,
+            self.process_memory_limit_provenance,
+        );
+        domain.admission.configureForcedRunDenialsForTesting(
+            self.forced_run_admission_denials_for_testing,
+        );
+        domain.admission_limits = self.admissionLimitsForBackend(.{ .backend = .native });
+    }
+
+    fn admissionController(
+        self: *const ModelManager,
+    ) *runtime.tier.memory.AdmissionController {
+        return &self.resource_domain.?.admission;
+    }
+
+    fn tokenizerCacheBudgetShard(
+        self: *ResourceDomain,
+        observer_id: usize,
+    ) *TokenizerCacheBudgetShard {
+        return &self.tokenizer_cache_budget_shards[
+            observer_id % tokenizer_cache_budget_shard_count
+        ];
+    }
+
+    fn tokenizerCacheCreditTarget(actual_bytes: usize) usize {
+        if (actual_bytes == 0) return 0;
+        const remainder = actual_bytes % tokenizer_cache_admission_quantum_bytes;
+        if (remainder == 0) return actual_bytes;
+        return std.math.add(
+            usize,
+            actual_bytes,
+            tokenizer_cache_admission_quantum_bytes - remainder,
+        ) catch actual_bytes;
+    }
+
+    fn acquireTokenizerCacheCredit(
+        self: *ResourceDomain,
+        bytes: usize,
+    ) !runtime.tier.memory.AdmissionLease {
+        std.debug.assert(bytes > 0);
+        const amounts = runtime.tier.memory.AdmissionAmounts{
+            .host_weight_bytes = bytes,
+        };
+        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        var lease = try self.admission.tryAcquireWithPressure(
+            .cpu,
+            self.admission_limits,
+            amounts,
+            true,
+            &pressure,
+        );
+        errdefer lease.release();
+        // Settle the transient live-memory epoch while retaining ordinary lease
+        // ownership for the admitted credit. The ModelManager record, not a raw
+        // byte total, remains the sole release authority.
+        try lease.retain(amounts);
+        return lease;
+    }
+
+    fn releaseTokenizerCacheCredit(
+        record: *TokenizerCacheBudgetRecord,
+        released_bytes: usize,
+    ) void {
+        std.debug.assert(released_bytes <= record.reserved_bytes);
+        var remaining = released_bytes;
+        while (remaining > 0) {
+            const lease = &record.credits.items[record.credits.items.len - 1];
+            const owned_bytes = lease.amounts.host_weight_bytes;
+            std.debug.assert(owned_bytes > 0);
+            if (owned_bytes <= remaining) {
+                remaining -= owned_bytes;
+                record.reserved_bytes -= owned_bytes;
+                lease.release();
+                _ = record.credits.pop();
+            } else {
+                lease.retain(.{
+                    .host_weight_bytes = owned_bytes - remaining,
+                }) catch unreachable;
+                record.reserved_bytes -= remaining;
+                remaining = 0;
+            }
+        }
+    }
+
+    fn removeTokenizerCacheBudgetRecord(
+        self: *ResourceDomain,
+        shard: *TokenizerCacheBudgetShard,
+        observer_id: usize,
+        record: *TokenizerCacheBudgetRecord,
+    ) void {
+        const removed = shard.records.fetchRemove(observer_id) orelse return;
+        std.debug.assert(removed.value == record);
+        std.debug.assert(record.actual_bytes == 0);
+        std.debug.assert(record.reserved_bytes == 0);
+        std.debug.assert(record.credits.items.len == 0);
+        record.credits.deinit(self.allocator);
+        self.allocator.destroy(record);
+    }
+
+    /// Track exact tokenizer usage while admitting capacity in bounded chunks.
+    /// The shard lock protects only identity transitions; potentially blocking
+    /// live-memory probes run after marking the record in flight and releasing
+    /// that lock. At most one quantum per tokenizer is conservatively unused.
+    fn reconcileLocalTokenizerCacheUsage(
+        self: *ResourceDomain,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        if (observer_id == 0) return false;
+        const shard = tokenizerCacheBudgetShard(self, observer_id);
+        spinLock(&shard.mutex);
+
+        var inserted = false;
+        const record = shard.records.get(observer_id) orelse blk: {
+            if (previous != 0) {
+                shard.mutex.unlock();
+                return false;
+            }
+            if (next == 0) {
+                shard.mutex.unlock();
+                return true;
+            }
+            const created = self.allocator.create(TokenizerCacheBudgetRecord) catch {
+                shard.mutex.unlock();
+                return false;
+            };
+            created.* = .{};
+            shard.records.put(self.allocator, observer_id, created) catch {
+                self.allocator.destroy(created);
+                shard.mutex.unlock();
+                return false;
+            };
+            inserted = true;
+            break :blk created;
+        };
+        if (record.actual_bytes != previous or record.transitioning) {
+            shard.mutex.unlock();
+            return false;
+        }
+
+        const reserved = record.reserved_bytes;
+        const rounded_target = tokenizerCacheCreditTarget(next);
+        const credit_target = if (next > reserved)
+            rounded_target
+        else if (next < previous)
+            @min(reserved, rounded_target)
+        else
+            reserved;
+        if (credit_target == reserved) {
+            record.actual_bytes = next;
+            if (next == 0) removeTokenizerCacheBudgetRecord(
+                self,
+                shard,
+                observer_id,
+                record,
+            );
+            shard.mutex.unlock();
+            return true;
+        }
+
+        if (credit_target > reserved) {
+            record.credits.ensureUnusedCapacity(self.allocator, 1) catch {
+                if (inserted) removeTokenizerCacheBudgetRecord(
+                    self,
+                    shard,
+                    observer_id,
+                    record,
+                );
+                shard.mutex.unlock();
+                return false;
+            };
+        }
+        record.transitioning = true;
+        shard.mutex.unlock();
+
+        if (credit_target > reserved) {
+            const preferred_growth = credit_target - reserved;
+            const required_growth = next -| reserved;
+            const credit = acquireTokenizerCacheCredit(self, preferred_growth) catch retry: {
+                if (preferred_growth == required_growth) {
+                    spinLock(&shard.mutex);
+                    record.transitioning = false;
+                    if (inserted) removeTokenizerCacheBudgetRecord(
+                        self,
+                        shard,
+                        observer_id,
+                        record,
+                    );
+                    shard.mutex.unlock();
+                    return false;
+                }
+                break :retry acquireTokenizerCacheCredit(self, required_growth) catch {
+                    spinLock(&shard.mutex);
+                    record.transitioning = false;
+                    if (inserted) removeTokenizerCacheBudgetRecord(
+                        self,
+                        shard,
+                        observer_id,
+                        record,
+                    );
+                    shard.mutex.unlock();
+                    return false;
+                };
+            };
+
+            spinLock(&shard.mutex);
+            record.credits.appendAssumeCapacity(credit);
+            record.reserved_bytes += credit.amounts.host_weight_bytes;
+            record.actual_bytes = next;
+            record.transitioning = false;
+            shard.mutex.unlock();
+            return true;
+        }
+
+        const released = reserved - credit_target;
+        releaseTokenizerCacheCredit(record, released);
+        spinLock(&shard.mutex);
+        record.actual_bytes = next;
+        record.transitioning = false;
+        if (next == 0) removeTokenizerCacheBudgetRecord(
+            self,
+            shard,
+            observer_id,
+            record,
+        );
+        shard.mutex.unlock();
+        return true;
+    }
+
+    fn reconcileExternalTokenizerCacheUsage(
+        self: *ResourceDomain,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        if (observer_id == 0) return false;
+        const upstream = self.external_tokenizer_cache_budget orelse return false;
+        const shard = tokenizerCacheBudgetShard(self, observer_id);
+        spinLock(&shard.mutex);
+
+        var inserted = false;
+        const record = shard.records.get(observer_id) orelse blk: {
+            if (previous != 0) {
+                shard.mutex.unlock();
+                return false;
+            }
+            if (next == 0) {
+                shard.mutex.unlock();
+                return true;
+            }
+            const created = self.allocator.create(TokenizerCacheBudgetRecord) catch {
+                shard.mutex.unlock();
+                return false;
+            };
+            created.* = .{};
+            shard.records.put(self.allocator, observer_id, created) catch {
+                self.allocator.destroy(created);
+                shard.mutex.unlock();
+                return false;
+            };
+            inserted = true;
+            break :blk created;
+        };
+        if (record.actual_bytes != previous or record.transitioning) {
+            shard.mutex.unlock();
+            return false;
+        }
+        record.transitioning = true;
+        shard.mutex.unlock();
+
+        if (!upstream.observe(upstream.context, observer_id, previous, next)) {
+            spinLock(&shard.mutex);
+            record.transitioning = false;
+            if (inserted) removeTokenizerCacheBudgetRecord(
+                self,
+                shard,
+                observer_id,
+                record,
+            );
+            shard.mutex.unlock();
+            return false;
+        }
+
+        spinLock(&shard.mutex);
+        record.actual_bytes = next;
+        record.transitioning = false;
+        if (next == 0) removeTokenizerCacheBudgetRecord(
+            self,
+            shard,
+            observer_id,
+            record,
+        );
+        shard.mutex.unlock();
+        return true;
+    }
+
+    fn reconcileTokenizerCacheUsage(
+        self: *ResourceDomain,
+        observer_id: usize,
+        previous: usize,
+        next: usize,
+    ) bool {
+        return switch (self.tokenizer_cache_budget_source) {
+            .none => false,
+            .local_manager => reconcileLocalTokenizerCacheUsage(
+                self,
+                observer_id,
+                previous,
+                next,
+            ),
+            .external_pair => reconcileExternalTokenizerCacheUsage(
+                self,
+                observer_id,
+                previous,
+                next,
+            ),
+        };
     }
 
     pub fn configureModelCache(
@@ -3333,11 +3944,22 @@ pub const ModelManager = struct {
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.acquireAmountsWithEviction(
+        return self.acquireRunResourceAmounts(
             backend_class,
             limits,
             .fromEstimate(estimate),
         );
+    }
+
+    /// Admit already-classified transient amounts. Callers use this when an
+    /// execution owns request-scoped artifacts in addition to KV and scratch.
+    pub fn acquireRunResourceAmounts(
+        self: *ModelManager,
+        backend_class: runtime.tier.memory.BackendClass,
+        limits: runtime.tier.memory.Limits,
+        amounts: runtime.tier.memory.AdmissionAmounts,
+    ) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEviction(backend_class, limits, amounts);
     }
 
     /// Atomically admits all transient resources for one execution. Speculative
@@ -3357,25 +3979,51 @@ pub const ModelManager = struct {
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.whisper_assets.count() == 0);
         self.admission_limit_overrides = overrides;
-        self.admission.configureSharedLimits(
-            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(overrides),
-        );
+        if (self.resource_domain) |domain|
+            self.configureAdmissionController(domain);
     }
 
-    pub fn configureAdmissionResourceBudget(
+    /// Attach both halves of one external process owner atomically. Requiring a
+    /// paired configuration prevents a model lease and tokenizer cache from
+    /// silently charging different managers.
+    pub fn configureExternalResourceBudgets(
         self: *ModelManager,
-        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
-    ) void {
+        admission_budget: runtime.tier.memory.AdmissionResourceBudget,
+        tokenizer_budget: hf_tokenizer.HfTokenizer.BpeCacheResourceBudget,
+    ) !void {
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.whisper_assets.count() == 0);
-        self.admission.configureResourceBudget(resource_budget);
+        if (self.resource_ownership != .external_required)
+            return error.ExternalResourceBudgetInLocalOwnership;
+        spinLock(&self.tokenizer_cache_config_mutex);
+        defer self.tokenizer_cache_config_mutex.unlock();
+        if (self.tokenizer_cache_budget_source != .none)
+            return error.ExternalResourceBudgetsAlreadyConfigured;
+        if (!admission_budget.hasValidLifetimeHooks() or
+            !tokenizer_budget.hasValidLifetimeHooks() or
+            admission_budget.retain_context == null or
+            tokenizer_budget.retain_context == null)
+            return error.ExternalResourceBudgetRequiresLifetimeHooks;
+        if (!tokenizer_budget.retainContext())
+            return error.ExternalResourceOwnerShuttingDown;
+        errdefer tokenizer_budget.releaseContext();
+        const lifetime = try self.ensureResourceDomain();
+        try lifetime.admission.configureResourceBudget(admission_budget);
+        lifetime.external_tokenizer_cache_budget = tokenizer_budget;
+        lifetime.tokenizer_cache_budget_source = .external_pair;
+        // Ownership pairing changes only provenance. Cache geometry remains
+        // the policy selected in NodeConfig/configureTokenizerCaches.
+        self.tokenizer_cache_config.resource_budget = lifetime.resourceBudget();
+        self.tokenizer_cache_budget_source = .external_pair;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(
         self: *ModelManager,
         count: usize,
     ) void {
-        self.admission.configureForcedRunDenialsForTesting(count);
+        self.forced_run_admission_denials_for_testing = count;
+        if (self.resource_domain) |domain|
+            domain.admission.configureForcedRunDenialsForTesting(count);
     }
 
     fn modelIsInFlightLocked(self: *ModelManager, model: *LoadedModel) bool {
@@ -3519,6 +4167,7 @@ pub const ModelManager = struct {
         std.debug.assert(model.retired);
         model.deinit();
         self.allocator.destroy(model);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn destroyEvictedModel(self: *ModelManager, evicted: EvictedModel) void {
@@ -3529,6 +4178,7 @@ pub const ModelManager = struct {
         evicted.model.deinit();
         self.allocator.destroy(evicted.model);
         self.allocator.free(evicted.key);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn takeLruWhisperAssetsLocked(
@@ -3586,6 +4236,7 @@ pub const ModelManager = struct {
     ) void {
         evicted.assets.deinit();
         self.allocator.destroy(evicted.assets);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     fn admissionAmountsPresent(amounts: runtime.tier.memory.AdmissionAmounts) bool {
@@ -3686,14 +4337,96 @@ pub const ModelManager = struct {
         return false;
     }
 
+    fn pressureCanBeRelievedByHostCache(
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        return switch (pressure) {
+            .shared_host, .shared_unified, .external_budget, .live_host => true,
+            .domain_host, .domain_combined => true,
+            .domain_backend, .domain_kv, .domain_scratch => false,
+        };
+    }
+
+    /// Called with eviction_lock held after no idle model remains. Active
+    /// native/PJRT sessions may still own cold, unpinned lazy weights. Reclaim
+    /// one entry and let the caller re-probe the authoritative controller;
+    /// never infer success from cache counters alone.
+    fn reclaimOneActiveCacheForAdmission(
+        self: *ModelManager,
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        if (!pressureCanBeRelievedByHostCache(pressure)) return false;
+
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        var candidate: ?*LoadedModel = null;
+        var oldest_ns: u64 = std.math.maxInt(u64);
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model.retired or self.modelIsInFlightLocked(model)) continue;
+            if (!loadedModelAdmissionReclaimRelevant(model, pressure)) continue;
+            if (candidate == null or model.last_used_ns < oldest_ns) {
+                candidate = model;
+                oldest_ns = model.last_used_ns;
+            }
+        }
+        var model = candidate orelse return false;
+        var released_bytes = session_factory.reclaimOneHostCacheEntryForSession(model.session);
+        if (released_bytes == 0) {
+            // A session may have no unpinned victim at this instant. Do not let
+            // one busy model hide reclaimable capacity in another model.
+            var fallback_it = self.loaded.iterator();
+            while (fallback_it.next()) |entry| {
+                const fallback = entry.value_ptr.*;
+                if (fallback == model or fallback.retired or
+                    self.modelIsInFlightLocked(fallback) or
+                    !loadedModelAdmissionReclaimRelevant(fallback, pressure))
+                {
+                    continue;
+                }
+                released_bytes = session_factory.reclaimOneHostCacheEntryForSession(fallback.session);
+                if (released_bytes != 0) {
+                    model = fallback;
+                    break;
+                }
+            }
+        }
+        if (released_bytes == 0) return false;
+        std.log.info(
+            "reclaimed inference host cache path={s} backend={s} bytes={d} pressure={s}",
+            .{
+                model.model_dir,
+                @tagName(model.session.backend()),
+                released_bytes,
+                @tagName(pressure),
+            },
+        );
+        // Cache storage is physically destroyed before its aggregate credit is
+        // observed by the next admission probe. On glibc, also return unused
+        // arena pages so the cgroup working set reflects that destruction
+        // rather than the allocator's historical high-water mark.
+        _ = platform.allocator.reclaimUnusedProcessMemory();
+        return true;
+    }
+
+    fn reclaimOneForAdmission(
+        self: *ModelManager,
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        if (self.evictOneIdleForAdmission(pressure)) return true;
+        return self.reclaimOneActiveCacheForAdmission(pressure);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        return self.admission.tryAcquireWithPressure(
+        return self.admissionController().tryAcquireWithPressure(
             backend_class,
             limits,
             amounts,
@@ -3704,7 +4437,7 @@ pub const ModelManager = struct {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 while (true) {
-                    if (self.admission.tryAcquireWithPressure(
+                    if (self.admissionController().tryAcquireWithPressure(
                         backend_class,
                         limits,
                         amounts,
@@ -3714,7 +4447,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(
+                    if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     ))
                         return error.ResourceTemporarilyUnavailable;
@@ -3728,8 +4461,9 @@ pub const ModelManager = struct {
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        return self.admission.tryAcquireRequestsWithPressure(
+        return self.admissionController().tryAcquireRequestsWithPressure(
             requests,
             true,
             &pressure,
@@ -3738,7 +4472,7 @@ pub const ModelManager = struct {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 while (true) {
-                    if (self.admission.tryAcquireRequestsWithPressure(
+                    if (self.admissionController().tryAcquireRequestsWithPressure(
                         requests,
                         true,
                         &pressure,
@@ -3748,7 +4482,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(
+                    if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     ))
                         return error.ResourceTemporarilyUnavailable;
@@ -4116,15 +4850,11 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackend(
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
             admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
         );
-        const overrides = self.admission_limit_overrides;
-        if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
-        if (overrides.backend_limit_bytes > 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
-        if (overrides.combined_limit_bytes > 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
-        if (overrides.kv_limit_bytes > 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
-        if (overrides.scratch_limit_bytes > 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+        limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
         return limits;
     }
 
@@ -4230,13 +4960,18 @@ pub const ModelManager = struct {
                 }
                 if (self.admission_enabled) {
                     attachSessionRunAdmission(
+                        self.allocator,
                         &session,
-                        &self.admission,
+                        self.admissionController(),
                         backend_runtime,
                         admission_limits,
                         resident_amounts,
                         null,
-                    );
+                    ) catch |err| {
+                        session.close();
+                        if (resource_lease) |*lease| lease.release();
+                        return err;
+                    };
                 }
                 return .{
                     .session = session,
@@ -4273,9 +5008,16 @@ pub const ModelManager = struct {
         try tokenizer.configureParallelBpe(self.tokenizer_parallel_bpe_config);
         if (resource_lease) |*lease| try lease.retain(plan.resident);
 
+        const managed_lifetime = if (self.resource_domain) |lifetime|
+            try lifetime.registerManagedTokenizer(resource_lease)
+        else
+            null;
+        if (managed_lifetime != null) resource_lease = null;
+
         return .{
             .tokenizer = tokenizer,
             .resource_lease = resource_lease,
+            .managed_lifetime = managed_lifetime,
         };
     }
 
@@ -4350,7 +5092,20 @@ pub const ModelManager = struct {
     ) !void {
         if (self.loaded.count() != 0 or self.whisper_assets.count() != 0)
             return error.TokenizerCacheConfigAfterModelLoad;
-        self.tokenizer_cache_config = config;
+        spinLock(&self.tokenizer_cache_config_mutex);
+        defer self.tokenizer_cache_config_mutex.unlock();
+        if (config.resource_budget != null) {
+            return switch (self.resource_ownership) {
+                .local => error.ExternalTokenizerBudgetInLocalOwnership,
+                .external_required => error.ExternalBudgetsMustBeConfiguredTogether,
+            };
+        }
+        var next = config;
+        switch (self.tokenizer_cache_budget_source) {
+            .none => {},
+            .local_manager, .external_pair => next.resource_budget = self.tokenizer_cache_config.resource_budget,
+        }
+        self.tokenizer_cache_config = next;
     }
 
     /// Configure persistent std.Io-consumer tokenizer state before loading
@@ -4393,6 +5148,13 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        if (self.resource_domain) |lifetime| {
+            lifetime.close();
+            self.tokenizer_cache_config.resource_budget = null;
+            self.resource_domain = null;
+            lifetime.release();
+        }
+        _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
@@ -4690,6 +5452,7 @@ pub const ModelManager = struct {
         errdefer if (assets_owned) {
             assets.deinit();
             self.allocator.destroy(assets);
+            _ = platform.allocator.reclaimUnusedProcessMemory();
         };
         spinLock(&self.eviction_lock);
         defer self.eviction_lock.unlock();
@@ -4700,6 +5463,7 @@ pub const ModelManager = struct {
                 self.unlockLoadedModels();
                 assets.deinit();
                 self.allocator.destroy(assets);
+                _ = platform.allocator.reclaimUnusedProcessMemory();
                 assets_owned = false;
                 return .{ .manager = self, .assets = existing };
             }
@@ -5397,6 +6161,7 @@ pub const ModelManager = struct {
         errdefer if (model_owned) {
             model.deinit();
             self.allocator.destroy(model);
+            _ = platform.allocator.reclaimUnusedProcessMemory();
         };
 
         const variant_key = try backendVariantCacheKey(
@@ -5436,6 +6201,7 @@ pub const ModelManager = struct {
 
                 model.deinit();
                 self.allocator.destroy(model);
+                _ = platform.allocator.reclaimUnusedProcessMemory();
                 model_owned = false;
                 return .{ .manager = self, .model = existing };
             }
@@ -5996,18 +6762,31 @@ pub const ManagedSession = struct {
 pub const ManagedHfTokenizer = struct {
     tokenizer: *hf_tokenizer.HfTokenizer,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    managed_lifetime: ?*ModelManager.ManagedTokenizerLifetime = null,
     owns_tokenizer: bool = true,
+
+    fn reclaimableAdmission(self: *const ManagedHfTokenizer) ?runtime.tier.memory.AdmissionLease {
+        if (self.resource_lease) |lease| return lease;
+        const managed = self.managed_lifetime orelse return null;
+        const lifetime = managed.lifetime;
+        spinLock(&lifetime.managed_mutex);
+        defer lifetime.managed_mutex.unlock();
+        return managed.resource_lease;
+    }
 
     pub fn deinit(self: *ManagedHfTokenizer) void {
         if (self.owns_tokenizer) self.tokenizer.deinitSelf();
         if (self.resource_lease) |*lease| lease.release();
+        if (self.managed_lifetime) |managed| managed.release();
         self.resource_lease = null;
+        self.managed_lifetime = null;
         self.owns_tokenizer = false;
     }
 
     pub fn take(self: *ManagedHfTokenizer) ManagedHfTokenizer {
         const owned = self.*;
         self.resource_lease = null;
+        self.managed_lifetime = null;
         self.owns_tokenizer = false;
         return owned;
     }
@@ -6314,13 +7093,26 @@ fn estimateModelArtifactBytes(
         ) orelse return error.ResourceLimitExceeded;
         total = std.math.add(usize, total, native_weight_bytes) catch
             return error.ResourceLimitExceeded;
-        try addArtifactBytes(&total, man.allocator, man.gguf_projector_path);
     } else {
         try addArtifactBytes(&total, man.allocator, man.onnx_path);
     }
 
     if (total == 0) return error.NoModelFileFound;
     return total;
+}
+
+/// A multimodal projector is opened, mapped, and consumed by an individual
+/// generation request; it is not part of the decoder session's retained
+/// residency. Charge its mapped artifact to the request that owns that mapping.
+pub fn projectorRunAdmissionAmounts(
+    man: manifest_mod.ModelManifest,
+) !runtime.tier.memory.AdmissionAmounts {
+    const path = man.gguf_projector_path orelse return .{};
+    const bytes = std.math.cast(
+        usize,
+        try c_file.fileSize(man.allocator, path),
+    ) orelse return error.ResourceLimitExceeded;
+    return .{ .host_weight_bytes = bytes };
 }
 
 fn estimateModelLoadAdmission(
@@ -6557,13 +7349,18 @@ fn loadSessionForPreferredBackends(
             }
             if (manager.admission_enabled) {
                 attachSessionRunAdmission(
+                    manager.allocator,
                     &session,
-                    &manager.admission,
+                    manager.admissionController(),
                     backend_runtime,
                     admission_limits,
                     resident_amounts,
                     &man,
-                );
+                ) catch |err| {
+                    session.close();
+                    if (resource_lease) |*lease| lease.release();
+                    return err;
+                };
             }
             return .{ .session = session, .resource_lease = resource_lease };
         } else |err| {
@@ -6612,6 +7409,387 @@ fn rememberPreferredLoadError(selected: *?anyerror, candidate: anyerror) void {
     }
 }
 
+test "external resource ownership fails closed until budget is attached" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    try manager.configureResourceOwnership(.external_required);
+    try std.testing.expectError(
+        error.ExternalResourceManagerNotConfigured,
+        manager.ensureResourceOwnerReady(),
+    );
+
+    const Bridge = struct {
+        fn retainContext(_: *anyopaque) bool {
+            return true;
+        }
+        fn releaseContext(_: *anyopaque) void {}
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    const CacheBridge = struct {
+        fn observe(_: *anyopaque, _: usize, _: usize, _: usize) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.ExternalBudgetsMustBeConfiguredTogether,
+        manager.configureTokenizerCaches(.{
+            .resource_budget = .{
+                .context = &context,
+                .observe = CacheBridge.observe,
+            },
+        }),
+    );
+    try manager.configureExternalResourceBudgets(
+        .{
+            .context = &context,
+            .retain_context = Bridge.retainContext,
+            .release_context = Bridge.releaseContext,
+            .try_reserve = Bridge.reserve,
+            .retain = Bridge.retain,
+            .release = Bridge.release,
+        },
+        .{
+            .context = &context,
+            .retain_context = Bridge.retainContext,
+            .release_context = Bridge.releaseContext,
+            .observe = CacheBridge.observe,
+        },
+    );
+    try manager.ensureResourceOwnerReady();
+}
+
+test "local resource ownership rejects external tokenizer provenance" {
+    const CacheBridge = struct {
+        fn observe(_: *anyopaque, _: usize, _: usize, _: usize) bool {
+            return true;
+        }
+    };
+    var manager = ModelManager.init(
+        std.testing.allocator,
+        backends.SessionManager.init(std.testing.allocator),
+    );
+    defer manager.deinit();
+    var context: u8 = 0;
+
+    try std.testing.expectError(
+        error.ExternalTokenizerBudgetInLocalOwnership,
+        manager.configureTokenizerCaches(.{
+            .resource_budget = .{
+                .context = &context,
+                .observe = CacheBridge.observe,
+            },
+        }),
+    );
+    try manager.ensureResourceOwnerReady();
+    try std.testing.expectError(
+        error.ResourceOwnershipAfterTokenizerBudgetConfiguration,
+        manager.configureResourceOwnership(.external_required),
+    );
+}
+
+test "local resource ownership amortizes exact tokenizer cache usage" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    manager.configureServingPolicy(.{});
+    const quantum = ModelManager.tokenizer_cache_admission_quantum_bytes;
+    manager.configureAdmissionLimits(.{
+        .host_limit_bytes = quantum + 20,
+        .combined_limit_bytes = quantum + 20,
+    });
+    try manager.ensureResourceOwnerReady();
+    const budget = manager.tokenizer_cache_config.resource_budget.?;
+
+    try std.testing.expect(budget.observe(budget.context, 71, 0, 16));
+    try std.testing.expectEqual(
+        quantum,
+        manager.admissionController().snapshot().host_weight_bytes,
+    );
+    // Growth inside the admitted quantum performs no additional admission or
+    // live-memory probe, but the observer retains the exact current value.
+    try std.testing.expect(budget.observe(budget.context, 71, 16, quantum - 1));
+    try std.testing.expectEqual(
+        quantum,
+        manager.admissionController().snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(!budget.observe(budget.context, 71, 0, 0));
+    // The preferred second quantum exceeds policy, so admission retries only
+    // the required delta instead of denying useful cache capacity.
+    try std.testing.expect(budget.observe(
+        budget.context,
+        71,
+        quantum - 1,
+        quantum + 16,
+    ));
+    try std.testing.expectEqual(
+        quantum + 16,
+        manager.admissionController().snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(budget.observe(
+        budget.context,
+        71,
+        quantum + 16,
+        quantum + 15,
+    ));
+    try std.testing.expectEqual(
+        quantum + 16,
+        manager.admissionController().snapshot().host_weight_bytes,
+    );
+    try std.testing.expect(!budget.observe(
+        budget.context,
+        71,
+        quantum + 15,
+        quantum + 21,
+    ));
+    try std.testing.expect(budget.observe(budget.context, 71, quantum + 15, 7));
+    try std.testing.expectEqual(quantum, manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expect(budget.observe(budget.context, 71, 7, 0));
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        manager.admissionController().snapshot(),
+    );
+}
+
+test "local tokenizer lifecycle releases its persistent admission credit" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5},
+        \\    "merges": ["a b", "ab c"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{
+        .host_limit_bytes = 4 * ModelManager.tokenizer_cache_admission_quantum_bytes,
+        .combined_limit_bytes = 4 * ModelManager.tokenizer_cache_admission_quantum_bytes,
+    });
+    try manager.ensureResourceOwnerReady();
+
+    var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, json_str);
+    errdefer tokenizer.deinitSelf();
+    try tokenizer.configureBpeCache(manager.tokenizer_cache_config);
+    for (0..4) |_| {
+        const ids = try tokenizer.tokenizer().encode(allocator, "abc");
+        allocator.free(ids);
+    }
+    const actual_cache_bytes = tokenizer.bpeCacheStats().used_bytes;
+    try std.testing.expectEqual(
+        ModelManager.tokenizerCacheCreditTarget(actual_cache_bytes),
+        manager.admissionController().snapshot().host_weight_bytes,
+    );
+
+    tokenizer.deinitSelf();
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        manager.admissionController().snapshot(),
+    );
+    for (&manager.resource_domain.?.tokenizer_cache_budget_shards) |*shard|
+        try std.testing.expectEqual(@as(usize, 0), shard.records.count());
+}
+
+test "managed tokenizer safely outlives ModelManager shutdown" {
+    const allocator = std.testing.allocator;
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "ab": 3},
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "tokenizer.json",
+        .data = tokenizer_json,
+    });
+    const tokenizer_path = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "tokenizer.json" },
+    );
+    defer allocator.free(tokenizer_path);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    manager.configureServingPolicy(.{});
+    try manager.ensureResourceOwnerReady();
+    var managed = try manager.loadManagedHfTokenizerFile(tokenizer_path);
+    try std.testing.expect(managed.managed_lifetime != null);
+    try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+
+    const domain = manager.resource_domain.?;
+    try std.testing.expect(domain.retain());
+    defer domain.release();
+
+    // Manager shutdown closes new growth but keeps physical tokenizer memory
+    // charged in the independently owned resource domain.
+    manager.deinit();
+    try std.testing.expect(domain.admission.snapshot().host_weight_bytes > 0);
+    managed.deinit();
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        domain.admission.snapshot(),
+    );
+}
+
+test "raw tokenizer budget capability pins resource domain through teardown" {
+    const allocator = std.testing.allocator;
+    const tokenizer_json =
+        \\{
+        \\  "model": {"type": "BPE", "vocab": {"a": 1}, "merges": []},
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    manager.configureServingPolicy(.{});
+    try manager.ensureResourceOwnerReady();
+
+    var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    try tokenizer.configureBpeCache(manager.tokenizer_cache_config);
+    const domain = manager.resource_domain.?;
+    try std.testing.expect(domain.retain());
+    defer domain.release();
+    try std.testing.expect(domain.admission.snapshot().host_weight_bytes > 0);
+
+    manager.deinit();
+    try std.testing.expect(domain.admission.snapshot().host_weight_bytes > 0);
+    tokenizer.deinitSelf();
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        domain.admission.snapshot(),
+    );
+}
+
+test "external ownership pairing preserves cache policy and drains observers" {
+    const AdmissionBridge = struct {
+        fn retainContext(_: *anyopaque) bool {
+            return true;
+        }
+        fn releaseContext(_: *anyopaque) void {}
+        fn reserve(_: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    const CacheBridge = struct {
+        current: usize = 0,
+        transitions: usize = 0,
+        alive: bool = true,
+        callbacks_after_shutdown: usize = 0,
+
+        fn observe(
+            context: *anyopaque,
+            _: usize,
+            previous: usize,
+            next: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.alive) {
+                self.callbacks_after_shutdown += 1;
+                return false;
+            }
+            if (self.current != previous) return false;
+            self.current = next;
+            self.transitions += 1;
+            return true;
+        }
+    };
+
+    var admission_context: u8 = 0;
+    var cache_context = CacheBridge{};
+    var manager = ModelManager.init(
+        std.testing.allocator,
+        backends.SessionManager.init(std.testing.allocator),
+    );
+    var manager_closed = false;
+    defer if (!manager_closed) manager.deinit();
+    try manager.configureResourceOwnership(.external_required);
+    try manager.configureTokenizerCaches(.{
+        .max_bytes = 7 * 1024 * 1024,
+        .bulk_slots_per_shard = 1024,
+    });
+    try manager.configureExternalResourceBudgets(
+        .{
+            .context = &admission_context,
+            .retain_context = AdmissionBridge.retainContext,
+            .release_context = AdmissionBridge.releaseContext,
+            .try_reserve = AdmissionBridge.reserve,
+            .retain = AdmissionBridge.retain,
+            .release = AdmissionBridge.release,
+        },
+        .{
+            .context = &cache_context,
+            .retain_context = AdmissionBridge.retainContext,
+            .release_context = AdmissionBridge.releaseContext,
+            .observe = CacheBridge.observe,
+        },
+    );
+    try manager.ensureResourceOwnerReady();
+    try std.testing.expectEqual(
+        @as(usize, 7 * 1024 * 1024),
+        manager.tokenizer_cache_config.max_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1024),
+        manager.tokenizer_cache_config.bulk_slots_per_shard,
+    );
+
+    const tokenizer_json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "ab": 3},
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(
+        std.testing.allocator,
+        tokenizer_json,
+    );
+    var tokenizer_owned = true;
+    errdefer if (tokenizer_owned) tokenizer.deinitSelf();
+    try tokenizer.configureBpeCache(manager.tokenizer_cache_config);
+    const managed_lifetime = try manager.resource_domain.?
+        .registerManagedTokenizer(null);
+    var managed = ManagedHfTokenizer{
+        .tokenizer = tokenizer,
+        .managed_lifetime = managed_lifetime,
+    };
+    tokenizer_owned = false;
+    defer managed.deinit();
+    try std.testing.expect(cache_context.current > 0);
+
+    manager.deinit();
+    manager_closed = true;
+    try std.testing.expect(cache_context.current > 0);
+
+    // The external owner stays retained until physical tokenizer destruction,
+    // which performs the exact final observer transition.
+    managed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cache_context.current);
+    try std.testing.expect(cache_context.transitions >= 2);
+    cache_context.alive = false;
+    try std.testing.expectEqual(@as(usize, 0), cache_context.callbacks_after_shutdown);
+}
+
 test "model loading preserves retryable admission errors across backend probes" {
     var selected: ?anyerror = null;
     rememberPreferredLoadError(&selected, error.NoBackendAvailable);
@@ -6640,9 +7818,18 @@ test "serving admission applies the node-wide host-memory override" {
 
     manager.configureServingPolicy(.{});
     manager.configureAdmissionLimits(.{ .host_limit_bytes = 100 });
+    try manager.ensureResourceOwnerReady();
     try std.testing.expectEqual(
         @as(usize, 100),
-        manager.admission.shared_limits.host_limit_bytes,
+        manager.admissionController().shared_limits.host_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        manager.resource_domain.?.admission_limits.host_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        manager.resource_domain.?.admission_limits.combined_limit_bytes,
     );
 }
 
@@ -7783,6 +8970,42 @@ test "gpu model admission classifies weights and persistent scratch" {
     try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
     try std.testing.expectEqual(weights + extra_backend_resident.backend_weight_bytes, metal.resident.backend_weight_bytes);
     try std.testing.expectEqual(extra_backend_resident.backend_scratch_bytes, metal.resident.backend_scratch_bytes);
+}
+
+test "projector residency follows its request-scoped lifecycle" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const decoder_bytes: usize = 8192;
+    const projector_bytes: usize = 4096;
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.gguf",
+        .data = &([_]u8{0x31} ** decoder_bytes),
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "mmproj.gguf",
+        .data = &([_]u8{0x32} ** projector_bytes),
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer man.deinit();
+
+    try std.testing.expectEqual(
+        decoder_bytes,
+        try estimateModelArtifactBytes(man, .native),
+    );
+    const request = try projectorRunAdmissionAmounts(man);
+    try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
+    try std.testing.expectEqual(projector_bytes, request.hostTotalBytes());
 }
 
 test "onnx admission separates encoded staging from completed residency" {

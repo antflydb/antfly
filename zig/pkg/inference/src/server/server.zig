@@ -597,13 +597,13 @@ pub const BudgetOverrides = struct {
     scratch_limit_bytes: usize = 0,
 
     pub fn apply(self: @This(), defaults: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
-        var limits = defaults;
-        if (self.host_limit_bytes > 0) limits.host_limit_bytes = self.host_limit_bytes;
-        if (self.backend_limit_bytes > 0) limits.backend_limit_bytes = self.backend_limit_bytes;
-        if (self.combined_limit_bytes > 0) limits.combined_limit_bytes = self.combined_limit_bytes;
-        if (self.kv_limit_bytes > 0) limits.kv_limit_bytes = self.kv_limit_bytes;
-        if (self.scratch_limit_bytes > 0) limits.scratch_limit_bytes = self.scratch_limit_bytes;
-        return limits;
+        return runtime.tier.memory.applyLimitOverrides(defaults, .{
+            .host_limit_bytes = self.host_limit_bytes,
+            .backend_limit_bytes = self.backend_limit_bytes,
+            .combined_limit_bytes = self.combined_limit_bytes,
+            .kv_limit_bytes = self.kv_limit_bytes,
+            .scratch_limit_bytes = self.scratch_limit_bytes,
+        });
     }
 };
 
@@ -876,6 +876,15 @@ pub const NodeConfig = struct {
     /// available to receive streaming request bodies.
     http_max_request_tasks: u32 = 64,
     pool_size: usize = 2,
+    /// Optional hard envelope for all memory charged to this process/container.
+    /// This is required when the runtime has no finite cgroup memory.max and
+    /// should normally match the orchestrator's process memory allocation.
+    process_memory_limit_bytes: usize = 0,
+    /// Where the finite byte value came from. Automatic is the fail-safe
+    /// default: callers must opt into the less conservative explicit-envelope
+    /// live reserve, while composing runtimes preserve their exact probe source.
+    process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
+    resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
     kernel_jit: graph_mod.kernel_jit.Config = .{},
@@ -2503,6 +2512,36 @@ const ModelCounts = struct {
     }
 };
 
+const ReadinessInventorySnapshot = struct {
+    counts: ModelCounts = .{},
+    initialized: bool = false,
+};
+
+/// A tiny, lock-protected publication point for the relatively expensive model
+/// inventory. Operational probes must never walk a shared model cache or parse
+/// manifests: they copy this snapshot and return immediately.
+const ReadinessInventory = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    snapshot: ReadinessInventorySnapshot = .{},
+
+    fn publish(self: *@This(), counts: ModelCounts) void {
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        self.snapshot = .{ .counts = counts, .initialized = true };
+    }
+
+    fn load(self: *@This()) ReadinessInventorySnapshot {
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        return self.snapshot;
+    }
+};
+
+// External pull/install commands publish into the shared models directory
+// without going through this process. Refresh often enough for operational
+// state to converge, but avoid continuously reparsing a large remote cache.
+const readiness_inventory_refresh_interval_ms: u64 = 60_000;
+
 fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
     if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
@@ -2578,7 +2617,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
     return counts;
 }
 
-fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
+fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
         "embedders",  "rerankers",   "chunkers",
         "generators", "classifiers", "extractors",
@@ -2588,7 +2627,9 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
     defer registry.deinit();
-    const discovered = registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    // The manifest is loaded below, so shallow discovery avoids parsing every
+    // manifest twice during each refresh.
+    const discovered = try registry.discoverShallow(io);
     defer {
         for (discovered) |entry| {
             allocator.free(entry.name);
@@ -2598,20 +2639,25 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     }
 
     for (discovered) |entry| {
-        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
+        // Read only listing metadata. Full manifest loading parses large GGUF
+        // tokenizer tables and was the dominant cost of readiness discovery.
+        var man = manifest_mod.loadListingFromDir(allocator, entry.path) catch continue;
+        defer man.deinit();
+        if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) continue;
 
-        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
-        defer if (maybe_manifest) |*man| man.deinit();
-
-        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-        const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
+        const zero_shot_classification = manifestSupportsZeroShotClassification(&man);
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
+            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedManifest(allocator, entry.path, man)) continue;
+            if (taskMatchesModelListing(
+                task,
+                @tagName(man.model_type),
+                man.gliner_model_type,
+                man.tasks,
+                man.capabilities,
+                zero_shot_classification,
+            )) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -2826,6 +2872,10 @@ pub const Node = struct {
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
+    readiness_inventory: ReadinessInventory = .{},
+    readiness_refresh_group: std.Io.Group = .init,
+    readiness_refresh_io: ?std.Io = null,
+    readiness_refresh_started: bool = false,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
     /// Set after configured preloads, including declared optional sessions,
@@ -2957,6 +3007,11 @@ pub const Node = struct {
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
         };
+        try node.model_manager.configureResourceOwnership(config.resource_ownership);
+        node.model_manager.configureProcessMemoryLimit(
+            config.process_memory_limit_bytes,
+            config.process_memory_limit_provenance,
+        );
         node.model_manager.configureServingPolicy(.{
             .allow_unknown = config.allow_unknown_models,
         });
@@ -2971,11 +3026,31 @@ pub const Node = struct {
             .kv_limit_bytes = config.generation_budget_overrides.kv_limit_bytes,
             .scratch_limit_bytes = config.generation_budget_overrides.scratch_limit_bytes,
         });
-        node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
+        if (!builtin.is_test) {
+            std.log.info(
+                "inference resource policy ownership={s} process_memory_limit_bytes={d} process_memory_limit_provenance={s}",
+                .{
+                    @tagName(config.resource_ownership),
+                    config.process_memory_limit_bytes,
+                    @tagName(config.process_memory_limit_provenance),
+                },
+            );
+        }
+        try node.model_manager.configureTokenizerCaches(config.tokenizer_cache);
         node.model_manager.tokenizer_parallel_bpe_config =
             config.tokenizer_parallel_bpe;
         node.updateAdmissionMetrics();
         return node;
+    }
+
+    fn defaultGenerationLimits(
+        self: *const Node,
+        backend: runtime.tier.memory.BackendClass,
+    ) runtime.tier.memory.Limits {
+        return runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            backend,
+            self.config.process_memory_limit_bytes,
+        );
     }
 
     /// Attach process-wide tokenizer-cache admission before loading models.
@@ -2984,14 +3059,22 @@ pub const Node = struct {
         config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
     ) !void {
         try self.model_manager.configureTokenizerCaches(config);
-        self.config.tokenizer_cache = config;
+        self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
+        // NodeConfig is public policy, not an owning runtime capability.
+        self.config.tokenizer_cache.resource_budget = null;
     }
 
-    pub fn configureAdmissionResourceBudget(
+    pub fn configureExternalResourceBudgets(
         self: *Node,
-        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
-    ) void {
-        self.model_manager.configureAdmissionResourceBudget(resource_budget);
+        admission_budget: runtime.tier.memory.AdmissionResourceBudget,
+        tokenizer_budget: hf_tokenizer_mod.HfTokenizer.BpeCacheResourceBudget,
+    ) !void {
+        try self.model_manager.configureExternalResourceBudgets(
+            admission_budget,
+            tokenizer_budget,
+        );
+        self.config.tokenizer_cache = self.model_manager.tokenizer_cache_config;
+        self.config.tokenizer_cache.resource_budget = null;
     }
 
     pub fn configureForcedRunAdmissionDenialsForTesting(
@@ -3027,6 +3110,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // The refresher borrows Node, its allocator, and the models directory.
+        // Cancel and join it before releasing any of those dependencies.
+        if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
         self.model_manager.deinit();
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
@@ -3171,6 +3257,52 @@ pub const Node = struct {
     pub fn attachIo(self: *Node, io: std.Io) void {
         self.session_manager.io = io;
         self.model_manager.attachIo(io);
+    }
+
+    fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
+        const counts = try collectDiscoveredModelCounts(
+            self.config.models_dir,
+            self.allocator,
+            io,
+        );
+        self.readiness_inventory.publish(counts);
+    }
+
+    fn readinessRefreshLoop(self: *Node, io: std.Io) std.Io.Cancelable!void {
+        while (true) {
+            try io.sleep(
+                std.Io.Duration.fromMilliseconds(readiness_inventory_refresh_interval_ms),
+                .awake,
+            );
+            self.refreshReadinessInventory(io) catch |err| {
+                // Preserve the last-known-good snapshot through transient cache
+                // or publication failures. A never-successful initialization
+                // remains not-ready.
+                std.log.warn(
+                    "readiness model inventory refresh failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+    }
+
+    /// Build the initial readiness view before listener publication and start
+    /// one runtime-owned refresher for model changes made by external pull
+    /// commands. Repeated calls are harmless (the runtime cannot be replaced).
+    pub fn startReadinessInventory(self: *Node, io: std.Io) void {
+        if (self.readiness_refresh_started) return;
+        self.refreshReadinessInventory(io) catch |err| {
+            // Liveness should still come up when a model volume is temporarily
+            // unavailable. The empty, uninitialized snapshot fails readiness
+            // closed until a later refresh succeeds.
+            std.log.warn(
+                "initial readiness model inventory failed err={s}",
+                .{@errorName(err)},
+            );
+        };
+        self.readiness_refresh_started = true;
+        self.readiness_refresh_io = io;
+        self.readiness_refresh_group.async(io, readinessRefreshLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
@@ -3579,7 +3711,7 @@ pub const Node = struct {
         };
         const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
             model.session,
-            runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
+            self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
@@ -3625,10 +3757,16 @@ pub const Node = struct {
             admitted_prefill_chunk,
             kv_capacity_policy,
         );
-        var admission_lease = try self.model_manager.acquireRunResources(
+        var admission_amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
+        if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
+            admission_amounts = try admission_amounts.merge(
+                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+            );
+        }
+        var admission_lease = try self.model_manager.acquireRunResourceAmounts(
             budget_backend_class,
             budget_limits,
-            resource_estimate,
+            admission_amounts,
         );
         defer admission_lease.release();
 
@@ -3689,6 +3827,8 @@ pub const Node = struct {
                 null;
         var result = pipeline.generate(messages, generation_config) catch |err| {
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
+            if (err == error.MemoryBudgetExceeded)
+                logMemoryBudgetExceeded(model.session, &run_budget);
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
                 @tagName(model.session.backend()),
@@ -3754,6 +3894,7 @@ pub const Node = struct {
     /// any listener or request handler that can reach this Node.
     pub fn warmConfiguredModelsBeforeServing(self: *Node, allocator: std.mem.Allocator) !void {
         if (self.request_surfaces_published) return error.KernelJitStartupWindowClosed;
+        try self.model_manager.ensureResourceOwnerReady();
         // A retry must earn readiness again. Otherwise a failed second warm
         // could leave a stale successful latch and permit route publication.
         self.startup_preloads_materialized = false;
@@ -5064,18 +5205,6 @@ pub const Node = struct {
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
         return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
-    }
-
-    fn memoryBudgetExceededMessage(
-        allocator: std.mem.Allocator,
-        session: backends_mod.Session,
-        run_budget: *const runtime.tier.memory.RunBudget,
-    ) []const u8 {
-        var buf: [512]u8 = undefined;
-        const msg = session_factory.memoryBudgetExceededDetail(session, run_budget, &buf) catch {
-            return "request exceeds native generation memory budget";
-        };
-        return allocator.dupe(u8, msg) catch "request exceeds native generation memory budget";
     }
 
     pub fn generateEmbeddings(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -6432,7 +6561,7 @@ pub const Node = struct {
                 .gpu
             else
                 .cpu;
-        var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+        var budget_limits = self.defaultGenerationLimits(budget_backend_class);
         budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
         if (draft_model_for_generation) |draft_model| {
             const draft_budget_class: runtime.tier.memory.BackendClass =
@@ -6440,7 +6569,7 @@ pub const Node = struct {
             const draft_budget_limits = self.config.generation_budget_overrides.apply(
                 session_factory.widenBudgetLimitsForSession(
                     draft_model.session,
-                    runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
+                    self.defaultGenerationLimits(draft_budget_class),
                 ),
             );
             budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
@@ -6512,10 +6641,7 @@ pub const Node = struct {
             admission_prefill_ceiling,
         ) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
@@ -6582,7 +6708,7 @@ pub const Node = struct {
         const target_admission_limits = self.config.generation_budget_overrides.apply(
             session_factory.widenBudgetLimitsForSession(
                 model.session,
-                runtime.tier.memory.defaultLimitsForBackend(target_backend_class),
+                self.defaultGenerationLimits(target_backend_class),
             ),
         );
         var admission_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
@@ -6591,6 +6717,11 @@ pub const Node = struct {
             .limits = target_admission_limits,
             .amounts = .fromEstimate(resource_estimate),
         };
+        if (generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items)) {
+            admission_requests[0].amounts = try admission_requests[0].amounts.merge(
+                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+            );
+        }
         const admission_request_count: usize = if (draft_resource_estimate) |estimate| blk: {
             const draft_backend_class: runtime.tier.memory.BackendClass =
                 if (draft_backend_kind.? == .native) .cpu else .gpu;
@@ -6599,7 +6730,7 @@ pub const Node = struct {
                 .limits = self.config.generation_budget_overrides.apply(
                     session_factory.widenBudgetLimitsForSession(
                         draft_model_for_generation.?.session,
-                        runtime.tier.memory.defaultLimitsForBackend(draft_backend_class),
+                        self.defaultGenerationLimits(draft_backend_class),
                     ),
                 ),
                 .amounts = .fromEstimate(estimate),
@@ -6614,6 +6745,11 @@ pub const Node = struct {
                 .message = "request exceeds the configured inference resource budget",
             }),
             error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
+            // Ownership configuration errors should have failed startup before
+            // request surfaces were published. Keep the HTTP boundary total so
+            // a violated invariant is reported as an internal failure instead
+            // of widening this inferred error set into a compile failure.
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer admission_lease.release();
 
@@ -6642,10 +6778,7 @@ pub const Node = struct {
         if (draft_model_for_generation) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
                 if (err == error.MemoryBudgetExceeded) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "MODEL_RESOURCE_LIMIT",
-                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                    });
+                    return generationMemoryBudgetResponse(ctx, draft_model.session, &run_budget);
                 }
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
             };
@@ -6658,10 +6791,7 @@ pub const Node = struct {
 
         var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
@@ -6833,8 +6963,11 @@ pub const Node = struct {
 
         const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
         defer logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
-        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
+            if (err == error.MemoryBudgetExceeded)
+                return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             return generationErrorResponse(ctx, err);
+        };
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -7720,7 +7853,7 @@ pub const Node = struct {
                 };
                 const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
                     model.session,
-                    runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
+                    self.defaultGenerationLimits(budget_backend_class),
                 ));
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
@@ -10844,6 +10977,7 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+        try self.model_manager.ensureResourceOwnerReady();
         validateStandaloneBind(host, self.config.allow_insecure_public_bind) catch |err| {
             std.log.err(
                 "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",
@@ -10852,6 +10986,7 @@ pub const Node = struct {
             return err;
         };
         self.attachIo(io);
+        self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
 
@@ -10914,12 +11049,13 @@ pub const Node = struct {
     }
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
-        const counts = collectDiscoveredModelCounts(self.config.models_dir, ctx.allocator, ctx.io);
-        const status_text = if (counts.total() > 0) "ready" else "not_ready";
-        const status_code: u16 = if (counts.total() > 0) 200 else 503;
+        const snapshot = self.readiness_inventory.load();
+        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const status_text = if (is_ready) "ready" else "not_ready";
+        const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
             .status = status_text,
-            .models = counts,
+            .models = snapshot.counts,
         });
     }
 };
@@ -14381,6 +14517,126 @@ test "root operational routes stay outside inference API prefix" {
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
 
+test "readyz serves only the published inventory snapshot" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{
+        // A request-path filesystem probe would fail against this path. The
+        // published snapshot must nevertheless be returned successfully.
+        .models_dir = "/nonexistent/antfly-readyz-must-not-scan",
+    });
+    defer node.deinit();
+
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
+    }
+
+    node.readiness_inventory.publish(.{ .generators = 2, .embedders = 1 });
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+}
+
+test "failed readiness refresh preserves the last known good inventory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models-is-a-file",
+        .data = "not a directory",
+    });
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "models-is-a-file",
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    node.readiness_inventory.publish(.{ .classifiers = 1 });
+
+    try std.testing.expectError(
+        error.NotDir,
+        node.refreshReadinessInventory(std.testing.io),
+    );
+    const snapshot = node.readiness_inventory.load();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.counts.classifiers);
+}
+
+test "readiness refresh observes an externally published model" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    try node.refreshReadinessInventory(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), node.readiness_inventory.load().counts.total());
+
+    // Model pulls happen in another process and atomically publish directories
+    // into this cache. A tiny GGUF marker is enough for listing discovery; no
+    // model is loaded or parsed by this test.
+    try tmp.dir.createDirPath(std.testing.io, "generators/acme/demo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/acme/demo/model.gguf",
+        .data = "listing-only fixture",
+    });
+    try node.refreshReadinessInventory(std.testing.io);
+
+    const refreshed = node.readiness_inventory.load();
+    try std.testing.expect(refreshed.initialized);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.counts.generators);
+}
+
+test "readiness inventory initializes once and owns its refresh task" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+    node.startReadinessInventory(std.testing.io);
+    node.startReadinessInventory(std.testing.io);
+
+    const snapshot = node.readiness_inventory.load();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.counts.total());
+    try std.testing.expect(node.readiness_refresh_started);
+    try std.testing.expect(node.readiness_refresh_io != null);
+}
+
 test "internal error response hides implementation error names" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
@@ -14414,6 +14670,45 @@ test "post-preprocessing prompt overflow remains a client generation error" {
     const batch_error = batchGenerationError(error.PromptTooLong);
     try std.testing.expectEqualStrings("INVALID_REQUEST", batch_error.code);
     try std.testing.expect(!batch_error.retryable);
+}
+
+test "generation memory exhaustion is an actionable non-retryable capacity error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.MemoryBudgetExceeded);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 507), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--host-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
+
+    const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
+    try std.testing.expectEqualStrings("MEMORY_BUDGET_EXCEEDED", batch_error.code);
+    try std.testing.expect(!batch_error.retryable);
+}
+
+test "generation live pressure is an actionable retryable capacity error" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try generationErrorResponse(&ctx, error.ResourceTemporarilyUnavailable);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MODEL_RESOURCE_BUSY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
+
+    const batch_error = batchGenerationError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", batch_error.code);
+    try std.testing.expect(batch_error.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -17731,6 +18026,33 @@ const GenerationRequestFailure = struct {
     retryable: bool,
 };
 
+const memory_budget_exceeded_message =
+    "model execution exceeds the configured inference memory budget; increase the relevant budget (for CPU models, --host-budget-mb) or choose a smaller/quantized model";
+
+fn logMemoryBudgetExceeded(
+    session: backends_mod.Session,
+    run_budget: *const runtime.tier.memory.RunBudget,
+) void {
+    if (builtin.is_test) return;
+    var buf: [512]u8 = undefined;
+    const detail = session_factory.memoryBudgetExceededDetail(session, run_budget, &buf) catch
+        "request exceeds native generation memory budget";
+    std.log.warn("generation memory admission denied: {s}", .{detail});
+}
+
+fn generationMemoryBudgetResponse(
+    ctx: *httpx.Context,
+    session: backends_mod.Session,
+    run_budget: *const runtime.tier.memory.RunBudget,
+) !httpx.Response {
+    logMemoryBudgetExceeded(session, run_budget);
+    return ctx.status(507).json(.{
+        .@"error" = "MEMORY_BUDGET_EXCEEDED",
+        .message = memory_budget_exceeded_message,
+        .retryable = false,
+    });
+}
+
 fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
     return switch (err) {
         error.PromptTooLong => .{
@@ -17738,6 +18060,18 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .code = "INVALID_REQUEST",
             .message = "prompt exceeds the model context window after reserving output tokens",
             .retryable = false,
+        },
+        error.MemoryBudgetExceeded => .{
+            .status = 507,
+            .code = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
+            .retryable = false,
+        },
+        error.ResourceTemporarilyUnavailable => .{
+            .status = 503,
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .retryable = true,
         },
         else => null,
     };
@@ -17756,6 +18090,8 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceTemporarilyUnavailable)
+        return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
         return ctx.status(failure.status).json(.{
             .@"error" = failure.code,
@@ -17798,6 +18134,8 @@ fn writeInternalStreamError(
 
 fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
     if (generationRequestFailure(err)) |failure| {
+        if (err == error.MemoryBudgetExceeded and !builtin.is_test)
+            std.log.warn("generation memory admission denied during streaming", .{});
         writer.writeEvent("error", failure.message) catch {};
         return;
     }

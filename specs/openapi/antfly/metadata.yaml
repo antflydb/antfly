@@ -185,6 +185,49 @@ tags:
       - Primary types (`text`, `html`) can be combined with variants (`keyword`, `search_as_you_type`)
       - `search_as_you_type` + `keyword` allowed without primary type (auto-adds `text`)
 
+      `x-antfly-types` remains supported as the compact multi-mapping/search
+      shorthand. Exact scalar names in that array describe how a field is
+      searched, but do not opt the field into the typed doc-value storage
+      required by production `order_by`.
+
+      ### `x-antfly-field`
+      Use an explicit field mapping for fields that participate in exact sort.
+      Set `sortable: true` on a keyword, numeric/number/integer,
+      boolean/bool, datetime/date/timestamp, or link mapping. Antfly derives
+      the internal typed doc values; `doc_values` is intentionally not a public
+      setting. The mapping type must accept the property's JSON Schema value
+      type. Explicit property mappings take precedence over dynamic templates.
+      When multiple document types declare the same dotted field path, their
+      normalized physical mappings must be identical.
+
+      ```json
+      {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-antfly-field": {"type": "date", "sortable": true}
+        },
+        "title": {
+          "type": "string",
+          "x-antfly-field": {
+            "type": "text",
+            "fields": {
+              "keyword": {"type": "keyword", "sortable": true}
+            }
+          }
+        }
+      }
+      ```
+
+      Sort the examples above with `created_at` and `title.keyword`,
+      respectively. An analyzed `text` field is never directly sortable.
+      Adding `sortable: true` to an existing table is a physical mapping
+      change. Once the write or rebuild visibility barrier completes, clients
+      may issue `order_by` directly. Antfly validates cold physical coverage on
+      first use and fails closed when it is incomplete; status reads do not
+      warm columns, so `sort_lifecycle_state` may remain `declared` until that
+      validation succeeds.
+
       ### `x-antfly-index`
       Boolean to disable indexing for a field:
       ```json
@@ -1433,6 +1476,129 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    MetadataCapabilityUnavailableError:
+      type: object
+      additionalProperties: false
+      description: The metadata service does not yet provide the consistency capability required by backup.
+      required: [code, error, message, required_capability, retryable, retry_after_ms]
+      properties:
+        code:
+          type: string
+          enum: [metadata_capability_unavailable]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum: [metadata capability unavailable]
+        message:
+          type: string
+        required_capability:
+          type: string
+          enum: [linearizable_snapshot]
+        retryable:
+          type: boolean
+          enum: [true]
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+    MetadataLeaderUnavailableError:
+      type: object
+      additionalProperties: false
+      description: The request could not establish authority with the current metadata leader.
+      required: [code, error, message, retryable, retry_after_ms]
+      properties:
+        code:
+          type: string
+          enum: [metadata_leader_unavailable]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+          enum: [metadata leader unavailable]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
+        retry_after_ms:
+          type: integer
+          format: int32
+          minimum: 1
+    BackupMetadataUnavailableError:
+      description: A retryable metadata-availability failure reported before backup side effects begin.
+      discriminator:
+        propertyName: code
+        mapping:
+          metadata_capability_unavailable: "#/components/schemas/MetadataCapabilityUnavailableError"
+          metadata_leader_unavailable: "#/components/schemas/MetadataLeaderUnavailableError"
+      oneOf:
+        - $ref: "#/components/schemas/MetadataCapabilityUnavailableError"
+        - $ref: "#/components/schemas/MetadataLeaderUnavailableError"
+    TableBackupConflictError:
+      description: A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
+      discriminator:
+        propertyName: code
+        mapping:
+          backup_already_exists: "#/components/schemas/BackupAlreadyExistsConflict"
+          table_catalog_changed: "#/components/schemas/TableCatalogChangedConflict"
+          backup_outcome_ambiguous: "#/components/schemas/BackupOutcomeAmbiguousConflict"
+      oneOf:
+        - $ref: "#/components/schemas/BackupAlreadyExistsConflict"
+        - $ref: "#/components/schemas/TableCatalogChangedConflict"
+        - $ref: "#/components/schemas/BackupOutcomeAmbiguousConflict"
+    BackupAlreadyExistsConflict:
+      type: object
+      additionalProperties: false
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [backup_already_exists]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+    TableCatalogChangedConflict:
+      type: object
+      additionalProperties: false
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [table_catalog_changed]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+    BackupOutcomeAmbiguousConflict:
+      type: object
+      additionalProperties: false
+      required: [code, error, message, retryable, backup_id]
+      properties:
+        code:
+          type: string
+          enum: [backup_outcome_ambiguous]
+        error:
+          type: string
+          description: Legacy human-readable error text. Use `code` for branching.
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        backup_id:
+          type: string
+          description: Logical backup ID whose outcome must be inspected before retrying.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
     InferenceCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -1456,6 +1622,26 @@ components:
           type: integer
           minimum: 1
           description: Minimum retry delay in milliseconds.
+    StorageResourceExhaustedError:
+      type: object
+      additionalProperties: false
+      description: Actionable retry contract for temporary storage descriptor exhaustion.
+      required: [code, error, message, retryable, retry_after_ms]
+      properties:
+        code:
+          type: string
+          enum: [storage_resource_exhausted]
+        error:
+          type: string
+          enum: [storage_resource_exhausted]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
+        retry_after_ms:
+          type: integer
+          minimum: 1
     TableStorageUnreadableError:
       type: object
       additionalProperties: false
@@ -3257,14 +3443,16 @@ components:
         indexes:
           type: object
           description: |
-            Map of index name to index configuration. Indexes enable different query capabilities:
+            Map of index name to create-index configuration. The map key owns the
+            index name; do not repeat `name` inside the configuration. Indexes enable
+            different query capabilities:
             - Full-text indexes for BM25 search
             - Vector indexes for semantic similarity
             - Multimodal indexes for images/audio/video
 
             You can add multiple indexes to support different query patterns.
           additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/CreateIndexRequest"
           example:
             search_index:
               type: full_text
@@ -3354,8 +3542,8 @@ components:
           type: boolean
           description: |
             Whether this concrete field is declared sortable in the effective
-            capability model. Public exact order_by accepts it only when
-            sort_lifecycle_state is queryable or accelerated.
+            capability model. A cold declared field is validated on first
+            exact order_by use; clients do not need to poll lifecycle status.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -3365,7 +3553,7 @@ components:
         sort_lifecycle_state:
           type: string
           enum: [unsupported, declared, indexed, covered, queryable, accelerated]
-          description: Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+          description: Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.
@@ -3466,6 +3654,18 @@ components:
         - Bucketing: terms, range, date_range, histogram, date_histogram
         - Geo: geohash_grid, geo_distance
         - Analytics: significant_terms
+    CardinalityMode:
+      type: string
+      enum:
+        - auto
+        - exact
+        - approximate
+      description: |
+        Exact-vs-approximate selection for a cardinality aggregation:
+        - auto: use a materialized HyperLogLog sketch when one applies and is
+          current, else an exact distinct scan (default).
+        - exact: always compute an exact distinct count.
+        - approximate: require a matching sketch; error if none applies.
     AggregationRange:
       type: object
       required:
@@ -3596,6 +3796,15 @@ components:
         field:
           type: string
           description: Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
+        mode:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: "#/components/schemas/CardinalityMode"
+          description: >-
+            Selection mode for a cardinality aggregation. `auto` (default) uses a
+            materialized HyperLogLog sketch when one applies and is current, else
+            falls back to an exact distinct scan. `exact` always scans. `approximate`
+            requires a sketch and errors if none applies. Ignored for other types.
         fields:
           type: array
           items:
@@ -3728,6 +3937,21 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+        approximate:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For cardinality aggregations, whether the value is an approximate
+            estimate from a HyperLogLog sketch (true) or an exact distinct count
+            (false). Absent for non-cardinality aggregations.
+        relative_error:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For an approximate cardinality value, the relative standard error of
+            the estimate. Present only when approximate is true.
         count:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -4367,8 +4591,12 @@ components:
       properties:
         status:
           type: string
-          enum: [committed, committed_pending]
-          description: Durable commit and visibility/participant recovery state.
+          enum: [committed, committed_pending, committed_repair_required]
+          description: |
+            Durable commit outcome. `committed_pending` means requested visibility or
+            participant propagation is still completing. `committed_repair_required`
+            means the primary write committed, but a terminal enrichment failure needs
+            operator repair and will not be retried indefinitely.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -4441,11 +4669,16 @@ components:
       properties:
         status:
           type: string
-          description: Durable commit and visibility/propagation state.
+          description: |
+            Durable commit outcome. Pending states mean requested visibility or
+            participant propagation is still completing. `committed_repair_required`
+            means the primary writes committed, but a terminal enrichment failure needs
+            operator repair and will not be retried indefinitely.
           enum:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
         tables:
           type: object
           description: Per-table batch results
@@ -4587,11 +4820,14 @@ components:
             - committed
             - committed_visibility_pending
             - committed_recovery_pending
+            - committed_repair_required
             - aborted
           description: |
             Durable transaction outcome. Pending committed states mean the
             commit decision is durable while its requested visibility barrier
-            or participant recovery is still completing.
+            or participant recovery is still completing. `committed_repair_required`
+            means the commit decision is durable and coordination may be released, but
+            a terminal enrichment failure requires operator repair.
         conflict:
           description: Details about the conflict that caused an abort (only present when status is "aborted")
           $ref: "#/components/schemas/TransactionConflict"
@@ -4994,14 +5230,21 @@ components:
           description: Status of each table backup
         status:
           type: string
-          enum: [completed, partial, failed]
+          enum: [completed, successful, partial, failed, ambiguous]
           description: Overall backup status
           example: "completed"
     TableBackupStatus:
       type: object
-      required:
-        - name
-        - status
+      additionalProperties: false
+      required: [name, status]
+      description: |
+        Outcome for one table in a cluster backup. `successful` is the legacy
+        spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+
+        An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+        `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+        generation without retrying blindly. Failed and skipped outcomes may include
+        `error`; other fields are omitted when they do not apply.
       properties:
         name:
           type: string
@@ -5009,12 +5252,24 @@ components:
           example: "users"
         status:
           type: string
-          enum: [completed, failed, skipped]
-          description: Backup status for this table
+          enum: [completed, successful, failed, skipped, ambiguous]
           example: "completed"
         error:
           type: string
-          description: Error message if backup failed
+          description: Human-readable failure, skip reason, or reconciliation guidance.
+        code:
+          type: string
+          enum: [backup_outcome_ambiguous]
+          description: Stable machine-readable code for an ambiguous outcome.
+        retryable:
+          type: boolean
+          description: False for an ambiguous outcome; inspect the retained attempt before retrying.
+        backup_id:
+          type: string
+          description: Logical per-table backup ID retained by an ambiguous cluster attempt.
+        artifact_backup_id:
+          type: string
+          description: Opaque artifact generation retained by an ambiguous cluster attempt.
     ClusterRestoreRequest:
       type: object
       additionalProperties: false
@@ -6766,7 +7021,9 @@ components:
             when each non-`_id` field is a mapped exact scalar field with sortable
             native doc-value coverage. Sortable mapping types are keyword,
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+            `x-antfly-types` shorthand declarations alone are not sortable.
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
             blob, html, object, and array fields are not directly sortable; sort
             on an exact scalar mapping such as `title.keyword` instead. Requests
             that cannot be executed through an exact native sort path return 422
@@ -8326,6 +8583,43 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    BackupMetadataUnavailable:
+      description: Backup could not establish the required metadata authority before starting side effects.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+        X-Antfly-Metadata-Not-Leader:
+          required: false
+          description: Present with value `true` only when retrying against the current metadata leader may succeed.
+          schema:
+            type: string
+            enum: ["true"]
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BackupMetadataUnavailableError"
+    TableBackupConflict:
+      description: Backup ID collision, catalog-incarnation change, or an outcome requiring reconciliation before retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TableBackupConflictError"
+    StorageResourceExhausted:
+      description: Storage descriptors are temporarily exhausted
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/StorageResourceExhaustedError"
     InferenceTransientCapacity:
       description: Inference capacity is temporarily unavailable
       headers:
@@ -9147,6 +9441,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/BackupMetadataUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore:
@@ -9998,7 +10294,9 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TableBackupConflict"
+        "503":
+          $ref: "#/components/responses/BackupMetadataUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/restore:
@@ -10982,13 +11280,26 @@ paths:
         content:
           application/json:
             schema:
-              #$ref: "#/components/schemas/CreateIndexRequest"
-              $ref: "indexes.yaml#/components/schemas/IndexConfig"
+              $ref: "indexes.yaml#/components/schemas/CreateIndexRequest"
       responses:
         "201": # Corrected to 201 as per handler
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:

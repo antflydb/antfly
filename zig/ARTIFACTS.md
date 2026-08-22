@@ -517,7 +517,10 @@ artifact producer policy under graph root `execution`:
   "artifact": {
     "name": "relations_v1",
     "kind": "asset",
-    "field": "body",
+    "source": {
+      "type": "field",
+      "value": "body"
+    },
     "content_type": "application/json",
     "producer_json": {
       "type": "extractor",

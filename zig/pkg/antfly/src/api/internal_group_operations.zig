@@ -32,6 +32,10 @@ pub const Error = operation.ApiError || error{
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
+    EnrichmentWaitCanceled,
+    EnrichmentWaitTimeout,
+    EnrichmentRetryInProgress,
+    EnrichmentWorkerFailed,
     RepairCanceled,
     InvalidRepairCancelToken,
 };
@@ -220,6 +224,10 @@ pub const Operations = struct {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
+            error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
@@ -250,6 +258,10 @@ pub const Operations = struct {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
+            error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
+            error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
@@ -295,10 +307,14 @@ pub const Operations = struct {
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnResolveGroupLocal(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level) catch |err| switch (err) {
+        _ = (writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, request.cancellation) catch |err| switch (err) {
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
+            error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
             else => return error.Internal,
@@ -830,6 +846,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         cancellation_signal: *const std.atomic.Value(bool),
         calls: usize = 0,
         fail_identity: bool = false,
+        visibility_error: ?anyerror = null,
 
         fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -857,6 +874,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
             try std.testing.expect(cancellation.ptr == @as(*const anyopaque, @ptrCast(self.cancellation_signal)));
             try std.testing.expect(!cancellation.isCancelled());
             if (self.fail_identity) return error.DocIdentityNamespaceMismatch;
+            if (self.visibility_error) |err| return err;
             return {};
         }
     };
@@ -899,6 +917,27 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         forwarding,
     ));
     try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    state.fail_identity = false;
+    state.visibility_error = error.EnrichmentRetryInProgress;
+    try std.testing.expectError(error.EnrichmentRetryInProgress, operations.routedBatch(
+        std.testing.allocator,
+        request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    ));
+    state.visibility_error = error.EnrichmentWorkerFailed;
+    try std.testing.expectError(error.EnrichmentWorkerFailed, operations.routedBatch(
+        std.testing.allocator,
+        request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
 }
 
 test "typed internal query workers preserve identity generation validation" {

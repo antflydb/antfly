@@ -37,7 +37,6 @@ from .antfly_embedder_config import AntflyEmbedderConfig
 from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
-from .antfly_type_2 import AntflyType2
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
@@ -47,9 +46,13 @@ from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
+from .backup_already_exists_conflict import BackupAlreadyExistsConflict
+from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
+from .backup_outcome_ambiguous_conflict import BackupOutcomeAmbiguousConflict
+from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConflictCode
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
@@ -66,6 +69,7 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
+from .cardinality_mode import CardinalityMode
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -111,12 +115,36 @@ from .connection import Connection
 from .connection_kind import ConnectionKind
 from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
+from .create_algebraic_index_request import CreateAlgebraicIndexRequest
+from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+from .create_embeddings_index_request import CreateEmbeddingsIndexRequest
+from .create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
+from .create_full_text_index_request import CreateFullTextIndexRequest
+from .create_full_text_index_request_type import CreateFullTextIndexRequestType
+from .create_graph_index_request import CreateGraphIndexRequest
+from .create_graph_index_request_type import CreateGraphIndexRequestType
+from .create_index_common import CreateIndexCommon
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
+from .created_algebraic_index import CreatedAlgebraicIndex
+from .created_algebraic_index_type import CreatedAlgebraicIndexType
+from .created_embeddings_index import CreatedEmbeddingsIndex
+from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
+from .created_embeddings_index_type import CreatedEmbeddingsIndexType
+from .created_enrichment_config import CreatedEnrichmentConfig
+from .created_full_text_index import CreatedFullTextIndex
+from .created_full_text_index_type import CreatedFullTextIndexType
+from .created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
+from .created_graph_artifact_producer_config_kind import CreatedGraphArtifactProducerConfigKind
+from .created_graph_index import CreatedGraphIndex
+from .created_graph_index_config import CreatedGraphIndexConfig
+from .created_graph_index_type import CreatedGraphIndexType
+from .created_index_common import CreatedIndexCommon
+from .created_provider_config import CreatedProviderConfig
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -150,8 +178,13 @@ from .document_artifact_table_reprocess_response_reprocess import DocumentArtifa
 from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
+from .document_field_mapping import DocumentFieldMapping
+from .document_field_mapping_fields import DocumentFieldMappingFields
+from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_subfield_mapping import DocumentSubfieldMapping
+from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
 from .drop_extension_request_mode import DropExtensionRequestMode
 from .drop_extension_response import DropExtensionResponse
@@ -234,6 +267,7 @@ from .field_capability import FieldCapability
 from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
 from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_mapping_type import FieldMappingType
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -266,6 +300,22 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
+from .graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
+from .graph_artifact_context_config import GraphArtifactContextConfig
+from .graph_artifact_edge_mapping_config import GraphArtifactEdgeMappingConfig
+from .graph_artifact_edge_mapping_config_metadata import GraphArtifactEdgeMappingConfigMetadata
+from .graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
+from .graph_artifact_node_mapping_config_model import GraphArtifactNodeMappingConfigModel
+from .graph_artifact_producer_config import GraphArtifactProducerConfig
+from .graph_artifact_producer_config_kind import GraphArtifactProducerConfigKind
+from .graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
+from .graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
+from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
+from .graph_artifact_source_config import GraphArtifactSourceConfig
+from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
+from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
+from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
+from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -283,6 +333,10 @@ from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
 from .graph_query_type import GraphQueryType
+from .graph_resolver_config import GraphResolverConfig
+from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
+from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
+from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -518,6 +572,15 @@ from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
 from .merge_strategy import MergeStrategy
+from .metadata_capability_unavailable_error import MetadataCapabilityUnavailableError
+from .metadata_capability_unavailable_error_code import MetadataCapabilityUnavailableErrorCode
+from .metadata_capability_unavailable_error_error import MetadataCapabilityUnavailableErrorError
+from .metadata_capability_unavailable_error_required_capability import (
+    MetadataCapabilityUnavailableErrorRequiredCapability,
+)
+from .metadata_leader_unavailable_error import MetadataLeaderUnavailableError
+from .metadata_leader_unavailable_error_code import MetadataLeaderUnavailableErrorCode
+from .metadata_leader_unavailable_error_error import MetadataLeaderUnavailableErrorError
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
@@ -662,6 +725,9 @@ from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
 from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
+from .storage_resource_exhausted_error import StorageResourceExhaustedError
+from .storage_resource_exhausted_error_code import StorageResourceExhaustedErrorCode
+from .storage_resource_exhausted_error_error import StorageResourceExhaustedErrorError
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
@@ -670,7 +736,10 @@ from .sync_level import SyncLevel
 from .table import Table
 from .table_artifact_enrichment_list import TableArtifactEnrichmentList
 from .table_backup_status import TableBackupStatus
+from .table_backup_status_code import TableBackupStatusCode
 from .table_backup_status_status import TableBackupStatusStatus
+from .table_catalog_changed_conflict import TableCatalogChangedConflict
+from .table_catalog_changed_conflict_code import TableCatalogChangedConflictCode
 from .table_indexes import TableIndexes
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
@@ -795,7 +864,6 @@ __all__ = (
     "AntflyGeneratorConfig",
     "AntflyRerankerConfig",
     "AntflyType",
-    "AntflyType2",
     "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
@@ -805,9 +873,13 @@ __all__ = (
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
+    "BackupAlreadyExistsConflict",
+    "BackupAlreadyExistsConflictCode",
     "BackupInfo",
     "BackupInfoFormat",
     "BackupListResponse",
+    "BackupOutcomeAmbiguousConflict",
+    "BackupOutcomeAmbiguousConflictCode",
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
@@ -824,6 +896,7 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "CalendarInterval",
     "Capability",
+    "CardinalityMode",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -869,8 +942,32 @@ __all__ = (
     "ConnectionKind",
     "ConnectionsResponse",
     "ConnectionStatus",
+    "CreateAlgebraicIndexRequest",
+    "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
+    "CreatedAlgebraicIndex",
+    "CreatedAlgebraicIndexType",
+    "CreatedEmbeddingsIndex",
+    "CreatedEmbeddingsIndexConfig",
+    "CreatedEmbeddingsIndexType",
+    "CreatedEnrichmentConfig",
+    "CreatedFullTextIndex",
+    "CreatedFullTextIndexType",
+    "CreatedGraphArtifactProducerConfig",
+    "CreatedGraphArtifactProducerConfigKind",
+    "CreatedGraphIndex",
+    "CreatedGraphIndexConfig",
+    "CreatedGraphIndexType",
+    "CreatedIndexCommon",
+    "CreatedProviderConfig",
+    "CreateEmbeddingsIndexRequest",
+    "CreateEmbeddingsIndexRequestType",
+    "CreateFullTextIndexRequest",
+    "CreateFullTextIndexRequestType",
+    "CreateGraphIndexRequest",
+    "CreateGraphIndexRequestType",
+    "CreateIndexCommon",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateUserRequest",
@@ -906,8 +1003,13 @@ __all__ = (
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
+    "DocumentFieldMapping",
+    "DocumentFieldMappingFields",
+    "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSubfieldMapping",
+    "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
     "DropExtensionRequestMode",
     "DropExtensionResponse",
@@ -990,6 +1092,7 @@ __all__ = (
     "FieldCapabilityIndexSortOrder",
     "FieldCapabilityQueryModesItem",
     "FieldCapabilitySortLifecycleState",
+    "FieldMappingType",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -1022,6 +1125,22 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphAlgebraicPlanningConfig",
+    "GraphArtifactContextConfig",
+    "GraphArtifactEdgeMappingConfig",
+    "GraphArtifactEdgeMappingConfigMetadata",
+    "GraphArtifactNodeMappingConfig",
+    "GraphArtifactNodeMappingConfigModel",
+    "GraphArtifactProducerConfig",
+    "GraphArtifactProducerConfigKind",
+    "GraphArtifactProducerConfigProducerJson",
+    "GraphArtifactProducerSourceConfig",
+    "GraphArtifactProducerSourceConfigType",
+    "GraphArtifactSourceConfig",
+    "GraphArtifactSourceConfigFormat",
+    "GraphArtifactSourceConfigKind",
+    "GraphBoundedTraversalConfig",
+    "GraphBoundedTraversalConfigLaw",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1039,6 +1158,10 @@ __all__ = (
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
     "GraphQueryType",
+    "GraphResolverConfig",
+    "GraphResolverConfigCandidateSearch",
+    "GraphResolverConfigFusionCombine",
+    "GraphResolverConfigSourceArtifactKind",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
@@ -1272,6 +1395,13 @@ __all__ = (
     "MergeConfigWeights",
     "MergeProfile",
     "MergeStrategy",
+    "MetadataCapabilityUnavailableError",
+    "MetadataCapabilityUnavailableErrorCode",
+    "MetadataCapabilityUnavailableErrorError",
+    "MetadataCapabilityUnavailableErrorRequiredCapability",
+    "MetadataLeaderUnavailableError",
+    "MetadataLeaderUnavailableErrorCode",
+    "MetadataLeaderUnavailableErrorError",
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",
@@ -1416,6 +1546,9 @@ __all__ = (
     "SSEToolMode",
     "SSEToolModeMode",
     "StorageMaintenanceCapabilities",
+    "StorageResourceExhaustedError",
+    "StorageResourceExhaustedErrorCode",
+    "StorageResourceExhaustedErrorError",
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
@@ -1424,7 +1557,10 @@ __all__ = (
     "Table",
     "TableArtifactEnrichmentList",
     "TableBackupStatus",
+    "TableBackupStatusCode",
     "TableBackupStatusStatus",
+    "TableCatalogChangedConflict",
+    "TableCatalogChangedConflictCode",
     "TableIndexes",
     "TableMigration",
     "TableMigrationState",

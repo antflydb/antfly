@@ -167,6 +167,12 @@ export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
+export type CreateIndexRequest = components["schemas"]["CreateIndexRequest"];
+export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIndexRequest"];
+export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];
+export type CreateGraphIndexRequest = components["schemas"]["CreateGraphIndexRequest"];
+export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraicIndexRequest"];
+export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
 
@@ -236,6 +242,11 @@ export type AggregationRange = components["schemas"]["AggregationRange"];
 export type AggregationDateRange = components["schemas"]["AggregationDateRange"];
 export type DistanceRange = components["schemas"]["DistanceRange"];
 export type AntflyType = components["schemas"]["AntflyType"];
+export type FieldMappingType = components["schemas"]["FieldMappingType"];
+export type DocumentFieldMapping = components["schemas"]["DocumentFieldMapping"];
+export type DocumentSubfieldMapping = components["schemas"]["DocumentSubfieldMapping"];
+export type TemplateFieldMapping = components["schemas"]["TemplateFieldMapping"];
+export type DynamicTemplate = components["schemas"]["DynamicTemplate"];
 
 // Connection types
 export type ConnectionsResponse = components["schemas"]["ConnectionsResponse"];

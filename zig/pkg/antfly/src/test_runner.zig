@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var include_filters: std.ArrayList([]const u8) = .empty;
     var exclude_filters: std.ArrayList([]const u8) = .empty;
     var allow_empty_test_filter = false;
+    var list_tests = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -57,6 +58,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             appendFilter(arena, "--skip-test-filter", &exclude_filters, args[i]);
         } else if (std.mem.eql(u8, arg, "--allow-empty-test-filter")) {
             allow_empty_test_filter = true;
+        } else if (std.mem.eql(u8, arg, "--list-tests")) {
+            list_tests = true;
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             // Accepted for compatibility with the default test runner.
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
@@ -100,6 +103,15 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
         std.debug.print("test selection matched no runnable tests\n", .{});
         std.process.exit(1);
+    }
+
+    if (list_tests) {
+        for (test_fns) |test_fn| {
+            if (matchesFilter(test_fn.name)) {
+                std.debug.print("TEST\t{s}\n", .{test_fn.name});
+            }
+        }
+        return;
     }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");

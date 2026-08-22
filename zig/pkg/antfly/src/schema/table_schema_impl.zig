@@ -482,32 +482,46 @@ pub fn validateWritesAgainstSchema(
     schema: TableSchema,
     writes: anytype,
 ) !void {
+    try validateWritesAgainstSchemaWithPhysicalFields(alloc, schema, writes, &.{});
+}
+
+pub const PhysicalFieldValidation = struct {
+    source_field: []const u8,
+    field_type: storage_schema.AntflyType,
+};
+
+pub fn validateWritesAgainstSchemaWithPhysicalFields(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    writes: anytype,
+    physical_fields: []const PhysicalFieldValidation,
+) !void {
     const Writes = @TypeOf(writes);
     switch (@typeInfo(Writes)) {
         .pointer => |pointer| {
             if (pointer.size == .slice) {
-                for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+                for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                 return;
             }
             if (pointer.size == .one) {
                 const child = @typeInfo(pointer.child);
                 if (child == .array) {
-                    for (writes.*) |write| try validateDocumentJson(alloc, schema, write.value);
+                    for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                     return;
                 }
                 if (child == .@"struct" and child.@"struct".is_tuple) {
-                    inline for (writes.*) |write| try validateDocumentJson(alloc, schema, write.value);
+                    inline for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                     return;
                 }
             }
         },
         .array => {
-            for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+            for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
             return;
         },
         .@"struct" => |struct_info| {
             if (struct_info.is_tuple) {
-                inline for (writes) |write| try validateDocumentJson(alloc, schema, write.value);
+                inline for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
                 return;
             }
         },
@@ -521,7 +535,16 @@ pub fn validateDocumentJson(
     schema: TableSchema,
     value_json: []const u8,
 ) !void {
-    if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0) return;
+    try validateDocumentJsonWithPhysicalFields(alloc, schema, value_json, &.{});
+}
+
+fn validateDocumentJsonWithPhysicalFields(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    value_json: []const u8,
+    physical_fields: []const PhysicalFieldValidation,
+) !void {
+    if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
     defer parsed.deinit();
@@ -584,6 +607,75 @@ pub fn validateDocumentJson(
         }
         if (schema.enforce_types) return error.InvalidBatchRequest;
     }
+
+    if (physical_fields.len > 0) {
+        var path = std.ArrayListUnmanaged(u8).empty;
+        defer path.deinit(alloc);
+        try validatePhysicalDocumentValue(alloc, physical_fields, &path, parsed.value, false);
+    }
+}
+
+fn validatePhysicalDocumentValue(
+    alloc: std.mem.Allocator,
+    physical_fields: []const PhysicalFieldValidation,
+    path: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    validate_current_path: bool,
+) !void {
+    if (validate_current_path and value != .null) {
+        const start = physicalFieldLowerBound(physical_fields, path.items);
+        for (physical_fields[start..]) |field| {
+            if (!std.mem.eql(u8, field.source_field, path.items)) break;
+            try validatePhysicalFieldValue(field.field_type, value);
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
+                const previous_len = path.items.len;
+                defer path.shrinkRetainingCapacity(previous_len);
+                if (previous_len > 0) try path.append(alloc, '.');
+                try path.appendSlice(alloc, entry.key_ptr.*);
+                try validatePhysicalDocumentValue(alloc, physical_fields, path, entry.value_ptr.*, true);
+            }
+        },
+        // A mapped scalar field may be multi-valued. Validate the mapping once
+        // against the complete array, then preserve the same path while walking
+        // object items for mappings declared below an array-of-objects field.
+        .array => |array| {
+            for (array.items) |item| {
+                try validatePhysicalDocumentValue(alloc, physical_fields, path, item, false);
+            }
+        },
+        else => {},
+    }
+}
+
+fn physicalFieldLowerBound(fields: []const PhysicalFieldValidation, path: []const u8) usize {
+    var low: usize = 0;
+    var high: usize = fields.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (std.mem.order(u8, fields[mid].source_field, path) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+fn validatePhysicalFieldValue(field_type: storage_schema.AntflyType, value: std.json.Value) !void {
+    if (value == .array and field_type != .embedding) {
+        for (value.array.items) |item| {
+            if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, item)) return error.InvalidBatchRequest;
+        }
+    } else if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, value)) {
+        return error.InvalidBatchRequest;
+    }
 }
 
 pub fn globMatch(pattern: []const u8, text: []const u8) bool {
@@ -611,6 +703,12 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
 
     while (pi < pattern.len and pattern[pi] == '*') pi += 1;
     return pi == pattern.len;
+}
+
+/// Match a field name against a JSON Schema `patternProperties` expression
+/// using the same regex engine and error mapping as runtime validation.
+pub fn patternPropertyMatches(pattern: []const u8, field_name: []const u8) !bool {
+    return try regexMatch(pattern, field_name);
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -1479,7 +1577,13 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
     while (keys.next()) |entry| {
         if (!isKnownFieldMappingKey(entry.key_ptr.*, allow_fields)) return error.InvalidSchemaUpdateRequest;
     }
-    if (mapping.object.get("type")) |mapping_type| if (mapping_type != .null and mapping_type != .string) return error.InvalidSchemaUpdateRequest;
+    if (mapping.object.get("type")) |mapping_type| {
+        if (mapping_type != .null and
+            (mapping_type != .string or !mappingTypeIsKnown(mapping_type.string)))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
     if (mapping.object.get("analyzer")) |analyzer| if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("index")) |index| if (index != .null and index != .bool) return error.InvalidSchemaUpdateRequest;
     if (mapping.object.get("store")) |store| if (store != .null and store != .bool) return error.InvalidSchemaUpdateRequest;
@@ -1505,6 +1609,76 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
             if (mapping_type != .string or !mappingTypeCanSort(mapping_type.string)) return error.InvalidSchemaUpdateRequest;
         }
     }
+}
+
+fn validateFieldMappingSchemaCompatibility(
+    schema_type: ?[]const u8,
+    mapping: ?DynamicTemplate,
+) !void {
+    const resolved_schema_type = schema_type orelse return;
+    const resolved_mapping = mapping orelse return;
+    if (!fieldMappingAcceptsSchemaType(resolved_mapping.field_type orelse "text", resolved_schema_type)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    for (resolved_mapping.fields) |subfield| {
+        try validateFieldMappingSchemaCompatibility(resolved_schema_type, subfield);
+    }
+}
+
+fn fieldMappingAcceptsSchemaType(mapping_type: []const u8, schema_type: []const u8) bool {
+    if (std.mem.eql(u8, mapping_type, "text") or
+        std.mem.eql(u8, mapping_type, "keyword") or
+        std.mem.eql(u8, mapping_type, "link") or
+        std.mem.eql(u8, mapping_type, "blob") or
+        std.mem.eql(u8, mapping_type, "html") or
+        std.mem.eql(u8, mapping_type, "search_as_you_type"))
+    {
+        return schemaTypeIsString(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "numeric") or
+        std.mem.eql(u8, mapping_type, "number") or
+        std.mem.eql(u8, mapping_type, "integer"))
+    {
+        return schemaTypeIsNumeric(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "boolean") or std.mem.eql(u8, mapping_type, "bool")) {
+        return std.mem.eql(u8, schema_type, "boolean");
+    }
+    if (std.mem.eql(u8, mapping_type, "datetime") or
+        std.mem.eql(u8, mapping_type, "date") or
+        std.mem.eql(u8, mapping_type, "timestamp"))
+    {
+        return std.mem.eql(u8, schema_type, "datetime") or
+            std.mem.eql(u8, schema_type, "integer") or
+            schemaTypeIsString(schema_type);
+    }
+    if (std.mem.eql(u8, mapping_type, "geopoint") or
+        std.mem.eql(u8, mapping_type, "geo_point") or
+        std.mem.eql(u8, mapping_type, "geoshape") or
+        std.mem.eql(u8, mapping_type, "geo_shape"))
+    {
+        return std.mem.eql(u8, schema_type, "object");
+    }
+    if (std.mem.eql(u8, mapping_type, "embedding")) {
+        return std.mem.eql(u8, schema_type, "array");
+    }
+    return false;
+}
+
+fn schemaTypeIsString(schema_type: []const u8) bool {
+    return std.mem.eql(u8, schema_type, "string") or
+        std.mem.eql(u8, schema_type, "text") or
+        std.mem.eql(u8, schema_type, "keyword") or
+        std.mem.eql(u8, schema_type, "link") or
+        std.mem.eql(u8, schema_type, "blob") or
+        std.mem.eql(u8, schema_type, "html") or
+        std.mem.eql(u8, schema_type, "search_as_you_type");
+}
+
+fn schemaTypeIsNumeric(schema_type: []const u8) bool {
+    return std.mem.eql(u8, schema_type, "number") or
+        std.mem.eql(u8, schema_type, "integer") or
+        std.mem.eql(u8, schema_type, "numeric");
 }
 
 fn isKnownFieldMappingKey(key: []const u8, allow_fields: bool) bool {
@@ -1561,6 +1735,19 @@ fn mappingTypeCanSort(mapping_type: []const u8) bool {
         std.mem.eql(u8, mapping_type, "date") or
         std.mem.eql(u8, mapping_type, "timestamp") or
         std.mem.eql(u8, mapping_type, "link");
+}
+
+fn mappingTypeIsKnown(mapping_type: []const u8) bool {
+    return mappingTypeCanSort(mapping_type) or
+        std.mem.eql(u8, mapping_type, "text") or
+        std.mem.eql(u8, mapping_type, "html") or
+        std.mem.eql(u8, mapping_type, "embedding") or
+        std.mem.eql(u8, mapping_type, "geopoint") or
+        std.mem.eql(u8, mapping_type, "geo_point") or
+        std.mem.eql(u8, mapping_type, "geoshape") or
+        std.mem.eql(u8, mapping_type, "geo_shape") or
+        std.mem.eql(u8, mapping_type, "blob") or
+        std.mem.eql(u8, mapping_type, "search_as_you_type");
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
@@ -2170,7 +2357,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         alloc.destroy(owned);
     };
 
-    if (schemaShapeIsArrayLike(
+    const array_like = schemaShapeIsArrayLike(
         field_type,
         min_items,
         max_items,
@@ -2183,7 +2370,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         min_contains,
         max_contains,
         unique_items,
-    )) {
+    );
+    if (array_like) {
         if (fieldMappingContainsSortable(antfly_field)) return error.InvalidSchemaUpdateRequest;
         if (documentPropertiesContainSortableMapping(prefix_items)) return error.InvalidSchemaUpdateRequest;
         if (item) |array_item| {
@@ -2195,6 +2383,10 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (unevaluated_items_schema) |unevaluated_item| {
             if (documentPropertyContainsSortableMapping(unevaluated_item.*)) return error.InvalidSchemaUpdateRequest;
         }
+    }
+
+    if (!array_like and (antfly_index orelse true)) {
+        try validateFieldMappingSchemaCompatibility(field_type, antfly_field);
     }
 
     property.* = .{
@@ -2789,8 +2981,16 @@ fn findDocumentProperty(properties: []const DocumentProperty, field_name: []cons
     return null;
 }
 
-fn shouldIgnoreSchemaValidationField(field_name: []const u8) bool {
+pub fn shouldIgnoreSchemaValidationField(field_name: []const u8) bool {
     return field_name.len > 0 and field_name[0] == '_';
+}
+
+pub fn pathContainsSchemaIgnoredField(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '.');
+    while (segments.next()) |segment| {
+        if (shouldIgnoreSchemaValidationField(segment)) return true;
+    }
+    return false;
 }
 
 fn fieldMatchesDynamicTemplates(dynamic_templates: []const DynamicTemplate, path: []const u8, value: std.json.Value) bool {
@@ -2858,6 +3058,10 @@ fn validateDocumentFieldValueWithContext(
     }
 
     if (value.* == .null) return validateNullValueWithContext(context, property, value, enforce_types);
+
+    if ((property.antfly_index orelse true)) {
+        if (property.antfly_field) |mapping| try validateMappedFieldValue(mapping, value.*);
+    }
 
     if (property.all_of.len > 0) {
         for (property.all_of) |variant| try validateDocumentFieldValueWithContext(context, variant, value, composed_enforce_types);
@@ -3035,7 +3239,9 @@ fn validateDocumentFieldValueWithContext(
         property.unevaluated_properties_schema != null or
         property.property_names != null or
         property.dependent_required.len > 0 or
-        property.dependent_schemas.len > 0)
+        property.dependent_schemas.len > 0 or
+        property.min_properties != null or
+        property.max_properties != null)
     {
         const object = switch (value.*) {
             .object => |object| object,
@@ -3159,6 +3365,18 @@ fn validateDocumentFieldValueWithContext(
         }
         return;
     }
+}
+
+fn validateMappedFieldValue(mapping: DynamicTemplate, value: std.json.Value) !void {
+    const field_type = storage_schema.parseAntflyType(mapping.field_type orelse "text") orelse return error.InvalidBatchRequest;
+    if (value == .array and field_type != .embedding) {
+        for (value.array.items) |item| {
+            if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, item)) return error.InvalidBatchRequest;
+        }
+    } else if (!storage_schema.fieldTypeAcceptsRuntimeValue(field_type, value)) {
+        return error.InvalidBatchRequest;
+    }
+    for (mapping.fields) |subfield| try validateMappedFieldValue(subfield, value);
 }
 
 fn validateNullValueWithContext(
@@ -3928,6 +4146,20 @@ test "parse accepts sortable without public doc values and rejects unsupported s
         error.InvalidSchemaUpdateRequest,
         parseSchema(
             std.testing.allocator,
+            "{\"dynamic_templates\":[{\"name\":\"mystery\",\"path_match\":\"mystery\",\"mapping\":{\"type\":\"unknown\"}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"mystery\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"unknown\"}}}}}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
             "{\"dynamic_templates\":[{\"name\":\"rank\",\"path_match\":\"rank\",\"unknown\":true,\"mapping\":{\"type\":\"numeric\",\"sortable\":true}}]}",
         ),
     );
@@ -4067,6 +4299,53 @@ test "parse accepts sortable without public doc values and rejects unsupported s
             std.testing.allocator,
             "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"patternProperties\":{\"^_.*$\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}",
         ),
+    );
+}
+
+test "parse rejects document field mappings incompatible with their schema value domain" {
+    const incompatible_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"active\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"boolean\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"numeric\":{\"type\":\"number\",\"sortable\":true}}}}}}}}}",
+    };
+    for (incompatible_schemas) |schema_json| {
+        try std.testing.expectError(
+            error.InvalidSchemaUpdateRequest,
+            parseSchema(std.testing.allocator, schema_json),
+        );
+    }
+
+    const compatible_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"integer\",\"x-antfly-field\":{\"type\":\"numeric\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"created_at\":{\"type\":\"string\",\"format\":\"date-time\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}}}",
+    };
+    for (compatible_schemas) |schema_json| {
+        var parsed = try parseSchema(std.testing.allocator, schema_json);
+        parsed.deinit(std.testing.allocator);
+    }
+}
+
+test "write validation rejects values that cannot populate explicit physical mappings" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"created_at\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"created_ns\":{\"type\":\"integer\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"location\":{\"type\":\"object\",\"x-antfly-field\":{\"type\":\"geo_point\"}}}}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20T12:00:00Z\",\"created_ns\":0,\"location\":{\"lat\":37.7,\"lon\":-122.4}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"not-a-date\",\"created_ns\":0,\"location\":{\"lat\":0,\"lon\":0}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":-1,\"location\":{\"lat\":0,\"lon\":0}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":0,\"location\":{\"lat\":91,\"lon\":0}}" }}),
     );
 }
 
@@ -4661,6 +4940,35 @@ test "validate string length and object cardinality" {
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"meta\":{\"a\":\"x\",\"b\":\"y\",\"c\":\"z\"}}" }}),
+    );
+}
+
+test "validate min and max properties without other nested object rules" {
+    var open = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"minProperties\":1,\"maxProperties\":1}}}}}}",
+    );
+    defer open.deinit(std.testing.allocator);
+
+    try validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{\"a\":1}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{}}" }}),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, open, &.{.{ .value = "{\"meta\":{\"a\":1,\"b\":2}}" }}),
+    );
+
+    var closed = try parseSchema(
+        std.testing.allocator,
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"meta\":{\"type\":\"object\",\"minProperties\":0}}}}}}",
+    );
+    defer closed.deinit(std.testing.allocator);
+    try validateWritesAgainstSchema(std.testing.allocator, closed, &.{.{ .value = "{\"meta\":{}}" }});
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateWritesAgainstSchema(std.testing.allocator, closed, &.{.{ .value = "{\"meta\":{\"unknown\":1}}" }}),
     );
 }
 

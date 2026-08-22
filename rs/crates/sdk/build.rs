@@ -13,6 +13,7 @@ fn main() {
     // heterogeneous error response schemas. Preprocess the spec to fix both.
     strip_non_json_media_types(&mut spec);
     unify_error_response_schemas(&mut spec);
+    mark_openapi_code_fences_as_text(&mut spec);
 
     let openapi: openapiv3::OpenAPI =
         serde_yaml::from_value(spec).expect("failed to deserialize filtered spec");
@@ -28,6 +29,52 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+/// OpenAPI descriptions document wire payloads and templates, not Rust source.
+/// Rustdoc treats bare and unknown-language Markdown fences as Rust doctests,
+/// so mark every opening fence as text before Progenitor turns descriptions
+/// into doc comments. This keeps crate-owned doctests enabled.
+fn mark_openapi_code_fences_as_text(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::String(text) => {
+            let had_trailing_newline = text.ends_with('\n');
+            let mut in_fence = false;
+            let rewritten = text
+                .lines()
+                .map(|line| {
+                    let trimmed = line.trim_start();
+                    if !trimmed.starts_with("```") {
+                        return line.to_owned();
+                    }
+                    if in_fence {
+                        in_fence = false;
+                        return line.to_owned();
+                    }
+                    in_fence = true;
+                    let indent_len = line.len() - trimmed.len();
+                    format!("{}```text", &line[..indent_len])
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            *text = rewritten;
+            if had_trailing_newline {
+                text.push('\n');
+            }
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for value in values {
+                mark_openapi_code_fences_as_text(value);
+            }
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            for value in mapping.values_mut() {
+                mark_openapi_code_fences_as_text(value);
+            }
+        }
+        serde_yaml::Value::Tagged(tagged) => mark_openapi_code_fences_as_text(&mut tagged.value),
+        _ => {}
+    }
 }
 
 /// Keep only `application/json` in content maps. Progenitor doesn't support
@@ -59,20 +106,56 @@ fn strip_non_json_media_types(spec: &mut serde_yaml::Value) {
 /// Progenitor asserts that all error responses share the same type. Replace
 /// any non-Error error response schema with the standard Error $ref.
 fn unify_error_response_schemas(spec: &mut serde_yaml::Value) {
-    let error_schema: serde_yaml::Value = serde_yaml::from_str(
+    // Progenitor requires every error response on an operation to share one
+    // schema. Keep this compatibility envelope private to Rust generation so
+    // the public OpenAPI contract retains its precise per-status response
+    // types for the other SDKs.
+    let create_index_error: serde_yaml::Value = serde_yaml::from_str(
         r#"
-content:
-  application/json:
-    schema:
-      $ref: '#/components/schemas/Error'
+type: object
+additionalProperties: false
+required: [error]
+properties:
+  error:
+    type: string
+  code:
+    type: string
+  message:
+    type: string
+  retryable:
+    type: boolean
+  retry_after_ms:
+    type: integer
+    minimum: 1
 "#,
     )
     .unwrap();
+    spec.get_mut("components")
+        .and_then(|value| value.get_mut("schemas"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("OpenAPI components.schemas must be a mapping")
+        .insert(
+            serde_yaml::Value::String("CreateIndexError".to_owned()),
+            create_index_error,
+        );
 
     if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_mapping_mut()) {
         for (_path, methods) in paths.iter_mut() {
             if let Some(methods) = methods.as_mapping_mut() {
                 for (_method, operation) in methods.iter_mut() {
+                    let error_type = if operation
+                        .get("operationId")
+                        .and_then(|value| value.as_str())
+                        == Some("createIndex")
+                    {
+                        "CreateIndexError"
+                    } else {
+                        "Error"
+                    };
+                    let error_schema: serde_yaml::Value = serde_yaml::from_str(&format!(
+                        "content:\n  application/json:\n    schema:\n      $ref: '#/components/schemas/{error_type}'\n"
+                    ))
+                    .unwrap();
                     if let Some(responses) = operation
                         .get_mut("responses")
                         .and_then(|r| r.as_mapping_mut())
@@ -87,40 +170,16 @@ content:
                             if !code_str.starts_with('4') && !code_str.starts_with('5') {
                                 continue;
                             }
-                            // If it has content with a non-Error schema, replace it
-                            if let Some(content) = resp.get("content").and_then(|c| c.as_mapping())
-                            {
-                                let json_key = serde_yaml::Value::String("application/json".into());
-                                if let Some(media) = content.get(&json_key) {
-                                    if let Some(schema) = media.get("schema") {
-                                        let is_error_ref = schema
-                                            .get("$ref")
-                                            .and_then(|r| r.as_str())
-                                            .is_some_and(|r| r.ends_with("/Error"));
-                                        if !is_error_ref {
-                                            // Replace with Error schema, keep description
-                                            let desc = resp.get("description").cloned();
-                                            if let Some(resp) = resp.as_mapping_mut() {
-                                                resp.remove(&serde_yaml::Value::String(
-                                                    "content".into(),
-                                                ));
-                                                if let Some(ec) = error_schema.as_mapping() {
-                                                    for (k, v) in ec {
-                                                        resp.insert(k.clone(), v.clone());
-                                                    }
-                                                }
-                                                if let Some(d) = desc {
-                                                    resp.insert(
-                                                        serde_yaml::Value::String(
-                                                            "description".into(),
-                                                        ),
-                                                        d,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            // Resolve both inline responses and response-level
+                            // $refs to one error shape. Progenitor cannot emit
+                            // an operation with heterogeneous error bodies.
+                            let desc = resp.get("description").cloned().unwrap_or_else(|| {
+                                serde_yaml::Value::String("Error response".into())
+                            });
+                            *resp = error_schema.clone();
+                            if let Some(mapping) = resp.as_mapping_mut() {
+                                mapping
+                                    .insert(serde_yaml::Value::String("description".into()), desc);
                             }
                         }
                     }

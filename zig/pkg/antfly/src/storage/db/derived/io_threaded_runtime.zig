@@ -27,6 +27,7 @@ const async_runtime_mod = @import("async_runtime.zig");
 const change_journal_mod = @import("change_journal.zig");
 const derived_types = @import("derived_types.zig");
 const threaded_io_limits = @import("../../../common/threaded_io_limits.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const RuntimeError = async_runtime_mod.RuntimeError;
 pub const ApplyFn = async_runtime_mod.ApplyFn;
@@ -126,6 +127,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn beginShutdown(_: *@This()) void {}
+
     pub fn hasWorkers(_: *@This()) bool {
         return false;
     }
@@ -192,11 +195,34 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn waitForAllWithVisibilityWait(
+        self: *@This(),
+        sequence: u64,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        _ = cancellation;
+        _ = deadline_ns;
+        return try self.waitForAll(sequence);
+    }
+
     pub fn waitForIndexes(self: *@This(), sequence: u64, index_names: []const []const u8) !void {
         _ = self;
         _ = sequence;
         _ = index_names;
         return error.UnsupportedPlatform;
+    }
+
+    pub fn waitForIndexesWithVisibilityWait(
+        self: *@This(),
+        sequence: u64,
+        index_names: []const []const u8,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        _ = cancellation;
+        _ = deadline_ns;
+        return try self.waitForIndexes(sequence, index_names);
     }
 } else struct {
     const IoOwner = enum {
@@ -333,12 +359,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *DerivedRuntime) void {
         const io = self.ioContext();
-
-        self.mutex.lockUncancelable(io);
-        self.shutdown = true;
-        for (self.workers.items) |worker| worker.stop = true;
-        self.cond.broadcast(io);
-        self.mutex.unlock(io);
+        self.beginShutdown();
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
@@ -361,6 +382,15 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             self.alloc.destroy(self.threaded);
         }
         self.* = undefined;
+    }
+
+    pub fn beginShutdown(self: *DerivedRuntime) void {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        for (self.workers.items) |worker| worker.stop = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
     }
 
     pub fn hasWorkers(self: *DerivedRuntime) bool {
@@ -388,6 +418,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             .kind = .{
                 .name = undefined,
                 .kind = kind.kind,
+                .estimated_dense_vector_bytes = kind.estimated_dense_vector_bytes,
             },
             .applied_sequence = applied_sequence,
             .persisted_sequence = applied_sequence,
@@ -556,6 +587,15 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForAll(self: *DerivedRuntime, sequence: u64) !void {
+        return try self.waitForAllWithVisibilityWait(sequence, .none, null);
+    }
+
+    pub fn waitForAllWithVisibilityWait(
+        self: *DerivedRuntime,
+        sequence: u64,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -615,6 +655,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.mutex.unlock(io);
                     io.sleep(Io.Duration.zero, .awake) catch {};
                     self.mutex.lockUncancelable(io);
+                    try checkVisibilityWait(cancellation, deadline_ns);
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -636,6 +677,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 return;
             }
+            try checkVisibilityWait(cancellation, deadline_ns);
             self.mutex.unlock(io);
             io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
             self.mutex.lockUncancelable(io);
@@ -643,6 +685,16 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForIndexes(self: *DerivedRuntime, sequence: u64, index_names: []const []const u8) !void {
+        return try self.waitForIndexesWithVisibilityWait(sequence, index_names, .none, null);
+    }
+
+    pub fn waitForIndexesWithVisibilityWait(
+        self: *DerivedRuntime,
+        sequence: u64,
+        index_names: []const []const u8,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
         if (index_names.len == 0) return;
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
@@ -708,6 +760,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.mutex.unlock(io);
                     io.sleep(Io.Duration.zero, .awake) catch {};
                     self.mutex.lockUncancelable(io);
+                    try checkVisibilityWait(cancellation, deadline_ns);
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -729,6 +782,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 return;
             }
+            try checkVisibilityWait(cancellation, deadline_ns);
             self.mutex.unlock(io);
             io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
             self.mutex.lockUncancelable(io);
@@ -752,6 +806,26 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return min_persisted;
     }
 };
+
+fn checkVisibilityWait(cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+    if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
+    }
+}
+
+test "derived enrichment visibility guard observes cancellation and deadline" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        checkVisibilityWait(types.CancellationToken.fromAtomic(&cancelled), null),
+    );
+    cancelled.store(false, .release);
+    try std.testing.expectError(
+        error.EnrichmentWaitTimeout,
+        checkVisibilityWait(.none, platform_time.monotonicNs()),
+    );
+}
 
 fn workerMain(worker: *Worker) void {
     const runtime = worker.runtime;
@@ -812,6 +886,7 @@ fn workerMain(worker: *Worker) void {
             worker.catch_up_active = false;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                     close_success = false;
@@ -832,6 +907,7 @@ fn workerMain(worker: *Worker) void {
             worker.catch_up_active = false;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                     close_success = false;
@@ -872,6 +948,7 @@ fn workerMain(worker: *Worker) void {
                     worker.catch_up_active = false;
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
+                    if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
                         closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                             close_success = false;
@@ -890,6 +967,7 @@ fn workerMain(worker: *Worker) void {
                     worker.catch_up_active = false;
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
+                    if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
                         closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                             close_success = false;
@@ -1139,6 +1217,11 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
+        // Structural reconciliation can retire the old HBC streaming session
+        // after replay work completes but before this worker publishes it.
+        // The applied checkpoint is advanced only after a successful close,
+        // so reopening and replaying is idempotent and preserves visibility.
+        error.NoActiveWriteSession => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
         else => false,
@@ -1154,6 +1237,12 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
     };
+}
+
+fn workerIsStopping(runtime: *DerivedRuntime, worker: *const Worker, io: Io) bool {
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    return runtime.shutdown or worker.stop or runtime.last_error_name != null;
 }
 
 fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {

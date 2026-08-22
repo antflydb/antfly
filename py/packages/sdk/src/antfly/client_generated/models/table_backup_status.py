@@ -4,8 +4,8 @@ from collections.abc import Mapping
 from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
+from ..models.table_backup_status_code import TableBackupStatusCode
 from ..models.table_backup_status_status import TableBackupStatusStatus
 from ..types import UNSET, Unset
 
@@ -14,17 +14,31 @@ T = TypeVar("T", bound="TableBackupStatus")
 
 @_attrs_define
 class TableBackupStatus:
-    """
-    Attributes:
-        name (str): Table name Example: users.
-        status (TableBackupStatusStatus): Backup status for this table Example: completed.
-        error (str | Unset): Error message if backup failed
+    """Outcome for one table in a cluster backup. `successful` is the legacy
+    spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+
+    An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+    `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+    generation without retrying blindly. Failed and skipped outcomes may include
+    `error`; other fields are omitted when they do not apply.
+
+        Attributes:
+            name (str): Table name Example: users.
+            status (TableBackupStatusStatus):  Example: completed.
+            error (str | Unset): Human-readable failure, skip reason, or reconciliation guidance.
+            code (TableBackupStatusCode | Unset): Stable machine-readable code for an ambiguous outcome.
+            retryable (bool | Unset): False for an ambiguous outcome; inspect the retained attempt before retrying.
+            backup_id (str | Unset): Logical per-table backup ID retained by an ambiguous cluster attempt.
+            artifact_backup_id (str | Unset): Opaque artifact generation retained by an ambiguous cluster attempt.
     """
 
     name: str
     status: TableBackupStatusStatus
     error: str | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    code: TableBackupStatusCode | Unset = UNSET
+    retryable: bool | Unset = UNSET
+    backup_id: str | Unset = UNSET
+    artifact_backup_id: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
@@ -33,8 +47,18 @@ class TableBackupStatus:
 
         error = self.error
 
+        code: str | Unset = UNSET
+        if not isinstance(self.code, Unset):
+            code = self.code.value
+
+        retryable = self.retryable
+
+        backup_id = self.backup_id
+
+        artifact_backup_id = self.artifact_backup_id
+
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "name": name,
@@ -43,6 +67,14 @@ class TableBackupStatus:
         )
         if error is not UNSET:
             field_dict["error"] = error
+        if code is not UNSET:
+            field_dict["code"] = code
+        if retryable is not UNSET:
+            field_dict["retryable"] = retryable
+        if backup_id is not UNSET:
+            field_dict["backup_id"] = backup_id
+        if artifact_backup_id is not UNSET:
+            field_dict["artifact_backup_id"] = artifact_backup_id
 
         return field_dict
 
@@ -55,27 +87,27 @@ class TableBackupStatus:
 
         error = d.pop("error", UNSET)
 
+        _code = d.pop("code", UNSET)
+        code: TableBackupStatusCode | Unset
+        if isinstance(_code, Unset):
+            code = UNSET
+        else:
+            code = TableBackupStatusCode(_code)
+
+        retryable = d.pop("retryable", UNSET)
+
+        backup_id = d.pop("backup_id", UNSET)
+
+        artifact_backup_id = d.pop("artifact_backup_id", UNSET)
+
         table_backup_status = cls(
             name=name,
             status=status,
             error=error,
+            code=code,
+            retryable=retryable,
+            backup_id=backup_id,
+            artifact_backup_id=artifact_backup_id,
         )
 
-        table_backup_status.additional_properties = d
         return table_backup_status
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

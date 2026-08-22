@@ -13,13 +13,16 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
+const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
 
 fn executeApiHttpxTestRequest(
@@ -80,6 +83,8 @@ const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
 const remote_metadata_http_executor_pool_size: usize = 4;
+const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
+const remote_metadata_linearizable_snapshot_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
@@ -319,6 +324,8 @@ const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_local_campaign_max_grace_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_forward_response_reserve_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_batch_initial_forwards: u8 = antfly.public_api.internal_batch_forwarding.max_forwards;
+const data_raft_protocol_capability_negative_cache_ttl_ns: u64 = std.time.ns_per_s;
+const data_raft_protocol_capability_probe_timeout_ms: u32 = 100;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
 const metadata_bootstrap_retry_base_ms: u64 = 250;
 const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
@@ -335,6 +342,9 @@ const DataRaftBatchRoute = struct {
     campaign_allowed: bool = true,
     forwards_remaining: u8 = data_raft_batch_initial_forwards,
     cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+    /// Borrowed only by the local visibility phase after Raft apply confirms
+    /// the durable outcome. It is never forwarded or serialized.
+    visibility_cancellation: antfly.db.types.CancellationToken = .none,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -645,6 +655,7 @@ const CliConfig = struct {
     failure_domain: ?[]const u8 = null,
     raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
     control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
+    process_memory_budget_mb: ?usize = null,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -1297,6 +1308,10 @@ const RaftTableApplyStateMachine = struct {
             if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
             var decoded = try data_raft_batch.decode(self.alloc, entry.data);
             defer decoded.deinit(self.alloc);
+            // The durable apply store consumes protocol barriers. They carry
+            // no document mutation, and their null batch payload is
+            // intentionally poison to binaries that predate the barrier.
+            if (decoded.protocol_barrier_version != null) continue;
             // Split lifecycle commands belong exclusively to the durable Raft
             // apply store. Sending an otherwise empty command through the
             // document DB can fail on unrelated index/runtime state after the
@@ -2212,6 +2227,14 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
     const snapshot = manager.snapshot();
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_bytes", "gauge", "Aggregate managed host-memory hard limit", snapshot.memory.hard_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_events_total", "counter", "Aggregate managed host-memory soft-limit events", snapshot.memory.soft_limit_events);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_rejections_total", "counter", "Aggregate managed host-memory hard-limit rejections", snapshot.memory.hard_limit_rejections);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_accounting_errors_total", "counter", "Fail-closed host-memory release accounting errors", snapshot.memory.accounting_errors);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_pressure", "gauge", "Aggregate managed host-memory pressure state, 0 normal, 1 soft, 2 hard", pressureValue(snapshot.memory.pressure));
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
     try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
@@ -2522,6 +2545,8 @@ const CachedSplitKey = union(enum) {
 };
 
 const StoreStatusHeartbeatCache = struct {
+    reporter_incarnation: u64 = 0,
+    status_generation: u64 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -2546,6 +2571,59 @@ const StoreStatusHeartbeatCache = struct {
 const StoreCapacitySnapshot = struct {
     capacity_bytes: u64 = 0,
     available_bytes: u64 = 0,
+};
+
+const DataRaftProtocolCapabilityCacheEntry = struct {
+    probe_mutex: std.atomic.Mutex = .unlocked,
+    protocol_version: u16 = 0,
+    checked_at_ns: u64 = 0,
+    endpoint_hash: u64 = 0,
+};
+
+const DataRaftProtocolActivationEntry = struct {
+    /// One reference belongs to the map; every request retains its own so an
+    /// exact-placement cleanup can unlink the entry without racing readers.
+    ref_count: std.atomic.Value(usize) = .init(1),
+    activation_mutex: std.atomic.Mutex = .unlocked,
+    protocol_version: std.atomic.Value(u16) = .init(0),
+    /// A barrier accepted by the current leader is sufficient to order later
+    /// entries in that term, but is not reusable after leadership changes
+    /// until the durable apply-store marker is visible.
+    pending_term: std.atomic.Value(u64) = .init(0),
+
+    fn retain(self: *@This()) void {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *@This(), alloc: std.mem.Allocator) void {
+        const previous = self.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) alloc.destroy(self);
+    }
+};
+
+const DataRaftBatchProtocolPreflight = struct {
+    conf_state_fingerprint: u64 = 0,
+    timestamp_supported: bool = false,
+    barrier_supported: bool = false,
+};
+
+const DataRaftProtocolPeer = struct {
+    node_id: u64,
+    raft_url: []const u8,
+};
+
+const DataRaftProtocolProbePlan = struct {
+    conf_state_fingerprint: u64 = 0,
+    routes_complete: bool = false,
+    peers: []const DataRaftProtocolPeer = &.{},
+
+    fn deinit(self: *DataRaftProtocolProbePlan, alloc: std.mem.Allocator) void {
+        for (self.peers) |peer| alloc.free(peer.raft_url);
+        if (self.peers.len != 0) alloc.free(self.peers);
+        self.* = undefined;
+    }
 };
 
 fn storeCapacitySnapshot(
@@ -2920,6 +2998,13 @@ pub const DataServerConfig = struct {
     index_repair_max_activation_gap_sequences: u64 = 200,
     index_repair_max_convergence_rounds: u32 = 32,
     index_repair_max_activation_pause_ms: u64 = 250,
+    /// Optional operator-owned envelope for all host memory in this process.
+    /// Zero auto-detects the cgroup or host limit.
+    process_memory_limit_bytes: usize = 0,
+    /// Present when startup has already resolved the shared process envelope.
+    /// This prevents independently composed managers from probing different
+    /// cgroup views or sizing from different host values.
+    process_memory_limit_source: ?antfly.public_api.MemoryLimitSource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -3526,6 +3611,30 @@ test "data runtime store status scheduler keeps clean periodic reports tick gate
         StoreStatusReportKind.full,
         chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true),
     );
+}
+
+test "data runtime heartbeat cache cannot regress to an older full report" {
+    var server: DataServer = undefined;
+    server.alloc = std.testing.allocator;
+    server.store_status_cache_mutex = .unlocked;
+    server.store_status_heartbeat_cache = .{};
+    defer server.store_status_heartbeat_cache.clear(std.testing.allocator);
+
+    try server.storeStatusHeartbeatCacheReplace(.{
+        .store_id = 7,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 11,
+        .capacity_bytes = 200,
+    });
+    try server.storeStatusHeartbeatCacheReplace(.{
+        .store_id = 7,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 10,
+        .capacity_bytes = 100,
+    });
+
+    try std.testing.expectEqual(@as(u64, 11), server.store_status_heartbeat_cache.status_generation);
+    try std.testing.expectEqual(@as(u64, 200), server.store_status_heartbeat_cache.capacity_bytes);
 }
 
 test "idle cached runtime status stays fresh only for the published root generation" {
@@ -4247,6 +4356,11 @@ pub const DataServer = struct {
     metadata_http_service: ?*antfly.metadata_service.MetadataHttpService = null,
     data_raft: ?*antfly.raft.ManagedHttpHostService = null,
     data_raft_mutex: std.atomic.Mutex = .unlocked,
+    data_raft_protocol_capability_mutex: std.atomic.Mutex = .unlocked,
+    data_raft_protocol_capabilities: std.AutoHashMapUnmanaged(u64, *DataRaftProtocolCapabilityCacheEntry) = .empty,
+    data_raft_protocol_activation_mutex: std.atomic.Mutex = .unlocked,
+    data_raft_protocol_activations: std.AutoHashMapUnmanaged(u64, *DataRaftProtocolActivationEntry) = .empty,
+    data_raft_protocol_activation_cleanup_needed: std.atomic.Value(bool) = .init(false),
     /// Serializes desired-state snapshots while allowing the Raft progress
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
@@ -4262,6 +4376,9 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
+    reporter_incarnation: u64 = 0,
+    store_status_generation: std.atomic.Value(u64) = .init(1),
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
     next_metadata_bootstrap_retry_at_ms: u64 = 0,
@@ -4487,6 +4604,13 @@ pub const DataServer = struct {
     const lsm_maintenance_worker_bulk_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_pressure_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_max_steps_per_wake = 8;
+    // A score of 500K is roughly fifty primary L0 runs above the soft limit,
+    // still well below the default 256-run hard limit. If continuous writers
+    // win four consecutive try-lock races at that debt, take one blocking,
+    // fairly queued maintenance turn before the L0 reaches foreground-stall
+    // territory.
+    const lsm_maintenance_fair_turn_score: u64 = 500_000;
+    const lsm_maintenance_fair_turn_deferrals: usize = 4;
     // Dense posting repair is time-driven rather than score-driven: checking
     // the backlog requires a posting-state scan, so the worker probes on a
     // fixed cadence and retries quickly only while repairs are landing.
@@ -4652,7 +4776,11 @@ pub const DataServer = struct {
             .store_registration = cfg.store_registration,
             .group_leadership_source = cfg.group_leadership_source,
             .group_membership_source = cfg.group_membership_source,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 catalog,
@@ -4690,7 +4818,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
@@ -4728,7 +4860,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHttpHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHttpHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
@@ -6358,6 +6494,12 @@ pub const DataServer = struct {
             self.alloc.destroy(store);
         }
         if (self.data_raft_base_uri) |uri| self.alloc.free(uri);
+        var protocol_capability_it = self.data_raft_protocol_capabilities.valueIterator();
+        while (protocol_capability_it.next()) |entry| self.alloc.destroy(entry.*);
+        self.data_raft_protocol_capabilities.deinit(self.alloc);
+        var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
+        while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
+        self.data_raft_protocol_activations.deinit(self.alloc);
         self.local_split_key_cache.deinit(self.alloc);
         self.local_group_status_cache.clear(self.alloc);
         self.runtime_status_disk_usage_cache.deinit(self.alloc);
@@ -6578,6 +6720,7 @@ pub const DataServer = struct {
     }
 
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
+        var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             const now_ns = platform_time.monotonicNs();
@@ -6618,7 +6761,13 @@ pub const DataServer = struct {
             var maintenance_progressed_unscoped = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const maintenance = live_write_source.runLsmMaintenanceRoundBestEffortDetailed() catch |err| {
+                const observed_score = live_write_source.lsmMaintenanceScoreBestEffort();
+                const force_fair_turn = observed_score >= lsm_maintenance_fair_turn_score and
+                    consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals;
+                const maintenance = (if (force_fair_turn)
+                    live_write_source.runLsmMaintenanceRoundDetailed()
+                else
+                    live_write_source.runLsmMaintenanceRoundBestEffortDetailed()) catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -6633,6 +6782,7 @@ pub const DataServer = struct {
                 if (!maintenance.progressed) {
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
+                        consecutive_lock_deferrals +|= 1;
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
                     } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                         if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
@@ -6640,6 +6790,7 @@ pub const DataServer = struct {
                     completed = true;
                     break;
                 }
+                consecutive_lock_deferrals = 0;
                 maintenance_progressed = true;
                 if (maintenance.group_id) |group_id| {
                     var already_recorded = false;
@@ -6777,7 +6928,9 @@ pub const DataServer = struct {
             .ptr = self,
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
+                .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
                 .batch_group_local = localRaftBatchGroupLocal,
+                .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
             },
         };
     }
@@ -6867,6 +7020,21 @@ pub const DataServer = struct {
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = true });
     }
 
+    fn localRaftBatchGroupWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
+            .refresh_metadata = true,
+            .visibility_cancellation = cancellation,
+        });
+    }
+
     fn localRaftBatchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6876,6 +7044,21 @@ pub const DataServer = struct {
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = false });
+    }
+
+    fn localRaftBatchGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{
+            .refresh_metadata = false,
+            .visibility_cancellation = cancellation,
+        });
     }
 
     fn localRaftBatchGroupForwarded(
@@ -6901,6 +7084,7 @@ pub const DataServer = struct {
                 .campaign_allowed = forwarding.campaign_allowed,
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
+                .visibility_cancellation = cancellation_token,
             },
             leader_wait_ns,
         );
@@ -6925,6 +7109,363 @@ pub const DataServer = struct {
         );
     }
 
+    fn materializeRaftBatchTimestamp(req: antfly.db.types.BatchRequest) antfly.db.types.BatchRequest {
+        var proposal_req = req;
+        // DB.batch treats zero as "read realtime now". Materialize that value
+        // once before any forwarding or Raft encoding so every replica applies
+        // identical document versions and TTL deadlines.
+        if (proposal_req.timestamp_ns == 0) proposal_req.timestamp_ns = platform_time.realtimeNs();
+        return proposal_req;
+    }
+
+    fn raftBatchRequestForProtocol(
+        req: antfly.db.types.BatchRequest,
+        timestamp_protocol_supported: bool,
+    ) antfly.db.types.BatchRequest {
+        if (timestamp_protocol_supported) return materializeRaftBatchTimestamp(req);
+        var legacy_req = req;
+        // Older replicas ignore `_timestamp_ns`. Do not put that field in the
+        // log until every replica that can apply the entry understands it.
+        legacy_req.timestamp_ns = 0;
+        return legacy_req;
+    }
+
+    fn dataRaftConfStateFingerprint(conf_state: raft_engine.core.ConfState) u64 {
+        var hasher = std.hash.Wyhash.init(0xd8e4d9c9735c54a1);
+        const replica_sets = [_][]const u64{
+            conf_state.voters,
+            conf_state.voters_outgoing,
+            conf_state.learners,
+            conf_state.learners_next,
+        };
+        for (replica_sets, 0..) |node_ids, set_index| {
+            var set_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &set_buf, @intCast(set_index), .little);
+            hasher.update(&set_buf);
+            std.mem.writeInt(u64, &set_buf, @intCast(node_ids.len), .little);
+            hasher.update(&set_buf);
+            for (node_ids) |node_id| {
+                std.mem.writeInt(u64, &set_buf, node_id, .little);
+                hasher.update(&set_buf);
+            }
+        }
+        return hasher.final();
+    }
+
+    fn dataRaftProtocolCapabilityEntry(
+        self: *DataServer,
+        node_id: u64,
+    ) !*DataRaftProtocolCapabilityCacheEntry {
+        lockAtomic(&self.data_raft_protocol_capability_mutex);
+        defer self.data_raft_protocol_capability_mutex.unlock();
+        if (self.data_raft_protocol_capabilities.get(node_id)) |entry| return entry;
+        const entry = try self.alloc.create(DataRaftProtocolCapabilityCacheEntry);
+        errdefer self.alloc.destroy(entry);
+        entry.* = .{};
+        try self.data_raft_protocol_capabilities.put(self.alloc, node_id, entry);
+        return entry;
+    }
+
+    fn dataRaftProtocolActivationEntry(
+        self: *DataServer,
+        group_id: u64,
+    ) !*DataRaftProtocolActivationEntry {
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        defer self.data_raft_protocol_activation_mutex.unlock();
+        if (self.data_raft_protocol_activations.get(group_id)) |entry| {
+            entry.retain();
+            return entry;
+        }
+        const entry = try self.alloc.create(DataRaftProtocolActivationEntry);
+        errdefer self.alloc.destroy(entry);
+        entry.* = .{};
+        try self.data_raft_protocol_activations.put(self.alloc, group_id, entry);
+        entry.retain();
+        return entry;
+    }
+
+    /// Unlinks only the caller's observed entry. A placement race can retire
+    /// an entry and install a replacement for the same group before the old
+    /// request notices; pointer identity prevents that stale request from
+    /// removing the replacement. The caller's retained reference remains
+    /// valid until its normal request-scope release.
+    fn unlinkDataRaftProtocolActivationEntry(
+        self: *DataServer,
+        group_id: u64,
+        expected: *DataRaftProtocolActivationEntry,
+    ) void {
+        var removed: ?*DataRaftProtocolActivationEntry = null;
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        if (self.data_raft_protocol_activations.get(group_id)) |current| {
+            if (current == expected) {
+                const entry = self.data_raft_protocol_activations.fetchRemove(group_id) orelse unreachable;
+                removed = entry.value;
+            }
+        }
+        self.data_raft_protocol_activation_mutex.unlock();
+        if (removed) |entry| entry.release(self.alloc);
+    }
+
+    fn sortedGroupIdsContain(group_ids: []const u64, target: u64) bool {
+        var lower: usize = 0;
+        var upper: usize = group_ids.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (group_ids[middle] < target) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        return lower < group_ids.len and group_ids[lower] == target;
+    }
+
+    fn sortedDataRaftGroupIdsAlloc(
+        self: *DataServer,
+        intents: []const antfly.raft.PlacementIntent,
+    ) ![]u64 {
+        const group_ids = try self.alloc.alloc(u64, intents.len);
+        for (intents, group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
+        std.mem.sort(u64, group_ids, {}, comptime std.sort.asc(u64));
+        return group_ids;
+    }
+
+    /// Drops the map's ownership for groups outside exact local placement.
+    /// Request references keep removed entries alive through their final Raft
+    /// status recheck, so topology cleanup never adds a global write-path wait.
+    fn retainDataRaftProtocolActivationGroups(
+        self: *DataServer,
+        active_group_ids_sorted: []const u64,
+    ) void {
+        const Retired = struct {
+            group_id: u64,
+            entry: *DataRaftProtocolActivationEntry,
+        };
+        var retired = std.ArrayListUnmanaged(Retired).empty;
+        defer retired.deinit(self.alloc);
+
+        lockAtomic(&self.data_raft_protocol_activation_mutex);
+        var retire_count: usize = 0;
+        var count_it = self.data_raft_protocol_activations.keyIterator();
+        while (count_it.next()) |group_id| {
+            if (!sortedGroupIdsContain(active_group_ids_sorted, group_id.*)) retire_count += 1;
+        }
+        retired.ensureTotalCapacity(self.alloc, retire_count) catch |err| {
+            self.data_raft_protocol_activation_cleanup_needed.store(true, .release);
+            self.data_raft_protocol_activation_mutex.unlock();
+            std.log.warn("data raft protocol activation cleanup skipped err={s}", .{@errorName(err)});
+            return;
+        };
+        var it = self.data_raft_protocol_activations.iterator();
+        while (it.next()) |item| {
+            if (sortedGroupIdsContain(active_group_ids_sorted, item.key_ptr.*)) continue;
+            retired.appendAssumeCapacity(.{
+                .group_id = item.key_ptr.*,
+                .entry = item.value_ptr.*,
+            });
+        }
+        for (retired.items) |item| {
+            const removed = self.data_raft_protocol_activations.fetchRemove(item.group_id) orelse unreachable;
+            std.debug.assert(removed.value == item.entry);
+        }
+        self.data_raft_protocol_activation_mutex.unlock();
+
+        for (retired.items) |item| item.entry.release(self.alloc);
+        self.data_raft_protocol_activation_cleanup_needed.store(false, .release);
+    }
+
+    fn durableDataRaftBatchProtocolVersion(self: *DataServer, group_id: u64) !u16 {
+        const raft = self.data_raft orelse return error.UnsupportedOperation;
+        const store = raft.host.owned_data_store orelse return error.UnsupportedOperation;
+        return try store.raftBatchProtocolVersionForRequest(group_id);
+    }
+
+    fn dataRaftTimestampProtocolUsable(
+        entry: *const DataRaftProtocolActivationEntry,
+        leader_term: u64,
+    ) bool {
+        return entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version or
+            (leader_term != 0 and entry.pending_term.load(.acquire) == leader_term);
+    }
+
+    fn reusableDataRaftProtocolCapability(
+        entry: *const DataRaftProtocolCapabilityCacheEntry,
+        endpoint_hash: u64,
+        now_ns: u64,
+    ) ?u16 {
+        if (entry.endpoint_hash != endpoint_hash or entry.checked_at_ns == 0) return null;
+        // Only negative evidence is reusable. Positive evidence describes one
+        // process incarnation and is consumed solely by the activation attempt
+        // that observed it; a later activation always revalidates the peer.
+        if (entry.protocol_version < data_raft_batch.activation_barrier_protocol_version and
+            now_ns -| entry.checked_at_ns <= data_raft_protocol_capability_negative_cache_ttl_ns)
+        {
+            return entry.protocol_version;
+        }
+        return null;
+    }
+
+    fn dataRaftProtocolProbeActive(
+        deadline_ns: u64,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) bool {
+        if (cancellation) |token| {
+            if (token.isCancelled()) return false;
+        }
+        return platform_time.monotonicNs() < deadline_ns;
+    }
+
+    fn probeDataRaftBatchProtocolVersion(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        node_id: u64,
+        raft_url: []const u8,
+        deadline_ns: u64,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) u16 {
+        const entry = self.dataRaftProtocolCapabilityEntry(node_id) catch return 0;
+        while (!entry.probe_mutex.tryLock()) {
+            if (!dataRaftProtocolProbeActive(deadline_ns, cancellation)) return 0;
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        defer entry.probe_mutex.unlock();
+
+        const probe_start_ns = platform_time.monotonicNs();
+        const endpoint_hash = std.hash.Wyhash.hash(0x552fba325614bacb, raft_url);
+        if (reusableDataRaftProtocolCapability(
+            entry,
+            endpoint_hash,
+            probe_start_ns,
+        )) |version| return version;
+        if (!dataRaftProtocolProbeActive(deadline_ns, cancellation)) return 0;
+
+        const raft = self.data_raft orelse return 0;
+        var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
+        const version = client.fetchDataRaftBatchProtocolVersion(
+            raft_url,
+            @min(dataRaftBatchHttpTimeoutMs(deadline_ns), data_raft_protocol_capability_probe_timeout_ms),
+            cancellation,
+        ) catch 0;
+        entry.protocol_version = version;
+        entry.checked_at_ns = platform_time.monotonicNs();
+        entry.endpoint_hash = endpoint_hash;
+        return version;
+    }
+
+    fn appendDataRaftProtocolPeerLocked(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        raft: *antfly.raft.ManagedHttpHostService,
+        group_id: u64,
+        node_id: u64,
+        peers: *std.ArrayListUnmanaged(DataRaftProtocolPeer),
+    ) !bool {
+        _ = self;
+        const resolver = raft.host.http_host.deps.host.peer_resolver orelse return false;
+        const endpoints = resolver.resolveGroupPeer(alloc, group_id, node_id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        var retained_address_index: ?usize = null;
+        defer {
+            for (endpoints, 0..) |endpoint, i| {
+                if (retained_address_index == null or retained_address_index.? != i) alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(endpoints);
+        }
+        for (endpoints, 0..) |endpoint, i| {
+            switch (endpoint.protocol) {
+                .http, .https, .http2, .http3 => {},
+                .quic => continue,
+            }
+            if (endpoint.address.len == 0) continue;
+            try peers.append(alloc, .{
+                .node_id = node_id,
+                // Transfer the resolver-owned address directly into the
+                // request plan instead of duplicating it on every batch.
+                .raft_url = endpoint.address,
+            });
+            retained_address_index = i;
+            return true;
+        }
+        return false;
+    }
+
+    /// Captures only the current group's remote applying peers while the Raft
+    /// mutex protects the resolver. Network probes happen after this plan has
+    /// been detached, and the final proposal rechecks its membership
+    /// fingerprint under the mutex.
+    fn dataRaftProtocolProbePlanLocked(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        raft: *antfly.raft.ManagedHttpHostService,
+        group_id: u64,
+        conf_state: raft_engine.core.ConfState,
+        local_node_id: u64,
+    ) !DataRaftProtocolProbePlan {
+        var peers = std.ArrayListUnmanaged(DataRaftProtocolPeer).empty;
+        errdefer {
+            for (peers.items) |peer| alloc.free(peer.raft_url);
+            peers.deinit(alloc);
+        }
+        var routes_complete = conf_state.voters.len != 0;
+        const replica_sets = [_][]const u64{
+            conf_state.voters,
+            conf_state.voters_outgoing,
+            conf_state.learners,
+            conf_state.learners_next,
+        };
+        for (replica_sets) |node_ids| {
+            for (node_ids) |node_id| {
+                if (node_id == local_node_id) continue;
+                var already_planned = false;
+                for (peers.items) |peer| {
+                    if (peer.node_id == node_id) {
+                        already_planned = true;
+                        break;
+                    }
+                }
+                if (already_planned) continue;
+                if (!try self.appendDataRaftProtocolPeerLocked(alloc, raft, group_id, node_id, &peers)) {
+                    routes_complete = false;
+                }
+            }
+        }
+        const owned_peers = if (peers.items.len == 0) blk: {
+            peers.deinit(alloc);
+            break :blk &.{};
+        } else try peers.toOwnedSlice(alloc);
+        return .{
+            .conf_state_fingerprint = dataRaftConfStateFingerprint(conf_state),
+            .routes_complete = routes_complete,
+            .peers = owned_peers,
+        };
+    }
+
+    fn dataRaftBatchProtocolPreflight(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        plan: DataRaftProtocolProbePlan,
+        deadline_ns: u64,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) DataRaftBatchProtocolPreflight {
+        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        for (plan.peers) |peer| {
+            if (self.probeDataRaftBatchProtocolVersion(
+                alloc,
+                peer.node_id,
+                peer.raft_url,
+                deadline_ns,
+                cancellation,
+            ) < data_raft_batch.activation_barrier_protocol_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        }
+        return .{
+            .conf_state_fingerprint = plan.conf_state_fingerprint,
+            .barrier_supported = true,
+        };
+    }
+
     fn proposeRaftBatchGroupWithLeaderWait(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -6935,6 +7476,7 @@ pub const DataServer = struct {
         leader_wait_ns: u64,
     ) !void {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
+        var proposal_req = req;
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
         if (route.refresh_metadata) {
@@ -6961,7 +7503,74 @@ pub const DataServer = struct {
         while (true) {
             try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
+            var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
+            var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
+            var protocol_activation_lock_owned = false;
+            defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
+            defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
             if (preflighted_local_leader) {
+                const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
+                protocol_activation_entry = activation_entry;
+                if (activation_entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version) {
+                    protocol_preflight.timestamp_supported = true;
+                } else if (activation_entry.activation_mutex.tryLock()) {
+                    protocol_activation_lock_owned = true;
+                    const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| switch (err) {
+                        // These states are retryable, but marker state is
+                        // unknown. Return before proposing instead of silently
+                        // degrading an activated group to legacy encoding.
+                        error.ApplyStoreGroupRetired => {
+                            // Exact reconciliation normally removes this map
+                            // entry. If this request recreated it after that
+                            // cleanup, retire its map reference immediately so
+                            // stable metadata rounds remain allocation-free.
+                            self.unlinkDataRaftProtocolActivationEntry(group_id, activation_entry);
+                            return error.LeaderUnavailable;
+                        },
+                        error.SplitSourceProjectionNotReady,
+                        error.ApplyStoreShuttingDown,
+                        error.ApplyStoreOwnerCachePinned,
+                        error.ResourceBudgetExceeded,
+                        => return error.LeaderUnavailable,
+                        // Corruption, unsupported protocol floors, and storage
+                        // I/O failures are correctness failures and must retain
+                        // their identity for diagnostics.
+                        else => return err,
+                    };
+                    if (durable_version >= data_raft_batch.timestamp_protocol_version) {
+                        activation_entry.protocol_version.store(durable_version, .release);
+                        activation_entry.pending_term.store(0, .release);
+                        protocol_preflight.timestamp_supported = true;
+                    } else {
+                        var protocol_plan: DataRaftProtocolProbePlan = preflight: {
+                            lockAtomic(&self.data_raft_mutex);
+                            defer self.data_raft_mutex.unlock();
+                            const status = raft.host.http_host.host.raftStatus(group_id) orelse break :preflight .{};
+                            // While this leader still owns the term, its
+                            // accepted barrier orders every later proposal.
+                            // Until that barrier applies, concurrent requests
+                            // use legacy encoding without repeating probes.
+                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term) break :preflight .{};
+                            activation_entry.pending_term.store(0, .release);
+                            break :preflight try self.dataRaftProtocolProbePlanLocked(
+                                alloc,
+                                raft,
+                                group_id,
+                                status.conf_state,
+                                raft.host.http_host.host.cfg.local_node_id,
+                            );
+                        };
+                        defer protocol_plan.deinit(alloc);
+                        protocol_preflight = self.dataRaftBatchProtocolPreflight(
+                            alloc,
+                            protocol_plan,
+                            deadline_ns,
+                            route.cancellation,
+                        );
+                    }
+                }
+                try ensureDataRaftBatchRouteActive(route);
+                if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
             }
@@ -6986,9 +7595,55 @@ pub const DataServer = struct {
                         // proposing a batch that skipped pressure admission.
                         retry_for_leader_preflight = true;
                     } else {
-                        const proposal_term = (raft.host.http_host.host.raftStatus(group_id) orelse
-                            return error.RaftBatchWriteOutcomeUnknown).hard.current_term;
-                        const encoded = try data_raft_batch.encode(alloc, table_name, req);
+                        const status = raft.host.http_host.host.raftStatus(group_id) orelse
+                            return error.RaftBatchWriteOutcomeUnknown;
+                        // Recheck the shared state while proposal ordering is
+                        // locked. A concurrent request may have appended the
+                        // barrier after this request skipped its singleflight
+                        // probe; in that case this entry must use the new
+                        // format because it will follow the barrier.
+                        var timestamp_supported = protocol_preflight.timestamp_supported or
+                            dataRaftTimestampProtocolUsable(protocol_activation_entry.?, status.hard.current_term);
+                        if (!timestamp_supported and
+                            protocol_preflight.barrier_supported and
+                            protocol_preflight.conf_state_fingerprint == dataRaftConfStateFingerprint(status.conf_state))
+                        {
+                            const barrier = try data_raft_batch.encodeProtocolBarrier(
+                                alloc,
+                                table_name,
+                                data_raft_batch.timestamp_protocol_version,
+                            );
+                            defer alloc.free(barrier);
+                            var barrier_index: ?u64 = null;
+                            raft.host.http_host.proposeWithReceipt(group_id, barrier, &barrier_index) catch |err| {
+                                if (barrier_index == null) {
+                                    // Activation is an optimization for this
+                                    // request. Preserve write availability by
+                                    // falling back to the universally readable
+                                    // legacy envelope when it was not accepted.
+                                    std.log.warn("data raft protocol barrier rejected group_id={} err={s}", .{
+                                        group_id,
+                                        @errorName(err),
+                                    });
+                                } else {
+                                    std.log.warn("data raft protocol barrier accepted before dispatch failure group_id={} index={} err={s}", .{
+                                        group_id,
+                                        barrier_index.?,
+                                        @errorName(err),
+                                    });
+                                }
+                            };
+                            if (barrier_index != null) {
+                                timestamp_supported = true;
+                                protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
+                            }
+                        }
+                        proposal_req = raftBatchRequestForProtocol(
+                            req,
+                            timestamp_supported,
+                        );
+                        const proposal_term = status.hard.current_term;
+                        const encoded = try data_raft_batch.encode(alloc, table_name, proposal_req);
                         defer alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
@@ -7010,7 +7665,7 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
-                        if (req.sync_level != .propose) {
+                        if (proposal_req.sync_level != .propose) {
                             const index = target_index.?;
                             const apply_sm = self.data_raft_apply orelse
                                 return error.RaftBatchWriteOutcomeUnknown;
@@ -7064,7 +7719,7 @@ pub const DataServer = struct {
                 defer if (outcome_waiter_index) |waiter_index|
                     if (self.data_raft_apply) |apply_sm|
                         apply_sm.cancelApplyOutcomeWaiter(group_id, waiter_index);
-                if (req.sync_level != .propose) {
+                if (proposal_req.sync_level != .propose) {
                     self.waitForLocalRaftBatchApply(group_id, index, deadline_ns) catch |err| {
                         std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=apply_wait err={s}", .{
                             group_id,
@@ -7085,7 +7740,19 @@ pub const DataServer = struct {
                     }
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
+                sync_source.syncReplicatedBatchGroupLocalWithCancellation(alloc, group_id, table_name, proposal_req.sync_level, route.visibility_cancellation) catch |err| {
+                    // Apply outcome is already confirmed above. Preserve
+                    // visibility-only outcomes so ingress can return an
+                    // explicit committed response instead of the ambiguous
+                    // Raft outcome contract used before apply confirmation.
+                    switch (err) {
+                        error.EnrichmentWaitCanceled,
+                        error.EnrichmentWaitTimeout,
+                        error.EnrichmentRetryInProgress,
+                        error.EnrichmentWorkerFailed,
+                        => return err,
+                        else => {},
+                    }
                     std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=sync_visibility err={s}", .{
                         group_id,
                         index,
@@ -7121,7 +7788,7 @@ pub const DataServer = struct {
                     alloc,
                     group_id,
                     table_name,
-                    req,
+                    proposal_req,
                     local_node_id,
                     deadline_ns,
                     route,
@@ -7148,7 +7815,7 @@ pub const DataServer = struct {
                                 var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
                                 defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
-                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
+                                const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     sleepDataRaftBatchLeaderRetry();
@@ -9712,6 +10379,25 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
+    fn reporterIncarnation(self: *DataServer) !u64 {
+        lockAtomic(&self.reporter_incarnation_mutex);
+        if (self.reporter_incarnation != 0) {
+            const reporter_incarnation = self.reporter_incarnation;
+            self.reporter_incarnation_mutex.unlock();
+            return reporter_incarnation;
+        }
+        self.reporter_incarnation_mutex.unlock();
+
+        const runtime = try self.ensureBackendRuntime();
+        const io_impl = runtime.apiIoImpl() orelse return error.BackendRuntimeUnavailable;
+        var candidate: u64 = 0;
+        while (candidate == 0) try io_impl.io().randomSecure(std.mem.asBytes(&candidate));
+        lockAtomic(&self.reporter_incarnation_mutex);
+        defer self.reporter_incarnation_mutex.unlock();
+        if (self.reporter_incarnation == 0) self.reporter_incarnation = candidate;
+        return self.reporter_incarnation;
+    }
+
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
@@ -9727,6 +10413,7 @@ pub const DataServer = struct {
         const record: antfly.metadata.table_manager.StoreRecord = .{
             .store_id = registration.store_id,
             .node_id = registration.node_id,
+            .reporter_incarnation = try self.reporterIncarnation(),
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -10316,8 +11003,25 @@ pub const DataServer = struct {
         // round; clearing at the end would lose that notification.
         _ = self.store_status_dirty.swap(false, .acq_rel);
         errdefer self.store_status_dirty.store(true, .release);
+        const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        const reporter_incarnation = try self.reporterIncarnation();
+        if (snapshot.status.runtime_status_protocol_ready_version >=
+            metadata_runtime_status_protocol.current_record_version and
+            !storeReporterIncarnationVisible(
+                snapshot.stores,
+                registration.store_id,
+                reporter_incarnation,
+            ))
+        {
+            // A process that registered while v13 was still rolling out has a
+            // legacy zero-incarnation record. Re-register once activation is
+            // durable so it gains causal authority without churning status
+            // records throughout the mixed-version window.
+            self.store_registration_confirmed = false;
+            try self.registerNodeIfConfigured();
+        }
         try self.syncDataRaftFromSnapshot(&snapshot);
         const report_generation = self.local_group_status_generation.load(.acquire);
 
@@ -10388,6 +11092,8 @@ pub const DataServer = struct {
 
         const report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
+            .reporter_incarnation = reporter_incarnation,
+            .status_generation = status_generation,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -10514,6 +11220,14 @@ pub const DataServer = struct {
             // fsync for identical topology.
             const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
             self.observeDataRaftStatusFingerprint(status_fingerprint);
+            // The common stable-topology path remains allocation-free. Retry
+            // exact activation cleanup only if its topology-change allocation
+            // previously failed under memory pressure.
+            if (self.data_raft_protocol_activation_cleanup_needed.load(.acquire)) {
+                const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
+                defer self.alloc.free(active_group_ids);
+                self.retainDataRaftProtocolActivationGroups(active_group_ids);
+            }
             return;
         }
         // A split destination is placed before cutover publishes its range.
@@ -10563,9 +11277,8 @@ pub const DataServer = struct {
             }
         }
 
-        const active_group_ids = try self.alloc.alloc(u64, local_intents.items.len);
+        const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
         defer self.alloc.free(active_group_ids);
-        for (local_intents.items, active_group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
 
         // Admit old-or-new before reconciliation because host reconciliation
         // can have partial side effects before returning an error. Exact new
@@ -10601,6 +11314,7 @@ pub const DataServer = struct {
             if (apply_group_transition) |*transition| transition.commit();
             if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         }
+        self.retainDataRaftProtocolActivationGroups(active_group_ids);
         const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
         self.observeDataRaftStatusFingerprint(status_fingerprint);
         if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
@@ -10761,6 +11475,8 @@ pub const DataServer = struct {
         if (cache.group_statuses.len == 0 and cache.runtime_statuses.len == 0) return null;
         return .{
             .store_id = store_id,
+            .reporter_incarnation = cache.reporter_incarnation,
+            .status_generation = cache.status_generation,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -10779,12 +11495,19 @@ pub const DataServer = struct {
         self: *DataServer,
         report: antfly.metadata.table_manager.StoreStatusReport,
     ) !void {
-        lockAtomic(&self.store_status_cache_mutex);
-        defer self.store_status_cache_mutex.unlock();
-        self.store_status_heartbeat_cache.clear(self.alloc);
-        self.store_status_heartbeat_cache = .{
+        const health_class = try self.alloc.dupe(u8, report.health_class);
+        errdefer self.alloc.free(health_class);
+        const group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, report.group_statuses);
+        errdefer if (group_statuses.len > 0)
+            antfly.metadata.table_manager.freeGroupStatuses(self.alloc, group_statuses);
+        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses);
+        errdefer if (runtime_statuses.len > 0)
+            antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        var next: StoreStatusHeartbeatCache = .{
+            .reporter_incarnation = report.reporter_incarnation,
+            .status_generation = report.status_generation,
             .live = report.live,
-            .health_class = try self.alloc.dupe(u8, report.health_class),
+            .health_class = health_class,
             .owns_health_class = true,
             .capacity_bytes = report.capacity_bytes,
             .available_bytes = report.available_bytes,
@@ -10793,9 +11516,22 @@ pub const DataServer = struct {
             .write_load = report.write_load,
             .active_backfills = report.active_backfills,
             .backfill_progress_millis = report.backfill_progress_millis,
-            .group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, report.group_statuses),
-            .runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, report.runtime_statuses),
+            .group_statuses = group_statuses,
+            .runtime_statuses = runtime_statuses,
         };
+
+        lockAtomic(&self.store_status_cache_mutex);
+        const cache = &self.store_status_heartbeat_cache;
+        if (cache.reporter_incarnation == report.reporter_incarnation and
+            cache.status_generation > report.status_generation)
+        {
+            self.store_status_cache_mutex.unlock();
+            next.clear(self.alloc);
+            return;
+        }
+        self.store_status_heartbeat_cache.clear(self.alloc);
+        self.store_status_heartbeat_cache = next;
+        self.store_status_cache_mutex.unlock();
     }
 
     fn collectStoreRuntimeStatusReports(
@@ -12009,6 +12745,23 @@ pub const DataServer = struct {
             }
             const group_id = candidate.group_id;
             const table_name = candidate.table_name;
+
+            // Healthy resident writers own ordinary async replay and publish
+            // runtime status directly. A resident writer with repair metadata
+            // or durable intent debt must still be audited, while a contended
+            // writer is retried without consuming the fallback cursor.
+            if (!candidate.queued) switch (self.liveRuntimeWriteSource().residentWriterRepairStateBestEffort(group_id, table_name)) {
+                .clean => {
+                    fallback_advance_count = @max(fallback_advance_count, candidate.cursor_distance + 1);
+                    continue;
+                },
+                .busy => {
+                    found_pending = true;
+                    self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
+                    continue;
+                },
+                .absent, .pending => {},
+            };
 
             var ownership_fence = IndexRepairOwnershipFence{
                 .leadership_source = self.group_leadership_source,
@@ -13631,7 +14384,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse if (data_raft) |raft| GroupLeadershipSource.fromManagedHttpHostService(raft) else null,
             .group_membership_source = cfg.group_membership_source orelse if (data_raft) |raft| GroupMembershipSource.fromManagedHttpHostService(raft) else null,
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -13898,12 +14655,25 @@ const RemoteMetadataSource = struct {
     // a successful read from a reachable-but-lagging follower must not steer
     // the next mutation or post-mutation catalog refresh away from the leader.
     preferred_authority_uri_index: usize = 0,
+    preferred_read_uri_index: usize = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
+    metadata_group_id: ?u64 = null,
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    // Incremented only by authoritative replacement or invalidation. An
+    // ordinary snapshot request captures this before I/O and may not publish
+    // across a generation change.
+    snapshot_fence_generation: u64 = 0,
+    // Mutation invalidation is intentionally distinct from cache publication:
+    // concurrent authoritative readers may supersede one another, while a
+    // mutation must reject every snapshot whose I/O began before it.
+    snapshot_invalidation_generation: u64 = 0,
+    next_linearizable_snapshot_sequence: u64 = 0,
+    published_linearizable_snapshot_sequence: u64 = 0,
+    linearizable_snapshot_unsupported_until_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
     test_faults: TestFaults = .{},
@@ -13937,9 +14707,13 @@ const RemoteMetadataSource = struct {
             owned[i] = try alloc.dupe(u8, uri);
             initialized += 1;
         }
+        const unsupported_until = try alloc.alloc(u64, base_uris.len);
+        errdefer alloc.free(unsupported_until);
+        @memset(unsupported_until, 0);
         return .{
             .alloc = alloc,
             .base_uris = owned,
+            .linearizable_snapshot_unsupported_until_ns = unsupported_until,
             .http_executors = http_executors,
         };
     }
@@ -13949,6 +14723,7 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.http_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
         for (self.base_uris) |uri| self.alloc.free(uri);
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
@@ -13975,20 +14750,75 @@ const RemoteMetadataSource = struct {
         return (start + attempt) % self.base_uris.len;
     }
 
+    fn metadataReadApiIndexForAttempt(self: *RemoteMetadataSource, attempt: usize) usize {
+        lockAtomic(&self.cache_mutex);
+        const start = self.preferred_read_uri_index % self.base_uris.len;
+        self.cache_mutex.unlock();
+        return (start + attempt) % self.base_uris.len;
+    }
+
     fn noteMetadataAuthoritySuccess(self: *RemoteMetadataSource, index: usize) void {
         lockAtomic(&self.cache_mutex);
         self.preferred_authority_uri_index = index;
+        // A successful mutation identifies both the authority and the
+        // freshest read target. Read successes intentionally update only the
+        // read affinity below.
+        self.preferred_read_uri_index = index;
+        self.cache_mutex.unlock();
+    }
+
+    fn noteMetadataReadSuccess(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        self.preferred_read_uri_index = index;
+        self.cache_mutex.unlock();
+    }
+
+    const LinearizableSnapshotTicket = struct {
+        invalidation_generation: u64,
+        sequence: u64,
+    };
+
+    const LinearizableSnapshotAcceptance = enum {
+        published,
+        superseded,
+    };
+
+    fn beginLinearizableSnapshot(self: *RemoteMetadataSource) LinearizableSnapshotTicket {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        self.next_linearizable_snapshot_sequence +%= 1;
+        return .{
+            .invalidation_generation = self.snapshot_invalidation_generation,
+            .sequence = self.next_linearizable_snapshot_sequence,
+        };
+    }
+
+    fn linearizableSnapshotCapabilitySuppressed(
+        self: *RemoteMetadataSource,
+        index: usize,
+        now_ns: u64,
+    ) bool {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.linearizable_snapshot_unsupported_until_ns[index] > now_ns;
+    }
+
+    fn noteLinearizableSnapshotUnsupported(self: *RemoteMetadataSource, index: usize, now_ns: u64) void {
+        lockAtomic(&self.cache_mutex);
+        self.linearizable_snapshot_unsupported_until_ns[index] = now_ns +|
+            remote_metadata_linearizable_snapshot_capability_retry_ns;
+        self.cache_mutex.unlock();
+    }
+
+    fn noteLinearizableSnapshotSupported(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        self.linearizable_snapshot_unsupported_until_ns[index] = 0;
         self.cache_mutex.unlock();
     }
 
     fn sameMetadataIncarnation(left: antfly.metadata_api.MetadataHead, right: antfly.metadata_api.MetadataHead) bool {
         return left.metadata_group_id == right.metadata_group_id and
             std.meta.eql(left.metadata_incarnation, right.metadata_incarnation);
-    }
-
-    fn monotonicMetadataHead(cached: antfly.metadata_api.MetadataHead, candidate: antfly.metadata_api.MetadataHead) antfly.metadata_api.MetadataHead {
-        if (sameMetadataIncarnation(cached, candidate) and cached.metadata_epoch > candidate.metadata_epoch) return cached;
-        return candidate;
     }
 
     fn snapshotHead(snapshot: *const antfly.metadata_api.AdminSnapshot) antfly.metadata_api.MetadataHead {
@@ -13999,19 +14829,38 @@ const RemoteMetadataSource = struct {
         };
     }
 
-    fn acceptMetadataIncarnation(
-        self: *RemoteMetadataSource,
+    fn requireValidMetadataIncarnation(
         candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
-    ) !void {
+    ) !antfly.metadata_api.MetadataClusterIncarnation {
         const incarnation = candidate orelse return error.MetadataIncarnationUnavailable;
         if (!antfly.metadata.incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
-        lockAtomic(&self.cache_mutex);
-        defer self.cache_mutex.unlock();
+        return incarnation;
+    }
+
+    fn acceptMetadataIdentityLocked(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        incarnation: antfly.metadata_api.MetadataClusterIncarnation,
+    ) !void {
+        if (self.metadata_group_id) |expected_group_id| {
+            if (expected_group_id != metadata_group_id) return error.MetadataGroupMismatch;
+        }
         if (self.metadata_incarnation) |expected| {
             if (!std.mem.eql(u8, &expected, &incarnation)) return error.MetadataIncarnationMismatch;
-            return;
         }
+        self.metadata_group_id = metadata_group_id;
         self.metadata_incarnation = incarnation;
+    }
+
+    fn acceptMetadataIdentity(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        candidate: ?antfly.metadata_api.MetadataClusterIncarnation,
+    ) !void {
+        const incarnation = try requireValidMetadataIncarnation(candidate);
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        try self.acceptMetadataIdentityLocked(metadata_group_id, incarnation);
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
@@ -14025,6 +14874,7 @@ const RemoteMetadataSource = struct {
         try ensureBudgetActive(budget);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
+        const observed_fence_generation = self.snapshot_fence_generation;
         if (@import("builtin").is_test) {
             if (self.test_faults.fetch_head_error) |err| {
                 self.cache_mutex.unlock();
@@ -14042,23 +14892,60 @@ const RemoteMetadataSource = struct {
         const head = try self.fetchRemoteHead(budget);
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
-        if (self.cached_head) |cached| {
-            const selected = monotonicMetadataHead(cached, head);
-            if (selected.metadata_epoch != head.metadata_epoch) return selected;
-        }
+        if (self.snapshot_fence_generation != observed_fence_generation)
+            return error.MetadataSnapshotHeadMismatch;
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
         return head;
     }
 
     fn invalidateCache(self: *RemoteMetadataSource) void {
+        var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
         lockAtomic(&self.cache_mutex);
-        defer self.cache_mutex.unlock();
-        if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        retired_snapshot = self.cached_snapshot;
         self.cached_snapshot = null;
         self.cached_head = null;
         self.cached_head_at_ms = 0;
         self.cached_snapshot_at_ms = 0;
+        self.snapshot_fence_generation +%= 1;
+        self.snapshot_invalidation_generation +%= 1;
+        self.cache_mutex.unlock();
+        if (retired_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+    }
+
+    fn acceptLinearizableSnapshot(
+        self: *RemoteMetadataSource,
+        snapshot: antfly.metadata_api.AdminSnapshot,
+        ticket: LinearizableSnapshotTicket,
+    ) !LinearizableSnapshotAcceptance {
+        const incarnation = try requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
+        lockAtomic(&self.cache_mutex);
+        if (self.snapshot_invalidation_generation != ticket.invalidation_generation) {
+            self.cache_mutex.unlock();
+            return error.MetadataSnapshotHeadMismatch;
+        }
+        self.acceptMetadataIdentityLocked(snapshot.status.metadata_group_id, incarnation) catch |err| {
+            self.cache_mutex.unlock();
+            return err;
+        };
+        if (ticket.sequence < self.published_linearizable_snapshot_sequence) {
+            self.cache_mutex.unlock();
+            return .superseded;
+        }
+        retired_snapshot = self.cached_snapshot;
+        self.cached_snapshot = snapshot;
+        self.cached_snapshot_at_ms = now_ms;
+        // MetadataHead.metadata_epoch is a content fingerprint while the
+        // snapshot status epoch is a lifecycle counter. Never mix them.
+        self.cached_head = null;
+        self.cached_head_at_ms = 0;
+        self.published_linearizable_snapshot_sequence = ticket.sequence;
+        self.snapshot_fence_generation +%= 1;
+        self.cache_mutex.unlock();
+        if (retired_snapshot) |*cached| freeAdminSnapshotOwned(self.alloc, cached);
+        return .published;
     }
 
     fn fetchSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
@@ -14111,10 +14998,12 @@ const RemoteMetadataSource = struct {
         try ensureBudgetActive(budget);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
+        const observed_fence_generation = self.snapshot_fence_generation;
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
-            if (sameMetadataIncarnation(cached_snapshot_head, head) and
-                cached_snapshot_head.metadata_epoch >= head.metadata_epoch and
+            if (self.cached_head != null and
+                std.meta.eql(self.cached_head.?, head) and
+                sameMetadataIncarnation(cached_snapshot_head, head) and
                 now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
             {
                 defer self.cache_mutex.unlock();
@@ -14124,11 +15013,21 @@ const RemoteMetadataSource = struct {
         self.cache_mutex.unlock();
 
         var fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
-        errdefer freeAdminSnapshotOwned(self.alloc, &fresh);
+        var fresh_owned = true;
+        defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
         const fresh_head = snapshotHead(&fresh);
 
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
+        // A fenced snapshot or mutation invalidation completed during I/O.
+        // Never let the older in-flight request overwrite that transition.
+        if (self.snapshot_fence_generation != observed_fence_generation) {
+            if (self.cached_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+            return error.MetadataSnapshotHeadMismatch;
+        }
+        if (self.cached_head) |current_head| {
+            if (!std.meta.eql(current_head, head)) return error.MetadataSnapshotHeadMismatch;
+        }
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
             // Concurrent follower reads may complete after a leader read.
@@ -14141,10 +15040,8 @@ const RemoteMetadataSource = struct {
         }
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.cached_snapshot = fresh;
-        self.cached_head = if (self.cached_head) |cached_head|
-            monotonicMetadataHead(cached_head, fresh_head)
-        else
-            fresh_head;
+        fresh_owned = false;
+        self.cached_head = head;
         self.cached_head_at_ms = now_ms;
         self.cached_snapshot_at_ms = now_ms;
         return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
@@ -14170,6 +15067,7 @@ const RemoteMetadataSource = struct {
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
+                .linearizable_snapshot = remoteLinearizableSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
@@ -14210,7 +15108,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14229,13 +15127,107 @@ const RemoteMetadataSource = struct {
         return try self.fetchRemoteHead(null);
     }
 
+    fn remoteLinearizableSnapshot(
+        ptr: *anyopaque,
+        request: antfly.public_api.operation.RequestContext,
+    ) !?antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const now_ns = platform_time.monotonicNs();
+        const local_deadline = now_ns +| remote_metadata_linearizable_snapshot_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |request_deadline|
+            @min(local_deadline, request_deadline)
+        else
+            local_deadline;
+        if (deadline_ns <= now_ns) return error.DeadlineExceeded;
+        var transport_cancellation: antfly.raft.transport.http_common.RequestCancellation = .{
+            .borrowed_context = request.cancellation.ptr,
+            .borrowed_is_cancelled = request.cancellation.is_cancelled_fn,
+        };
+        const budget = antfly.metadata_http_client.RequestBudget{
+            .deadline_ns = deadline_ns,
+            .cancellation = &transport_cancellation,
+        };
+        var last_err: anyerror = error.MissingMetadataApi;
+        var unsupported_count: usize = 0;
+        endpoint_attempts: for (0..self.base_uris.len) |attempt| {
+            try request.ensureActive();
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const attempt_now_ns = platform_time.monotonicNs();
+            if (self.linearizableSnapshotCapabilitySuppressed(index, attempt_now_ns)) {
+                unsupported_count += 1;
+                continue;
+            }
+            snapshot_attempts: for (0..2) |snapshot_attempt| {
+                const ticket = self.beginLinearizableSnapshot();
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(
+                    arena.allocator(),
+                    self.httpExecutor(),
+                );
+                var parsed = metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget) catch |err| {
+                    if (err == error.UnsupportedOperation) {
+                        self.noteLinearizableSnapshotUnsupported(index, platform_time.monotonicNs());
+                        unsupported_count += 1;
+                        continue :endpoint_attempts;
+                    }
+                    if (err == error.Cancelled) {
+                        if (request.cancellation.isCancelled()) return error.Canceled;
+                        return err;
+                    }
+                    if (err == error.Timeout) {
+                        if (request.deadline_ns) |request_deadline| {
+                            if (platform_time.monotonicNs() >= request_deadline) return error.DeadlineExceeded;
+                        }
+                        return error.MetadataLinearizableReadTimeout;
+                    }
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                defer parsed.deinit();
+                self.noteLinearizableSnapshotSupported(index);
+                _ = requireValidMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                var result = cloneAdminSnapshotOwned(self.alloc, parsed.value) catch |err| {
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                var result_owned = true;
+                defer if (result_owned) freeAdminSnapshotOwned(self.alloc, &result);
+                var cached = cloneAdminSnapshotOwned(self.alloc, parsed.value) catch |err| {
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                var cache_ownership_transferred = false;
+                defer if (!cache_ownership_transferred) freeAdminSnapshotOwned(self.alloc, &cached);
+                const acceptance = self.acceptLinearizableSnapshot(cached, ticket) catch |err| {
+                    if (err == error.MetadataSnapshotHeadMismatch and snapshot_attempt == 0) {
+                        continue :snapshot_attempts;
+                    }
+                    last_err = err;
+                    continue :endpoint_attempts;
+                };
+                cache_ownership_transferred = acceptance == .published;
+                self.noteMetadataReadSuccess(index);
+                result_owned = false;
+                return result;
+            }
+        }
+        try request.ensureActive();
+        if (unsupported_count == self.base_uris.len) return null;
+        return last_err;
+    }
+
     fn fetchRemoteHead(
         self: *RemoteMetadataSource,
         budget: ?antfly.metadata_http_client.RequestBudget,
     ) !antfly.metadata_api.MetadataHead {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataApiIndexForAttempt(attempt);
+            const index = self.metadataReadApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -14245,10 +15237,11 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(head.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
+            self.noteMetadataReadSuccess(index);
             return head;
         }
         return last_err;
@@ -14258,7 +15251,7 @@ const RemoteMetadataSource = struct {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataApiIndexForAttempt(attempt);
+            const index = self.metadataReadApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -14267,10 +15260,11 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.acceptMetadataIncarnation(status.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(status.metadata_group_id, status.metadata_incarnation) catch |err| {
                 last_err = err;
                 continue;
             };
+            self.noteMetadataReadSuccess(index);
             return status;
         }
         return last_err;
@@ -14290,7 +15284,7 @@ const RemoteMetadataSource = struct {
     ) !antfly.metadata_api.AdminSnapshot {
         var last_err: anyerror = error.MissingMetadataApi;
         for (0..self.base_uris.len) |attempt| {
-            const index = self.metadataApiIndexForAttempt(attempt);
+            const index = self.metadataReadApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -14301,7 +15295,10 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
-            self.acceptMetadataIncarnation(parsed.value.status.metadata_incarnation) catch |err| {
+            self.acceptMetadataIdentity(
+                parsed.value.status.metadata_group_id,
+                parsed.value.status.metadata_incarnation,
+            ) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -14313,6 +15310,7 @@ const RemoteMetadataSource = struct {
                 last_err = error.MetadataSnapshotHeadMismatch;
                 continue;
             }
+            self.noteMetadataReadSuccess(index);
             return try cloneAdminSnapshotOwned(self.alloc, parsed.value);
         }
         return last_err;
@@ -15120,7 +16118,31 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .repair_status = index.index_repair_status,
+        .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
+}
+
+test "data runtime report preserves compact managed repair admission state" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .index_repair_status = .waiting,
+        .index_repair_active_generation_serviceable = false,
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
+    try std.testing.expect(!report.repair_active_generation_serviceable);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        encoded,
+    );
 }
 
 fn progressMillis(progress: f64) u16 {
@@ -15299,7 +16321,23 @@ fn storeRegistrationVisible(
         if (!std.mem.eql(u8, store.role, record.role)) continue;
         if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
         if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
+        // A zero committed incarnation is a legacy rolling-upgrade record.
+        // Once v13 is active, registration visibility requires the exact
+        // process incarnation and stale processes lose report authority.
+        if (store.reporter_incarnation != 0 and
+            store.reporter_incarnation != record.reporter_incarnation) continue;
         return true;
+    }
+    return false;
+}
+
+fn storeReporterIncarnationVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    store_id: u64,
+    reporter_incarnation: u64,
+) bool {
+    for (stores) |store| {
+        if (store.store_id == store_id) return store.reporter_incarnation == reporter_incarnation;
     }
     return false;
 }
@@ -16490,6 +17528,18 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+fn storageMemoryLimitSource(
+    source: process_memory_budget.EffectiveSource,
+) antfly.public_api.MemoryLimitSource {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -16520,6 +17570,15 @@ pub fn runFromIterator(
         cli.raft_tick_ms,
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
+    const process_memory_resolution = process_memory_budget.resolveSystemDetailed(
+        cli.process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        null,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -16635,6 +17694,8 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
@@ -16663,6 +17724,17 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
+    std.log.info(
+        "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            data_server.provisioned_storage.effective_memory_limit_bytes,
+            managed_memory.hard_limit_bytes,
+        },
+    );
     try data_server.start();
 
     const base_uri = try data_server.baseUri(alloc);
@@ -16832,6 +17904,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--control-tick-ms")) {
             cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb")) {
+            cfg.process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -17144,6 +18220,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --failure-domain <name>        Registered store failure domain
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
+        \\  --process-memory-budget-mb <n> Whole-process host-memory envelope (0: auto-detect)
         \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -17844,6 +18921,8 @@ test "data runtime parses optional split store registration flags" {
         "data",
         "--failure-domain",
         "rack-a",
+        "--process-memory-budget-mb",
+        "0",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var parsed = try parseCli(std.testing.allocator, &iter);
@@ -17854,6 +18933,11 @@ test "data runtime parses optional split store registration flags" {
     try std.testing.expectEqual(@as(u64, 21), parsed.store_id.?);
     try std.testing.expectEqualStrings("data", parsed.store_role.?);
     try std.testing.expectEqualStrings("rack-a", parsed.failure_domain.?);
+    try std.testing.expectEqual(@as(?usize, 0), parsed.process_memory_budget_mb);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try process_memory_budget.resolve(parsed.process_memory_budget_mb, "invalid", null),
+    );
 }
 
 test "data runtime accepts repeated metadata api flags" {
@@ -25563,6 +26647,181 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
 }
 
+test "raft proposal materializes a default batch timestamp exactly once" {
+    const alloc = std.testing.allocator;
+    const materialized = DataServer.materializeRaftBatchTimestamp(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+    });
+    try std.testing.expect(materialized.timestamp_ns != 0);
+
+    const rematerialized = DataServer.materializeRaftBatchTimestamp(materialized);
+    try std.testing.expectEqual(materialized.timestamp_ns, rematerialized.timestamp_ns);
+
+    const encoded = try data_raft_batch.encode(alloc, "docs", rematerialized);
+    defer alloc.free(encoded);
+    var decoded = try data_raft_batch.decode(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(materialized.timestamp_ns, decoded.batch.req.timestamp_ns);
+
+    const explicit = DataServer.materializeRaftBatchTimestamp(.{ .timestamp_ns = 123 });
+    try std.testing.expectEqual(@as(u64, 123), explicit.timestamp_ns);
+
+    const legacy = DataServer.raftBatchRequestForProtocol(explicit, false);
+    try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);
+    const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true);
+    try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
+}
+
+test "raft batch protocol preflight fingerprint fences every applying replica set" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var outgoing = [_]u64{ 1, 2, 4 };
+    var learners = [_]u64{5};
+    var learners_next = [_]u64{6};
+    const base: raft_engine.core.ConfState = .{
+        .voters = &voters,
+        .voters_outgoing = &outgoing,
+        .learners = &learners,
+        .learners_next = &learners_next,
+    };
+    const fingerprint = DataServer.dataRaftConfStateFingerprint(base);
+    try std.testing.expectEqual(fingerprint, DataServer.dataRaftConfStateFingerprint(base));
+
+    learners_next[0] = 7;
+    try std.testing.expect(fingerprint != DataServer.dataRaftConfStateFingerprint(base));
+}
+
+test "raft batch protocol plan resolves only current group applying peers" {
+    const alloc = std.testing.allocator;
+    var resolver = antfly.raft.MemoryPeerResolver.init(alloc);
+    defer resolver.deinit();
+    for ([_]u64{ 2, 3, 4, 5 }) |node_id| {
+        var route_buf: [64]u8 = undefined;
+        const route = try std.fmt.bufPrint(&route_buf, "http://raft-node-{d}", .{node_id});
+        try resolver.upsert(77, node_id, &.{.{ .protocol = .http, .address = route }});
+    }
+    try resolver.upsert(88, 99, &.{.{ .protocol = .http, .address = "http://unrelated" }});
+
+    var raft: antfly.raft.ManagedHttpHostService = undefined;
+    var http_host: antfly.raft.HttpHost = undefined;
+    raft.host.http_host = &http_host;
+    http_host.deps.host.peer_resolver = resolver.resolver();
+    var server: DataServer = undefined;
+
+    var voters = [_]u64{ 1, 2 };
+    var outgoing = [_]u64{ 1, 3 };
+    var learners = [_]u64{4};
+    var learners_next = [_]u64{5};
+    const conf_state: raft_engine.core.ConfState = .{
+        .voters = &voters,
+        .voters_outgoing = &outgoing,
+        .learners = &learners,
+        .learners_next = &learners_next,
+    };
+    var plan = try server.dataRaftProtocolProbePlanLocked(alloc, &raft, 77, conf_state, 1);
+    defer plan.deinit(alloc);
+    try std.testing.expect(plan.routes_complete);
+    try std.testing.expectEqual(@as(usize, 4), plan.peers.len);
+    for (plan.peers, 0..) |peer, i| {
+        try std.testing.expectEqual(@as(u64, 2) + i, peer.node_id);
+        try std.testing.expect(std.mem.indexOf(u8, peer.raft_url, "unrelated") == null);
+    }
+
+    learners_next[0] = 6;
+    var incomplete = try server.dataRaftProtocolProbePlanLocked(alloc, &raft, 77, conf_state, 1);
+    defer incomplete.deinit(alloc);
+    try std.testing.expect(!incomplete.routes_complete);
+}
+
+test "raft batch protocol cache reuses only short lived negative evidence" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = undefined;
+    server.alloc = alloc;
+    server.data_raft_protocol_capability_mutex = .unlocked;
+    server.data_raft_protocol_capabilities = .empty;
+    defer {
+        var it = server.data_raft_protocol_capabilities.valueIterator();
+        while (it.next()) |entry| alloc.destroy(entry.*);
+        server.data_raft_protocol_capabilities.deinit(alloc);
+    }
+
+    const first = try server.dataRaftProtocolCapabilityEntry(2);
+    const second = try server.dataRaftProtocolCapabilityEntry(3);
+    try std.testing.expect(first != second);
+
+    const endpoint_hash = std.hash.Wyhash.hash(0x552fba325614bacb, "http://node-2");
+    first.* = .{
+        .protocol_version = data_raft_batch.protocol_version,
+        .checked_at_ns = 200,
+        .endpoint_hash = endpoint_hash,
+    };
+    try std.testing.expect(
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash, 200) == null,
+    );
+
+    first.protocol_version = 0;
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash, 201).?,
+    );
+    try std.testing.expect(
+        DataServer.reusableDataRaftProtocolCapability(first, endpoint_hash +% 1, 201) == null,
+    );
+
+    lockAtomic(&first.probe_mutex);
+    defer first.probe_mutex.unlock();
+    try std.testing.expect(second.probe_mutex.tryLock());
+    second.probe_mutex.unlock();
+}
+
+test "raft batch protocol activation is reusable only in its accepted leader term" {
+    var entry: DataRaftProtocolActivationEntry = .{};
+    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
+
+    entry.pending_term.store(7, .release);
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
+    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+
+    entry.protocol_version.store(data_raft_batch.timestamp_protocol_version, .release);
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+}
+
+test "raft batch protocol activation cleanup preserves in flight references" {
+    const alloc = std.testing.allocator;
+    var server: DataServer = undefined;
+    server.alloc = alloc;
+    server.data_raft_protocol_activation_mutex = .unlocked;
+    server.data_raft_protocol_activations = .empty;
+    server.data_raft_protocol_activation_cleanup_needed = .init(false);
+    defer {
+        var it = server.data_raft_protocol_activations.valueIterator();
+        while (it.next()) |entry| entry.*.release(alloc);
+        server.data_raft_protocol_activations.deinit(alloc);
+    }
+
+    const retired = try server.dataRaftProtocolActivationEntry(11);
+    const retained = try server.dataRaftProtocolActivationEntry(12);
+    defer retained.release(alloc);
+    retired.protocol_version.store(data_raft_batch.timestamp_protocol_version, .release);
+
+    server.retainDataRaftProtocolActivationGroups(&.{12});
+    try std.testing.expectEqual(@as(usize, 1), server.data_raft_protocol_activations.count());
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == null);
+    try std.testing.expect(server.data_raft_protocol_activations.get(12) == retained);
+    // Cleanup released only the map reference. The request can safely finish
+    // its lock-free activation read before releasing the final reference.
+    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(retired, 99));
+
+    // A stale request must not unlink a replacement installed for the same
+    // group after exact-placement cleanup.
+    const replacement = try server.dataRaftProtocolActivationEntry(11);
+    server.unlinkDataRaftProtocolActivationEntry(11, retired);
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == replacement);
+    server.unlinkDataRaftProtocolActivationEntry(11, replacement);
+    try std.testing.expect(server.data_raft_protocol_activations.get(11) == null);
+    replacement.release(alloc);
+    retired.release(alloc);
+}
+
 test "data server mirrors managed primary writes into HA replication log" {
     const alloc = std.testing.allocator;
     const FakeStatus = struct {
@@ -27818,14 +29077,15 @@ test "remote metadata source pins one cluster incarnation across cache invalidat
     );
     defer source.deinit();
 
-    try source.acceptMetadataIncarnation(first);
+    try source.acceptMetadataIdentity(9, first);
     source.invalidateCache();
-    try source.acceptMetadataIncarnation(first);
-    try std.testing.expectError(error.MetadataIncarnationMismatch, source.acceptMetadataIncarnation(foreign));
-    try std.testing.expectError(error.MetadataIncarnationUnavailable, source.acceptMetadataIncarnation(null));
+    try source.acceptMetadataIdentity(9, first);
+    try std.testing.expectError(error.MetadataGroupMismatch, source.acceptMetadataIdentity(10, first));
+    try std.testing.expectError(error.MetadataIncarnationMismatch, source.acceptMetadataIdentity(9, foreign));
+    try std.testing.expectError(error.MetadataIncarnationUnavailable, source.acceptMetadataIdentity(9, null));
     try std.testing.expectError(
         error.InvalidMetadataIncarnation,
-        source.acceptMetadataIncarnation(antfly.metadata.incarnation.zero),
+        source.acceptMetadataIdentity(9, antfly.metadata.incarnation.zero),
     );
 }
 
@@ -27841,34 +29101,163 @@ test "remote metadata source retains mutation authority across cache invalidatio
 
     source.noteMetadataAuthoritySuccess(2);
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+    try std.testing.expectEqual(@as(usize, 2), source.metadataReadApiIndexForAttempt(0));
     try std.testing.expectEqual(@as(usize, 0), source.metadataApiIndexForAttempt(1));
     try std.testing.expectEqual(@as(usize, 1), source.metadataApiIndexForAttempt(2));
 
     source.cached_head = .{ .metadata_group_id = 9, .metadata_epoch = 17 };
     source.invalidateCache();
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+    try std.testing.expect(source.statusSource().vtable.linearizable_snapshot != null);
+
+    source.noteMetadataReadSuccess(1);
+    try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+    try std.testing.expectEqual(@as(usize, 1), source.metadataReadApiIndexForAttempt(0));
 }
 
-test "remote metadata cache orders heads monotonically within an incarnation" {
-    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
-    const older = antfly.metadata_api.MetadataHead{
-        .metadata_group_id = 9,
-        .metadata_incarnation = incarnation,
-        .metadata_epoch = 16,
-    };
-    const newer = antfly.metadata_api.MetadataHead{
-        .metadata_group_id = 9,
-        .metadata_incarnation = incarnation,
-        .metadata_epoch = 17,
-    };
-    try std.testing.expect(RemoteMetadataSource.sameMetadataIncarnation(older, newer));
-    try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(newer, older));
-    try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(older, newer));
+test "remote metadata source installs fenced snapshot without comparing epoch domains" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
 
-    var foreign = newer;
-    foreign.metadata_group_id = 10;
-    try std.testing.expect(!RemoteMetadataSource.sameMetadataIncarnation(newer, foreign));
-    try std.testing.expectEqual(foreign, RemoteMetadataSource.monotonicMetadataHead(newer, foreign));
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    // Head epochs are content fingerprints and can be arbitrarily larger
+    // than the lifecycle counter carried by AdminSnapshot.status.
+    source.cached_head = .{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = std.math.maxInt(u64),
+    };
+    const fenced = antfly.metadata_api.AdminSnapshot{
+        .status = .{
+            .metadata_group_id = 9,
+            .metadata_incarnation = incarnation,
+            .metadata_epoch = 1,
+            .metrics = .{},
+        },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const owned = try cloneAdminSnapshotOwned(std.testing.allocator, fenced);
+    try std.testing.expectEqual(
+        RemoteMetadataSource.LinearizableSnapshotAcceptance.published,
+        try source.acceptLinearizableSnapshot(owned, source.beginLinearizableSnapshot()),
+    );
+
+    try std.testing.expect(source.cached_head == null);
+    try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot.?.status.metadata_epoch);
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+}
+
+test "remote metadata source rejects fenced snapshot across mutation invalidation" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const fenced = antfly.metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    var owned = try cloneAdminSnapshotOwned(std.testing.allocator, fenced);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &owned);
+    const ticket = source.beginLinearizableSnapshot();
+    source.invalidateCache();
+
+    try std.testing.expectError(
+        error.MetadataSnapshotHeadMismatch,
+        source.acceptLinearizableSnapshot(owned, ticket),
+    );
+    try std.testing.expect(source.cached_snapshot == null);
+    try std.testing.expect(source.metadata_group_id == null);
+    try std.testing.expect(source.metadata_incarnation == null);
+    try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+}
+
+test "remote metadata source treats superseded concurrent fenced snapshot as success" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const newer = try cloneAdminSnapshotOwned(std.testing.allocator, .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 2, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+    var older = try cloneAdminSnapshotOwned(std.testing.allocator, .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+    defer freeAdminSnapshotOwned(std.testing.allocator, &older);
+
+    const older_ticket = source.beginLinearizableSnapshot();
+    const newer_ticket = source.beginLinearizableSnapshot();
+    try std.testing.expectEqual(
+        RemoteMetadataSource.LinearizableSnapshotAcceptance.published,
+        try source.acceptLinearizableSnapshot(newer, newer_ticket),
+    );
+    try std.testing.expectEqual(
+        RemoteMetadataSource.LinearizableSnapshotAcceptance.superseded,
+        try source.acceptLinearizableSnapshot(older, older_ticket),
+    );
+    try std.testing.expectEqual(@as(u64, 2), source.cached_snapshot.?.status.metadata_epoch);
+}
+
+test "remote metadata source bounds unsupported linearizable snapshot probes" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const now_ns: u64 = 123;
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
+    source.noteLinearizableSnapshotUnsupported(0, now_ns);
+    try std.testing.expect(source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(
+        0,
+        now_ns + remote_metadata_linearizable_snapshot_capability_retry_ns,
+    ));
+    source.noteLinearizableSnapshotSupported(0);
+    try std.testing.expect(!source.linearizableSnapshotCapabilitySuppressed(0, now_ns));
 }
 
 test "remote metadata source shares backend runtime io across a bounded executor pool" {
@@ -27901,6 +29290,11 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.Timeout));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteOutcomeUnknown));
+    // A peer's typed 202 proves the mutation committed. Preserve the pending
+    // visibility/repair result instead of reclassifying it as ambiguous and
+    // risking a transform replay.
+    try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.EnrichmentRetryInProgress));
+    try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.EnrichmentWorkerFailed));
     // The HTTP client converts an OOM observed after transmission begins into
     // RaftBatchWriteOutcomeUnknown. A raw OOM can only reach this classifier
     // when request setup was proven not to have sent bytes.

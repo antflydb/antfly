@@ -3384,6 +3384,40 @@ fn collectStatsBatched(
                     }
                 }
             },
+            .i64_val => {
+                for (0..reader.num_chunks) |ci| {
+                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
+                    defer alloc.free(doc_ids);
+                    const values = try reader.readI64Chunk(@intCast(ci));
+                    defer alloc.free(values);
+                    for (doc_ids, 0..) |did, vi| {
+                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
+                            fn cmp(key: u32, item: u32) std.math.Order {
+                                return std.math.order(key, item);
+                            }
+                        }.cmp) != null) {
+                            stats.collect(@floatFromInt(values[vi]));
+                        }
+                    }
+                }
+            },
+            .numeric_val => {
+                for (0..reader.num_chunks) |ci| {
+                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
+                    defer alloc.free(doc_ids);
+                    const values = try reader.readNumericChunk(@intCast(ci));
+                    defer alloc.free(values);
+                    for (doc_ids, 0..) |did, vi| {
+                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
+                            fn cmp(key: u32, item: u32) std.math.Order {
+                                return std.math.order(key, item);
+                            }
+                        }.cmp) != null) {
+                            stats.collect(typed_dv.numericValueAsF64(values[vi]));
+                        }
+                    }
+                }
+            },
             else => {
                 // Fallback for non-numeric types (shouldn't happen for stats)
                 for (local_ids.items) |lid| {
@@ -3410,6 +3444,14 @@ fn readF64ForDoc(
         .u64_val => {
             const v = try reader.getU64(resolved.local_id) orelse return null;
             return @floatFromInt(v);
+        },
+        .i64_val => {
+            const v = try reader.getI64(resolved.local_id) orelse return null;
+            return @floatFromInt(v);
+        },
+        .numeric_val => {
+            const v = try reader.getNumeric(resolved.local_id) orelse return null;
+            return typed_dv.numericValueAsF64(v);
         },
         else => null,
     };
@@ -4545,11 +4587,11 @@ test "search with stats aggregation" {
     defer alloc.free(inv_data);
 
     // Build typed doc values for a "price" field
-    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .numeric_val, 1024);
     defer dv_writer.deinit();
-    try dv_writer.add(0, .{ .f64_val = 10.0 });
-    try dv_writer.add(1, .{ .f64_val = 20.0 });
-    try dv_writer.add(2, .{ .f64_val = 30.0 });
+    try dv_writer.add(0, .{ .numeric_val = .{ .i64_val = 10 } });
+    try dv_writer.add(1, .{ .numeric_val = .{ .f64_val = 20.0 } });
+    try dv_writer.add(2, .{ .numeric_val = .{ .u64_val = 30 } });
     const dv_data = try dv_writer.build();
     defer alloc.free(dv_data);
 

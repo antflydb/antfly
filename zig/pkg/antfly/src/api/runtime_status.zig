@@ -1378,6 +1378,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
             .index_repair_last_error = index_repair_last_error,
             .index_repair_wait_reason = item.index_repair_wait_reason,
+            .index_repair_status = item.index_repair_status,
+            .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
             .projection_checkpoint_status = item.projection_checkpoint_status,
             .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
             .projection_checkpoint_generation = item.projection_checkpoint_generation,
@@ -2323,6 +2325,38 @@ test "table runtime snapshot cache rejects a late stale live observation" {
     defer docs.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache preserves active managed admission proof" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .index_repair_id = 1,
+        .index_repair_trigger = "projection_generation_invalid",
+        .index_repair_phase = "detected",
+        .index_repair_active_generation_serviceable = true,
+    }};
+    const status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{
+            .index_count = 1,
+            .indexes = &indexes,
+        },
+    };
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try publishGroupForTest(&cache, "docs", status),
+    );
+
+    var snapshot = (try cache.snapshot(alloc, "docs")).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.items[0].stats.indexes.len);
+    try std.testing.expect(snapshot.items[0].stats.indexes[0].index_repair_active_generation_serviceable);
 }
 
 test "table runtime snapshot cache invalidation fences a stale observed publisher" {

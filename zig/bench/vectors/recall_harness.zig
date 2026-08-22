@@ -37,6 +37,7 @@ const Config = struct {
     dataset_dir: []const u8,
     suite: Suite = .both,
     dataset_filter: ?[]const u8 = null,
+    metric: ?vec.DistanceMetric = null,
     bulk_build: bool = false,
     centroid_only_routing: bool = false,
     dump_query_index: ?usize = null,
@@ -115,6 +116,8 @@ fn parseArgs(args_in: std.process.Args) !Config {
             cfg.suite = parseSuite(raw) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--dataset")) {
             cfg.dataset_filter = args.next() orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--metric")) {
+            cfg.metric = parseMetric(args.next() orelse return error.InvalidArgument) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--bulk-build")) {
             cfg.bulk_build = true;
         } else if (std.mem.eql(u8, arg, "--centroid-only-routing")) {
@@ -184,34 +187,72 @@ fn runSuite(
             );
             return err;
         };
-        const case_ok = compareMetrics(case, actual);
+        const case_ok = compareMetrics(cfg, case, actual);
         all_ok = all_ok and case_ok;
 
-        std.debug.print(
-            "{s} dataset={s} randomize={any} count={d} topk={d} recall(E={d:.2} IP={d:.2} C={d:.2}) expected(E={d:.2} IP={d:.2} C={d:.2}) {s}\n",
-            .{
-                suite_name,
-                case.dataset,
-                case.randomize,
-                case.count,
-                case.top_k,
-                actual.euclidean,
-                actual.inner_product,
-                actual.cosine,
-                case.expected.euclidean,
-                case.expected.inner_product,
-                case.expected.cosine,
-                if (case_ok) "OK" else "MISMATCH",
-            },
-        );
+        if (cfg.metric) |metric| {
+            std.debug.print(
+                "{s} dataset={s} randomize={any} count={d} topk={d} metric={s} recall={d:.2} expected={d:.2} {s}\n",
+                .{
+                    suite_name,
+                    case.dataset,
+                    case.randomize,
+                    case.count,
+                    case.top_k,
+                    @tagName(metric),
+                    metricValue(actual, metric),
+                    metricValue(case.expected, metric),
+                    if (case_ok) "OK" else "MISMATCH",
+                },
+            );
+        } else {
+            std.debug.print(
+                "{s} dataset={s} randomize={any} count={d} topk={d} recall(E={d:.2} IP={d:.2} C={d:.2}) expected(E={d:.2} IP={d:.2} C={d:.2}) {s}\n",
+                .{
+                    suite_name,
+                    case.dataset,
+                    case.randomize,
+                    case.count,
+                    case.top_k,
+                    actual.euclidean,
+                    actual.inner_product,
+                    actual.cosine,
+                    case.expected.euclidean,
+                    case.expected.inner_product,
+                    case.expected.cosine,
+                    if (case_ok) "OK" else "MISMATCH",
+                },
+            );
+        }
     }
     return all_ok;
 }
 
-fn compareMetrics(case: RecallCase, actual: common.MetricStats) bool {
+fn compareMetrics(cfg: Config, case: RecallCase, actual: common.MetricStats) bool {
+    if (cfg.metric) |metric| {
+        return approxEq(metricValue(actual, metric), metricValue(case.expected, metric), case.tolerance);
+    }
     return approxEq(actual.euclidean, case.expected.euclidean, case.tolerance) and
         approxEq(actual.inner_product, case.expected.inner_product, case.tolerance) and
         approxEq(actual.cosine, case.expected.cosine, case.tolerance);
+}
+
+fn metricValue(stats: common.MetricStats, metric: vec.DistanceMetric) f64 {
+    return switch (metric) {
+        .l2_squared => stats.euclidean,
+        .inner_product => stats.inner_product,
+        .cosine => stats.cosine,
+    };
+}
+
+fn singleMetricStats(metric: vec.DistanceMetric, value: f64) common.MetricStats {
+    var stats: common.MetricStats = .{ .euclidean = 0, .inner_product = 0, .cosine = 0 };
+    switch (metric) {
+        .l2_squared => stats.euclidean = value,
+        .inner_product => stats.inner_product = value,
+        .cosine => stats.cosine = value,
+    }
+    return stats;
 }
 
 fn approxEq(actual: f64, expected: f64, tolerance: f64) bool {
@@ -232,7 +273,6 @@ fn convertedDatasetName(alloc: std.mem.Allocator, gob_name: []const u8) ![]u8 {
 }
 
 fn runQuantizerCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: []const u8, case: RecallCase) !common.MetricStats {
-    _ = cfg;
     std.debug.print("recall_harness_load_start suite=quantizer dataset={s} path={s}\n", .{ case.dataset, dataset_path });
     var loaded = try common.loadVectorSet(io, alloc, dataset_path);
     defer loaded.deinit(alloc);
@@ -256,6 +296,12 @@ fn runQuantizerCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_p
         std.debug.print("recall_harness_randomize_done suite=quantizer dataset={s}\n", .{case.dataset});
     }
 
+    if (cfg.metric) |metric| {
+        return singleMetricStats(
+            metric,
+            100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, metric),
+        );
+    }
     const euclidean = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .l2_squared);
     const inner_product = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .inner_product);
     const cosine = 100.0 * try calculateQuantizerRecallMetric(alloc, case.dataset, split, case.top_k, .cosine);
@@ -381,6 +427,12 @@ fn runHBCCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config, dataset_path: [
         }
     }
 
+    if (cfg.metric) |metric| {
+        return singleMetricStats(
+            metric,
+            100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, metric, cfg.bulk_build, cfg.centroid_only_routing),
+        );
+    }
     const euclidean = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .l2_squared, cfg.bulk_build, cfg.centroid_only_routing);
     const inner_product = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .inner_product, cfg.bulk_build, cfg.centroid_only_routing);
     const cosine = 100.0 * try calculateHBCRecallMetric(alloc, case.dataset, split, case.top_k, case.randomize, .cosine, cfg.bulk_build, cfg.centroid_only_routing);

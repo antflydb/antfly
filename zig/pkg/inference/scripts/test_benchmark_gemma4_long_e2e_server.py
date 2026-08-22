@@ -1795,10 +1795,13 @@ class HarnessIntegrationTests(unittest.TestCase):
                 evidence["contract"]["reference_prompt_sha256"],
                 evidence["rows"][0]["llama_cpp"]["prompt_template"]["sha256"],
             )
-            self.assertGreaterEqual(
-                evidence["rows"][0]["antfly"]["decode_ms"]
-                - evidence["rows"][0]["antfly"]["visible_content_ms"],
-                10.0,
+            # The terminal usage event must extend decode timing past the last
+            # visible token. Do not assert a minimum wall-clock gap here: the
+            # client can spend an arbitrary portion of the fake server's delay
+            # parsing the already-buffered token events under CI load.
+            self.assertGreater(
+                evidence["rows"][0]["antfly"]["decode_ms"],
+                evidence["rows"][0]["antfly"]["visible_content_ms"],
             )
             self.assertGreaterEqual(evidence["rows"][0]["antfly"]["stream_tail_ms"], 0.0)
             self.assertAlmostEqual(

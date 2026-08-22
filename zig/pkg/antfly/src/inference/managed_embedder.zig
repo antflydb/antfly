@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -46,7 +47,6 @@ const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
-const runtime_error_abi = @import("../runtime_error_abi.zig");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -74,7 +74,7 @@ pub const EmbeddingRequestContext = struct {
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
-    boundary_dispatch: runtime_callback_abi.CallbackDispatch = &antflyProviderBoundaryDispatch,
+    boundary_dispatch: runtime_callback_abi.CallbackDispatch = AntflyProviderBoundary.local_dispatch,
     embed_dense_texts: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -161,18 +161,14 @@ pub const AntflyProvider = struct {
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
-fn antflyProviderBoundaryDispatch(
-    contract: *const @import("../runtime_native_abi.zig").CallContract,
-    callback: *const anyopaque,
-    args: *const anyopaque,
-    output: ?*anyopaque,
-) callconv(.c) runtime_error_abi.Status {
-    return AntflyProviderBoundary.local_dispatch(contract, callback, args, output);
-}
-
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
+    /// The supplied I/O executor can run the provider request and its timeout
+    /// watchdog concurrently. Keep this explicit: merely having an Io value
+    /// does not imply concurrency (query probes often use the global
+    /// single-threaded executor).
+    bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -195,6 +191,7 @@ const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
 const pacing_cancellation_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
+const max_embedding_request_timeout_ns: u64 = max_embedding_request_timeout_ms * std.time.ns_per_ms;
 const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
@@ -397,6 +394,7 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
+    bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     index_name: []u8,
@@ -658,6 +656,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_parts_fn = embedDenseParts,
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
+            .foreground_bounded = self.denseForegroundBounded(),
         };
     }
 
@@ -667,7 +666,24 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_fn = embedSparse,
             .sparse_embed_batch_fn = embedSparseBatch,
             .deinit_fn = deinitSparseEmbedder,
+            .foreground_bounded = self.sparseForegroundBounded(),
         };
+    }
+
+    fn denseForegroundBounded(self: *const ManagedEmbedder) bool {
+        for (self.entries) |*entry| {
+            if (entry.sparse) continue;
+            if (!entryForegroundBounded(entry, false)) return false;
+        }
+        return true;
+    }
+
+    fn sparseForegroundBounded(self: *const ManagedEmbedder) bool {
+        for (self.entries) |*entry| {
+            if (!entry.sparse) continue;
+            if (!entryForegroundBounded(entry, true)) return false;
+        }
+        return true;
     }
 
     pub fn createDenseEmbedder(alloc: std.mem.Allocator, indexes_json: []const u8) !?db_embedder.DenseEmbedder {
@@ -949,7 +965,7 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
     try ensureEntryDeadline(entry);
     const pacer = entry.pacer orelse return;
-    try pacer.acquire(embeddingIo(entry), entry.deadline_ns, entry.cancellation);
+    try pacer.acquire(embeddingIo(entry), embeddingOperationDeadline(entry), entry.cancellation);
     try ensureEntryDeadline(entry);
 }
 
@@ -958,7 +974,11 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
 }
 
 fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
-    return .{ .io = embeddingIo(entry), .deadline_ns = entry.deadline_ns, .cancellation = entry.cancellation };
+    return .{ .io = embeddingIo(entry), .deadline_ns = embeddingOperationDeadline(entry), .cancellation = entry.cancellation };
+}
+
+fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
+    return entry.deadline_ns orelse monotonicNowNs() +| max_embedding_request_timeout_ns;
 }
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
@@ -972,7 +992,7 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         .keep_alive = false,
         .max_response_size = 4 << 20,
     };
-    const deadline = entry.deadline_ns orelse return config;
+    const deadline = embeddingOperationDeadline(entry);
     const now_ns = monotonicNowNs();
     if (now_ns >= deadline) return error.Timeout;
     const remaining_ns = deadline - now_ns;
@@ -981,8 +1001,30 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
     );
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
-    config.timeouts.request_ms = timeout_ms;
+    // The whole-request watchdog needs Io.concurrent. Manual/embedded owners
+    // deliberately use the single-threaded fallback executor, so retain finite
+    // connect/read/write timeouts there without attempting an unsupported
+    // watchdog. Their provider interface does not advertise a hard foreground
+    // bound and synchronous enrichment therefore fails closed before invoking
+    // it; supervised background replay remains backwards compatible.
+    if (entry.bounded_http_request) config.timeouts.request_ms = timeout_ms;
     return config;
+}
+
+fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
+    if (isAntflyProvider(entry.provider)) {
+        if (entry.antfly_provider) |local| {
+            if (sparse) return false;
+            if (local.embed_dense_texts_with_context == null) return false;
+            if (entry.multimodal and local.embed_dense_parts_with_context == null)
+                return false;
+            return true;
+        }
+    }
+    // Remote providers enforce a whole-request deadline only when the owner
+    // supplied an executor capable of running the request and watchdog
+    // concurrently.
+    return entry.bounded_http_request;
 }
 
 pub fn testEmbeddingProviderDeadlines() !void {
@@ -1014,6 +1056,8 @@ pub fn testEmbeddingProviderDeadlines() !void {
     ;
     const expired_deadline = monotonicNowNs();
     var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator, indexes_json, .{
+        .io = io,
+        .bounded_http_request = true,
         .deadline_ns = expired_deadline,
     });
     defer managed.deinit();
@@ -1021,7 +1065,7 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expectError(error.Timeout, embeddingHttpClientConfig(&managed.entries[0]));
     const render_config = queryTemplateRenderConfig(&managed.entries[0]);
     if (comptime @hasField(template_remote.RenderConfig, "io")) {
-        try std.testing.expect(render_config.io == null);
+        try std.testing.expect(render_config.io != null);
     }
     if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
         try std.testing.expectEqual(expired_deadline, render_config.deadline_ns.?);
@@ -1036,6 +1080,13 @@ pub fn testEmbeddingProviderDeadlines() !void {
     try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
     try std.testing.expect(config.timeouts.request_ms > 0);
     try std.testing.expect(config.timeouts.request_ms <= 5_000);
+
+    var manual = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, indexes_json);
+    defer manual.deinit();
+    const manual_config = try embeddingHttpClientConfig(&manual.entries[0]);
+    try std.testing.expectEqual(@as(u64, 0), manual_config.timeouts.request_ms);
+    try std.testing.expect(manual_config.timeouts.connect_ms > 0);
+    try std.testing.expect(!manual.denseInterface().foreground_bounded);
 
     const Local = struct {
         context_calls: usize = 0,
@@ -1130,6 +1181,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1172,6 +1224,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer out.deinit(alloc);
             try out.appendSlice(alloc, "{\"field\":");
             try appendJsonString(alloc, &out, source_field);
+            try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
             try appendExecutionObjectIfPresent(alloc, &out, root);
             try out.append(alloc, '}');
             return try out.toOwnedSlice(alloc);
@@ -1190,6 +1243,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
         try out.appendSlice(alloc, "{\"field\":");
         try appendJsonString(alloc, &out, source_field);
+        try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
         if (cfg.top_k) |top_k| {
             try out.appendSlice(alloc, ",\"top_k\":");
             const top_k_json = try std.fmt.allocPrint(alloc, "{d}", .{top_k});
@@ -1264,6 +1318,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
 
     if (artifact_embedding_name != null) {
         if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
@@ -1299,7 +1354,64 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+fn normalizeAntflyChunkerDefaultModelJson(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]u8 {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const type_value = root.get("type") orelse return null;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) return null;
+
+    const chunker = switch (root.get("chunker") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const provider = chunker.get("provider") orelse return null;
+    if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) return null;
+    // Preserve explicit values, including null, so validation can reject them
+    // instead of silently changing caller intent.
+    if (chunker.get("model") != null) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first_root_field = true;
+    var root_it = root.iterator();
+    while (root_it.next()) |entry| {
+        if (!first_root_field) try out.append(alloc, ',');
+        first_root_field = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        if (!std.mem.eql(u8, entry.key_ptr.*, "chunker")) {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            continue;
+        }
+
+        try out.append(alloc, '{');
+        var first_chunker_field = true;
+        var chunker_it = chunker.iterator();
+        while (chunker_it.next()) |chunker_entry| {
+            if (!first_chunker_field) try out.append(alloc, ',');
+            first_chunker_field = false;
+            try appendJsonString(alloc, &out, chunker_entry.key_ptr.*);
+            try out.append(alloc, ':');
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(chunker_entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+        if (!first_chunker_field) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"model\":\"fixed\"}");
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     value: std.json.Value,
@@ -1326,9 +1438,8 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
         if (!sparse) _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
         return null;
     }
-    const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
-
     if (sparse) {
+        const embedder = embedder_value orelse return error.InvalidCreateTableRequest;
         if (validation_value != null) return error.InvalidCreateTableRequest;
         try validateSparseEmbeddingForManagedConfig(alloc, index_name, cfg, embedder, options);
         return null;
@@ -1336,6 +1447,15 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
 
     const declared_dims = try resolveDeclaredEmbeddingDimensions(cfg);
     if (validation == .defer_probe and declared_dims == null) return error.InvalidCreateTableRequest;
+    // Chunker-only dense indexes consume caller-supplied chunk embeddings and
+    // have no embedding provider to probe. Their declared dimension remains
+    // authoritative; the subsequent config translation validates that a
+    // chunker is actually present.
+    const embedder = embedder_value orelse {
+        if (validation_value != null) return error.InvalidCreateTableRequest;
+        _ = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+        return null;
+    };
     const dims = try resolveEmbeddingDimensionsForManagedConfigWithValidation(alloc, index_name, cfg, embedder, options, validation);
     if (cfg.dimension != null and validation_value == null) return null;
 
@@ -1362,6 +1482,25 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    options: InitOptions,
+) !?[]u8 {
+    if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(alloc, index_name, value, options)) |normalized_dimension| {
+        errdefer alloc.free(normalized_dimension);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized_dimension, .{});
+        defer parsed.deinit();
+        if (try normalizeAntflyChunkerDefaultModelJson(alloc, parsed.value)) |normalized_defaults| {
+            alloc.free(normalized_dimension);
+            return normalized_defaults;
+        }
+        return normalized_dimension;
+    }
+    return try normalizeAntflyChunkerDefaultModelJson(alloc, value);
 }
 
 fn parseManagedEmbeddingEntry(
@@ -1461,6 +1600,7 @@ fn buildManagedEmbeddingEntry(
     return .{
         .alloc = alloc,
         .io = options.io,
+        .bounded_http_request = options.bounded_http_request,
         .deadline_ns = options.deadline_ns,
         .cancellation = options.cancellation,
         .index_name = owned_index_name,
@@ -2554,6 +2694,16 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
+fn appendCoveragePolicyIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: ?indexes_openapi.DerivedCoveragePolicy,
+) !void {
+    const value = policy orelse return;
+    try out.appendSlice(alloc, ",\"coverage_policy\":");
+    try appendJsonString(alloc, out, @tagName(value));
+}
+
 fn appendExecutionObjectIfPresent(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2791,6 +2941,29 @@ test "managed embedder rejects invalid execution batch policy" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+}
+
+test "managed embedder preserves coverage policy in storage config" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","coverage_policy":"partial","template":"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(
+        std.testing.allocator,
+        "thumbnail",
+        parsed.value,
+        .{ .antfly_provider = local.provider() },
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{"field":"body","dims":384,"embedding_name":"thumbnail","coverage_policy":"partial"}
+    ,
+        config_json,
+    );
 }
 
 test "managed embedder rejects unsupported execution namespaces" {
@@ -3500,6 +3673,42 @@ test "managed embedder defers operational dimension probe failure with explicit 
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
 }
 
+fn testChunkerOnlyDenseIndexPreservesDeclaredDimensions() !void {
+    const alloc = std.testing.allocator;
+    const index_json =
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        parsed.value,
+        .{},
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        \\{"type":"embeddings","field":"body","dimension":3,"chunker":{"provider":"antfly","model":"fixed","store_chunks":false,"text":{"target_tokens":4,"separator":" "}}}
+    ,
+        normalized,
+    );
+
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer normalized_parsed.deinit();
+
+    const translated = try translateEmbeddingsIndexConfigJsonWithOptions(
+        alloc,
+        "semantic_chunked_idx",
+        normalized_parsed.value,
+        .{},
+    );
+    defer alloc.free(translated);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"dims\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, translated, "\"chunker\":") != null);
+}
+
 test "managed embedder strict dimension probe failure is retryable" {
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
 }
@@ -3509,6 +3718,7 @@ pub fn testDimensionProbeValidationModes() !void {
     try testManagedEmbedderDefersOperationalDimensionProbeFailure();
     try testManagedEmbedderDeferProbeRequiresDeclaredDimension();
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+    try testChunkerOnlyDenseIndexPreservesDeclaredDimensions();
 }
 
 fn testManagedEmbedderDefersOperationalDimensionProbeFailure() !void {
@@ -3736,12 +3946,12 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     try std.testing.expectError(error.ResourceLimitExceeded, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.TestUnexpectedResult;
-    // Unit-private Zig errors are intentionally not transported between
-    // independently generated runtime archives. Unknown outcomes fail closed
-    // at the stable boundary instead of relying on compilation-local error IDs.
-    try std.testing.expectError(error.RuntimeBoundaryFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
-    try std.testing.expectError(error.RuntimeBoundaryFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
-    try std.testing.expectError(error.RuntimeBoundaryFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+    // Default providers created and consumed in one runtime unit keep normal
+    // Zig error semantics. Explicit foreign dispatchers still use the stable
+    // status ABI, as covered by runtime_callback_abi's boundary tests.
+    try std.testing.expectError(error.TestUnexpectedResult, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 }
 
 test "managed embedder routes antfly without api_url to local provider" {

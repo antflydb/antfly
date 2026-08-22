@@ -235,6 +235,8 @@ pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -270,6 +272,10 @@ pub const AggregationRequest = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations
@@ -554,6 +560,14 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+pub const BackupAlreadyExistsConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const BackupInfo = struct {
     /// The backup identifier
     backup_id: []const u8,
@@ -574,6 +588,52 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
     /// Opaque continuation cursor. Omitted when no additional backups remain.
     next_cursor: ?[]const u8 = null,
+};
+
+/// A retryable metadata-availability failure reported before backup side effects begin.
+pub const BackupMetadataUnavailableError = union(enum) {
+    metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
+    metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromValueLeaky(MetadataCapabilityUnavailableError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromValueLeaky(MetadataLeaderUnavailableError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .metadata_capability_unavailable_error => |v| try jw.write(v),
+            .metadata_leader_unavailable_error => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const BackupOutcomeAmbiguousConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Logical backup ID whose outcome must be inspected before retrying.
+    backup_id: []const u8,
+    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
+    artifact_backup_id: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
@@ -599,7 +659,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit and visibility/participant recovery state.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -647,6 +707,35 @@ pub const CalendarInterval = enum {
             .{ "month", .month },
             .{ "quarter", .quarter },
             .{ "year", .year },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -1023,8 +1112,8 @@ pub const CreateTableRequest = struct {
     num_shards: ?i64 = null,
     /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
     description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig) = null,
+    /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.CreateIndexRequest) = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
@@ -1334,7 +1423,16 @@ pub const EdgesResponse = struct {
 pub const Embedding = std.json.Value;
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 pub const ExactSortError = struct {
@@ -1424,13 +1522,13 @@ pub const FieldCapability = struct {
     type: AntflyType,
     /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
     query_modes: []const []const u8,
-    /// Whether this concrete field is declared sortable in the effective capability model. Public exact order_by accepts it only when sort_lifecycle_state is queryable or accelerated.
+    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
     sortable: bool,
     /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
     provenance: []const u8,
     /// Current missing/null handling policy for this field.
     missing_null_policy: []const u8,
-    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
     sort_lifecycle_state: []const u8,
     /// Analyzer name for text/searchable fields, when applicable.
     analyzer: ?[]const u8 = null,
@@ -2016,6 +2114,27 @@ pub const MergeProfile = struct {
     duration_ms: ?i64 = null,
 };
 
+/// The metadata service does not yet provide the consistency capability required by backup.
+pub const MetadataCapabilityUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    required_capability: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
+/// The request could not establish authority with the current metadata leader.
+pub const MetadataLeaderUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
@@ -2025,7 +2144,7 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
-    /// Durable commit and visibility/propagation state.
+    /// Durable commit outcome. Pending states mean requested visibility or participant propagation is still completing. `committed_repair_required` means the primary writes committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
@@ -2305,7 +2424,7 @@ pub const QueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -2762,7 +2881,7 @@ pub const RetrievalQueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -3145,6 +3264,15 @@ pub const StorageMaintenanceCapabilities = struct {
     asynchronous: bool,
 };
 
+/// Actionable retry contract for temporary storage descriptor exhaustion.
+pub const StorageResourceExhaustedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i64,
+};
+
 pub const StorageRuntimeStatus = struct {
     engine: []const u8,
     format: ?[]const u8 = null,
@@ -3221,13 +3349,68 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
 };
 
+/// A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
+pub const TableBackupConflictError = union(enum) {
+    backup_already_exists_conflict: BackupAlreadyExistsConflict,
+    table_catalog_changed_conflict: TableCatalogChangedConflict,
+    backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromValueLeaky(BackupAlreadyExistsConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromValueLeaky(TableCatalogChangedConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromValueLeaky(BackupOutcomeAmbiguousConflict, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .backup_already_exists_conflict => |v| try jw.write(v),
+            .table_catalog_changed_conflict => |v| try jw.write(v),
+            .backup_outcome_ambiguous_conflict => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Outcome for one table in a cluster backup. `successful` is the legacy spelling emitted by pre-Zig coordinators; new coordinators emit `completed`. An `ambiguous` outcome includes `error`, `code`, `retryable: false`, `backup_id`, and `artifact_backup_id` so callers can reconcile the retained generation without retrying blindly. Failed and skipped outcomes may include `error`; other fields are omitted when they do not apply.
 pub const TableBackupStatus = struct {
     /// Table name
     name: []const u8,
-    /// Backup status for this table
     status: []const u8,
-    /// Error message if backup failed
+    /// Human-readable failure, skip reason, or reconciliation guidance.
     @"error": ?[]const u8 = null,
+    /// Stable machine-readable code for an ambiguous outcome.
+    code: ?[]const u8 = null,
+    /// False for an ambiguous outcome; inspect the retained attempt before retrying.
+    retryable: ?bool = null,
+    /// Logical per-table backup ID retained by an ambiguous cluster attempt.
+    backup_id: ?[]const u8 = null,
+    /// Opaque artifact generation retained by an ambiguous cluster attempt.
+    artifact_backup_id: ?[]const u8 = null,
+};
+
+pub const TableCatalogChangedConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
@@ -3465,7 +3648,7 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,
@@ -3526,7 +3709,7 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,

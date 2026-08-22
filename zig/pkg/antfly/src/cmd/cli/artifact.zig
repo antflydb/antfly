@@ -35,20 +35,34 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     cli.fatal("unknown artifact subcommand: {s}", .{subcommand});
 }
 
+fn takeUniqueValue(args: *std.process.Args.Iterator, slot: *?[]const u8, flag: []const u8) void {
+    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse cli.fatal("{s} requires a value", .{flag});
+}
+
+fn takeUniqueSwitch(seen: *bool, flag: []const u8) void {
+    if (seen.*) cli.fatal("{s} may only be provided once", .{flag});
+    seen.* = true;
+}
+
 fn listArtifactsWithFirstArg(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, first_arg: ?[]const u8, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     var key: ?[]const u8 = null;
     var raw = false;
+    var raw_set = false;
     var current_arg = first_arg;
 
     while (true) {
         const arg = if (current_arg) |value| value else args.next() orelse break;
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
-            key = args.next();
+            takeUniqueValue(args, &key, arg);
         } else if (std.mem.eql(u8, arg, "--raw")) {
+            takeUniqueSwitch(&raw_set, arg);
             raw = true;
+        } else {
+            cli.fatal("unknown artifact list option: {s}", .{arg});
         }
         current_arg = null;
     }
@@ -71,16 +85,20 @@ fn getArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     var key: ?[]const u8 = null;
     var artifact_name: ?[]const u8 = null;
     var raw = false;
+    var raw_set = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
-            key = args.next();
+            takeUniqueValue(args, &key, arg);
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
-            artifact_name = args.next();
+            takeUniqueValue(args, &artifact_name, arg);
         } else if (std.mem.eql(u8, arg, "--raw")) {
+            takeUniqueSwitch(&raw_set, arg);
             raw = true;
+        } else {
+            cli.fatal("unknown artifact get option: {s}", .{arg});
         }
     }
 
@@ -99,11 +117,13 @@ fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *antf
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
-            artifact_name = args.next();
+            takeUniqueValue(args, &artifact_name, arg);
         } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
-            file_path = args.next();
+            takeUniqueValue(args, &file_path, arg);
+        } else {
+            cli.fatal("unknown artifact put option: {s}", .{arg});
         }
     }
 
@@ -168,9 +188,11 @@ fn deleteArtifactEnrichment(client: *antfly_client.AntflyClient, args: *std.proc
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
-            artifact_name = args.next();
+            takeUniqueValue(args, &artifact_name, arg);
+        } else {
+            cli.fatal("unknown artifact delete option: {s}", .{arg});
         }
     }
 
@@ -192,23 +214,29 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
-            key = args.next();
+            takeUniqueValue(args, &key, arg);
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
-            artifact_name = args.next();
+            takeUniqueValue(args, &artifact_name, arg);
         } else if (std.mem.eql(u8, arg, "--from-key")) {
-            from_key = args.next();
+            takeUniqueValue(args, &from_key, arg);
         } else if (std.mem.eql(u8, arg, "--to-key")) {
-            to_key = args.next();
+            takeUniqueValue(args, &to_key, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
+            if (limit != null) cli.fatal("--limit may only be provided once", .{});
             limit = parseIntFlag(args.next(), "--limit");
+        } else {
+            cli.fatal("unknown artifact reprocess option: {s}", .{arg});
         }
     }
 
     const table = table_name orelse cli.fatal("--table is required", .{});
     const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
     if (key) |doc_key| {
+        if (from_key != null or to_key != null or limit != null) {
+            cli.fatal("--key cannot be combined with --from-key, --to-key, or --limit", .{});
+        }
         var resp = try client.reprocessDocumentArtifact(table, doc_key, artifact);
         defer resp.deinit();
         try cli.printResponse(allocator, io, &resp);
@@ -284,24 +312,36 @@ fn parseJobArgs(args: *std.process.Args.Iterator, start: bool) !JobArgs {
     var to_key: ?[]const u8 = null;
     var limit: ?i64 = null;
     var advance: ?bool = null;
+    var advance_set = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            table_name = args.next();
+            takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
-            artifact_name = args.next();
+            takeUniqueValue(args, &artifact_name, arg);
         } else if (std.mem.eql(u8, arg, "--job")) {
-            job_id = args.next();
+            if (start) cli.fatal("--job is not supported when starting a job", .{});
+            takeUniqueValue(args, &job_id, arg);
         } else if (std.mem.eql(u8, arg, "--from-key")) {
-            from_key = args.next();
+            if (!start) cli.fatal("--from-key is only supported when starting a job", .{});
+            takeUniqueValue(args, &from_key, arg);
         } else if (std.mem.eql(u8, arg, "--to-key")) {
-            to_key = args.next();
+            if (!start) cli.fatal("--to-key is only supported when starting a job", .{});
+            takeUniqueValue(args, &to_key, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
+            if (!start) cli.fatal("--limit is only supported when starting a job", .{});
+            if (limit != null) cli.fatal("--limit may only be provided once", .{});
             limit = parseIntFlag(args.next(), "--limit");
         } else if (std.mem.eql(u8, arg, "--advance")) {
+            if (!start) cli.fatal("--advance is only supported when starting a job", .{});
+            takeUniqueSwitch(&advance_set, arg);
             advance = true;
         } else if (std.mem.eql(u8, arg, "--no-advance")) {
+            if (!start) cli.fatal("--no-advance is only supported when starting a job", .{});
+            takeUniqueSwitch(&advance_set, arg);
             advance = false;
+        } else {
+            cli.fatal("unknown artifact job option: {s}", .{arg});
         }
     }
 

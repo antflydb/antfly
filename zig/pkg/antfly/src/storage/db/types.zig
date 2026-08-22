@@ -26,7 +26,9 @@ const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
+const index_repair_status = @import("../../common/index_repair_status.zig");
 pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -216,6 +218,11 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    /// Internal single-participant transaction contract. Transform expansion
+    /// still runs under the DB apply lock, but the batch is rejected before
+    /// mutation if it would emit graph projection deltas that the distributed
+    /// transaction intent format cannot represent.
+    reject_graph_transform_projections: bool = false,
     /// Internal data-Raft transition state. Public batch parsing never sets it.
     split_checkpoint: ?SplitReplicationCheckpoint = null,
     /// Internal identity context for writes to an unpublished split destination.
@@ -2841,6 +2848,13 @@ pub const DBIndexStats = struct {
     index_repair_next_retry_at_ms: u64 = 0,
     index_repair_last_error: ?[]const u8 = null,
     index_repair_wait_reason: []const u8 = "none",
+    // Compact lifecycle used when DBIndexStats crosses process boundaries.
+    // The full local durable diagnostics remain authoritative when present.
+    index_repair_status: ?IndexRepairStatus = null,
+    // Internal proof that the durable intent is obsolete because the active
+    // managed-admission generation has already converged. Public status uses
+    // this to avoid advertising reconstruction that no longer blocks reads.
+    index_repair_active_generation_serviceable: bool = false,
     projection_checkpoint_status: []const u8 = "clean",
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,

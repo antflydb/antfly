@@ -27,6 +27,9 @@ import requests
 from helpers import wait_until
 
 
+pytestmark = pytest.mark.reuse_antfly_process
+
+
 NUM_SHARDS = 4
 
 
@@ -87,6 +90,7 @@ def assert_committed_response(status: int, result: dict) -> None:
         assert result["status"] in {
             "committed_visibility_pending",
             "committed_recovery_pending",
+            "committed_repair_required",
         }
 
 

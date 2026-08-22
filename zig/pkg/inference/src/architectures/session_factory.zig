@@ -3705,6 +3705,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+            .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
             .deinit = @ptrCast(&deinitSelf),
         };
@@ -3753,6 +3754,8 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
                 .allocator = self.allocator,
             };
         }
+
+        fn discardTensorFileCacheImpl(_: *@This(), _: []const u8) void {}
 
         fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
             return &self.encoder_file;
@@ -5964,6 +5967,63 @@ pub fn widenBudgetLimitsForSession(
     return widenLimits(limits, self.budget_floor);
 }
 
+/// Bind a session's lazy residency cache to the serving owner's hard limits
+/// before the session is published. Cache defaults are derived from host/node
+/// capacity during construction and can be much larger than a container or an
+/// explicit serving policy; leaving those defaults in place lets lazy weight
+/// promotion bypass the ModelManager/ResourceManager envelope.
+pub fn configureSharedCacheAdmissionForSession(
+    session: Session,
+    allocator: std.mem.Allocator,
+    controller: *runtime.tier.memory.AdmissionController,
+    backend_class: runtime.tier.memory.BackendClass,
+    limits: runtime.tier.memory.Limits,
+    resident: runtime.tier.memory.AdmissionAmounts,
+) !void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const hard_budget = runtime.tier.cache.Budget{
+        .host_limit_bytes = limits.host_limit_bytes,
+        .backend_limit_bytes = limits.backend_limit_bytes,
+    };
+    const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
+        .native => if (self.backend_data.native.tier_cache) |*cache| cache else null,
+        .metal => if (build_options.enable_metal)
+            if (gpuBackendData(self).tier_cache) |*cache| cache else null
+        else
+            null,
+        .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
+        .cuda, .onnx, .wasm => null,
+    };
+    const cache = tier_cache orelse return;
+    cache.configureHardBudget(hard_budget);
+    try cache.configureAdmission(
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        .{
+            .host_limit_bytes = resident.host_weight_bytes,
+            .backend_limit_bytes = resident.backend_weight_bytes,
+        },
+    );
+}
+
+/// Release one backend-owned, unpinned host-cache entry without unloading the
+/// model identity. ModelManager uses this after an authoritative aggregate or
+/// live-host denial, then re-probes admission before choosing another victim.
+/// Unsupported backends return zero and retain their existing whole-model
+/// eviction behavior.
+pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.backend_type) {
+        .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
+        .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
+        .metal, .cuda, .onnx, .wasm => 0,
+    };
+}
+
 pub fn memoryBudgetExceededDetail(
     session: Session,
     run_budget: *const runtime.tier.memory.RunBudget,
@@ -7057,6 +7117,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.native);
             if (self.backend_data.native.residency) |*residency| residency.deinit();
             if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .metal => {
             if (comptime build_options.enable_metal) {
@@ -7076,6 +7138,8 @@ fn archClose(ptr: *anyopaque) void {
                 if (gpu_data.residency) |*residency| residency.deinit();
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
+                if (gpu_data.tier_cache) |*tier_cache|
+                    tier_cache.deinitAdmission();
             }
         },
         .pjrt => {
@@ -7104,6 +7168,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.pjrt.native);
             if (self.backend_data.pjrt.native.residency) |*residency| residency.deinit();
             if (self.backend_data.pjrt.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {

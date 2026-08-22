@@ -16,6 +16,45 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const platform_time = @import("antfly_platform").time;
+
+pub const CoverageReadMode = enum(u8) {
+    /// Return only coverage summaries that have already been validated. This
+    /// is the observability path: it must never turn a status read into an
+    /// O(documents) column scan.
+    cached_only,
+    /// Validate uncached coverage for the selected fields. Query admission
+    /// uses this fail-closed path before an exact sort reaches execution.
+    validate,
+};
+
+pub const ObservationQuery = struct {
+    /// When set, observe only this text index. A null index intentionally
+    /// preserves the existing cross-index conservative merge semantics.
+    index_name: ?[]const u8 = null,
+    /// Empty means all fields. Query admission supplies its de-duplicated
+    /// physical sort fields so unrelated columns remain cold.
+    fields: []const []const u8 = &.{},
+    coverage_read_mode: CoverageReadMode = .cached_only,
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
+
+    pub fn includesField(self: ObservationQuery, field: []const u8) bool {
+        if (self.fields.len == 0) return true;
+        for (self.fields) |selected| {
+            if (std.mem.eql(u8, selected, field)) return true;
+        }
+        return false;
+    }
+
+    pub fn checkActive(self: ObservationQuery) !void {
+        if (self.cancellation) |token| try token.check();
+        if (self.execution_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        }
+    }
+};
 
 pub const ObservedDynamicFieldCapabilitySet = struct {
     index_name: []u8,

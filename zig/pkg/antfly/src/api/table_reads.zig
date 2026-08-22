@@ -87,6 +87,8 @@ fn publishRuntimeStatusRefreshForTest(
     try std.testing.expect(!result.hasRejectedTables());
 }
 const http_client = @import("http_client.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
+const http_routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
@@ -256,6 +258,7 @@ pub const TextStatsResponse = table_read_source.TextStatsResponse;
 pub const BackgroundTextStatsResponse = table_read_source.BackgroundTextStatsResponse;
 pub const LsmStorageStats = table_read_source.LsmStorageStats;
 pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicFieldCapabilitySet;
+pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
 pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
 pub const testing = if (builtin.is_test) struct {
@@ -1364,6 +1367,39 @@ fn provisionedLocalQueryDbOwner(
     return .{ .owned = db };
 }
 
+fn provisionedLocalQueryDbOwnerIfPresent(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    catalog: table_catalog.CatalogSource,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    table_name: []const u8,
+    read_activity_held: bool,
+) !?LocalQueryDbOwner {
+    if (resident_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{
+            .read_activity_held = read_activity_held,
+        })) |lease_value| {
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                var lease = lease_value;
+                lease.release(alloc);
+                return err;
+            };
+            return .{ .resident = .{ .lease = lease_value, .alloc = alloc } };
+        }
+    }
+
+    const query_cache = cache orelse return null;
+    const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    var lease = query_cache.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name) orelse return null;
+    validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db) catch |err| {
+        lease.release();
+        return err;
+    };
+    return .{ .cached = lease };
+}
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
@@ -1728,7 +1764,11 @@ const AlgebraicPartialResponseInput = struct {
     canonical_axis: []const u8,
     metric: []const u8 = "",
     law: []const u8,
-    value: []const u8,
+    // `value_base64` is the canonical binary-safe wire representation. Keep
+    // `value` optional so rolling upgrades can still read responses from an
+    // older peer.
+    value: ?[]const u8 = null,
+    value_base64: ?[]const u8 = null,
 };
 
 const AlgebraicPartialsResponseInput = struct {
@@ -2087,10 +2127,11 @@ pub const BoundTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
     }
 
     fn localRuntimeStatuses(
@@ -3561,6 +3602,7 @@ pub const ProvisionedTableReadSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        observation: DynamicFieldObservationQuery,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var read_activity = self.beginPreparedRead(table_name, .general);
@@ -3573,19 +3615,33 @@ pub const ProvisionedTableReadSource = struct {
         errdefer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
 
         for (group_ids) |group_id| {
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            var db = try openProvisionedWarmStatusDbForTable(
+            // Sort/queryability evidence lives in the loaded text-index
+            // catalog, which status-only DB handles intentionally omit. Lease
+            // only an already-present, generation-matched resident or cached
+            // query DB: table status must not map a potentially large index.
+            // Query admission handles the temporary miss by running its normal
+            // preflight warm-and-retry protocol.
+            var owner = (provisionedLocalQueryDbOwnerIfPresent(
+                self.resident_db,
+                self.cache,
+                self.catalog,
                 alloc,
-                path,
+                group_id,
                 self.visibleRootGeneration(group_id),
-                self.backend_runtime,
-                identity_namespace,
-            );
-            defer db.close();
+                table_name,
+                true,
+            ) catch |err| switch (err) {
+                // ResidentDbRetryRequired is a private in-process retry
+                // protocol and is intentionally absent from the runtime error
+                // ABI. Translate it before this callback crosses a runtime
+                // partition so query admission can perform the normal warm
+                // retry while status reads remain best effort.
+                error.ResidentDbRetryRequired => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            }) orelse return error.StorageReadTemporarilyUnavailable;
+            defer owner.deinit();
 
-            const group_sets = try db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+            const group_sets = try owner.db().observedDynamicFieldCapabilitySetsAlloc(alloc, observation);
             defer freeObservedDynamicFieldCapabilitySets(alloc, group_sets);
             for (group_sets) |set| try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
         }
@@ -12601,11 +12657,11 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
             pipeline_filled += 1;
             continue;
         }
-        var request_plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, &first_entry.index, request, constraints, req.identity_read_generation)) orelse return false;
+        var request_plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, first_entry.index, request, constraints, req.identity_read_generation)) orelse return false;
         defer request_plan.deinit(alloc);
         var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram(), first_db, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, &first_entry.index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -12689,7 +12745,10 @@ fn collectProvisionedAlgebraicDistributedPartials(
         if (!(try algebraicIndexFreshEnoughForRequest(alloc, group_req, db))) return null;
         var parsed = try parseAlgebraicPartialsRequest(alloc, body);
         defer parsed.deinit(alloc);
-        const shard_partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
+        const shard_partials = collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed) catch |err| switch (err) {
+            error.HllCardinalityUnavailable => return null,
+            else => return err,
+        };
         defer if (shard_partials.len > 0) alloc.free(shard_partials);
         for (shard_partials) |partial| try partials.append(alloc, partial);
     }
@@ -12819,7 +12878,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
             requests,
             meta,
             consistency,
-            &first_entry.index,
+            first_entry.index,
             required_identity_generations,
         );
     }
@@ -12946,6 +13005,14 @@ const HistogramCardinalityPlan = struct {
     }
 };
 
+fn algebraicCardinalityPartialMode(mode: db_mod.aggregations.CardinalityMode) db_mod.algebraic.index.CardinalityPartialMode {
+    return switch (mode) {
+        .auto => .auto,
+        .exact => .exact,
+        .approximate => .approximate,
+    };
+}
+
 fn algebraicTermsCardinalityChildRequestsAlloc(
     alloc: std.mem.Allocator,
     request: db_mod.aggregations.SearchAggregationRequest,
@@ -12962,7 +13029,7 @@ fn algebraicTermsCardinalityChildRequestsAlloc(
     var idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[idx] = .{ .name = child.name, .field = child.field };
+        children[idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         idx += 1;
     }
     return children;
@@ -12981,7 +13048,14 @@ fn algebraicDistributedTensorProgramForAggregationRequestAlloc(
     defer if (ir_constraints.len > 0) alloc.free(ir_constraints);
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
-        return try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(alloc, index, request.name, request.field, ir_constraints);
+        return try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(
+            alloc,
+            index,
+            request.name,
+            request.field,
+            ir_constraints,
+            request.cardinality_mode != .exact,
+        );
     }
     if (try algebraicTermsCardinalityChildRequestsAlloc(alloc, request)) |children| {
         defer alloc.free(children);
@@ -13049,7 +13123,7 @@ fn algebraicHistogramCardinalityPlanAlloc(
     var child_idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[child_idx] = .{ .name = child.name, .field = child.field };
+        children[child_idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         child_idx += 1;
     }
     const date_bucket = if (kind == .date) try alloc.dupe(u8, db_mod.aggregations.algebraicBucketName(request).?) else "";
@@ -13088,7 +13162,7 @@ fn algebraicRangeCardinalityPlanAlloc(
     var child_idx: usize = 0;
     for (request.aggregations) |child| {
         if (db_mod.aggregations.isPipelineAggregation(child.type)) continue;
-        children[child_idx] = .{ .name = child.name, .field = child.field };
+        children[child_idx] = .{ .name = child.name, .field = child.field, .mode = algebraicCardinalityPartialMode(child.cardinality_mode) };
         child_idx += 1;
     }
 
@@ -13762,7 +13836,10 @@ fn collectHostedAlgebraicDistributedPartials(
                 if (!(try algebraicIndexFreshEnoughForRequest(alloc, group_req, &db))) return null;
                 var parsed = try parseAlgebraicPartialsRequest(alloc, body);
                 defer parsed.deinit(alloc);
-                break :blk try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
+                break :blk collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed) catch |err| switch (err) {
+                    error.HllCardinalityUnavailable => return null,
+                    else => return err,
+                };
             },
             .remote => |remote| blk: {
                 var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
@@ -14244,7 +14321,11 @@ fn encodeAlgebraicPartialsResponse(
         try appendJsonFieldString(alloc, &out, &first, "canonical_axis", partial.canonical_axis);
         try appendJsonFieldString(alloc, &out, &first, "metric", partial.metric);
         try appendJsonFieldString(alloc, &out, &first, "law", @tagName(partial.law_id));
-        try appendJsonFieldString(alloc, &out, &first, "value", partial.value);
+        const encoded_len = std.base64.standard.Encoder.calcSize(partial.value.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, partial.value);
+        try appendJsonFieldString(alloc, &out, &first, "value_base64", encoded);
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -14269,11 +14350,24 @@ fn parseAlgebraicPartialsResponse(
     }
     for (parsed.value.partials, 0..) |partial, i| {
         const law_id = std.meta.stringToEnum(db_mod.algebraic.law.Id, partial.law) orelse return error.InvalidQueryRequest;
+        if ((partial.value == null) == (partial.value_base64 == null)) return error.InvalidQueryRequest;
+        const canonical_axis = try alloc.dupe(u8, partial.canonical_axis);
+        errdefer alloc.free(canonical_axis);
+        const metric = try alloc.dupe(u8, partial.metric);
+        errdefer alloc.free(metric);
+        const value = if (partial.value_base64) |encoded| blk: {
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidQueryRequest;
+            const decoded = try alloc.alloc(u8, decoded_len);
+            errdefer alloc.free(decoded);
+            std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidQueryRequest;
+            break :blk decoded;
+        } else try alloc.dupe(u8, partial.value.?);
+        errdefer alloc.free(value);
         partials[i] = .{
-            .canonical_axis = try alloc.dupe(u8, partial.canonical_axis),
-            .metric = try alloc.dupe(u8, partial.metric),
+            .canonical_axis = canonical_axis,
+            .metric = metric,
             .law_id = law_id,
-            .value = try alloc.dupe(u8, partial.value),
+            .value = value,
         };
         initialized += 1;
     }
@@ -14851,7 +14945,7 @@ fn collectAlgebraicPartialsFromDbForRequest(
         if (try entry.index.scanDistributedPartialsForTensorProgramAtGeneration(db.core.store, access_path_values, view.program, generation)) |partials| {
             return partials;
         }
-        const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, &entry.index, request.tensor_access_paths, program);
+        const exprs = try algebraicTensorProgramOutputExpressionsForIndexAlloc(alloc, entry.index, request.tensor_access_paths, program);
         defer if (exprs.len > 0) alloc.free(exprs);
         return try entry.index.scanDistributedPartialsForExpressions(db.core.store, exprs);
     }
@@ -22154,6 +22248,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
     const ExecutorState = struct {
         signal: *std.atomic.Value(bool),
         calls: usize = 0,
+        algebraic_base64_header_seen: bool = false,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
             return .{
@@ -22168,6 +22263,13 @@ test "remote shard query phases propagate deadline and request cancellation" {
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.timeout_ms.? > 0);
             try std.testing.expect(req.timeout_ms.? <= 60_000);
+            if (std.mem.endsWith(u8, req.uri, http_routes.Routes.algebraic_partials_suffix)) {
+                try std.testing.expectEqualStrings(
+                    algebraic_partials_wire.base64_v1,
+                    req.header(algebraic_partials_wire.response_encoding_header) orelse return error.TestExpectedAlgebraicPartialsEncoding,
+                );
+                self.algebraic_base64_header_seen = true;
+            }
             const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
             try std.testing.expect(!cancellation.isCancelled());
             self.signal.store(true, .release);
@@ -22231,6 +22333,7 @@ test "remote shard query phases propagate deadline and request cancellation" {
         controlled_request,
     ));
     try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expect(state.algebraic_base64_header_seen);
 }
 
 test "remote query returns the shard-selected identity generation" {
@@ -22863,6 +22966,33 @@ test "explicit text stats requests reject stale identity generation" {
     try std.testing.expectError(error.IdentityReadGenerationChanged, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
 }
 
+test "algebraic partial response base64 round trips binary values" {
+    const alloc = std.testing.allocator;
+    const raw = [_]u8{ 0, 1, 2, 127, 128, 255 };
+    const partials = [_]db_mod.algebraic.distributed.Partial{.{
+        .canonical_axis = "axis",
+        .metric = "metric",
+        .law_id = .hll,
+        .value = raw[0..],
+    }};
+    const encoded = try encodeAlgebraicPartialsResponse(alloc, partials[0..]);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"value_base64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\\u0000") == null);
+
+    const decoded = try parseAlgebraicPartialsResponse(alloc, encoded);
+    defer db_mod.algebraic.distributed.freePartials(alloc, decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualSlices(u8, raw[0..], decoded[0].value);
+
+    const legacy = try parseAlgebraicPartialsResponse(
+        alloc,
+        "{\"partials\":[{\"canonical_axis\":\"axis\",\"law\":\"count\",\"value\":\"1\"}]}",
+    );
+    defer db_mod.algebraic.distributed.freePartials(alloc, legacy);
+    try std.testing.expectEqualStrings("1", legacy[0].value);
+}
+
 test "algebraic partial request preserves planner-owned materialization tensor programs" {
     const alloc = std.testing.allocator;
 
@@ -23328,12 +23458,12 @@ test "provisioned distributed aggregations collect path terms nested cardinality
     try std.testing.expectEqual(@as(usize, 2), aggregation.buckets.len);
     try std.testing.expectEqualStrings("\"silver\"", aggregation.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), aggregation.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"gold\"", aggregation.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregation.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[1].aggregations[1].value_json.?);
 }
 
 test "algebraic partial request accepts expression cache proofs without named materializations" {
@@ -23473,6 +23603,67 @@ test "algebraic partial request accepts current identity generation and rejects 
     try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
 }
 
+test "algebraic partial request uses HLL at the current identity generation" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-algebraic-partials-current-generation-hll";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{"version":1,"table":"orders","group_fields":[{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"customers","group_by":[],"value_field":"customer","precision":14}]}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "o1", .value = "{\"customer\":\"alice\"}" },
+            .{ .key = "o2", .value = "{\"customer\":\"bob\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    const derived_docs = [_]db_mod.derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\"}" },
+    };
+    try entry.index.applyBatch(db.core.store, .{ .sequence = generation, .documents = derived_docs[0..] });
+    try db.core.saveAppliedSequence("alg", generation);
+    var plan = (try algebraic_planner.planCardinalityPartialsTensorProgramAlloc(
+        alloc,
+        entry.index,
+        "customer_cardinality",
+        "customer",
+        &.{},
+        true,
+    )) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    const encoded = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(
+        alloc,
+        "alg",
+        generation,
+        plan.access_paths,
+        &.{},
+        plan.asProgram(),
+    );
+    defer alloc.free(encoded);
+    var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
+    defer db_mod.algebraic.distributed.freePartials(alloc, partials);
+    try std.testing.expectEqual(@as(usize, 1), partials.len);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.hll, partials[0].law_id);
+    try std.testing.expectEqual(@as(u64, 2), try db_mod.algebraic.hll.estimateEncoded(partials[0].value));
+}
+
 test "algebraic partial request accepts tensor program expression outputs" {
     const alloc = std.testing.allocator;
 
@@ -23601,6 +23792,26 @@ test "algebraic distributed planner selects derived join tensor program for metr
     try std.testing.expectEqual(algebraic_ir.TensorFragment.join, program_plan.steps[1].expr.fragment);
     try std.testing.expectEqual(db_mod.algebraic.law.Id.sum, program_plan.steps[1].expr.law_id.?);
     try std.testing.expectEqualStrings("joined_amount", program_plan.steps[1].expr.semantic_id.?);
+}
+
+test "algebraic distributed cardinality auto attempts HLL before whole-query fallback" {
+    const alloc = std.testing.allocator;
+    var index = try db_mod.algebraic.index.Index.open(alloc, "alg",
+        \\{"version":1,"table":"docs","group_fields":[{"name":"customer","path":"customer","type":"keyword"}]}
+    );
+    defer index.close();
+    const request = db_mod.aggregations.SearchAggregationRequest{
+        .name = "customers",
+        .type = "cardinality",
+        .field = "customer",
+        .cardinality_mode = .auto,
+    };
+    var plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, &index, request, &.{}, null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(db_mod.algebraic.law.Id.hll, plan.steps[1].expr.law_id.?);
+    var decoded = try db_mod.algebraic.index.decodeCardinalityPartialsMetadataAlloc(alloc, plan.steps[1].expr.metadata.?);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.request.approximate);
 }
 
 test "algebraic distributed planner selects identity-stamped derived join tensor program" {
@@ -26561,7 +26772,7 @@ test "provisioned storage inspection uses table read admission" {
     source.prepare_for_read = tracker.iface();
 
     try std.testing.expect((try source.source().lsmStorageStats(std.testing.allocator, "docs")) == null);
-    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs")) == null);
+    try std.testing.expect((try source.source().observedDynamicFieldCapabilitySets(std.testing.allocator, "docs", .{})) == null);
     try std.testing.expectEqual(@as(usize, 2), tracker.begins);
     try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 }

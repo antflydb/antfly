@@ -24,7 +24,10 @@ import requests
 
 from helpers import query_hits_total_value, wait_until
 
-pytestmark = pytest.mark.postgres_integration
+pytestmark = [
+    pytest.mark.postgres_integration,
+    pytest.mark.reuse_antfly_process,
+]
 
 DEFAULT_PG_DSN = "postgres://localhost:5432/postgres?sslmode=disable"
 PSQL_BIN = os.environ.get("ANTFLY_TEST_PSQL_BIN", "/opt/homebrew/opt/postgresql@18/bin/psql")

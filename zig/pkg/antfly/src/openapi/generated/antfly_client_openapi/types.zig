@@ -228,6 +228,8 @@ pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -263,6 +265,10 @@ pub const AggregationRequest = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations
@@ -563,8 +569,8 @@ pub const AntflyChunkerConfig = struct {
     audio: ?AudioChunkOptions = null,
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: []const u8,
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+    model: ?[]const u8 = null,
 };
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
@@ -651,62 +657,6 @@ pub const AntflyType = enum {
             .{ "geoshape", .geoshape },
             .{ "embedding", .embedding },
             .{ "blob", .blob },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Field type annotations for schema fields
-pub const AntflyType2 = enum {
-    text,
-    html,
-    keyword,
-    numeric,
-    boolean,
-    datetime,
-    geopoint,
-    geoshape,
-    embedding,
-    blob,
-    link,
-    search_as_you_type,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .text => "text",
-            .html => "html",
-            .keyword => "keyword",
-            .numeric => "numeric",
-            .boolean => "boolean",
-            .datetime => "datetime",
-            .geopoint => "geopoint",
-            .geoshape => "geoshape",
-            .embedding => "embedding",
-            .blob => "blob",
-            .link => "link",
-            .search_as_you_type => "search_as_you_type",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "text", .text },
-            .{ "html", .html },
-            .{ "keyword", .keyword },
-            .{ "numeric", .numeric },
-            .{ "boolean", .boolean },
-            .{ "datetime", .datetime },
-            .{ "geopoint", .geopoint },
-            .{ "geoshape", .geoshape },
-            .{ "embedding", .embedding },
-            .{ "blob", .blob },
-            .{ "link", .link },
-            .{ "search_as_you_type", .search_as_you_type },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -855,6 +805,14 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+pub const BackupAlreadyExistsConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const BackupInfo = struct {
     /// The backup identifier
     backup_id: []const u8,
@@ -875,6 +833,52 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
     /// Opaque continuation cursor. Omitted when no additional backups remain.
     next_cursor: ?[]const u8 = null,
+};
+
+/// A retryable metadata-availability failure reported before backup side effects begin.
+pub const BackupMetadataUnavailableError = union(enum) {
+    metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
+    metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromValueLeaky(MetadataCapabilityUnavailableError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromValueLeaky(MetadataLeaderUnavailableError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .metadata_capability_unavailable_error => |v| try jw.write(v),
+            .metadata_leader_unavailable_error => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const BackupOutcomeAmbiguousConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Logical backup ID whose outcome must be inspected before retrying.
+    backup_id: []const u8,
+    /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
+    artifact_backup_id: ?[]const u8 = null,
 };
 
 pub const BackupRequest = struct {
@@ -900,7 +904,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit and visibility/participant recovery state.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -1052,6 +1056,35 @@ pub const Capability = struct {
 
 /// Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
 pub const CapabilityName = []const u8;
+
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 pub const CdcConnection = struct {
     /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
@@ -1249,7 +1282,7 @@ pub const ChunkerConfig = struct {
     audio: ?AudioChunkOptions = null,
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
     model: ?[]const u8 = null,
     provider: ChunkerProvider,
     /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
@@ -1771,6 +1804,19 @@ pub const ContentPart = union(enum) {
     }
 };
 
+/// Create a schema-derived algebraic index.
+pub const CreateAlgebraicIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+    type: []const u8,
+};
+
 /// Request to create a new API key.
 pub const CreateApiKeyRequest = struct {
     /// Human-readable name for the API key.
@@ -1783,13 +1829,154 @@ pub const CreateApiKeyRequest = struct {
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
+/// Create a dense or sparse embeddings index.
+pub const CreateEmbeddingsIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
+    type: []const u8,
+};
+
+/// Create a full-text index.
+pub const CreateFullTextIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
+    type: []const u8,
+};
+
+/// Create a graph index.
+pub const CreateGraphIndexRequest = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
+    type: []const u8,
+};
+
+/// Fields shared by every create-index variant. The index name is owned by the request path.
+pub const CreateIndexCommon = struct {
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index.
+    enrichments: ?[]const EnrichmentConfig = null,
+};
+
+/// Type-safe configuration for a new index. The index name is owned by the request path.
+pub const CreateIndexRequest = union(enum) {
+    create_full_text_index_request: CreateFullTextIndexRequest,
+    create_embeddings_index_request: CreateEmbeddingsIndexRequest,
+    create_graph_index_request: CreateGraphIndexRequest,
+    create_algebraic_index_request: CreateAlgebraicIndexRequest,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .create_full_text_index_request = try std.json.parseFromValueLeaky(CreateFullTextIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .create_embeddings_index_request = try std.json.parseFromValueLeaky(CreateEmbeddingsIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .create_graph_index_request = try std.json.parseFromValueLeaky(CreateGraphIndexRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .create_algebraic_index_request = try std.json.parseFromValueLeaky(CreateAlgebraicIndexRequest, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .create_full_text_index_request => |v| try jw.write(v),
+            .create_embeddings_index_request => |v| try jw.write(v),
+            .create_graph_index_request => |v| try jw.write(v),
+            .create_algebraic_index_request => |v| try jw.write(v),
+        }
+    }
+};
+
 pub const CreateTableRequest = struct {
     /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
     num_shards: ?i64 = null,
     /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
     description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
+    /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(CreateIndexRequest) = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
@@ -1804,6 +1991,238 @@ pub const CreateUserRequest = struct {
     initial_policies: ?[]const Permission = null,
     /// Auth metadata available to stored row-filter policies.
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+/// Normalized effective schema-derived algebraic index configuration returned after creation.
+pub const CreatedAlgebraicIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+    type: []const u8,
+};
+
+/// Normalized effective dense or sparse embeddings index configuration returned after creation.
+pub const CreatedEmbeddingsIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    mem_only: ?bool = null,
+    embedder: ?CreatedProviderConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
+    chunker: ?ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+    type: []const u8,
+};
+
+/// Credential-free normalized embeddings configuration returned after creation.
+pub const CreatedEmbeddingsIndexConfig = struct {
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    external: ?bool = null,
+    sparse: ?bool = null,
+    dimension: ?i64 = null,
+    field: ?[]const u8 = null,
+    embedding_name: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    mem_only: ?bool = null,
+    embedder: ?CreatedProviderConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
+    chunker: ?ChunkerConfig = null,
+    top_k: ?i64 = null,
+    min_weight: ?f32 = null,
+    chunk_size: ?i64 = null,
+    execution: ?IndexExecutionConfig = null,
+};
+
+/// Credential-free normalized enrichment configuration returned after index creation.
+pub const CreatedEnrichmentConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    expected_dims: ?i64 = null,
+    chunk_size: ?i64 = null,
+    chunk_overlap: ?i64 = null,
+    chunker_json: ?[]const u8 = null,
+    full_text_index: ?bool = null,
+    content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
+};
+
+/// Normalized effective full-text index configuration returned after creation.
+pub const CreatedFullTextIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
+    type: []const u8,
+};
+
+/// Credential-free graph artifact producer configuration returned after creation.
+pub const CreatedGraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: []const u8,
+    source: GraphArtifactProducerSourceConfig,
+    content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
+};
+
+/// Normalized effective graph index configuration returned after creation.
+pub const CreatedGraphIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    summarizer: ?CreatedProviderConfig = null,
+    template: ?[]const u8 = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
+    type: []const u8,
+};
+
+/// Credential-free normalized graph configuration returned after creation.
+pub const CreatedGraphIndexConfig = struct {
+    summarizer: ?CreatedProviderConfig = null,
+    template: ?[]const u8 = null,
+    edge_types: ?[]const EdgeTypeConfig = null,
+    max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?CreatedGraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
+};
+
+/// Discriminated normalized configuration returned after an index is created.
+pub const CreatedIndex = union(enum) {
+    created_full_text_index: CreatedFullTextIndex,
+    created_embeddings_index: CreatedEmbeddingsIndex,
+    created_graph_index: CreatedGraphIndex,
+    created_algebraic_index: CreatedAlgebraicIndex,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .created_full_text_index = try std.json.parseFromValueLeaky(CreatedFullTextIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .created_embeddings_index = try std.json.parseFromValueLeaky(CreatedEmbeddingsIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .created_graph_index = try std.json.parseFromValueLeaky(CreatedGraphIndex, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .created_algebraic_index = try std.json.parseFromValueLeaky(CreatedAlgebraicIndex, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .created_full_text_index => |v| try jw.write(v),
+            .created_embeddings_index => |v| try jw.write(v),
+            .created_graph_index => |v| try jw.write(v),
+            .created_algebraic_index => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Fields returned for every newly created index. Provider credentials are write-only and are never returned.
+pub const CreatedIndexCommon = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+};
+
+/// Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented.
+pub const CreatedProviderConfig = struct {
+    /// Configured provider discriminator.
+    provider: []const u8,
+    /// Configured provider model when applicable.
+    model: ?[]const u8 = null,
+    models: ?[]const []const u8 = null,
+    project_id: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+    dimension: ?i64 = null,
+    dimensions: ?i64 = null,
+    input_type: ?[]const u8 = null,
+    truncate: ?[]const u8 = null,
+    strip_new_lines: ?bool = null,
+    batch_size: ?i64 = null,
+    temperature: ?f32 = null,
+    max_tokens: ?i64 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
+    timeout: ?i64 = null,
 };
 
 pub const Credentials = struct {
@@ -2334,12 +2753,48 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
+/// Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected.
+pub const DocumentFieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
+    /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
+    fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
     schema: ?std.json.Value = null,
+};
+
+/// Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property.
+pub const DocumentSubfieldMapping = struct {
+    type: ?FieldMappingType = null,
+    /// Analyzer name for text-oriented mappings.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field. Omit to use the server default of true.
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
+    sortable: ?bool = null,
+    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    missing_null_policy: ?[]const u8 = null,
 };
 
 pub const DropExtensionRequest = struct {
@@ -2694,7 +3149,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Serialized asset producer configuration.
+    /// Write-only serialized asset producer configuration. It may contain provider credentials and is never returned.
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -2778,7 +3233,16 @@ pub const EnrichmentRuntimeStatus = struct {
 };
 
 pub const Error = struct {
+    /// Optional stable machine-readable error code for programmatic handling.
+    code: ?[]const u8 = null,
+    /// Legacy human-readable error text.
     @"error": []const u8,
+    /// Human-readable error description when supplied by the endpoint.
+    message: ?[]const u8 = null,
+    /// Whether retrying the operation may succeed without changing the request.
+    retryable: ?bool = null,
+    /// Suggested minimum retry delay in milliseconds.
+    retry_after_ms: ?i32 = null,
 };
 
 /// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
@@ -3344,13 +3808,13 @@ pub const FieldCapability = struct {
     type: AntflyType,
     /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
     query_modes: []const []const u8,
-    /// Whether this concrete field is declared sortable in the effective capability model. Public exact order_by accepts it only when sort_lifecycle_state is queryable or accelerated.
+    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
     sortable: bool,
     /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
     provenance: []const u8,
     /// Current missing/null handling policy for this field.
     missing_null_policy: []const u8,
-    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
     sort_lifecycle_state: []const u8,
     /// Analyzer name for text/searchable fields, when applicable.
     analyzer: ?[]const u8 = null,
@@ -3358,6 +3822,83 @@ pub const FieldCapability = struct {
     index_sort_position: ?i64 = null,
     /// Sort direction in the table index_sort tuple when this field participates.
     index_sort_order: ?[]const u8 = null,
+};
+
+/// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
+pub const FieldMappingType = enum {
+    text,
+    html,
+    keyword,
+    numeric,
+    number,
+    integer,
+    boolean,
+    bool,
+    datetime,
+    date,
+    timestamp,
+    geopoint,
+    geo_point,
+    geoshape,
+    geo_shape,
+    embedding,
+    blob,
+    link,
+    search_as_you_type,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .html => "html",
+            .keyword => "keyword",
+            .numeric => "numeric",
+            .number => "number",
+            .integer => "integer",
+            .boolean => "boolean",
+            .bool => "bool",
+            .datetime => "datetime",
+            .date => "date",
+            .timestamp => "timestamp",
+            .geopoint => "geopoint",
+            .geo_point => "geo_point",
+            .geoshape => "geoshape",
+            .geo_shape => "geo_shape",
+            .embedding => "embedding",
+            .blob => "blob",
+            .link => "link",
+            .search_as_you_type => "search_as_you_type",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "keyword", .keyword },
+            .{ "numeric", .numeric },
+            .{ "number", .number },
+            .{ "integer", .integer },
+            .{ "boolean", .boolean },
+            .{ "bool", .bool },
+            .{ "datetime", .datetime },
+            .{ "date", .date },
+            .{ "timestamp", .timestamp },
+            .{ "geopoint", .geopoint },
+            .{ "geo_point", .geo_point },
+            .{ "geoshape", .geoshape },
+            .{ "geo_shape", .geo_shape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+            .{ "link", .link },
+            .{ "search_as_you_type", .search_as_you_type },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Statistics about a specific field.
@@ -3421,6 +3962,10 @@ pub const ForeignSource = struct {
 pub const FullTextIndexConfig = struct {
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3719,6 +4264,62 @@ pub const GoogleGeneratorConfig = struct {
     url: ?[]const u8 = null,
 };
 
+/// Optional algebraic planning features for graph traversal.
+pub const GraphAlgebraicPlanningConfig = struct {
+    bounded_traversal: ?GraphBoundedTraversalConfig = null,
+};
+
+/// Document fields made available to graph mapping templates through `_doc.value`.
+pub const GraphArtifactContextConfig = struct {
+    doc_fields: ?[]const []const u8 = null,
+};
+
+/// Maps each artifact item to an edge type, weight, and public metadata.
+pub const GraphArtifactEdgeMappingConfig = struct {
+    type: ?GraphTemplateValue = null,
+    weight: ?GraphTemplateValue = null,
+    /// JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses.
+    metadata: ?std.json.Value = null,
+};
+
+/// Maps each artifact item to graph node identifiers.
+pub const GraphArtifactNodeMappingConfig = struct {
+    model: ?[]const u8 = null,
+    source: ?GraphTemplateValue = null,
+    target: ?GraphTemplateValue = null,
+};
+
+/// Asset producer used by an artifact-backed graph index.
+pub const GraphArtifactProducerConfig = struct {
+    name: []const u8,
+    kind: []const u8,
+    source: GraphArtifactProducerSourceConfig,
+    content_type: ?[]const u8 = null,
+    execution: ?ExecutionPolicy = null,
+    /// Write-only producer configuration; it may contain credentials and is never returned.
+    producer_json: ?std.json.Value = null,
+};
+
+/// Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template.
+pub const GraphArtifactProducerSourceConfig = struct {
+    type: []const u8,
+    value: []const u8,
+};
+
+/// Artifact stream materialized into graph edges.
+pub const GraphArtifactSourceConfig = struct {
+    kind: []const u8,
+    artifact: []const u8,
+    path: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    mention_edge_type: ?[]const u8 = null,
+};
+
+/// Algebraic law used to combine bounded graph traversal provenance.
+pub const GraphBoundedTraversalConfig = struct {
+    law: []const u8,
+};
+
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -3729,6 +4330,13 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3941,6 +4549,28 @@ pub const GraphQueryType = enum {
     }
 };
 
+/// Versioned entity resolver attached to an artifact-backed graph index.
+pub const GraphResolverConfig = struct {
+    name: []const u8,
+    table: []const u8,
+    source_artifact: []const u8,
+    source_artifact_kind: ?[]const u8 = null,
+    resolution_artifact: []const u8,
+    key_template: []const u8,
+    type_must_match: ?bool = null,
+    scorer_json: ?[]const u8 = null,
+    candidate_search: ?[]const u8 = null,
+    candidate_ann_index: ?[]const u8 = null,
+    candidate_limit: ?i64 = null,
+    name_embedding: ?[]const u8 = null,
+    name_embedding_dims: ?i64 = null,
+    fusion_combine: ?[]const u8 = null,
+    fusion_trust: ?f64 = null,
+    fusion_prior: ?f64 = null,
+    fusion_prior_weight: ?f64 = null,
+    config_generation: ?i64 = null,
+};
+
 /// A node in graph query results
 pub const GraphResultNode = struct {
     /// Document key
@@ -3964,6 +4594,9 @@ pub const GraphResultNode = struct {
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
 };
+
+/// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
+pub const GraphTemplateValue = std.json.Value;
 
 /// Ground truth data for evaluation
 pub const GroundTruth = struct {
@@ -4121,6 +4754,10 @@ pub const IndexConfig = struct {
     enrichments: ?[]const EnrichmentConfig = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
+    /// Document field indexed as text. Omit for the table's default full-document text index.
+    field: ?[]const u8 = null,
+    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    artifact_name: ?[]const u8 = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -4129,8 +4766,6 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
-    field: ?[]const u8 = null,
     /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
@@ -4156,6 +4791,13 @@ pub const IndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    source: ?GraphArtifactSourceConfig = null,
+    artifact: ?GraphArtifactProducerConfig = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+    algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
+    resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
 
@@ -4181,6 +4823,14 @@ pub const IndexConfig = struct {
             try jw.objectField("mem_only");
             try jw.write(value);
         }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
         if (self.coverage_policy) |value| {
             try jw.objectField("coverage_policy");
             try jw.write(value);
@@ -4195,10 +4845,6 @@ pub const IndexConfig = struct {
         }
         if (self.dimension) |value| {
             try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.field) |value| {
-            try jw.objectField("field");
             try jw.write(value);
         }
         if (self.embedding_name) |value| {
@@ -4251,6 +4897,34 @@ pub const IndexConfig = struct {
         }
         if (self.max_edges_per_document) |value| {
             try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
             try jw.write(value);
         }
         if (self.derive_from_schema) |value| {
@@ -6165,6 +6839,27 @@ pub const MergeStrategy = enum {
     }
 };
 
+/// The metadata service does not yet provide the consistency capability required by backup.
+pub const MetadataCapabilityUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    required_capability: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
+/// The request could not establish authority with the current metadata leader.
+pub const MetadataLeaderUnavailableError = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i32,
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
@@ -6174,7 +6869,7 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
-    /// Durable commit and visibility/propagation state.
+    /// Durable commit outcome. Pending states mean requested visibility or participant propagation is still completing. `committed_repair_required` means the primary writes committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely.
     status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
@@ -7022,7 +7717,7 @@ pub const QueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -7577,7 +8272,7 @@ pub const RetrievalQueryRequest = struct {
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
     /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
     search_after: ?[]const std.json.Value = null,
@@ -8075,6 +8770,15 @@ pub const StorageMaintenanceCapabilities = struct {
     asynchronous: bool,
 };
 
+/// Actionable retry contract for temporary storage descriptor exhaustion.
+pub const StorageResourceExhaustedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    retry_after_ms: i64,
+};
+
 pub const StorageRuntimeStatus = struct {
     engine: []const u8,
     format: ?[]const u8 = null,
@@ -8151,13 +8855,68 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const EnrichmentConfig,
 };
 
+/// A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation.
+pub const TableBackupConflictError = union(enum) {
+    backup_already_exists_conflict: BackupAlreadyExistsConflict,
+    table_catalog_changed_conflict: TableCatalogChangedConflict,
+    backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromValueLeaky(BackupAlreadyExistsConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromValueLeaky(TableCatalogChangedConflict, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromValueLeaky(BackupOutcomeAmbiguousConflict, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .backup_already_exists_conflict => |v| try jw.write(v),
+            .table_catalog_changed_conflict => |v| try jw.write(v),
+            .backup_outcome_ambiguous_conflict => |v| try jw.write(v),
+        }
+    }
+};
+
+/// Outcome for one table in a cluster backup. `successful` is the legacy spelling emitted by pre-Zig coordinators; new coordinators emit `completed`. An `ambiguous` outcome includes `error`, `code`, `retryable: false`, `backup_id`, and `artifact_backup_id` so callers can reconcile the retained generation without retrying blindly. Failed and skipped outcomes may include `error`; other fields are omitted when they do not apply.
 pub const TableBackupStatus = struct {
     /// Table name
     name: []const u8,
-    /// Backup status for this table
     status: []const u8,
-    /// Error message if backup failed
+    /// Human-readable failure, skip reason, or reconciliation guidance.
     @"error": ?[]const u8 = null,
+    /// Stable machine-readable code for an ambiguous outcome.
+    code: ?[]const u8 = null,
+    /// False for an ambiguous outcome; inspect the retained attempt before retrying.
+    retryable: ?bool = null,
+    /// Logical per-table backup ID retained by an ambiguous cluster attempt.
+    backup_id: ?[]const u8 = null,
+    /// Opaque artifact generation retained by an ambiguous cluster attempt.
+    artifact_backup_id: ?[]const u8 = null,
+};
+
+pub const TableCatalogChangedConflict = struct {
+    code: []const u8,
+    /// Legacy human-readable error text. Use `code` for branching.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
@@ -8435,12 +9194,12 @@ pub const TavilySearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Field mapping to apply when a dynamic template matches
+/// Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required.
 pub const TemplateFieldMapping = struct {
-    type: ?AntflyType2 = null,
+    type: ?FieldMappingType = null,
     /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
     analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
+    /// Whether to index the field. Omit to use the server default of true.
     index: ?bool = null,
     /// Whether to store the field value (default false)
     store: ?bool = null,
@@ -8521,7 +9280,7 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,
@@ -8582,7 +9341,7 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing. `committed_repair_required` means the commit decision is durable and coordination may be released, but a terminal enrichment failure requires operator repair.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?TransactionConflict = null,
