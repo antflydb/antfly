@@ -78,9 +78,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-cuda-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-cuda.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   inference:
@@ -133,7 +134,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-cuda-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-cuda
 
       - name: Install E2E executable
