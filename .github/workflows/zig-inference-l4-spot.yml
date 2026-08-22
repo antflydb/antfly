@@ -1,6 +1,12 @@
 name: Zig Inference L4 Spot Canary
 
 on:
+  workflow_call:
+    inputs:
+      scope:
+        description: CUDA validation scope
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       scope:
