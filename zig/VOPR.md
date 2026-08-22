@@ -1299,6 +1299,16 @@ is adopted.
 
 ## Module Layout
 
+Use `lib/vopr`, not a generic `lib/sim`, for the reusable engine. `sim` is too
+broad to communicate the replay ABI, scheduler, property, corpus, and reduction
+contracts, and it would invite unrelated test helpers to acquire a false
+stability promise. Antfly-independent deterministic exploration belongs in
+`lib/vopr`; Antfly scenario adapters, determinism audits, fixtures, and CLI
+policy belong in `pkg/antfly/src/sim`. A future library should move below VOPR
+only when it is independently useful without VOPR campaign semantics—for
+example, a general modeled block device—not merely because two Antfly tests use
+it.
+
 ```text
 lib/vopr/
   build.zig
@@ -2129,26 +2139,37 @@ work uncovers a concrete contradiction:
 11. Keep real HTTP, threaded, and process chaos tests as complementary layers.
 12. Require explicit human review before fixture promotion.
 
-## Open Design Questions
+## Resolved Design Decisions and Follow-ons
 
-These can be resolved during Phase 0 without changing the overall design:
+Implementation resolved the Phase 0 design questions as follows:
 
-- whether the generic scenario API should use comptime dispatch, type erasure,
-  or a hybrid
-- whether the canonical trace stores every enabled alternative or only an
-  enabled-set digest outside verbose mode
-- which metadata state should be observed through public APIs versus internal
-  test-only inspectors
-- how much node restart state can use the current physical temporary-directory
-  paths before a fully modeled device is required
-- the first client-history consistency model for public data traffic
-- the compatibility policy and migration tooling for trace schema revisions
-- whether the corpus manager belongs in Zig or a thin external orchestration
-  tool while the deterministic runner remains Zig-native
-- which LLVM/Zig coverage hooks are stable enough for an optional later phase
+- scenario execution uses compile-time dispatch while artifacts, choices, and
+  application-facing runtime capabilities use stable runtime types
+- canonical traces store the complete enabled alternative set, making replay
+  divergence diagnostic rather than relying on an opaque set digest
+- safety and client-visible properties prefer public observations; internal
+  inspectors are limited to scheduler enablement, stable semantic coverage,
+  and diagnostics that cannot change product decisions
+- the first public-data consistency model is an acknowledged-operation model:
+  only successful responses enter the required set, while explicitly uncertain
+  durability outcomes have a separate allowed-result set
+- trace compatibility is fail-closed on system, scenario version, schema
+  version, choice site, occurrence, and complete enabled set; format migration
+  must parse and exact-replay before producing a new canonical artifact
+- the corpus manager remains Zig-native so selection, mutation, coverage, and
+  replay share one deterministic implementation; external orchestration may
+  allocate workers and wall-clock budgets but does not select transitions
+- compiler coverage remains optional secondary feedback because the current
+  Zig/LLVM instrumentation surface is not stable enough to join the replay ABI
 
-None of these questions blocks traceable metadata VOPR, atomic scheduling,
-properties, semantic coverage, replay, or same-fingerprint reduction.
+Two bounded follow-ons remain. The distributed public-data macro-scenario
+should eventually expose each workload, transition, restart, and storage fault
+through generated VOPR choices; its current deterministic composition already
+satisfies the Phase 4 exit property. Physical temporary directories remain
+acceptable for integration scenarios, while deterministic histories that make
+durability claims must use `ModeledDevice` or an equally explicit storage
+capability. Neither follow-on changes the standalone runtime boundary or trace
+format decisions above.
 
 ## Conclusion
 
