@@ -12,10 +12,20 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-test {
-    _ = @import("graph/query.zig");
-    _ = @import("storage/db/db.zig");
-    _ = @import("storage/db/graph_runtime.zig");
-    _ = @import("storage/db/promotion_runtime.zig");
-    _ = @import("storage/db/resolution_runtime.zig");
-}
+pub const GraphEdgeWrite = struct {
+    index_name: []const u8,
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+    weight: f64 = 1.0,
+    created_at: u64 = 0,
+    updated_at: u64 = 0,
+    metadata_json: []const u8 = "",
+};
+
+pub const GraphEdgeDelete = struct {
+    index_name: []const u8,
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+};

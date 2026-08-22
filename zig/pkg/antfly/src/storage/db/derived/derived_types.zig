@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("../types.zig");
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
+const graph_edge_types = @import("../graph_edge_types.zig");
 
 pub const DerivedAction = enum {
     upsert,
@@ -74,8 +74,8 @@ pub const DerivedBatch = struct {
     dense_embeddings: []const DerivedDenseEmbeddingWrite = &.{},
     sparse_embeddings: []const DerivedSparseEmbeddingWrite = &.{},
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
-    graph_writes: []const types.GraphEdgeWrite = &.{},
-    graph_deletes: []const types.GraphEdgeDelete = &.{},
+    graph_writes: []const graph_edge_types.GraphEdgeWrite = &.{},
+    graph_deletes: []const graph_edge_types.GraphEdgeDelete = &.{},
 };
 
 pub const DerivedLogRecord = struct {
@@ -128,7 +128,7 @@ pub fn deinitDerivedSparseEmbedding(alloc: Allocator, embedding: DerivedSparseEm
     if (embedding.values.len > 0) alloc.free(embedding.values);
 }
 
-pub fn deinitDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) void {
+pub fn deinitDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdgeWrite) void {
     alloc.free(@constCast(write.index_name));
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
@@ -136,7 +136,7 @@ pub fn deinitDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) vo
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
-pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) void {
+pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphEdgeDelete) void {
     alloc.free(@constCast(delete.index_name));
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
@@ -234,7 +234,7 @@ pub fn cloneDerivedSparseEmbedding(
     };
 }
 
-pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {
+pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdgeWrite) !graph_edge_types.GraphEdgeWrite {
     const index_name = try alloc.dupe(u8, write.index_name);
     errdefer alloc.free(index_name);
     const source = try alloc.dupe(u8, write.source);
@@ -259,7 +259,7 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !ty
     };
 }
 
-pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.GraphEdgeDelete {
+pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphEdgeDelete) !graph_edge_types.GraphEdgeDelete {
     const index_name = try alloc.dupe(u8, delete.index_name);
     errdefer alloc.free(index_name);
     const source = try alloc.dupe(u8, delete.source);
@@ -393,7 +393,7 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
     const generated_enrichment_refs = try enrichment_types.cloneGeneratedRefs(alloc, batch.generated_enrichment_refs);
     errdefer enrichment_types.deinitGeneratedRefs(alloc, generated_enrichment_refs);
 
-    var graph_writes = try alloc.alloc(types.GraphEdgeWrite, batch.graph_writes.len);
+    var graph_writes = try alloc.alloc(graph_edge_types.GraphEdgeWrite, batch.graph_writes.len);
     var initialized_graph_writes: usize = 0;
     errdefer {
         for (graph_writes[0..initialized_graph_writes]) |write|
@@ -405,7 +405,7 @@ pub fn cloneBatch(alloc: Allocator, batch: DerivedBatch) !DerivedBatch {
         initialized_graph_writes += 1;
     }
 
-    var graph_deletes = try alloc.alloc(types.GraphEdgeDelete, batch.graph_deletes.len);
+    var graph_deletes = try alloc.alloc(graph_edge_types.GraphEdgeDelete, batch.graph_deletes.len);
     var initialized_graph_deletes: usize = 0;
     errdefer {
         for (graph_deletes[0..initialized_graph_deletes]) |delete|
@@ -806,7 +806,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     batch.generated_enrichment_refs = generated_enrichment_refs;
 
     const graph_write_count = try reader.readInt(u32);
-    const graph_writes = try alloc.alloc(types.GraphEdgeWrite, graph_write_count);
+    const graph_writes = try alloc.alloc(graph_edge_types.GraphEdgeWrite, graph_write_count);
     errdefer alloc.free(graph_writes);
     var initialized_graph_writes: usize = 0;
     errdefer {
@@ -834,7 +834,7 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     batch.graph_writes = graph_writes;
 
     const graph_delete_count = try reader.readInt(u32);
-    const graph_deletes = try alloc.alloc(types.GraphEdgeDelete, graph_delete_count);
+    const graph_deletes = try alloc.alloc(graph_edge_types.GraphEdgeDelete, graph_delete_count);
     errdefer alloc.free(graph_deletes);
     var initialized_graph_deletes: usize = 0;
     errdefer {

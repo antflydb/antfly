@@ -7544,6 +7544,25 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
+    const graph_runtime_filters = [_][]const u8{
+        "storage.db.graph_runtime.test.",
+    };
+    const graph_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &graph_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_runtime_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_runtime_tests,
+        &graph_runtime_filters,
+    );
+    const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
+    graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+
     // Keep the small, deterministic release-blocker primitives in the PR/base
     // unit gate. The corpus-scale fixtures below protect thresholds that only
     // appear at thousands of documents and run in the zig-full gate instead.
@@ -7767,6 +7786,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.document_mapper.",
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
+            "storage.db.graph_runtime.",
             "storage.db.lease.",
             "storage.db.mod.",
             "storage.db.ownership.",

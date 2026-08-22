@@ -25,6 +25,7 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const graph_edge_types = @import("graph_edge_types.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
@@ -233,23 +234,8 @@ pub const BatchRequest = struct {
     transaction: ?TransactionMutation = null,
 };
 
-pub const GraphEdgeWrite = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64 = 1.0,
-    created_at: u64 = 0,
-    updated_at: u64 = 0,
-    metadata_json: []const u8 = "",
-};
-
-pub const GraphEdgeDelete = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-};
+pub const GraphEdgeWrite = graph_edge_types.GraphEdgeWrite;
+pub const GraphEdgeDelete = graph_edge_types.GraphEdgeDelete;
 
 pub const IndexKind = enum {
     full_text,
