@@ -18,6 +18,9 @@ import requests
 from . import models
 from .conftest import (
     InferenceServer,
+    _backend_selection_diagnostic,
+    _managed_model_id,
+    _parse_backend_exceptions,
     _positive_timeout,
     _server_budget_args,
     capacity_retry_delay,
@@ -825,26 +828,79 @@ def test_live_server_tail_read_does_not_move_shared_output_offset():
         server.output.close()
 
 
-def test_server_output_backend_scan_searches_full_capture_without_moving_offset():
+def test_server_output_backend_scan_searches_full_capture_without_moving_offset(
+    tmp_path,
+):
     server = InferenceServer.__new__(InferenceServer)
     server.output = tempfile.TemporaryFile(mode="w+b")
     server.proc = SimpleNamespace(poll=lambda: 0)
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
     try:
-        server.output.write(b"selected backend cuda for first-model\n")
+        server.output.write(f"selected backend cuda for {cuda_model}\n".encode())
         server.output.write(b"x" * (70 * 1024))
-        server.output.write(b"selected backend native for second-model\n")
+        server.output.write(f"selected backend native for {native_model}\n".encode())
         server.output.seek(7)
         position = server.output.tell()
 
-        assert server.output_contains("selected backend cuda for first-model")
+        assert server.output_contains(f"selected backend cuda for {cuda_model}")
         assert not server.output_contains("selected backend metal for model")
-        assert server.selected_backends({"cuda", "metal", "native"}) == {
-            "cuda",
-            "native",
+        selections = server.backend_selections({"cuda", "metal", "native"})
+        assert selections == {
+            ("cuda", str(cuda_model)),
+            ("native", str(native_model)),
         }
+        assert (
+            _managed_model_id(str(native_model), str(models_path)) == "owner/cpu-model"
+        )
+        assert (
+            _backend_selection_diagnostic(
+                selections,
+                "cuda",
+                {("owner/cpu-model", "native")},
+                str(models_path),
+            )
+            is None
+        )
         assert server.output.tell() == position
     finally:
         server.output.close()
+
+
+def test_backend_selection_policy_rejects_unexpected_and_stale_exceptions(tmp_path):
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
+    selections = {("cuda", str(cuda_model)), ("native", str(native_model))}
+
+    assert "disallowed selections" in _backend_selection_diagnostic(
+        selections, "cuda", set(), str(models_path)
+    )
+    assert "unused exceptions" in _backend_selection_diagnostic(
+        {("cuda", str(cuda_model))},
+        "cuda",
+        {("owner/cpu-model", "native")},
+        str(models_path),
+    )
+
+
+def test_backend_exception_parser_is_exact_and_validated():
+    supported = {"cuda", "native"}
+    assert _parse_backend_exceptions(
+        "owner/whisper=native, owner/sparse=native", supported
+    ) == {("owner/whisper", "native"), ("owner/sparse", "native")}
+
+    with pytest.raises(pytest.UsageError, match="owner/model=backend"):
+        _parse_backend_exceptions("owner/whisper", supported)
+    with pytest.raises(pytest.UsageError, match="must use owner/model"):
+        _parse_backend_exceptions("whisper=native", supported)
+    with pytest.raises(pytest.UsageError, match="must be one of"):
+        _parse_backend_exceptions("owner/whisper=metal", supported)
+    with pytest.raises(pytest.UsageError, match="duplicate"):
+        _parse_backend_exceptions(
+            "owner/whisper=native,owner/whisper=native", supported
+        )
 
 
 def test_live_server_http_diagnostic_is_reported_once(capsys):
