@@ -421,6 +421,9 @@ pub const GraphHydrateRequest = struct {
     exclusion_query_json: []const u8 = "",
     exclusion_query_json_owned: bool = false,
     include_stored: bool = true,
+    fields: []const []const u8 = &.{},
+    fields_owned: bool = false,
+    include_all_fields: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
     incoming_index_name_owned: bool = false,
@@ -433,6 +436,7 @@ pub const GraphHydrateRequest = struct {
     pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
         for (self.keys) |key| alloc.free(key);
         if (self.keys.len > 0) alloc.free(self.keys);
+        if (self.fields_owned) freeConstStrings(alloc, self.fields);
         if (self.filter_query_json_owned and self.filter_query_json.len > 0) {
             alloc.free(@constCast(self.filter_query_json));
         }
@@ -652,6 +656,8 @@ const GraphHydrateRequestJson = struct {
     _filter_query_json: []const u8 = "",
     _exclusion_query_json: []const u8 = "",
     include_stored: bool = true,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
     _resolved_doc_filter: ?std.json.Value = null,
@@ -1043,6 +1049,7 @@ const GraphAdmissionTableState = struct {
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     allowed: bool,
     requires_admission: bool,
+    graph_index_available: ?bool = null,
     requires_hydration: bool,
     decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
@@ -1232,6 +1239,23 @@ const GraphNodeAdmissionContext = struct {
         return self.tables.getPtr(table_name).?;
     }
 
+    fn graphIndexAvailable(
+        self: *GraphNodeAdmissionContext,
+        state: *GraphAdmissionTableState,
+        index_name: []const u8,
+    ) !bool {
+        if (std.mem.eql(u8, state.table_name, self.source_table)) return true;
+        if (state.graph_index_available) |available| return available;
+        const available = try catalogTableHasGraphIndex(
+            self.alloc,
+            self.catalog,
+            state.table_name,
+            index_name,
+        );
+        state.graph_index_available = available;
+        return available;
+    }
+
     fn filterMany(
         ctx: ?*anyopaque,
         result_alloc: std.mem.Allocator,
@@ -1302,6 +1326,8 @@ const GraphNodeAdmissionContext = struct {
                 state.resolved_doc_filter,
                 state.resolved_doc_filter_wire_context,
                 false,
+                true,
+                &.{},
                 entry.value_ptr.keys.items,
                 self.consistency,
             );
@@ -1471,6 +1497,11 @@ const DistributedEdgeReader = struct {
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
+        // Cross-table endpoints remain useful result nodes even when their table
+        // does not expose the same graph index. Treat those nodes as terminals
+        // instead of turning an explicit multi-hop traversal into IndexNotFound.
+        if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
+            return try a.alloc(graph_mod.Edge, 0);
         const group_id = (try table_catalog.resolveGroupForKeyPinned(
             a,
             self.catalog,
@@ -1616,7 +1647,7 @@ fn executeDistributedPattern(
 
     // Hydrate documents if requested.
     const hits = if (graph_query.query.include_documents)
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
 
@@ -1727,7 +1758,7 @@ fn executeDistributedConjunctivePattern(
         if (unique_nodes.len > 0) alloc.free(unique_nodes);
     }
     const hits = if (graph_query.query.include_documents or req.expand_strategy != null)
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     const name = state.name;
@@ -1941,6 +1972,7 @@ fn executeDistributedTraverse(
             frontier,
             effective_max_depth,
             admission,
+            graph_query.query.index_name,
         );
         defer freeFrontierBatches(alloc, &batches);
         const batch_entries = try collectGraphExpandBatchEntries(alloc, &batches);
@@ -2192,7 +2224,7 @@ fn executeDistributedTraverse(
     state.hits = try adoptHydratedHits(
         alloc,
         state.hits,
-        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items),
+        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields),
     );
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
@@ -2243,7 +2275,7 @@ fn executeDistributedShortestPath(
         alloc.free(nodes);
     };
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, nodes);
+    const hits = try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -2468,7 +2500,7 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_paths);
     }
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, out_nodes);
+    const hits = try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -2588,6 +2620,7 @@ fn findDistributedShortestPath(
         const expansion_table = item.table orelse table_name;
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
+        if (!(try admission.graphIndexAvailable(table_state, graph_query.query.index_name))) continue;
         const group_id = (try table_catalog.resolveGroupForKeyPinned(
             alloc,
             catalog,
@@ -2701,6 +2734,7 @@ fn batchFrontierByGroup(
     frontier: []const FrontierState,
     max_depth: u32,
     admission: *GraphNodeAdmissionContext,
+    index_name: []const u8,
 ) !GraphExpandBatches {
     var batches = GraphExpandBatches.empty;
     errdefer freeFrontierBatches(alloc, &batches);
@@ -2710,6 +2744,7 @@ fn batchFrontierByGroup(
         const table_name = item.table orelse source_table;
         const table_state = try admission.ensureTable(table_name);
         if (!table_state.allowed) return error.TableNotFound;
+        if (!(try admission.graphIndexAvailable(table_state, index_name))) continue;
         const group_id = (try table_catalog.resolveGroupForKeyPinned(
             alloc,
             catalog,
@@ -2952,6 +2987,8 @@ fn hydrateHitsForResultNodes(
     alloc: std.mem.Allocator,
     admission: *GraphNodeAdmissionContext,
     nodes: []const graph_query_mod.GraphResultNode,
+    include_all_fields: bool,
+    fields: []const []const u8,
 ) ![]db_mod.types.SearchHit {
     // Most nodes are hydrated from the query table. Mention/DocRef edges carry a
     // cross-table endpoint (`node.table`, e.g. the canonical "entities" table)
@@ -2986,6 +3023,8 @@ fn hydrateHitsForResultNodes(
             state.resolved_doc_filter,
             state.resolved_doc_filter_wire_context,
             true,
+            include_all_fields,
+            fields,
             keys,
             admission.consistency,
         );
@@ -3039,6 +3078,8 @@ fn hydrateHitsForResultNodes(
             state.resolved_doc_filter,
             state.resolved_doc_filter_wire_context,
             true,
+            include_all_fields,
+            fields,
             entry.value_ptr.items,
             admission.consistency,
         );
@@ -3095,6 +3136,8 @@ fn hydrateHitsForKeys(
     resolved_doc_filter: ?*const anyopaque,
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext,
     include_stored: bool,
+    include_all_fields: bool,
+    fields: []const []const u8,
     keys: []const []const u8,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.SearchHit {
@@ -3154,6 +3197,8 @@ fn hydrateHitsForKeys(
                 req.filter_query_json = filter_query_json;
                 req.exclusion_query_json = exclusion_query_json;
                 req.include_stored = include_stored;
+                req.include_all_fields = include_all_fields;
+                req.fields = fields;
                 req.resolved_doc_filter = resolved_doc_filter;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context;
                 defer req.deinit(alloc);
@@ -3204,6 +3249,8 @@ fn hydrateHitsForKeys(
                 resolved_doc_filter_inner: ?*const anyopaque,
                 resolved_doc_filter_wire_context_inner: ?db_mod.types.ResolvedDocFilterWireContext,
                 include_stored_inner: bool,
+                include_all_fields_inner: bool,
+                fields_inner: []const []const u8,
                 consistency_inner: raft_mod.ReadConsistency,
             ) void {
                 const arena = slot.arena.allocator();
@@ -3219,6 +3266,8 @@ fn hydrateHitsForKeys(
                 req.filter_query_json = filter_query_json_inner;
                 req.exclusion_query_json = exclusion_query_json_inner;
                 req.include_stored = include_stored_inner;
+                req.include_all_fields = include_all_fields_inner;
+                req.fields = fields_inner;
                 req.resolved_doc_filter = resolved_doc_filter_inner;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context_inner;
                 slot.result = worker_inner.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
@@ -3233,7 +3282,7 @@ fn hydrateHitsForKeys(
             const end = @min(start + graph_fanout_plan.width, entries.len);
             var group: std.Io.Group = .init;
             for (entries[start..end], start..end) |entry, i| {
-                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, consistency });
+                group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
             }
             group.await(io) catch {};
         }
@@ -3264,6 +3313,8 @@ fn hydrateHitsForKeys(
         req.filter_query_json = filter_query_json;
         req.exclusion_query_json = exclusion_query_json;
         req.include_stored = include_stored;
+        req.include_all_fields = include_all_fields;
+        req.fields = fields;
         req.resolved_doc_filter = resolved_doc_filter;
         req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context;
         defer req.deinit(alloc);
@@ -3486,6 +3537,8 @@ pub fn encodeGraphHydrateRequest(alloc: std.mem.Allocator, req: GraphHydrateRequ
         ._filter_query_json = req.filter_query_json,
         ._exclusion_query_json = req.exclusion_query_json,
         .include_stored = req.include_stored,
+        .fields = req.fields,
+        .include_all_fields = req.include_all_fields,
         .include_hits = req.include_hits,
         .incoming_index_name = req.incoming_index_name,
     });
@@ -3522,6 +3575,8 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
     else
         &.{};
     errdefer if (incoming_index_name.len > 0) alloc.free(incoming_index_name);
+    const fields = try dupConstStrings(alloc, parsed.value.fields);
+    errdefer freeConstStrings(alloc, fields);
 
     const out = GraphHydrateRequest{
         .keys = keys,
@@ -3532,6 +3587,9 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
         .exclusion_query_json = exclusion_query_json,
         .exclusion_query_json_owned = exclusion_query_json.len > 0,
         .include_stored = parsed.value.include_stored,
+        .fields = fields,
+        .fields_owned = fields.len > 0,
+        .include_all_fields = parsed.value.include_all_fields,
         .include_hits = parsed.value.include_hits,
         .incoming_index_name = incoming_index_name,
         .incoming_index_name_owned = incoming_index_name.len > 0,
@@ -4908,6 +4966,61 @@ fn catalogGraphIndexEnablesAlgebraicSemiring(
     defer lookup.deinit();
     if (indexes_api.inferIndexType(index_name, lookup.config) != .graph) return false;
     return graphConfigEnablesAlgebraicSemiring(lookup.config);
+}
+
+fn catalogTableHasGraphIndex(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    index_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return false;
+    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name)) orelse return false;
+    defer lookup.deinit();
+    return indexes_api.inferIndexType(index_name, lookup.config) == .graph;
+}
+
+test "cross-table graph index availability fails closed for terminal expansion" {
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "with_graph", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}" },
+            .{ .table_id = 8, .name = "without_index", .placement_role = "data" },
+            .{ .table_id = 9, .name = "wrong_kind", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"full_text\"}}" },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "with_graph", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "without_index", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "wrong_kind", "graph_idx"));
+    try std.testing.expect(!try catalogTableHasGraphIndex(alloc, FakeCatalog.iface(), "missing_table", "graph_idx"));
 }
 
 fn graphConfigEnablesAlgebraicSemiring(config: std.json.Value) bool {
@@ -6362,7 +6475,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         .read_index,
     );
     defer admission.deinit();
-    const hits = try hydrateHitsForResultNodes(alloc, &admission, nodes[0..]);
+    const hits = try hydrateHitsForResultNodes(alloc, &admission, nodes[0..], true, &.{});
     defer {
         for (hits) |*hit| hit.deinit(alloc);
         alloc.free(hits);
@@ -7019,6 +7132,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
         .topology_epoch = 11,
         .identity_read_generation = 12345,
         .include_stored = false,
+        .fields = &.{ "title", "summary" },
+        .include_all_fields = false,
         .include_hits = false,
         .incoming_index_name = "graph_idx",
         .resolved_doc_filter = &filter,
@@ -7035,6 +7150,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed_hydrate.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expectEqual(@as(?u64, 12345), parsed_hydrate.identity_read_generation);
     try std.testing.expect(!parsed_hydrate.include_stored);
+    try std.testing.expect(!parsed_hydrate.include_all_fields);
+    try std.testing.expectEqualSlices([]const u8, &.{ "title", "summary" }, parsed_hydrate.fields);
     try std.testing.expect(!parsed_hydrate.include_hits);
     try std.testing.expectEqualStrings("graph_idx", parsed_hydrate.incoming_index_name);
 
@@ -8370,7 +8487,12 @@ test "distributed graph traverse routes cross-table frontier by table generation
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{
             .{ .table_id = 7, .name = "docs", .placement_role = "data" },
-            .{ .table_id = 8, .name = "entities", .placement_role = "data" },
+            .{
+                .table_id = 8,
+                .name = "entities",
+                .placement_role = "data",
+                .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            },
         };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = null },

@@ -6687,6 +6687,8 @@ fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.
         .filter_query_json = req.filter_query_json,
         .exclusion_query_json = req.exclusion_query_json,
         .include_stored = req.include_stored,
+        .fields = req.fields,
+        .include_all_fields = req.include_all_fields,
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
@@ -16924,7 +16926,7 @@ fn appendGraphQueryParamsField(
         .in => "in",
         .both => "both",
     });
-    if (params.max_depth != 3) try appendJsonFieldU32(alloc, out, &params_first, "max_depth", params.max_depth);
+    if (params.max_depth != 1) try appendJsonFieldU32(alloc, out, &params_first, "max_depth", params.max_depth);
     if (params.min_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "min_weight", params.min_weight);
     if (params.max_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "max_weight", params.max_weight);
     if (params.max_results != 100) try appendJsonFieldU32(alloc, out, &params_first, "max_results", params.max_results);

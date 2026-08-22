@@ -6,15 +6,12 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="GraphDocumentQuery")
+T = TypeVar("T", bound="LegacyGraphDocumentQuery")
 
 
 @_attrs_define
-class GraphDocumentQuery:
-    """A document-query expression in either public QueryRequest.filter_query syntax or canonical Antfly filter AST syntax.
-    Graph queries embed this existing document query language; alias-to-alias predicates belong in GraphMatch.where.
-
-    """
+class LegacyGraphDocumentQuery:
+    """Deprecated free-form graph filter accepted by the v0.2 compatibility contract."""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -28,10 +25,10 @@ class GraphDocumentQuery:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        graph_document_query = cls()
+        legacy_graph_document_query = cls()
 
-        graph_document_query.additional_properties = d
-        return graph_document_query
+        legacy_graph_document_query.additional_properties = d
+        return legacy_graph_document_query
 
     @property
     def additional_keys(self) -> list[str]:

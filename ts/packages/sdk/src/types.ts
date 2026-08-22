@@ -189,14 +189,16 @@ export type EdgeDirection = components["schemas"]["EdgeDirection"];
 export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
-export type GraphDocumentQuery = components["schemas"]["GraphDocumentQuery"];
+export type GraphFilterQuery = AntflyQuery;
+/** @deprecated Use GraphFilterQuery. */
+export type GraphDocumentQuery = GraphFilterQuery;
 export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
 export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
 export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];
 export type GraphNotEqualPredicate = components["schemas"]["GraphNotEqualPredicate"];
 export type GraphNotExistsPattern = components["schemas"]["GraphNotExistsPattern"];
 export type GraphMatchNode = Omit<components["schemas"]["GraphMatchNode"], "filter"> & {
-  filter?: GraphDocumentQuery;
+  filter?: GraphFilterQuery;
 };
 export type GraphOptionalMatch = Omit<components["schemas"]["GraphOptionalMatch"], "nodes"> & {
   nodes?: Record<string, GraphMatchNode>;
@@ -209,20 +211,20 @@ export type GraphMatchQuery = Omit<components["schemas"]["GraphMatchQuery"], "ma
   match: GraphMatch;
 };
 export type GraphTraversal = Omit<components["schemas"]["GraphTraversal"], "filter"> & {
-  filter?: GraphDocumentQuery;
+  filter?: GraphFilterQuery;
 };
 export type GraphTraverseQuery = Omit<components["schemas"]["GraphTraverseQuery"], "traverse"> & {
   traverse: GraphTraversal;
 };
 export type GraphShortestPath = Omit<components["schemas"]["GraphShortestPath"], "filter"> & {
-  filter?: GraphDocumentQuery;
+  filter?: GraphFilterQuery;
 };
 export type GraphShortestPathQuery = Omit<
   components["schemas"]["GraphShortestPathQuery"],
   "shortest_path"
 > & { shortest_path: GraphShortestPath };
 export type GraphKShortestPaths = Omit<components["schemas"]["GraphKShortestPaths"], "filter"> & {
-  filter?: GraphDocumentQuery;
+  filter?: GraphFilterQuery;
 };
 export type GraphKShortestPathsQuery = Omit<
   components["schemas"]["GraphKShortestPathsQuery"],
@@ -246,6 +248,9 @@ export type PatternMatch = components["schemas"]["PatternMatch"];
 export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
 export type GraphResultNode = components["schemas"]["GraphResultNode"];
 export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
+export type GraphKeyNodeSelector = components["schemas"]["GraphKeyNodeSelector"];
+export type GraphIdentityNodeSelector = components["schemas"]["GraphIdentityNodeSelector"];
+export type GraphResultRefNodeSelector = components["schemas"]["GraphResultRefNodeSelector"];
 export type GraphReturn = components["schemas"]["GraphReturn"];
 export type GraphWhereExpression = components["schemas"]["GraphWhereExpression"];
 export type PathWeightMode = components["schemas"]["PathWeightMode"];

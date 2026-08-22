@@ -9916,7 +9916,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":{"path":"title","value":"beta"}}},"c":{"filter":{"prefix":"ga","field":"title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","field":"title"}},"c":{"filter":{"prefix":"ga","field":"title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
         ,
     });
     defer pattern.deinit(alloc);

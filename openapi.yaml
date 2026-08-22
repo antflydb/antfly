@@ -21919,19 +21919,18 @@ components:
         provider: ollama
         model: dengcao/Qwen3-Reranker-0.6B:F16
         field: content
-    GraphDocumentQuery:
-      type: object
-      additionalProperties: true
-      description: A document-query expression in either public QueryRequest.filter_query syntax or canonical
-        Antfly filter AST syntax. Graph queries embed this existing document query language; alias-to-alias
+    GraphFilterQuery:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+      description: The same validated QueryRequest.filter_query DSL, embedded at a graph node. Alias-to-alias
         predicates belong in GraphMatch.where.
     GraphMatchNode:
       type: object
       additionalProperties: false
       properties:
         filter:
-          $ref: '#/components/schemas/GraphDocumentQuery'
-          description: Canonical Antfly document-query expression evaluated for this alias.
+          $ref: '#/components/schemas/GraphFilterQuery'
+          description: The QueryRequest.filter_query expression evaluated for this alias.
     GraphMatchEdge:
       type: object
       additionalProperties: false
@@ -22084,6 +22083,16 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
+        include_documents:
+          type: boolean
+          default: false
+          description: Hydrate documents for projected non-null bindings.
+        fields:
+          type: array
+          items:
+            type: string
+          description: Document fields to hydrate. Requires include_documents=true; omit to include all
+            fields.
     GraphCountAggregate:
       type: object
       additionalProperties: false
@@ -22126,6 +22135,20 @@ components:
           $ref: '#/components/schemas/GraphMatch'
         return:
           $ref: '#/components/schemas/GraphReturn'
+    GraphKeyNodeSelector:
+      type: object
+      additionalProperties: false
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          uniqueItems: true
+          items:
+            type: string
+          description: Exact keys in the table being queried.
     GraphPathEndpoint:
       type: object
       additionalProperties: false
@@ -22138,56 +22161,41 @@ components:
           type: string
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query
             table.
-    NodeFilter:
-      x-go-type-skip-optional-pointer: true
-      type: object
-      description: Filter nodes during graph traversal using existing query primitives
-      properties:
-        filter_query:
-          x-go-type-skip-optional-pointer: true
-          $ref: '#/components/schemas/GraphDocumentQuery'
-          description: Antfly query to filter nodes (same syntax as search filter_query)
-        filter_prefix:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Filter by key prefix
-    GraphNodeSelector:
-      x-go-type-skip-optional-pointer: true
+    GraphIdentityNodeSelector:
       type: object
       additionalProperties: false
-      description: Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys
-        retain legacy cross-table wildcard semantics; identities are exact.
+      required:
+        - identities
       properties:
-        keys:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            type: string
-          description: Legacy list of node keys, matching the key in any reachable table. Prefer identities
-            when keys may collide across tables.
         identities:
-          x-go-type-skip-optional-pointer: true
           type: array
           minItems: 1
+          maxItems: 10000
+          uniqueItems: true
           items:
             $ref: '#/components/schemas/GraphPathEndpoint'
           description: Exact node identities. Omitted table means the query table.
+    GraphResultRefNodeSelector:
+      type: object
+      additionalProperties: false
+      required:
+        - result_ref
+      properties:
         result_ref:
-          x-go-type-skip-optional-pointer: true
           type: string
-          description: >
-            Reference to search results to use as nodes:
-
-            - "$full_text_results" - use full-text search results
-
-            - "$embeddings_results.index_name" - use vector search results from specific index
+          description: 'A prior result set: `$full_text_results`, `$embeddings_results`, `$fused_results`,
+            or `$graph_results.<query-name>`.'
         limit:
-          x-go-type-skip-optional-pointer: true
           type: integer
-          description: Maximum number of nodes to select from result_ref; invalid with keys or identities.
-        node_filter:
-          $ref: '#/components/schemas/NodeFilter'
-          description: Filter which nodes to use as start/target
+          minimum: 1
+          maximum: 10000
+          description: Maximum referenced results to use. Omit only when the referenced result is complete.
+    GraphNodeSelector:
+      oneOf:
+        - $ref: '#/components/schemas/GraphKeyNodeSelector'
+        - $ref: '#/components/schemas/GraphIdentityNodeSelector'
+        - $ref: '#/components/schemas/GraphResultRefNodeSelector'
+      description: Select graph nodes using exactly one explicit, exact selector form.
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -22206,7 +22214,8 @@ components:
           type: integer
           minimum: 1
           maximum: 64
-          default: 3
+          default: 1
+          description: Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
         min_weight:
           type: number
           format: double
@@ -22235,8 +22244,8 @@ components:
           description: Document fields to include when include_documents is true. Omit to include all
             fields.
         filter:
-          $ref: '#/components/schemas/GraphDocumentQuery'
-          description: Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
+          $ref: '#/components/schemas/GraphFilterQuery'
+          description: The same document-query DSL accepted by QueryRequest.filter_query.
     GraphTraverseQuery:
       type: object
       additionalProperties: false
@@ -22294,8 +22303,8 @@ components:
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
         filter:
-          $ref: '#/components/schemas/GraphDocumentQuery'
-          description: Canonical Antfly document-query AST.
+          $ref: '#/components/schemas/GraphFilterQuery'
+          description: The same document-query DSL accepted by QueryRequest.filter_query.
         include_documents:
           type: boolean
           default: false
@@ -22353,8 +22362,8 @@ components:
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
         filter:
-          $ref: '#/components/schemas/GraphDocumentQuery'
-          description: Canonical Antfly document-query AST.
+          $ref: '#/components/schemas/GraphFilterQuery'
+          description: The same document-query DSL accepted by QueryRequest.filter_query.
         include_documents:
           type: boolean
           default: false
@@ -22392,6 +22401,63 @@ components:
         - k_shortest_paths
         - pattern
       description: Deprecated discriminator used by LegacyGraphQuery.
+    LegacyGraphDocumentQuery:
+      type: object
+      additionalProperties: true
+      description: Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
+    NodeFilter:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      description: Filter nodes during graph traversal using existing query primitives
+      properties:
+        filter_query:
+          x-go-type-skip-optional-pointer: true
+          $ref: '#/components/schemas/LegacyGraphDocumentQuery'
+          description: Antfly query to filter nodes (same syntax as search filter_query)
+        filter_prefix:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Filter by key prefix
+    LegacyGraphNodeSelector:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      deprecated: true
+      description: Deprecated v0.2 graph selector. Unqualified target keys match any reachable table.
+      properties:
+        keys:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Legacy list of node keys. Target keys match any reachable table.
+        identities:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/GraphPathEndpoint'
+          description: Exact node identities. Omitted table means the query table.
+        result_ref:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: >
+            Reference to search results to use as nodes:
+
+            - "$full_text_results" - use full-text search results
+
+            - "$embeddings_results" - use merged vector search results
+
+            - "$fused_results" - use fused retrieval results
+
+            - "$graph_results.<query-name>" - use a prior graph query result
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: Maximum number of nodes to select from result_ref; invalid with keys or identities.
+        node_filter:
+          $ref: '#/components/schemas/NodeFilter'
+          description: Filter which nodes to use as start/target
     GraphQueryParams:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -22504,9 +22570,9 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
         start_nodes:
-          $ref: '#/components/schemas/GraphNodeSelector'
+          $ref: '#/components/schemas/LegacyGraphNodeSelector'
         target_nodes:
-          $ref: '#/components/schemas/GraphNodeSelector'
+          $ref: '#/components/schemas/LegacyGraphNodeSelector'
         params:
           $ref: '#/components/schemas/GraphQueryParams'
         pattern:

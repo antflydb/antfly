@@ -10,8 +10,8 @@ from ..models.graph_query_type import GraphQueryType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.graph_node_selector import GraphNodeSelector
     from ..models.graph_query_params import GraphQueryParams
+    from ..models.legacy_graph_node_selector import LegacyGraphNodeSelector
     from ..models.pattern_step import PatternStep
 
 
@@ -25,10 +25,10 @@ class LegacyGraphQuery:
     Attributes:
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
         index_name (str):
-        start_nodes (GraphNodeSelector | Unset): Select graph nodes by exactly one of keys, identities, or result_ref.
-            Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
-        target_nodes (GraphNodeSelector | Unset): Select graph nodes by exactly one of keys, identities, or result_ref.
-            Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
+        start_nodes (LegacyGraphNodeSelector | Unset): Deprecated v0.2 graph selector. Unqualified target keys match any
+            reachable table.
+        target_nodes (LegacyGraphNodeSelector | Unset): Deprecated v0.2 graph selector. Unqualified target keys match
+            any reachable table.
         params (GraphQueryParams | Unset): Deprecated graph_searches traversal and path parameters.
         pattern (list[PatternStep] | Unset):
         return_aliases (list[str] | Unset):
@@ -39,8 +39,8 @@ class LegacyGraphQuery:
 
     type_: GraphQueryType
     index_name: str
-    start_nodes: GraphNodeSelector | Unset = UNSET
-    target_nodes: GraphNodeSelector | Unset = UNSET
+    start_nodes: LegacyGraphNodeSelector | Unset = UNSET
+    target_nodes: LegacyGraphNodeSelector | Unset = UNSET
     params: GraphQueryParams | Unset = UNSET
     pattern: list[PatternStep] | Unset = UNSET
     return_aliases: list[str] | Unset = UNSET
@@ -114,8 +114,8 @@ class LegacyGraphQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_node_selector import GraphNodeSelector
         from ..models.graph_query_params import GraphQueryParams
+        from ..models.legacy_graph_node_selector import LegacyGraphNodeSelector
         from ..models.pattern_step import PatternStep
 
         d = dict(src_dict)
@@ -124,18 +124,18 @@ class LegacyGraphQuery:
         index_name = d.pop("index_name")
 
         _start_nodes = d.pop("start_nodes", UNSET)
-        start_nodes: GraphNodeSelector | Unset
+        start_nodes: LegacyGraphNodeSelector | Unset
         if isinstance(_start_nodes, Unset):
             start_nodes = UNSET
         else:
-            start_nodes = GraphNodeSelector.from_dict(_start_nodes)
+            start_nodes = LegacyGraphNodeSelector.from_dict(_start_nodes)
 
         _target_nodes = d.pop("target_nodes", UNSET)
-        target_nodes: GraphNodeSelector | Unset
+        target_nodes: LegacyGraphNodeSelector | Unset
         if isinstance(_target_nodes, Unset):
             target_nodes = UNSET
         else:
-            target_nodes = GraphNodeSelector.from_dict(_target_nodes)
+            target_nodes = LegacyGraphNodeSelector.from_dict(_target_nodes)
 
         _params = d.pop("params", UNSET)
         params: GraphQueryParams | Unset

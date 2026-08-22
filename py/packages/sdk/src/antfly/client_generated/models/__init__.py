@@ -322,7 +322,7 @@ from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
-from .graph_document_query import GraphDocumentQuery
+from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -336,12 +336,12 @@ from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
 from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_k_shortest_paths import GraphKShortestPaths
 from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
+from .graph_key_node_selector import GraphKeyNodeSelector
 from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
 from .graph_match_nodes import GraphMatchNodes
 from .graph_match_query import GraphMatchQuery
-from .graph_node_selector import GraphNodeSelector
 from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
@@ -360,6 +360,7 @@ from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourc
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_ref_node_selector import GraphResultRefNodeSelector
 from .graph_result_row_type_0 import GraphResultRowType0
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_query import GraphShortestPathQuery
@@ -574,6 +575,8 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .legacy_graph_document_query import LegacyGraphDocumentQuery
+from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
@@ -1176,7 +1179,7 @@ __all__ = (
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphCountAggregate",
-    "GraphDocumentQuery",
+    "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1188,6 +1191,7 @@ __all__ = (
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
     "GraphIndexStatsSourceArtifact",
+    "GraphKeyNodeSelector",
     "GraphKShortestPaths",
     "GraphKShortestPathsQuery",
     "GraphMatch",
@@ -1195,7 +1199,6 @@ __all__ = (
     "GraphMatchNode",
     "GraphMatchNodes",
     "GraphMatchQuery",
-    "GraphNodeSelector",
     "GraphNotEqualPredicate",
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
@@ -1214,6 +1217,7 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultRefNodeSelector",
     "GraphResultRowType0",
     "GraphShortestPath",
     "GraphShortestPathQuery",
@@ -1426,6 +1430,8 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LegacyGraphDocumentQuery",
+    "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
     "LinearMergePageStatus",
     "LinearMergeRequest",

@@ -12,23 +12,23 @@ if TYPE_CHECKING:
     from ..models.node_filter import NodeFilter
 
 
-T = TypeVar("T", bound="GraphNodeSelector")
+T = TypeVar("T", bound="LegacyGraphNodeSelector")
 
 
 @_attrs_define
-class GraphNodeSelector:
-    """Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys retain legacy cross-table
-    wildcard semantics; identities are exact.
+class LegacyGraphNodeSelector:
+    """Deprecated v0.2 graph selector. Unqualified target keys match any reachable table.
 
-        Attributes:
-            keys (list[str] | Unset): Legacy list of node keys, matching the key in any reachable table. Prefer identities
-                when keys may collide across tables.
-            identities (list[GraphPathEndpoint] | Unset): Exact node identities. Omitted table means the query table.
-            result_ref (str | Unset): Reference to search results to use as nodes:
-                - "$full_text_results" - use full-text search results
-                - "$embeddings_results.index_name" - use vector search results from specific index
-            limit (int | Unset): Maximum number of nodes to select from result_ref; invalid with keys or identities.
-            node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
+    Attributes:
+        keys (list[str] | Unset): Legacy list of node keys. Target keys match any reachable table.
+        identities (list[GraphPathEndpoint] | Unset): Exact node identities. Omitted table means the query table.
+        result_ref (str | Unset): Reference to search results to use as nodes:
+            - "$full_text_results" - use full-text search results
+            - "$embeddings_results" - use merged vector search results
+            - "$fused_results" - use fused retrieval results
+            - "$graph_results.<query-name>" - use a prior graph query result
+        limit (int | Unset): Maximum number of nodes to select from result_ref; invalid with keys or identities.
+        node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
     """
 
     keys: list[str] | Unset = UNSET
@@ -101,7 +101,7 @@ class GraphNodeSelector:
         else:
             node_filter = NodeFilter.from_dict(_node_filter)
 
-        graph_node_selector = cls(
+        legacy_graph_node_selector = cls(
             keys=keys,
             identities=identities,
             result_ref=result_ref,
@@ -109,4 +109,4 @@ class GraphNodeSelector:
             node_filter=node_filter,
         )
 
-        return graph_node_selector
+        return legacy_graph_node_selector

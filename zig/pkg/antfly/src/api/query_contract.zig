@@ -8491,10 +8491,10 @@ pub fn parseLegacyGraphQuery(
     errdefer freeGraphQueryParams(alloc, params);
     const index_name = try alloc.dupe(u8, query.index_name);
     errdefer alloc.free(index_name);
-    const start_nodes = try parseGraphNodeSelector(alloc, query.start_nodes orelse return error.UnsupportedQueryRequest);
+    const start_nodes = try parseLegacyGraphNodeSelector(alloc, query.start_nodes orelse return error.UnsupportedQueryRequest);
     errdefer freeGraphNodeSelector(alloc, start_nodes);
     const target_nodes = if (query.target_nodes) |selector|
-        try parseGraphNodeSelector(alloc, selector)
+        try parseLegacyGraphNodeSelector(alloc, selector)
     else
         null;
     errdefer if (target_nodes) |selector| freeGraphNodeSelector(alloc, selector);
@@ -8671,7 +8671,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .params = .{
             .edge_types = edge_types,
             .direction = parseGraphDirection(traversal.direction),
-            .max_depth = try parseGraphBoundedU32(traversal.max_depth, 3, 1, 64),
+            .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
             .min_weight = traversal.min_weight orelse 0,
             .max_weight = traversal.max_weight orelse 0,
@@ -8787,6 +8787,15 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     const aggregates = if (aggregates_return) |return_value| try parseGraphCountAggregates(alloc, return_value.aggregates) else &.{};
     errdefer freeGraphCountAggregates(alloc, aggregates);
     const limit = if (bindings_return) |return_value| try parseGraphBoundedU32(return_value.limit, 100, 1, 10_000) else 0;
+    if (bindings_return) |return_value| {
+        if (return_value.fields != null and return_value.include_documents != true)
+            return error.InvalidQueryRequest;
+    }
+    const fields = if (bindings_return) |return_value|
+        if (return_value.fields) |items| try cloneFields(alloc, items) else &.{}
+    else
+        &.{};
+    errdefer freeOwnedStringSlice(alloc, fields);
     const match_pattern = graph_pattern_mod.ConjunctivePattern{ .nodes = nodes, .edges = edges, .predicates = predicates, .optional = optional };
     graph_pattern_mod.validateConjunctivePattern(match_pattern) catch return error.InvalidQueryRequest;
     return .{
@@ -8798,6 +8807,9 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
         .return_aliases = aliases,
         .return_limit = limit,
         .aggregates = aggregates,
+        .include_documents = if (bindings_return) |return_value| return_value.include_documents orelse false else false,
+        .fields = fields,
+        .include_all_fields = if (bindings_return) |return_value| return_value.fields == null else true,
     };
 }
 
@@ -8998,6 +9010,33 @@ fn parseGraphNodeSelector(
     alloc: std.mem.Allocator,
     selector: indexes_openapi.GraphNodeSelector,
 ) !graph_query_mod.NodeSelector {
+    return switch (selector) {
+        .graph_key_node_selector => |value| blk: {
+            if (value.keys.len == 0 or value.keys.len > 10_000) return error.InvalidQueryRequest;
+            break :blk .{ .identities = try cloneGraphKeysAsIdentities(alloc, value.keys) };
+        },
+        .graph_identity_node_selector => |value| blk: {
+            if (value.identities.len == 0 or value.identities.len > 10_000) return error.InvalidQueryRequest;
+            const owned = try cloneGraphNodeIdentities(alloc, value.identities);
+            break :blk .{ .identities = owned };
+        },
+        .graph_result_ref_node_selector => |value| blk: {
+            try validateGraphResultRef(value.result_ref);
+            break :blk .{ .result_ref = .{
+                .ref = try alloc.dupe(u8, value.result_ref),
+                .limit = if (value.limit) |limit|
+                    try parseGraphBoundedU32(limit, 0, 1, 10_000)
+                else
+                    0,
+            } };
+        },
+    };
+}
+
+fn parseLegacyGraphNodeSelector(
+    alloc: std.mem.Allocator,
+    selector: indexes_openapi.LegacyGraphNodeSelector,
+) !graph_query_mod.NodeSelector {
     if (selector.node_filter != null) return error.UnsupportedQueryRequest;
     const selector_count = @as(u8, @intFromBool(selector.keys != null)) +
         @as(u8, @intFromBool(selector.identities != null)) +
@@ -9036,6 +9075,92 @@ fn parseGraphNodeSelector(
         } };
     }
     return error.UnsupportedQueryRequest;
+}
+
+fn cloneGraphNodeIdentities(
+    alloc: std.mem.Allocator,
+    identities: []const indexes_openapi.GraphPathEndpoint,
+) ![]graph_query_mod.NodeIdentity {
+    var seen = GraphNodeIdentitySet.empty;
+    defer seen.deinit(alloc);
+    const owned = try alloc.alloc(graph_query_mod.NodeIdentity, identities.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |identity| {
+            alloc.free(identity.key);
+            if (identity.table) |table| alloc.free(table);
+        }
+        alloc.free(owned);
+    }
+    for (identities, 0..) |identity, i| {
+        if (identity.key.len == 0 or (identity.table != null and identity.table.?.len == 0))
+            return error.InvalidQueryRequest;
+        const entry = try seen.getOrPut(alloc, .{ .key = identity.key, .table = identity.table });
+        if (entry.found_existing) return error.InvalidQueryRequest;
+        entry.value_ptr.* = {};
+        owned[i] = .{ .key = try alloc.dupe(u8, identity.key), .table = null };
+        initialized += 1;
+        if (identity.table) |value| owned[i].table = try alloc.dupe(u8, value);
+    }
+    return owned;
+}
+
+fn cloneGraphKeysAsIdentities(
+    alloc: std.mem.Allocator,
+    keys: []const []const u8,
+) ![]graph_query_mod.NodeIdentity {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    const owned = try alloc.alloc(graph_query_mod.NodeIdentity, keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |identity| alloc.free(identity.key);
+        alloc.free(owned);
+    }
+    for (keys, 0..) |key, i| {
+        if (key.len == 0) return error.InvalidQueryRequest;
+        const entry = try seen.getOrPut(alloc, key);
+        if (entry.found_existing) return error.InvalidQueryRequest;
+        entry.value_ptr.* = {};
+        owned[i] = .{ .key = try alloc.dupe(u8, key), .table = null };
+        initialized += 1;
+    }
+    return owned;
+}
+
+const GraphNodeIdentityKey = struct {
+    key: []const u8,
+    table: ?[]const u8,
+};
+
+const GraphNodeIdentityContext = struct {
+    pub fn hash(_: @This(), identity: GraphNodeIdentityKey) u64 {
+        var hasher = std.hash.Wyhash.init(0x414E_5446_4C59_4752);
+        const table_len: u64 = if (identity.table) |table| @intCast(table.len + 1) else 0;
+        hasher.update(std.mem.asBytes(&table_len));
+        if (identity.table) |table| hasher.update(table);
+        const key_len: u64 = @intCast(identity.key.len);
+        hasher.update(std.mem.asBytes(&key_len));
+        hasher.update(identity.key);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), a: GraphNodeIdentityKey, b: GraphNodeIdentityKey) bool {
+        if (!std.mem.eql(u8, a.key, b.key)) return false;
+        if (a.table == null or b.table == null) return a.table == null and b.table == null;
+        return std.mem.eql(u8, a.table.?, b.table.?);
+    }
+};
+
+const GraphNodeIdentitySet = std.HashMapUnmanaged(GraphNodeIdentityKey, void, GraphNodeIdentityContext, 80);
+
+fn validateGraphResultRef(ref: []const u8) !void {
+    if (std.mem.eql(u8, ref, "$full_text_results") or
+        std.mem.eql(u8, ref, "$embeddings_results") or
+        std.mem.eql(u8, ref, "$fused_results")) return;
+    if (std.mem.startsWith(u8, ref, "$graph_results.") and
+        ref.len > "$graph_results.".len) return;
+    return error.InvalidQueryRequest;
 }
 
 fn parseExpandStrategy(text: []const u8) !graph_query_mod.ExpandStrategy {

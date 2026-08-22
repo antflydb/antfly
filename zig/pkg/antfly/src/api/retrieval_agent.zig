@@ -5880,28 +5880,44 @@ fn buildTreeStartNodes(
         const trimmed = std.mem.trim(u8, start_nodes, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidRetrievalAgentRequest;
         if (std.mem.eql(u8, trimmed, "$roots")) {
-            return .{ .keys = try discoverTreeRootKeys(
+            return try makeTreeKeyNodeSelector(alloc, try discoverTreeRootKeys(
                 alloc,
                 runner,
                 table_name,
                 tree_search.index,
                 query_request.filter_query,
                 query_request.exclusion_query,
-            ) };
+            ));
         }
         if (trimmed[0] == '$') {
-            if (hasInlineTreeSeedSearch(query_request)) {
-                return .{ .result_ref = "$tree_search" };
-            }
-            return .{ .keys = try buildTreeStartKeysFromHits(alloc, previous_query_hits) };
+            if (treeSeedResultRef(query_request)) |result_ref|
+                return try makeTreeResultRefNodeSelector(alloc, result_ref);
+            return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
         }
-        return .{ .keys = try buildTreeStartKeysFromCsv(alloc, trimmed) };
+        return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromCsv(alloc, trimmed));
     }
 
-    if (hasInlineTreeSeedSearch(query_request)) {
-        return .{ .result_ref = "$tree_search" };
-    }
-    return .{ .keys = try buildTreeStartKeysFromHits(alloc, previous_query_hits) };
+    if (treeSeedResultRef(query_request)) |result_ref|
+        return try makeTreeResultRefNodeSelector(alloc, result_ref);
+    return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
+}
+
+fn makeTreeKeyNodeSelector(
+    alloc: std.mem.Allocator,
+    keys: []const []const u8,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphKeyNodeSelector);
+    value.* = .{ .keys = keys };
+    return .{ .graph_key_node_selector = value };
+}
+
+fn makeTreeResultRefNodeSelector(
+    alloc: std.mem.Allocator,
+    result_ref: []const u8,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphResultRefNodeSelector);
+    value.* = .{ .result_ref = result_ref };
+    return .{ .graph_result_ref_node_selector = value };
 }
 
 fn retrievalQueryDiscoversTreeRoots(retrieval_query: RetrievalQueryRequest) bool {
@@ -5910,12 +5926,16 @@ fn retrievalQueryDiscoversTreeRoots(retrieval_query: RetrievalQueryRequest) bool
     return std.mem.eql(u8, std.mem.trim(u8, start_nodes, " \t\r\n"), "$roots");
 }
 
-fn hasInlineTreeSeedSearch(query_request: QueryRequest) bool {
-    return query_request.full_text_search != null or
-        query_request.semantic_search != null or
-        query_request.embeddings != null or
+fn treeSeedResultRef(query_request: QueryRequest) ?[]const u8 {
+    const has_lexical = query_request.full_text_search != null or
         query_request.filter_query != null or
         query_request.exclusion_query != null;
+    const has_semantic = query_request.semantic_search != null or
+        query_request.embeddings != null;
+    if (has_lexical and has_semantic) return "$fused_results";
+    if (has_semantic) return "$embeddings_results";
+    if (has_lexical) return "$full_text_results";
+    return null;
 }
 
 fn buildTreeStartKeysFromHits(
@@ -6253,7 +6273,10 @@ fn extractTreeFallbackRootKey(
         .graph_traverse_query => |query| query.traverse.start,
         else => return null,
     };
-    const keys = start_nodes.keys orelse return null;
+    const keys = switch (start_nodes) {
+        .graph_key_node_selector => |selector| selector.keys,
+        else => return null,
+    };
     if (keys.len != 1) return null;
     return keys[0];
 }
@@ -6458,7 +6481,7 @@ test "retrieval agent supports inline tree search" {
             defer parsed_query.deinit();
             const graph_queries = parsed_query.value.graph_queries.?;
             const tree_query = graph_queries.map.get("tree_search").?;
-            try std.testing.expectEqualStrings("$tree_search", tree_query.graph_traverse_query.traverse.start.result_ref.?);
+            try std.testing.expectEqualStrings("$embeddings_results", tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_documents.?);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{

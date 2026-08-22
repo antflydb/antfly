@@ -1240,6 +1240,10 @@ pub const GraphArtifactSourceConfig = struct {
 pub const GraphBindingsReturn = struct {
     bindings: []const []const u8,
     limit: ?i64 = null,
+    /// Hydrate documents for projected non-null bindings.
+    include_documents: ?bool = null,
+    /// Document fields to hydrate. Requires include_documents=true; omit to include all fields.
+    fields: ?[]const []const u8 = null,
 };
 
 /// Algebraic law used to combine bounded graph traversal provenance.
@@ -1253,8 +1257,13 @@ pub const GraphCountAggregate = struct {
     distinct: ?bool = null,
 };
 
-/// A document-query expression in either public QueryRequest.filter_query syntax or canonical Antfly filter AST syntax. Graph queries embed this existing document query language; alias-to-alias predicates belong in GraphMatch.where.
-pub const GraphDocumentQuery = std.json.Value;
+/// The same validated QueryRequest.filter_query DSL, embedded at a graph node. Alias-to-alias predicates belong in GraphMatch.where.
+pub const GraphFilterQuery = std.json.Value;
+
+pub const GraphIdentityNodeSelector = struct {
+    /// Exact node identities. Omitted table means the query table.
+    identities: []const GraphPathEndpoint,
+};
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
@@ -1382,8 +1391,8 @@ pub const GraphKShortestPaths = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// Canonical Antfly document-query AST.
-    filter: ?GraphDocumentQuery = null,
+    /// The same document-query DSL accepted by QueryRequest.filter_query.
+    filter: ?GraphFilterQuery = null,
     /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -1393,6 +1402,11 @@ pub const GraphKShortestPaths = struct {
 pub const GraphKShortestPathsQuery = struct {
     index: []const u8,
     k_shortest_paths: GraphKShortestPaths,
+};
+
+pub const GraphKeyNodeSelector = struct {
+    /// Exact keys in the table being queried.
+    keys: []const []const u8,
 };
 
 pub const GraphMatch = struct {
@@ -1415,8 +1429,8 @@ pub const GraphMatchEdge = struct {
 };
 
 pub const GraphMatchNode = struct {
-    /// Canonical Antfly document-query expression evaluated for this alias.
-    filter: ?GraphDocumentQuery = null,
+    /// The QueryRequest.filter_query expression evaluated for this alias.
+    filter: ?GraphFilterQuery = null,
 };
 
 pub const GraphMatchQuery = struct {
@@ -1425,18 +1439,62 @@ pub const GraphMatchQuery = struct {
     @"return": GraphReturn,
 };
 
-/// Select graph nodes by exactly one of keys, identities, or result_ref. Unqualified keys retain legacy cross-table wildcard semantics; identities are exact.
-pub const GraphNodeSelector = struct {
-    /// Legacy list of node keys, matching the key in any reachable table. Prefer identities when keys may collide across tables.
-    keys: ?[]const []const u8 = null,
-    /// Exact node identities. Omitted table means the query table.
-    identities: ?[]const GraphPathEndpoint = null,
-    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
-    result_ref: ?[]const u8 = null,
-    /// Maximum number of nodes to select from result_ref; invalid with keys or identities.
-    limit: ?i64 = null,
-    /// Filter which nodes to use as start/target
-    node_filter: ?NodeFilter = null,
+/// Select graph nodes using exactly one explicit, exact selector form.
+pub const GraphNodeSelector = union(enum) {
+    graph_result_ref_node_selector: *GraphResultRefNodeSelector,
+    graph_identity_node_selector: *GraphIdentityNodeSelector,
+    graph_key_node_selector: *GraphKeyNodeSelector,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "result_ref",
+            "limit",
+        })) {
+            if (try parseStructuralVariant(GraphResultRefNodeSelector, allocator, source, options)) |parsed| return .{ .graph_result_ref_node_selector = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "identities",
+        })) {
+            if (try parseStructuralVariant(GraphIdentityNodeSelector, allocator, source, options)) |parsed| return .{ .graph_identity_node_selector = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "keys",
+        })) {
+            if (try parseStructuralVariant(GraphKeyNodeSelector, allocator, source, options)) |parsed| return .{ .graph_key_node_selector = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_result_ref_node_selector => |v| try jw.write(v.*),
+            .graph_identity_node_selector => |v| try jw.write(v.*),
+            .graph_key_node_selector => |v| try jw.write(v.*),
+        }
+    }
 };
 
 pub const GraphNotEqualPredicate = struct {
@@ -1652,6 +1710,13 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+pub const GraphResultRefNodeSelector = struct {
+    /// A prior result set: `$full_text_results`, `$embeddings_results`, `$fused_results`, or `$graph_results.<query-name>`.
+    result_ref: []const u8,
+    /// Maximum referenced results to use. Omit only when the referenced result is complete.
+    limit: ?i64 = null,
+};
+
 pub const GraphResultRow = std.json.Value;
 
 /// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
@@ -1686,6 +1751,8 @@ pub const GraphReturn = union(enum) {
         if (objectHasAnyKey(source.object, &.{
             "bindings",
             "limit",
+            "include_documents",
+            "fields",
         })) {
             if (try parseStructuralVariant(GraphBindingsReturn, allocator, source, options)) |parsed| return .{ .graph_bindings_return = parsed };
         }
@@ -1714,8 +1781,8 @@ pub const GraphShortestPath = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     weight_mode: ?PathWeightMode = null,
-    /// Canonical Antfly document-query AST.
-    filter: ?GraphDocumentQuery = null,
+    /// The same document-query DSL accepted by QueryRequest.filter_query.
+    filter: ?GraphFilterQuery = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
@@ -1734,6 +1801,7 @@ pub const GraphTraversal = struct {
     start: GraphNodeSelector,
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
+    /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -1744,8 +1812,8 @@ pub const GraphTraversal = struct {
     include_documents: ?bool = null,
     /// Document fields to include when include_documents is true. Omit to include all fields.
     fields: ?[]const []const u8 = null,
-    /// Canonical Antfly document-query AST (the same shape accepted by QueryRequest.filter_query).
-    filter: ?GraphDocumentQuery = null,
+    /// The same document-query DSL accepted by QueryRequest.filter_query.
+    filter: ?GraphFilterQuery = null,
 };
 
 pub const GraphTraverseQuery = struct {
@@ -2107,12 +2175,29 @@ pub const IndexType = enum {
     }
 };
 
+/// Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
+pub const LegacyGraphDocumentQuery = std.json.Value;
+
+/// Deprecated v0.2 graph selector. Unqualified target keys match any reachable table.
+pub const LegacyGraphNodeSelector = struct {
+    /// Legacy list of node keys. Target keys match any reachable table.
+    keys: ?[]const []const u8 = null,
+    /// Exact node identities. Omitted table means the query table.
+    identities: ?[]const GraphPathEndpoint = null,
+    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results" - use merged vector search results - "$fused_results" - use fused retrieval results - "$graph_results.<query-name>" - use a prior graph query result
+    result_ref: ?[]const u8 = null,
+    /// Maximum number of nodes to select from result_ref; invalid with keys or identities.
+    limit: ?i64 = null,
+    /// Filter which nodes to use as start/target
+    node_filter: ?NodeFilter = null,
+};
+
 /// Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
 pub const LegacyGraphQuery = struct {
     type: GraphQueryType,
     index_name: []const u8,
-    start_nodes: ?GraphNodeSelector = null,
-    target_nodes: ?GraphNodeSelector = null,
+    start_nodes: ?LegacyGraphNodeSelector = null,
+    target_nodes: ?LegacyGraphNodeSelector = null,
     params: ?GraphQueryParams = null,
     pattern: ?[]const PatternStep = null,
     return_aliases: ?[]const []const u8 = null,
@@ -2164,7 +2249,7 @@ pub const MergeStrategy = enum {
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
-    filter_query: ?GraphDocumentQuery = null,
+    filter_query: ?LegacyGraphDocumentQuery = null,
     /// Filter by key prefix
     filter_prefix: ?[]const u8 = null,
 };

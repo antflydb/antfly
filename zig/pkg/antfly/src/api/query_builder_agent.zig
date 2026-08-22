@@ -1557,7 +1557,7 @@ fn metadataValidateGraphSelectorResultRef(
     selector_name: []const u8,
     selector: ?indexes_openapi.GraphNodeSelector,
 ) !?[]const u8 {
-    const result_ref = (selector orelse return null).result_ref orelse return null;
+    const result_ref = graphNodeSelectorResultRef(selector orelse return null) orelse return null;
     if (generatedGraphResultDependencyName(result_ref)) |dependency_name| {
         if (graph_queries.map.get(dependency_name) == null) {
             return try std.fmt.allocPrint(alloc, "graph_queries.{s}.{s} references missing graph result '{s}'", .{ search_name, selector_name, result_ref });
@@ -3701,20 +3701,26 @@ fn validateGeneratedQueryBuilderGraphQuery(
 }
 
 fn validateGeneratedGraphNodeSelector(selector: indexes_openapi.GraphNodeSelector) QueryBuilderValidationError!void {
-    const has_keys = selector.keys != null and selector.keys.?.len > 0;
-    const has_ref = selector.result_ref != null and selector.result_ref.?.len > 0;
-    if (selector.node_filter != null) return error.InvalidQueryBuilderGeneration;
-    if (selector.limit) |limit| {
-        if (limit <= 0) return error.InvalidQueryBuilderGeneration;
+    switch (selector) {
+        .graph_key_node_selector => |value| {
+            if (value.keys.len == 0) return error.InvalidQueryBuilderGeneration;
+            for (value.keys) |key| {
+                if (key.len == 0) return error.InvalidQueryBuilderGeneration;
+            }
+        },
+        .graph_identity_node_selector => |value| {
+            if (value.identities.len == 0) return error.InvalidQueryBuilderGeneration;
+            for (value.identities) |identity| {
+                if (identity.key.len == 0) return error.InvalidQueryBuilderGeneration;
+            }
+        },
+        .graph_result_ref_node_selector => |value| {
+            if (!isAllowedGeneratedGraphResultRef(value.result_ref)) return error.InvalidQueryBuilderGeneration;
+            if (value.limit) |limit| {
+                if (limit <= 0 or limit > 10_000) return error.InvalidQueryBuilderGeneration;
+            }
+        },
     }
-    if (has_keys) {
-        for (selector.keys.?) |key| {
-            if (key.len == 0) return error.InvalidQueryBuilderGeneration;
-        }
-    }
-    if (has_ref and !isAllowedGeneratedGraphResultRef(selector.result_ref.?)) return error.InvalidQueryBuilderGeneration;
-    if (has_keys and has_ref) return error.InvalidQueryBuilderGeneration;
-    if (!has_keys and !has_ref) return error.InvalidQueryBuilderGeneration;
 }
 
 fn validateGeneratedGraphResultDependencies(
@@ -3732,7 +3738,7 @@ fn validateGeneratedGraphSelectorDependency(
     selector: ?indexes_openapi.GraphNodeSelector,
     max_depth: usize,
 ) QueryBuilderValidationError!void {
-    const result_ref = (selector orelse return).result_ref orelse return;
+    const result_ref = graphNodeSelectorResultRef(selector orelse return) orelse return;
     const dep_name = generatedGraphResultDependencyName(result_ref) orelse return;
     try validateGeneratedGraphDependencyChain(graph_queries, dep_name, max_depth);
 }
@@ -3761,6 +3767,38 @@ fn generatedGraphQueryStartSelector(query: indexes_openapi.GraphQuery) ?indexes_
         .graph_traverse_query => |value| value.traverse.start,
         else => null,
     };
+}
+
+fn graphNodeSelectorResultRef(selector: indexes_openapi.GraphNodeSelector) ?[]const u8 {
+    return switch (selector) {
+        .graph_result_ref_node_selector => |value| value.result_ref,
+        else => null,
+    };
+}
+
+fn graphNodeSelectorKeys(selector: indexes_openapi.GraphNodeSelector) ?[]const []const u8 {
+    return switch (selector) {
+        .graph_key_node_selector => |value| value.keys,
+        else => null,
+    };
+}
+
+fn makeGraphKeyNodeSelector(
+    alloc: std.mem.Allocator,
+    keys: []const []const u8,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphKeyNodeSelector);
+    value.* = .{ .keys = keys };
+    return .{ .graph_key_node_selector = value };
+}
+
+fn makeGraphResultRefNodeSelector(
+    alloc: std.mem.Allocator,
+    result_ref: []const u8,
+) !indexes_openapi.GraphNodeSelector {
+    const value = try alloc.create(indexes_openapi.GraphResultRefNodeSelector);
+    value.* = .{ .result_ref = result_ref };
+    return .{ .graph_result_ref_node_selector = value };
 }
 
 fn isAllowedGeneratedGraphResultRef(result_ref: []const u8) bool {
@@ -4822,7 +4860,7 @@ fn queryBuilderInferredGraphSearches(
 }
 
 fn graphNodeSelectorSingleKey(selector: indexes_openapi.GraphNodeSelector) ?[]const u8 {
-    const keys = selector.keys orelse return null;
+    const keys = graphNodeSelectorKeys(selector) orelse return null;
     return if (keys.len == 1) keys[0] else null;
 }
 
@@ -4830,7 +4868,7 @@ fn graphNodeSelectorFilterValue(
     alloc: std.mem.Allocator,
     selector: indexes_openapi.GraphNodeSelector,
 ) !?std.json.Value {
-    const keys = selector.keys orelse return null;
+    const keys = graphNodeSelectorKeys(selector) orelse return null;
     if (keys.len == 0) return null;
     var ids = std.json.Array.init(alloc);
     for (keys) |key| try ids.append(.{ .string = key });
@@ -4926,12 +4964,12 @@ fn queryBuilderGraphStartNodes(
     if (value) |start_nodes| {
         const trimmed = std.mem.trim(u8, start_nodes, " \t\r\n");
         if (trimmed.len == 0) return null;
-        if (trimmed[0] == '$') return .{ .result_ref = try alloc.dupe(u8, trimmed) };
+        if (trimmed[0] == '$') return try makeGraphResultRefNodeSelector(alloc, try alloc.dupe(u8, trimmed));
         return try queryBuilderGraphNodeSelectorFromText(alloc, trimmed);
     }
     if (try queryBuilderInferredGraphNodeSelector(alloc, request.intent, .start)) |start_nodes| return start_nodes;
     const seed_ref = queryBuilderGraphSeedResultRef(built) orelse return null;
-    return .{ .result_ref = seed_ref };
+    return try makeGraphResultRefNodeSelector(alloc, seed_ref);
 }
 
 fn queryBuilderGraphTargetNodes(
@@ -4944,7 +4982,7 @@ fn queryBuilderGraphTargetNodes(
     if (value) |target_nodes| {
         const trimmed = std.mem.trim(u8, target_nodes, " \t\r\n");
         if (trimmed.len == 0) return null;
-        if (trimmed[0] == '$') return .{ .result_ref = try alloc.dupe(u8, trimmed) };
+        if (trimmed[0] == '$') return try makeGraphResultRefNodeSelector(alloc, try alloc.dupe(u8, trimmed));
         return try queryBuilderGraphNodeSelectorFromText(alloc, trimmed);
     }
     if (graph_mode.query_type != .shortest_path and graph_mode.query_type != .k_shortest_paths) return null;
@@ -4997,7 +5035,7 @@ fn queryBuilderGraphNodeSelectorFromText(
 ) !?indexes_openapi.GraphNodeSelector {
     const keys = try queryBuilderCsvStringSlice(alloc, text);
     if (keys.len == 0) return null;
-    return .{ .keys = keys };
+    return try makeGraphKeyNodeSelector(alloc, keys);
 }
 
 fn queryBuilderInferredIntentNodeText(
@@ -8369,7 +8407,7 @@ test "query builder uses generated graph specialist when runner is provided" {
     try std.testing.expectEqual(@as(f64, 0.87), result.confidence.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     try std.testing.expectEqualStrings("used table graph index", result.warnings.?[0]);
 }
@@ -8437,7 +8475,7 @@ test "query builder repairs invalid generated graph plan once" {
     try std.testing.expectEqualStrings("Repaired to use the table graph index.", result.explanation.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("repaired").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     if (result.warnings) |warnings| {
         for (warnings) |warning| {
@@ -8508,7 +8546,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired to use the available lexical seed.", result.explanation.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
 }
 
 test "query builder accepts generated graph result dependencies" {
@@ -8557,7 +8595,7 @@ test "query builder accepts generated graph result dependencies" {
     const graph_queries = result.query_request.?.graph_queries.?;
     try std.testing.expect(graph_queries.map.get("seed") != null);
     const dependent = graph_queries.map.get("expand_seed").?;
-    try std.testing.expectEqualStrings("$graph_results.seed", dependent.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$graph_results.seed", dependent.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqualStrings("links", dependent.graph_traverse_query.traverse.edge_types.?[0]);
 }
 
@@ -9607,7 +9645,7 @@ test "query builder maps graph searches from constraints" {
     try std.testing.expectEqual(@as(usize, 1), query_request.graph_queries.?.map.count());
     const graph_query = query_request.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("doc-1", graph_query.graph_traverse_query.traverse.start.keys.?[0]);
+    try std.testing.expectEqualStrings("doc-1", graph_query.graph_traverse_query.traverse.start.graph_key_node_selector.keys[0]);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
 }
 
@@ -9626,7 +9664,7 @@ test "query builder infers graph search from table context" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$full_text_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
     try std.testing.expectEqual(@as(i64, 2), graph_query.graph_traverse_query.traverse.max_depth.?);
 }
 
@@ -9652,7 +9690,7 @@ test "query builder infers dense graph seed from semantic results" {
     try std.testing.expectEqualStrings("semantic", result.specialist.?);
     try std.testing.expect(result.query_request.?.semantic_search != null);
     const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("$embeddings_results", graph_query.graph_traverse_query.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$embeddings_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
 }
 
 test "query builder preserves legacy flat graph indexes without structured metadata" {
@@ -9690,8 +9728,8 @@ test "query builder maps graph shorthand constraints" {
     try std.testing.expectEqualStrings("graph", result.specialist.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("graph_search").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
-    try std.testing.expectEqualStrings("doc:a", graph_query.graph_traverse_query.traverse.start.keys.?[0]);
-    try std.testing.expectEqualStrings("doc:b", graph_query.graph_traverse_query.traverse.start.keys.?[1]);
+    try std.testing.expectEqualStrings("doc:a", graph_query.graph_traverse_query.traverse.start.graph_key_node_selector.keys[0]);
+    try std.testing.expectEqualStrings("doc:b", graph_query.graph_traverse_query.traverse.start.graph_key_node_selector.keys[1]);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
     try std.testing.expectEqual(@as(i64, 1), graph_query.graph_traverse_query.traverse.max_depth.?);
 }

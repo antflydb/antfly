@@ -317,7 +317,7 @@ test "parse supported graph queries alloc clones edge types and keys" {
         \\        "start": {"keys": ["doc-a"]},
         \\        "edge_types": ["cites", "related"],
         \\        "limit": 7,
-        \\        "filter": {"term": {"path": "tenant", "value": "visible"}}
+        \\        "filter": {"term": "visible", "field": "tenant"}
         \\      }
         \\    }
         \\  }
@@ -335,6 +335,10 @@ test "parse supported graph queries alloc clones edge types and keys" {
     try std.testing.expectEqualStrings("cites", items[0].query.params.edge_types[0]);
     try std.testing.expectEqualStrings("related", items[0].query.params.edge_types[1]);
     try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
+    try std.testing.expectEqual(@as(u32, 1), items[0].query.params.max_depth);
+    try std.testing.expect(items[0].query.start_nodes == .identities);
+    try std.testing.expectEqualStrings("doc-a", items[0].query.start_nodes.identities[0].key);
+    try std.testing.expect(items[0].query.start_nodes.identities[0].table == null);
     try std.testing.expect(items[0].query.params.node_filter.filter_query_json != null);
     try std.testing.expectEqualStrings(
         "{\"term\":{\"path\":\"tenant\",\"term\":\"visible\"}}",
@@ -354,6 +358,7 @@ test "parse supported graph queries accepts deprecated graph searches" {
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expect(items[0].query.legacy_response);
+    try std.testing.expect(items[0].query.start_nodes == .keys);
     try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
     try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
     try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
@@ -398,7 +403,7 @@ test "parse supported graph queries rejects unsupported result refs" {
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries accepts graph result refs" {
@@ -531,10 +536,10 @@ test "parse supported graph queries accepts pattern node filter queries" {
         \\    "walk": {
         \\      "index": "graph_idx",
         \\      "match": {
-        \\        "nodes": {"a": {}, "b": {"filter": {"term": {"path": "title", "value": "beta"}}}},
+        \\        "nodes": {"a": {}, "b": {"filter": {"term": "beta", "field": "title"}}},
         \\        "edges": [{"from": "a", "to": "b", "types": ["links"]}]
         \\      },
-        \\      "return": {"bindings": ["a", "b"]}
+        \\      "return": {"bindings": ["a", "b"], "include_documents": true, "fields": ["title"]}
         \\    }
         \\  }
         \\}
@@ -546,11 +551,36 @@ test "parse supported graph queries accepts pattern node filter queries" {
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqual(graph_query_mod.QueryType.pattern, items[0].query.query_type);
+    try std.testing.expect(items[0].query.include_documents);
+    try std.testing.expect(!items[0].query.include_all_fields);
+    try std.testing.expectEqual(@as(usize, 1), items[0].query.fields.len);
+    try std.testing.expectEqualStrings("title", items[0].query.fields[0]);
     try std.testing.expect(items[0].query.match_pattern.?.nodes[1].filter.filter_query_json != null);
     try std.testing.expectEqualStrings(
         "{\"term\":{\"path\":\"title\",\"term\":\"beta\"}}",
         items[0].query.match_pattern.?.nodes[1].filter.filter_query_json.?,
     );
+}
+
+test "parse supported graph queries require document hydration for projected fields" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {
+        \\    "walk": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "nodes": {"a": {}, "b": {}},
+        \\        "edges": [{"from": "a", "to": "b"}]
+        \\      },
+        \\      "return": {"bindings": ["b"], "fields": ["title"]}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries accepts branches predicates optional groups and counts" {

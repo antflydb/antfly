@@ -25334,7 +25334,7 @@ test "api http server query builder handles tree graph indexes" {
     const graph_query = graph_inferred.value.query_request.?.graph_queries.?.map.get("graph_search").?;
     const traversal = graph_query.graph_traverse_query;
     try std.testing.expectEqualStrings("doc_hierarchy", traversal.index);
-    try std.testing.expectEqualStrings("$full_text_results", traversal.traverse.start.result_ref.?);
+    try std.testing.expectEqualStrings("$full_text_results", traversal.traverse.start.graph_result_ref_node_selector.result_ref);
 
     var question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,

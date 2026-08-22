@@ -65,7 +65,7 @@ pub const ResultRef = struct {
 pub const QueryParams = struct {
     edge_types: []const []const u8 = &.{},
     direction: graph_mod.EdgeDirection = .out,
-    max_depth: u32 = 3,
+    max_depth: u32 = 1,
     max_results: u32 = 100,
     min_weight: f64 = 0.0,
     max_weight: f64 = 0.0,
@@ -1440,7 +1440,7 @@ test "GraphQuery struct construction" {
         .start_nodes = .{ .keys = &.{ "doc1", "doc2" } },
     };
     try std.testing.expectEqual(QueryType.traverse, gq_traverse.query_type);
-    try std.testing.expectEqual(@as(u32, 3), gq_traverse.params.max_depth);
+    try std.testing.expectEqual(@as(u32, 1), gq_traverse.params.max_depth);
 
     const gq_neighbors = GraphQuery{
         .query_type = .neighbors,
