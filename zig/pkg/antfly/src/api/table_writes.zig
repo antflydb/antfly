@@ -8306,11 +8306,19 @@ pub const ProvisionedTableWriteSource = struct {
     ) bool {
         const snapshot_cache = self.runtime_status_cache orelse return false;
         publishRuntimeStatusSnapshot(self, snapshot_cache.alloc, table_name, group_id, db) catch |err| {
-            std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
-                table_name,
-                group_id,
-                @errorName(err),
-            });
+            if (err == error.WriterLocked) {
+                std.log.debug("managed runtime status publish deferred table={s} group_id={} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+            } else {
+                std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+            }
             return false;
         };
         return true;
@@ -21464,7 +21472,11 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         status = .{
             .group_id = group_id,
             .stats = switch (mode) {
-                .best_effort => try db.stats(alloc),
+                // Never turn apply-lock contention into a fresh, authoritative
+                // zero-cardinality observation. Callers already treat
+                // WriterLocked as a retryable status-publication miss, and the
+                // next targeted read can sample the resident writer exactly.
+                .best_effort => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
                 .consistent => try db.runtimeStatusStatsConsistent(alloc),
                 .consistent_if_available => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
                 .diagnostic => try db.diagnosticStats(alloc),
@@ -35450,6 +35462,50 @@ test "provisioned table write source consistent visibility hook does not block o
 
     const published = try snapshot_cache.snapshot(alloc, "docs");
     try std.testing.expect(published == null);
+}
+
+test "provisioned table write source best effort publish does not advertise lock contention as an empty table" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-best-effort-busy", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var db = try openManagedDbWithIndexesJson(
+        alloc,
+        path,
+        "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+    );
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"ready\"}" }},
+        .sync_level = .write,
+    });
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    source.runtime_status_cache = &snapshot_cache;
+
+    db.core.lockApplyExclusive();
+    const published_while_busy = source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db);
+    db.core.unlockApplyExclusive();
+
+    try std.testing.expect(!published_while_busy);
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db));
+    var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), published.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.source_doc_count);
+    try std.testing.expectEqual(published.items[0].stats.doc_identity.live_ordinals, published.items[0].stats.source_doc_count);
 }
 
 test "provisioned table write source consistent visibility refreshes stale dense status" {

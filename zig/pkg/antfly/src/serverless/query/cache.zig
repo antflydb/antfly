@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -23,6 +24,9 @@ const cache_record_magic = "AFQCR001";
 const cache_record_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 const cache_record_header_len = cache_record_magic.len + @sizeOf(u64) + cache_record_digest_len;
 const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
+const abandoned_cache_write_sweep_interval_ns: u64 = 5 * std.time.ns_per_min;
+const cache_write_owner_dir_name = ".query-cache-owners";
+const cache_write_owner_lease_suffix = ".lease";
 
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
@@ -124,10 +128,30 @@ const EvictableFile = struct {
     counts_as_payload_block: bool,
 };
 
+const CacheWriteOwnerLease = struct {
+    path: []u8,
+    file: std.Io.File,
+    transferred: bool = false,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.transferred) return;
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        self.file.unlock(io_impl.io());
+        self.file.close(io_impl.io());
+        deleteFilePath(io_impl.io(), self.path) catch {};
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub const QueryCache = struct {
     alloc: Allocator,
     root_dir: []u8,
     instance_id: u128,
+    owner_lease_path: []u8,
+    owner_lease_file: std.Io.File,
+    next_abandoned_write_sweep_ns: u64,
     cfg: QueryCacheConfig,
     stats_mu: std.atomic.Mutex = .unlocked,
     maintenance_mu: std.atomic.Mutex = .unlocked,
@@ -142,19 +166,25 @@ pub const QueryCache = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
-        const startup_usage = try reconcileCacheOnStartup(alloc, root_dir);
         var instance_id: u128 = undefined;
         io_impl.io().random(std.mem.asBytes(&instance_id));
+        var owner_lease = try acquireCacheWriteOwnerLease(alloc, root_dir, instance_id);
+        errdefer owner_lease.deinit(alloc);
+        const startup_usage = try reconcileCacheOnDisk(alloc, root_dir, instance_id, .none);
         var cache = QueryCache{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
             .instance_id = instance_id,
+            .owner_lease_path = owner_lease.path,
+            .owner_lease_file = owner_lease.file,
+            .next_abandoned_write_sweep_ns = platform_time.monotonicNs() +| abandoned_cache_write_sweep_interval_ns,
             .cfg = cfg,
             .stats = .{
                 .max_bytes = cfg.max_bytes,
                 .max_payload_bytes = cfg.max_payload_bytes,
             },
         };
+        owner_lease.transferred = true;
         errdefer cache.deinit();
         cache.usage = startup_usage;
         applyUsageToStats(&cache.stats, cache.usage);
@@ -163,6 +193,12 @@ pub const QueryCache = struct {
     }
 
     pub fn deinit(self: *QueryCache) void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        self.owner_lease_file.unlock(io_impl.io());
+        self.owner_lease_file.close(io_impl.io());
+        deleteFilePath(io_impl.io(), self.owner_lease_path) catch {};
+        self.alloc.free(self.owner_lease_path);
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -453,6 +489,28 @@ fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
+fn cacheWriteOwnerLeasePathAlloc(alloc: Allocator, root_dir: []const u8, instance_id: u128) ![]u8 {
+    const file_name = try std.fmt.allocPrint(alloc, "{x}{s}", .{ instance_id, cache_write_owner_lease_suffix });
+    defer alloc.free(file_name);
+    return try std.fs.path.join(alloc, &.{ root_dir, cache_write_owner_dir_name, file_name });
+}
+
+fn acquireCacheWriteOwnerLease(alloc: Allocator, root_dir: []const u8, instance_id: u128) !CacheWriteOwnerLease {
+    const owner_dir = try std.fs.path.join(alloc, &.{ root_dir, cache_write_owner_dir_name });
+    defer alloc.free(owner_dir);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, owner_dir);
+    const path = try cacheWriteOwnerLeasePathAlloc(alloc, root_dir, instance_id);
+    errdefer alloc.free(path);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true, .exclusive = true });
+    errdefer deleteFilePath(io, path) catch {};
+    errdefer file.close(io);
+    try file.lock(io, .exclusive);
+    return .{ .path = path, .file = file };
+}
+
 fn cachePathAlloc(alloc: Allocator, root_dir: []const u8, artifact_id: []const u8) ![]u8 {
     const checksum = try artifacts_mod.sha256ChecksumFromArtifactId(artifact_id);
     return try std.fs.path.join(alloc, &.{ root_dir, checksum });
@@ -740,6 +798,7 @@ fn publishCacheEntry(
 
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
+    try maybeReconcileCacheOnDisk(self, cancellation);
     if (fileExists(path)) return false;
     if (!try ensureCapacityForWrite(self, incoming_bytes, lane, cancellation)) {
         recordBypass(self);
@@ -873,10 +932,15 @@ fn consumesPayloadBudget(lane: CacheWriteLane) bool {
 }
 
 fn currentBytesNoLock(alloc: Allocator, root_dir: []const u8) !u64 {
-    return (try cacheUsageNoLock(alloc, root_dir, .none)).total_bytes;
+    return (try cacheUsageNoLock(alloc, root_dir, null, .none)).total_bytes;
 }
 
-fn cacheUsageNoLock(alloc: Allocator, root_dir: []const u8, cancellation: CancellationToken) !CacheUsage {
+fn cacheUsageNoLock(
+    alloc: Allocator,
+    root_dir: []const u8,
+    current_instance_id: ?u128,
+    cancellation: CancellationToken,
+) !CacheUsage {
     var usage = CacheUsage{};
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -891,19 +955,41 @@ fn cacheUsageNoLock(alloc: Allocator, root_dir: []const u8, cancellation: Cancel
     while (try walker.next(io_impl.io())) |entry| {
         try cancellation.check();
         if (entry.kind != .file) continue;
-        if (isTemporaryCachePath(entry.path)) continue;
+        if (isCacheWriteOwnerLeasePath(entry.path)) continue;
         const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        if (isTemporaryCachePath(entry.path)) {
+            if (current_instance_id != null and temporaryCacheWriteOwnerId(entry.path) == current_instance_id) continue;
+            addScannedFileUsage(&usage, entry.path, stat.size);
+            continue;
+        }
         addScannedFileUsage(&usage, entry.path, stat.size);
     }
     return usage;
 }
 
-/// Reconciles the on-disk cache in one startup walk. Recent or locked staging
-/// files may belong to an overlapping process during a rolling restart and are
-/// never removed. Abandoned staging files and pre-record-format range/block
-/// entries are safe to discard because the authoritative artifact store can
-/// recreate them.
-fn reconcileCacheOnStartup(alloc: Allocator, root_dir: []const u8) !CacheUsage {
+const TemporaryCacheWriteDisposition = enum {
+    removed,
+    current_owner,
+    retained,
+};
+
+const CacheWriteOwnerState = enum {
+    live,
+    dead,
+    unknown,
+};
+
+/// Reconciles physical disk usage and recoverable cache state. Owner leases
+/// allow a crashed writer's staging files to be reclaimed immediately without
+/// racing an overlapping rolling-restart writer. Legacy staging files without
+/// a lease retain the age-and-file-lock fallback and count against the physical
+/// cache budget until they are safe to remove.
+fn reconcileCacheOnDisk(
+    alloc: Allocator,
+    root_dir: []const u8,
+    current_instance_id: u128,
+    cancellation: CancellationToken,
+) !CacheUsage {
     var usage = CacheUsage{};
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -917,13 +1003,25 @@ fn reconcileCacheOnStartup(alloc: Allocator, root_dir: []const u8) !CacheUsage {
     var walker = try dir.walk(alloc);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
+        try cancellation.check();
         if (entry.kind != .file) continue;
+        if (isCacheWriteOwnerLeasePath(entry.path)) continue;
         const stat = dir.statFile(io, entry.path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
         if (isTemporaryCachePath(entry.path)) {
-            try removeAbandonedCacheWrite(io, dir, entry.path, stat.mtime.toNanoseconds(), cutoff_ns);
+            const disposition = try reconcileTemporaryCacheWrite(
+                alloc,
+                io,
+                dir,
+                root_dir,
+                entry.path,
+                current_instance_id,
+                stat.mtime.toNanoseconds(),
+                cutoff_ns,
+            );
+            if (disposition == .retained) addScannedFileUsage(&usage, entry.path, stat.size);
             continue;
         }
         if (usesVerifiedCacheRecordPath(entry.path) and
@@ -937,19 +1035,49 @@ fn reconcileCacheOnStartup(alloc: Allocator, root_dir: []const u8) !CacheUsage {
         }
         addScannedFileUsage(&usage, entry.path, stat.size);
     }
+    try pruneDeadCacheWriteOwnerLeases(alloc, root_dir, current_instance_id, cancellation);
     return usage;
 }
 
-fn removeAbandonedCacheWrite(
+fn maybeReconcileCacheOnDisk(self: *QueryCache, cancellation: CancellationToken) !void {
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns < self.next_abandoned_write_sweep_ns) return;
+    const usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = usage;
+    self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
+    recordUsage(self);
+}
+
+fn reconcileTemporaryCacheWrite(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    root_dir: []const u8,
+    path: []const u8,
+    current_instance_id: u128,
+    observed_mtime_ns: i128,
+    cutoff_ns: i128,
+) !TemporaryCacheWriteDisposition {
+    if (temporaryCacheWriteOwnerId(path)) |owner_id| {
+        if (owner_id == current_instance_id) return .current_owner;
+        switch (try cacheWriteOwnerState(alloc, io, root_dir, owner_id)) {
+            .live => return .retained,
+            .dead => return try removeUnlockedCacheWrite(io, dir, path, null),
+            .unknown => {},
+        }
+    }
+    if (observed_mtime_ns > cutoff_ns) return .retained;
+    return try removeUnlockedCacheWrite(io, dir, path, cutoff_ns);
+}
+
+fn removeUnlockedCacheWrite(
     io: std.Io,
     dir: std.Io.Dir,
     path: []const u8,
-    observed_mtime_ns: i128,
-    cutoff_ns: i128,
-) !void {
-    if (observed_mtime_ns > cutoff_ns) return;
+    cutoff_ns: ?i128,
+) !TemporaryCacheWriteDisposition {
     var file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return .removed,
         else => return err,
     };
     const locked = file.tryLock(io, .exclusive) catch |err| {
@@ -958,18 +1086,113 @@ fn removeAbandonedCacheWrite(
     };
     if (!locked) {
         file.close(io);
-        return;
+        return .retained;
     }
     defer {
         file.unlock(io);
         file.close(io);
     }
     const locked_stat = try file.stat(io);
-    if (locked_stat.mtime.toNanoseconds() > cutoff_ns) return;
+    if (cutoff_ns) |cutoff| {
+        if (locked_stat.mtime.toNanoseconds() > cutoff) return .retained;
+    }
     dir.deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
+    return .removed;
+}
+
+fn temporaryCacheWriteOwnerId(path: []const u8) ?u128 {
+    const marker = ".tmp-query-cache-";
+    const marker_index = std.mem.lastIndexOf(u8, path, marker) orelse return null;
+    const encoded = path[marker_index + marker.len ..];
+    const separator = std.mem.indexOfScalar(u8, encoded, '-') orelse return null;
+    if (separator == 0) return null;
+    return std.fmt.parseInt(u128, encoded[0..separator], 16) catch null;
+}
+
+fn cacheWriteOwnerState(
+    alloc: Allocator,
+    io: std.Io,
+    root_dir: []const u8,
+    owner_id: u128,
+) !CacheWriteOwnerState {
+    const lease_path = try cacheWriteOwnerLeasePathAlloc(alloc, root_dir, owner_id);
+    defer alloc.free(lease_path);
+    var file = (if (std.fs.path.isAbsolute(lease_path))
+        std.Io.Dir.openFileAbsolute(io, lease_path, .{ .mode = .read_write })
+    else
+        std.Io.Dir.cwd().openFile(io, lease_path, .{ .mode = .read_write })) catch |err| switch (err) {
+        error.FileNotFound => return .unknown,
+        else => return err,
+    };
+    const locked = file.tryLock(io, .exclusive) catch |err| {
+        file.close(io);
+        return err;
+    };
+    if (!locked) {
+        file.close(io);
+        return .live;
+    }
+    file.unlock(io);
+    file.close(io);
+    return .dead;
+}
+
+fn pruneDeadCacheWriteOwnerLeases(
+    alloc: Allocator,
+    root_dir: []const u8,
+    current_instance_id: u128,
+    cancellation: CancellationToken,
+) !void {
+    const owner_dir_path = try std.fs.path.join(alloc, &.{ root_dir, cache_write_owner_dir_name });
+    defer alloc.free(owner_dir_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var owner_dir = std.Io.Dir.cwd().openDir(io, owner_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer owner_dir.close(io);
+    var iter = owner_dir.iterateAssumeFirstIteration();
+    while (try iter.next(io)) |entry| {
+        try cancellation.check();
+        if (entry.kind != .file) continue;
+        const owner_id = cacheWriteOwnerIdFromLeaseName(entry.name) orelse continue;
+        if (owner_id == current_instance_id) continue;
+        var file = owner_dir.openFile(io, entry.name, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        const locked = file.tryLock(io, .exclusive) catch |err| {
+            file.close(io);
+            return err;
+        };
+        if (!locked) {
+            file.close(io);
+            continue;
+        }
+        file.unlock(io);
+        file.close(io);
+        owner_dir.deleteFile(io, entry.name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+}
+
+fn cacheWriteOwnerIdFromLeaseName(name: []const u8) ?u128 {
+    if (!std.mem.endsWith(u8, name, cache_write_owner_lease_suffix)) return null;
+    const encoded = name[0 .. name.len - cache_write_owner_lease_suffix.len];
+    if (encoded.len == 0) return null;
+    return std.fmt.parseInt(u128, encoded, 16) catch null;
+}
+
+fn isCacheWriteOwnerLeasePath(path: []const u8) bool {
+    const prefix = cache_write_owner_dir_name ++ "/";
+    return std.mem.startsWith(u8, path, prefix) and std.mem.endsWith(u8, path, cache_write_owner_lease_suffix);
 }
 
 fn usesVerifiedCacheRecordPath(path: []const u8) bool {
@@ -1135,7 +1358,7 @@ fn removeCorruptCacheEntry(self: *QueryCache, path: []const u8, cancellation: Ca
         error.FileNotFound => {},
         else => return err,
     };
-    self.usage = try cacheUsageNoLock(self.alloc, self.root_dir, cancellation);
+    self.usage = try cacheUsageNoLock(self.alloc, self.root_dir, self.instance_id, cancellation);
     lockAtomic(&self.stats_mu);
     defer self.stats_mu.unlock();
     self.stats.integrity_failures += 1;
@@ -1658,41 +1881,107 @@ test "serverless query cache rejects same-size corrupted range and block records
     try std.testing.expect(!fileExists(block_path));
 }
 
-test "serverless query cache preserves live writes and removes abandoned writes during startup" {
+test "serverless query cache leases live writes and reclaims crashed writers during startup" {
     const alloc = std.testing.allocator;
     var cache_root_buf: [256]u8 = undefined;
     const cache_root = tmpPath(&cache_root_buf, "cache-startup-temp");
     defer cleanupTmp(cache_root);
 
     var initial = try QueryCache.init(alloc, std.mem.span(cache_root));
-    initial.deinit();
-    const orphan_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "orphan.tmp-query-cache-42" });
-    defer alloc.free(orphan_path);
-    try overwriteFile(orphan_path, "incomplete");
-    try std.testing.expect(fileExists(orphan_path));
+    const live_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/live.tmp-query-cache-{x}-0",
+        .{ std.mem.span(cache_root), initial.instance_id },
+    );
+    defer alloc.free(live_path);
+    try overwriteFile(live_path, "live-write");
 
     var fresh_overlap = try QueryCache.init(alloc, std.mem.span(cache_root));
+    try std.testing.expectEqual(@as(u64, "live-write".len), fresh_overlap.statsSnapshot().current_bytes);
     fresh_overlap.deinit();
-    try std.testing.expect(fileExists(orphan_path));
+    try std.testing.expect(fileExists(live_path));
 
-    try setFileModifyTimestamp(orphan_path, 1);
+    initial.deinit();
+    try setFileModifyTimestamp(live_path, 1);
+    var recovered_live_owner = try QueryCache.init(alloc, std.mem.span(cache_root));
+    recovered_live_owner.deinit();
+    try std.testing.expect(!fileExists(live_path));
+
+    const crashed_owner_id: u128 = 0x42;
+    const crashed_lease_path = try cacheWriteOwnerLeasePathAlloc(alloc, std.mem.span(cache_root), crashed_owner_id);
+    defer alloc.free(crashed_lease_path);
+    try ensureParentDir(crashed_lease_path);
+    try overwriteFile(crashed_lease_path, "");
+    const crashed_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/crashed.tmp-query-cache-{x}-0",
+        .{ std.mem.span(cache_root), crashed_owner_id },
+    );
+    defer alloc.free(crashed_path);
+    try overwriteFile(crashed_path, "recent-crash");
+
+    var recovered_crash = try QueryCache.init(alloc, std.mem.span(cache_root));
+    recovered_crash.deinit();
+    try std.testing.expect(!fileExists(crashed_path));
+    try std.testing.expect(!fileExists(crashed_lease_path));
+
+    const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(cache_root), "legacy.tmp-query-cache-42" });
+    defer alloc.free(legacy_path);
+    try overwriteFile(legacy_path, "incomplete");
+
+    var legacy_overlap = try QueryCache.init(alloc, std.mem.span(cache_root));
+    try std.testing.expect(fileExists(legacy_path));
+    try std.testing.expectEqual(@as(u64, "incomplete".len), legacy_overlap.statsSnapshot().current_bytes);
+    legacy_overlap.deinit();
+
+    try setFileModifyTimestamp(legacy_path, 1);
     {
         var lock_io = threadedIo();
         defer lock_io.deinit();
-        var locked_file = try std.Io.Dir.openFileAbsolute(lock_io.io(), orphan_path, .{ .mode = .read_write });
+        var locked_file = try std.Io.Dir.openFileAbsolute(lock_io.io(), legacy_path, .{ .mode = .read_write });
         defer locked_file.close(lock_io.io());
         try locked_file.lock(lock_io.io(), .exclusive);
         defer locked_file.unlock(lock_io.io());
 
         var locked_overlap = try QueryCache.init(alloc, std.mem.span(cache_root));
         defer locked_overlap.deinit();
-        try std.testing.expect(fileExists(orphan_path));
+        try std.testing.expect(fileExists(legacy_path));
+        try std.testing.expectEqual(@as(u64, "incomplete".len), locked_overlap.statsSnapshot().current_bytes);
     }
 
     var recovered = try QueryCache.init(alloc, std.mem.span(cache_root));
     defer recovered.deinit();
-    try std.testing.expect(!fileExists(orphan_path));
+    try std.testing.expect(!fileExists(legacy_path));
     try std.testing.expectEqual(@as(u64, 0), recovered.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache maintenance reclaims newly orphaned owner writes" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-maintenance-orphan");
+    defer cleanupTmp(cache_root);
+
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    const crashed_owner_id: u128 = 0x99;
+    const crashed_lease_path = try cacheWriteOwnerLeasePathAlloc(alloc, std.mem.span(cache_root), crashed_owner_id);
+    defer alloc.free(crashed_lease_path);
+    try ensureParentDir(crashed_lease_path);
+    try overwriteFile(crashed_lease_path, "");
+    const crashed_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/crashed.tmp-query-cache-{x}-0",
+        .{ std.mem.span(cache_root), crashed_owner_id },
+    );
+    defer alloc.free(crashed_path);
+    try overwriteFile(crashed_path, "orphaned-after-startup");
+
+    cache.next_abandoned_write_sweep_ns = 0;
+    try maybeReconcileCacheOnDisk(&cache, .none);
+    try std.testing.expect(!fileExists(crashed_path));
+    try std.testing.expect(!fileExists(crashed_lease_path));
+    try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().current_bytes);
 }
 
 test "serverless query cache prunes legacy pinned block records during startup" {
