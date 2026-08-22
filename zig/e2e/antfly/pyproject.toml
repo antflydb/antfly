@@ -5,6 +5,7 @@ description = "Portable E2E tests for antfly-zig"
 requires-python = ">=3.11"
 dependencies = [
     "pytest>=8.0",
+    "pytest-xdist>=3.8",
     "requests>=2.31",
 ]
 

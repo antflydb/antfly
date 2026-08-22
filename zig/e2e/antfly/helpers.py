@@ -17,10 +17,26 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from socketserver import BaseServer
 from typing import Callable
 
 import requests
+
+
+HTTP_SERVER_POLL_INTERVAL_S = 0.02
+
+
+def start_http_server(server: BaseServer) -> threading.Thread:
+    """Start a test HTTP server without Python's 500ms shutdown latency."""
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": HTTP_SERVER_POLL_INTERVAL_S},
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def json_doc(**fields) -> str:
