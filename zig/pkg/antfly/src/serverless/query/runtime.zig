@@ -209,9 +209,9 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         const result = if (self.cache) |cache|
-            try cache.getOrFetchAlloc(self.artifacts, artifact.artifact_id)
+            try cache.getOrFetchAllocWithCancellation(self.artifacts, artifact.artifact_id, self.cancellation)
         else
-            try self.artifacts.getAlloc(artifact.artifact_id);
+            try self.artifacts.getAllocWithCancellation(artifact.artifact_id, self.cancellation);
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -221,9 +221,9 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAlloc(self.artifacts, artifact.artifact_id, offset, len)
+            try cache.getRangeOrFetchAllocWithCancellation(self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
         else
-            try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+            try self.artifacts.getRangeAllocWithCancellation(artifact.artifact_id, offset, len, self.cancellation);
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -233,9 +233,9 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         const result = if (self.cache) |cache|
-            try cache.getBlockOrFetchRangeAlloc(self.artifacts, artifact.artifact_id, block_id, offset, len)
+            try cache.getBlockOrFetchRangeAllocWithCancellation(self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
         else
-            try self.artifacts.getRangeAlloc(artifact.artifact_id, offset, len);
+            try self.artifacts.getRangeAllocWithCancellation(artifact.artifact_id, offset, len, self.cancellation);
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -622,6 +622,106 @@ test "query runtime block range fetch uses cache after artifact deletion" {
     const second = try session.fetchArtifactBlockRangeAlloc(0, "vector-header", 2, 3);
     defer alloc.free(second);
     try std.testing.expectEqualStrings("cde", second);
+}
+
+test "serverless query session propagates cancellation through full and cached range transports" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        cancelled: *std.atomic.Value(bool),
+        full_calls: usize = 0,
+        range_calls: usize = 0,
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedPut;
+        }
+
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.NonCancellableFullReadUsed;
+        }
+
+        fn getAllocWithCancellation(ptr: *anyopaque, _: Allocator, _: []const u8, cancellation: CancellationToken) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.full_calls += 1;
+            self.cancelled.store(true, .release);
+            try cancellation.check();
+            return error.ExpectedCancellation;
+        }
+
+        fn getRangeAlloc(_: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return error.NonCancellableRangeReadUsed;
+        }
+
+        fn getRangeAllocWithCancellation(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize, cancellation: CancellationToken) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_calls += 1;
+            self.cancelled.store(true, .release);
+            try cancellation.check();
+            return error.ExpectedCancellation;
+        }
+
+        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedStat;
+        }
+
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedDelete;
+        }
+
+        const vtable = artifacts_mod.ArtifactStore.VTable{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = getAlloc,
+            .get_alloc_with_cancellation = getAllocWithCancellation,
+            .get_range_alloc = getRangeAlloc,
+            .get_range_alloc_with_cancellation = getRangeAllocWithCancellation,
+            .stat = stat,
+            .delete = delete,
+        };
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var state = State{ .cancelled = &cancelled };
+    var artifact_store = artifacts_mod.ArtifactStore{
+        .allocator = alloc,
+        .ptr = &state,
+        .vtable = &State.vtable,
+    };
+    defer artifact_store.deinit();
+    var refs = [_]manifest_mod.ArtifactRef{.{
+        .kind = .vector_segment,
+        .artifact_id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .byte_len = 7,
+        .checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    }};
+    var session = QuerySession{
+        .alloc = alloc,
+        .artifacts = &artifact_store,
+        .manifest = .{
+            .namespace = "docs",
+            .version = 1,
+            .built_at_ns = 1,
+            .wal_start_lsn = 1,
+            .wal_end_lsn = 1,
+            .stats = .{},
+            .artifacts = &refs,
+        },
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+
+    try std.testing.expectError(error.Canceled, session.fetchArtifactAlloc(0));
+    try std.testing.expectEqual(@as(usize, 1), state.full_calls);
+
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "transport-cancellation-cache");
+    defer cleanupTmp(cache_root);
+    var cache = try cache_mod.QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+    session.cache = &cache;
+    cancelled.store(false, .release);
+    try std.testing.expectError(error.Canceled, session.fetchArtifactBlockRangeAlloc(0, "vector-header", 0, 7));
+    try std.testing.expectEqual(@as(usize, 1), state.range_calls);
 }
 
 test "query runtime tracks namespace-scoped search metrics" {

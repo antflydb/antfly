@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 
@@ -147,35 +148,50 @@ pub const QueryCache = struct {
     }
 
     pub fn getOrFetchAlloc(self: *QueryCache, artifacts: *artifacts_mod.ArtifactStore, artifact_id: []const u8) ![]u8 {
+        return try self.getOrFetchAllocWithCancellation(artifacts, artifact_id, .none);
+    }
+
+    pub fn getOrFetchAllocWithCancellation(
+        self: *QueryCache,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
         const path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
-        const cached = readFileAlloc(self.alloc, path) catch |err| switch (err) {
+        const cached = readFileAllocWithCancellation(self.alloc, path, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (cached) |value| {
+            errdefer self.alloc.free(value);
             touchFileNow(path) catch {};
             lockAtomic(&self.mu);
             defer self.mu.unlock();
+            try cancellation.check();
+            try refreshUsageStatsNoLock(self);
             self.stats.hits += 1;
             self.stats.full_hits += 1;
-            try refreshUsageStatsNoLock(self);
             return value;
         }
 
-        const contents = try artifacts.getAlloc(artifact_id);
+        const contents = try artifacts.getAllocWithCancellation(artifact_id, cancellation);
         errdefer self.alloc.free(contents);
+        try cancellation.check();
         try ensureParentDir(path);
 
         lockAtomic(&self.mu);
         defer self.mu.unlock();
+        try cancellation.check();
 
         self.stats.misses += 1;
         self.stats.full_misses += 1;
         try ensureCapacityNoLock(self, @intCast(contents.len), .full);
+        try cancellation.check();
         try ensureParentDir(path);
-        try writeFileAtomically(path, contents);
+        try writeFileAtomicallyWithCancellation(path, contents, cancellation);
         self.stats.writes += 1;
         self.stats.full_writes += 1;
         try refreshUsageStatsNoLock(self);
@@ -189,56 +205,70 @@ pub const QueryCache = struct {
         offset: u64,
         len: usize,
     ) ![]u8 {
+        return try self.getRangeOrFetchAllocWithCancellation(artifacts, artifact_id, offset, len, .none);
+    }
+
+    pub fn getRangeOrFetchAllocWithCancellation(
+        self: *QueryCache,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
         const full_path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(full_path);
 
-        const full_cached = readFileAlloc(self.alloc, full_path) catch |err| switch (err) {
+        const full_cached = readFileRangeAllocWithCancellation(self.alloc, full_path, offset, len, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (full_cached) |value| {
-            defer self.alloc.free(value);
-            if (offset <= value.len) {
-                const start: usize = @intCast(offset);
-                const end = @min(value.len, start + len);
-                touchFileNow(full_path) catch {};
-                lockAtomic(&self.mu);
-                defer self.mu.unlock();
-                self.stats.hits += 1;
-                self.stats.range_hits += 1;
-                try refreshUsageStatsNoLock(self);
-                return try self.alloc.dupe(u8, value[start..end]);
-            }
+            errdefer self.alloc.free(value);
+            touchFileNow(full_path) catch {};
+            lockAtomic(&self.mu);
+            defer self.mu.unlock();
+            try cancellation.check();
+            try refreshUsageStatsNoLock(self);
+            self.stats.hits += 1;
+            self.stats.range_hits += 1;
+            return value;
         }
 
         const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
         defer self.alloc.free(range_path);
-        const cached = readFileAlloc(self.alloc, range_path) catch |err| switch (err) {
+        const cached = readFileAllocWithCancellation(self.alloc, range_path, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (cached) |value| {
+            errdefer self.alloc.free(value);
             touchFileNow(range_path) catch {};
             lockAtomic(&self.mu);
             defer self.mu.unlock();
+            try cancellation.check();
+            try refreshUsageStatsNoLock(self);
             self.stats.hits += 1;
             self.stats.range_hits += 1;
-            try refreshUsageStatsNoLock(self);
             return value;
         }
 
-        const contents = try artifacts.getRangeAlloc(artifact_id, offset, len);
+        const contents = try artifacts.getRangeAllocWithCancellation(artifact_id, offset, len, cancellation);
         errdefer self.alloc.free(contents);
+        try cancellation.check();
         try ensureParentDir(range_path);
 
         lockAtomic(&self.mu);
         defer self.mu.unlock();
+        try cancellation.check();
 
         self.stats.misses += 1;
         self.stats.range_misses += 1;
         try ensureCapacityNoLock(self, @intCast(contents.len), .range);
+        try cancellation.check();
         try ensureParentDir(range_path);
-        try writeFileAtomically(range_path, contents);
+        try writeFileAtomicallyWithCancellation(range_path, contents, cancellation);
         self.stats.writes += 1;
         self.stats.range_writes += 1;
         try refreshUsageStatsNoLock(self);
@@ -253,56 +283,70 @@ pub const QueryCache = struct {
         offset: u64,
         len: usize,
     ) ![]u8 {
+        return try self.getBlockOrFetchRangeAllocWithCancellation(artifacts, artifact_id, block_id, offset, len, .none);
+    }
+
+    pub fn getBlockOrFetchRangeAllocWithCancellation(
+        self: *QueryCache,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
         const full_path = try cachePathAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(full_path);
 
-        const full_cached = readFileAlloc(self.alloc, full_path) catch |err| switch (err) {
+        const full_cached = readFileRangeAllocWithCancellation(self.alloc, full_path, offset, len, cancellation) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (full_cached) |value| {
-            defer self.alloc.free(value);
-            if (offset <= value.len) {
-                const start: usize = @intCast(offset);
-                const end = @min(value.len, start + len);
-                touchFileNow(full_path) catch {};
-                lockAtomic(&self.mu);
-                defer self.mu.unlock();
-                self.stats.hits += 1;
-                self.stats.block_hits += 1;
-                incrementBlockClassHit(&self.stats, block_class);
-                incrementPayloadBlockClassHit(&self.stats, payload_block_class);
-                try refreshUsageStatsNoLock(self);
-                return try self.alloc.dupe(u8, value[start..end]);
-            }
-        }
-
-        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, block_class);
-        defer self.alloc.free(block_path);
-        const cached = readFileAlloc(self.alloc, block_path) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (cached) |value| {
-            touchFileNow(block_path) catch {};
+            errdefer self.alloc.free(value);
+            touchFileNow(full_path) catch {};
             lockAtomic(&self.mu);
             defer self.mu.unlock();
+            try cancellation.check();
+            try refreshUsageStatsNoLock(self);
             self.stats.hits += 1;
             self.stats.block_hits += 1;
             incrementBlockClassHit(&self.stats, block_class);
             incrementPayloadBlockClassHit(&self.stats, payload_block_class);
-            try refreshUsageStatsNoLock(self);
             return value;
         }
 
-        const contents = try artifacts.getRangeAlloc(artifact_id, offset, len);
+        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, block_class);
+        defer self.alloc.free(block_path);
+        const cached = readFileAllocWithCancellation(self.alloc, block_path, cancellation) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (cached) |value| {
+            errdefer self.alloc.free(value);
+            touchFileNow(block_path) catch {};
+            lockAtomic(&self.mu);
+            defer self.mu.unlock();
+            try cancellation.check();
+            try refreshUsageStatsNoLock(self);
+            self.stats.hits += 1;
+            self.stats.block_hits += 1;
+            incrementBlockClassHit(&self.stats, block_class);
+            incrementPayloadBlockClassHit(&self.stats, payload_block_class);
+            return value;
+        }
+
+        const contents = try artifacts.getRangeAllocWithCancellation(artifact_id, offset, len, cancellation);
         errdefer self.alloc.free(contents);
+        try cancellation.check();
         try ensureParentDir(block_path);
 
         lockAtomic(&self.mu);
         defer self.mu.unlock();
+        try cancellation.check();
 
         self.stats.misses += 1;
         self.stats.block_misses += 1;
@@ -312,8 +356,9 @@ pub const QueryCache = struct {
             .routing => .routing_block,
             .payload => .payload_block,
         });
+        try cancellation.check();
         try ensureParentDir(block_path);
-        try writeFileAtomically(block_path, contents);
+        try writeFileAtomicallyWithCancellation(block_path, contents, cancellation);
         self.stats.writes += 1;
         self.stats.block_writes += 1;
         incrementBlockClassWrite(&self.stats, block_class);
@@ -351,10 +396,47 @@ fn blockCachePathAlloc(
     return try std.fs.path.join(alloc, &.{ root_dir, lane, artifact_id, block_id });
 }
 
-fn readFileAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+fn readFileAllocWithCancellation(alloc: Allocator, path: []const u8, cancellation: CancellationToken) ![]u8 {
+    return (try readFileRangeAllocWithCancellation(alloc, path, 0, std.math.maxInt(usize), cancellation)) orelse
+        return error.InvalidRange;
+}
+
+/// Returns null when the file exists but the requested offset is beyond its
+/// current end. Range callers can then fall through to their authoritative
+/// source without allocating the entire cached artifact.
+fn readFileRangeAllocWithCancellation(
+    alloc: Allocator,
+    path: []const u8,
+    offset: u64,
+    len: usize,
+    cancellation: CancellationToken,
+) !?[]u8 {
+    try cancellation.check();
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(std.math.maxInt(usize)));
+    const io = io_impl.io();
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (offset > stat.size) return null;
+    const available = stat.size - offset;
+    const output_len = std.math.cast(usize, @min(available, len)) orelse return error.CacheEntryTooLarge;
+    const out = try alloc.alloc(u8, output_len);
+    errdefer alloc.free(out);
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < out.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, out.len - copied);
+        const chunk = out[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, offset + copied) != chunk.len) return error.ShortCacheRead;
+        copied += chunk.len;
+    }
+    try cancellation.check();
+    return out;
 }
 
 fn ensureParentDir(path: []const u8) !void {
@@ -366,21 +448,31 @@ fn ensureParentDir(path: []const u8) !void {
 
 var nonce: std.atomic.Value(u64) = .init(0);
 
-fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
+fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
+    try cancellation.check();
     const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{ path, nonce.fetchAdd(1, .monotonic) });
     defer std.heap.page_allocator.free(tmp_path);
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
+    errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
     {
         var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
-        try writer.interface.writeAll(contents);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var written: usize = 0;
+        while (written < contents.len) {
+            try cancellation.check();
+            const chunk_len = @min(cancellation_chunk_bytes, contents.len - written);
+            try writer.interface.writeAll(contents[written..][0..chunk_len]);
+            written += chunk_len;
+        }
         try writer.end();
     }
+    try cancellation.check();
     if (std.fs.path.isAbsolute(path)) {
         try std.Io.Dir.renameAbsolute(tmp_path, path, io);
     } else {
@@ -672,6 +764,53 @@ test "query cache reuses cached artifact contents" {
     try std.testing.expectEqual(@as(u64, 1), stats.full_misses);
     try std.testing.expectEqual(@as(u64, 1), stats.full_hits);
     try std.testing.expectEqual(@as(u64, 1), stats.full_writes);
+}
+
+test "serverless query cache cancels bounded positional reads without recording a hit" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-cancel");
+    const cache_root = tmpPath(&cache_root_buf, "cache-cancel");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    const contents = try alloc.alloc(u8, 2 * 1024 * 1024);
+    defer alloc.free(contents);
+    @memset(contents, 'x');
+    var meta = try artifact_store.put(contents);
+    defer meta.deinit(alloc);
+
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+    const warmed = try cache.getOrFetchAlloc(&artifact_store, meta.artifact_id);
+    alloc.free(warmed);
+
+    const State = struct {
+        checks: usize = 0,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 4;
+        }
+    };
+    var state = State{};
+    try std.testing.expectError(
+        error.Canceled,
+        cache.getRangeOrFetchAllocWithCancellation(
+            &artifact_store,
+            meta.artifact_id,
+            0,
+            contents.len,
+            CancellationToken{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
+        ),
+    );
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.range_hits);
 }
 
 test "query cache clears cache when max bytes would be exceeded" {

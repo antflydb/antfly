@@ -201,15 +201,35 @@ const HttpxTransport = struct {
         }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
         defer response.deinit();
 
-        return .{
-            .status = response.status.code,
-            .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
-            .etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null,
-            .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
-            .location = if (response.headers.get("Location")) |value| try alloc.dupe(u8, value) else null,
-        };
+        return try transportResponseAlloc(
+            alloc,
+            response.status.code,
+            response.body orelse "",
+            response.headers.get("ETag"),
+            response.headers.get("Content-Type"),
+            response.headers.get("Location"),
+        );
     }
 };
+
+fn transportResponseAlloc(
+    alloc: Allocator,
+    status: u16,
+    body: []const u8,
+    etag: ?[]const u8,
+    content_type: ?[]const u8,
+    location: ?[]const u8,
+) !TransportResponse {
+    var result = TransportResponse{
+        .status = status,
+        .body = try alloc.dupe(u8, body),
+    };
+    errdefer result.deinit(alloc);
+    if (etag) |value| result.etag = try alloc.dupe(u8, value);
+    if (content_type) |value| result.content_type = try alloc.dupe(u8, value);
+    if (location) |value| result.location = try alloc.dupe(u8, value);
+    return result;
+}
 
 test "gcs http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
@@ -1318,6 +1338,23 @@ test "gcs response parsers clean up every allocation failure" {
                 "{\"items\":[{\"name\":\"backup/a\",\"etag\":\"a\",\"size\":\"1\"},{\"name\":\"backup/b\",\"etag\":\"b\",\"size\":\"2\"}],\"prefixes\":[\"backup/nested/\"],\"nextPageToken\":\"next\"}",
             );
             defer listed.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "gcs transport response construction cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var response = try transportResponseAlloc(
+                alloc,
+                200,
+                "payload",
+                "etag",
+                "application/octet-stream",
+                "https://storage.googleapis.com/session",
+            );
+            defer response.deinit(alloc);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

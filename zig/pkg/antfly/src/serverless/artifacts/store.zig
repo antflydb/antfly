@@ -70,6 +70,7 @@ pub const ArtifactStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u8,
+        get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror![]u8 = null,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         stat: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
@@ -87,7 +88,22 @@ pub const ArtifactStore = struct {
     }
 
     pub fn getAlloc(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {
-        return try self.vtable.get_alloc(self.ptr, self.allocator, artifact_id);
+        return try self.getAllocWithCancellation(artifact_id, .none);
+    }
+
+    pub fn getAllocWithCancellation(
+        self: *ArtifactStore,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const payload = if (self.vtable.get_alloc_with_cancellation) |get_with_cancellation|
+            try get_with_cancellation(self.ptr, self.allocator, artifact_id, cancellation)
+        else
+            try self.vtable.get_alloc(self.ptr, self.allocator, artifact_id);
+        errdefer self.allocator.free(payload);
+        try cancellation.check();
+        return payload;
     }
 
     pub fn getRangeAlloc(self: *ArtifactStore, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {

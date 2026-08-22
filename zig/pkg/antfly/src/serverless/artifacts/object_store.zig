@@ -168,12 +168,25 @@ pub const ObjectStore = struct {
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
+        return try self.getAllocWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn getAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
         defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{});
+        var result = self.client.getObject(self.bucket, key, .{
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
         defer result.deinit(alloc);
-        return try alloc.dupe(u8, result.body);
+        try cancellation.check();
+        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
 
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -200,7 +213,7 @@ pub const ObjectStore = struct {
         }) catch |err| return normalizeCancellationError(err);
         defer result.deinit(alloc);
         try cancellation.check();
-        return try alloc.dupe(u8, result.body);
+        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
 
     pub fn stat(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
@@ -242,6 +255,7 @@ pub const ObjectStore = struct {
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .stat = erasedStat,
@@ -262,6 +276,11 @@ pub const ObjectStore = struct {
     fn erasedGetAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.getAlloc(alloc, artifact_id);
+    }
+
+    fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.getAllocWithCancellation(alloc, artifact_id, cancellation);
     }
 
     fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -292,6 +311,25 @@ pub const ObjectStore = struct {
 
 fn normalizeCancellationError(err: anyerror) anyerror {
     return if (err == error.Cancelled) error.Canceled else err;
+}
+
+fn dupeWithCancellationAlloc(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    cancellation: CancellationToken,
+) ![]u8 {
+    const out = try alloc.alloc(u8, source.len);
+    errdefer alloc.free(out);
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < source.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, source.len - copied);
+        @memcpy(out[copied..][0..chunk_len], source[copied..][0..chunk_len]);
+        copied += chunk_len;
+    }
+    try cancellation.check();
+    return out;
 }
 
 fn sha256StringAlloc(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {

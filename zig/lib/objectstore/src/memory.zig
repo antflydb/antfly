@@ -173,18 +173,29 @@ pub const MemoryClient = struct {
         }
         if (opts.cancellation) |token| try token.check();
 
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const owned_etag = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(owned_etag);
+        const owned_checksum = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(owned_checksum);
+        const owned_content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_content_type) |value| alloc.free(value);
+
         return .{
             .body = body,
             .metadata = .{
-                .bucket = try alloc.dupe(u8, bucket),
-                .key = try alloc.dupe(u8, key),
-                .etag = try alloc.dupe(u8, object.etag),
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .etag = owned_etag,
                 .checksum = .{
                     .algorithm = .sha256_hex,
-                    .value = try alloc.dupe(u8, object.etag),
+                    .value = owned_checksum,
                 },
                 .content_length = @intCast(object.body.len),
-                .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
+                .content_type = owned_content_type,
             },
         };
     }
@@ -445,6 +456,22 @@ test "memory client supports put get stat list and delete" {
 
     try client.deleteObject("bucket", "a/one", .{});
     try std.testing.expectError(error.FileNotFound, client.getObject("bucket", "a/one", .{}));
+}
+
+test "memory get result construction cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var memory = MemoryClient.init(alloc);
+            var client = memory.client();
+            defer client.deinit();
+            try client.makeBucket("bucket");
+            var put = try client.putObject("bucket", "object", "payload", .{ .content_type = "application/octet-stream" });
+            defer put.deinit(alloc);
+            var result = try client.getObject("bucket", "object", .{});
+            defer result.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "memory client supports non-recursive listing with common prefixes" {

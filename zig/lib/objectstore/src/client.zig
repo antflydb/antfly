@@ -31,6 +31,7 @@ pub const Client = struct {
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
+        get_file_with_options: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.GetOptions) anyerror!void = null,
         get_prefix: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!usize = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
@@ -98,7 +99,7 @@ pub const Client = struct {
             opts.part_number == null and
             opts.max_response_bytes == null)
         {
-            return try self.getWholeFileWithIo(io, bucket, key, dest_path);
+            return try self.getWholeFileWithIo(io, bucket, key, dest_path, opts.cancellation);
         }
         var object = try self.getObject(bucket, key, opts);
         defer object.deinit(self.allocator);
@@ -106,9 +107,22 @@ pub const Client = struct {
         try writeFileAtomically(io, dest_path, object.body);
     }
 
-    fn getWholeFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
-        if (self.vtable.get_file) |get_file| return try get_file(self.ptr, self.allocator, io, bucket, key, dest_path);
-        var meta = try self.statObject(bucket, key);
+    fn getWholeFileWithIo(
+        self: *Client,
+        io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        dest_path: []const u8,
+        cancellation: ?types.CancellationToken,
+    ) !void {
+        if (cancellation) |token| try token.check();
+        if (self.vtable.get_file_with_options) |get_file_with_options| {
+            return try get_file_with_options(self.ptr, self.allocator, io, bucket, key, dest_path, .{ .cancellation = cancellation });
+        }
+        if (cancellation == null) {
+            if (self.vtable.get_file) |get_file| return try get_file(self.ptr, self.allocator, io, bucket, key, dest_path);
+        }
+        var meta = try self.statObjectWithOptions(bucket, key, .{ .cancellation = cancellation });
         defer meta.deinit(self.allocator);
         try ensureParentDir(io, dest_path);
         const tmp_path = try tempPathAlloc(dest_path, io);
@@ -126,6 +140,8 @@ pub const Client = struct {
                 var part = try self.getObject(bucket, key, .{
                     .range = .{ .offset = offset, .length = length },
                     .if_match_etag = meta.etag,
+                    .max_response_bytes = @intCast(length),
+                    .cancellation = cancellation,
                 });
                 defer part.deinit(self.allocator);
                 if (part.body.len != length) return error.ShortObjectRead;
@@ -134,6 +150,7 @@ pub const Client = struct {
             }
             try writer.end();
         }
+        if (cancellation) |token| try token.check();
         try renameFilePath(io, tmp_path, dest_path);
     }
 

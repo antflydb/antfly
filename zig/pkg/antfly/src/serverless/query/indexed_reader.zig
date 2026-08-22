@@ -148,15 +148,23 @@ fn searchResolvedAllocWithStats(
     for (final_scored_docs, 0..) |scored, idx| {
         if (idx % 64 == 0) try session.checkCancellation();
         const body = findBody(docs, scored.doc_id) orelse return error.DocumentBodyNotFound;
-        hits[idx] = .{
-            .doc_id = try alloc.dupe(u8, scored.doc_id),
-            .body = try alloc.dupe(u8, body),
-            .score = scored.score,
-            .distance = scored.distance,
-        };
+        hits[idx] = try cloneSearchHitAlloc(alloc, scored, body);
         initialized_hits += 1;
     }
     return hits;
+}
+
+fn cloneSearchHitAlloc(alloc: Allocator, scored: ScoredDoc, body: []const u8) !query_request.SearchHit {
+    const owned_doc_id = try alloc.dupe(u8, scored.doc_id);
+    errdefer alloc.free(owned_doc_id);
+    const owned_body = try alloc.dupe(u8, body);
+    errdefer alloc.free(owned_body);
+    return .{
+        .doc_id = owned_doc_id,
+        .body = owned_body,
+        .score = scored.score,
+        .distance = scored.distance,
+    };
 }
 
 fn loadPublishedDocumentsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession) ![]materializer_mod.Document {
@@ -189,9 +197,13 @@ fn allocMaterializedDocumentsFromEntries(alloc: Allocator, entries: []const docu
         for (docs[0..initialized]) |*doc| doc.deinit(alloc);
     }
     for (entries, 0..) |entry, idx| {
+        const owned_doc_id = try alloc.dupe(u8, entry.doc_id);
+        errdefer alloc.free(owned_doc_id);
+        const owned_body = try alloc.dupe(u8, entry.body);
+        errdefer alloc.free(owned_body);
         docs[idx] = .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = try alloc.dupe(u8, entry.body),
+            .doc_id = owned_doc_id,
+            .body = owned_body,
             .last_lsn = entry.last_lsn,
             .last_timestamp_ns = entry.last_timestamp_ns,
         };
@@ -206,12 +218,16 @@ fn allocMaterializerMutationsFromEntries(alloc: Allocator, entries: []const segm
     var initialized: usize = 0;
     errdefer freeMaterializerMutations(alloc, mutations[0..initialized]);
     for (entries, 0..) |entry, idx| {
+        const owned_doc_id = try alloc.dupe(u8, entry.doc_id);
+        errdefer alloc.free(owned_doc_id);
+        const owned_body = if (entry.body) |body| try alloc.dupe(u8, body) else null;
+        errdefer if (owned_body) |body| alloc.free(body);
         mutations[idx] = .{
             .lsn = entry.lsn,
             .timestamp_ns = entry.timestamp_ns,
             .kind = entry.kind,
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = if (entry.body) |body| try alloc.dupe(u8, body) else null,
+            .doc_id = owned_doc_id,
+            .body = owned_body,
         };
         initialized += 1;
     }
@@ -484,11 +500,7 @@ fn applyTextFilterSetsAlloc(
         }
         if (req.filter_text != null and !allowed.contains(hit.doc_id)) continue;
         if (req.exclusion_text != null and excluded.contains(hit.doc_id)) continue;
-        try filtered.append(alloc, .{
-            .doc_id = try alloc.dupe(u8, hit.doc_id),
-            .score = hit.score,
-            .distance = hit.distance,
-        });
+        try appendOwnedScoredDocAlloc(alloc, &filtered, hit.doc_id, hit.score, hit.distance);
     }
     return try filtered.toOwnedSlice(alloc);
 }
@@ -1102,17 +1114,21 @@ fn searchVectorArtifactAlloc(
     var merged = std.StringArrayHashMapUnmanaged(ScoredDocValue).empty;
     defer freeScoredDocValueMap(alloc, &merged);
     for (scored.items) |hit| {
-        const gop = try merged.getOrPut(alloc, hit.doc_id);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try alloc.dupe(u8, hit.doc_id);
-            gop.value_ptr.* = .{ .score = hit.score, .distance = hit.distance };
-        } else if (hit.score > gop.value_ptr.score) {
-            gop.value_ptr.* = .{ .score = hit.score, .distance = hit.distance };
+        if (merged.getPtr(hit.doc_id)) |existing| {
+            if (hit.score > existing.score) {
+                existing.* = .{ .score = hit.score, .distance = hit.distance };
+            }
+            continue;
         }
+        try merged.ensureUnusedCapacity(alloc, 1);
+        const owned_doc_id = try alloc.dupe(u8, hit.doc_id);
+        merged.putAssumeCapacityNoClobber(owned_doc_id, .{ .score = hit.score, .distance = hit.distance });
     }
     const merged_owned = try ownedScoredDocsFromValueMap(alloc, merged, 0, merged.count());
-    defer alloc.free(merged_owned);
-    return try clipScoredDocsAlloc(alloc, merged_owned, req.offset, req.limit, req.min_score);
+    errdefer freeScoredDocs(alloc, merged_owned);
+    const clipped = try clipScoredDocsAlloc(alloc, merged_owned, req.offset, req.limit, req.min_score);
+    alloc.free(merged_owned);
+    return clipped;
 }
 
 fn warmVectorArtifact(
@@ -1496,12 +1512,13 @@ fn fuseHitsAlloc(
             .weighted_rrf => weight / (reciprocal_rank_k + @as(f32, @floatFromInt(rank + 1))),
             .weighted_sum => weight * @as(f32, @floatFromInt(hit.score)),
         };
-        const gop = try merged.getOrPut(alloc, hit.doc_id);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try alloc.dupe(u8, hit.doc_id);
-            gop.value_ptr.* = 0;
+        if (merged.getPtr(hit.doc_id)) |existing| {
+            existing.* += contribution;
+            continue;
         }
-        gop.value_ptr.* += contribution;
+        try merged.ensureUnusedCapacity(alloc, 1);
+        const owned_doc_id = try alloc.dupe(u8, hit.doc_id);
+        merged.putAssumeCapacityNoClobber(owned_doc_id, contribution);
     }
 }
 
@@ -1821,11 +1838,16 @@ pub fn normalizeAlloc(alloc: Allocator, value: []const u8) ![]u8 {
 
 fn tokenizeAlloc(alloc: Allocator, normalized: []const u8) ![]const []const u8 {
     var list = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer list.deinit(alloc);
+    errdefer {
+        for (list.items) |token| alloc.free(token);
+        list.deinit(alloc);
+    }
     var iter = std.mem.tokenizeAny(u8, normalized, " ");
     while (iter.next()) |token| {
         if (token.len == 0) continue;
-        try list.append(alloc, try alloc.dupe(u8, token));
+        try list.ensureUnusedCapacity(alloc, 1);
+        const owned_token = try alloc.dupe(u8, token);
+        list.appendAssumeCapacity(owned_token);
     }
     return try list.toOwnedSlice(alloc);
 }
@@ -1924,6 +1946,54 @@ test "serverless vector quantizer cancellation adapter preserves callback semant
     var cancelled = std.atomic.Value(bool).init(true);
     const adapted = vectorQuantizerCancellation(CancellationToken.fromAtomic(&cancelled)).?;
     try std.testing.expectError(error.Canceled, adapted.check());
+}
+
+test "serverless indexed reader owned results clean up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var hit = try cloneSearchHitAlloc(alloc, .{ .doc_id = "doc-a", .score = 10 }, "body");
+            defer hit.deinit(alloc);
+
+            var document_entries = [_]document_segment_mod.Entry{.{
+                .doc_id = @constCast("doc-a"),
+                .body = @constCast("body"),
+                .last_lsn = 1,
+                .last_timestamp_ns = 2,
+            }};
+            const documents = try allocMaterializedDocumentsFromEntries(alloc, &document_entries);
+            defer materializer_mod.freeDocuments(alloc, documents);
+
+            var mutation_entries = [_]segment_mod.Entry{.{
+                .lsn = 2,
+                .timestamp_ns = 3,
+                .kind = .upsert,
+                .doc_id = @constCast("doc-a"),
+                .body = @constCast("updated"),
+            }};
+            const mutations = try allocMaterializerMutationsFromEntries(alloc, &mutation_entries);
+            defer freeMaterializerMutations(alloc, mutations);
+
+            const tokens = try tokenizeAlloc(alloc, "alpha bravo");
+            defer freeTokenSlice(alloc, tokens);
+
+            var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
+            defer {
+                freeOwnedScoredDocItems(alloc, scored.items);
+                scored.deinit(alloc);
+            }
+            try appendOwnedScoredDocAlloc(alloc, &scored, "doc-a", 10, null);
+            try appendOwnedScoredDocAlloc(alloc, &scored, "doc-b", 9, null);
+
+            var merged = std.StringArrayHashMapUnmanaged(f32).empty;
+            defer freeScoreMap(alloc, &merged);
+            try fuseHitsAlloc(alloc, &merged, &.{
+                .{ .doc_id = "doc-a", .score = 10 },
+                .{ .doc_id = "doc-a", .score = 9 },
+                .{ .doc_id = "doc-b", .score = 8 },
+            }, 1.0, .weighted_rrf);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "indexed reader uses text postings for all-term and prefix search" {
