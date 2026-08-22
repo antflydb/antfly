@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - smoke
+          - regressions
           - inference-e2e
 
 permissions:
