@@ -7116,6 +7116,7 @@ pub fn build(b: *std.Build) void {
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
+    wal_test_mod.addImport("vopr", vopr_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
         .test_runner = .{
@@ -7145,6 +7146,7 @@ pub fn build(b: *std.Build) void {
             "wal modeled replay runner uses virtual storage and time",
             "wal modeled crash runner preserves acknowledged public append",
             "wal modeled VOPR campaign stays green",
+            "modeled WAL campaign records and exactly replays VOPR traces",
             "wal modeled replay fixtures stay green",
             "wal modeled crash fixtures stay green",
             "wal modeled commit backend completion uses scheduled virtual time",
@@ -7167,6 +7169,7 @@ pub fn build(b: *std.Build) void {
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
     const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
+    wal_soak_test_mod.addImport("vopr", vopr_mod);
     const wal_soak_tests = b.addTest(.{
         .root_module = wal_soak_test_mod,
         .filters = &.{"wal sim soak stays green"},

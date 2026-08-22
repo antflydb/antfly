@@ -1,6 +1,6 @@
 # VOPR: Deterministic Autonomous Simulation for Antfly
 
-Status: implementation in progress; Phases 0, 0.5, and 1 complete
+Status: implementation in progress; Phases 0, 0.5, and 1 complete; Phases 2–4 partially implemented
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -1735,6 +1735,28 @@ that exercises the CLI promotion path end to end.
 
 Exit condition: one distributed scenario checks acknowledged user data across a
 range transition, node restart, network fault, and modeled storage recovery.
+
+#### Phase 4 implementation progress (2026-08-22)
+
+The modeled WAL campaign now has a real adapter to the standalone scenario
+contract in `pkg/antfly/src/storage/wal_vopr.zig`. It allocates a fresh modeled
+device/runtime world for every history, enumerates append, bounded batch,
+cursor verification, reopen, and truncate operations as stable transitions,
+and makes the final modeled-device crash/recovery an explicit fault transition.
+Its observations include the acknowledged model digest, visible entry count,
+LSN watermarks, virtual time, reopen count, and recovery state. Named
+properties continuously compare public WAL reads with the acknowledged model
+and specifically require acknowledged entries to survive the modeled crash.
+
+The smoke test records both existing WAL seeds as `vopr-trace-v1`, parses the
+serialized artifact, rebuilds a clean device generation, and requires exact
+byte-for-byte replay. This is the first storage suite using the common runner;
+the older schedule fixtures remain supported as seed/regression inputs during
+the migration.
+
+Phase 4 remains open for modeled I/O outcome-set transitions, the distributed
+public data/reference-model scenario, split/merge plus restart/network/storage
+fault composition, and TLA+ export from promoted VOPR histories.
 
 ### Phase 5: Search and Snapshot Optimizations
 
