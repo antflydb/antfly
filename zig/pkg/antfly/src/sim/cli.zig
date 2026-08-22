@@ -12,6 +12,10 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const argv = try init.minimal.args.toSlice(alloc);
     defer alloc.free(argv);
+    return dispatch(alloc, io, argv);
+}
+
+pub fn dispatch(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     if (argv.len < 2) return usage();
     if (std.mem.eql(u8, argv[1], "run")) return runCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "replay")) return replayCommand(alloc, io, argv[2..]);
@@ -274,10 +278,12 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
         .corpus = vopr.corpus.Corpus.init(std.heap.smp_allocator),
     };
+    defer context.deinitReport();
     try context.primeCorpus(alloc);
     defer context.corpus.deinit();
     defer context.coverage.deinit();
     const worker_count = @min(workers, @as(usize, @intCast(histories)));
+    context.worker_count = worker_count;
     const threads = try alloc.alloc(std.Thread, worker_count);
     defer alloc.free(threads);
     var spawned: usize = 0;
@@ -287,11 +293,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         spawned += 1;
     }
     for (threads) |thread| thread.join();
+    try context.reportSummary();
     if (context.first_error) |err| return err;
-    std.debug.print(
-        "VOPR campaign histories={d} seeded={d} retained={d} failures={d} features={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
-        .{ histories, context.seeded_entries, context.retained, context.failures, context.coverage.hits.count(), context.splice_attempts, context.spliced, context.splice_rejected, worker_count, artifact_dir },
-    );
 }
 
 fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -456,11 +459,40 @@ fn promoteRecordedToDir(
 }
 
 const CampaignContext = struct {
+    const Candidate = struct {
+        artifact: vopr.trace.Trace,
+        parent_indexes: [2]usize = undefined,
+        parent_count: u2 = 0,
+    };
+
+    const PropertySummary = struct {
+        name: []u8,
+        evaluations: u64 = 0,
+        ever_true: bool = false,
+        ever_false: bool = false,
+        failed: bool = false,
+
+        fn status(self: PropertySummary) []const u8 {
+            if (self.failed) return "fail";
+            if (self.evaluations == 0) return "not-reached";
+            return "pass";
+        }
+    };
+
+    const FailureSummary = struct {
+        first_history: u64,
+        first_path: []u8,
+        smallest_history: u64,
+        smallest_transitions: u64,
+        smallest_path: []u8,
+    };
+
     io: std.Io,
     histories: u64,
     transitions: usize,
     base_seed: u64,
     artifact_dir: []const u8,
+    worker_count: usize = 0,
     next_history: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
     coverage: vopr.coverage.Tracker,
@@ -468,10 +500,38 @@ const CampaignContext = struct {
     seeded_entries: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
+    clean_histories: u64 = 0,
+    transitions_executed: u64 = 0,
+    exact_replays: u64 = 0,
+    replay_divergences: u64 = 0,
+    harness_errors: u64 = 0,
     splice_attempts: u64 = 0,
     spliced: u64 = 0,
     splice_rejected: u64 = 0,
+    semantic_states: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    transition_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    fault_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    workload_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    properties: std.AutoHashMapUnmanaged(u64, PropertySummary) = .empty,
+    failure_summaries: std.AutoHashMapUnmanaged(u64, FailureSummary) = .empty,
     first_error: ?anyerror = null,
+
+    fn deinitReport(self: *@This()) void {
+        const alloc = std.heap.smp_allocator;
+        var property_it = self.properties.valueIterator();
+        while (property_it.next()) |summary| alloc.free(summary.name);
+        self.properties.deinit(alloc);
+        var failure_it = self.failure_summaries.valueIterator();
+        while (failure_it.next()) |summary| {
+            alloc.free(summary.first_path);
+            alloc.free(summary.smallest_path);
+        }
+        self.failure_summaries.deinit(alloc);
+        self.semantic_states.deinit(alloc);
+        self.transition_ids.deinit(alloc);
+        self.fault_ids.deinit(alloc);
+        self.workload_ids.deinit(alloc);
+    }
 
     fn worker(self: *@This()) void {
         while (true) {
@@ -480,6 +540,7 @@ const CampaignContext = struct {
             self.runHistory(history_index) catch |err| {
                 self.mutex.lock(self.io) catch return;
                 defer self.mutex.unlock(self.io);
+                self.harness_errors += 1;
                 if (self.first_error == null) self.first_error = err;
                 return;
             };
@@ -489,48 +550,206 @@ const CampaignContext = struct {
     fn runHistory(self: *@This(), history_index: u64) !void {
         const alloc = std.heap.smp_allocator;
         const seed = self.base_seed +% history_index *% 0x9e37_79b9_7f4a_7c15;
-        var artifact = (try self.mutateCorpusEntry(alloc, seed)) orelse blk: {
+        const candidate = (try self.mutateCorpusEntry(alloc, seed)) orelse blk: {
             // Keep semantic identities stable across a campaign. The history
             // seed still varies scheduling, while stable IDs allow compatible
             // observation states from independent histories to be spliced.
             const base_id = 10_000 + self.base_seed % 1_000_000;
-            break :blk try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
-                .seed = seed,
-                .operation_count = self.transitions,
-                .metadata_group_id = base_id,
-                .table_id = base_id + 1,
-                .range_group_id = base_id + 2,
-                .split_group_id = base_id + 3,
-                .split_transition_id = base_id + 4,
-            });
+            break :blk Candidate{
+                .artifact = try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+                    .seed = seed,
+                    .operation_count = self.transitions,
+                    .metadata_group_id = base_id,
+                    .table_id = base_id + 1,
+                    .range_group_id = base_id + 2,
+                    .split_group_id = base_id + 3,
+                    .split_transition_id = base_id + 4,
+                }),
+            };
         };
+        var artifact = candidate.artifact;
         defer artifact.deinit();
 
+        var replayed = antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact) catch |err| {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            self.replay_divergences += 1;
+            if (self.first_error == null) self.first_error = err;
+            return;
+        };
+        replayed.deinit();
+
         try self.mutex.lock(self.io);
+        self.exact_replays += 1;
+        self.observeArtifactLocked(&artifact) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
         const novelty = self.coverage.observe(&artifact) catch |err| {
             self.mutex.unlock(self.io);
             return err;
         };
         const failed = artifact.failures.items.len > 0;
         const retain = history_index == 0 or novelty.discovered > 0 or failed;
-        if (failed) self.failures += 1;
+        if (failed) self.failures += 1 else self.clean_histories += 1;
         const added = if (retain) self.corpus.add(&artifact, novelty) catch |err| {
             self.mutex.unlock(self.io);
             return err;
         } else null;
         const inserted = if (added) |result| result.inserted else false;
-        if (inserted) self.retained += 1;
+        if (inserted) {
+            self.retained += 1;
+            for (candidate.parent_indexes[0..candidate.parent_count]) |parent_index| {
+                self.corpus.markProductive(parent_index) catch unreachable;
+            }
+        }
         self.mutex.unlock(self.io);
-        if (!inserted) return;
+        // Corpus retention is deduplicated, but every failing history still
+        // receives a standalone artifact and a stable report entry.
+        if (!inserted and !failed) return;
 
         const bytes = try artifact.renderAlloc(alloc);
         defer alloc.free(bytes);
         const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.simtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        if (failed) {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            try self.recordFailureArtifactsLocked(&artifact, history_index, path);
+        }
     }
 
-    fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64) !?vopr.trace.Trace {
+    fn observeArtifactLocked(self: *@This(), artifact: *const vopr.trace.Trace) !void {
+        const alloc = std.heap.smp_allocator;
+        self.transitions_executed +|= artifact.summary.?.transitions;
+        for (artifact.observations.items) |record| try self.semantic_states.put(alloc, record.digest, {});
+        for (artifact.transitions.items) |record| {
+            try self.transition_ids.put(alloc, record.id, {});
+            if (record.kind == .workload) try self.workload_ids.put(alloc, record.id, {});
+        }
+        for (artifact.faults.items) |record| try self.fault_ids.put(alloc, record.id, {});
+        for (artifact.properties.items) |record| {
+            const gop = try self.properties.getOrPut(alloc, record.property_id);
+            if (!gop.found_existing) {
+                const name = alloc.dupe(u8, record.name) catch |err| {
+                    _ = self.properties.remove(record.property_id);
+                    return err;
+                };
+                gop.value_ptr.* = .{ .name = name };
+            }
+            gop.value_ptr.evaluations +|= 1;
+            gop.value_ptr.ever_true = gop.value_ptr.ever_true or record.condition;
+            gop.value_ptr.ever_false = gop.value_ptr.ever_false or !record.condition;
+        }
+        for (artifact.failures.items) |failure| if (failure.property_id) |property_id| {
+            if (self.properties.getPtr(property_id)) |summary| summary.failed = true;
+        };
+    }
+
+    fn recordFailureArtifactsLocked(
+        self: *@This(),
+        artifact: *const vopr.trace.Trace,
+        history_index: u64,
+        path: []const u8,
+    ) !void {
+        const alloc = std.heap.smp_allocator;
+        for (artifact.failures.items) |failure| {
+            const gop = try self.failure_summaries.getOrPut(alloc, failure.fingerprint);
+            if (!gop.found_existing) {
+                errdefer _ = self.failure_summaries.remove(failure.fingerprint);
+                const first_path = try alloc.dupe(u8, path);
+                errdefer alloc.free(first_path);
+                const smallest_path = try alloc.dupe(u8, path);
+                errdefer alloc.free(smallest_path);
+                gop.value_ptr.* = .{
+                    .first_history = history_index,
+                    .first_path = first_path,
+                    .smallest_history = history_index,
+                    .smallest_transitions = artifact.summary.?.transitions,
+                    .smallest_path = smallest_path,
+                };
+                continue;
+            }
+            if (history_index < gop.value_ptr.first_history) {
+                const replacement = try alloc.dupe(u8, path);
+                alloc.free(gop.value_ptr.first_path);
+                gop.value_ptr.first_path = replacement;
+                gop.value_ptr.first_history = history_index;
+            }
+            if (artifact.summary.?.transitions < gop.value_ptr.smallest_transitions or
+                (artifact.summary.?.transitions == gop.value_ptr.smallest_transitions and history_index < gop.value_ptr.smallest_history))
+            {
+                const replacement = try alloc.dupe(u8, path);
+                alloc.free(gop.value_ptr.smallest_path);
+                gop.value_ptr.smallest_path = replacement;
+                gop.value_ptr.smallest_history = history_index;
+                gop.value_ptr.smallest_transitions = artifact.summary.?.transitions;
+            }
+        }
+    }
+
+    fn reportSummary(self: *@This()) !void {
+        const alloc = std.heap.smp_allocator;
+        var productive: usize = 0;
+        for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
+        std.debug.print(
+            "VOPR campaign histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
+            .{
+                self.histories,
+                self.transitions_executed,
+                self.clean_histories,
+                self.failures,
+                self.replay_divergences,
+                self.harness_errors,
+                self.exact_replays,
+                self.seeded_entries,
+                self.retained,
+                self.semantic_states.count(),
+                self.transition_ids.count(),
+                self.fault_ids.count(),
+                self.workload_ids.count(),
+                productive,
+                self.splice_attempts,
+                self.spliced,
+                self.splice_rejected,
+                self.worker_count,
+                self.artifact_dir,
+            },
+        );
+        const property_ids = try alloc.alloc(u64, self.properties.count());
+        defer alloc.free(property_ids);
+        var property_it = self.properties.keyIterator();
+        var property_count: usize = 0;
+        while (property_it.next()) |property_id| : (property_count += 1) property_ids[property_count] = property_id.*;
+        std.mem.sort(u64, property_ids, {}, std.sort.asc(u64));
+        for (property_ids) |property_id| {
+            const summary = self.properties.get(property_id).?;
+            std.debug.print("VOPR property id={x} name={s} status={s} evaluations={d} true={} false={}\n", .{
+                property_id,
+                summary.name,
+                summary.status(),
+                summary.evaluations,
+                summary.ever_true,
+                summary.ever_false,
+            });
+        }
+        const fingerprints = try alloc.alloc(u64, self.failure_summaries.count());
+        defer alloc.free(fingerprints);
+        var failure_it = self.failure_summaries.keyIterator();
+        var failure_count: usize = 0;
+        while (failure_it.next()) |fingerprint| : (failure_count += 1) fingerprints[failure_count] = fingerprint.*;
+        std.mem.sort(u64, fingerprints, {}, std.sort.asc(u64));
+        for (fingerprints) |fingerprint| {
+            const summary = self.failure_summaries.get(fingerprint).?;
+            std.debug.print(
+                "VOPR failure fingerprint={x} first={s} smallest_transitions={d} smallest={s} replay='zig build sim-replay -- --trace {s}' reduce='zig build sim-reduce -- --trace {s} --out <reduced.simtrace>'\n",
+                .{ fingerprint, summary.first_path, summary.smallest_transitions, summary.smallest_path, summary.smallest_path, summary.smallest_path },
+            );
+        }
+    }
+
+    fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64) !?Candidate {
         var prng = std.Random.DefaultPrng.init(seed ^ 0x6d75_7461_7465_3031);
         try self.mutex.lock(self.io);
         if (self.corpus.entries.items.len == 0) {
@@ -585,23 +804,24 @@ const CampaignContext = struct {
         }
         const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(&parent);
         var source = vopr.choice.Mutating.init(parent.choices.items, mutation_index, replacement, seed);
-        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
+        const artifact = antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
             error.MutationPointNotReached,
             error.MutationPointOutOfRange,
             error.MutationPrefixExhausted,
             error.ReplayChoiceSiteDiverged,
             error.ReplayEnabledSetDiverged,
             error.ChoiceSourceSelectedDisabledAlternative,
-            => null,
+            => return null,
             else => return err,
         };
+        return .{ .artifact = artifact, .parent_indexes = .{ parent_index, undefined }, .parent_count = 1 };
     }
 
     fn spliceCorpusEntries(
         self: *@This(),
         alloc: std.mem.Allocator,
         prng: *std.Random.DefaultPrng,
-    ) !?vopr.trace.Trace {
+    ) !?Candidate {
         try self.mutex.lock(self.io);
         if (self.corpus.entries.items.len < 2) {
             self.mutex.unlock(self.io);
@@ -678,7 +898,11 @@ const CampaignContext = struct {
         var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact);
         replayed.deinit();
         try self.recordSpliceResult(true);
-        return artifact;
+        return .{
+            .artifact = artifact,
+            .parent_indexes = .{ left_index, right_index },
+            .parent_count = 2,
+        };
     }
 
     fn recordSpliceResult(self: *@This(), accepted: bool) !void {
@@ -775,6 +999,16 @@ fn usage() error{InvalidUsage} {
     return error.InvalidUsage;
 }
 
+test "VOPR command entrypoint" {
+    const init_ptr: *const std.process.Init.Minimal = @ptrCast(@alignCast(antflyVoprProcessInit()));
+    const init = init_ptr.*;
+    const argv = try init.args.toSlice(std.testing.allocator);
+    defer std.testing.allocator.free(argv);
+    try dispatch(std.testing.allocator, std.testing.io, argv);
+}
+
+extern fn antflyVoprProcessInit() *const anyopaque;
+
 test "Antfly injected bug is discovered replayed reduced and promoted" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -832,8 +1066,8 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expectEqual(@as(usize, 1), context.corpus.entries.items.len);
     if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12)) |mutated_value| {
         var mutated = mutated_value;
-        defer mutated.deinit();
-        var mutation_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &mutated);
+        defer mutated.artifact.deinit();
+        var mutation_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &mutated.artifact);
         mutation_replay.deinit();
     } else return error.PersistentCorpusMutationRequired;
 

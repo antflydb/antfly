@@ -6682,7 +6682,17 @@ pub fn build(b: *std.Build) void {
     sim_cli_mod.addImport("antfly", lib_test_mod);
     sim_cli_mod.addImport("vopr", vopr_mod);
     sim_cli_mod.link_libc = true;
-    const sim_cli = b.addExecutable(.{ .name = "vopr", .root_module = sim_cli_mod });
+    // Antfly's simulated scenarios deliberately use std.testing facilities.
+    // A custom runner makes the test artifact behave as a normal command-line
+    // program while retaining the harness-only compilation contract.
+    const sim_cli = b.addTest(.{
+        .name = "vopr",
+        .root_module = sim_cli_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/sim/cli_runner.zig"),
+            .mode = .simple,
+        },
+    });
     const sim_cli_meta_tests = b.addTest(.{
         .root_module = sim_cli_mod,
         .filters = &.{"Antfly injected bug is discovered replayed reduced and promoted"},
