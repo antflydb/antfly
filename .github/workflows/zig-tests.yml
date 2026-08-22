@@ -830,6 +830,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@v6
@@ -851,7 +852,7 @@ jobs:
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
@@ -994,6 +995,7 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1004,7 +1006,7 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache

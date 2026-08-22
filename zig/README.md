@@ -119,10 +119,16 @@ scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 uv run --project e2e/inference pytest -q e2e/inference
 ```
 
-The Antfly runner uses up to two pytest workers and keeps each module on one
-worker so module-scoped process reuse remains intact. Set
-`ANTFLY_E2E_WORKERS` to override the resource-safe default for experiments, or
-set it to `1` for a sequential comparison or debugging run.
+The Antfly runner uses up to four pytest workers, schedules historically slow
+independent tests first, and keeps shared fixtures on one worker. Antfly process
+and cluster work has a separate concurrency budget of two. Set
+`ANTFLY_E2E_WORKERS` and `ANTFLY_E2E_PROCESS_SLOTS` to tune those limits, or set
+`ANTFLY_E2E_WORKERS=1` for a sequential debugging run. Test duration history is
+stored under `e2e/antfly/.pytest_cache` locally and in the ARC cache in CI.
+The scheduler infers process ownership and fixture scope for the standard E2E
+fixtures. Custom fixtures can declare `@pytest.mark.e2e_resource("antfly_process")`,
+and tests with unusual sharing requirements can use
+`@pytest.mark.e2e_isolation("test")` or `@pytest.mark.e2e_isolation("module")`.
 
 Some e2e tests start local binaries from `zig-out/bin`; build the relevant
 binary first when running those tests directly:

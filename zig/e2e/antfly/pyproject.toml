@@ -13,6 +13,8 @@ dependencies = [
 testpaths = ["."]
 addopts = "-v --durations=50 --durations-min=1.0"
 markers = [
+    "e2e_isolation(policy, group=None): declares test- or module-level scheduling isolation",
+    "e2e_resource(name): declares a capacity-constrained resource such as antfly_process",
     "reuse_antfly_process: share one local Antfly process within this test module and clean tables after each test",
     "fresh_antfly_process: override module-level process reuse for tests that exercise process or storage lifecycle",
     "objectstore_integration: requires real S3 or GCS objectstore credentials and buckets",
