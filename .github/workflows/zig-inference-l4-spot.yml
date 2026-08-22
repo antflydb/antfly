@@ -100,7 +100,14 @@ jobs:
       ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
       ANTFLY_INFERENCE_PREFERRED_BACKEND: cuda
       ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND: cuda
+      ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0
       ANTFLY_PROCESS_MEMORY_BUDGET_MB: "14000"
+      # Gemma 4 E2B Q4_0 plans at about 2.7 GiB host + 6.0 GiB device on L4.
+      # Keep explicit per-domain and aggregate admission headroom without
+      # weakening the independent 14 GiB host-process envelope above.
+      ANTFLY_INFERENCE_HOST_BUDGET_MB: "4096"
+      ANTFLY_INFERENCE_BACKEND_BUDGET_MB: "8192"
+      ANTFLY_INFERENCE_COMBINED_BUDGET_MB: "12288"
       RUN_MULTIMODAL_GENERATOR_TESTS: "1"
       RUN_CLIPCLAP_CONTRACT_TESTS: "1"
     steps:
@@ -195,7 +202,7 @@ jobs:
           trap cleanup EXIT
           if [[ "${{ inputs.scope }}" == "smoke" ]]; then
             uv run --project e2e/inference pytest -q \
-              e2e/inference/test_generate.py::test_basic_generation
+              e2e/inference/test_generate.py::test_configured_generation_smoke
           else
             uv run --project e2e/inference pytest -q --continue-on-collection-errors \
               e2e/inference

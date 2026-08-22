@@ -152,7 +152,18 @@ def _first_choice(resp: dict) -> dict:
 
 
 def test_basic_generation(api):
-    model = _first_generator_model(api)
+    messages = [{"role": "user", "content": "Hello"}]
+    resp = api.generate(messages, max_tokens=50)
+    content = _message_content(resp)
+    assert content, f"No generated content in response: {resp}"
+
+
+def test_configured_generation_smoke(api):
+    model = os.environ.get("ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL", "").strip()
+    if not model:
+        pytest.skip(
+            "Set ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL to run the explicit-model smoke"
+        )
     messages = [{"role": "user", "content": "Hello"}]
     resp = api.generate(
         messages,

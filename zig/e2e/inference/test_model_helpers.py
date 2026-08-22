@@ -35,6 +35,9 @@ from .models import (
     bootstrap_models_for_listing,
     find_local_model_path,
 )
+from .test_generate import (
+    test_configured_generation_smoke as run_configured_generation_smoke,
+)
 
 
 def test_server_budget_args_validate_and_preserve_values(monkeypatch):
@@ -47,6 +50,45 @@ def test_server_budget_args_validate_and_preserve_values(monkeypatch):
         "--scratch-budget-mb",
         "0",
     ]
+
+
+def test_configured_generation_smoke_uses_exact_model_and_first_use_timeout(
+    monkeypatch,
+):
+    model = "owner/model:gguf:Q4_0"
+    monkeypatch.setenv("ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL", model)
+
+    class Api:
+        request = None
+
+        def generate(self, messages, **kwargs):
+            self.request = (messages, kwargs)
+            return {
+                "id": "chatcmpl-smoke",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Hello"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+    api = Api()
+    run_configured_generation_smoke(api)
+
+    assert api.request is not None
+    _, kwargs = api.request
+    assert kwargs["model"] == model
+    assert kwargs["request_timeout"] > 0
 
 
 @pytest.mark.parametrize("value", ["-1", "invalid", "1.5"])
