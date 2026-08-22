@@ -13858,6 +13858,7 @@ func TestCreatePublicAPIService_DistributedTargetsMetadataAPI(t *testing.T) {
 	g.Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "metadata"))
 	g.Expect(svc.Spec.Ports).To(HaveLen(1))
 	g.Expect(svc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(12377))
+	g.Expect(svc.Spec.PublishNotReadyAddresses).To(BeFalse())
 }
 
 func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
@@ -13895,6 +13896,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	publicSvc := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
 	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
+	g.Expect(publicSvc.Spec.PublishNotReadyAddresses).To(BeTrue())
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
 	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))

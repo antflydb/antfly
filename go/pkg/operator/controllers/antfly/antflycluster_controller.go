@@ -3698,6 +3698,11 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 
 	selector := serviceSelectorLabels(cluster.Name, component)
 	var annotations map[string]string
+	// Keep the single, explicitly selected HA route reachable while its Pod is
+	// degraded. The runtime remains the authority boundary: it serves safe reads
+	// and typed fencing responses, while rejecting mutations without authority.
+	publishNotReadyAddresses := cluster.Spec.HighAvailability != nil &&
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeHotStandby
 	if haPrimaryRouteManaged(cluster) {
 		target := haCurrentPrimaryRouteTarget(cluster)
 		routeSelectorApplied := false
@@ -3717,9 +3722,10 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 			Annotations: annotations,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     serviceType,
-			Selector: selector,
-			Ports:    []corev1.ServicePort{servicePort},
+			Type:                     serviceType,
+			Selector:                 selector,
+			Ports:                    []corev1.ServicePort{servicePort},
+			PublishNotReadyAddresses: publishNotReadyAddresses,
 		},
 	}
 }
