@@ -434,6 +434,17 @@ pub const BackendRuntime = struct {
         return self.native_storage_pool.snapshotStats();
     }
 
+    /// Installs a process-local DB-open policy for composed simulations and
+    /// embedded runtimes. The configurator is borrowed and must outlive this
+    /// runtime and every DB opened through it.
+    pub fn setDbOpenConfigurator(self: *BackendRuntime, configurator: ?DbOpenConfigurator) void {
+        self.db_open_configurator = configurator;
+    }
+
+    pub fn hasDbOpenConfigurator(self: *const BackendRuntime) bool {
+        return self.db_open_configurator != null;
+    }
+
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();

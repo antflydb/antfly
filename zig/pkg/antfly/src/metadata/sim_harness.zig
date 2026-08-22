@@ -96,11 +96,13 @@ const SimSplitRuntime = struct {
     entries: [16]Entry = undefined,
     len: usize = 0,
     replica_root_dir: ?[]const u8 = null,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
 
     fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
         self.len = 0;
         self.replica_root_dir = null;
+        self.backend_runtime = null;
     }
 
     fn iface(self: *@This()) transition_runtime.SplitRuntime {
@@ -153,7 +155,7 @@ const SimSplitRuntime = struct {
             const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, destination_group_id);
             defer alloc.free(destination_root_dir);
 
-            try ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
+            try self.ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
 
             const status = try data_mod.storage.observeSplitStatus(alloc, .{
                 .transition_id = transition_id,
@@ -165,6 +167,7 @@ const SimSplitRuntime = struct {
                 .source = .{ .root_dir = source_root_dir },
                 .dest = .{
                     .root_dir = destination_root_dir,
+                    .db = self.dbOptions(.{}),
                 },
             });
             return .{
@@ -302,14 +305,15 @@ const SimSplitRuntime = struct {
             const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, destination_group_id);
             defer alloc.free(destination_root_dir);
 
-            try ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
+            try self.ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
 
             const coord = try alloc.create(data_mod.SplitSyncCoordinator);
             errdefer alloc.destroy(coord);
             var dest_db_options = db_mod.OpenOptions{};
-            if (try splitDestinationIdentityNamespaceFromSource(alloc, source_root_dir, destination_group_id)) |namespace| {
+            if (try self.splitDestinationIdentityNamespaceFromSource(alloc, source_root_dir, destination_group_id)) |namespace| {
                 dest_db_options.identity_namespace = namespace;
             }
+            dest_db_options.backend_runtime = self.backend_runtime;
             coord.* = try data_mod.SplitSyncCoordinator.init(alloc, .{
                 .transition_id = transition_id,
                 .attempt_epoch = attempt_epoch,
@@ -325,15 +329,17 @@ const SimSplitRuntime = struct {
     }
 
     fn splitDestinationIdentityNamespaceFromSource(
+        self: *@This(),
         alloc: std.mem.Allocator,
         source_root_dir: []const u8,
         destination_group_id: u64,
     ) !?db_mod.DocIdentityNamespace {
         _ = destination_group_id;
-        var db = db_mod.DB.open(alloc, source_root_dir, .{
+        const options = self.dbOptions(.{
             .open_mode = .status_only,
             .start_index_workers = false,
-        }) catch |err| switch (err) {
+        });
+        var db = db_mod.DB.open(alloc, source_root_dir, options) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -349,6 +355,7 @@ const SimSplitRuntime = struct {
     }
 
     fn ensureSourceApplyStoreSeeded(
+        self: *@This(),
         alloc: std.mem.Allocator,
         source_root_dir: []const u8,
         source_group_id: u64,
@@ -357,7 +364,7 @@ const SimSplitRuntime = struct {
         defer source_store.deinit();
         if ((try source_store.latestBatch(source_group_id)) != null) return;
 
-        var db = db_mod.DB.open(alloc, source_root_dir, .{}) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, source_root_dir, self.dbOptions(.{})) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -409,7 +416,26 @@ const SimSplitRuntime = struct {
             .entries_bytes = encoded,
         });
     }
+
+    fn dbOptions(self: *const @This(), base: db_mod.OpenOptions) db_mod.OpenOptions {
+        var options = base;
+        options.backend_runtime = self.backend_runtime;
+        return options;
+    }
 };
+
+fn backendRuntimeForReplicaRoot(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dir: []const u8,
+) ?*db_mod.background_runtime.BackendRuntime {
+    for (cluster.cluster.configs, 0..) |config, index| {
+        const configured_root = config.host.http.host.replica_root_dir orelse continue;
+        if (!std.mem.eql(u8, configured_root, replica_root_dir)) continue;
+        const runtime = cluster.backendRuntime(index);
+        return if (runtime.hasDbOpenConfigurator()) runtime else null;
+    }
+    return null;
+}
 
 test "metadata sim split runtime preserves source identity namespace" {
     const alloc = std.testing.allocator;
@@ -510,6 +536,7 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
     var read_db = db_mod.DB.open(cluster.alloc, path, .{
         .open_mode = .query_readonly,
         .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
         else => return err,
@@ -520,6 +547,7 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
 
     var db = db_mod.DB.open(cluster.alloc, path, .{
         .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
         error.LsmRootWriterAlreadyOpen => return true,
@@ -596,12 +624,18 @@ fn runtimeDocIdentityStatusReportFromStats(
     };
 }
 
+const RuntimeGroupMetricsOverride = struct {
+    doc_count: u64,
+    disk_bytes: u64,
+};
+
 fn reportRuntimeDocIdentityForActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     node: anytype,
     replica_root_dirs: []const []const u8,
     table_name: []const u8,
     group_ids: []const u64,
+    metrics_override: ?RuntimeGroupMetricsOverride,
 ) !void {
     const alloc = std.testing.allocator;
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
@@ -629,6 +663,7 @@ fn reportRuntimeDocIdentityForActiveReplicas(
             var db = db_mod.DB.open(alloc, path, .{
                 .open_mode = .status_only,
                 .start_index_workers = false,
+                .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dirs[i]),
             }) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -637,31 +672,48 @@ fn reportRuntimeDocIdentityForActiveReplicas(
             const stats = try db.runtimeStatusStatsConsistent(alloc);
             defer db_mod.types.freeDBStats(alloc, stats);
             const now_ms = currentGroupStatusTimestampMs();
+            const reported_doc_count = if (metrics_override) |metrics| metrics.doc_count else stats.doc_count;
+            const reported_disk_bytes = if (metrics_override) |metrics| metrics.disk_bytes else 1;
+            const raft_status = cluster.cluster.node(i).raftStatus(group_id) orelse continue;
+            const local_node_id = cluster.cluster.configs[i].host.http.host.local_node_id;
+            const local_voter = std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) != null;
             try group_statuses.append(alloc, .{
                 .group_id = group_id,
-                .doc_count = stats.doc_count,
-                .disk_bytes = 1,
-                .empty = stats.doc_count == 0,
+                .raft_applied_index = raft_status.applied_index,
+                .raft_term = raft_status.hard.current_term,
+                .raft_membership_index = raft_status.applied_index,
+                .doc_count = reported_doc_count,
+                .disk_bytes = reported_disk_bytes,
+                .disk_bytes_known = true,
+                .empty = reported_doc_count == 0,
                 .updated_at_millis = now_ms,
-                .local_leader = currentGroupLeaderIndex(cluster, group_id) == i,
-                .local_voter = true,
-                .voter_count = 1,
+                .local_leader = raft_status.soft.role == .leader,
+                .local_voter = local_voter,
+                .voter_count = @intCast(raft_status.conf_state.voters.len),
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
+                .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
             });
-            try runtime_statuses.append(alloc, .{
+            const runtime_report = try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, .{
                 .table_id = stats.doc_identity.namespace_table_id,
-                .table_name = try alloc.dupe(u8, table_name),
+                .table_name = table_name,
                 .group_id = group_id,
                 .store_id = @intCast(i + 1),
                 .node_id = @intCast(i + 1),
                 .updated_at_ns = now_ms * std.time.ns_per_ms,
-                .source = try alloc.dupe(u8, "metadata-sim"),
-                .freshness = try alloc.dupe(u8, "fresh"),
-                .doc_count = stats.doc_count,
-                .disk_bytes = 1,
+                .source = "metadata-sim",
+                .freshness = "fresh",
+                .doc_count = reported_doc_count,
+                .disk_bytes = reported_disk_bytes,
+                .disk_bytes_known = true,
                 .created_at_millis = now_ms,
                 .index_count = stats.index_count,
                 .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
             });
+            runtime_statuses.append(alloc, runtime_report) catch |err| {
+                metadata_table_manager.freeRuntimeGroupStatusReport(alloc, runtime_report);
+                return err;
+            };
         }
 
         if (runtime_statuses.items.len == 0 and group_statuses.items.len == 0) continue;
@@ -698,6 +750,7 @@ fn seedGroupDocsAcrossReplicaRoots(
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dir),
         }) catch |err| switch (err) {
             error.PathAlreadyExists, error.FileNotFound => continue,
             else => return err,
@@ -1001,6 +1054,55 @@ const split_query_needles_without_mid = [_][]const u8{
     "\"_id\":\"doc:b\"",
     "\"_id\":\"doc:y\"",
 };
+
+const AcknowledgedPublicDataModel = struct {
+    const Entry = struct {
+        key: []const u8,
+        value_needle: []const u8,
+        query_needle: []const u8,
+    };
+
+    entries: [5]Entry = undefined,
+    len: usize = 0,
+
+    fn acknowledge(self: *@This(), entry: Entry) !void {
+        if (self.len == self.entries.len) return error.ReferenceModelCapacityExceeded;
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+
+    fn verify(
+        self: *const @This(),
+        cluster: *MetadataHttpClusterSimulation,
+        client: *api_http_client.ApiHttpClient,
+        client_base: []const u8,
+        table_name: []const u8,
+        max_rounds: usize,
+    ) !void {
+        var query_needles: [5][]const u8 = undefined;
+        for (self.entries[0..self.len], 0..) |entry, index| {
+            try std.testing.expect(try waitForLookupContains(
+                cluster,
+                client,
+                client_base,
+                table_name,
+                entry.key,
+                entry.value_needle,
+                max_rounds,
+            ));
+            query_needles[index] = entry.query_needle;
+        }
+        try std.testing.expect(try waitForQueryContainsAll(
+            cluster,
+            client,
+            client_base,
+            table_name,
+            shared_hello_query_body,
+            query_needles[0..self.len],
+            max_rounds,
+        ));
+    }
+};
 const merge_query_needles = [_][]const u8{
     "\"_id\":\"doc:a\"",
     "\"_id\":\"doc:z\"",
@@ -1039,6 +1141,7 @@ const AutomaticSplitPublicTrafficFailureMode = enum {
     restart_metadata_leader,
     restart_source_group_leader,
     partition_metadata_leader,
+    partition_then_restart_source_with_storage_crash,
 };
 
 const AutomaticSplitPublicTrafficScenario = struct {
@@ -1052,6 +1155,7 @@ const AutomaticSplitPublicTrafficScenario = struct {
     finalize_rounds: usize,
     post_failure_leader_wait_rounds: usize = 0,
     ensure_source_group_text_index_before_transition: bool = false,
+    modeled_storage: bool = false,
     failure_mode: AutomaticSplitPublicTrafficFailureMode = .none,
     verify: SplitPublicVerificationConfig,
 };
@@ -1323,6 +1427,7 @@ fn verifySplitPublicTraffic(
     table_name: []const u8,
     roots: []const []const u8,
     cfg: SplitPublicVerificationConfig,
+    acknowledged_model: ?*AcknowledgedPublicDataModel,
 ) !void {
     const groups = try waitForSplitResolvedGroups(cluster, catalog, table_name, cfg.route_rounds);
     try std.testing.expect(try cluster.waitForGroupStatusCountAtLeast(groups.left_group, .active, cfg.left_active_count, cfg.active_rounds));
@@ -1339,7 +1444,7 @@ fn verifySplitPublicTraffic(
     try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, api_tables.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const split_groups = [_]u64{ groups.left_group, groups.right_group };
-    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..]);
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..], null);
     try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
@@ -1348,6 +1453,10 @@ fn verifySplitPublicTraffic(
     var post_split_batch = try client.fetchBatch(client_base, table_name, split_post_batch_body);
     defer post_split_batch.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(post_split_batch.body, &.{"\"inserted\":2"});
+    if (acknowledged_model) |model| {
+        try model.acknowledge(.{ .key = "doc:b", .value_needle = "\"beta\"", .query_needle = "\"_id\":\"doc:b\"" });
+        try model.acknowledge(.{ .key = "doc:y", .value_needle = "\"gamma\"", .query_needle = "\"_id\":\"doc:y\"" });
+    }
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.left_group, table_name, split_left_post_batch_body);
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.right_group, table_name, split_right_post_batch_body);
 
@@ -1364,6 +1473,7 @@ fn verifySplitPublicTraffic(
     if (cfg.count_profile_rounds) |count_rounds| {
         try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, 5, 2, true, count_rounds));
     }
+    if (acknowledged_model) |model| try model.verify(cluster, client, client_base, table_name, cfg.lookup_rounds);
 }
 
 fn verifyMergePublicTraffic(
@@ -1391,7 +1501,7 @@ fn verifyMergePublicTraffic(
     try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const merge_groups = [_]u64{merged_group};
-    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..]);
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..], null);
     try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
@@ -1433,6 +1543,18 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    var modeled_devices: [3]storage_sim.ModeledDevice = undefined;
+    var modeled_device_count: usize = 0;
+    defer for (modeled_devices[0..modeled_device_count]) |*device| device.deinit();
+    var modeled_configurators: [3]ModeledDbOpenConfigurator = undefined;
+    if (cfg.modeled_storage) {
+        for (&modeled_devices, &modeled_configurators) |*device, *configurator| {
+            device.* = storage_sim.ModeledDevice.init(std.testing.allocator);
+            modeled_device_count += 1;
+            configurator.* = .{ .device = device };
+        }
+    }
 
     var delayed_a: ?raft_sim.DelayingRequestExecutor = null;
     defer if (delayed_a) |*executor| executor.deinit();
@@ -1483,6 +1605,11 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
+    const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+    if (cfg.modeled_storage) for (0..3) |index| {
+        cluster.backendRuntime(index).setDbOpenConfigurator(modeled_configurators[index].iface());
+        factories[index].split_runtime.backend_runtime = cluster.backendRuntime(index);
+    };
     const leader_index = try startBootstrappedMetadataCluster(&cluster, cfg.bootstrap_rounds, true);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
@@ -1511,29 +1638,48 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const roots = [_][]const u8{ root_a, root_b, root_c };
     var public_api: PublicApiTestRig(3) = undefined;
     try public_api.initLeaderBackedInPlace(std.testing.allocator, &cluster, roots);
-    defer public_api.deinit();
+    var public_api_open = true;
+    defer if (public_api_open) public_api.deinit();
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual;
-    const client_base = public_api.api_base_uris[client_index];
+    var client_base = public_api.api_base_uris[client_index];
     try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, api_tables.default_full_text_index_name, 40);
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, client_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
 
     var pre_split_batch = try client.fetchBatch(client_base, "docs", split_seed_batch_body);
     defer pre_split_batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, pre_split_batch.body, "\"inserted\":3") != null);
+    var acknowledged_model = AcknowledgedPublicDataModel{};
+    if (cfg.modeled_storage) {
+        try acknowledged_model.acknowledge(.{ .key = "doc:a", .value_needle = "\"alpha\"", .query_needle = "\"_id\":\"doc:a\"" });
+        try acknowledged_model.acknowledge(.{ .key = "doc:m", .value_needle = "\"mid\"", .query_needle = "\"_id\":\"doc:m\"" });
+        try acknowledged_model.acknowledge(.{ .key = "doc:z", .value_needle = "\"zeta\"", .query_needle = "\"_id\":\"doc:z\"" });
+    }
     try mirrorGroupBatchToActiveReplicas(&cluster, &client, public_api.api_base_uris[0..], initial_group_id, "docs", split_seed_batch_body);
     try std.testing.expect(try waitForMedianKeyEquals(&cluster, cluster.node(leader_index), initial_group_id, "doc:m", 64));
 
     const source_leader = switch (cfg.failure_mode) {
-        .restart_source_group_leader, .restart_metadata_leader => (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual,
+        .restart_source_group_leader, .restart_metadata_leader, .partition_then_restart_source_with_storage_crash => (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual,
         else => null,
     };
     if (cfg.ensure_source_group_text_index_before_transition) {
         const source_leader_index = source_leader orelse return error.TestExpectedEqual;
         try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, api_tables.default_full_text_index_name, 40);
     }
+    if (cfg.modeled_storage) {
+        const source_groups = [_]u64{initial_group_id};
+        try reportRuntimeDocIdentityForActiveReplicas(
+            &cluster,
+            cluster.node(leader_index),
+            roots[0..],
+            "docs",
+            source_groups[0..],
+            .{ .doc_count = 256, .disk_bytes = 180 },
+        );
+        try cluster.stepAll();
+    }
 
-    try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
+    if (!cfg.modeled_storage) try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
@@ -1555,7 +1701,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
             try cluster.restartNode(source_leader orelse return error.TestExpectedEqual);
             break :blk (try cluster.waitForMetadataLeader(cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
         },
-        .partition_metadata_leader => blk: {
+        .partition_metadata_leader, .partition_then_restart_source_with_storage_crash => blk: {
             try isolateMetadataNode(&cluster, query_index);
             break :blk (try waitForMetadataLeaderExcluding(&cluster, query_index, cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
         },
@@ -1567,7 +1713,32 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const retirement = try retireFinalizedSplitTransition(cluster.node(verification_index), &auto_loop);
     try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
-    try verifySplitPublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], cfg.verify);
+    if (cfg.failure_mode == .partition_then_restart_source_with_storage_crash) {
+        if (!cfg.modeled_storage) return error.ModeledStorageRequired;
+        cluster.cluster.healAll();
+        const restart_index = source_leader orelse return error.TestExpectedEqual;
+        public_api.deinit();
+        public_api_open = false;
+        try modeled_devices[restart_index].device().crash();
+        try cluster.restartNode(restart_index);
+        _ = (try cluster.waitForMetadataLeader(cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+        try public_api.initLeaderBackedInPlace(std.testing.allocator, &cluster, roots);
+        public_api_open = true;
+        client = public_api.client;
+        client_base = public_api.api_base_uris[restart_index];
+    }
+
+    try verifySplitPublicTraffic(
+        &cluster,
+        &client,
+        public_api.api_base_uris[0..],
+        public_api.catalog_sources[verification_index].iface(),
+        client_base,
+        "docs",
+        roots[0..],
+        cfg.verify,
+        if (cfg.modeled_storage) &acknowledged_model else null,
+    );
 }
 
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
@@ -2504,6 +2675,30 @@ fn makeHostSimDepsWithTransportExecutor(
     };
 }
 
+const ModeledDbOpenConfigurator = struct {
+    device: *storage_sim.ModeledDevice,
+
+    fn iface(self: *@This()) db_mod.background_runtime.DbOpenConfigurator {
+        return .{ .ptr = self, .configure_fn = configure };
+    }
+
+    fn configure(ptr: *anyopaque, _: []const u8, opaque_options: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const options: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
+        options.primary_backend = .{ .lsm = .{ .flush_threshold = 1 } };
+        options.storage = self.device.storage();
+        options.physical_root_mode = .external_backend;
+        options.index_backends = .{
+            .text_main_backend = .lsm,
+            .text_lsm_storage = self.device.storage(),
+            .dense_storage_backend = .lsm,
+            .dense_lsm_storage = self.device.storage(),
+            .graph_reverse_backend = .lsm,
+            .graph_lsm_storage = self.device.storage(),
+        };
+    }
+};
+
 pub const MetadataHttpNodeSimulation = struct {
     cluster: *MetadataHttpClusterSimulation,
     index: usize,
@@ -2571,7 +2766,10 @@ pub const MetadataHttpNodeSimulation = struct {
         const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var db = db_mod.DB.open(alloc, db_path, .{ .open_mode = .status_only }) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, db_path, .{
+            .open_mode = .status_only,
+            .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dir),
+        }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -9117,6 +9315,30 @@ test "metadata http cluster simulation serves public traffic across automatic sp
             .lookup_rounds = 160,
             .right_active_count = 2,
             .count_profile_rounds = 160,
+        },
+    });
+}
+
+test "metadata VOPR distributed data survives split partition node restart and modeled storage crash" {
+    try runAutomaticSplitPublicTrafficScenario(.{
+        .table_id = 4553,
+        .path_prefix = "metadata-vopr-distributed-data",
+        .description = "VOPR distributed data durability docs",
+        .delayed_transport = true,
+        .bootstrap_rounds = 48,
+        .range_create_rounds = 64,
+        .projected_index_rounds = 96,
+        .finalize_rounds = 160,
+        .post_failure_leader_wait_rounds = 96,
+        .ensure_source_group_text_index_before_transition = true,
+        .modeled_storage = true,
+        .failure_mode = .partition_then_restart_source_with_storage_crash,
+        .verify = .{
+            .route_rounds = 96,
+            .active_rounds = 96,
+            .leader_rounds = 192,
+            .lookup_rounds = 192,
+            .count_profile_rounds = 192,
         },
     });
 }

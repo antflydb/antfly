@@ -1778,9 +1778,31 @@ byte-for-byte replay. This is the first storage suite using the common runner;
 the older schedule fixtures remain supported as seed/regression inputs during
 the migration.
 
-Phase 4 remains open for modeled I/O outcome-set transitions, the distributed
-public data/reference-model scenario, split/merge plus restart/network/storage
-fault composition, and TLA+ export from promoted VOPR histories.
+The Phase 4 exit scenario is implemented as `metadata VOPR distributed data
+survives split partition node restart and modeled storage crash`, with the
+focused `zig build lib-metadata-vopr-data-test` gate and inclusion in
+`zig build sim-test`. Each of the three data replicas opens its real LSM-backed
+Antfly DB and indexes through a node-local `ModeledDevice`; the same injected
+backend is used by hosted public APIs, median-key planning, runtime telemetry,
+and the real split synchronization coordinator. The test acknowledges three
+documents through the public batch endpoint, drives an automatic range split,
+isolates the metadata leader while the transition finalizes, heals the
+network, crashes the source leader's modeled device, restarts that node and
+the public API stack, then acknowledges two more cross-range writes.
+
+An explicit acknowledged-data reference model records keys only after a
+successful public response. Its terminal property checks every modeled key by
+public point lookup and checks the complete set through a routed full-text
+query, in addition to the existing two-shard count/profile assertion. Runtime
+status publication was also made faithful to the replacement-snapshot
+protocol: capacity, Raft membership, and document-identity evidence are
+reported together, so the scenario exercises the same automatic-split safety
+preconditions as production.
+
+Phase 4's stated exit condition is now met. The phase remains open for modeled
+I/O outcome-set transitions, migration of this fixed distributed scenario into
+generated/replayable VOPR choices, merge composition, and TLA+ export from
+promoted VOPR histories.
 
 ### Phase 5: Search and Snapshot Optimizations
 

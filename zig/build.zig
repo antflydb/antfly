@@ -4911,6 +4911,18 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
     lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
 
+    const lib_metadata_vopr_data_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"metadata VOPR distributed data survives split partition node restart and modeled storage crash"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_metadata_vopr_data_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_data_tests);
+    const lib_metadata_vopr_data_test_step = b.step("lib-metadata-vopr-data-test", "Run the distributed public-data VOPR durability scenario");
+    lib_metadata_vopr_data_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
+
     const lib_metadata_vopr_chaos_default_filters = [_][]const u8{
         "metadata VOPR expanded generated workload campaign",
     };
@@ -6702,6 +6714,7 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
+    sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
     sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
