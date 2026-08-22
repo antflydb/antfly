@@ -19,6 +19,11 @@ const hbs = @import("handlebars");
 
 const default_batch_size: usize = 1000;
 const default_max_batches: usize = 100;
+// A successful load must establish a visibility boundary for commands that
+// immediately inspect the table (notably `index wait`). Raft `propose` only
+// acknowledges acceptance, so the API default could let a subsequent status
+// request observe the pre-load empty table before the proposed writes applied.
+const default_load_sync_level: antfly_client.types.SyncLevel = .write;
 const default_read_buffer_bytes: usize = 1024 * 1024;
 const default_max_line_bytes: usize = 16 * 1024 * 1024;
 const default_batch_bytes: usize = 8 * 1024 * 1024;
@@ -573,7 +578,7 @@ const LoadProcessor = struct {
         if (!self.opts.dry_run) {
             var resp = try self.client.?.batch(self.opts.table_name, .{
                 .inserts = self.batch.inserts,
-                .sync_level = self.opts.sync_level,
+                .sync_level = effectiveLoadSyncLevel(self.opts.sync_level),
             });
             defer resp.deinit();
             self.stats.committed += @intCast(self.batch.docs);
@@ -841,6 +846,10 @@ fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
+}
+
+fn effectiveLoadSyncLevel(configured: ?antfly_client.types.SyncLevel) antfly_client.types.SyncLevel {
+    return configured orelse default_load_sync_level;
 }
 
 fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
@@ -1308,6 +1317,23 @@ test "load sync level parser supports public values" {
     try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, parseSyncLevel("full_index").?);
     try std.testing.expect(parseSyncLevel("aknn") == null);
     try std.testing.expect(parseSyncLevel("full-text") == null);
+}
+
+test "load parser defaults to applied write visibility" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl" };
+    const parsed = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = argv[0..] }));
+    try std.testing.expect(parsed.value.sync_level == null);
+    try std.testing.expectEqual(
+        antfly_client.types.SyncLevel.write,
+        effectiveLoadSyncLevel(parsed.value.sync_level),
+    );
+
+    var propose_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--sync-level", "propose" };
+    const propose = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = propose_argv[0..] }));
+    try std.testing.expectEqual(
+        antfly_client.types.SyncLevel.propose,
+        effectiveLoadSyncLevel(propose.value.sync_level),
+    );
 }
 
 test "checkpoint validation rejects changed source and load config" {
