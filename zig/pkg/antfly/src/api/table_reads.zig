@@ -6650,6 +6650,7 @@ fn requiresDistributedGraphCoordinator(
     return distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or
             req.graph_table_read_authorizer != null or
+            distributed_graph.requiresCompleteMatchAnchors(req) or
             graphRequestHasQualifiedIdentity(req));
 }
 
@@ -25616,6 +25617,25 @@ test "qualified graph endpoint requires coordination for a single source group" 
             .index_name = "graph_v1",
             .start_nodes = .{ .identities = &starts },
             .target_nodes = .{ .identities = &targets },
+        },
+    }};
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
+}
+
+test "conjunctive graph match requires coordination for a single source group" {
+    const nodes = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "a" },
+        .{ .alias = "b" },
+    };
+    const edges = [_]graph_pattern_mod.MatchEdge{.{ .from = "a", .to = "b" }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "match",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = .{ .nodes = &nodes, .edges = &edges },
         },
     }};
 

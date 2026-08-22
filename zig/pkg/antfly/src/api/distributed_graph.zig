@@ -908,7 +908,13 @@ fn executeCrossRangeOnce(
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
-    try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
+    // The coordinator also serves single-node and standalone deployments,
+    // where merged runtime status may not be projected even though the
+    // catalog range and the opened DB carry a valid identity namespace.
+    // Reject every reported rebuild/conflict/reassignment, while allowing the
+    // existing range + generation checks below to validate an unstamped
+    // standalone catalog without weakening cross-shard snapshot fencing.
+    try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
     try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
     if (match_anchor_result) |anchors|
         try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors);

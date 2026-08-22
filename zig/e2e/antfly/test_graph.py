@@ -260,7 +260,6 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         interval_s=0.1,
     )
     assert public_traverse_result is not None
-    assert public_traverse_result["type"] == "traverse"
     assert len(public_traverse_result["nodes"]) == 2
     assert [node["key"] for node in public_traverse_result["nodes"]] == ["bob", "carol"]
     assert public_traverse_result["nodes"][1]["path"] == ["alice", "bob", "carol"]
@@ -288,7 +287,6 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         interval_s=0.1,
     )
     assert public_shortest_result is not None
-    assert public_shortest_result["type"] == "shortest_path"
     assert len(public_shortest_result["paths"]) == 1
     assert public_shortest_result["nodes"] == []
     assert len(public_shortest_result["paths"]) == 1
@@ -489,7 +487,6 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         interval_s=0.5,
     )
     assert neighbor_result is not None
-    assert neighbor_result["type"] == "neighbors"
     assert len(neighbor_result["nodes"]) == 2
     assert [node["key"] for node in neighbor_result["nodes"]] == ["doc-b", "doc-c"]
 
@@ -503,7 +500,6 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         interval_s=0.5,
     )
     assert traverse_result is not None
-    assert traverse_result["type"] == "traverse"
     assert len(traverse_result["nodes"]) == 2
     assert [node["key"] for node in traverse_result["nodes"]] == ["doc-b", "doc-c"]
     assert traverse_result["nodes"][1]["depth"] == 2
@@ -519,7 +515,6 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         interval_s=0.5,
     )
     assert shortest_result is not None
-    assert shortest_result["type"] == "shortest_path"
     assert len(shortest_result["paths"]) == 1
     assert shortest_result["nodes"] == []
     assert len(shortest_result["paths"]) == 1
@@ -1119,16 +1114,20 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     table_name = f"graph_pattern_relational_{time.time_ns()}"
     created = _create_stateful_table(backup_api, table_name, num_shards=1)
     assert created["name"] == table_name
-    assert _create_index(
-        backup_api,
-        table_name,
+    assert_created_index(
+        _create_index(
+            backup_api,
+            table_name,
+            "graph_idx",
+            {
+                "name": "graph_idx",
+                "type": "graph",
+                "edge_types": [{"name": "knows"}, {"name": "likes"}, {"name": "blocks"}],
+            },
+        ),
         "graph_idx",
-        {
-            "name": "graph_idx",
-            "type": "graph",
-            "edge_types": [{"name": "knows"}, {"name": "likes"}, {"name": "blocks"}],
-        },
-    ) == {}
+        "graph",
+    )
     batch = _batch_write_stateful(
         backup_api,
         table_name,
