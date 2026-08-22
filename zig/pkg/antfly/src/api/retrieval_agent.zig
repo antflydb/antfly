@@ -5856,6 +5856,12 @@ fn buildTreeGraphSearches(
             .max_depth = max_depth,
             .limit = max_results,
             .deduplicate_nodes = true,
+            // Tree retrieval consumes both the document and its ancestry when
+            // ranking branches and grounding generation. Keep those semantics
+            // explicit in the canonical graph query instead of relying on the
+            // legacy graph-search response to include them implicitly.
+            .include_documents = true,
+            .include_paths = true,
         },
     };
     try graph_queries.map.put(alloc, "tree_search", .{ .graph_traverse_query = traverse_query });
@@ -6453,6 +6459,8 @@ test "retrieval agent supports inline tree search" {
             const graph_queries = parsed_query.value.graph_queries.?;
             const tree_query = graph_queries.map.get("tree_search").?;
             try std.testing.expectEqualStrings("$tree_search", tree_query.graph_traverse_query.traverse.start.result_ref.?);
+            try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_documents.?);
+            try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{
                 .json = try alloc.dupe(u8,
                     \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"took":1}}}]}

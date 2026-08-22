@@ -473,6 +473,7 @@ def _wait_for_mention_hydration(
                     "start": {"keys": [start_node]},
                     "edge_types": ["mentions"],
                     "direction": "out",
+                    "max_depth": 1,
                     "limit": 10,
                     "include_documents": True,
                     "fields": ["entity_type", "canonical_name", "aliases"],
@@ -579,7 +580,6 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         },
         deadline=_new_e2e_deadline(),
     )
-    assert mentions["type"] == "neighbors"
     node_keys = {node["key"] for node in mentions["nodes"]}
     assert {"person/ada_lovelace", "org/antfly"} <= node_keys
 
