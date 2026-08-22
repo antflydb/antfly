@@ -5807,7 +5807,7 @@ fn startBootstrappedMetadataCluster(
     return leader_index;
 }
 
-const metadata_vopr_scenario_version: u32 = 5;
+const metadata_vopr_scenario_version: u32 = 6;
 
 pub const MetadataVoprCampaignConfig = struct {
     seed: u64,
@@ -5916,6 +5916,41 @@ pub const MetadataOverlapDiscoveryChoice = struct {
     }
 };
 
+const MetadataNodeCrashLifecycleChoice = struct {
+    stage: enum { crash, restart, complete } = .crash,
+
+    fn source(self: *@This()) vopr.choice.Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target_name: ?[]const u8 = switch (self.stage) {
+            .crash => "metadata.node.crash",
+            .restart => "metadata.node.restart",
+            .complete => null,
+        };
+        if (target_name) |name| {
+            for (request.enabled) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, name)) continue;
+                self.stage = switch (self.stage) {
+                    .crash => .restart,
+                    .restart => .complete,
+                    .complete => unreachable,
+                };
+                return candidate.id;
+            }
+            return error.MetadataNodeLifecycleTargetNotEnabled;
+        }
+        return request.enabled[0].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.stage != .complete) return error.MetadataNodeLifecycleTargetNotReached;
+    }
+};
+
 const MetadataVoprAction = enum {
     step,
     network_deliver,
@@ -5942,7 +5977,9 @@ const MetadataVoprAction = enum {
     stop_link_partition,
     stop_node_partition,
     heal_all,
-    restart_follower,
+    graceful_stop_node,
+    crash_node,
+    restart_node,
 };
 
 fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
@@ -5972,7 +6009,9 @@ fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
         .stop_link_partition => "stop_link_partition",
         .stop_node_partition => "stop_node_partition",
         .heal_all => "heal_all",
-        .restart_follower => "restart_follower",
+        .graceful_stop_node => "graceful_stop_node",
+        .crash_node => "crash_node",
+        .restart_node => "restart_node",
     };
 }
 
@@ -5991,9 +6030,16 @@ const MetadataVoprCampaignState = struct {
     unavailable_node_id: ?u64 = null,
     queue_capacity: ?usize = null,
     paused_node_id: ?u64 = null,
+    gracefully_stopped_node_id: ?u64 = null,
+    crashed_node_id: ?u64 = null,
 
     fn faultCount(self: *const MetadataVoprCampaignState) usize {
-        return self.active_link_count + self.active_node_count + @intFromBool(self.unavailable_node_id != null) + @intFromBool(self.queue_capacity != null) + @intFromBool(self.paused_node_id != null);
+        return self.active_link_count + self.active_node_count +
+            @intFromBool(self.unavailable_node_id != null) +
+            @intFromBool(self.queue_capacity != null) +
+            @intFromBool(self.paused_node_id != null) +
+            @intFromBool(self.gracefully_stopped_node_id != null) +
+            @intFromBool(self.crashed_node_id != null);
     }
 
     fn containsLink(self: *const MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) bool {
@@ -6048,6 +6094,19 @@ const MetadataVoprCampaignState = struct {
         self.unavailable_node_id = null;
         self.queue_capacity = null;
         self.paused_node_id = null;
+        self.gracefully_stopped_node_id = null;
+        self.crashed_node_id = null;
+    }
+
+    fn nodeUnavailable(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        return self.gracefully_stopped_node_id == node_id or self.crashed_node_id == node_id;
+    }
+
+    fn linksConfinedToNode(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        for (self.active_links[0..self.active_link_count]) |link| {
+            if (link.source_id != node_id and link.target_id != node_id) return false;
+        }
+        return true;
     }
 };
 
@@ -6184,9 +6243,17 @@ const MetadataVoprDriver = struct {
     }
 
     fn enumerate(self: *MetadataVoprDriver, candidates: *std.ArrayListUnmanaged(MetadataVoprCandidate)) !void {
+        if (self.quiet_mode and self.state.faultCount() > 0) {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
+                .action = .heal_all,
+            });
+            return;
+        }
         for (0..self.cluster.cluster.nodes.len) |node_index| {
             const node_id = metadataVoprNodeId(self.cluster, node_index);
             if (self.state.paused_node_id != null and self.state.paused_node_id.? == node_id) continue;
+            if (self.state.nodeUnavailable(node_id)) continue;
             try appendCandidate(candidates, self.alloc, .{
                 .transition = .{
                     .id = actionId(.step, node_id),
@@ -6350,6 +6417,45 @@ const MetadataVoprDriver = struct {
                 });
             }
         }
+        if (self.state.active_node_count == 0 and
+            self.state.queue_capacity == null and
+            self.state.unavailable_node_id == null and
+            self.state.paused_node_id == null and
+            self.state.gracefully_stopped_node_id == null and
+            self.state.crashed_node_id == null)
+        {
+            for (0..self.cluster.cluster.nodes.len) |node_index| {
+                const node_id = metadataVoprNodeId(self.cluster, node_index);
+                // Existing link faults may overlap a node lifecycle only when
+                // they are incident to that node, leaving the other two nodes
+                // as an intact healthy quorum.
+                if (!self.state.linksConfinedToNode(node_id)) continue;
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.graceful_stop_node, node_id),
+                        .name = "metadata.node.graceful_stop",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                        .parameter = @intCast(node_index),
+                    },
+                    .action = .graceful_stop_node,
+                    .source_node_id = node_id,
+                    .node_index = node_index,
+                });
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.crash_node, node_id),
+                        .name = "metadata.node.crash",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                        .parameter = @intCast(node_index),
+                    },
+                    .action = .crash_node,
+                    .source_node_id = node_id,
+                    .node_index = node_index,
+                });
+            }
+        }
         if (self.state.queue_capacity) |capacity| try appendCandidate(candidates, self.alloc, .{
             .transition = .{
                 .id = actionId(.stop_queue_limit, capacity),
@@ -6451,19 +6557,19 @@ const MetadataVoprDriver = struct {
             .action = .heal_all,
         });
 
-        const leader_index = currentMetadataLeaderIndex(self.cluster);
-        for (0..self.cluster.cluster.nodes.len) |node_index| {
-            if (leader_index != null and leader_index.? == node_index) continue;
-            const node_id = metadataVoprNodeId(self.cluster, node_index);
+        if (self.state.gracefully_stopped_node_id orelse self.state.crashed_node_id) |node_id| {
+            const node_index = for (0..self.cluster.cluster.nodes.len) |candidate_index| {
+                if (metadataVoprNodeId(self.cluster, candidate_index) == node_id) break candidate_index;
+            } else return error.MetadataVoprNodeMissing;
             try appendCandidate(candidates, self.alloc, .{
                 .transition = .{
-                    .id = actionId(.restart_follower, node_id),
+                    .id = actionId(.restart_node, node_id),
                     .name = "metadata.node.restart",
                     .kind = .fault,
                     .actor_id = node_id,
                     .parameter = @intCast(node_index),
                 },
-                .action = .restart_follower,
+                .action = .restart_node,
                 .source_node_id = node_id,
                 .node_index = node_index,
             });
@@ -6502,6 +6608,7 @@ const MetadataVoprDriver = struct {
             if (candidate.transition.id == selected_id) break candidate;
         } else return error.SelectedMetadataActionMissing;
 
+        const state_before = self.state;
         self.execute(selected) catch |err| {
             metadataVoprReportFailure(self.cfg, @intCast(self.occurrence), selected.action, err);
             return err;
@@ -6517,14 +6624,7 @@ const MetadataVoprDriver = struct {
             .parameter = selected.transition.parameter,
             .payload_digest = selected.transition.payloadDigest(),
         });
-        if (selected.transition.kind == .fault) {
-            const phase: vopr.trace.FaultPhase = switch (selected.action) {
-                .start_link_partition, .start_node_partition, .start_queue_limit, .start_route_unavailable, .pause_node => .start,
-                .stop_link_partition, .stop_node_partition, .stop_queue_limit, .stop_route_unavailable, .resume_node, .heal_all => .end,
-                else => .pulse,
-            };
-            try self.trace().addFault(.{ .index = self.occurrence, .id = selected.transition.id, .name = selected.transition.name, .phase = phase });
-        }
+        if (selected.transition.kind == .fault) try self.recordFaultChanges(selected, state_before);
         try self.trace().addEvent(.{
             .index = self.occurrence,
             .ordinal = 0,
@@ -6537,6 +6637,135 @@ const MetadataVoprDriver = struct {
         });
         _ = try self.recordObservation(self.occurrence);
         try self.evaluateProperties(self.occurrence);
+    }
+
+    const FaultChange = struct {
+        id: u64,
+        name: []const u8,
+        phase: vopr.trace.FaultPhase,
+    };
+
+    fn recordFaultChanges(self: *MetadataVoprDriver, selected: MetadataVoprCandidate, before: MetadataVoprCampaignState) !void {
+        var changes: [12]FaultChange = undefined;
+        var count: usize = 0;
+        switch (selected.action) {
+            .start_link_partition, .stop_link_partition => {
+                const link_id = vopr.id.derive("antfly.metadata.link", selected.source_node_id.?, selected.target_node_id.?);
+                changes[count] = .{
+                    .id = vopr.id.derive("fault.metadata.link-partition", link_id, 0),
+                    .name = "metadata.network.partition_link",
+                    .phase = if (selected.action == .start_link_partition) .start else .end,
+                };
+                count += 1;
+            },
+            .start_node_partition, .stop_node_partition => {
+                changes[count] = nodeFaultChange(
+                    "metadata.network.partition_node",
+                    selected.source_node_id.?,
+                    if (selected.action == .start_node_partition) .start else .end,
+                );
+                count += 1;
+            },
+            .start_queue_limit, .stop_queue_limit => {
+                changes[count] = .{
+                    .id = vopr.id.derive("fault.metadata.queue-capacity", selected.ticks, 0),
+                    .name = "metadata.network.queue_capacity",
+                    .phase = if (selected.action == .start_queue_limit) .start else .end,
+                };
+                count += 1;
+            },
+            .start_route_unavailable, .stop_route_unavailable => {
+                changes[count] = nodeFaultChange(
+                    "metadata.network.route_unavailable",
+                    selected.source_node_id.?,
+                    if (selected.action == .start_route_unavailable) .start else .end,
+                );
+                count += 1;
+            },
+            .pause_node, .resume_node => {
+                changes[count] = nodeFaultChange(
+                    "metadata.node.paused",
+                    selected.source_node_id.?,
+                    if (selected.action == .pause_node) .start else .end,
+                );
+                count += 1;
+            },
+            .graceful_stop_node => {
+                changes[count] = nodeFaultChange("metadata.node.gracefully_stopped", selected.source_node_id.?, .start);
+                count += 1;
+            },
+            .crash_node => {
+                changes[count] = nodeFaultChange("metadata.node.crashed", selected.source_node_id.?, .start);
+                count += 1;
+            },
+            .restart_node => {
+                const name: []const u8 = if (before.crashed_node_id == selected.source_node_id.?)
+                    "metadata.node.crashed"
+                else
+                    "metadata.node.gracefully_stopped";
+                changes[count] = nodeFaultChange(name, selected.source_node_id.?, .end);
+                count += 1;
+            },
+            .heal_all => {
+                for (before.active_links[0..before.active_link_count]) |link| {
+                    const link_id = vopr.id.derive("antfly.metadata.link", link.source_id, link.target_id);
+                    changes[count] = .{
+                        .id = vopr.id.derive("fault.metadata.link-partition", link_id, 0),
+                        .name = "metadata.network.partition_link",
+                        .phase = .end,
+                    };
+                    count += 1;
+                }
+                for (before.active_node_ids[0..before.active_node_count]) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.network.partition_node", node_id, .end);
+                    count += 1;
+                }
+                if (before.queue_capacity) |capacity| {
+                    changes[count] = .{
+                        .id = vopr.id.derive("fault.metadata.queue-capacity", capacity, 0),
+                        .name = "metadata.network.queue_capacity",
+                        .phase = .end,
+                    };
+                    count += 1;
+                }
+                if (before.unavailable_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.network.route_unavailable", node_id, .end);
+                    count += 1;
+                }
+                if (before.paused_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.paused", node_id, .end);
+                    count += 1;
+                }
+                if (before.gracefully_stopped_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.gracefully_stopped", node_id, .end);
+                    count += 1;
+                }
+                if (before.crashed_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.crashed", node_id, .end);
+                    count += 1;
+                }
+            },
+            else => {
+                changes[count] = .{ .id = selected.transition.id, .name = selected.transition.name, .phase = .pulse };
+                count += 1;
+            },
+        }
+        std.mem.sort(FaultChange, changes[0..count], {}, struct {
+            fn lessThan(_: void, lhs: FaultChange, rhs: FaultChange) bool {
+                if (lhs.id != rhs.id) return lhs.id < rhs.id;
+                return @intFromEnum(lhs.phase) < @intFromEnum(rhs.phase);
+            }
+        }.lessThan);
+        for (changes[0..count]) |change| try self.trace().addFault(.{
+            .index = self.occurrence,
+            .id = change.id,
+            .name = change.name,
+            .phase = change.phase,
+        });
+    }
+
+    fn nodeFaultChange(name: []const u8, node_id: u64, phase: vopr.trace.FaultPhase) FaultChange {
+        return .{ .id = vopr.id.derive("fault.metadata.node", vopr.id.stable("fault-kind", name), node_id), .name = name, .phase = phase };
     }
 
     fn execute(self: *MetadataVoprDriver, selected: MetadataVoprCandidate) !void {
@@ -6616,10 +6845,40 @@ const MetadataVoprDriver = struct {
             },
             .heal_all => {
                 self.cluster.cluster.healAll();
+                if (self.state.crashed_node_id) |node_id| {
+                    const node_index = for (0..self.cluster.cluster.nodes.len) |candidate_index| {
+                        if (metadataVoprNodeId(self.cluster, candidate_index) == node_id) break candidate_index;
+                    } else return error.MetadataVoprNodeMissing;
+                    try self.cluster.restartNode(node_index);
+                }
                 self.state.clear();
             },
-            .restart_follower => {
-                try self.cluster.restartNode(selected.node_index.?);
+            .graceful_stop_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.gracefully_stopped_node_id != null or self.state.crashed_node_id != null)
+                    return error.MetadataVoprFaultBudgetExceeded;
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.gracefully_stopped_node_id = node_id;
+            },
+            .crash_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.gracefully_stopped_node_id != null or self.state.crashed_node_id != null)
+                    return error.MetadataVoprFaultBudgetExceeded;
+                // The host remains allocated but is unreachable and receives
+                // no rounds. Restart destroys this volatile process image and
+                // reconstructs it from the preserved durable dependencies.
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.crashed_node_id = node_id;
+            },
+            .restart_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.crashed_node_id == node_id) {
+                    try self.cluster.restartNode(selected.node_index.?);
+                    self.state.crashed_node_id = null;
+                } else if (self.state.gracefully_stopped_node_id == node_id) {
+                    self.state.gracefully_stopped_node_id = null;
+                } else return error.MetadataVoprFaultNotActive;
+                self.cluster.cluster.heal(.{ .route_unavailable = node_id });
             },
         }
     }
@@ -6644,11 +6903,14 @@ const MetadataVoprDriver = struct {
         try builder.addNamed(self.alloc, "metadata.fault.route_unavailable", @intFromBool(self.state.unavailable_node_id != null));
         try builder.addNamed(self.alloc, "metadata.fault.queue_limited", @intFromBool(self.state.queue_capacity != null));
         try builder.addNamed(self.alloc, "metadata.fault.node_paused", @intFromBool(self.state.paused_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.node_gracefully_stopped", @intFromBool(self.state.gracefully_stopped_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.node_crashed", @intFromBool(self.state.crashed_node_id != null));
         try builder.addNamed(self.alloc, "metadata.phase.quiet", @intFromBool(self.quiet_mode));
         var leader_count: i64 = 0;
         var commit_total: u64 = 0;
         var applied_total: u64 = 0;
-        for (self.cluster.cluster.nodes) |*node| {
+        for (self.cluster.cluster.nodes, 0..) |*node, node_index| {
+            if (self.state.nodeUnavailable(metadataVoprNodeId(self.cluster, node_index))) continue;
             if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
                 leader_count += @intFromBool(status.soft.role == .leader);
                 commit_total +|= status.hard.commit_index;
@@ -6670,6 +6932,7 @@ const MetadataVoprDriver = struct {
         var leader_unique = true;
         var monotonic = true;
         for (self.cluster.cluster.nodes, 0..) |*node, node_index| {
+            if (self.state.nodeUnavailable(metadataVoprNodeId(self.cluster, node_index))) continue;
             if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
                 if (status.soft.role == .leader) {
                     for (leader_terms[0..leader_count]) |term| {
@@ -6744,6 +7007,17 @@ const MetadataVoprDriver = struct {
         self.quiet_mode = true;
         try self.runActions(budget);
         if (!self.recovery_satisfied) self.recovery_failure_at = self.occurrence;
+    }
+
+    fn healAllRecorded(self: *MetadataVoprDriver) !void {
+        if (self.state.faultCount() == 0) return;
+        const was_quiet = self.quiet_mode;
+        self.quiet_mode = true;
+        defer self.quiet_mode = was_quiet;
+        try self.runOne();
+        if (self.state.faultCount() != 0) return error.MetadataVoprHealTransitionIncomplete;
+        for (0..4) |_| try self.cluster.stepAll();
+        _ = try self.cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
     }
 
     fn finish(self: *MetadataVoprDriver) !vopr.trace.Trace {
@@ -6830,6 +7104,12 @@ fn metadataVoprHealAll(
     state: *MetadataVoprCampaignState,
 ) !void {
     cluster.cluster.healAll();
+    if (state.crashed_node_id) |node_id| {
+        const node_index = for (0..cluster.cluster.nodes.len) |candidate_index| {
+            if (metadataVoprNodeId(cluster, candidate_index) == node_id) break candidate_index;
+        } else return error.MetadataVoprNodeMissing;
+        try cluster.restartNode(node_index);
+    }
     state.clear();
     for (0..4) |_| try cluster.stepAll();
     _ = try cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
@@ -7242,13 +7522,13 @@ fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
     defer driver.deinit();
     if (cfg.workload == .smoke) {
         try driver.runActions(cfg.operation_count);
-        try metadataVoprHealAll(&cluster, &driver.state);
+        try driver.healAllRecorded();
     }
     metadataVoprRunLivenessWorkload(&cluster, cfg, &driver) catch |err| {
         metadataVoprReportFailure(cfg, null, null, err);
         return err;
     };
-    try metadataVoprHealAll(&cluster, &driver.state);
+    try driver.healAllRecorded();
     // Heal hostile faults, then permit only node/message/time transitions. The
     // bounded quiet suffix is itself part of the decision trace and is checked
     // by an eventually-after-quiescence property.
@@ -7454,6 +7734,43 @@ test "metadata VOPR seeded smoke campaign" {
         .split_group_id = 6103,
         .split_transition_id = 6104,
     });
+}
+
+test "metadata VOPR records crash interval and durable-state restart lifecycle" {
+    var choices = MetadataNodeCrashLifecycleChoice{};
+    var recorded = try runMetadataVoprCampaignWithChoices(std.testing.allocator, .{
+        .seed = 0xA17F_C2A5,
+        .operation_count = 2,
+        .metadata_group_id = 6150,
+        .table_id = 6151,
+        .range_group_id = 6152,
+        .split_group_id = 6153,
+        .split_transition_id = 6154,
+    }, choices.source());
+    defer recorded.deinit();
+
+    var crash_id: ?u64 = null;
+    var saw_start = false;
+    var saw_end = false;
+    for (recorded.faults.items) |fault_record| {
+        if (!std.mem.eql(u8, fault_record.name, "metadata.node.crashed")) continue;
+        crash_id = crash_id orelse fault_record.id;
+        try std.testing.expectEqual(crash_id.?, fault_record.id);
+        saw_start = saw_start or fault_record.phase == .start;
+        saw_end = saw_end or fault_record.phase == .end;
+    }
+    try std.testing.expect(saw_start and saw_end);
+    var saw_crashed_observation = false;
+    for (recorded.observations.items) |observation_record| {
+        for (observation_record.features) |feature| {
+            if (std.mem.eql(u8, feature.name, "metadata.fault.node_crashed") and feature.value == 1)
+                saw_crashed_observation = true;
+        }
+    }
+    try std.testing.expect(saw_crashed_observation);
+
+    var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &recorded);
+    replayed.deinit();
 }
 
 test "metadata VOPR expanded generated workload campaign" {

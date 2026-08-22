@@ -4898,6 +4898,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_vopr_default_filters = [_][]const u8{
         "metadata VOPR seeded smoke campaign",
+        "metadata VOPR records crash interval and durable-state restart lifecycle",
     };
     const lib_metadata_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
