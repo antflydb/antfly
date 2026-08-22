@@ -169,6 +169,11 @@ def test_configured_generation_smoke(api):
         messages,
         model=model,
         max_tokens=50,
+        # This canary validates public-response generation, not private
+        # reasoning. Reasoning models can otherwise spend the entire short
+        # smoke budget in their thought channel and correctly return an empty
+        # public response with finish_reason=length.
+        chat_template_kwargs={"enable_thinking": False},
         request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     content = _message_content(resp)

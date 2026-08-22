@@ -88,6 +88,7 @@ def test_configured_generation_smoke_uses_exact_model_and_first_use_timeout(
     assert api.request is not None
     _, kwargs = api.request
     assert kwargs["model"] == model
+    assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
     assert kwargs["request_timeout"] > 0
 
 
