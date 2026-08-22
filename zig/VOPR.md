@@ -1737,9 +1737,17 @@ failure, reduces it under the same fingerprint, promotes the canonical trace
 through the same guarded writer as the CLI, refuses an accidental overwrite,
 parses the promoted file, and exact-replays it again. The injection changes no
 production behavior and is serialized as an explicit scenario parameter.
-Richer deletion operators and loading persisted queues into future campaigns
-remain useful follow-on search improvements, but are no longer prerequisites
-for proving the autonomous failure lifecycle.
+
+Campaign artifact directories are now persistent mutation queues rather than
+write-only output folders. At startup the CLI recursively loads `.simtrace`
+entries in lexical order, validates and exact-replays each artifact under the
+current scenario ABI, reconstructs semantic coverage, and inserts canonical
+deduplicated entries into the energy-weighted corpus. Workers select those
+entries as structured mutation parents; newly retained histories are merged
+back into the in-memory queue and written atomically as independent files. The
+meta-test also reopens its promoted fixture as a fresh persistent corpus,
+selects it for mutation, and exact-replays the result. Richer command-aware
+deletion operators remain a useful follow-on reduction improvement.
 
 ### Phase 4: Storage and Data Integration
 

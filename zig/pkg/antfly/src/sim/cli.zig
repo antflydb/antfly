@@ -120,7 +120,10 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         .base_seed = seed,
         .artifact_dir = artifact_dir,
         .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
+        .corpus = vopr.corpus.Corpus.init(std.heap.smp_allocator),
     };
+    try context.primeCorpus(alloc);
+    defer context.corpus.deinit();
     defer context.coverage.deinit();
     const worker_count = @min(workers, @as(usize, @intCast(histories)));
     const threads = try alloc.alloc(std.Thread, worker_count);
@@ -134,8 +137,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     for (threads) |thread| thread.join();
     if (context.first_error) |err| return err;
     std.debug.print(
-        "VOPR campaign histories={d} retained={d} failures={d} features={d} workers={d} artifacts={s}\n",
-        .{ histories, context.retained, context.failures, context.coverage.hits.count(), worker_count, artifact_dir },
+        "VOPR campaign histories={d} seeded={d} retained={d} failures={d} features={d} workers={d} artifacts={s}\n",
+        .{ histories, context.seeded_entries, context.retained, context.failures, context.coverage.hits.count(), worker_count, artifact_dir },
     );
 }
 
@@ -252,6 +255,8 @@ const CampaignContext = struct {
     next_history: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
     coverage: vopr.coverage.Tracker,
+    corpus: vopr.corpus.Corpus,
+    seeded_entries: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
     first_error: ?anyerror = null,
@@ -272,16 +277,18 @@ const CampaignContext = struct {
     fn runHistory(self: *@This(), history_index: u64) !void {
         const alloc = std.heap.smp_allocator;
         const seed = self.base_seed +% history_index *% 0x9e37_79b9_7f4a_7c15;
-        const base_id = 10_000 + seed % 1_000_000;
-        var artifact = try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
-            .seed = seed,
-            .operation_count = self.transitions,
-            .metadata_group_id = base_id,
-            .table_id = base_id + 1,
-            .range_group_id = base_id + 2,
-            .split_group_id = base_id + 3,
-            .split_transition_id = base_id + 4,
-        });
+        var artifact = (try self.mutateCorpusEntry(alloc, seed)) orelse blk: {
+            const base_id = 10_000 + seed % 1_000_000;
+            break :blk try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+                .seed = seed,
+                .operation_count = self.transitions,
+                .metadata_group_id = base_id,
+                .table_id = base_id + 1,
+                .range_group_id = base_id + 2,
+                .split_group_id = base_id + 3,
+                .split_transition_id = base_id + 4,
+            });
+        };
         defer artifact.deinit();
 
         try self.mutex.lock(self.io);
@@ -292,15 +299,116 @@ const CampaignContext = struct {
         const failed = artifact.failures.items.len > 0;
         const retain = history_index == 0 or novelty.discovered > 0 or failed;
         if (failed) self.failures += 1;
-        if (retain) self.retained += 1;
+        const added = if (retain) self.corpus.add(&artifact, novelty) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        } else null;
+        const inserted = if (added) |result| result.inserted else false;
+        if (inserted) self.retained += 1;
         self.mutex.unlock(self.io);
-        if (!retain) return;
+        if (!inserted) return;
 
         const bytes = try artifact.renderAlloc(alloc);
         defer alloc.free(bytes);
         const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.simtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+    }
+
+    fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64) !?vopr.trace.Trace {
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x6d75_7461_7465_3031);
+        try self.mutex.lock(self.io);
+        if (self.corpus.entries.items.len == 0) {
+            self.mutex.unlock(self.io);
+            return null;
+        }
+        const parent_index = self.corpus.select(prng.random()) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        const parent_bytes = alloc.dupe(u8, self.corpus.entries.items[parent_index].bytes) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+        defer alloc.free(parent_bytes);
+
+        var parent = try vopr.trace.parseAlloc(alloc, parent_bytes);
+        defer parent.deinit();
+        var mutable_count: usize = 0;
+        for (parent.choices.items) |record| mutable_count += @intFromBool(record.enabled_ids.len > 1);
+        if (mutable_count == 0) return null;
+        var ordinal = prng.random().uintLessThan(usize, mutable_count);
+        var mutation_index: usize = 0;
+        for (parent.choices.items, 0..) |record, index| {
+            if (record.enabled_ids.len <= 1) continue;
+            if (ordinal == 0) {
+                mutation_index = index;
+                break;
+            }
+            ordinal -= 1;
+        }
+        const record = parent.choices.items[mutation_index];
+        var replacement_count: usize = 0;
+        for (record.enabled_ids) |candidate| replacement_count += @intFromBool(candidate != record.selected_id);
+        var replacement_ordinal = prng.random().uintLessThan(usize, replacement_count);
+        var replacement = record.selected_id;
+        for (record.enabled_ids) |candidate| {
+            if (candidate == record.selected_id) continue;
+            if (replacement_ordinal == 0) {
+                replacement = candidate;
+                break;
+            }
+            replacement_ordinal -= 1;
+        }
+        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(&parent);
+        var source = vopr.choice.Mutating.init(parent.choices.items, mutation_index, replacement, seed);
+        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
+            error.MutationPointNotReached,
+            error.MutationPointOutOfRange,
+            error.MutationPrefixExhausted,
+            error.ReplayChoiceSiteDiverged,
+            error.ReplayEnabledSetDiverged,
+            error.ChoiceSourceSelectedDisabledAlternative,
+            => null,
+            else => return err,
+        };
+    }
+
+    fn primeCorpus(self: *@This(), alloc: std.mem.Allocator) !void {
+        var dir = if (std.fs.path.isAbsolute(self.artifact_dir))
+            try std.Io.Dir.openDirAbsolute(self.io, self.artifact_dir, .{ .iterate = true })
+        else
+            try std.Io.Dir.cwd().openDir(self.io, self.artifact_dir, .{ .iterate = true });
+        defer dir.close(self.io);
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        var walker = try dir.walk(alloc);
+        defer walker.deinit();
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".simtrace")) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.path));
+        }
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+        for (names.items) |name| {
+            const encoded = try dir.readFileAlloc(self.io, name, alloc, .limited(max_trace_bytes));
+            defer alloc.free(encoded);
+            var artifact = try vopr.trace.parseAlloc(alloc, encoded);
+            defer artifact.deinit();
+            // Corpus files must still be executable under the current ABI.
+            var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact);
+            replayed.deinit();
+            const novelty = try self.coverage.observe(&artifact);
+            const added = try self.corpus.add(&artifact, novelty);
+            if (added.inserted) self.seeded_entries += 1;
+        }
     }
 };
 
@@ -365,4 +473,27 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expectEqual(reduced.target_fingerprint, promoted.failures.items[0].fingerprint);
     var promoted_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &promoted);
     promoted_replay.deinit();
+
+    const corpus_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(corpus_path);
+    var context = CampaignContext{
+        .io = io,
+        .histories = 1,
+        .transitions = 2,
+        .base_seed = 1,
+        .artifact_dir = corpus_path,
+        .coverage = vopr.coverage.Tracker.init(alloc),
+        .corpus = vopr.corpus.Corpus.init(alloc),
+    };
+    defer context.corpus.deinit();
+    defer context.coverage.deinit();
+    try context.primeCorpus(alloc);
+    try std.testing.expectEqual(@as(u64, 1), context.seeded_entries);
+    try std.testing.expectEqual(@as(usize, 1), context.corpus.entries.items.len);
+    if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12)) |mutated_value| {
+        var mutated = mutated_value;
+        defer mutated.deinit();
+        var mutation_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &mutated);
+        mutation_replay.deinit();
+    } else return error.PersistentCorpusMutationRequired;
 }
