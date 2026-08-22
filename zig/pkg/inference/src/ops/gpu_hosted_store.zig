@@ -282,6 +282,44 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
     data.packed_expert_view_bytes = 0;
 }
 
+fn expectedDenseCacheBytes(
+    data: *const WeightStore,
+    entry: *const LazyWeightEntry,
+    quantized_storage: ?*const QuantizedStorage,
+) !usize {
+    if (quantized_storage) |storage| {
+        var element_count: usize = 1;
+        for (storage.shape) |dim| {
+            if (dim < 0) return error.InvalidTensorShape;
+            element_count = std.math.mul(usize, element_count, @intCast(dim)) catch
+                return error.MemoryBudgetExceeded;
+        }
+        if (storage.packed_expert) |packed_view| {
+            if (packed_view.expert_count == 0) return error.InvalidTensorShape;
+            element_count = std.math.divExact(
+                usize,
+                element_count,
+                @intCast(packed_view.expert_count),
+            ) catch return error.InvalidTensorShape;
+            if (entry.tensor_ref.fused_gate_up) {
+                element_count = std.math.divExact(usize, element_count, 2) catch
+                    return error.InvalidTensorShape;
+            }
+        }
+        return std.math.mul(usize, element_count, @sizeOf(f32)) catch
+            error.MemoryBudgetExceeded;
+    }
+
+    // LoRA merge requires an owned f32 base. Conservatively reserve the f16 /
+    // bf16 expansion before materialization; an already-f32 source settles the
+    // unused half after loading.
+    if (data.jina_lora_adapter != null) {
+        return std.math.mul(usize, entry.tensor_ref.byte_len, 2) catch
+            error.MemoryBudgetExceeded;
+    }
+    return entry.tensor_ref.byte_len;
+}
+
 pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEntry) !void {
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
@@ -293,13 +331,21 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
 
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
     if (data.allow_direct_quant and !entry.prefer_dense) {
-        if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |loaded_storage| {
+        if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
+            var loaded_storage = storage_value;
+            errdefer loaded_storage.deinit();
             entry.loaded_bytes = loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
+            if (entry.loaded_bytes != 0) {
+                if (data.tier_cache) |*tier_cache| {
+                    tier_cache.reserve(.host, entry.loaded_bytes) catch |err| {
+                        tier_cache.noteDenied(.host, entry.loaded_bytes);
+                        entry.loaded_bytes = 0;
+                        return err;
+                    };
+                }
+            }
             entry.quantized_storage = loaded_storage;
             entry.active_tier = .host;
-            if (entry.loaded_bytes != 0) {
-                if (data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, entry.loaded_bytes);
-            }
             return;
         }
     }
@@ -309,7 +355,40 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
         }
     }
 
+    // Direct-quant-disabled paths still need an exact dense expansion estimate
+    // before materialization. A temporary metadata-only storage view supplies
+    // shape and packed-expert geometry without changing execution policy.
+    var sizing_storage: ?QuantizedStorage = null;
+    defer if (sizing_storage) |*storage| storage.deinit();
+    if (entry.tensor_ref.quantized and entry.quantized_storage == null) {
+        sizing_storage = try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref);
+    }
+    const quantized_storage = if (entry.quantized_storage) |*storage|
+        storage
+    else if (sizing_storage) |*storage|
+        storage
+    else
+        null;
+    const expected_bytes = try expectedDenseCacheBytes(data, entry, quantized_storage);
+    var cache_reserved_bytes: usize = 0;
+    if (data.tier_cache) |*tier_cache| {
+        tier_cache.reserve(.host, expected_bytes) catch |err| {
+            tier_cache.noteDenied(.host, expected_bytes);
+            return err;
+        };
+        cache_reserved_bytes = expected_bytes;
+    }
+    errdefer if (cache_reserved_bytes != 0) {
+        data.tier_cache.?.noteRelease(.host, cache_reserved_bytes);
+    };
+
     entry.host_loaded = try tensor_store.loadTensorRef(&entry.tensor_ref);
+    errdefer if (entry.host_loaded) |*loaded| {
+        loaded.deinit();
+        entry.host_loaded = null;
+        entry.loaded_bytes = 0;
+        entry.active_tier = entry.placement.spill_tier;
+    };
     if (entry.host_loaded.?.quantized_storage) |*storage| {
         storage.deinit();
         entry.host_loaded.?.quantized_storage = null;
@@ -320,8 +399,18 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     }
     entry.loaded_bytes = entry.host_loaded.?.tensor.data.len;
     entry.active_tier = if (entry.loaded_bytes == 0) .disk else .host;
-    if (entry.loaded_bytes != 0) {
-        if (data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, entry.loaded_bytes);
+    if (data.tier_cache) |*tier_cache| {
+        if (entry.loaded_bytes > cache_reserved_bytes) {
+            const additional = entry.loaded_bytes - cache_reserved_bytes;
+            tier_cache.reserve(.host, additional) catch |err| {
+                tier_cache.noteDenied(.host, additional);
+                return err;
+            };
+            cache_reserved_bytes = entry.loaded_bytes;
+        } else if (entry.loaded_bytes < cache_reserved_bytes) {
+            tier_cache.noteRelease(.host, cache_reserved_bytes - entry.loaded_bytes);
+            cache_reserved_bytes = entry.loaded_bytes;
+        }
     }
 }
 

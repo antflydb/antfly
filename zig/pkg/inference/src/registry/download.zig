@@ -50,6 +50,8 @@ pub const managed_download_complete_filename = managed_receipt.complete_filename
 pub const managed_download_lock_filename = ".antfly-download.lock";
 const managed_download_staging_suffix = ".antfly-download-staging";
 const managed_download_backup_suffix = ".antfly-download-backup";
+const streamed_download_max_retries: u32 = 3;
+const streamed_download_initial_retry_ms: u64 = 500;
 
 const ManagedArtifactReceipt = managed_receipt.ArtifactReceipt;
 const ManagedDownloadReceipt = managed_receipt.DownloadReceipt;
@@ -2163,6 +2165,43 @@ fn downloadClientConfig(max_response_size: usize) httpx.ClientConfig {
     };
 }
 
+fn isRetryableStreamDownloadError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed,
+        error.ConnectionRefused,
+        error.Closed,
+        error.NotConnected,
+        error.EndOfStream,
+        error.UnexpectedEof,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.RecvFailed,
+        error.SendFailed,
+        error.ConnectionFailed,
+        error.ConnectionReset,
+        error.ConnectionTimeout,
+        error.InvalidResponse,
+        error.TlsHandshakeFailed,
+        error.TlsError,
+        error.Timeout,
+        error.HostUnreachable,
+        error.DnsResolutionFailed,
+        error.ProtocolError,
+        error.StreamError,
+        error.Http2Error,
+        error.Http3Error,
+        error.QuicError,
+        => true,
+        else => false,
+    };
+}
+
+fn streamedDownloadRetryDelayMs(attempt: u32) u64 {
+    if (attempt == 0) return 0;
+    const shift: u6 = @intCast(@min(attempt - 1, 5));
+    return @min(streamed_download_initial_retry_ms << shift, 10_000);
+}
+
 const ParsedContentRange = struct {
     start: u64,
     end: u64,
@@ -2302,6 +2341,7 @@ fn downloadFile(
     );
     defer allocator.free(download_url);
 
+    var download_attempt: u32 = 0;
     while (true) {
         if (range_header) |range| {
             allocator.free(range);
@@ -2372,11 +2412,55 @@ fn downloadFile(
                     continue;
                 }
             }
+            if (isRetryableStreamDownloadError(err) and
+                download_attempt < streamed_download_max_retries)
+            {
+                download_attempt += 1;
+                // A digest makes the resumable prefix independently
+                // verifiable at publication. Without one, restart the
+                // artifact so a malformed response can never splice two
+                // unverified representations together.
+                if (expected_sha256 == null and expected_git_blob_sha1 == null) {
+                    dest.deleteFile(io, temp_path) catch {};
+                    resume_from = 0;
+                } else {
+                    resume_from = existingFileSize(dest, io, temp_path) catch 0;
+                    if (resume_from > config.max_artifact_bytes) {
+                        dest.deleteFile(io, temp_path) catch {};
+                        return error.DownloadSizeLimitExceeded;
+                    }
+                    if (total_bytes) |total| {
+                        if (resume_from == total) {
+                            try finalizeDownloadedFile(
+                                dest,
+                                io,
+                                temp_path,
+                                dest_path,
+                                expected_sha256,
+                                expected_git_blob_sha1,
+                            );
+                            return false;
+                        }
+                        if (resume_from > total) {
+                            dest.deleteFile(io, temp_path) catch {};
+                            resume_from = 0;
+                        }
+                    }
+                }
+                const delay_ms = streamedDownloadRetryDelayMs(download_attempt);
+                std.log.warn(
+                    "model artifact stream interrupted; retrying file={s} attempt={d}/{d} resume_bytes={d} delay_ms={d} err={s}",
+                    .{ filename, download_attempt, streamed_download_max_retries, resume_from, delay_ms, @errorName(err) },
+                );
+                io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                continue;
+            }
             return err;
         };
 
         if (!streamed.ok()) {
-            std.debug.print("download failed for {s}: HTTP {d}\n", .{ filename, streamed.status.code });
+            const status_code = streamed.status.code;
+            std.debug.print("download failed for {s}: HTTP {d}\n", .{ filename, status_code });
             streamed.deinit();
             file.close(io);
             // The streaming client may already have written the error body.
@@ -2384,6 +2468,23 @@ fn downloadFile(
             dest.deleteFile(io, temp_path) catch {};
             if (resume_from > 0) {
                 resume_from = 0;
+                continue;
+            }
+            if (download_attempt < streamed_download_max_retries and
+                (status_code == 408 or
+                    status_code == 429 or
+                    status_code == 500 or
+                    status_code == 502 or
+                    status_code == 503 or
+                    status_code == 504))
+            {
+                download_attempt += 1;
+                const delay_ms = streamedDownloadRetryDelayMs(download_attempt);
+                std.log.warn(
+                    "model artifact server returned retryable status; retrying file={s} status={d} attempt={d}/{d} delay_ms={d}",
+                    .{ filename, status_code, download_attempt, streamed_download_max_retries, delay_ms },
+                );
+                io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
                 continue;
             }
             return error.DownloadFailed;
@@ -3106,7 +3207,17 @@ const python_download_server_script =
     "        rng = self.headers.get('Range')\n" ++
     "        with log_path.open('ab') as f:\n" ++
     "            f.write(((rng or '-') + '\\n').encode())\n" ++
-    "        if mode == 'resume' and rng and rng.startswith('bytes='):\n" ++
+    "        if mode == 'drop-once' and not rng:\n" ++
+    "            body = payload[:max(1, len(payload) // 2)]\n" ++
+    "            self.send_response(200)\n" ++
+    "            self.send_header('Content-Length', str(len(payload)))\n" ++
+    "            self.send_header('Connection', 'close')\n" ++
+    "            self.end_headers()\n" ++
+    "            self.wfile.write(body)\n" ++
+    "            self.wfile.flush()\n" ++
+    "            self.connection.close()\n" ++
+    "            return\n" ++
+    "        if mode in ('resume', 'drop-once') and rng and rng.startswith('bytes='):\n" ++
     "            start = int(rng[6:].split('-', 1)[0])\n" ++
     "            body = payload[start:]\n" ++
     "            self.send_response(206)\n" ++
@@ -3811,6 +3922,60 @@ test "downloadFile resumes from partial file with 206 response" {
     var log_buf: [128]u8 = undefined;
     const log_n = try log_file.readStreaming(io, &.{log_buf[0..]});
     try std.testing.expect(std.mem.indexOf(u8, log_buf[0..log_n], "bytes=6-") != null);
+}
+
+test "downloadFile resumes a digest-verified artifact after a transient stream interruption" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "hello resumed world";
+    try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_download_server_script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "requests.log", .data = "" });
+
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg, "drop-once", "payload.bin", "requests.log" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+        .base_url = base_url,
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
+
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
+    defer allocator.free(final_path);
+    var file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const n = try file.readStreaming(io, &.{buf[0..]});
+    try std.testing.expectEqualStrings(payload, buf[0..n]);
+
+    const log_path = try testTmpPath(allocator, tmp, "requests.log");
+    defer allocator.free(log_path);
+    var log_file = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer log_file.close(io);
+    var log_buf: [128]u8 = undefined;
+    const log_n = try log_file.readStreaming(io, &.{log_buf[0..]});
+    try std.testing.expect(std.mem.startsWith(u8, log_buf[0..log_n], "-\nbytes="));
 }
 
 test "downloadFile restarts when a 206 content range is inconsistent" {

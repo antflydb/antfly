@@ -20,6 +20,7 @@ const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
 const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
@@ -654,6 +655,7 @@ const CliConfig = struct {
     failure_domain: ?[]const u8 = null,
     raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
     control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
+    process_memory_budget_mb: ?usize = null,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -2225,6 +2227,14 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
     const snapshot = manager.snapshot();
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_bytes", "gauge", "Aggregate managed host-memory hard limit", snapshot.memory.hard_limit_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_events_total", "counter", "Aggregate managed host-memory soft-limit events", snapshot.memory.soft_limit_events);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_rejections_total", "counter", "Aggregate managed host-memory hard-limit rejections", snapshot.memory.hard_limit_rejections);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_accounting_errors_total", "counter", "Fail-closed host-memory release accounting errors", snapshot.memory.accounting_errors);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_pressure", "gauge", "Aggregate managed host-memory pressure state, 0 normal, 1 soft, 2 hard", pressureValue(snapshot.memory.pressure));
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
     try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
@@ -2988,6 +2998,13 @@ pub const DataServerConfig = struct {
     index_repair_max_activation_gap_sequences: u64 = 200,
     index_repair_max_convergence_rounds: u32 = 32,
     index_repair_max_activation_pause_ms: u64 = 250,
+    /// Optional operator-owned envelope for all host memory in this process.
+    /// Zero auto-detects the cgroup or host limit.
+    process_memory_limit_bytes: usize = 0,
+    /// Present when startup has already resolved the shared process envelope.
+    /// This prevents independently composed managers from probing different
+    /// cgroup views or sizing from different host values.
+    process_memory_limit_source: ?antfly.public_api.MemoryLimitSource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -4759,7 +4776,11 @@ pub const DataServer = struct {
             .store_registration = cfg.store_registration,
             .group_leadership_source = cfg.group_leadership_source,
             .group_membership_source = cfg.group_membership_source,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 catalog,
@@ -4797,7 +4818,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
@@ -4835,7 +4860,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse GroupLeadershipSource.fromManagedHttpHostService(&svc.raft),
             .group_membership_source = cfg.group_membership_source orelse GroupMembershipSource.fromManagedHttpHostService(&svc.raft),
             .local_transition_runtime = svc.raft.local_transition_runtime,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
@@ -14355,7 +14384,11 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse if (data_raft) |raft| GroupLeadershipSource.fromManagedHttpHostService(raft) else null,
             .group_membership_source = cfg.group_membership_source orelse if (data_raft) |raft| GroupMembershipSource.fromManagedHttpHostService(raft) else null,
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+                alloc,
+                cfg.process_memory_limit_bytes,
+                cfg.process_memory_limit_source,
+            ),
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -17495,6 +17528,18 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+fn storageMemoryLimitSource(
+    source: process_memory_budget.EffectiveSource,
+) antfly.public_api.MemoryLimitSource {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -17525,6 +17570,15 @@ pub fn runFromIterator(
         cli.raft_tick_ms,
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
+    const process_memory_resolution = process_memory_budget.resolveSystemDetailed(
+        cli.process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        null,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -17640,6 +17694,8 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
@@ -17668,6 +17724,17 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
+    std.log.info(
+        "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            data_server.provisioned_storage.effective_memory_limit_bytes,
+            managed_memory.hard_limit_bytes,
+        },
+    );
     try data_server.start();
 
     const base_uri = try data_server.baseUri(alloc);
@@ -17837,6 +17904,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--control-tick-ms")) {
             cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb")) {
+            cfg.process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -18149,6 +18220,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --failure-domain <name>        Registered store failure domain
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
+        \\  --process-memory-budget-mb <n> Whole-process host-memory envelope (0: auto-detect)
         \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -18849,6 +18921,8 @@ test "data runtime parses optional split store registration flags" {
         "data",
         "--failure-domain",
         "rack-a",
+        "--process-memory-budget-mb",
+        "0",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var parsed = try parseCli(std.testing.allocator, &iter);
@@ -18859,6 +18933,11 @@ test "data runtime parses optional split store registration flags" {
     try std.testing.expectEqual(@as(u64, 21), parsed.store_id.?);
     try std.testing.expectEqualStrings("data", parsed.store_role.?);
     try std.testing.expectEqualStrings("rack-a", parsed.failure_domain.?);
+    try std.testing.expectEqual(@as(?usize, 0), parsed.process_memory_budget_mb);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try process_memory_budget.resolve(parsed.process_memory_budget_mb, "invalid", null),
+    );
 }
 
 test "data runtime accepts repeated metadata api flags" {
