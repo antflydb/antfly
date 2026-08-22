@@ -260,6 +260,10 @@ fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const 
     }
 }
 
+fn expectExactErrorLogs(run: *std.Build.Step.Run, test_filter: []const u8, count: []const u8) void {
+    run.addArgs(&.{ "--expect-error-logs", test_filter, count });
+}
+
 fn configureUnitStorageTestRun(
     b: *std.Build,
     run: *std.Build.Step.Run,
@@ -3768,7 +3772,7 @@ pub fn build(b: *std.Build) void {
         "db preflightSearchRequest validates live lane bindings",
         "db graph search filters result nodes and hidden traversal intermediates",
         "db graph shortest path searches through admitted alternatives",
-        "db graph artifact external node targets return ids without document hydration",
+        "db graph runtime artifact external node targets return ids without document hydration",
         "db graph hydration fails closed for a not-yet-promoted entity node",
         "api distributed graph cross-table hydrate enforces target authorization",
         "authenticated single-group graph queries require distributed coordination",
@@ -3784,6 +3788,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
     addRuntimeTestFilters(b, run_lib_unit_tests, lib_unit_filters);
+    // The broad root discovery anchor may retain API tests after a merge adds
+    // imports. Keep this stateful error-path test in its dedicated API shards.
+    run_lib_unit_tests.addArgs(&.{
+        "--skip-test-filter",
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+    });
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -5230,6 +5240,16 @@ pub fn build(b: *std.Build) void {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
+    expectExactErrorLogs(
+        run_public_api_parity_tests,
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "2",
+    );
+    expectExactErrorLogs(
+        run_public_api_parity_aggregate_tests,
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "2",
+    );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
@@ -5321,6 +5341,11 @@ pub fn build(b: *std.Build) void {
         b,
         lib_api_auth_tests,
         lib_api_auth_runtime_filters,
+    );
+    expectExactErrorLogs(
+        run_lib_api_auth_tests,
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "2",
     );
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
@@ -5490,6 +5515,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_api_storage_authority_tests = addFilteredTestRunArtifact(b, lib_api_storage_authority_tests);
+    expectExactErrorLogs(
+        run_lib_api_storage_authority_tests,
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "2",
+    );
     const lib_api_storage_authority_test_step = b.step("lib-api-storage-authority-test", "Run remote backup credential-boundary tests");
     lib_api_storage_authority_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
 
@@ -7348,6 +7378,8 @@ pub fn build(b: *std.Build) void {
         "graph metric runtime worker pool identity",
         "graph metric runtime boundary tick",
         "ownership state tracks lease takeover and loss",
+        "graph metric query shape bounds clauses and unique dependencies",
+        "borrowed graph metric names do not allocate per node",
         "graph metric order and filter dependencies attach status without projection",
         "graph metric metadata preserves score epoch input and decodes v3",
         "graph metric edge filter equality and fingerprint treat types as set",
@@ -7387,6 +7419,8 @@ pub fn build(b: *std.Build) void {
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
+        "api query contract uses portable graph metric filter operators",
+        "api query contract rejects oversized and duplicate graph metric clauses",
         "query encoder emits graph metric results",
         "query profile reports failed graph metric status across read surfaces",
         "query encoder emits graph metric rerank score details",

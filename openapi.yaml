@@ -22765,6 +22765,7 @@ components:
       properties:
         metric:
           type: string
+          minLength: 1
         direction:
           type: string
           enum:
@@ -22786,16 +22787,18 @@ components:
       properties:
         metric:
           type: string
+          minLength: 1
         op:
           type: string
+          description: Semantic comparison operator. Named values keep generated SDK enums portable and
+            readable.
           enum:
-            - '>'
-            - '>='
-            - <
-            - <=
-            - '='
-            - ==
-            - '!='
+            - gt
+            - gte
+            - lt
+            - lte
+            - eq
+            - neq
         value:
           type: number
           format: double
@@ -22853,21 +22856,31 @@ components:
         metrics:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 16
+          uniqueItems: true
           items:
             type: string
-          description: Graph metric names to project onto result nodes
+            minLength: 1
+          description: Graph metric names to project onto result nodes. At most 16 distinct metric dependencies
+            may be used across metrics, order_by, and where_metric.
         order_by:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 8
+          uniqueItems: true
           items:
             $ref: '#/components/schemas/GraphMetricOrder'
-          description: Sort graph result nodes by graph metric scores
+          description: Sort graph result nodes by up to 8 distinct graph metric scores. At most 16 distinct
+            metric dependencies may be used across metrics, order_by, and where_metric.
         where_metric:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 32
           items:
             $ref: '#/components/schemas/GraphMetricFilter'
-          description: Filter graph result nodes by graph metric scores
+          description: Filter graph result nodes with up to 32 predicates. Multiple predicates may target
+            one metric, and at most 16 distinct metric dependencies may be used across metrics, order_by,
+            and where_metric.
         metric_freshness:
           x-go-type-skip-optional-pointer: true
           type: string

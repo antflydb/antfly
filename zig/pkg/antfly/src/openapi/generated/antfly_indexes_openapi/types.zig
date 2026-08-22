@@ -1383,6 +1383,7 @@ pub const GraphMetricEvent = struct {
 
 pub const GraphMetricFilter = struct {
     metric: []const u8,
+    /// Semantic comparison operator. Named values keep generated SDK enums portable and readable.
     op: []const u8,
     value: f64,
 };
@@ -1569,11 +1570,11 @@ pub const GraphQuery = struct {
     include_edges: ?bool = null,
     /// Which fields to return from documents
     fields: ?[]const []const u8 = null,
-    /// Graph metric names to project onto result nodes
+    /// Graph metric names to project onto result nodes. At most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric.
     metrics: ?[]const []const u8 = null,
-    /// Sort graph result nodes by graph metric scores
+    /// Sort graph result nodes by up to 8 distinct graph metric scores. At most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric.
     order_by: ?[]const GraphMetricOrder = null,
-    /// Filter graph result nodes by graph metric scores
+    /// Filter graph result nodes with up to 32 predicates. Multiple predicates may target one metric, and at most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric.
     where_metric: ?[]const GraphMetricFilter = null,
     /// Freshness mode for projected, ordered, and filtered graph metrics
     metric_freshness: ?[]const u8 = null,

@@ -16680,12 +16680,12 @@ fn appendGraphQueryValue(
             var filter_first = true;
             try appendJsonFieldString(alloc, out, &filter_first, "metric", filter.name);
             try appendJsonFieldString(alloc, out, &filter_first, "op", switch (filter.op) {
-                .gt => ">",
-                .gte => ">=",
-                .lt => "<",
-                .lte => "<=",
-                .eq => "==",
-                .neq => "!=",
+                .gt => "gt",
+                .gte => "gte",
+                .lt => "lt",
+                .lte => "lte",
+                .eq => "eq",
+                .neq => "neq",
             });
             try appendJsonFieldF64(alloc, out, &filter_first, "value", filter.value);
             try out.append(alloc, '}');
@@ -27366,7 +27366,7 @@ test "encode query request includes graph metric read rerank and traversal statu
     const graph_search = parsed.value.object.get("graph_searches").?.object.get("related").?.object;
     try std.testing.expect(graph_search.get("include_metric_status").?.bool);
     try std.testing.expectEqualStrings("pagerank", graph_search.get("metrics").?.array.items[0].string);
-    try std.testing.expectEqualStrings(">=", graph_search.get("where_metric").?.array.items[0].object.get("op").?.string);
+    try std.testing.expectEqualStrings("gte", graph_search.get("where_metric").?.array.items[0].object.get("op").?.string);
 }
 
 test "remote query parser preserves graph metric fan-in provenance and durable status" {

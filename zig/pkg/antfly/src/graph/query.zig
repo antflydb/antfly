@@ -74,6 +74,13 @@ pub const QueryParams = struct {
 /// set. Bound that set explicitly so a broad traversal cannot turn a small
 /// requested page into unbounded memory and sort work.
 pub const graph_metric_candidate_limit: u32 = 100_000;
+/// Public and internal graph metric query bounds. These limits keep request
+/// parsing, metric materialization, and comparison work predictable even when
+/// an internal caller bypasses the OpenAPI layer.
+pub const graph_metric_projection_limit: usize = 16;
+pub const graph_metric_order_limit: usize = 8;
+pub const graph_metric_filter_limit: usize = 32;
+pub const graph_metric_dependency_limit: usize = 16;
 
 pub fn nodeFilterActive(filter: pattern_mod.NodeFilter) bool {
     return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
@@ -161,6 +168,53 @@ pub const GraphMetricFilter = struct {
     freshness: GraphMetricFreshness = .published,
 };
 
+/// Validate graph metric request cardinality and semantics without allocating.
+/// Repeated filter metrics are intentional (for example, `gte` plus `lt`), but
+/// repeated projections and sort keys are ambiguous and therefore rejected.
+pub fn validateGraphMetricQueryShape(query: GraphQuery) !void {
+    if (query.metrics.len > graph_metric_projection_limit or
+        query.order_by.len > graph_metric_order_limit or
+        query.where_metric.len > graph_metric_filter_limit)
+    {
+        return error.InvalidQueryRequest;
+    }
+
+    var dependency_names: [graph_metric_dependency_limit][]const u8 = undefined;
+    var dependency_count: usize = 0;
+
+    for (query.metrics, 0..) |metric, i| {
+        if (metric.name.len == 0) return error.InvalidQueryRequest;
+        for (query.metrics[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, metric.name)) return error.InvalidQueryRequest;
+        }
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, metric.name);
+    }
+    for (query.order_by, 0..) |order, i| {
+        if (order.name.len == 0) return error.InvalidQueryRequest;
+        for (query.order_by[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, order.name)) return error.InvalidQueryRequest;
+        }
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, order.name);
+    }
+    for (query.where_metric) |filter| {
+        if (filter.name.len == 0 or !std.math.isFinite(filter.value)) return error.InvalidQueryRequest;
+        try appendGraphMetricDependencyName(&dependency_names, &dependency_count, filter.name);
+    }
+}
+
+fn appendGraphMetricDependencyName(
+    names: *[graph_metric_dependency_limit][]const u8,
+    count: *usize,
+    name: []const u8,
+) !void {
+    for (names[0..count.*]) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    if (count.* == names.len) return error.InvalidQueryRequest;
+    names[count.*] = name;
+    count.* += 1;
+}
+
 // ============================================================================
 // Result types
 // ============================================================================
@@ -216,9 +270,19 @@ pub const GraphResultNode = struct {
 pub const GraphMetricValue = struct {
     name: []const u8,
     score: ?f64 = null,
+    /// Local execution interns metric names in `GraphQueryResult.metric_status`
+    /// so a 100k-node candidate set does not perform one string allocation per
+    /// node and metric. Cloned and decoded results retain owned names.
+    name_owned: bool = true,
+
+    pub fn ensureNameOwned(self: *GraphMetricValue, alloc: Allocator) !void {
+        if (self.name_owned) return;
+        self.name = try alloc.dupe(u8, self.name);
+        self.name_owned = true;
+    }
 
     pub fn deinit(self: *GraphMetricValue, alloc: Allocator) void {
-        alloc.free(self.name);
+        if (self.name_owned) alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -342,6 +406,7 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
+        try validateGraphMetricQueryShape(gq);
         const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
         var execution_params = gq.params;
         if (defer_result_limit) execution_params.max_results = graph_metric_candidate_limit + 1;
@@ -450,8 +515,12 @@ pub const GraphQueryEngine = struct {
 
     const MetricSortNode = struct {
         node: GraphResultNode,
-        scores: []?f64,
         original_index: usize,
+    };
+
+    const MetricSortContext = struct {
+        orders: []const GraphMetricOrder,
+        metric_indexes: []const usize,
     };
 
     fn orderByGraphMetric(
@@ -461,30 +530,37 @@ pub const GraphQueryEngine = struct {
     ) !void {
         if (orders.len == 0 or result.nodes.len == 0) return;
 
-        const score_values = try self.alloc.alloc(?f64, result.nodes.len * orders.len);
-        defer self.alloc.free(score_values);
+        var metric_index_buffer: [graph_metric_order_limit]usize = undefined;
+        const metric_indexes = metric_index_buffer[0..orders.len];
+        for (orders, 0..) |order, i| {
+            metric_indexes[i] = graphMetricValueIndexByName(result.nodes[0].metrics, order.name) orelse
+                return error.InvalidQueryRequest;
+        }
+
         var items = try self.alloc.alloc(MetricSortNode, result.nodes.len);
         defer self.alloc.free(items);
 
         for (result.nodes, 0..) |node, node_idx| {
-            const scores = score_values[node_idx * orders.len .. (node_idx + 1) * orders.len];
-            for (orders, 0..) |order, order_idx| {
-                scores[order_idx] = graphMetricValueByName(node.metrics, order.name);
-            }
             items[node_idx] = .{
                 .node = node,
-                .scores = scores,
                 .original_index = node_idx,
             };
         }
 
-        std.mem.sort(MetricSortNode, items, orders, metricSortNodeLessThan);
+        std.mem.sort(MetricSortNode, items, MetricSortContext{
+            .orders = orders,
+            .metric_indexes = metric_indexes,
+        }, metricSortNodeLessThan);
         for (items, 0..) |item, i| result.nodes[i] = item.node;
     }
 
-    fn metricSortNodeLessThan(orders: []const GraphMetricOrder, left: MetricSortNode, right: MetricSortNode) bool {
-        for (orders, 0..) |order, i| {
-            const cmp = compareOptionalMetricScore(left.scores[i], right.scores[i], order);
+    fn metricSortNodeLessThan(context: MetricSortContext, left: MetricSortNode, right: MetricSortNode) bool {
+        for (context.orders, context.metric_indexes) |order, metric_index| {
+            const cmp = compareOptionalMetricScore(
+                left.node.metrics[metric_index].score,
+                right.node.metrics[metric_index].score,
+                order,
+            );
             if (cmp) |less| return less;
         }
         return left.original_index < right.original_index;
@@ -528,6 +604,7 @@ pub const GraphQueryEngine = struct {
             dep.require_published = dep.require_published or require_published;
             return;
         }
+        if (deps.items.len == graph_metric_dependency_limit) return error.InvalidQueryRequest;
         try deps.append(alloc, .{
             .read = .{ .name = name, .freshness = freshness },
             .require_published = require_published,
@@ -586,10 +663,11 @@ pub const GraphQueryEngine = struct {
                 for (values[0..initialized_values]) |*value| value.deinit(self.alloc);
                 self.alloc.free(values);
             }
-            for (metric_dependencies, 0..) |metric, metric_idx| {
+            for (metric_dependencies, 0..) |_, metric_idx| {
                 values[metric_idx] = .{
-                    .name = try self.alloc.dupe(u8, metric.read.name),
+                    .name = statuses[metric_idx].name,
                     .score = score_columns[metric_idx][node_idx],
+                    .name_owned = false,
                 };
                 initialized_values += 1;
             }
@@ -608,6 +686,13 @@ pub const GraphQueryEngine = struct {
     fn graphMetricValueByName(values: []const GraphMetricValue, name: []const u8) ?f64 {
         for (values) |value| {
             if (std.mem.eql(u8, value.name, name)) return value.score;
+        }
+        return null;
+    }
+
+    fn graphMetricValueIndexByName(values: []const GraphMetricValue, name: []const u8) ?usize {
+        for (values, 0..) |value, i| {
+            if (std.mem.eql(u8, value.name, name)) return i;
         }
         return null;
     }
@@ -1972,6 +2057,96 @@ test "traverse: multi-start with depth 2" {
 
     // Should find B, C, D (from A) + Y, Z (from X) = 5 nodes
     try std.testing.expectEqual(@as(usize, 5), result.nodes.len);
+}
+
+test "graph metric query shape bounds clauses and unique dependencies" {
+    const names = [_][]const u8{
+        "m00", "m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08",
+        "m09", "m10", "m11", "m12", "m13", "m14", "m15", "m16",
+    };
+    var reads: [graph_metric_projection_limit + 1]GraphMetricRead = undefined;
+    for (&reads, names) |*read, name| read.* = .{ .name = name };
+
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &reads,
+    }));
+
+    var too_many_orders: [graph_metric_order_limit + 1]GraphMetricOrder = undefined;
+    for (&too_many_orders) |*order| order.* = .{ .name = "pagerank" };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .order_by = &too_many_orders,
+    }));
+
+    var too_many_filters: [graph_metric_filter_limit + 1]GraphMetricFilter = undefined;
+    for (&too_many_filters) |*filter| filter.* = .{ .name = "pagerank", .op = .gte, .value = 0.1 };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &too_many_filters,
+    }));
+
+    const extra_order = [_]GraphMetricOrder{.{ .name = names[graph_metric_dependency_limit] }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = reads[0..graph_metric_dependency_limit],
+        .order_by = &extra_order,
+    }));
+
+    const duplicate_reads = [_]GraphMetricRead{ .{ .name = "pagerank" }, .{ .name = "pagerank" } };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &duplicate_reads,
+    }));
+
+    const duplicate_orders = [_]GraphMetricOrder{ .{ .name = "pagerank" }, .{ .name = "pagerank", .direction = .asc } };
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .order_by = &duplicate_orders,
+    }));
+
+    const range_filters = [_]GraphMetricFilter{
+        .{ .name = "pagerank", .op = .gte, .value = 0.1 },
+        .{ .name = "pagerank", .op = .lt, .value = 0.9 },
+    };
+    try validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &range_filters,
+    });
+
+    const invalid_filters = [_]GraphMetricFilter{.{
+        .name = "pagerank",
+        .op = .gte,
+        .value = std.math.nan(f64),
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(.{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &invalid_filters,
+    }));
+}
+
+test "borrowed graph metric names do not allocate per node" {
+    var value = GraphMetricValue{ .name = "pagerank", .score = 0.5, .name_owned = false };
+    try value.ensureNameOwned(std.testing.allocator);
+    try std.testing.expect(value.name_owned);
+    try std.testing.expectEqualStrings("pagerank", value.name);
+    value.deinit(std.testing.allocator);
 }
 
 test "graph metric order and filter dependencies attach status without projection" {

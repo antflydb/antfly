@@ -12158,8 +12158,11 @@ export interface components {
         };
         GraphMetricFilter: {
             metric: string;
-            /** @enum {string} */
-            op: ">" | ">=" | "<" | "<=" | "=" | "==" | "!=";
+            /**
+             * @description Semantic comparison operator. Named values keep generated SDK enums portable and readable.
+             * @enum {string}
+             */
+            op: "gt" | "gte" | "lt" | "lte" | "eq" | "neq";
             /** Format: double */
             value: number;
         };
@@ -12184,11 +12187,11 @@ export interface components {
             include_edges?: boolean;
             /** @description Which fields to return from documents */
             fields?: string[];
-            /** @description Graph metric names to project onto result nodes */
+            /** @description Graph metric names to project onto result nodes. At most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric. */
             metrics?: string[];
-            /** @description Sort graph result nodes by graph metric scores */
+            /** @description Sort graph result nodes by up to 8 distinct graph metric scores. At most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric. */
             order_by?: components["schemas"]["GraphMetricOrder"][];
-            /** @description Filter graph result nodes by graph metric scores */
+            /** @description Filter graph result nodes with up to 32 predicates. Multiple predicates may target one metric, and at most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric. */
             where_metric?: components["schemas"]["GraphMetricFilter"][];
             /**
              * @description Freshness mode for projected, ordered, and filtered graph metrics

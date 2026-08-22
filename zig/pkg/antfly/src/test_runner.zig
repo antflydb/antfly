@@ -20,9 +20,14 @@ pub const std_options: std.Options = .{
     .logFn = log,
 };
 
-var log_err_count: usize = 0;
+var log_err_count: std.atomic.Value(usize) = .init(0);
 var test_filters: []const []const u8 = &.{};
 var skip_test_filters: []const []const u8 = &.{};
+
+const ExpectedErrorLogs = struct {
+    filter: []const u8,
+    count: usize,
+};
 
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
@@ -35,6 +40,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
     var include_filters: std.ArrayList([]const u8) = .empty;
     var exclude_filters: std.ArrayList([]const u8) = .empty;
+    var expected_error_logs: std.ArrayList(ExpectedErrorLogs) = .empty;
     var allow_empty_test_filter = false;
     var list_tests = false;
 
@@ -56,6 +62,16 @@ pub fn main(init: std.process.Init.Minimal) void {
             i += 1;
             if (i >= args.len) @panic("missing value for --skip-test-filter");
             appendFilter(arena, "--skip-test-filter", &exclude_filters, args[i]);
+        } else if (std.mem.eql(u8, arg, "--expect-error-logs")) {
+            if (i + 2 >= args.len) @panic("--expect-error-logs requires a test filter and exact count");
+            const filter = args[i + 1];
+            if (filter.len == 0) @panic("--expect-error-logs requires a non-empty test filter");
+            const count = std.fmt.parseUnsigned(usize, args[i + 2], 10) catch
+                @panic("--expect-error-logs requires a non-negative integer count");
+            if (count == 0) @panic("--expect-error-logs count must be greater than zero");
+            expected_error_logs.append(arena, .{ .filter = filter, .count = count }) catch
+                @panic("out of memory while appending expected error logs");
+            i += 2;
         } else if (std.mem.eql(u8, arg, "--allow-empty-test-filter")) {
             allow_empty_test_filter = true;
         } else if (std.mem.eql(u8, arg, "--list-tests")) {
@@ -105,6 +121,23 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
 
+    for (expected_error_logs.items) |expectation| {
+        var declared_matches: usize = 0;
+        for (builtin.test_functions) |test_fn| {
+            if (matchesSingleFilter(test_fn.name, expectation.filter)) declared_matches += 1;
+        }
+        // Compile-time test filters may legitimately omit the expected test
+        // from a focused developer run. Multiple matches are ambiguous and
+        // could hide unrelated error logs, so reject those configurations.
+        if (declared_matches > 1) {
+            std.debug.print(
+                "expected error-log filter matched multiple declared tests: {s} (matched {d})\n",
+                .{ expectation.filter, declared_matches },
+            );
+            std.process.exit(1);
+        }
+    }
+
     if (list_tests) {
         for (test_fns) |test_fn| {
             if (matchesFilter(test_fn.name)) {
@@ -116,6 +149,8 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     var current_count: usize = 0;
+    var error_log_expectation_failures: usize = 0;
+    var expected_error_log_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
         current_count += 1;
@@ -130,6 +165,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         });
         testing.environ = init.environ;
         testing.log_level = .warn;
+        const error_logs_before = log_err_count.load(.acquire);
 
         if (test_fn.func()) |_| {
             ok_count += 1;
@@ -157,6 +193,17 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (testing.allocator_instance.deinit() == .leak) {
             leak_count += 1;
         }
+        const emitted_error_logs = log_err_count.load(.acquire) -| error_logs_before;
+        if (expectedErrorLogsForTest(expected_error_logs.items, test_fn.name)) |expectation| {
+            expected_error_log_count += @min(emitted_error_logs, expectation.count);
+            if (emitted_error_logs != expectation.count) {
+                error_log_expectation_failures += 1;
+                std.debug.print(
+                    "expected exactly {d} error logs but observed {d}: {s}\n",
+                    .{ expectation.count, emitted_error_logs, test_fn.name },
+                );
+            }
+        }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
     }
 
@@ -165,12 +212,29 @@ pub fn main(init: std.process.Init.Minimal) void {
         .{ ok_count, skip_count, fail_count, leak_count },
     );
     const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
-    if (log_err_count != 0) {
-        std.debug.print("{d} errors were logged.\n", .{log_err_count});
+    const total_error_log_count = log_err_count.load(.acquire);
+    const unexpected_error_log_count = total_error_log_count -| expected_error_log_count;
+    if (total_error_log_count != 0) {
+        std.debug.print(
+            "{d} errors were logged ({d} expected, {d} unexpected).\n",
+            .{ total_error_log_count, expected_error_log_count, unexpected_error_log_count },
+        );
     }
-    if (fail_count != 0 or leak_count != 0 or (fail_on_error_logs and log_err_count != 0)) {
+    if (fail_count != 0 or leak_count != 0 or error_log_expectation_failures != 0 or
+        (fail_on_error_logs and unexpected_error_log_count != 0))
+    {
         std.process.exit(1);
     }
+}
+
+fn expectedErrorLogsForTest(expectations: []const ExpectedErrorLogs, test_name: []const u8) ?ExpectedErrorLogs {
+    var matched: ?ExpectedErrorLogs = null;
+    for (expectations) |expectation| {
+        if (!matchesSingleFilter(test_name, expectation.filter)) continue;
+        if (matched != null) @panic("multiple --expect-error-logs filters matched one test");
+        matched = expectation;
+    }
+    return matched;
 }
 
 fn matchesFilter(name: []const u8) bool {
@@ -244,7 +308,7 @@ pub fn log(
 ) void {
     @disableInstrumentation();
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
-        log_err_count +|= 1;
+        _ = log_err_count.fetchAdd(1, .monotonic);
     }
     std.debug.print("[{s}] ({s}): ", .{
         @tagName(message_level),

@@ -1239,6 +1239,12 @@ pub fn executeSingleNonPatternQueryWithSets(
 
     const name = try alloc.dupe(u8, named.name);
     errdefer alloc.free(name);
+    // Graph execution interns candidate metric names in its status list. The
+    // nodes escape that result below, so materialize names only for the final,
+    // output-bounded projection instead of allocating names for every candidate.
+    for (graph_result.nodes) |*node| {
+        for (node.metrics) |*metric| try metric.ensureNameOwned(alloc);
+    }
     const metric_status = if (named.query.include_metric_status)
         try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
     else

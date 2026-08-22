@@ -16,7 +16,8 @@ class GraphMetricFilter:
     """
     Attributes:
         metric (str):
-        op (GraphMetricFilterOp):
+        op (GraphMetricFilterOp): Semantic comparison operator. Named values keep generated SDK enums portable and
+            readable.
         value (float):
     """
 

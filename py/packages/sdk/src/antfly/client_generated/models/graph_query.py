@@ -36,9 +36,13 @@ class GraphQuery:
         include_documents (bool | Unset): Fetch full documents for graph results
         include_edges (bool | Unset): Include edge details for each node
         fields (list[str] | Unset): Which fields to return from documents
-        metrics (list[str] | Unset): Graph metric names to project onto result nodes
-        order_by (list[GraphMetricOrder] | Unset): Sort graph result nodes by graph metric scores
-        where_metric (list[GraphMetricFilter] | Unset): Filter graph result nodes by graph metric scores
+        metrics (list[str] | Unset): Graph metric names to project onto result nodes. At most 16 distinct metric
+            dependencies may be used across metrics, order_by, and where_metric.
+        order_by (list[GraphMetricOrder] | Unset): Sort graph result nodes by up to 8 distinct graph metric scores. At
+            most 16 distinct metric dependencies may be used across metrics, order_by, and where_metric.
+        where_metric (list[GraphMetricFilter] | Unset): Filter graph result nodes with up to 32 predicates. Multiple
+            predicates may target one metric, and at most 16 distinct metric dependencies may be used across metrics,
+            order_by, and where_metric.
         metric_freshness (GraphQueryMetricFreshness | Unset): Freshness mode for projected, ordered, and filtered graph
             metrics
         include_metric_status (bool | Unset): Include graph metric status metadata in the graph result

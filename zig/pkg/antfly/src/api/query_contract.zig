@@ -8570,7 +8570,7 @@ fn parseGraphQuery(
     else
         1;
 
-    return .{
+    const parsed_query: graph_query_mod.GraphQuery = .{
         .query_type = switch (query.type) {
             .traverse => .traverse,
             .neighbors => .neighbors,
@@ -8596,6 +8596,8 @@ fn parseGraphQuery(
         .where_metric = where_metric,
         .include_metric_status = query.include_metric_status orelse false,
     };
+    try graph_query_mod.validateGraphMetricQueryShape(parsed_query);
+    return parsed_query;
 }
 
 fn parseGraphMetricQueriesAlloc(
@@ -8698,6 +8700,7 @@ fn parseGraphMetricFreshnessString(value: []const u8) !graph_query_mod.GraphMetr
 }
 
 fn parseGraphMetricReads(alloc: std.mem.Allocator, values: []const []const u8, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricRead {
+    if (values.len > graph_query_mod.graph_metric_projection_limit) return error.InvalidQueryRequest;
     const out = try alloc.alloc(graph_query_mod.GraphMetricRead, values.len);
     var initialized: usize = 0;
     errdefer {
@@ -8713,6 +8716,7 @@ fn parseGraphMetricReads(alloc: std.mem.Allocator, values: []const []const u8, f
 }
 
 fn parseGraphMetricOrders(alloc: std.mem.Allocator, values: []const indexes_openapi.GraphMetricOrder, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricOrder {
+    if (values.len > graph_query_mod.graph_metric_order_limit) return error.InvalidQueryRequest;
     const out = try alloc.alloc(graph_query_mod.GraphMetricOrder, values.len);
     var initialized: usize = 0;
     errdefer {
@@ -8733,6 +8737,7 @@ fn parseGraphMetricOrders(alloc: std.mem.Allocator, values: []const indexes_open
 }
 
 fn parseGraphMetricFilters(alloc: std.mem.Allocator, values: []const indexes_openapi.GraphMetricFilter, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricFilter {
+    if (values.len > graph_query_mod.graph_metric_filter_limit) return error.InvalidQueryRequest;
     const out = try alloc.alloc(graph_query_mod.GraphMetricFilter, values.len);
     var initialized: usize = 0;
     errdefer {
@@ -8741,7 +8746,7 @@ fn parseGraphMetricFilters(alloc: std.mem.Allocator, values: []const indexes_ope
     }
     for (values, 0..) |value, i| {
         if (value.metric.len == 0 or !std.math.isFinite(value.value)) return error.InvalidQueryRequest;
-        const op: graph_query_mod.GraphMetricFilterOp = if (std.mem.eql(u8, value.op, ">")) .gt else if (std.mem.eql(u8, value.op, ">=")) .gte else if (std.mem.eql(u8, value.op, "<")) .lt else if (std.mem.eql(u8, value.op, "<=")) .lte else if (std.mem.eql(u8, value.op, "=") or std.mem.eql(u8, value.op, "==")) .eq else if (std.mem.eql(u8, value.op, "!=")) .neq else return error.InvalidQueryRequest;
+        const op = std.meta.stringToEnum(graph_query_mod.GraphMetricFilterOp, value.op) orelse return error.InvalidQueryRequest;
         out[i] = .{ .name = try alloc.dupe(u8, value.metric), .op = op, .value = value.value, .freshness = freshness };
         initialized += 1;
     }
@@ -14294,6 +14299,62 @@ test "api query contract bounds graph metric top k" {
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
         \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
     ));
+}
+
+test "api query contract uses portable graph metric filter operators" {
+    const cases = [_]struct { wire: []const u8, expected: graph_query_mod.GraphMetricFilterOp }{
+        .{ .wire = "gt", .expected = .gt },
+        .{ .wire = "gte", .expected = .gte },
+        .{ .wire = "lt", .expected = .lt },
+        .{ .wire = "lte", .expected = .lte },
+        .{ .wire = "eq", .expected = .eq },
+        .{ .wire = "neq", .expected = .neq },
+    };
+    for (cases) |case| {
+        const filters = [_]indexes_openapi.GraphMetricFilter{.{
+            .metric = "pagerank",
+            .op = case.wire,
+            .value = 0.5,
+        }};
+        const parsed = try parseGraphQuery(std.testing.allocator, .{
+            .type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .where_metric = &filters,
+        });
+        defer freeGraphQuery(std.testing.allocator, parsed);
+        try std.testing.expectEqual(case.expected, parsed.where_metric[0].op);
+    }
+
+    const legacy = [_]indexes_openapi.GraphMetricFilter{.{
+        .metric = "pagerank",
+        .op = ">=",
+        .value = 0.5,
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphQuery(std.testing.allocator, .{
+        .type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &legacy,
+    }));
+}
+
+test "api query contract rejects oversized and duplicate graph metric clauses" {
+    var metric_names: [graph_query_mod.graph_metric_projection_limit + 1][]const u8 = undefined;
+    @memset(&metric_names, "pagerank");
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(
+        std.testing.allocator,
+        &metric_names,
+        .published,
+    ));
+
+    const duplicate_metrics = [_][]const u8{ "pagerank", "pagerank" };
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphQuery(std.testing.allocator, .{
+        .type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &duplicate_metrics,
+    }));
 }
 
 test "api query contract preserves graph metric fingerprint precision" {

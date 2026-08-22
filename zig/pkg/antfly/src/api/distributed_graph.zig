@@ -1673,6 +1673,7 @@ fn executeDistributedTraverse(
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
 ) !db_mod.types.GraphSearchResult {
+    try graph_query_mod.validateGraphMetricQueryShape(graph_query.query);
     const include_paths = graph_query.query.params.include_paths;
     const max_depth: u32 = switch (graph_query.query.query_type) {
         .neighbors => 1,
@@ -6939,30 +6940,45 @@ const DistributedGraphMetricSortNode = struct {
     original_index: usize,
 };
 
+const DistributedGraphMetricSortContext = struct {
+    orders: []const graph_query_mod.GraphMetricOrder,
+    scores: []const ?f64,
+};
+
 fn orderDistributedGraphNodesByMetric(
     alloc: std.mem.Allocator,
     nodes: []graph_query_mod.GraphResultNode,
     orders: []const graph_query_mod.GraphMetricOrder,
 ) !void {
     if (orders.len == 0 or nodes.len == 0) return;
+    const score_count = std.math.mul(usize, nodes.len, orders.len) catch return error.QueryCandidateBudgetExceeded;
+    const scores = try alloc.alloc(?f64, score_count);
+    defer alloc.free(scores);
     const sortable = try alloc.alloc(DistributedGraphMetricSortNode, nodes.len);
     defer alloc.free(sortable);
     for (nodes, 0..) |node, i| {
+        const node_scores = scores[i * orders.len ..][0..orders.len];
+        for (orders, 0..) |order, order_index| {
+            node_scores[order_index] = graphNodeMetricScore(node, order.name);
+        }
         sortable[i] = .{ .node = node, .original_index = i };
     }
-    std.mem.sort(DistributedGraphMetricSortNode, sortable, orders, distributedGraphMetricSortLessThan);
+    std.mem.sort(DistributedGraphMetricSortNode, sortable, DistributedGraphMetricSortContext{
+        .orders = orders,
+        .scores = scores,
+    }, distributedGraphMetricSortLessThan);
     for (sortable, 0..) |item, i| nodes[i] = item.node;
 }
 
 fn distributedGraphMetricSortLessThan(
-    orders: []const graph_query_mod.GraphMetricOrder,
+    context: DistributedGraphMetricSortContext,
     left: DistributedGraphMetricSortNode,
     right: DistributedGraphMetricSortNode,
 ) bool {
-    for (orders) |order| {
+    for (context.orders, 0..) |order, order_index| {
         const cmp = compareOptionalGraphMetricScore(
-            graphNodeMetricScore(left.node, order.name),
-            graphNodeMetricScore(right.node, order.name),
+            context.scores[left.original_index * context.orders.len + order_index],
+            context.scores[right.original_index * context.orders.len + order_index],
             order,
         );
         if (cmp) |less| return less;

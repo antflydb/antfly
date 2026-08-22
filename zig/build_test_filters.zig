@@ -18,11 +18,19 @@ fn validateSkipTestFilter(value: []const u8) error{EmptySkipTestFilter}!void {
     if (value.len == 0) return error.EmptySkipTestFilter;
 }
 
+fn validateExpectedErrorLogs(filter: []const u8, count_value: []const u8) error{ InvalidExpectedErrorLogFilter, InvalidExpectedErrorLogCount }!void {
+    if (filter.len == 0) return error.InvalidExpectedErrorLogFilter;
+    const count = std.fmt.parseUnsigned(usize, count_value, 10) catch
+        return error.InvalidExpectedErrorLogCount;
+    if (count == 0) return error.InvalidExpectedErrorLogCount;
+}
+
 fn isTestControl(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--test-filter") or
         std.mem.startsWith(u8, arg, "--test-filter=") or
         std.mem.eql(u8, arg, "--skip-test-filter") or
         std.mem.startsWith(u8, arg, "--skip-test-filter=") or
+        std.mem.eql(u8, arg, "--expect-error-logs") or
         std.mem.startsWith(u8, arg, "--seed=") or
         std.mem.startsWith(u8, arg, "--cache-dir=") or
         std.mem.eql(u8, arg, "--listen=-");
@@ -72,6 +80,11 @@ pub fn select(
         } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
             validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
                 @panic("missing value after --skip-test-filter=");
+        } else if (std.mem.eql(u8, arg, "--expect-error-logs")) {
+            if (i + 2 >= args.len) @panic("--expect-error-logs requires a test filter and exact count");
+            validateExpectedErrorLogs(args[i + 1], args[i + 2]) catch
+                @panic("invalid --expect-error-logs test filter or count");
+            i += 2;
         } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
@@ -123,6 +136,12 @@ pub fn addRuntimeControls(
             validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
                 @panic("missing value after --skip-test-filter=");
             run.addArg(arg);
+        } else if (std.mem.eql(u8, arg, "--expect-error-logs")) {
+            if (i + 2 >= args.len) @panic("--expect-error-logs requires a test filter and exact count");
+            validateExpectedErrorLogs(args[i + 1], args[i + 2]) catch
+                @panic("invalid --expect-error-logs test filter or count");
+            run.addArgs(args[i .. i + 3]);
+            i += 2;
         } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
@@ -140,6 +159,9 @@ test "select accepts repeated and equals-form test filters" {
         "--test-filter=table manager",
         "--skip-test-filter",
         "metadata sim",
+        "--expect-error-logs",
+        "expected failure path",
+        "2",
         "--seed=0x1234",
     };
     const filters = select(std.testing.allocator, &args, &.{"default"});
@@ -205,6 +227,9 @@ test "foreign option detection is generic and preserves test-only arguments" {
         "--test-filter=metadata",
         "--skip-test-filter",
         "slow",
+        "--expect-error-logs",
+        "expected failure path",
+        "2",
         "--seed=1234",
         "--cache-dir=/tmp/cache",
         "--listen=-",
@@ -214,4 +239,20 @@ test "foreign option detection is generic and preserves test-only arguments" {
 test "empty skip filters are rejected before compiling a zero-test selection" {
     try std.testing.expectError(error.EmptySkipTestFilter, validateSkipTestFilter(""));
     try validateSkipTestFilter("known flaky test");
+}
+
+test "expected error log controls require a named test and positive exact count" {
+    try validateExpectedErrorLogs("expected failure path", "2");
+    try std.testing.expectError(
+        error.InvalidExpectedErrorLogFilter,
+        validateExpectedErrorLogs("", "2"),
+    );
+    try std.testing.expectError(
+        error.InvalidExpectedErrorLogCount,
+        validateExpectedErrorLogs("expected failure path", "0"),
+    );
+    try std.testing.expectError(
+        error.InvalidExpectedErrorLogCount,
+        validateExpectedErrorLogs("expected failure path", "many"),
+    );
 }

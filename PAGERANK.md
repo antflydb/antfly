@@ -686,7 +686,7 @@ Filtering by metric should come after ordering support:
 ```json
 {
   "where_metric": [
-    { "metric": "pagerank", "op": ">=", "value": 0.01 }
+    { "metric": "pagerank", "op": "gte", "value": 0.01 }
   ]
 }
 ```
