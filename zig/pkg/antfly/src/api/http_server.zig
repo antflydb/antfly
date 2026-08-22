@@ -25334,7 +25334,7 @@ test "api http server query builder handles tree graph indexes" {
     const graph_query = graph_inferred.value.query_request.?.graph_queries.?.map.get("graph_search").?;
     const traversal = graph_query.graph_traverse_query;
     try std.testing.expectEqualStrings("doc_hierarchy", traversal.index);
-    try std.testing.expectEqualStrings("$full_text_results", traversal.traverse.start.result_ref.?.ref);
+    try std.testing.expectEqualStrings("$full_text_results", traversal.traverse.start.result_ref.?);
 
     var question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -25383,7 +25383,7 @@ test "api http server query builder handles tree graph indexes" {
     defer graph_answer.deinit();
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, graph_answer.value.status.?);
     const graph_answer_query = graph_answer.value.query_request.?.graph_queries.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("topic_graph", graph_answer_query.index_name);
+    try std.testing.expectEqualStrings("topic_graph", graph_answer_query.graph_traverse_query.index);
 }
 
 test "api http server query builder replays clarification decisions" {
