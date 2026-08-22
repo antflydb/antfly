@@ -14441,14 +14441,26 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-local-node-id '1'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-replica-id '1'`))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-		Name: "ha-seed-generation", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/data",
+		Name: "standalone-storage", MountPath: "/antflydb/data", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/data",
 	}))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-		Name: "ha-seed-generation", MountPath: "/antflydb/metadata", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/metadata",
+		Name: "standalone-storage", MountPath: "/antflydb/metadata", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/metadata",
 	}))
 	g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-		Name: "ha-seed-generation", MountPath: "/antflydb/extensions", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/extensions",
+		Name: "standalone-storage", MountPath: "/antflydb/extensions", SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/extensions",
 	}))
+	var pvcVolumes []corev1.Volume
+	for _, volume := range sts.Spec.Template.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			pvcVolumes = append(pvcVolumes, volume)
+		}
+	}
+	g.Expect(pvcVolumes).To(Equal([]corev1.Volume{{
+		Name: "standalone-storage",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}}), "one PVC must have one Pod volume identity; duplicate names for the same claim can deadlock kubelet volume setup")
 
 	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())

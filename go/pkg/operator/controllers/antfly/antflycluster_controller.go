@@ -143,7 +143,6 @@ const (
 	haSeedTargetPVCNameAnnotation           = "antfly.io/ha-seed-target-pvc-name"
 	haSeedTargetPVCUIDAnnotation            = "antfly.io/ha-seed-target-pvc-uid"
 	haSeedCheckpointLSNAnnotation           = "antfly.io/ha-seed-checkpoint-lsn"
-	haSeedGenerationVolumeName              = "ha-seed-generation"
 	haSeedLiveDataPath                      = "/antflydb/data"
 	haSeedLiveMetadataPath                  = "/antflydb/metadata"
 	haSeedLiveExtensionsPath                = "/antflydb/extensions"
@@ -3963,20 +3962,19 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			required := *startupGate.RequiredReceipt
 			volumes = append(volumes,
 				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
-				corev1.Volume{Name: haSeedGenerationVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
 			)
 			generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation)
 			volumeMounts = append(volumeMounts,
 				corev1.VolumeMount{
-					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveDataPath,
+					Name: storageVolumeName, MountPath: haSeedLiveDataPath,
 					SubPath: path.Join(generationRoot, "data"),
 				},
 				corev1.VolumeMount{
-					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveMetadataPath,
+					Name: storageVolumeName, MountPath: haSeedLiveMetadataPath,
 					SubPath: path.Join(generationRoot, "metadata"),
 				},
 				corev1.VolumeMount{
-					Name: haSeedGenerationVolumeName, MountPath: haSeedLiveExtensionsPath,
+					Name: storageVolumeName, MountPath: haSeedLiveExtensionsPath,
 					SubPath: path.Join(generationRoot, "extensions"),
 				},
 			)
