@@ -264,6 +264,68 @@ pub const Mutating = struct {
     }
 };
 
+/// Replays an exact prefix, removes a contiguous range of recorded logical
+/// decisions, then attempts to rebase the recorded suffix onto the resulting
+/// state. A suffix decision is reused only when its choice site and stable
+/// transition ID are valid; otherwise the remainder is generated from the
+/// deterministic suffix seed. Every candidate still executes from a clean
+/// world, so deletion never edits an artifact in place.
+pub const Deleting = struct {
+    base: []const trace.ChoiceRecord,
+    start: usize,
+    end: usize,
+    seeded: Seeded,
+    cursor: usize = 0,
+    suffix_only: bool = false,
+    deletion_reached: bool = false,
+
+    pub fn init(base: []const trace.ChoiceRecord, start: usize, end: usize, suffix_seed: u64) !Deleting {
+        if (start >= end or end > base.len) return error.InvalidChoiceDeletionRange;
+        return .{
+            .base = base,
+            .start = start,
+            .end = end,
+            .seeded = Seeded.init(suffix_seed),
+        };
+    }
+
+    pub fn source(self: *Deleting) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *Deleting = @ptrCast(@alignCast(ptr));
+        const index = self.cursor;
+        self.cursor += 1;
+        if (index < self.start) {
+            if (index >= self.base.len) return error.DeletionPrefixExhausted;
+            const record = self.base[index];
+            try verifyRecord(record, request);
+            return record.selected_id;
+        }
+        self.deletion_reached = true;
+        if (!self.suffix_only) {
+            const rebased_index = index + (self.end - self.start);
+            if (rebased_index < self.base.len) {
+                const record = self.base[rebased_index];
+                if (record.site_id == request.site_id and std.mem.eql(u8, record.site_name, request.site_name)) {
+                    for (request.enabled) |enabled| {
+                        if (enabled.id == record.selected_id) return record.selected_id;
+                    }
+                }
+            }
+            self.suffix_only = true;
+        }
+        return try self.seeded.source().choose(request);
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *Deleting = @ptrCast(@alignCast(ptr));
+        if (!self.deletion_reached) return error.DeletionPointNotReached;
+        try self.seeded.source().finish();
+    }
+};
+
 fn verifySite(record: trace.ChoiceRecord, request: Request) !void {
     if (record.site_id != request.site_id or !std.mem.eql(u8, record.site_name, request.site_name) or record.occurrence != request.occurrence) return error.ReplayChoiceSiteDiverged;
 }
@@ -299,6 +361,22 @@ test "mutating choice source replays a prefix and branches" {
     const source = mutating.source();
     try std.testing.expectEqual(@as(u64, 1), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
     try std.testing.expectEqual(@as(u64, 2), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 1, .enabled = &enabled }));
+    try source.finish();
+}
+
+test "deleting choice source removes a range and rebases a valid suffix" {
+    const records = [_]trace.ChoiceRecord{
+        .{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled_ids = &.{ 1, 2 }, .selected_id = 1 },
+        .{ .site_id = 7, .site_name = "site", .occurrence = 1, .enabled_ids = &.{ 1, 2 }, .selected_id = 1 },
+        .{ .site_id = 7, .site_name = "site", .occurrence = 2, .enabled_ids = &.{ 1, 2 }, .selected_id = 2 },
+    };
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "loop", .kind = .workload },
+        .{ .id = 2, .name = "finish", .kind = .workload },
+    };
+    var deleting = try Deleting.init(&records, 0, 2, 99);
+    const source = deleting.source();
+    try std.testing.expectEqual(@as(u64, 2), try source.choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
     try source.finish();
 }
 

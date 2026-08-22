@@ -20,6 +20,8 @@ pub const Report = struct {
     target_fingerprint: u64,
     attempts: u64 = 0,
     accepted: u64 = 0,
+    deletion_attempts: u64 = 0,
+    deletions_accepted: u64 = 0,
     replay_checks: u64 = 0,
 };
 
@@ -58,6 +60,39 @@ pub fn reduce(
     var changed = true;
     while (changed and report.attempts < config.max_attempts) {
         changed = false;
+
+        // Delta-debug contiguous logical decision ranges before local choice
+        // substitution. Start with coarse chunks, then halve down to a single
+        // decision. The source rebases compatible suffix choices and generates
+        // deterministically from the first incompatibility.
+        var chunk = @max(@as(usize, 1), current.choices.items.len / 2);
+        while (chunk > 0 and !changed and report.attempts < config.max_attempts) : (chunk /= 2) {
+            var start: usize = 0;
+            while (start < current.choices.items.len and report.attempts < config.max_attempts) : (start += chunk) {
+                const end = @min(current.choices.items.len, start + chunk);
+                report.attempts += 1;
+                report.deletion_attempts += 1;
+                var source = try choice.Deleting.init(current.choices.items, start, end, config.suffix_seed +% report.attempts);
+                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current)) catch continue;
+                defer candidate.deinit();
+                if (!hasFingerprint(&candidate, target_fingerprint)) continue;
+                if (!try strictlySimpler(allocator, &candidate, &current)) continue;
+
+                var exact = replay.exact(Scenario, allocator, &candidate) catch continue;
+                exact.deinit();
+                report.replay_checks += 1;
+                const replacement = try cloneTrace(allocator, &candidate);
+                current.deinit();
+                current = replacement;
+                report.accepted += 1;
+                report.deletions_accepted += 1;
+                report.reduced_transitions = current.summary.?.transitions;
+                changed = true;
+                break;
+            }
+        }
+        if (changed) continue;
+
         var choice_index = current.choices.items.len;
         while (choice_index > 0 and report.attempts < config.max_attempts) {
             choice_index -= 1;
@@ -173,5 +208,7 @@ test "reducer shortens a history while preserving its failure fingerprint" {
     try std.testing.expectEqual(@as(u64, 3), result.report.original_transitions);
     try std.testing.expectEqual(@as(u64, 1), result.report.reduced_transitions);
     try std.testing.expect(result.report.accepted > 0);
+    try std.testing.expect(result.report.deletion_attempts > 0);
+    try std.testing.expect(result.report.deletions_accepted > 0);
     try std.testing.expect(hasFingerprint(&result.artifact, fingerprint));
 }

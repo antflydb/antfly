@@ -1793,11 +1793,16 @@ rarity/productivity energy. `explorer.zig` runs deterministic history-count
 campaigns, reserves configurable uniform exploration, mutates structured
 choices, and retains novel or failing histories.
 
-`reducer.zig` verifies the original exact replay, explores structured choice
-replacements from a clean world, accepts only strictly simpler artifacts with
-the same failure fingerprint, and exact-replays every accepted result. Its
-meta-test injects a named property bug and reduces a three-transition history
-to one transition.
+`reducer.zig` verifies the original exact replay, first delta-debugs contiguous
+logical decision ranges, then explores individual structured choice
+replacements. Range deletion exact-replays the retained prefix, rebases later
+stable transition IDs only while they remain enabled at the same choice site,
+and switches to a deterministic generated suffix at the first incompatibility.
+Every candidate starts from a clean world; only a strictly simpler artifact
+with the same failure fingerprint is accepted and exact-replayed. The report
+separately counts deletion attempts and accepted deletions. Its meta-test
+injects a named property bug and reduces a three-transition history to one
+transition through this path.
 
 The Antfly CLI now exposes distinct `sim-campaign`, `sim-reduce`, and
 `sim-promote` workflows in addition to run and replay. Campaign workers execute
@@ -1826,8 +1831,9 @@ deduplicated entries into the energy-weighted corpus. Workers select those
 entries as structured mutation parents; newly retained histories are merged
 back into the in-memory queue and written atomically as independent files. The
 meta-test also reopens its promoted fixture as a fresh persistent corpus,
-selects it for mutation, and exact-replays the result. Richer command-aware
-deletion operators remain a useful follow-on reduction improvement.
+selects it for mutation, and exact-replays the result. Scenario-specific
+configuration shrinkers remain additive hooks after the generic decision-range
+and choice simplifiers, as demonstrated by metadata operation-count reduction.
 
 The standalone choice engine also implements weighted seeded selection while
 preserving the legacy all-uniform PRNG stream, plus a bounded depth-first
