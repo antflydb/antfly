@@ -1282,6 +1282,14 @@ pub const SearchRequest = struct {
     exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
+    /// Trusted request-local row authorization predicate. Public request
+    /// parsing never populates this field. The HTTP authorization boundary
+    /// records it separately from retrieval filters so canonical graph MATCH
+    /// can enumerate the complete authorized source relation without
+    /// inheriting unrelated retrieval shaping. It is never serialized to a
+    /// shard; ordinary retrieval still receives the conjoined predicate in
+    /// `filter_query_json`.
+    authorization_filter_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
     doc_filter_bindings: []const NamedDocFilterBinding = &.{},
     dense: ?DenseKnnQuery = null,
@@ -1375,6 +1383,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
+    "authorization_filter_query_json",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -2033,14 +2042,19 @@ pub const GraphAggregateResult = struct {
     /// Exact shard-merge payload for count(distinct alias). This is internal
     /// execution data and is never exposed by the public response contract.
     distinct_values: []graph_node_identity.Ref = &.{},
+    /// Duplicate named aggregates may share one immutable merge payload inside
+    /// a result. Exactly one aggregate owns that allocation.
+    distinct_values_owned: bool = true,
 
     pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
         alloc.free(self.name);
-        for (self.distinct_values) |value| {
-            if (value.table) |table| alloc.free(table);
-            alloc.free(value.key);
+        if (self.distinct_values_owned) {
+            for (self.distinct_values) |value| {
+                if (value.table) |table| alloc.free(table);
+                alloc.free(value.key);
+            }
+            if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
         }
-        if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
         self.* = undefined;
     }
 };

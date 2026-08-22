@@ -9461,6 +9461,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     if (req.exclusion_text) |exclusion_text| freeTextQuery(alloc, exclusion_text);
     if (req.filter_query_json.len > 0) alloc.free(req.filter_query_json);
     if (req.exclusion_query_json.len > 0) alloc.free(req.exclusion_query_json);
+    if (req.authorization_filter_query_json.len > 0) alloc.free(req.authorization_filter_query_json);
     for (req.order_by) |field| alloc.free(field.field);
     if (req.order_by.len > 0) alloc.free(req.order_by);
     freeClonedJsonValues(alloc, req.search_after);

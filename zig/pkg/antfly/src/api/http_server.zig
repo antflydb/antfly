@@ -16893,6 +16893,12 @@ pub fn injectRowFilterIntoSearchRequest(
     req: *db_mod.types.SearchRequest,
     row_filter_json: []const u8,
 ) !void {
+    if (req.authorization_filter_query_json.len != 0) return error.InvalidQueryRequest;
+    req.authorization_filter_query_json = try alloc.dupe(u8, row_filter_json);
+    errdefer {
+        alloc.free(req.authorization_filter_query_json);
+        req.authorization_filter_query_json = "";
+    }
     if (req.filter_query_json.len == 0) {
         req.filter_query_json = try alloc.dupe(u8, row_filter_json);
         return;
@@ -16911,7 +16917,10 @@ test "retrieval agent authenticated row filter conjoins generated filter" {
     var req = db_mod.types.SearchRequest{
         .filter_query_json = try alloc.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
     };
-    defer alloc.free(req.filter_query_json);
+    defer {
+        alloc.free(req.filter_query_json);
+        alloc.free(req.authorization_filter_query_json);
+    }
 
     try injectRowFilterIntoSearchRequest(
         alloc,
@@ -16922,6 +16931,10 @@ test "retrieval agent authenticated row filter conjoins generated filter" {
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"conjuncts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"status\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"tenant\":\"visible\"") != null);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"tenant\":\"visible\"}}",
+        req.authorization_filter_query_json,
+    );
 }
 
 test "retrieval root scan pushes row inclusion and exclusion predicates into one filter" {

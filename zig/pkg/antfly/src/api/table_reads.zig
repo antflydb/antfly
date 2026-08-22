@@ -5069,7 +5069,8 @@ const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" 
 
 /// Canonical MATCH is a graph relation over the authorized source-table
 /// universe, not over the public retrieval page. Build one stable identity-only
-/// cursor page while retaining every request-scoped admission predicate.
+/// cursor page. The caller adds only the trusted authorization predicate and
+/// the selected MATCH anchor's explicit filter.
 fn completeGraphMatchAnchorRequest(
     req: db_mod.types.SearchRequest,
     search_after: []const std.json.Value,
@@ -5077,29 +5078,14 @@ fn completeGraphMatchAnchorRequest(
     return .{
         .index_name = req.index_name,
         .primary_text_index_name = req.primary_text_index_name,
-        .filter_text = req.filter_text,
-        .exclusion_text = req.exclusion_text,
-        .filter_query_json = req.filter_query_json,
-        .exclusion_query_json = req.exclusion_query_json,
-        .doc_filter_bindings = req.doc_filter_bindings,
         .include_all_fields = false,
         .include_stored = false,
         .order_by = &complete_match_anchor_order,
         .search_after = search_after,
         .limit = distributed_graph.complete_match_anchor_page_size,
-        .filter_prefix = req.filter_prefix,
-        .filter_ids = req.filter_ids,
-        .exclude_ids = req.exclude_ids,
-        .filter_doc_ids = req.filter_doc_ids,
-        .filter_doc_ids_positive = req.filter_doc_ids_positive,
-        .exclude_doc_ids = req.exclude_doc_ids,
-        .resolved_doc_filter = req.resolved_doc_filter,
-        .resolved_text_doc_filter = req.resolved_text_doc_filter,
-        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .graph_table_read_authorizer = req.graph_table_read_authorizer,
         .execution_deadline_ns = req.execution_deadline_ns,
         .cancellation = req.cancellation,
-        .require_algebraic_filter_resolution = req.require_algebraic_filter_resolution,
     };
 }
 
@@ -5114,16 +5100,17 @@ fn completeGraphMatchAnchorFilterAlloc(
     const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
     const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
     const filter = anchor.filter.filter_query_json;
-    if (filter == null and req.filter_query_json.len == 0) return null;
-    if (filter == null) return try alloc.dupe(u8, req.filter_query_json);
-    if (req.filter_query_json.len == 0) return try alloc.dupe(u8, filter.?);
+    const authorization = req.authorization_filter_query_json;
+    if (filter == null and authorization.len == 0) return null;
+    if (filter == null) return try alloc.dupe(u8, authorization);
+    if (authorization.len == 0) return try alloc.dupe(u8, filter.?);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
     try out.appendSlice(alloc, filter.?);
     try out.append(alloc, ',');
-    try out.appendSlice(alloc, req.filter_query_json);
+    try out.appendSlice(alloc, authorization);
     try out.appendSlice(alloc, "]}}");
     return try out.toOwnedSlice(alloc);
 }
@@ -5144,6 +5131,9 @@ const ProvisionedMatchAnchorPager = struct {
     ) !db_mod.types.SearchResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+        anchor_req.filter_prefix = anchor.filter.filter_prefix;
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
         if (anchor_filter) |value| anchor_req.filter_query_json = value;
@@ -5175,6 +5165,9 @@ const HostedMatchAnchorPager = struct {
     ) !db_mod.types.SearchResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+        anchor_req.filter_prefix = anchor.filter.filter_prefix;
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
         if (anchor_filter) |value| anchor_req.filter_query_json = value;
@@ -5190,7 +5183,7 @@ const HostedMatchAnchorPager = struct {
     }
 };
 
-test "complete graph match anchors retain admission and discard retrieval shaping" {
+test "complete graph match anchors discard retrieval shaping" {
     const filter_ids = [_]u64{ 3, 7 };
     const excluded_ids = [_]u64{11};
     const filter_doc_ids = [_][]const u8{"visible"};
@@ -5209,6 +5202,7 @@ test "complete graph match anchors retain admission and discard retrieval shapin
         .exclusion_text = .match_none,
         .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
         .exclusion_query_json = "{\"term\":{\"deleted\":true}}",
+        .authorization_filter_query_json = "{\"term\":{\"tenant\":\"authorized\"}}",
         .order_by = &order_by,
         .search_after = &cursor,
         .include_all_fields = true,
@@ -5239,18 +5233,20 @@ test "complete graph match anchors retain admission and discard retrieval shapin
     try std.testing.expect(!anchors.count_only);
     try std.testing.expect(!anchors.profile);
 
-    try std.testing.expectEqual(std.meta.Tag(db_mod.types.TextQuery).match_all, std.meta.activeTag(anchors.filter_text.?));
-    try std.testing.expectEqual(std.meta.Tag(db_mod.types.TextQuery).match_none, std.meta.activeTag(anchors.exclusion_text.?));
-    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"one\"}}", anchors.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"deleted\":true}}", anchors.exclusion_query_json);
-    try std.testing.expectEqualStrings("tenant-one:", anchors.filter_prefix);
-    try std.testing.expectEqualSlices(u64, &filter_ids, anchors.filter_ids);
-    try std.testing.expectEqualSlices(u64, &excluded_ids, anchors.exclude_ids);
-    try std.testing.expectEqualStrings("visible", anchors.filter_doc_ids[0]);
-    try std.testing.expect(anchors.filter_doc_ids_positive);
-    try std.testing.expectEqualStrings("hidden", anchors.exclude_doc_ids[0]);
+    try std.testing.expect(anchors.filter_text == null);
+    try std.testing.expect(anchors.exclusion_text == null);
+    try std.testing.expectEqualStrings("", anchors.filter_query_json);
+    try std.testing.expectEqualStrings("", anchors.exclusion_query_json);
+    try std.testing.expectEqualStrings("", anchors.filter_prefix);
+    try std.testing.expectEqual(@as(usize, 0), anchors.filter_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.exclude_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.filter_doc_ids.len);
+    try std.testing.expect(!anchors.filter_doc_ids_positive);
+    try std.testing.expectEqual(@as(usize, 0), anchors.exclude_doc_ids.len);
+    try std.testing.expect(anchors.resolved_doc_filter == null);
+    try std.testing.expect(anchors.resolved_text_doc_filter == null);
     try std.testing.expectEqual(@as(?u64, 1234), anchors.execution_deadline_ns);
-    try std.testing.expect(anchors.require_algebraic_filter_resolution);
+    try std.testing.expect(!anchors.require_algebraic_filter_resolution);
 }
 
 test "complete graph match anchor scan is independent per named operation" {
@@ -5267,7 +5263,8 @@ test "complete graph match anchor scan is independent per named operation" {
         .{ .name = "b", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .anchor_alias = "selected", .nodes = &nodes_b, .edges = &.{} } } },
     };
     const combined = (try completeGraphMatchAnchorFilterAlloc(std.testing.allocator, .{
-        .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .filter_query_json = "{\"term\":{\"retrieval\":\"ignored\"}}",
+        .authorization_filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
         .graph_queries = &queries,
     }, queries[0])).?;
     defer std.testing.allocator.free(combined);

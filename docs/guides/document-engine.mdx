@@ -267,6 +267,10 @@ Exact aggregation streams bindings without materializing a bounded row page.
 through cross-table edges retain their table-qualified identities. Anchor
 identities are read in stable snapshot-pinned pages, independently for each
 named graph operation.
+Top-level full-text, semantic, and filter clauses shape the retrieval result only;
+they do not implicitly narrow `MATCH`. Put source constraints on the node named by
+`match.anchor`. Row-level authorization still applies to every anchor and reached
+node.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 its graph work budget, the request fails instead of returning a partial count.
 
