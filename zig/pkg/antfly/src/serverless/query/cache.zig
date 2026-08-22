@@ -85,6 +85,11 @@ const CacheUsage = struct {
     payload_block_count: u64 = 0,
 };
 
+const CacheReconciliation = struct {
+    usage: CacheUsage = .{},
+    integrity_failures: u64 = 0,
+};
+
 const PayloadBlockClass = enum {
     none,
     approximate,
@@ -212,7 +217,7 @@ pub const QueryCache = struct {
         io_impl.io().random(std.mem.asBytes(&instance_id));
         var owner_lease = try acquireCacheWriteOwnerLease(alloc, root_dir, instance_id);
         errdefer owner_lease.deinit(alloc);
-        const startup_usage = try reconcileCacheOnDisk(alloc, root_dir, instance_id, .none);
+        const startup_reconciliation = try reconcileCacheOnDisk(alloc, root_dir, instance_id, .none);
         var cache = QueryCache{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
@@ -238,7 +243,8 @@ pub const QueryCache = struct {
             cache.alloc.free(cache.root_dir);
             coordination_file_transferred = false;
         }
-        cache.usage = startup_usage;
+        cache.usage = startup_reconciliation.usage;
+        cache.stats.integrity_failures = startup_reconciliation.integrity_failures;
         applyUsageToStats(&cache.stats, cache.usage);
         try enforceStartupCapacity(&cache);
         return cache;
@@ -609,10 +615,10 @@ fn synchronizeCacheUsageUnderCoordinationLock(
     const shared_generation = try readCacheCoordinationGeneration(self.coordination_file, io);
     if (!force and shared_generation != null and shared_generation.? == self.observed_coordination_generation) return;
     const reconciliation_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
-    const reconciled_usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
-    self.usage = reconciled_usage;
+    const reconciliation = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = reconciliation.usage;
     self.observed_coordination_generation = reconciliation_generation;
-    recordUsage(self);
+    recordReconciliation(self, reconciliation.integrity_failures);
 }
 
 fn cacheWriteOwnerLeasePathAlloc(alloc: Allocator, root_dir: []const u8, instance_id: u128) ![]u8 {
@@ -1122,10 +1128,10 @@ fn reapAbandonedCacheWritesUnderCoordinationLock(
     // observed generation after reconciliation succeeds, so an I/O failure
     // forces the next operation to rescan instead of trusting stale counters.
     const mutation_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
-    const reconciled_usage = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
-    self.usage = reconciled_usage;
+    const reconciliation = try reconcileCacheOnDisk(self.alloc, self.root_dir, self.instance_id, cancellation);
+    self.usage = reconciliation.usage;
     self.observed_coordination_generation = mutation_generation;
-    recordUsage(self);
+    recordReconciliation(self, reconciliation.integrity_failures);
 }
 
 fn touchFileNow(path: []const u8) !void {
@@ -1302,13 +1308,13 @@ fn reconcileCacheOnDisk(
     root_dir: []const u8,
     current_instance_id: u128,
     cancellation: CancellationToken,
-) !CacheUsage {
-    var usage = CacheUsage{};
+) !CacheReconciliation {
+    var reconciliation = CacheReconciliation{};
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
     var dir = std.Io.Dir.cwd().openDir(io, root_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return usage,
+        error.FileNotFound => return reconciliation,
         else => return err,
     };
     defer dir.close(io);
@@ -1339,23 +1345,29 @@ fn reconcileCacheOnDisk(
                 cutoff_ns,
             );
             if (disposition != .removed) {
-                addScannedFileUsage(&usage, entry.path, temporaryCacheAccountedBytes(entry.path, stat.size));
+                addScannedFileUsage(&reconciliation.usage, entry.path, temporaryCacheAccountedBytes(entry.path, stat.size));
             }
             continue;
         }
         if (usesVerifiedCacheRecordPath(entry.path) and
             !try cacheRecordFramingValid(io, dir, entry.path, stat.size))
         {
-            dir.deleteFile(io, entry.path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
+            const removed = blk: {
+                dir.deleteFile(io, entry.path) catch |err| switch (err) {
+                    error.FileNotFound => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
             };
+            if (removed) {
+                reconciliation.integrity_failures +|= 1;
+            }
             continue;
         }
-        addScannedFileUsage(&usage, entry.path, stat.size);
+        addScannedFileUsage(&reconciliation.usage, entry.path, stat.size);
     }
     try pruneDeadCacheWriteOwnerLeases(alloc, root_dir, current_instance_id, cancellation);
-    return usage;
+    return reconciliation;
 }
 
 fn maybeReconcileCacheOnDisk(self: *QueryCache, cancellation: CancellationToken) !void {
@@ -1646,6 +1658,13 @@ fn recordUsage(self: *QueryCache) void {
     applyUsageToStats(&self.stats, self.usage);
 }
 
+fn recordReconciliation(self: *QueryCache, integrity_failures: u64) void {
+    lockAtomic(&self.stats_mu);
+    defer self.stats_mu.unlock();
+    self.stats.integrity_failures +|= integrity_failures;
+    applyUsageToStats(&self.stats, self.usage);
+}
+
 fn recordFullHit(self: *QueryCache) void {
     lockAtomic(&self.stats_mu);
     defer self.stats_mu.unlock();
@@ -1729,14 +1748,17 @@ fn removeCorruptCacheEntry(self: *QueryCache, path: []const u8, cancellation: Ca
     try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, false);
     self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
     try cancellation.check();
-    deleteFilePath(io, path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
+    const removed = blk: {
+        deleteFilePath(io, path) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
     };
     self.usage = try cacheUsageNoLock(self.alloc, self.root_dir, cancellation);
     lockAtomic(&self.stats_mu);
     defer self.stats_mu.unlock();
-    self.stats.integrity_failures += 1;
+    if (removed) self.stats.integrity_failures +|= 1;
     applyUsageToStats(&self.stats, self.usage);
 }
 
@@ -2240,6 +2262,17 @@ test "serverless query cache rejects same-size corrupted range and block records
     const corrupt_record = [_]u8{'x'} ** (cache_record_header_len + 3);
     try overwriteFile(range_path, &corrupt_record);
     try overwriteFile(block_path, &corrupt_record);
+    // Force the first corrupt read through shared reconciliation. Both records
+    // can be scrubbed in that pass, and telemetry must count each physical
+    // corruption exactly once rather than only the directly requested path.
+    {
+        var coordination_io = threadedIo();
+        defer coordination_io.deinit();
+        const io = coordination_io.io();
+        try lockFileExclusiveWithCancellation(cache.coordination_file, io, .none);
+        defer cache.coordination_file.unlock(io);
+        _ = try advanceCacheCoordinationGeneration(cache.coordination_file, io);
+    }
     try artifact_store.delete(range_meta.artifact_id);
     try artifact_store.delete(block_meta.artifact_id);
 
