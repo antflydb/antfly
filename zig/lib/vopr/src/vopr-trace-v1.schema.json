@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vopr:schema:trace:v1",
+  "title": "VOPR deterministic simulation trace v1 NDJSON records",
+  "description": "Each NDJSON line validates against exactly one record variant. Canonical stream order is header, config, choices, transitions, observations, properties, summary.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/config" },
+    { "$ref": "#/$defs/choice" },
+    { "$ref": "#/$defs/transition" },
+    { "$ref": "#/$defs/fault" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/observation" },
+    { "$ref": "#/$defs/property" },
+    { "$ref": "#/$defs/failure" },
+    { "$ref": "#/$defs/summary" }
+  ],
+  "$defs": {
+    "u64": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "format", "simulator_abi", "system", "scenario", "scenario_version", "source_revision", "target", "optimize"],
+      "properties": {
+        "type": { "const": "header" },
+        "format": { "const": "vopr-trace-v1" },
+        "simulator_abi": { "const": 1 },
+        "system": { "type": "string", "minLength": 1 },
+        "scenario": { "type": "string", "minLength": 1 },
+        "scenario_version": { "type": "integer", "minimum": 1 },
+        "source_revision": { "type": "string" },
+        "target": { "type": "string" },
+        "optimize": { "type": "string" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "seed", "transition_budget", "resource_budget", "fixture_hashes", "feature_flags", "backend_ids"],
+      "properties": {
+        "type": { "const": "config" },
+        "seed": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "transition_budget": { "type": "integer", "minimum": 1 },
+        "resource_budget": { "$ref": "#/$defs/u64" },
+        "fixture_hashes": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
+        "feature_flags": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
+        "backend_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } }
+      }
+    },
+    "choice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "site_id", "site_name", "occurrence", "enabled_ids", "selected_id"],
+      "properties": {
+        "type": { "const": "choice" },
+        "site_id": { "$ref": "#/$defs/u64" },
+        "site_name": { "type": "string", "minLength": 1 },
+        "occurrence": { "$ref": "#/$defs/u64" },
+        "enabled_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/u64" } },
+        "selected_id": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "id", "name", "kind"],
+      "properties": {
+        "type": { "const": "transition" },
+        "index": { "type": "integer", "minimum": 1 },
+        "id": { "$ref": "#/$defs/u64" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["scheduler", "workload", "fault", "maintenance", "quiescence"] }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "id", "name", "phase"],
+      "properties": {
+        "type": { "const": "fault" },
+        "index": { "type": "integer", "minimum": 1 },
+        "id": { "$ref": "#/$defs/u64" },
+        "name": { "type": "string", "minLength": 1 },
+        "phase": { "enum": ["start", "end", "pulse"] }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "ordinal", "id", "name", "kind", "actor_id", "resource_id", "payload_digest"],
+      "properties": {
+        "type": { "const": "event" },
+        "index": { "type": "integer", "minimum": 1 },
+        "ordinal": { "$ref": "#/$defs/u64" },
+        "id": { "$ref": "#/$defs/u64" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["message_enqueued", "state_change", "client_response", "injected_error", "domain"] },
+        "actor_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "resource_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "payload_digest": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "value"],
+      "properties": {
+        "id": { "$ref": "#/$defs/u64" },
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "integer" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "digest", "features"],
+      "properties": {
+        "type": { "const": "observation" },
+        "index": { "$ref": "#/$defs/u64" },
+        "digest": { "$ref": "#/$defs/u64" },
+        "features": { "type": "array", "items": { "$ref": "#/$defs/feature" } }
+      }
+    },
+    "property": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "property_id", "name", "kind", "condition", "details"],
+      "properties": {
+        "type": { "const": "property" },
+        "index": { "type": "integer", "minimum": 1 },
+        "property_id": { "$ref": "#/$defs/u64" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["always", "always_or_unreachable", "reachable", "unreachable", "sometimes", "eventually_after_quiescence"] },
+        "condition": { "type": "boolean" },
+        "details": { "type": "string" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "index", "class", "property_id", "identity", "fingerprint", "observation_digest"],
+      "properties": {
+        "type": { "const": "failure" },
+        "index": { "$ref": "#/$defs/u64" },
+        "class": { "enum": ["property", "harness", "panic", "process", "allocator", "differential"] },
+        "property_id": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] },
+        "identity": { "type": "string", "minLength": 1 },
+        "fingerprint": { "$ref": "#/$defs/u64" },
+        "observation_digest": { "oneOf": [{ "$ref": "#/$defs/u64" }, { "type": "null" }] }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "transitions", "final_observation_digest", "property_failures"],
+      "properties": {
+        "type": { "const": "summary" },
+        "transitions": { "$ref": "#/$defs/u64" },
+        "final_observation_digest": { "$ref": "#/$defs/u64" },
+        "property_failures": { "$ref": "#/$defs/u64" }
+      }
+    }
+  }
+}

@@ -701,6 +701,7 @@ fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std
 
 const AntflyRootImports = struct {
     build_options: *std.Build.Step.Options,
+    vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
@@ -771,6 +772,7 @@ const AntflyRootImports = struct {
     filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
+        .{ .name = "vopr", .field = "vopr" },
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
         .{ .name = "raft_engine", .field = "raft_engine" },
         .{ .name = "antfly_public_openapi", .field = "public_openapi" },
@@ -1406,6 +1408,8 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
+    const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -1994,6 +1998,7 @@ pub fn build(b: *std.Build) void {
 
     const antfly_imports = AntflyRootImports{
         .build_options = build_options,
+        .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
@@ -6633,7 +6638,20 @@ pub fn build(b: *std.Build) void {
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_status_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_runtime_tests.step);
 
+    const sim_contract_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vopr/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sim_contract_tests = b.addTest(.{ .root_module = sim_contract_test_mod });
+    const run_sim_contract_tests = b.addRunArtifact(sim_contract_tests);
+    const vopr_test_step = b.step("vopr-test", "Run standalone VOPR engine and replay tests");
+    vopr_test_step.dependOn(&run_sim_contract_tests.step);
+    const sim_contract_test_step = b.step("sim-contract-test", "Run deterministic simulation contract and replay-equivalence tests");
+    sim_contract_test_step.dependOn(&run_sim_contract_tests.step);
+
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
+    sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);

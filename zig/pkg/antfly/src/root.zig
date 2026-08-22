@@ -93,6 +93,9 @@ pub const internal = @import("internal/mod.zig");
 // Tracing (TLA+ trace validation)
 pub const tracing = @import("tracing/mod.zig");
 
+// Deterministic simulation contracts and replay artifacts.
+pub const sim = @import("vopr");
+
 // Raft integration
 pub const raft = @import("raft/mod.zig");
 pub const admin = @import("admin/mod.zig");
@@ -272,6 +275,7 @@ test {
     _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;
+    _ = sim;
     _ = metadata_api;
     _ = metadata_admin;
     _ = metadata_http_routes;
