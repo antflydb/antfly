@@ -1769,6 +1769,32 @@ fault composition, and TLA+ export from promoted VOPR histories.
 Exit condition: optimizations increase states or failures found per CPU unit
 without altering replay semantics.
 
+#### Phase 5 implementation progress (2026-08-22)
+
+The generic explorer now accepts weighted semantic target features, retains
+target-reaching histories even after ordinary novelty is exhausted, reports
+target hits, and incorporates target proximity alongside existing inverse-hit
+rarity in corpus energy. Target scoring is based only on canonical observation
+IDs and values and counts each target once per history.
+
+`lib/vopr/src/splice.zig` finds candidate joins using matching logical
+observation digests and provides a choice source that combines an exact prefix
+with a rebased suffix. The suffix must reproduce its stable choice sites and
+complete enabled sets; the resulting artifact must still replay from a clean
+world before retention, so a digest collision or insufficient state signature
+cannot silently create an invalid history.
+
+`lib/vopr/src/snapshot.zig` defines scenario-owned logical checkpoints with
+integrity digests and deduplicated storage. Scenarios serialize modeled values
+and logical IDs through explicit hooks instead of copying heap pointers or OS
+resources. Checkpoints are exploration accelerators only: retained histories
+remain decision traces and must pass clean-world exact replay.
+
+Phase 5 remains open for wiring splice/checkpoint selection into long-running
+campaign workers, evaluating compiler coverage hooks, causal-report enrichment,
+and committing a benchmark that demonstrates improved states or failures per
+CPU unit without changing replay results.
+
 ## Risks and Mitigations
 
 ### False Determinism

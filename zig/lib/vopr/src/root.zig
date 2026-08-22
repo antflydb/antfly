@@ -16,6 +16,8 @@ pub const reducer = @import("reducer.zig");
 pub const runtime = @import("runtime.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const sim_runtime = @import("sim_runtime.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const splice = @import("splice.zig");
 pub const runner = @import("runner.zig");
 pub const scenario = @import("scenario.zig");
 pub const trace = @import("trace.zig");
@@ -144,5 +146,7 @@ test {
     _ = runtime;
     _ = scheduler;
     _ = sim_runtime;
+    _ = snapshot;
+    _ = splice;
     _ = transition;
 }

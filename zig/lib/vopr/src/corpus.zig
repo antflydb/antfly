@@ -19,6 +19,7 @@ pub const Entry = struct {
     bytes: []const u8,
     novelty: usize,
     rarity_score: u64,
+    target_score: u64,
     selections: u64 = 0,
     productive_children: u64 = 0,
 
@@ -26,7 +27,7 @@ pub const Entry = struct {
         const novelty_energy: u64 = @intCast(@min(self.novelty, 1024));
         const productivity = self.productive_children *| 8;
         const selection_penalty = self.selections / 4;
-        return @max(@as(u64, 1), 1 +| novelty_energy *| 16 +| self.rarity_score / 100_000 +| productivity -| selection_penalty);
+        return @max(@as(u64, 1), 1 +| novelty_energy *| 16 +| self.rarity_score / 100_000 +| self.target_score *| 32 +| productivity -| selection_penalty);
     }
 };
 
@@ -68,6 +69,7 @@ pub const Corpus = struct {
             .bytes = bytes,
             .novelty = novelty.discovered,
             .rarity_score = novelty.rarity_score,
+            .target_score = novelty.target_score,
         });
         gop.value_ptr.* = index;
         return .{ .index = index, .inserted = true };

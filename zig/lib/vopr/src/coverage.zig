@@ -12,6 +12,13 @@ pub const Novelty = struct {
     discovered: usize = 0,
     observed: usize = 0,
     rarity_score: u64 = 0,
+    target_score: u64 = 0,
+};
+
+pub const Target = struct {
+    feature_id: ids.StableId,
+    value: ?i64 = null,
+    weight: u64 = 1,
 };
 
 pub const Tracker = struct {
@@ -65,6 +72,29 @@ pub const Tracker = struct {
     }
 };
 
+/// Score explicit target-state features without mutating global coverage.
+/// Repeated observations count once per target, so extending a history cannot
+/// manufacture target energy without reaching another requested state.
+pub fn scoreTargets(allocator: std.mem.Allocator, artifact: *const trace.Trace, targets: []const Target) !u64 {
+    var matched = try allocator.alloc(bool, targets.len);
+    defer allocator.free(matched);
+    @memset(matched, false);
+    for (artifact.observations.items) |record| {
+        for (record.features) |feature| {
+            for (targets, 0..) |target, index| {
+                if (matched[index] or feature.id != target.feature_id) continue;
+                if (target.value) |expected| if (feature.value != expected) continue;
+                matched[index] = true;
+            }
+        }
+    }
+    var score: u64 = 0;
+    for (targets, matched) |target, hit| if (hit) {
+        score +|= target.weight;
+    };
+    return score;
+}
+
 test "semantic coverage rewards new features and then decays rarity" {
     var artifact = try trace.Trace.init(std.testing.allocator, .{ .scenario = "coverage", .scenario_version = 1 }, .{ .transition_budget = 1 });
     defer artifact.deinit();
@@ -83,4 +113,16 @@ test "semantic coverage rewards new features and then decays rarity" {
     try std.testing.expect(first.discovered > 0);
     try std.testing.expectEqual(@as(usize, 0), second.discovered);
     try std.testing.expect(first.rarity_score > second.rarity_score);
+}
+
+test "target scoring is stable and does not reward repeated observations" {
+    var artifact = try trace.Trace.init(std.testing.allocator, .{ .scenario = "target", .scenario_version = 1 }, .{ .transition_budget = 1 });
+    defer artifact.deinit();
+    const feature = @import("observation.zig").Feature{ .id = 31, .name = "phase", .value = 4 };
+    const digest = @import("observation.zig").digestFeatures(&.{feature});
+    try artifact.addObservation(.{ .index = 0, .digest = digest, .features = &.{feature} });
+    try artifact.addObservation(.{ .index = 1, .digest = digest, .features = &.{feature} });
+    artifact.summary = .{ .transitions = 0, .final_observation_digest = digest, .property_failures = 0 };
+    try std.testing.expectEqual(@as(u64, 7), try scoreTargets(std.testing.allocator, &artifact, &.{.{ .feature_id = 31, .value = 4, .weight = 7 }}));
+    try std.testing.expectEqual(@as(u64, 0), try scoreTargets(std.testing.allocator, &artifact, &.{.{ .feature_id = 31, .value = 5, .weight = 7 }}));
 }

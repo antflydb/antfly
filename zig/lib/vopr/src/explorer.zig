@@ -16,6 +16,7 @@ pub const Config = struct {
     transition_budget: u64,
     seed: u64,
     uniform_percent: u8 = 10,
+    targets: []const coverage_mod.Target = &.{},
 
     pub fn validate(self: Config) !void {
         if (self.histories == 0) return error.InvalidHistoryBudget;
@@ -31,6 +32,7 @@ pub const Report = struct {
     retained: u64 = 0,
     failures: u64 = 0,
     semantic_features: usize = 0,
+    target_hits: u64 = 0,
 };
 
 pub fn Campaign(comptime Scenario: type) type {
@@ -130,10 +132,12 @@ pub fn Campaign(comptime Scenario: type) type {
         }
 
         fn consider(self: *Self, artifact: *const trace.Trace, parent_index: ?usize) !void {
-            const novelty = try self.coverage.observe(artifact);
+            var novelty = try self.coverage.observe(artifact);
+            novelty.target_score = try coverage_mod.scoreTargets(self.allocator, artifact, self.config.targets);
+            if (novelty.target_score > 0) self.report.target_hits += 1;
             const failed = artifact.failures.items.len > 0;
             if (failed) self.report.failures += 1;
-            if (novelty.discovered == 0 and !failed and self.corpus.entries.items.len > 0) return;
+            if (novelty.discovered == 0 and novelty.target_score == 0 and !failed and self.corpus.entries.items.len > 0) return;
             const added = try self.corpus.add(artifact, novelty);
             if (added.inserted) {
                 self.report.retained += 1;
@@ -159,4 +163,25 @@ test "campaign generates, mutates, and retains semantic histories" {
     try std.testing.expect(campaign.report.mutated >= 1);
     try std.testing.expect(campaign.report.retained >= 1);
     try std.testing.expect(campaign.report.semantic_features > 0);
+}
+
+test "campaign retains and energizes target-state histories" {
+    const ToyScenario = @import("toy_scenario.zig").ToyScenario;
+    var campaign = try Campaign(ToyScenario).init(std.testing.allocator, .{
+        .system = "vopr-test",
+        .histories = 3,
+        .transition_budget = 4,
+        .seed = 0x55,
+        .targets = &.{.{
+            .feature_id = @import("id.zig").stable("observation", "toy.steps"),
+            .value = 4,
+            .weight = 8,
+        }},
+    });
+    defer campaign.deinit();
+    try campaign.run();
+    try std.testing.expect(campaign.report.target_hits > 0);
+    var has_target_energy = false;
+    for (campaign.corpus.entries.items) |entry| has_target_energy = has_target_energy or entry.target_score > 0;
+    try std.testing.expect(has_target_energy);
 }
