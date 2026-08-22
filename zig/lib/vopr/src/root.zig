@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const choice = @import("choice.zig");
+pub const command = @import("command.zig");
 pub const benchmark = @import("benchmark.zig");
 pub const causal = @import("causal.zig");
 pub const coverage = @import("coverage.zig");
@@ -176,6 +177,7 @@ test "trace v1 schema is checked in and valid JSON" {
 
 test {
     _ = choice;
+    _ = command;
     _ = benchmark;
     _ = causal;
     _ = coverage;
