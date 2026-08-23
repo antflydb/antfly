@@ -330,7 +330,7 @@ pub const DataPlaneScenario = struct {
 
     const Stage = enum { admit, route, packet, persist, apply, acknowledge, split_copy, split_cutover, read, terminal };
     const State = struct {
-        sim: vopr.sim_io.SimIo,
+        sim: vopr.vopr_io.VoprIo,
         pair: [2]std.Io.net.Socket,
         raft_log: std.Io.File,
         stage: Stage = .admit,
@@ -868,7 +868,7 @@ pub const ClockLeaseTtlScenario = struct {
     const timer_id = transitionId(name, "timer_delivery");
     const stabilize_id = transitionId(name, "stabilize_and_cleanup");
     const State = struct {
-        sim: vopr.sim_io.SimIo,
+        sim: vopr.vopr_io.VoprIo,
         clock: vopr.clock_fault.Domain,
         steps: u8 = 0,
         lease_deadline_real: i96 = 100,
@@ -957,7 +957,7 @@ fn add(list: *vopr.transition.List, allocator: Allocator, id: u64, transition_na
 
 fn record(comptime Scenario: type, allocator: Allocator, seed: u64, budget: u64) !vopr.trace.Trace {
     var seeded = vopr.choice.Seeded.init(seed);
-    const backend_ids = vopr.sim_io.artifactBackendIds();
+    const backend_ids = vopr.vopr_io.artifactBackendIds();
     return vopr.runner.run(Scenario, allocator, seeded.source(), .{
         .system = "antfly",
         .seed = seed,

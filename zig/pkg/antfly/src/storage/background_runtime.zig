@@ -29,6 +29,21 @@ pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
+    /// Optional caller-owned I/O interfaces. These make the production
+    /// runtime usable with deterministic `std.Io` implementations without
+    /// teaching it about VOPR or any concrete backend. The caller must keep
+    /// every supplied interface alive until all lane leases are released and
+    /// `BackendRuntime.deinit` returns.
+    borrowed_io: ?BorrowedIo = null,
+};
+
+pub const BorrowedIo = struct {
+    general: Io,
+    raft_inbound: ?Io = null,
+    raft_outbound: ?Io = null,
+    api: ?Io = null,
+    inference: ?Io = null,
+    control: ?Io = null,
 };
 
 /// Atomic admission gate for a lane whose backing executor is destroyed only
@@ -293,6 +308,7 @@ pub const BackendRuntime = struct {
     api_io_impl: ?*IoImpl = null,
     inference_io_impl: ?*IoImpl = null,
     control_io_impl: ?*IoImpl = null,
+    borrowed_io: ?BorrowedIo = null,
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
@@ -311,6 +327,8 @@ pub const BackendRuntime = struct {
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
+        if (config.borrowed_io != null and config.backend != .manual)
+            return error.BorrowedIoRequiresManualBackend;
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
@@ -332,6 +350,7 @@ pub const BackendRuntime = struct {
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
             .durable_jobs = undefined,
+            .borrowed_io = config.borrowed_io,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
 
@@ -422,6 +441,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn io(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
@@ -446,26 +466,31 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.raft_inbound orelse borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (self.borrowed_io != null) return null;
         if (comptime builtin.os.tag == .freestanding) return null;
         return self.raft_inbound_io_impl orelse self.io_impl;
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.raft_outbound orelse borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (self.borrowed_io != null) return null;
         if (comptime builtin.os.tag == .freestanding) return null;
         return self.raft_outbound_io_impl orelse self.io_impl;
     }
 
     pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
+        if (self.borrowed_io != null) return null;
         if (comptime builtin.os.tag == .freestanding) return null;
         return self.api_io_impl orelse self.io_impl;
     }
@@ -474,6 +499,7 @@ pub const BackendRuntime = struct {
     /// Components own and await the tasks they submit; BackendRuntime only owns
     /// the executor lane and must outlive every borrower.
     pub fn apiIo(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.api orelse borrowed.general;
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
     }
@@ -527,6 +553,7 @@ pub const BackendRuntime = struct {
     /// fan-out. A lifetime lease is required because the linked inference
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.inference orelse borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
         return io_impl.io();
@@ -569,6 +596,7 @@ pub const BackendRuntime = struct {
     /// coordination. It is intentionally isolated from public API work so
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
+        if (self.borrowed_io) |borrowed| return borrowed.control orelse borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
         return io_impl.io();
@@ -1147,6 +1175,47 @@ test "backend runtime API lane leases expose and release the interface" {
     first.release();
     try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingApiLeases());
     second.release();
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+}
+
+test "backend runtime borrows backend-agnostic std.Io lanes" {
+    var general_token: u8 = 0;
+    var api_token: u8 = 0;
+    var control_token: u8 = 0;
+    const general = Io{ .userdata = &general_token, .vtable = std.Io.failing.vtable };
+    const api = Io{ .userdata = &api_token, .vtable = std.Io.failing.vtable };
+    const control = Io{ .userdata = &control_token, .vtable = std.Io.failing.vtable };
+
+    try std.testing.expectError(
+        error.BorrowedIoRequiresManualBackend,
+        BackendRuntimeHandle.init(std.testing.allocator, .{
+            .backend = .io_threaded,
+            .borrowed_io = .{ .general = general },
+        }),
+    );
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{
+            .general = general,
+            .api = api,
+            .control = control,
+        },
+    });
+    defer handle.deinit();
+
+    try std.testing.expect(handle.ptr().apiIoImpl() == null);
+    try std.testing.expect(handle.ptr().raftInboundIoImpl() == null);
+    try std.testing.expectEqual(@intFromPtr(&general_token), @intFromPtr(handle.ptr().io().?.userdata.?));
+    try std.testing.expectEqual(@intFromPtr(&general_token), @intFromPtr(handle.ptr().raftInboundIo().?.userdata.?));
+    try std.testing.expectEqual(@intFromPtr(&general_token), @intFromPtr(handle.ptr().raftOutboundIo().?.userdata.?));
+    try std.testing.expectEqual(@intFromPtr(&api_token), @intFromPtr(handle.ptr().apiIo().?.userdata.?));
+    try std.testing.expectEqual(@intFromPtr(&general_token), @intFromPtr(handle.ptr().inferenceIo().?.userdata.?));
+    try std.testing.expectEqual(@intFromPtr(&control_token), @intFromPtr(handle.ptr().controlIo().?.userdata.?));
+
+    var lease = try handle.ptr().acquireApiLane();
+    try std.testing.expectEqual(@intFromPtr(&api_token), @intFromPtr(lease.io().userdata.?));
+    lease.release();
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
 }
 

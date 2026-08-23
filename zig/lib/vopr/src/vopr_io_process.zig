@@ -1,15 +1,15 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Registered in-process programs for SimIo.
+//! Registered in-process programs for VoprIo.
 //!
 //! This is deliberately not an executable emulator. Only names explicitly
-//! registered by the harness can spawn. Each child is a SimIo fiber and may
+//! registered by the harness can spawn. Each child is a VoprIo fiber and may
 //! cooperate with pause and deterministic CPU quotas through `Context`.
 
 const std = @import("std");
 const ids = @import("id.zig");
-const sim_io_net = @import("sim_io_net.zig");
+const vopr_io_net = @import("vopr_io_net.zig");
 
 pub const Start = *const fn (*Context, []const []const u8) u8;
 
@@ -72,18 +72,18 @@ const Process = struct {
 pub const Table = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    wait_port: ?sim_io_net.WaitPort = null,
+    wait_port: ?vopr_io_net.WaitPort = null,
     next_pid: u32 = 10_000,
     next_sequence: u64 = 1,
     processes: std.AutoHashMapUnmanaged(u32, *Process) = .empty,
     process_order: std.ArrayListUnmanaged(*Process) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Table {
-        if (config.max_processes == 0) return error.InvalidSimIoProcessLimit;
+        if (config.max_processes == 0) return error.InvalidVoprIoProcessLimit;
         for (config.registrations, 0..) |registration, index| {
-            if (registration.name.len == 0) return error.InvalidSimIoProgramName;
+            if (registration.name.len == 0) return error.InvalidVoprIoProgramName;
             for (config.registrations[0..index]) |earlier| {
-                if (std.mem.eql(u8, earlier.name, registration.name)) return error.DuplicateSimIoProgram;
+                if (std.mem.eql(u8, earlier.name, registration.name)) return error.DuplicateVoprIoProgram;
             }
         }
         return .{ .allocator = allocator, .config = config };
@@ -96,7 +96,7 @@ pub const Table = struct {
         self.* = undefined;
     }
 
-    pub fn bindWaitPort(self: *Table, wait_port: sim_io_net.WaitPort) void {
+    pub fn bindWaitPort(self: *Table, wait_port: vopr_io_net.WaitPort) void {
         self.wait_port = wait_port;
     }
 

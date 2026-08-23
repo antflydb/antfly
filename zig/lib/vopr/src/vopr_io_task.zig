@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Stackful deterministic task kernel used by SimIo.
+//! Stackful deterministic task kernel used by VoprIo.
 //!
 //! Fibers never schedule one another directly. Parking switches back to the
 //! VOPR runner; resumption, futex wake selection, and virtual-time advancement
@@ -13,7 +13,7 @@ const ids = @import("id.zig");
 const transition = @import("transition.zig");
 
 comptime {
-    if (!std.Io.fiber.supported) @compileError("SimIo requires std.Io.fiber support");
+    if (!std.Io.fiber.supported) @compileError("VoprIo requires std.Io.fiber support");
 }
 
 const stack_alignment = builtin.target.stackAlignment();
@@ -147,7 +147,7 @@ const Entry = struct {
                 :
                 : [call] "X" (&call),
             ),
-            else => |arch| @compileError("unsupported SimIo fiber architecture: " ++ @tagName(arch)),
+            else => |arch| @compileError("unsupported VoprIo fiber architecture: " ++ @tagName(arch)),
         }
     }
 
@@ -177,8 +177,8 @@ pub const Kernel = struct {
     external_wakes: std.ArrayListUnmanaged(ExternalWake) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Kernel {
-        if (config.stack_size < 64 * 1024) return error.SimIoStackTooSmall;
-        if (config.max_tasks == 0) return error.InvalidSimIoTaskLimit;
+        if (config.stack_size < 64 * 1024) return error.VoprIoStackTooSmall;
+        if (config.max_tasks == 0) return error.InvalidVoprIoTaskLimit;
         return .{ .allocator = allocator, .config = config };
     }
 
@@ -259,9 +259,9 @@ pub const Kernel = struct {
         const target: *Task = @ptrCast(@alignCast(any_future));
         if (target.kernel != self or target.group != null or target.result_len != result.len or
             !result_alignment.compare(.lte, .fromByteUnits(storage_alignment)))
-            return error.InvalidSimIoFuture;
-        const awaiter = self.current orelse return error.SimIoAwaitOutsideTask;
-        if (target == awaiter or target.awaiter != null) return error.InvalidSimIoFuture;
+            return error.InvalidVoprIoFuture;
+        const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+        if (target == awaiter or target.awaiter != null) return error.InvalidVoprIoFuture;
         if (target.status != .finished) {
             target.awaiter = awaiter;
             awaiter.waiting_on_future = target;
@@ -276,7 +276,7 @@ pub const Kernel = struct {
 
     pub fn cancel(self: *Kernel, any_future: *std.Io.AnyFuture, result: []u8, result_alignment: std.mem.Alignment) !void {
         const target: *Task = @ptrCast(@alignCast(any_future));
-        if (target.kernel != self) return error.InvalidSimIoFuture;
+        if (target.kernel != self) return error.InvalidVoprIoFuture;
         target.requestCancel();
         try self.await(any_future, result, result_alignment);
     }
@@ -342,10 +342,10 @@ pub const Kernel = struct {
 
     pub fn groupAwait(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
-        if (group.public != public_group) return error.InvalidSimIoGroup;
+        if (group.public != public_group) return error.InvalidVoprIoGroup;
         if (group.tasks.items.len != 0) {
-            const awaiter = self.current orelse return error.SimIoAwaitOutsideTask;
-            if (group.awaiter != null) return error.InvalidSimIoGroup;
+            const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+            if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
             awaiter.waiting_on_group = group;
             awaiter.status = .waiting_group;
@@ -359,11 +359,11 @@ pub const Kernel = struct {
 
     pub fn groupCancel(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
-        if (group.public != public_group) return error.InvalidSimIoGroup;
+        if (group.public != public_group) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
         if (group.tasks.items.len != 0) {
-            const awaiter = self.current orelse return error.SimIoAwaitOutsideTask;
-            if (group.awaiter != null) return error.InvalidSimIoGroup;
+            const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+            if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
             awaiter.waiting_on_group = group;
             awaiter.status = .waiting_group;
@@ -374,14 +374,14 @@ pub const Kernel = struct {
     }
 
     pub fn recancel(self: *Kernel) !void {
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
-        if (!task.cancel_acknowledged) return error.InvalidSimIoRecancel;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        if (!task.cancel_acknowledged) return error.InvalidVoprIoRecancel;
         task.cancel_acknowledged = false;
         task.cancel_requested = true;
     }
 
     pub fn swapCancelProtection(self: *Kernel, new: std.Io.CancelProtection) !std.Io.CancelProtection {
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
         const old = task.cancel_protection;
         task.cancel_protection = new;
         return old;
@@ -393,7 +393,7 @@ pub const Kernel = struct {
     }
 
     pub fn sleepCurrent(self: *Kernel, sleep_info: ?Sleep) !void {
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.sleep = sleep_info;
         task.status = .waiting_sleep;
@@ -405,7 +405,7 @@ pub const Kernel = struct {
     /// product code. The current task becomes runnable again, so resumption is
     /// selected and recorded by the ordinary scheduler.
     pub fn yieldCurrentTask(self: *Kernel) !void {
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.status = .runnable;
         task.resume_generation +|= 1;
@@ -416,7 +416,7 @@ pub const Kernel = struct {
     pub fn futexWait(self: *Kernel, ptr: *const u32, expected: u32, sleep_info: ?Sleep, uncancelable: bool) !void {
         if (@atomicLoad(u32, ptr, .seq_cst) != expected) return;
         _ = try self.ensureFutexIdentity(ptr);
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
         if (!uncancelable) try task.checkCancel();
         task.futex_ptr = ptr;
         task.futex_uncancelable = uncancelable;
@@ -440,7 +440,7 @@ pub const Kernel = struct {
     /// Park the current fiber on a simulator-owned logical resource. The
     /// resource ID must be derived from stable modeled state, never a pointer.
     pub fn waitExternal(self: *Kernel, resource_id: ids.StableId) !void {
-        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        const task = self.current orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.external_id = resource_id;
         task.status = .waiting_external;
@@ -581,10 +581,10 @@ pub const Kernel = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         group: ?*GroupState,
     ) !*Task {
-        if (self.tasks.items.len >= self.config.max_tasks) return error.SimIoTaskLimitExceeded;
+        if (self.tasks.items.len >= self.config.max_tasks) return error.VoprIoTaskLimitExceeded;
         if (!result_alignment.compare(.lte, .fromByteUnits(storage_alignment)) or
             !context_alignment.compare(.lte, .fromByteUnits(storage_alignment)))
-            return error.SimIoTaskAlignmentUnsupported;
+            return error.VoprIoTaskAlignmentUnsupported;
 
         const sequence = try self.allocateSequence();
         const result_offset = result_alignment.forward(context_bytes.len);
@@ -628,7 +628,7 @@ pub const Kernel = struct {
     }
 
     fn allocateSequence(self: *Kernel) !u64 {
-        if (self.next_sequence == std.math.maxInt(u64)) return error.SimIoSequenceExhausted;
+        if (self.next_sequence == std.math.maxInt(u64)) return error.VoprIoSequenceExhausted;
         const result = self.next_sequence;
         self.next_sequence += 1;
         return result;

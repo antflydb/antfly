@@ -876,33 +876,33 @@ fn migrateCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
 
 fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
-        return "pkg/antfly/src/sim/fixtures/metadata";
+        return "pkg/antfly/src/vopr/fixtures/metadata";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
-        return "pkg/antfly/src/sim/fixtures/distributed-data";
+        return "pkg/antfly/src/vopr/fixtures/distributed-data";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
-        return "pkg/antfly/src/sim/fixtures/transaction";
+        return "pkg/antfly/src/vopr/fixtures/transaction";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/wal";
+        return "pkg/antfly/src/vopr/fixtures/wal";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/persistent";
+        return "pkg/antfly/src/vopr/fixtures/persistent";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/index-manager";
+        return "pkg/antfly/src/vopr/fixtures/index-manager";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/db-split";
+        return "pkg/antfly/src/vopr/fixtures/db-split";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/raft";
+        return "pkg/antfly/src/vopr/fixtures/raft";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/lmdb";
+        return "pkg/antfly/src/vopr/fixtures/lmdb";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/lsm";
+        return "pkg/antfly/src/vopr/fixtures/lsm";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
-        return "pkg/antfly/src/sim/fixtures/ha";
+        return "pkg/antfly/src/vopr/fixtures/ha";
     if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
-        .distributed_transaction => "pkg/antfly/src/sim/fixtures/distributed-transaction",
-        .data_plane => "pkg/antfly/src/sim/fixtures/data-plane",
-        .derived_workflow => "pkg/antfly/src/sim/fixtures/derived-workflow",
-        .backup_restore => "pkg/antfly/src/sim/fixtures/backup-restore",
-        .clock_fault => "pkg/antfly/src/sim/fixtures/clock-fault",
+        .distributed_transaction => "pkg/antfly/src/vopr/fixtures/distributed-transaction",
+        .data_plane => "pkg/antfly/src/vopr/fixtures/data-plane",
+        .derived_workflow => "pkg/antfly/src/vopr/fixtures/derived-workflow",
+        .backup_restore => "pkg/antfly/src/vopr/fixtures/backup-restore",
+        .clock_fault => "pkg/antfly/src/vopr/fixtures/clock-fault",
     };
     return error.UnsupportedScenario;
 }
@@ -1210,7 +1210,7 @@ const CampaignContext = struct {
         for (fingerprints) |fingerprint| {
             const summary = self.failure_summaries.get(fingerprint).?;
             std.debug.print(
-                "VOPR failure fingerprint={x} first={s} smallest_transitions={d} smallest={s} replay='zig build sim-replay -- --trace {s}' reduce='zig build sim-reduce -- --trace {s} --out <reduced.simtrace>'\n",
+                "VOPR failure fingerprint={x} first={s} smallest_transitions={d} smallest={s} replay='zig build vopr-replay -- --trace {s}' reduce='zig build vopr-reduce -- --trace {s} --out <reduced.simtrace>'\n",
                 .{ fingerprint, summary.first_path, summary.smallest_transitions, summary.smallest_path, summary.smallest_path, summary.smallest_path },
             );
         }
@@ -1540,8 +1540,8 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
 
     var transaction_artifact = try antfly.transaction_vopr.record(alloc, 0xA17F_7A4A);
     defer transaction_artifact.deinit();
-    try std.testing.expectEqualStrings("pkg/antfly/src/sim/fixtures/metadata", try fixtureDirForScenario(&promoted));
-    try std.testing.expectEqualStrings("pkg/antfly/src/sim/fixtures/transaction", try fixtureDirForScenario(&transaction_artifact));
+    try std.testing.expectEqualStrings("pkg/antfly/src/vopr/fixtures/metadata", try fixtureDirForScenario(&promoted));
+    try std.testing.expectEqualStrings("pkg/antfly/src/vopr/fixtures/transaction", try fixtureDirForScenario(&transaction_artifact));
     var generic_transaction_replay = try replayKnownScenario(alloc, &transaction_artifact);
     generic_transaction_replay.deinit();
     var transaction_ndjson: std.Io.Writer.Allocating = .init(alloc);

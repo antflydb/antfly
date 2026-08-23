@@ -16,6 +16,7 @@ comptime {
     _ = @import("background_runtime.zig");
     _ = @import("backup_codec.zig");
     _ = @import("coverage_identity.zig");
+    _ = @import("db_split_vopr.zig");
     _ = @import("db/aggregations.zig");
     _ = @import("db/algebraic/adaptive.zig");
     _ = @import("db/algebraic/algebra.zig");
@@ -146,10 +147,12 @@ comptime {
     _ = @import("ha/standby.zig");
     _ = @import("ha/status.zig");
     _ = @import("ha/validation.zig");
+    _ = @import("ha/vopr.zig");
     _ = @import("ha/write_gate.zig");
     _ = @import("hbc_adapter.zig");
     _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
+    _ = @import("index_manager_vopr.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
     _ = @import("lite/conformance_test.zig");
@@ -162,6 +165,7 @@ comptime {
     _ = @import("lite/restore_staging.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
+    _ = @import("lmdb_vopr.zig");
     _ = @import("lsm/binary_search.zig");
     _ = @import("lsm/k_way_merge.zig");
     _ = @import("lsm/manifest.zig");
@@ -184,17 +188,22 @@ comptime {
     _ = @import("lsm_backend/storage_io.zig");
     _ = @import("lsm_backend/wal.zig");
     _ = @import("lsm_backend_sim_test.zig");
+    _ = @import("lsm_vopr.zig");
     _ = @import("maintenance.zig");
     _ = @import("mem_backend.zig");
     _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
+    _ = @import("persistent_vopr.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
     _ = @import("schema.zig");
     _ = @import("shard.zig");
     _ = @import("sim_runtime.zig");
     _ = @import("transactions.zig");
+    _ = @import("transaction_vopr.zig");
     _ = @import("ttl.zig");
     _ = @import("wal.zig");
+    _ = @import("vopr_durable_job_lane.zig");
+    _ = @import("wal_vopr.zig");
 }

@@ -3,13 +3,13 @@
 
 //! Reusable deterministic node-clock fault surface.
 //!
-//! A domain owns no host resources. It advances a `SimIo` clock pair, keeps
+//! A domain owns no host resources. It advances a `VoprIo` clock pair, keeps
 //! realtime rate and node-pause state replayable, and separates clock passage
 //! from timer delivery. Fault changes consume an explicit budget so campaigns
 //! cannot accidentally create an unbounded overlapping-fault state space.
 
 const std = @import("std");
-const sim_io = @import("sim_io.zig");
+const vopr_io = @import("vopr_io.zig");
 
 pub const normal_rate_ppm: i64 = 1_000_000;
 
@@ -20,14 +20,14 @@ pub const Config = struct {
 };
 
 pub const Domain = struct {
-    sim: *sim_io.SimIo,
+    sim: *vopr_io.VoprIo,
     config: Config,
     rate_ppm: i64 = normal_rate_ppm,
     paused: bool = false,
     timer_delivery_pending: bool = false,
     faults_used: u32 = 0,
 
-    pub fn init(sim: *sim_io.SimIo, config: Config) !Domain {
+    pub fn init(sim: *vopr_io.VoprIo, config: Config) !Domain {
         if (config.fault_budget == 0) return error.InvalidClockFaultBudget;
         if (config.minimum_rate_ppm <= 0 or config.maximum_rate_ppm < config.minimum_rate_ppm)
             return error.InvalidClockRateBounds;
@@ -86,12 +86,12 @@ pub const Domain = struct {
 fn scale(delta_ns: u64, rate_ppm: i64) !i64 {
     const product = try std.math.mul(i128, @as(i128, delta_ns), @as(i128, rate_ppm));
     const value = @divTrunc(product, normal_rate_ppm);
-    if (value > std.math.maxInt(i64)) return error.SimIoClockOverflow;
+    if (value > std.math.maxInt(i64)) return error.VoprIoClockOverflow;
     return @intCast(value);
 }
 
 test "clock domain separates faults oscillator passage and timer delivery" {
-    var sim = try sim_io.SimIo.init(.{ .required = .of(&.{ .clock_read, .sleep }) });
+    var sim = try vopr_io.VoprIo.init(.{ .required = .of(&.{ .clock_read, .sleep }) });
     defer sim.deinit();
     var domain = try Domain.init(&sim, .{ .fault_budget = 4 });
     try domain.setRate(2_000_000);
@@ -110,7 +110,7 @@ test "clock domain separates faults oscillator passage and timer delivery" {
 }
 
 test "clock domain enforces fault and frequency budgets" {
-    var sim = try sim_io.SimIo.init(.{ .required = .of(&.{.clock_read}) });
+    var sim = try vopr_io.VoprIo.init(.{ .required = .of(&.{.clock_read}) });
     defer sim.deinit();
     var domain = try Domain.init(&sim, .{ .fault_budget = 1 });
     try std.testing.expectError(error.ClockRateOutOfRange, domain.setRate(0));

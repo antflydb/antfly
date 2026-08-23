@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Deterministic in-memory filesystem for SimIo.
+//! Deterministic in-memory filesystem for VoprIo.
 //!
 //! Handles are virtual integers and never reach the host. Namespace durability
 //! and file-data durability are separate: file sync persists contents, while
@@ -64,7 +64,7 @@ pub const FileSystem = struct {
     faults: Faults = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !FileSystem {
-        if (config.max_open_handles == 0) return error.InvalidSimIoFileHandleLimit;
+        if (config.max_open_handles == 0) return error.InvalidVoprIoFileHandleLimit;
         var self: FileSystem = .{ .allocator = allocator, .config = config };
         errdefer self.deinit();
         const root = try self.createNode("/", .directory, .default_dir, 0);

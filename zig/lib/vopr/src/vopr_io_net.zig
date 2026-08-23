@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Deterministic in-memory stream network for SimIo.
+//! Deterministic in-memory stream network for VoprIo.
 //!
 //! Writes enqueue logical packets. Packet delivery, including eligible
 //! reordering/drop/duplication, is selected by the VOPR scheduler. Blocking
@@ -105,8 +105,8 @@ pub const Network = struct {
     faults: Faults = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Network {
-        if (config.max_sockets == 0) return error.InvalidSimIoSocketLimit;
-        if (config.stream_capacity == 0) return error.InvalidSimIoStreamCapacity;
+        if (config.max_sockets == 0) return error.InvalidVoprIoSocketLimit;
+        if (config.stream_capacity == 0) return error.InvalidVoprIoStreamCapacity;
         return .{ .allocator = allocator, .config = config };
     }
 

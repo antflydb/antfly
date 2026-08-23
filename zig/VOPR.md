@@ -37,15 +37,15 @@ not a prerequisite for deterministic search.
 | Stable structured choices and exact clean-world replay | `lib/vopr/src/choice.zig`, `runner.zig`, `replay.zig`, canonical `vopr-trace-v1` | `zig build vopr-test` |
 | One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-test` |
 | Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; Antfly `DurableJobLane` adapter | `zig build vopr-runtime-test` |
-| Deterministic `std.Io` tasks and synchronization | `sim_io.zig`, `sim_io_task.zig` | `zig build vopr-test` in Debug and ReleaseSafe |
-| Modeled files, durability, sockets, processes, and quotas | `sim_io_file.zig`, `sim_io_net.zig`, `sim_io_process.zig` | `zig build vopr-test` |
-| Stable optional safepoints | `sim_io_instrumentation.zig` | `zig build vopr-test` |
+| Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-test` in Debug and ReleaseSafe |
+| Modeled files, durability, sockets, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-test` |
+| Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-test` |
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-test storage-sim-runtime-test` |
 | Properties, observations, semantic coverage, corpus, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-test vopr-benchmark` |
-| Replay-before-retention campaigns and deterministic workers | Antfly `sim/cli.zig` | `zig build sim-meta-test` |
-| Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `sim-reduce`, `sim-promote`, `sim-migrate` | `zig build vopr-test sim-meta-test` |
-| TLA+ export | transaction and Raft `sim-tla` dispatch | `zig build transaction-vopr-test sim-meta-test` |
-| Counterfactual causality and clean-replay branching | `causal.zig`, `debugger.zig`, `collector.zig` | `zig build vopr-test sim-meta-test` |
+| Replay-before-retention campaigns and deterministic workers | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
+| Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-test vopr-meta-test` |
+| TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
+| Counterfactual causality and clean-replay branching | `causal.zig`, `debugger.zig`, `collector.zig` | `zig build vopr-test vopr-meta-test` |
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
@@ -88,7 +88,7 @@ algorithms.
 - Put workload, message, task, timer, storage, node, and fault interleavings
   under one scheduler.
 - Run production components unchanged on `std.Io.Threaded` or deterministic
-  `SimIo` where their capability requirements are supported.
+  `VoprIo` where their capability requirements are supported.
 - Express correctness as stable named properties and distinguish product
   failures from harness failures.
 - Guide exploration with semantic state, transition, property, and optional
@@ -125,7 +125,7 @@ campaign / replay / reducer / debugger
                   |
  narrow Runtime / std.Io capability boundary
                   |
- SimIo tasks, clocks, files, sockets, processes, quotas
+ VoprIo tasks, clocks, files, sockets, processes, quotas
                   |
  Antfly metadata, Raft, storage, HA, and application adapters
 ```
@@ -144,7 +144,7 @@ The dependency rules are:
 - Antfly scenarios import VOPR and their production domains.
 - Production code depends only on narrow runtime, clock, entropy, transport,
   storage, and executor interfaces.
-- Test and campaign policy stays in `pkg/antfly/src/sim`.
+- Test and campaign policy stays in `pkg/antfly/src/vopr`.
 
 Key layout:
 
@@ -153,9 +153,9 @@ lib/vopr/src/
   choice.zig                 scenario.zig
   scheduler.zig              runner.zig
   runtime.zig                sim_runtime.zig
-  sim_io.zig                 sim_io_task.zig
-  sim_io_file.zig            sim_io_net.zig
-  sim_io_process.zig         sim_io_instrumentation.zig
+  vopr_io.zig                 vopr_io_task.zig
+  vopr_io_file.zig            vopr_io_net.zig
+  vopr_io_process.zig         vopr_io_instrumentation.zig
   time.zig                   clock_fault.zig
   fault.zig                  property.zig
   observation.zig            coverage.zig
@@ -166,13 +166,20 @@ lib/vopr/src/
   causal.zig                 debugger.zig
   collector.zig              vopr-trace-v1.schema.json
 
-pkg/antfly/src/sim/
+pkg/antfly/src/vopr/
   DETERMINISM_AUDIT.md
   cli.zig
   cli_runner.zig
   domain_vopr.zig
+  request_lifecycle.zig
   fixtures/<scenario>/
 ```
+
+`VoprIo`, the `vopr_io*.zig` modules, `pkg/antfly/src/vopr`, and `vopr-*`
+build steps are canonical. The old `sim-*` CLI and contract-test steps remain
+temporary workflow aliases. Serialized `sim-io-*` backend identifiers remain
+unchanged because they are part of the `vopr-trace-v1` replay ABI, not source
+names.
 
 Domain adapters may remain beside their production domains when that preserves
 the cleanest dependency direction.
@@ -237,11 +244,11 @@ Transition outcomes distinguish:
 
 The runner must never report a harness error as an Antfly correctness failure.
 
-## `std.Io` Simulation Runtime
+## `VoprIo` Runtime
 
-`SimIo` is an application-scoped deterministic virtual OS implemented as a real
+`VoprIo` is an application-scoped deterministic virtual OS implemented as a real
 `std.Io.VTable`. The same production component should be able to use
-`std.Io.Threaded` or `SimIo` without a second simulation-only business-logic
+`std.Io.Threaded` or `VoprIo` without a second simulation-only business-logic
 implementation.
 
 ### Fail-Closed Capability Model
@@ -377,7 +384,7 @@ Generated artifacts normally live under:
 Reviewed promoted fixtures live under:
 
 ```text
-pkg/antfly/src/sim/fixtures/<scenario>/<name>.simtrace
+pkg/antfly/src/vopr/fixtures/<scenario>/<name>.simtrace
 ```
 
 Promotion is explicit. Migration must replay the source, translate it, replay
@@ -488,7 +495,7 @@ Focused gates: `ha-vopr-test` and `ha-chaos-test`.
 
 The independent modeled scenario decomposes admission, route, virtual packet,
 Raft-log persistence, application, acknowledgement, writer-epoch handoff,
-split copy/cutover, and point/query visibility. It directly consumes `SimIo`
+split copy/cutover, and point/query visibility. It directly consumes `VoprIo`
 sockets and durable modeled files. Its focused gate also composes the real
 metadata distributed-data and per-group Raft suites.
 
@@ -549,38 +556,38 @@ or represented as a production Antfly binary.
 
 ```sh
 # Generate one history.
-zig build sim-run -- \
+zig build vopr-run -- \
   --scenario metadata \
   --seed 0xa17f0001 \
   --transitions 500 \
   --trace-out /tmp/metadata.simtrace
 
 # Exact replay, reduction, and reviewed promotion.
-zig build sim-replay -- --trace /tmp/metadata.simtrace
-zig build sim-reduce -- \
+zig build vopr-replay -- --trace /tmp/metadata.simtrace
+zig build vopr-reduce -- \
   --trace /tmp/metadata.simtrace \
   --out /tmp/metadata-reduced.simtrace
-zig build sim-promote -- \
+zig build vopr-promote -- \
   --trace /tmp/metadata-reduced.simtrace \
   --name split-leader-restart-before-finalize
 
 # Replay-proven format migration.
-zig build sim-migrate -- \
+zig build vopr-migrate -- \
   --trace /tmp/metadata-reduced.simtrace \
   --out /tmp/metadata-migrated.simtrace
 
 # Formal export and causal explanation.
-zig build sim-tla -- \
+zig build vopr-tla -- \
   --trace /tmp/metadata-reduced.simtrace \
   --domain raft \
   --out /tmp/metadata-raft.ndjson
-zig build sim-explain -- \
+zig build vopr-explain -- \
   --trace /tmp/metadata-reduced.simtrace \
   --failure 0 \
   --out /tmp/metadata-causal.json
 
 # Bounded deterministic campaign.
-zig build sim-campaign -- \
+zig build vopr-campaign -- \
   --scenario metadata \
   --histories 1000 \
   --transitions 500 \
@@ -669,11 +676,11 @@ This is the highest-value gap. Add safe borrowed-writer-lease and request
 executor suspension points around public admission, routing, timeout,
 cancellation, Raft propose/persist/apply/ack, writer handoff, split/merge copy,
 cutover, rollback, cleanup, and query result assembly. Run the real request path
-on `SimIo` without opening a second writer or weakening lease ownership.
+on `VoprIo` without opening a second writer or weakening lease ownership.
 
 ### 2. HTTP Lifecycle and Backpressure
 
-Run the common listener, executor, and disconnect observer on `SimIo`. Explore
+Run the common listener, executor, and disconnect observer on `VoprIo`. Explore
 accept versus shutdown, half-close, slow and partial writes, cancellation,
 deadlines, connection admission, descriptor exhaustion, and recovery after
 overload.
@@ -695,7 +702,7 @@ suite-local runner.
 
 ### 5. Admission and Resource Pressure
 
-Compose the production resource manager and lane admission with `SimIo` task,
+Compose the production resource manager and lane admission with `VoprIo` task,
 CPU, allocator, file-descriptor, socket, storage, and queue limits. Verify that
 overload is bounded, cancellation returns reservations, priorities make
 progress, and recovery restores capacity.
@@ -718,7 +725,7 @@ progress, and recovery restores capacity.
 
 - **Hidden host nondeterminism:** audit every scenario and fail closed on an
   unsupported `std.Io` capability.
-- **Simulator drift:** run the same component on Threaded and SimIo where
+- **Simulator drift:** run the same component on Threaded and VoprIo where
   possible and retain focused real-backend differential tests.
 - **Coarse atomicity:** document atomic boundaries and add only production-safe
   suspension points.

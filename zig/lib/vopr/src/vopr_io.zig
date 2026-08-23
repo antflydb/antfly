@@ -3,7 +3,7 @@
 
 //! Fail-closed deterministic `std.Io` boundary for VOPR.
 //!
-//! This is the capability shell underneath the staged SimIo implementation.
+//! This is the capability shell underneath the staged VoprIo implementation.
 //! It intentionally advertises only behavior implemented here. Unsupported
 //! capabilities are rejected at construction, and the vtable is cloned from
 //! `std.Io.failing` rather than from a host backend. Selected operations whose
@@ -16,11 +16,11 @@ const std = @import("std");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
-const file_mod = @import("sim_io_file.zig");
-const instrumentation_mod = @import("sim_io_instrumentation.zig");
-const net_mod = @import("sim_io_net.zig");
-const process_mod = @import("sim_io_process.zig");
-const task_mod = @import("sim_io_task.zig");
+const file_mod = @import("vopr_io_file.zig");
+const instrumentation_mod = @import("vopr_io_instrumentation.zig");
+const net_mod = @import("vopr_io_net.zig");
+const process_mod = @import("vopr_io_process.zig");
+const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
 pub const model_version: u32 = 1;
@@ -70,7 +70,7 @@ pub const CapabilitySet = struct {
 };
 
 /// Capabilities whose semantics are implemented by this file. Adding a bit is
-/// an API promise and therefore requires conformance tests on both SimIo and
+/// an API promise and therefore requires conformance tests on both VoprIo and
 /// `std.Io.Threaded`.
 pub const supported_capabilities = CapabilitySet.of(&.{
     .eager_async,
@@ -103,6 +103,9 @@ pub fn metadata() Metadata {
 }
 
 pub fn capabilityDigest(capabilities: CapabilitySet) u64 {
+    // Keep the pre-rename namespace: these strings are serialized replay ABI,
+    // not source-level type names. Changing them would invalidate trace-v1
+    // artifacts produced when VoprIo was called SimIo.
     return ids.derive(
         "sim-io-capabilities-v1",
         ids.digest(builtin.zig_version_string),
@@ -111,10 +114,11 @@ pub fn capabilityDigest(capabilities: CapabilitySet) u64 {
 }
 
 /// Canonical backend identities to place in `trace.Config.backend_ids` for
-/// every SimIo-backed scenario. This uses the existing trace-v1 extension
+/// every VoprIo-backed scenario. This uses the existing trace-v1 extension
 /// surface, so toolchain and virtual-OS compatibility are replay inputs without
 /// coupling the stable trace schema to Zig's evolving public vtable layout.
 pub fn artifactBackendIds() [4]ids.StableId {
+    // See capabilityDigest: the sim-io strings remain stable trace-v1 IDs.
     var result = [4]ids.StableId{
         ids.stable("sim-io-zig", builtin.zig_version_string),
         capabilityDigest(supported_capabilities),
@@ -132,7 +136,7 @@ pub fn validateArtifactBackendIds(actual: []const ids.StableId) !void {
         if (required_index == required.len) break;
         if (candidate == required[required_index]) required_index += 1;
     }
-    if (required_index != required.len) return error.IncompatibleSimIoBackend;
+    if (required_index != required.len) return error.IncompatibleVoprIoBackend;
 }
 
 pub const ViolationOperation = enum {
@@ -201,18 +205,18 @@ pub const Config = struct {
 
 pub const InitError = error{
     OutOfMemory,
-    UnsupportedSimIoCapabilities,
-    SimIoStackTooSmall,
-    InvalidSimIoTaskLimit,
-    InvalidSimIoFileHandleLimit,
-    InvalidSimIoSocketLimit,
-    InvalidSimIoStreamCapacity,
-    InvalidSimIoProcessLimit,
-    InvalidSimIoProgramName,
-    DuplicateSimIoProgram,
+    UnsupportedVoprIoCapabilities,
+    VoprIoStackTooSmall,
+    InvalidVoprIoTaskLimit,
+    InvalidVoprIoFileHandleLimit,
+    InvalidVoprIoSocketLimit,
+    InvalidVoprIoStreamCapacity,
+    InvalidVoprIoProcessLimit,
+    InvalidVoprIoProgramName,
+    DuplicateVoprIoProgram,
 };
 
-pub const SimIo = struct {
+pub const VoprIo = struct {
     prng: std.Random.DefaultPrng,
     monotonic_ns: i96,
     realtime_ns: i96,
@@ -229,26 +233,26 @@ pub const SimIo = struct {
     processes: process_mod.Table,
     instrumentation: instrumentation_mod.Instrumentation,
 
-    pub fn init(config: Config) InitError!SimIo {
+    pub fn init(config: Config) InitError!VoprIo {
         if (!supported_capabilities.containsAll(config.required)) {
-            return error.UnsupportedSimIoCapabilities;
+            return error.UnsupportedVoprIoCapabilities;
         }
         if (config.required.contains(.instrumentation) and !config.instrumentation.enabled)
-            return error.UnsupportedSimIoCapabilities;
+            return error.UnsupportedVoprIoCapabilities;
         var files = file_mod.FileSystem.init(config.file_allocator, config.files) catch |err| switch (err) {
-            error.InvalidSimIoFileHandleLimit => return error.InvalidSimIoFileHandleLimit,
+            error.InvalidVoprIoFileHandleLimit => return error.InvalidVoprIoFileHandleLimit,
             else => return error.OutOfMemory,
         };
         errdefer files.deinit();
         var network = net_mod.Network.init(config.net_allocator, config.network) catch |err| switch (err) {
-            error.InvalidSimIoSocketLimit => return error.InvalidSimIoSocketLimit,
-            error.InvalidSimIoStreamCapacity => return error.InvalidSimIoStreamCapacity,
+            error.InvalidVoprIoSocketLimit => return error.InvalidVoprIoSocketLimit,
+            error.InvalidVoprIoStreamCapacity => return error.InvalidVoprIoStreamCapacity,
         };
         errdefer network.deinit();
         var processes = process_mod.Table.init(config.process_allocator, config.processes) catch |err| switch (err) {
-            error.InvalidSimIoProcessLimit => return error.InvalidSimIoProcessLimit,
-            error.InvalidSimIoProgramName => return error.InvalidSimIoProgramName,
-            error.DuplicateSimIoProgram => return error.DuplicateSimIoProgram,
+            error.InvalidVoprIoProcessLimit => return error.InvalidVoprIoProcessLimit,
+            error.InvalidVoprIoProgramName => return error.InvalidVoprIoProgramName,
+            error.DuplicateVoprIoProgram => return error.DuplicateVoprIoProgram,
         };
         errdefer processes.deinit();
         return .{
@@ -265,7 +269,7 @@ pub const SimIo = struct {
         };
     }
 
-    pub fn deinit(self: *SimIo) void {
+    pub fn deinit(self: *VoprIo) void {
         self.tasks.deinit();
         self.files.deinit();
         self.network.deinit();
@@ -274,21 +278,21 @@ pub const SimIo = struct {
         self.* = undefined;
     }
 
-    pub fn io(self: *SimIo) std.Io {
+    pub fn io(self: *VoprIo) std.Io {
         self.bindNetwork();
         return .{ .userdata = self, .vtable = &vtable };
     }
 
-    pub fn scheduler(self: *SimIo) runtime_mod.SchedulerPort {
+    pub fn scheduler(self: *VoprIo) runtime_mod.SchedulerPort {
         self.bindNetwork();
         return .{ .ptr = self, .vtable = &scheduler_vtable };
     }
 
-    pub fn safepoint(self: *SimIo, stable_id: ids.StableId) std.Io.Cancelable!void {
+    pub fn safepoint(self: *VoprIo, stable_id: ids.StableId) std.Io.Cancelable!void {
         return self.instrumentation.safepoint(&self.tasks, stable_id);
     }
 
-    pub fn artifactIds(self: *const SimIo) [4]ids.StableId {
+    pub fn artifactIds(self: *const VoprIo) [4]ids.StableId {
         var result = artifactBackendIds();
         const old_instrumentation = ids.derive("sim-io-instrumentation", ids.stable("sim-io", "safepoints"), 0);
         const new_instrumentation = ids.derive(
@@ -306,7 +310,7 @@ pub const SimIo = struct {
 
     pub fn require(required: CapabilitySet) InitError!void {
         if (!supported_capabilities.containsAll(required)) {
-            return error.UnsupportedSimIoCapabilities;
+            return error.UnsupportedVoprIoCapabilities;
         }
     }
 
@@ -314,101 +318,101 @@ pub const SimIo = struct {
         return supported_capabilities.missing(required);
     }
 
-    pub fn firstCapabilityViolation(self: *const SimIo) ?CapabilityViolation {
+    pub fn firstCapabilityViolation(self: *const VoprIo) ?CapabilityViolation {
         return self.first_violation;
     }
 
-    pub fn clearCapabilityViolation(self: *SimIo) void {
+    pub fn clearCapabilityViolation(self: *VoprIo) void {
         self.violation_count = 0;
         self.first_violation = null;
     }
 
-    pub fn ensureNoCapabilityViolation(self: *const SimIo) !void {
-        if (self.first_violation != null) return error.SimIoCapabilityViolation;
+    pub fn ensureNoCapabilityViolation(self: *const VoprIo) !void {
+        if (self.first_violation != null) return error.VoprIoCapabilityViolation;
     }
 
     /// Advance the monotonic clock and ordinary realtime together. Explicit
     /// realtime jumps are modeled separately by `jumpRealtime`.
-    pub fn advance(self: *SimIo, delta_ns: u64) !void {
+    pub fn advance(self: *VoprIo, delta_ns: u64) !void {
         try self.advanceClocks(delta_ns, @intCast(delta_ns), true);
     }
 
-    pub fn jumpRealtime(self: *SimIo, delta_ns: i64) !void {
+    pub fn jumpRealtime(self: *VoprIo, delta_ns: i64) !void {
         try self.advanceClocks(0, delta_ns, true);
     }
 
-    pub fn advanceClocks(self: *SimIo, monotonic_delta_ns: u64, realtime_delta_ns: i96, deliver_timers: bool) !void {
+    pub fn advanceClocks(self: *VoprIo, monotonic_delta_ns: u64, realtime_delta_ns: i96, deliver_timers: bool) !void {
         const monotonic_delta: i96 = @intCast(monotonic_delta_ns);
         const next_monotonic = std.math.add(i96, self.monotonic_ns, monotonic_delta) catch
-            return error.SimIoClockOverflow;
+            return error.VoprIoClockOverflow;
         const next_realtime = std.math.add(i96, self.realtime_ns, realtime_delta_ns) catch
-            return error.SimIoClockOverflow;
+            return error.VoprIoClockOverflow;
         self.monotonic_ns = next_monotonic;
         self.realtime_ns = next_realtime;
         if (deliver_timers) self.tasks.wakeDue(self.monotonic_ns, self.realtime_ns);
     }
 
-    pub fn deliverDueTimers(self: *SimIo) !void {
+    pub fn deliverDueTimers(self: *VoprIo) !void {
         self.tasks.wakeDue(self.monotonic_ns, self.realtime_ns);
     }
 
-    pub fn dropNextNetworkPacket(self: *SimIo) void {
+    pub fn dropNextNetworkPacket(self: *VoprIo) void {
         self.network.faults.drop_next = true;
     }
 
-    pub fn duplicateNextNetworkPacket(self: *SimIo) void {
+    pub fn duplicateNextNetworkPacket(self: *VoprIo) void {
         self.network.faults.duplicate_next = true;
     }
 
-    pub fn setNetworkReordering(self: *SimIo, enabled: bool) void {
+    pub fn setNetworkReordering(self: *VoprIo, enabled: bool) void {
         self.network.faults.reorder = enabled;
     }
 
-    pub fn setNetworkOutage(self: *SimIo, enabled: bool) void {
+    pub fn setNetworkOutage(self: *VoprIo, enabled: bool) void {
         self.network.faults.network_down = enabled;
     }
 
-    pub fn setNetworkDeliveryPaused(self: *SimIo, paused: bool) void {
+    pub fn setNetworkDeliveryPaused(self: *VoprIo, paused: bool) void {
         self.network.faults.delivery_paused = paused;
     }
 
-    pub fn setDirectionalPartition(self: *SimIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
+    pub fn setDirectionalPartition(self: *VoprIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
         self.network.faults.partition_source = source;
         self.network.faults.partition_destination = destination;
     }
 
-    pub fn limitNextNetworkWrite(self: *SimIo, bytes: usize) !void {
+    pub fn limitNextNetworkWrite(self: *VoprIo, bytes: usize) !void {
         if (bytes == 0) return error.InvalidPartialWriteLimit;
         self.network.faults.partial_write_limit = bytes;
     }
 
-    pub fn failNextFileRead(self: *SimIo) void {
+    pub fn failNextFileRead(self: *VoprIo) void {
         self.files.faults.fail_next_read = true;
     }
 
-    pub fn failNextFileWrite(self: *SimIo) void {
+    pub fn failNextFileWrite(self: *VoprIo) void {
         self.files.faults.fail_next_write = true;
     }
 
-    pub fn dropNextFileSync(self: *SimIo) void {
+    pub fn dropNextFileSync(self: *VoprIo) void {
         self.files.faults.drop_next_sync = true;
     }
 
-    pub fn limitNextFileWrite(self: *SimIo, bytes: usize) !void {
+    pub fn limitNextFileWrite(self: *VoprIo, bytes: usize) !void {
         if (bytes == 0) return error.InvalidPartialWriteLimit;
         self.files.faults.partial_write_limit = bytes;
     }
 
-    pub fn crashFileSystem(self: *SimIo) !void {
+    pub fn crashFileSystem(self: *VoprIo) !void {
         try self.files.crash();
     }
 
-    pub fn setCpuTime(self: *SimIo, process_ns: i64, thread_ns: i64) void {
+    pub fn setCpuTime(self: *VoprIo, process_ns: i64, thread_ns: i64) void {
         self.process_cpu_ns = process_ns;
         self.thread_cpu_ns = thread_ns;
     }
 
-    fn latch(self: *SimIo, operation: ViolationOperation) void {
+    fn latch(self: *VoprIo, operation: ViolationOperation) void {
         self.violation_count +|= 1;
         if (self.first_violation == null) {
             self.first_violation = .{
@@ -422,7 +426,7 @@ pub const SimIo = struct {
         return ids.derive("sim-io.time-advance", ids.stable("sim-io", "global-time"), delta_ns);
     }
 
-    fn bindNetwork(self: *SimIo) void {
+    fn bindNetwork(self: *VoprIo) void {
         const wait_port: net_mod.WaitPort = .{ .ptr = &self.tasks, .vtable = &network_wait_vtable };
         self.network.bindWaitPort(wait_port);
         self.processes.bindWaitPort(wait_port);
@@ -444,7 +448,7 @@ const network_wait_vtable: net_mod.WaitPort.VTable = .{
     .wake = networkWake,
 };
 
-fn state(userdata: ?*anyopaque) *SimIo {
+fn state(userdata: ?*anyopaque) *VoprIo {
     return @ptrCast(@alignCast(userdata orelse unreachable));
 }
 
@@ -937,25 +941,25 @@ fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void 
     };
 }
 
-fn timeoutSleep(self: *SimIo, timeout: std.Io.Timeout) !?task_mod.Sleep {
+fn timeoutSleep(self: *VoprIo, timeout: std.Io.Timeout) !?task_mod.Sleep {
     return switch (timeout) {
         .none => null,
         .duration => |duration| blk: {
             if (duration.clock == .cpu_process or duration.clock == .cpu_thread)
-                return error.UnsupportedSimIoCpuSleep;
+                return error.UnsupportedVoprIoCpuSleep;
             const deadline = std.math.add(i96, clockValue(self, duration.clock), duration.raw.toNanoseconds()) catch
-                return error.SimIoClockOverflow;
+                return error.VoprIoClockOverflow;
             break :blk .{ .clock = duration.clock, .deadline_ns = deadline };
         },
         .deadline => |deadline| blk: {
             if (deadline.clock == .cpu_process or deadline.clock == .cpu_thread)
-                return error.UnsupportedSimIoCpuSleep;
+                return error.UnsupportedVoprIoCpuSleep;
             break :blk .{ .clock = deadline.clock, .deadline_ns = deadline.raw.toNanoseconds() };
         },
     };
 }
 
-fn clockValue(self: *const SimIo, clock: std.Io.Clock) i96 {
+fn clockValue(self: *const VoprIo, clock: std.Io.Clock) i96 {
     return switch (clock) {
         .real => self.realtime_ns,
         .awake, .boot => self.monotonic_ns,
@@ -1075,13 +1079,13 @@ fn netLookup(userdata: ?*anyopaque, host_name: std.Io.net.HostName, resolved: *s
 }
 
 fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Allocator) !void {
-    const self: *SimIo = @ptrCast(@alignCast(ptr));
+    const self: *VoprIo = @ptrCast(@alignCast(ptr));
     try self.tasks.enumerateReady(list, allocator);
     try self.network.enumerateReady(list, allocator);
     if (self.tasks.nextWakeDelta(self.monotonic_ns, self.realtime_ns)) |delta_ns| {
-        if (delta_ns == 0) return error.SimIoDueTimerNotWoken;
+        if (delta_ns == 0) return error.VoprIoDueTimerNotWoken;
         try list.append(allocator, .{
-            .id = SimIo.timeAdvanceId(delta_ns),
+            .id = VoprIo.timeAdvanceId(delta_ns),
             .name = "sim-io.time_advance",
             .kind = .scheduler,
             .resource_id = ids.stable("sim-io", "global-time"),
@@ -1091,7 +1095,7 @@ fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Al
 }
 
 fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink, allocator: std.mem.Allocator) !void {
-    const self: *SimIo = @ptrCast(@alignCast(ptr));
+    const self: *VoprIo = @ptrCast(@alignCast(ptr));
     if (try self.tasks.executeReady(transition_id)) |execution| {
         try self.ensureNoCapabilityViolation();
         try sink.emit(allocator, .{
@@ -1118,9 +1122,9 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
     }
 
     const delta_ns = self.tasks.nextWakeDelta(self.monotonic_ns, self.realtime_ns) orelse
-        return error.UnknownSimIoTransition;
-    if (delta_ns == 0 or transition_id != SimIo.timeAdvanceId(delta_ns))
-        return error.UnknownSimIoTransition;
+        return error.UnknownVoprIoTransition;
+    if (delta_ns == 0 or transition_id != VoprIo.timeAdvanceId(delta_ns))
+        return error.UnknownVoprIoTransition;
     try self.advance(delta_ns);
     try sink.emit(allocator, .{
         .id = ids.stable("event", "sim-io.time_advanced"),
@@ -1132,7 +1136,7 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
 }
 
 fn quiescent(ptr: *anyopaque) bool {
-    const self: *SimIo = @ptrCast(@alignCast(ptr));
+    const self: *VoprIo = @ptrCast(@alignCast(ptr));
     return self.tasks.isQuiescent() and self.network.isQuiescent();
 }
 
@@ -1259,32 +1263,32 @@ const vtable: std.Io.VTable = blk: {
     break :blk result;
 };
 
-test "SimIo capability construction fails before exposing unsupported services" {
-    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files, .sockets, .processes, .resources }));
+test "VoprIo capability construction fails before exposing unsupported services" {
+    try VoprIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files, .sockets, .processes, .resources }));
     try std.testing.expectError(
-        error.UnsupportedSimIoCapabilities,
-        SimIo.init(.{ .required = .of(&.{.instrumentation}) }),
+        error.UnsupportedVoprIoCapabilities,
+        VoprIo.init(.{ .required = .of(&.{.instrumentation}) }),
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes, .resources, .instrumentation })).bits,
+        VoprIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes, .resources, .instrumentation })).bits,
     );
-    var instrumented = try SimIo.init(.{
+    var instrumented = try VoprIo.init(.{
         .required = .of(&.{.instrumentation}),
         .instrumentation = .{ .enabled = true, .map_digest = 17 },
     });
     instrumented.deinit();
 }
 
-test "SimIo clocks and entropy are deterministic and host independent" {
-    var left = try SimIo.init(.{
+test "VoprIo clocks and entropy are deterministic and host independent" {
+    var left = try VoprIo.init(.{
         .required = .of(&.{ .clock_read, .deterministic_entropy }),
         .seed = 0x51_4d_49_4f,
         .monotonic_ns = 100,
         .realtime_ns = 1_000,
     });
     defer left.deinit();
-    var right = try SimIo.init(.{
+    var right = try VoprIo.init(.{
         .required = .of(&.{ .clock_read, .deterministic_entropy }),
         .seed = 0x51_4d_49_4f,
         .monotonic_ns = 100,
@@ -1311,8 +1315,8 @@ test "SimIo clocks and entropy are deterministic and host independent" {
     try left.ensureNoCapabilityViolation();
 }
 
-test "SimIo unsupported operations latch a deterministic harness violation" {
-    var sim = try SimIo.init(.{});
+test "VoprIo unsupported operations latch a deterministic harness violation" {
+    var sim = try VoprIo.init(.{});
     defer sim.deinit();
     const io = sim.io();
     try std.testing.expectError(
@@ -1325,15 +1329,15 @@ test "SimIo unsupported operations latch a deterministic harness violation" {
         std.Io.Dir.cwd().symLink(io, "target", "unsupported", .{}),
     );
     try std.testing.expectEqual(ViolationOperation.directory_symbolic_link, sim.firstCapabilityViolation().?.operation);
-    try std.testing.expectError(error.SimIoCapabilityViolation, sim.ensureNoCapabilityViolation());
+    try std.testing.expectError(error.VoprIoCapabilityViolation, sim.ensureNoCapabilityViolation());
 
     sim.clearCapabilityViolation();
     _ = io.vtable.netSend(io.userdata, 0, &.{}, .{});
     try std.testing.expectEqual(ViolationOperation.network_send, sim.firstCapabilityViolation().?.operation);
 }
 
-test "SimIo vtable contains no std.Io.Threaded handlers" {
-    var sim = try SimIo.init(.{});
+test "VoprIo vtable contains no std.Io.Threaded handlers" {
+    var sim = try VoprIo.init(.{});
     defer sim.deinit();
     const io = sim.io();
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1351,17 +1355,17 @@ test "SimIo vtable contains no std.Io.Threaded handlers" {
     try std.testing.expect(info.capability_digest != 0);
 }
 
-test "SimIo replay backend identities are canonical and compatibility checked" {
+test "VoprIo replay backend identities are canonical and compatibility checked" {
     const backend_ids = artifactBackendIds();
     try ids.validateCanonical(&backend_ids);
     try validateArtifactBackendIds(&backend_ids);
     try std.testing.expectError(
-        error.IncompatibleSimIoBackend,
+        error.IncompatibleVoprIoBackend,
         validateArtifactBackendIds(backend_ids[1..]),
     );
 }
 
-test "SimIo scheduler controls nested futures and virtual sleep" {
+test "VoprIo scheduler controls nested futures and virtual sleep" {
     const Shared = struct {
         io: std.Io,
         order: [5]u8 = [_]u8{0} ** 5,
@@ -1388,7 +1392,7 @@ test "SimIo scheduler controls nested futures and virtual sleep" {
         }
     };
 
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{ .task_scheduling, .sleep, .clock_read }),
     });
     defer sim.deinit();
@@ -1413,7 +1417,7 @@ test "SimIo scheduler controls nested futures and virtual sleep" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo groups and futex wake ordering remain scheduler visible" {
+test "VoprIo groups and futex wake ordering remain scheduler visible" {
     const Shared = struct {
         io: std.Io,
         futex: u32 align(@alignOf(u32)) = 0,
@@ -1435,7 +1439,7 @@ test "SimIo groups and futex wake ordering remain scheduler visible" {
         }
     };
 
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{ .task_scheduling, .synchronization }),
     });
     defer sim.deinit();
@@ -1468,7 +1472,7 @@ test "SimIo groups and futex wake ordering remain scheduler visible" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo future cancellation is delivered at a task cancellation point" {
+test "VoprIo future cancellation is delivered at a task cancellation point" {
     const Shared = struct {
         io: std.Io,
         canceled: bool = false,
@@ -1489,7 +1493,7 @@ test "SimIo future cancellation is delivered at a task cancellation point" {
         }
     };
 
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{ .task_scheduling, .sleep }),
     });
     defer sim.deinit();
@@ -1513,7 +1517,7 @@ test "SimIo future cancellation is delivered at a task cancellation point" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo runs std.Io mutex queue and select on the futex kernel" {
+test "VoprIo runs std.Io mutex queue and select on the futex kernel" {
     const Selected = union(enum) { fast: u8, slow: u8 };
     const Shared = struct {
         io: std.Io,
@@ -1556,7 +1560,7 @@ test "SimIo runs std.Io mutex queue and select on the futex kernel" {
         }
     };
 
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{ .task_scheduling, .synchronization, .sleep }),
     });
     defer sim.deinit();
@@ -1581,8 +1585,8 @@ test "SimIo runs std.Io mutex queue and select on the futex kernel" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo core modeled files execute through std.Io and survive only durable syncs" {
-    var sim = try SimIo.init(.{});
+test "VoprIo core modeled files execute through std.Io and survive only durable syncs" {
+    var sim = try VoprIo.init(.{});
     defer sim.deinit();
     const io = sim.io();
 
@@ -1611,8 +1615,8 @@ test "SimIo core modeled files execute through std.Io and survive only durable s
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo modeled file surface supports deterministic iteration atomic replace locks and mappings" {
-    var sim = try SimIo.init(.{ .required = .of(&.{.files}) });
+test "VoprIo modeled file surface supports deterministic iteration atomic replace locks and mappings" {
+    var sim = try VoprIo.init(.{ .required = .of(&.{.files}) });
     defer sim.deinit();
     const io = sim.io();
 
@@ -1667,7 +1671,7 @@ test "SimIo modeled file surface supports deterministic iteration atomic replace
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo stream sockets expose packet delivery and waiter wake choices" {
+test "VoprIo stream sockets expose packet delivery and waiter wake choices" {
     const Shared = struct {
         io: std.Io,
         server: *std.Io.net.Server,
@@ -1704,7 +1708,7 @@ test "SimIo stream sockets expose packet delivery and waiter wake choices" {
         }
     };
 
-    var sim = try SimIo.init(.{ .required = .of(&.{.sockets}) });
+    var sim = try VoprIo.init(.{ .required = .of(&.{.sockets}) });
     defer sim.deinit();
     const io = sim.io();
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31_337) };
@@ -1740,7 +1744,7 @@ test "SimIo stream sockets expose packet delivery and waiter wake choices" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo registered processes spawn pause resume and wait through std.process" {
+test "VoprIo registered processes spawn pause resume and wait through std.process" {
     const Program = struct {
         fn run(context: *process_mod.Context, argv: []const []const u8) u8 {
             context.checkpoint(3) catch return 99;
@@ -1760,7 +1764,7 @@ test "SimIo registered processes spawn pause resume and wait through std.process
         .name = "worker",
         .start = Program.run,
     }};
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{.processes}),
         .processes = .{ .registrations = &registrations },
     });
@@ -1815,8 +1819,8 @@ test "SimIo registered processes spawn pause resume and wait through std.process
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo resource capability enforces file socket and storage quotas" {
-    var sim = try SimIo.init(.{
+test "VoprIo resource capability enforces file socket and storage quotas" {
+    var sim = try VoprIo.init(.{
         .required = .of(&.{.resources}),
         .files = .{ .max_open_handles = 1, .capacity_bytes = 4 },
         .network = .{ .max_sockets = 2, .stream_capacity = 4 },
@@ -1843,11 +1847,11 @@ test "SimIo resource capability enforces file socket and storage quotas" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "SimIo stable safepoints yield and produce canonical instrumentation feedback" {
+test "VoprIo stable safepoints yield and produce canonical instrumentation feedback" {
     const Shared = struct {
         const point_a = ids.stable("safepoint", "test.cpu.a");
         const point_b = ids.stable("safepoint", "test.cpu.b");
-        sim: *SimIo,
+        sim: *VoprIo,
         completed: u32 = 0,
 
         fn worker(self: *@This()) void {
@@ -1856,7 +1860,7 @@ test "SimIo stable safepoints yield and produce canonical instrumentation feedba
             self.completed += 1;
         }
     };
-    var sim = try SimIo.init(.{
+    var sim = try VoprIo.init(.{
         .required = .of(&.{ .task_scheduling, .instrumentation }),
         .instrumentation = .{ .enabled = true, .map_digest = 0x51de },
     });

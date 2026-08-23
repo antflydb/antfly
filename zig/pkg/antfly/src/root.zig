@@ -93,9 +93,10 @@ pub const internal = @import("internal/mod.zig");
 // Tracing (TLA+ trace validation)
 pub const tracing = @import("tracing/mod.zig");
 
-// Deterministic simulation contracts and replay artifacts.
-pub const sim = @import("vopr");
-pub const domain_vopr = @import("sim/domain_vopr.zig");
+// Deterministic VOPR contracts, campaign policy, and replay artifacts.
+pub const vopr = @import("vopr");
+pub const domain_vopr = @import("vopr/domain_vopr.zig");
+pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
@@ -286,7 +287,7 @@ test {
     _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;
-    _ = sim;
+    _ = vopr;
     _ = metadata_api;
     _ = metadata_admin;
     _ = metadata_http_routes;
@@ -340,6 +341,7 @@ test {
     _ = transactions;
     _ = transaction_vopr;
     _ = domain_vopr;
+    _ = request_lifecycle_vopr;
     _ = schema;
     _ = object_storage;
     _ = host_environment;

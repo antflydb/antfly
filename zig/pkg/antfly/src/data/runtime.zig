@@ -4934,10 +4934,7 @@ pub const DataServer = struct {
         _ = self.read_source.withIo(&self.query_io_impl.?);
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
-        const restore_io = if (self.backend_runtime) |runtime|
-            if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
-        else
-            null;
+        const restore_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null;
         _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
         _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
@@ -10418,9 +10415,9 @@ pub const DataServer = struct {
         self.reporter_incarnation_mutex.unlock();
 
         const runtime = try self.ensureBackendRuntime();
-        const io_impl = runtime.apiIoImpl() orelse return error.BackendRuntimeUnavailable;
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         var candidate: u64 = 0;
-        while (candidate == 0) try io_impl.io().randomSecure(std.mem.asBytes(&candidate));
+        while (candidate == 0) try io.randomSecure(std.mem.asBytes(&candidate));
         lockAtomic(&self.reporter_incarnation_mutex);
         defer self.reporter_incarnation_mutex.unlock();
         if (self.reporter_incarnation == 0) self.reporter_incarnation = candidate;

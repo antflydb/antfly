@@ -3813,6 +3813,7 @@ pub fn build(b: *std.Build) void {
         "native executor borrows validate before reconstructing std.Io",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "httpx write admission rejects saturated table mutations",
+        "httpx request lifecycle hook suspends after admission without leaking capacity",
         "httpx inference connection uses the configured shared admission owner",
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
@@ -6690,17 +6691,19 @@ pub fn build(b: *std.Build) void {
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_status_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_runtime_tests.step);
 
-    const sim_contract_test_mod = b.createModule(.{
+    const vopr_contract_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/vopr/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const sim_contract_tests = b.addTest(.{ .root_module = sim_contract_test_mod });
-    const run_sim_contract_tests = b.addRunArtifact(sim_contract_tests);
+    const vopr_contract_tests = b.addTest(.{ .root_module = vopr_contract_test_mod });
+    const run_vopr_contract_tests = b.addRunArtifact(vopr_contract_tests);
     const vopr_test_step = b.step("vopr-test", "Run standalone VOPR engine and replay tests");
-    vopr_test_step.dependOn(&run_sim_contract_tests.step);
-    const sim_contract_test_step = b.step("sim-contract-test", "Run deterministic simulation contract and replay-equivalence tests");
-    sim_contract_test_step.dependOn(&run_sim_contract_tests.step);
+    vopr_test_step.dependOn(&run_vopr_contract_tests.step);
+    const vopr_contract_test_step = b.step("vopr-contract-test", "Run deterministic VOPR contract and replay-equivalence tests");
+    vopr_contract_test_step.dependOn(&run_vopr_contract_tests.step);
+    const sim_contract_test_compat_step = b.step("sim-contract-test", "Compatibility alias for vopr-contract-test");
+    sim_contract_test_compat_step.dependOn(&run_vopr_contract_tests.step);
 
     const vopr_benchmark_mod = b.createModule(.{
         .root_source_file = b.path("lib/vopr/src/benchmark_main.zig"),
@@ -6712,39 +6715,43 @@ pub fn build(b: *std.Build) void {
     const vopr_benchmark_step = b.step("vopr-benchmark", "Run deterministic VOPR search-efficiency benchmarks");
     vopr_benchmark_step.dependOn(&b.addRunArtifact(vopr_benchmark).step);
 
-    const sim_cli_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/sim/cli.zig"),
+    const vopr_cli_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/vopr/cli.zig"),
         .target = target,
         .optimize = optimize,
     });
-    sim_cli_mod.addImport("antfly", lib_test_mod);
-    sim_cli_mod.addImport("vopr", vopr_mod);
-    sim_cli_mod.link_libc = true;
-    // Antfly's simulated scenarios deliberately use std.testing facilities.
+    vopr_cli_mod.addImport("antfly", lib_test_mod);
+    vopr_cli_mod.addImport("vopr", vopr_mod);
+    vopr_cli_mod.link_libc = true;
+    // Antfly's VOPR scenarios deliberately use std.testing facilities.
     // A custom runner makes the test artifact behave as a normal command-line
     // program while retaining the harness-only compilation contract.
-    const sim_cli = b.addTest(.{
+    const vopr_cli = b.addTest(.{
         .name = "vopr",
-        .root_module = sim_cli_mod,
+        .root_module = vopr_cli_mod,
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/sim/cli_runner.zig"),
+            .path = b.path("pkg/antfly/src/vopr/cli_runner.zig"),
             .mode = .simple,
         },
     });
-    const sim_cli_meta_tests = b.addTest(.{
-        .root_module = sim_cli_mod,
+    const vopr_cli_meta_tests = b.addTest(.{
+        .root_module = vopr_cli_mod,
         .filters = &.{"Antfly injected bug is discovered replayed reduced and promoted"},
     });
-    const run_sim_cli_meta_tests = b.addRunArtifact(sim_cli_meta_tests);
-    const sim_meta_test_step = b.step("sim-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
-    sim_meta_test_step.dependOn(&run_sim_cli_meta_tests.step);
-    const sim_cli_registry_tests = b.addTest(.{
-        .root_module = sim_cli_mod,
+    const run_vopr_cli_meta_tests = b.addRunArtifact(vopr_cli_meta_tests);
+    const vopr_meta_test_step = b.step("vopr-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
+    vopr_meta_test_step.dependOn(&run_vopr_cli_meta_tests.step);
+    const sim_meta_test_compat_step = b.step("sim-meta-test", "Compatibility alias for vopr-meta-test");
+    sim_meta_test_compat_step.dependOn(&run_vopr_cli_meta_tests.step);
+    const vopr_cli_registry_tests = b.addTest(.{
+        .root_module = vopr_cli_mod,
         .filters = &.{"VOPR scenario registry"},
     });
-    const run_sim_cli_registry_tests = b.addRunArtifact(sim_cli_registry_tests);
-    const sim_registry_test_step = b.step("sim-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
-    sim_registry_test_step.dependOn(&run_sim_cli_registry_tests.step);
+    const run_vopr_cli_registry_tests = b.addRunArtifact(vopr_cli_registry_tests);
+    const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
+    vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
+    const sim_registry_test_compat_step = b.step("sim-registry-test", "Compatibility alias for vopr-registry-test");
+    sim_registry_test_compat_step.dependOn(&run_vopr_cli_registry_tests.step);
 
     const transaction_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6774,6 +6781,19 @@ pub fn build(b: *std.Build) void {
     data_plane_vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
     data_plane_vopr_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
     data_plane_vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
+
+    const request_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"request lifecycle adapter records stable VoprIo safepoints"},
+    });
+    const run_request_lifecycle_vopr_tests = b.addRunArtifact(request_lifecycle_vopr_tests);
+    const request_lifecycle_vopr_test_step = b.step(
+        "request-lifecycle-vopr-test",
+        "Run production request lifecycle suspension points on VoprIo",
+    );
+    request_lifecycle_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
+    request_lifecycle_vopr_test_step.dependOn(&run_api_http_runtime_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
 
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6826,59 +6846,76 @@ pub fn build(b: *std.Build) void {
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
-    const run_sim_cli = b.addRunArtifact(sim_cli);
-    run_sim_cli.addArg("run");
-    if (b.args) |args| run_sim_cli.addArgs(args);
-    const sim_run_step = b.step("sim-run", "Run one deterministic generated VOPR history");
-    sim_run_step.dependOn(&run_sim_cli.step);
+    const run_vopr_cli = b.addRunArtifact(vopr_cli);
+    run_vopr_cli.addArg("run");
+    if (b.args) |args| run_vopr_cli.addArgs(args);
+    const vopr_run_step = b.step("vopr-run", "Run one deterministic generated VOPR history");
+    vopr_run_step.dependOn(&run_vopr_cli.step);
+    const sim_run_compat_step = b.step("sim-run", "Compatibility alias for vopr-run");
+    sim_run_compat_step.dependOn(&run_vopr_cli.step);
 
-    const replay_sim_cli = b.addRunArtifact(sim_cli);
-    replay_sim_cli.addArg("replay");
-    if (b.args) |args| replay_sim_cli.addArgs(args);
-    const sim_replay_step = b.step("sim-replay", "Replay one exact VOPR artifact");
-    sim_replay_step.dependOn(&replay_sim_cli.step);
+    const replay_vopr_cli = b.addRunArtifact(vopr_cli);
+    replay_vopr_cli.addArg("replay");
+    if (b.args) |args| replay_vopr_cli.addArgs(args);
+    const vopr_replay_step = b.step("vopr-replay", "Replay one exact VOPR artifact");
+    vopr_replay_step.dependOn(&replay_vopr_cli.step);
+    const sim_replay_compat_step = b.step("sim-replay", "Compatibility alias for vopr-replay");
+    sim_replay_compat_step.dependOn(&replay_vopr_cli.step);
 
-    const campaign_sim_cli = b.addRunArtifact(sim_cli);
-    campaign_sim_cli.addArg("campaign");
-    if (b.args) |args| campaign_sim_cli.addArgs(args);
-    const sim_campaign_step = b.step("sim-campaign", "Run a bounded parallel VOPR campaign");
-    sim_campaign_step.dependOn(&campaign_sim_cli.step);
+    const campaign_vopr_cli = b.addRunArtifact(vopr_cli);
+    campaign_vopr_cli.addArg("campaign");
+    if (b.args) |args| campaign_vopr_cli.addArgs(args);
+    const vopr_campaign_step = b.step("vopr-campaign", "Run a bounded parallel VOPR campaign");
+    vopr_campaign_step.dependOn(&campaign_vopr_cli.step);
+    const sim_campaign_compat_step = b.step("sim-campaign", "Compatibility alias for vopr-campaign");
+    sim_campaign_compat_step.dependOn(&campaign_vopr_cli.step);
 
-    const reduce_sim_cli = b.addRunArtifact(sim_cli);
-    reduce_sim_cli.addArg("reduce");
-    if (b.args) |args| reduce_sim_cli.addArgs(args);
-    const sim_reduce_step = b.step("sim-reduce", "Reduce a VOPR failure while preserving its fingerprint");
-    sim_reduce_step.dependOn(&reduce_sim_cli.step);
+    const reduce_vopr_cli = b.addRunArtifact(vopr_cli);
+    reduce_vopr_cli.addArg("reduce");
+    if (b.args) |args| reduce_vopr_cli.addArgs(args);
+    const vopr_reduce_step = b.step("vopr-reduce", "Reduce a VOPR failure while preserving its fingerprint");
+    vopr_reduce_step.dependOn(&reduce_vopr_cli.step);
+    const sim_reduce_compat_step = b.step("sim-reduce", "Compatibility alias for vopr-reduce");
+    sim_reduce_compat_step.dependOn(&reduce_vopr_cli.step);
 
-    const promote_sim_cli = b.addRunArtifact(sim_cli);
-    promote_sim_cli.addArg("promote");
-    if (b.args) |args| promote_sim_cli.addArgs(args);
-    const sim_promote_step = b.step("sim-promote", "Promote a reviewed reduced VOPR failure fixture");
-    sim_promote_step.dependOn(&promote_sim_cli.step);
+    const promote_vopr_cli = b.addRunArtifact(vopr_cli);
+    promote_vopr_cli.addArg("promote");
+    if (b.args) |args| promote_vopr_cli.addArgs(args);
+    const vopr_promote_step = b.step("vopr-promote", "Promote a reviewed reduced VOPR failure fixture");
+    vopr_promote_step.dependOn(&promote_vopr_cli.step);
+    const sim_promote_compat_step = b.step("sim-promote", "Compatibility alias for vopr-promote");
+    sim_promote_compat_step.dependOn(&promote_vopr_cli.step);
 
-    const migrate_sim_cli = b.addRunArtifact(sim_cli);
-    migrate_sim_cli.addArg("migrate");
-    if (b.args) |args| migrate_sim_cli.addArgs(args);
-    const sim_migrate_step = b.step("sim-migrate", "Migrate a VOPR artifact after proving equivalent replay outcomes");
-    sim_migrate_step.dependOn(&migrate_sim_cli.step);
+    const migrate_vopr_cli = b.addRunArtifact(vopr_cli);
+    migrate_vopr_cli.addArg("migrate");
+    if (b.args) |args| migrate_vopr_cli.addArgs(args);
+    const vopr_migrate_step = b.step("vopr-migrate", "Migrate a VOPR artifact after proving equivalent replay outcomes");
+    vopr_migrate_step.dependOn(&migrate_vopr_cli.step);
+    const sim_migrate_compat_step = b.step("sim-migrate", "Compatibility alias for vopr-migrate");
+    sim_migrate_compat_step.dependOn(&migrate_vopr_cli.step);
 
-    const tla_sim_cli = b.addRunArtifact(sim_cli);
-    tla_sim_cli.addArg("tla");
-    if (b.args) |args| tla_sim_cli.addArgs(args);
-    const sim_tla_step = b.step("sim-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
-    sim_tla_step.dependOn(&tla_sim_cli.step);
+    const tla_vopr_cli = b.addRunArtifact(vopr_cli);
+    tla_vopr_cli.addArg("tla");
+    if (b.args) |args| tla_vopr_cli.addArgs(args);
+    const vopr_tla_step = b.step("vopr-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
+    vopr_tla_step.dependOn(&tla_vopr_cli.step);
+    const sim_tla_compat_step = b.step("sim-tla", "Compatibility alias for vopr-tla");
+    sim_tla_compat_step.dependOn(&tla_vopr_cli.step);
 
-    const explain_sim_cli = b.addRunArtifact(sim_cli);
-    explain_sim_cli.addArg("explain");
-    if (b.args) |args| explain_sim_cli.addArgs(args);
-    const sim_explain_step = b.step("sim-explain", "Exact-replay a failing VOPR artifact and render its semantic causal slice");
-    sim_explain_step.dependOn(&explain_sim_cli.step);
+    const explain_vopr_cli = b.addRunArtifact(vopr_cli);
+    explain_vopr_cli.addArg("explain");
+    if (b.args) |args| explain_vopr_cli.addArgs(args);
+    const vopr_explain_step = b.step("vopr-explain", "Exact-replay a failing VOPR artifact and render its semantic causal slice");
+    vopr_explain_step.dependOn(&explain_vopr_cli.step);
+    const sim_explain_compat_step = b.step("sim-explain", "Compatibility alias for vopr-explain");
+    sim_explain_compat_step.dependOn(&explain_vopr_cli.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
-    sim_test_step.dependOn(&run_sim_contract_tests.step);
+    sim_test_step.dependOn(&run_vopr_contract_tests.step);
     sim_test_step.dependOn(&run_transaction_vopr_tests.step);
     sim_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
     sim_test_step.dependOn(&run_data_plane_vopr_tests.step);
+    sim_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     sim_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     sim_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     sim_test_step.dependOn(&run_clock_fault_vopr_tests.step);
@@ -6889,8 +6926,8 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_lib_raft_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
-    sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
-    sim_test_step.dependOn(&run_sim_cli_registry_tests.step);
+    sim_test_step.dependOn(&run_vopr_cli_meta_tests.step);
+    sim_test_step.dependOn(&run_vopr_cli_registry_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
@@ -7873,6 +7910,7 @@ pub fn build(b: *std.Build) void {
             "storage.lsm.",
             "storage.lsm_backend.",
             "storage.lsm_backend_sim_test.",
+            "storage.lsm_vopr.",
         },
         &.{
             "storage.backend_adapter.",
@@ -7882,28 +7920,35 @@ pub fn build(b: *std.Build) void {
             "storage.background_runtime.",
             "storage.backup_codec.",
             "storage.coverage_identity.",
+            "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
             "storage.hbc_adapter.",
             "storage.hierarchy_navigation.",
+            "storage.index_manager_vopr.",
             "storage.internal_keys.",
             "storage.lmdb.",
             "storage.lmdb_backend.",
+            "storage.lmdb_vopr.",
             "storage.maintenance.",
             "storage.mem_backend.",
             "storage.mem_ordered.",
             "storage.object_storage.",
             "storage.persistent.",
+            "storage.persistent_vopr.",
             "storage.portable_backup.",
             "storage.resource_manager.",
             "storage.schema.",
             "storage.shard.",
             "storage.sim_runtime.",
             "storage.transactions.",
+            "storage.transaction_vopr.",
             "storage.ttl.",
+            "storage.vopr_durable_job_lane.",
             "storage.wal.",
+            "storage.wal_vopr.",
         },
     };
     const unit_storage_db_core_shard_index = 3;

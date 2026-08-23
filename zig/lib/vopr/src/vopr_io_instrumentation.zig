@@ -1,11 +1,11 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Stable optional safepoints and search feedback for SimIo.
+//! Stable optional safepoints and search feedback for VoprIo.
 
 const std = @import("std");
 const ids = @import("id.zig");
-const task = @import("sim_io_task.zig");
+const task = @import("vopr_io_task.zig");
 
 pub const Config = struct {
     enabled: bool = false,

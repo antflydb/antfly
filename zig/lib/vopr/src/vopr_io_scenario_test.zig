@@ -11,7 +11,7 @@ const outcome = @import("outcome.zig");
 const property = @import("property.zig");
 const replay = @import("replay.zig");
 const runner = @import("runner.zig");
-const sim_io = @import("sim_io.zig");
+const vopr_io = @import("vopr_io.zig");
 const transition = @import("transition.zig");
 
 const Scenario = struct {
@@ -40,14 +40,14 @@ const Scenario = struct {
     };
 
     pub const World = struct {
-        sim: *sim_io.SimIo,
+        sim: *vopr_io.VoprIo,
         shared: *Shared,
     };
 
     pub fn init(allocator: std.mem.Allocator) !World {
-        const sim = try allocator.create(sim_io.SimIo);
+        const sim = try allocator.create(vopr_io.VoprIo);
         errdefer allocator.destroy(sim);
-        sim.* = try sim_io.SimIo.init(.{
+        sim.* = try vopr_io.VoprIo.init(.{
             .required = .of(&.{ .task_scheduling, .sleep, .clock_read }),
             .seed = 0x51_4d_49_4f,
         });
@@ -93,8 +93,8 @@ const Scenario = struct {
     }
 };
 
-test "SimIo fiber histories exact replay through the VOPR runner" {
-    const backend_ids = sim_io.artifactBackendIds();
+test "VoprIo fiber histories exact replay through the VOPR runner" {
+    const backend_ids = vopr_io.artifactBackendIds();
     var seeded = choice.Seeded.init(0x51_4d_49_4f);
     var recorded = try runner.run(Scenario, std.testing.allocator, seeded.source(), .{
         .system = "vopr-test",
@@ -106,7 +106,7 @@ test "SimIo fiber histories exact replay through the VOPR runner" {
         .optimize = @tagName(@import("builtin").mode),
     });
     defer recorded.deinit();
-    try sim_io.validateArtifactBackendIds(recorded.config.backend_ids);
+    try vopr_io.validateArtifactBackendIds(recorded.config.backend_ids);
     try std.testing.expect(recorded.choices.items.len >= 6);
     for (0..100) |_| {
         var replayed = try replay.exact(Scenario, std.testing.allocator, &recorded);

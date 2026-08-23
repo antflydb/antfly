@@ -659,6 +659,32 @@ pub const HAMutationPolicySource = struct {
     }
 };
 
+/// Production-owned suspension and observation seam for deterministic request
+/// lifecycle testing. The interface deliberately carries semantic phases and
+/// operation IDs rather than VOPR types, so production code remains unaware of
+/// the explorer. Hooks may block/yield and may fail the request before product
+/// state changes; callers use this to expose safe scheduler boundaries on any
+/// `std.Io` backend.
+pub const RequestLifecyclePhase = enum {
+    ingress,
+    admission_acquired,
+    response_ready,
+};
+
+pub const RequestLifecycleEvent = struct {
+    phase: RequestLifecyclePhase,
+    operation_id: ?[]const u8 = null,
+};
+
+pub const RequestLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: RequestLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: RequestLifecycleHook, event: RequestLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
 /// Optional request-count admission owner for an embedded inference runtime.
 /// API-only processes omit this and use their local fallback admission gate.
 pub const InferenceRequestAdmissionSource = struct {
@@ -696,6 +722,9 @@ pub const ApiHttpServerConfig = struct {
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
+    /// Optional deterministic suspension/observation seam. The owner must
+    /// outlive the API server and every in-flight request.
+    request_lifecycle_hook: ?RequestLifecycleHook = null,
     /// Explicit in-process transport for the reserved local-inference virtual
     /// connection. The destination route owns admission and no public listener
     /// connection is consumed. Configured connections are always remote.
@@ -2052,7 +2081,7 @@ pub const ApiHttpServer = struct {
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
         if (cfg.backend_runtime) |runtime| {
-            if (runtime.apiIoImpl()) |io_impl| return io_impl.io();
+            if (runtime.apiIo()) |io| return io;
         }
         return std.Io.Threaded.global_single_threaded.io();
     }
@@ -2078,6 +2107,15 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
+    }
+
+    pub fn reachRequestLifecycle(
+        self: *ApiHttpServer,
+        phase: RequestLifecyclePhase,
+        operation_id: ?[]const u8,
+    ) !void {
+        const hook = self.cfg.request_lifecycle_hook orelse return;
+        try hook.reach(.{ .phase = phase, .operation_id = operation_id });
     }
 
     pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
@@ -2454,7 +2492,7 @@ pub const ApiHttpServer = struct {
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
             .io = if (self.cfg.backend_runtime) |runtime|
-                if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
+                runtime.apiIo()
             else
                 null,
         }, &self.connections_cache, .{
@@ -2525,8 +2563,7 @@ pub const ApiHttpServer = struct {
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
         const runtime = self.cfg.backend_runtime orelse return null;
-        const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return null;
-        return io_impl.io();
+        return runtime.apiIo();
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -11753,10 +11790,10 @@ pub const ApiHttpServer = struct {
         fn run(ptr: *anyopaque) !void {
             const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
             const runtime = self.server.cfg.backend_runtime orelse return;
-            const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return;
+            const io = runtime.apiIo() orelse return;
             var elapsed_ns: u64 = 0;
             while (!self.stop.load(.acquire)) {
-                io_impl.io().sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
                 if (self.stop.load(.acquire)) break;
                 elapsed_ns +|= poll_ns;
                 if (elapsed_ns < interval_ns) continue;
@@ -11814,7 +11851,7 @@ pub const ApiHttpServer = struct {
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
-        if (runtime.apiIoImpl() == null and runtime.io_impl == null) return null;
+        if (runtime.apiIo() == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
         const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
