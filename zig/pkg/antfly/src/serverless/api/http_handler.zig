@@ -5626,8 +5626,9 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 
 const ServerlessIndexStatus = struct {
     readiness_ready: bool,
+    readiness_incarnation: u64,
     readiness_target_revision: u64,
-    readiness_published_revision: u64,
+    readiness_published_revision: ?u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -5703,7 +5704,7 @@ fn appendServerlessIndexEntry(
 ) !void {
     const config_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(config, .{})});
     defer alloc.free(config_json);
-    const runtime = try serverlessIndexStatus(index_name, config, status);
+    const runtime = try serverlessIndexStatus(index_name, config, config_json, status);
     try out.appendSlice(alloc, "{\"config\":");
     try out.appendSlice(alloc, config_json);
     try out.appendSlice(alloc, ",\"status\":");
@@ -5720,11 +5721,15 @@ fn appendServerlessIndexStatusJson(
     try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
     const readiness_identity = try std.fmt.allocPrint(
         alloc,
-        ",\"incarnation\":\"sv-{x:0>16}\",\"target_revision\":{},\"published_revision\":{},\"pending_reasons\":",
-        .{ status.readiness_target_revision, status.readiness_target_revision, status.readiness_published_revision },
+        ",\"incarnation\":\"sv-{x:0>16}\",\"target_revision\":{}",
+        .{ status.readiness_incarnation, status.readiness_target_revision },
     );
     defer alloc.free(readiness_identity);
     try out.appendSlice(alloc, readiness_identity);
+    if (status.readiness_published_revision) |published_revision| {
+        try out.print(alloc, ",\"published_revision\":{}", .{published_revision});
+    }
+    try out.appendSlice(alloc, ",\"pending_reasons\":");
     if (status.readiness_ready) {
         try out.appendSlice(alloc, "[]}");
     } else if (status.materialization_blocked) {
@@ -5859,6 +5864,7 @@ fn appendServerlessIndexStatusJson(
 fn serverlessIndexStatus(
     index_name: []const u8,
     config: std.json.Value,
+    config_json: []const u8,
     status: catalog_types.BuildStatus,
 ) !ServerlessIndexStatus {
     if (config != .object) return error.InvalidTableIndexMetadata;
@@ -5878,6 +5884,8 @@ fn serverlessIndexStatus(
     const head_sparse_action = findNamedArtifactPublicationAction(status.head_sparse_index_actions, index_name);
     const graph_action = findNamedArtifactPublicationAction(status.graph_index_actions, index_name);
     const head_graph_action = findNamedArtifactPublicationAction(status.head_graph_index_actions, index_name);
+    const config_action = findNamedArtifactPublicationAction(status.index_config_actions, index_name);
+    const config_published = if (config_action) |action| action.action == .reuse else false;
     const built = if (std.mem.eql(u8, kind, "full_text")) blk: {
         if (full_text_action) |action| {
             break :blk action.action == .reuse;
@@ -5904,7 +5912,7 @@ fn serverlessIndexStatus(
         }
         break :blk status.head_version != 0;
     } else if (std.mem.eql(u8, kind, "algebraic")) blk: {
-        break :blk status.head_version != 0;
+        break :blk config_published;
     } else return error.InvalidTableIndexMetadata;
 
     const doc_count: u64 = if (built)
@@ -5933,10 +5941,12 @@ fn serverlessIndexStatus(
         break :blk null;
     } else null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
+    const readiness_ready = config_published and built and materialization_blocker == null;
     return .{
-        .readiness_ready = built and materialization_blocker == null,
-        .readiness_target_revision = status.next_version,
-        .readiness_published_revision = status.head_version,
+        .readiness_ready = readiness_ready,
+        .readiness_incarnation = serverlessIndexIncarnation(index_name, config_json),
+        .readiness_target_revision = if (readiness_ready) status.head_version else status.next_version,
+        .readiness_published_revision = if (config_published and status.head_version != 0) status.head_version else null,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -5958,6 +5968,8 @@ fn serverlessIndexStatus(
                 null;
         } else if (std.mem.eql(u8, kind, "graph"))
             if (graph_action) |action| action.action else null
+        else if (std.mem.eql(u8, kind, "algebraic"))
+            if (config_action) |action| action.action else null
         else
             null,
         .head_publication_action = if (std.mem.eql(u8, kind, "full_text"))
@@ -5991,6 +6003,15 @@ fn serverlessIndexStatus(
         .full_text_source_mode = if (std.mem.eql(u8, kind, "full_text") and full_text_action != null) full_text_action.?.source_mode else null,
         .chunked_source_count = if (std.mem.eql(u8, kind, "full_text") and full_text_action != null) full_text_action.?.chunked_source_count else 0,
     };
+}
+
+fn serverlessIndexIncarnation(index_name: []const u8, config_json: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0x6174_666c_795f_7376);
+    hasher.update("antfly-serverless-index-incarnation-v1\x00");
+    hasher.update(index_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(config_json);
+    return hasher.final();
 }
 
 fn isSparseEmbeddingsIndex(config: std.json.Value) !bool {
@@ -8138,7 +8159,7 @@ test "http handler index status exposes lexical sparse blocker for sparse index"
     try std.testing.expectEqualStrings("lexical_sparse", parsed_sparse_index.value.status.materialization_blocker.?);
 }
 
-test "http handler index status exposes graph publication actions" {
+test "serverless http handler index status exposes graph publication actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -8226,6 +8247,9 @@ test "http handler index status exposes graph publication actions" {
     try std.testing.expectEqualStrings("rebuild", parsed_planned.value.status.planned_publication_action.?);
     try std.testing.expectEqualStrings("pending", parsed_planned.value.status.readiness.?.state);
     try std.testing.expect(parsed_planned.value.status.readiness.?.pending_reasons.len > 0);
+    try std.testing.expect(parsed_planned.value.status.readiness.?.incarnation != null);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_planned.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_planned.value.status.readiness.?.published_revision);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -8242,6 +8266,14 @@ test "http handler index status exposes graph publication actions" {
     try std.testing.expectEqualStrings("rebuild", parsed_head.value.status.head_publication_action.?);
     try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
     try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
+    try std.testing.expectEqualStrings(
+        parsed_planned.value.status.readiness.?.incarnation.?,
+        parsed_head.value.status.readiness.?.incarnation.?,
+    );
+    try std.testing.expectEqual(
+        parsed_head.value.status.readiness.?.target_revision,
+        parsed_head.value.status.readiness.?.published_revision,
+    );
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {
@@ -8349,7 +8381,7 @@ test "http handler index status predicts graph reuse and rebuild before publish"
     try std.testing.expectEqualStrings("rebuild", parsed_graph_rebuild.value.status.planned_publication_action.?);
 }
 
-test "http handler create index expands schema-derived algebraic config" {
+test "serverless http handler create index expands schema-derived algebraic config" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -8409,6 +8441,16 @@ test "http handler create index expands schema-derived algebraic config" {
         "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
     ));
 
+    const initial_docs = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "order-1", .body = "{\"customer\":\"acme\",\"amount\":42,\"created_at\":\"2026-01-01T00:00:00Z\"}" },
+    };
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 150, .mutations = &initial_docs });
+    defer ingest.deinit(alloc);
+
+    var initial_build = try catalog.buildTable("docs");
+    defer initial_build.deinit(alloc);
+    try std.testing.expect(initial_build.published);
+
     var create = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/indexes/sales_rollup",
@@ -8437,7 +8479,35 @@ test "http handler create index expands schema-derived algebraic config" {
     defer detail.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), detail.status);
     try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"derive_from_schema\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"group_fields\"") != null);
+    var parsed_detail = try parseServerlessIndexStatusTestResponse(alloc, detail.body, "sales_rollup");
+    defer parsed_detail.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_detail.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
+    try std.testing.expect(parsed_detail.value.status.readiness.?.incarnation != null);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
+
+    var algebraic_build = try catalog.buildTable("docs");
+    defer algebraic_build.deinit(alloc);
+    try std.testing.expect(algebraic_build.published);
+
+    var published_detail = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/sales_rollup",
+    });
+    defer published_detail.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), published_detail.status);
+    var parsed_published = try parseServerlessIndexStatusTestResponse(alloc, published_detail.body, "sales_rollup");
+    defer parsed_published.deinit();
+    try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
+    try std.testing.expectEqualStrings(
+        parsed_detail.value.status.readiness.?.incarnation.?,
+        parsed_published.value.status.readiness.?.incarnation.?,
+    );
+    try std.testing.expectEqual(
+        parsed_published.value.status.readiness.?.target_revision,
+        parsed_published.value.status.readiness.?.published_revision,
+    );
 }
 
 test "serverless create index normalization resolves and persists one probed embedding dimension" {

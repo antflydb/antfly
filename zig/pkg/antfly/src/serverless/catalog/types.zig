@@ -255,6 +255,9 @@ pub const BuildStatus = struct {
     head_graph_index_actions: []NamedArtifactPublicationAction = &.{},
     head_derived_output_actions: DerivedOutputPublicationActions = .{},
     artifact_actions: ArtifactPublicationActions = .{},
+    /// Exact desired-name/config publication state, independent of whether a
+    /// compatible physical artifact can be reused for the next table head.
+    index_config_actions: []NamedArtifactPublicationAction = &.{},
     full_text_index_actions: []FullTextIndexPublicationAction = &.{},
     vector_index_actions: []NamedArtifactPublicationAction = &.{},
     sparse_index_actions: []NamedArtifactPublicationAction = &.{},
@@ -297,6 +300,8 @@ pub const BuildStatus = struct {
         if (self.head_sparse_index_actions.len > 0) alloc.free(self.head_sparse_index_actions);
         for (self.head_graph_index_actions) |*entry| entry.deinit(alloc);
         if (self.head_graph_index_actions.len > 0) alloc.free(self.head_graph_index_actions);
+        for (self.index_config_actions) |*entry| entry.deinit(alloc);
+        if (self.index_config_actions.len > 0) alloc.free(self.index_config_actions);
         for (self.full_text_index_actions) |*entry| entry.deinit(alloc);
         if (self.full_text_index_actions.len > 0) alloc.free(self.full_text_index_actions);
         for (self.vector_index_actions) |*entry| entry.deinit(alloc);

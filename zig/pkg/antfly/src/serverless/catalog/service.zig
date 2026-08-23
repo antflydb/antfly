@@ -459,6 +459,13 @@ pub const CatalogService = struct {
                 null;
         var head_actions = try headPublicationActionsAlloc(self.alloc, self.manifests, namespace, head_version);
         defer head_actions.deinit(self.alloc);
+        const head_indexes_json = if (published_head.manifest) |manifest| manifest.stats.indexes_json else "";
+        const index_config_actions = try planIndexConfigActionsAlloc(
+            self.alloc,
+            head_indexes_json,
+            plan.table_definition.indexes_json,
+        );
+        defer freeNamedArtifactActions(self.alloc, index_config_actions);
         const head_republish_recommended = plan.forceRepublishFromHead();
         const pending_materialization_rebuild =
             !head_republish_recommended and
@@ -500,6 +507,7 @@ pub const CatalogService = struct {
                 .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
                 .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
             },
+            .index_config_actions = try cloneNamedArtifactActionsAlloc(self.alloc, index_config_actions),
             .full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions),
             .vector_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.vector_index_actions),
             .sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions),
@@ -781,6 +789,11 @@ pub const CatalogService = struct {
                     (!effective_policy.rerank_terms_enabled or completion.rerank_terms_complete);
 
                 metadata_republish.read_schema_migration = impact.migration_state_changed;
+                metadata_republish.index_definitions_changed = !std.mem.eql(
+                    u8,
+                    manifest.stats.indexes_json,
+                    table.indexes_json,
+                );
                 metadata_republish.published_search_sources_changed = !publishedSearchSourcesMatch(
                     targets.published_search_sources,
                     manifest.stats.published_search_sources,
@@ -1524,6 +1537,60 @@ fn planNamedIndexActionsAlloc(
     var before_it = before_object.iterator();
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
+        if (after_object.get(entry.key_ptr.*) != null) continue;
+        try actions.append(alloc, .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .action = .drop,
+        });
+    }
+
+    std.mem.sort(publication_plan.NamedArtifactAction, actions.items, {}, lessNamedArtifactAction);
+    return try actions.toOwnedSlice(alloc);
+}
+
+/// Plan exact public index-definition publication separately from physical
+/// artifact reuse. A rename or equivalent config may reuse an artifact, but it
+/// is not query-visible under the desired name until a manifest containing that
+/// exact name/config pair becomes the head.
+fn planIndexConfigActionsAlloc(
+    alloc: Allocator,
+    before_indexes_json: []const u8,
+    after_indexes_json: []const u8,
+) ![]publication_plan.NamedArtifactAction {
+    var before = try std.json.parseFromSlice(std.json.Value, alloc, if (before_indexes_json.len == 0) "{}" else before_indexes_json, .{});
+    defer before.deinit();
+    var after = try std.json.parseFromSlice(std.json.Value, alloc, if (after_indexes_json.len == 0) "{}" else after_indexes_json, .{});
+    defer after.deinit();
+
+    const before_object = switch (before.value) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const after_object = switch (after.value) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+
+    var actions = std.ArrayListUnmanaged(publication_plan.NamedArtifactAction).empty;
+    errdefer {
+        for (actions.items) |*item| item.deinit(alloc);
+        actions.deinit(alloc);
+    }
+
+    var after_it = after_object.iterator();
+    while (after_it.next()) |entry| {
+        const action: publication_plan.ArtifactAction = if (before_object.get(entry.key_ptr.*)) |before_value|
+            if (jsonValueEql(entry.value_ptr.*, before_value)) .reuse else .rebuild
+        else
+            .rebuild;
+        try actions.append(alloc, .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .action = action,
+        });
+    }
+
+    var before_it = before_object.iterator();
+    while (before_it.next()) |entry| {
         if (after_object.get(entry.key_ptr.*) != null) continue;
         try actions.append(alloc, .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
