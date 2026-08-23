@@ -28,6 +28,8 @@ const wildcard_mod = @import("../../../search/wildcard.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 
+const graph_document_hydration_batch_size: usize = 4096;
+
 pub const NamedResultSet = struct {
     name: []const u8,
     hits: []const types.SearchHit,
@@ -90,6 +92,12 @@ pub const PatternQueryExecutor = struct {
         query: graph_query_mod.GraphQuery,
         key: []const u8,
     ) anyerror!?[]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        query: graph_query_mod.GraphQuery,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1332,6 +1340,10 @@ test "distinct graph aggregates include table identity" {
 
 fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGraphQuery) bool {
     if (named.query.include_documents or req.expand_strategy != null) return true;
+    // Canonical MATCH dependencies always select an explicit binding and are
+    // resolved directly from GraphPatternMatch rows. Only the deprecated
+    // unbound compatibility format still depends on flattened SearchHits.
+    if (!named.query.legacy_response) return false;
     for (req.graph_queries) |candidate| {
         if (selectorReferencesGraphResult(candidate.query.start_nodes, named.name)) return true;
         if (candidate.query.target_nodes) |selector| {
@@ -1361,6 +1373,7 @@ test "pattern hit shaping is lazy but preserves graph dependencies" {
             .query_type = .pattern,
             .index_name = "graph",
             .start_nodes = .{ .keys = &.{"doc:a"} },
+            .legacy_response = true,
             .pattern = &.{ .{ .alias = "a" }, .{ .alias = "b" } },
         },
     };
@@ -1380,6 +1393,36 @@ test "pattern hit shaping is lazy but preserves graph dependencies" {
     with_documents.query.include_documents = true;
     try std.testing.expect(patternQueryNeedsHits(.{ .graph_queries = &.{with_documents} }, &with_documents));
     try std.testing.expect(patternQueryNeedsHits(.{ .graph_queries = &.{seed}, .expand_strategy = .@"union" }, &seed));
+
+    const canonical_seed = types.NamedGraphQuery{
+        .name = "canonical_seed",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .match_pattern = .{
+                .anchor_alias = "a",
+                .nodes = &.{.{ .alias = "a" }},
+                .edges = &.{},
+            },
+            .return_aliases = &.{"a"},
+        },
+    };
+    const canonical_dependent = types.NamedGraphQuery{
+        .name = "canonical_dependent",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph",
+            .start_nodes = .{ .result_ref = .{
+                .ref = "$graph_results.canonical_seed",
+                .binding = "a",
+            } },
+        },
+    };
+    try std.testing.expect(!patternQueryNeedsHits(
+        .{ .graph_queries = &.{ canonical_seed, canonical_dependent } },
+        &canonical_seed,
+    ));
 }
 
 pub fn executeSingleNonPatternQueryWithSets(
@@ -1495,14 +1538,11 @@ pub fn executeSingleNonPatternQueryWithSets(
     if (preserve_internal_paths) discardGraphResultPaths(alloc, graph_result.nodes);
 
     const total_hits: u32 = @intCast(graph_result.nodes.len);
-    const start = @min(req.offset, total_hits);
-    const end = @min(start + req.limit, total_hits);
-
     const hits = try buildGraphNodeHits(
         alloc,
         req,
         named.query,
-        graph_result.nodes[@intCast(start)..@intCast(end)],
+        graph_result.nodes,
         executor,
     );
 
@@ -1766,46 +1806,83 @@ fn buildPatternDocumentHits(
     matches: []const types.GraphPatternMatch,
     executor: PatternQueryExecutor,
 ) ![]types.SearchHit {
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    defer nodes.deinit(alloc);
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            // SearchHit is a table-local compatibility view. Cross-table
+            // identities remain fully represented by the binding itself and
+            // must not be reinterpreted as keys in the source table.
+            if (binding.node.table != null) continue;
+            if (!try seen.putIfAbsent(alloc, .{ .table = null, .key = binding.node.key }, {})) continue;
+            try nodes.append(alloc, binding.node);
+        }
+    }
+
     var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
     errdefer {
         for (hits.items) |*hit| hit.deinit(alloc);
         hits.deinit(alloc);
     }
+    try hits.ensureTotalCapacity(alloc, nodes.items.len);
 
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |key| alloc.free(key.*);
-        seen.deinit(alloc);
-    }
+    const key_capacity = @min(nodes.items.len, graph_document_hydration_batch_size);
+    const keys = try alloc.alloc([]const u8, key_capacity);
+    defer if (keys.len > 0) alloc.free(keys);
 
-    for (matches) |match| {
-        for (match.bindings) |binding| {
-            if (seen.contains(binding.node.key)) continue;
-            {
-                const seen_key = try alloc.dupe(u8, binding.node.key);
-                errdefer alloc.free(seen_key);
-                try seen.put(alloc, seen_key, {});
+    var offset: usize = 0;
+    while (offset < nodes.items.len) {
+        const batch_len = @min(graph_document_hydration_batch_size, nodes.items.len - offset);
+        for (nodes.items[offset .. offset + batch_len], 0..) |node, i| keys[i] = node.key;
+
+        const documents = if (query.include_documents) blk: {
+            if (executor.load_projected_documents) |load_many| {
+                const loaded = try load_many(executor.ctx, alloc, query, keys[0..batch_len]);
+                if (loaded.len != batch_len) {
+                    freeOptionalOwnedBytes(alloc, loaded);
+                    return error.InvalidQueryResult;
+                }
+                break :blk loaded;
             }
-            try hits.ensureUnusedCapacity(alloc, 1);
-            const stored_data = if (query.include_documents)
-                try executor.load_projected_document(executor.ctx, alloc, query, binding.node.key)
-            else
-                null;
+
+            const loaded = try alloc.alloc(?[]u8, batch_len);
+            @memset(loaded, null);
+            var initialized: usize = 0;
+            errdefer {
+                for (loaded[0..initialized]) |stored| if (stored) |bytes| alloc.free(bytes);
+                if (loaded.len > 0) alloc.free(loaded);
+            }
+            for (keys[0..batch_len], 0..) |key, i| {
+                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query, key);
+                initialized += 1;
+            }
+            break :blk loaded;
+        } else null;
+        defer if (documents) |loaded| freeOptionalOwnedBytes(alloc, loaded);
+
+        for (nodes.items[offset .. offset + batch_len], 0..) |node, i| {
+            const stored_data = if (documents) |loaded| blk: {
+                const stored = loaded[i];
+                loaded[i] = null;
+                break :blk stored;
+            } else null;
             errdefer if (stored_data) |stored| alloc.free(stored);
-            const id = try alloc.dupe(u8, binding.node.key);
+            const id = try alloc.dupe(u8, node.key);
             errdefer alloc.free(id);
             const doc_ordinal = if (executor.lookup_doc_ordinal) |lookup|
-                try lookup(executor.ctx, alloc, binding.node.key, identity_read_generation)
+                try lookup(executor.ctx, alloc, node.key, identity_read_generation)
             else
                 null;
             hits.appendAssumeCapacity(.{
                 .id = id,
                 .doc_ordinal = doc_ordinal,
-                .score = @floatCast(binding.node.distance),
+                .score = @floatCast(node.distance),
                 .stored_data = stored_data,
             });
         }
+        offset += batch_len;
     }
 
     return try hits.toOwnedSlice(alloc);
@@ -4774,14 +4851,23 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             try std.testing.expectEqualStrings("doc:root", start_key_refs[0]);
             try std.testing.expectEqual(@as(usize, 0), target_keys.len);
 
-            const nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 1);
-            nodes[0] = .{
-                .key = try alloc_inner.dupe(u8, "doc:child"),
-                .depth = 1,
-                .distance = 1.0,
-                .path = null,
-                .path_edges = null,
-            };
+            const node_keys = [_][]const u8{ "doc:child", "doc:sibling", "doc:cousin" };
+            const nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, node_keys.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc_inner);
+                alloc_inner.free(nodes);
+            }
+            for (node_keys, 0..) |key, i| {
+                nodes[i] = .{
+                    .key = try alloc_inner.dupe(u8, key),
+                    .depth = 1,
+                    .distance = 1.0,
+                    .path = null,
+                    .path_edges = null,
+                };
+                initialized += 1;
+            }
             return .{
                 .nodes = nodes,
                 .matches = &.{},
@@ -4813,12 +4899,22 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             try std.testing.expect(!req.defer_stored_projection);
             try std.testing.expectEqual(@as(usize, 1), req.fields.len);
             try std.testing.expectEqualStrings("title", req.fields[0]);
-            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqual(@as(usize, 3), keys.len);
             try std.testing.expectEqualStrings("doc:child", keys[0]);
+            try std.testing.expectEqualStrings("doc:sibling", keys[1]);
+            try std.testing.expectEqualStrings("doc:cousin", keys[2]);
 
             const loaded = try alloc_inner.alloc(?[]u8, keys.len);
-            errdefer alloc_inner.free(loaded);
-            loaded[0] = try alloc_inner.dupe(u8, "{\"title\":\"child\"}");
+            @memset(loaded, null);
+            var initialized: usize = 0;
+            errdefer {
+                for (loaded[0..initialized]) |stored| if (stored) |bytes| alloc_inner.free(bytes);
+                alloc_inner.free(loaded);
+            }
+            for (loaded, 0..) |*stored, i| {
+                stored.* = try std.fmt.allocPrint(alloc_inner, "{{\"title\":\"node-{d}\"}}", .{i});
+                initialized += 1;
+            }
             return loaded;
         }
 
@@ -4854,7 +4950,10 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
         .fields = &.{"body"},
         .include_all_fields = false,
         .defer_stored_projection = true,
-        .limit = 10,
+        // Retrieval pagination must never page a named graph operation's
+        // independently bounded result or its document hydration.
+        .offset = 1,
+        .limit = 1,
         .identity_read_generation = 42,
     }, &named, &.{}, .{
         .ctx = &harness,
@@ -4870,11 +4969,13 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     try std.testing.expect(harness.batch_loaded);
     try std.testing.expect(!harness.singular_loaded);
     try std.testing.expectEqual(@as(?u64, 42), harness.seen_generation);
-    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
     try std.testing.expectEqualStrings("doc:child", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
     try std.testing.expect(result.hits[0].stored_data != null);
-    try std.testing.expectEqualStrings("{\"title\":\"child\"}", result.hits[0].stored_data.?);
+    try std.testing.expectEqualStrings("{\"title\":\"node-0\"}", result.hits[0].stored_data.?);
+    try std.testing.expectEqualStrings("doc:cousin", result.hits[2].id);
+    try std.testing.expectEqualStrings("{\"title\":\"node-2\"}", result.hits[2].stored_data.?);
 }
 
 test "stateful path results materialize endpoint nodes for result refs" {
@@ -5142,6 +5243,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     };
 
     const Harness = struct {
+        batch_loaded: bool = false,
         seen_generation: ?u64 = null,
 
         fn matchPattern(
@@ -5161,6 +5263,34 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
             _: []const u8,
         ) anyerror!?[]u8 {
             return error.TestUnexpectedResult;
+        }
+
+        fn loadProjectedDocuments(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            query: graph_query_mod.GraphQuery,
+            keys: []const []const u8,
+        ) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.batch_loaded = true;
+            try std.testing.expect(!query.include_all_fields);
+            try std.testing.expectEqual(@as(usize, 1), query.fields.len);
+            try std.testing.expectEqualStrings("title", query.fields[0]);
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("doc:a", keys[0]);
+            try std.testing.expectEqualStrings("doc:b", keys[1]);
+            const loaded = try alloc_inner.alloc(?[]u8, keys.len);
+            @memset(loaded, null);
+            var initialized: usize = 0;
+            errdefer {
+                for (loaded[0..initialized]) |stored| if (stored) |bytes| alloc_inner.free(bytes);
+                alloc_inner.free(loaded);
+            }
+            for (loaded, 0..) |*stored, i| {
+                stored.* = try std.fmt.allocPrint(alloc_inner, "{{\"title\":\"binding-{d}\"}}", .{i});
+                initialized += 1;
+            }
+            return loaded;
         }
 
         fn lookupOrdinal(
@@ -5183,11 +5313,14 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
         .query_type = .pattern,
         .index_name = "graph",
         .start_nodes = .{ .keys = &.{} },
-        .include_documents = false,
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
     }, 42, &matches, .{
         .ctx = &harness,
         .match_pattern = Harness.matchPattern,
         .load_projected_document = Harness.loadProjectedDocument,
+        .load_projected_documents = Harness.loadProjectedDocuments,
         .lookup_doc_ordinal = Harness.lookupOrdinal,
     });
     defer {
@@ -5195,12 +5328,15 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
         if (hits.len > 0) alloc.free(hits);
     }
 
+    try std.testing.expect(harness.batch_loaded);
     try std.testing.expectEqual(@as(?u64, 42), harness.seen_generation);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqualStrings("doc:a", hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), hits[0].doc_ordinal);
+    try std.testing.expectEqualStrings("{\"title\":\"binding-0\"}", hits[0].stored_data.?);
     try std.testing.expectEqualStrings("doc:b", hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
+    try std.testing.expectEqualStrings("{\"title\":\"binding-1\"}", hits[1].stored_data.?);
 }
 
 test "fuseNamedSets preserves source hit ordinals" {

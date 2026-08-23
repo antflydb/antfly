@@ -25314,6 +25314,7 @@ pub const DB = struct {
             else
                 executeConjunctiveAggregateCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
+            .load_projected_documents = loadPatternProjectedDocumentsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .filter_keys = filterGraphKeysCallback,
@@ -25729,6 +25730,27 @@ pub const DB = struct {
             })
         else
             null;
+    }
+
+    fn loadPatternProjectedDocumentsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        query: graph_query_mod.GraphQuery,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys);
+        errdefer freeOptionalOwnedBytes(alloc, loaded);
+        for (loaded, keys, 0..) |maybe_stored, key, i| {
+            const stored = maybe_stored orelse continue;
+            const projected = try projectLookupStoredBytes(self, alloc, key, stored, .{
+                .fields = query.fields,
+                .include_all_fields = query.include_all_fields,
+            });
+            alloc.free(stored);
+            loaded[i] = projected;
+        }
+        return loaded;
     }
 
     fn executeShortestPathCallback(
