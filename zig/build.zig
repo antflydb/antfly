@@ -2089,7 +2089,7 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
 
-    const metadata_unit_test_root_paths = [_][]const u8{
+    const metadata_unit_baseline_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
         "pkg/antfly/src/metadata_core_test_root.zig",
@@ -2099,6 +2099,20 @@ pub fn build(b: *std.Build) void {
         "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
         "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
         "pkg/antfly/src/metadata_storage_test_root.zig",
+    };
+    var metadata_unit_baseline_mods: [metadata_unit_baseline_root_paths.len]*std.Build.Module = undefined;
+    for (metadata_unit_baseline_root_paths, &metadata_unit_baseline_mods) |root_path, *test_mod| {
+        test_mod.* = b.createModule(.{
+            .root_source_file = b.path(root_path),
+            .target = target,
+            .optimize = optimize,
+        });
+        antfly_imports.configure(b, test_mod.*, true, true);
+    }
+
+    const metadata_unit_test_root_paths = [_][]const u8{
+        "pkg/antfly/src/metadata_unit_lane_a_test_root.zig",
+        "pkg/antfly/src/metadata_unit_lane_b_test_root.zig",
     };
     var metadata_unit_test_mods: [metadata_unit_test_root_paths.len]*std.Build.Module = undefined;
     for (metadata_unit_test_root_paths, &metadata_unit_test_mods) |root_path, *test_mod| {
@@ -7965,7 +7979,62 @@ pub fn build(b: *std.Build) void {
         "unit-metadata-test",
         "Run the production metadata portion of the default unit-test target in bounded shards",
     );
-    const unit_metadata_shard_names = [_][]const u8{
+    const metadata_runtime_filter_is_default =
+        lib_metadata_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    // Preserve the former two compile lanes while compiling each lane's
+    // production metadata ownership groups into one executable. This removes
+    // seven repeated semantic-analysis/code-generation passes without
+    // constructing the public metadata barrel that also owns simulations.
+    const unit_metadata_artifact_shard_indices = [_][]const usize{
+        &.{ 0, 2, 4, 6, 8 },
+        &.{ 1, 3, 5, 7 },
+    };
+    const unit_metadata_artifact_names = [_][]const u8{
+        "metadata-unit-lane-a-tests",
+        "metadata-unit-lane-b-tests",
+    };
+    var unit_metadata_compile_filters: [unit_metadata_artifact_shard_indices.len][]const []const u8 = .{
+        &.{},
+        &.{},
+    };
+    for (unit_metadata_artifact_shard_indices, &unit_metadata_compile_filters) |shard_indices, *compile_filters| {
+        for (shard_indices) |shard_index| {
+            compile_filters.* = compileFiltersWithAnchors(
+                b,
+                compile_filters.*,
+                unit_metadata_shard_filters[shard_index],
+            );
+        }
+    }
+
+    var unit_metadata_tests: [metadata_unit_test_mods.len]*std.Build.Step.Compile = undefined;
+    for (
+        unit_metadata_artifact_names,
+        metadata_unit_test_mods,
+        unit_metadata_compile_filters,
+        &unit_metadata_tests,
+    ) |artifact_name, test_mod, compile_filters, *tests| {
+        tests.* = b.addTest(.{
+            .name = artifact_name,
+            .root_module = test_mod,
+            .filters = compile_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+            .max_rss = 8 * 1024 * 1024 * 1024,
+        });
+    }
+    const unit_metadata_compile_step = b.step(
+        "unit-metadata-compile",
+        "Compile the two consolidated metadata unit-test artifacts without running them",
+    );
+    for (unit_metadata_tests) |tests| unit_metadata_compile_step.dependOn(&tests.step);
+
+    // Keep the prior nine-artifact layout as an opt-in coverage oracle. It is
+    // deliberately absent from unit-test and unit-metadata-test.
+    const unit_metadata_baseline_names = [_][]const u8{
         "metadata-reconciler-tests",
         "metadata-service-http-tests",
         "metadata-core-tests",
@@ -7976,106 +8045,157 @@ pub fn build(b: *std.Build) void {
         "metadata-replication-backfill-tests",
         "metadata-storage-tests",
     };
-    const unit_metadata_shard_max_rss = [_]usize{
+    const unit_metadata_baseline_max_rss = [_]usize{
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        // The core shard now compiles the contextual public router and its
-        // compatibility manifest; Debug codegen peaks around 6.8 GB on
-        // aarch64 macOS.
         7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        // The server shard compiles the public API kernel and listener stack;
-        // Debug codegen currently peaks around 6.4 GB on aarch64 macOS.
         7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         7 * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     };
-    const metadata_runtime_filter_is_default =
-        lib_metadata_runtime_filters.len == 1 and
-        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
-    const unit_metadata_shard_lanes = [_]usize{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
-    var unit_metadata_compile_tails = [_]?*std.Build.Step{ null, null };
-    var unit_metadata_aggregate_run_tails = [_]?*std.Build.Step{ null, null };
-    var unit_metadata_focused_run_tails = [_]?*std.Build.Step{ null, null };
+    const unit_metadata_baseline_lanes = [_]usize{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
+    var unit_metadata_baseline_compile_tails = [_]?*std.Build.Step{ null, null };
+    var unit_metadata_baseline_tests: [metadata_unit_baseline_mods.len]*std.Build.Step.Compile = undefined;
     for (
         unit_metadata_shard_filters,
-        unit_metadata_shard_names,
-        metadata_unit_test_mods,
-        unit_metadata_shard_max_rss,
-        unit_metadata_shard_lanes,
-    ) |shard_filters, shard_name, test_mod, shard_max_rss, lane| {
-        const is_runtime_exclusive = std.mem.eql(u8, shard_name, "metadata-replication-backfill-tests");
-        const unit_metadata_tests = b.addTest(.{
-            .name = shard_name,
+        unit_metadata_baseline_names,
+        metadata_unit_baseline_mods,
+        unit_metadata_baseline_max_rss,
+        unit_metadata_baseline_lanes,
+        &unit_metadata_baseline_tests,
+    ) |shard_filters, artifact_name, test_mod, max_rss, lane, *tests| {
+        tests.* = b.addTest(.{
+            .name = artifact_name,
             .root_module = test_mod,
             .filters = shard_filters,
             .test_runner = .{
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            .max_rss = shard_max_rss,
+            .max_rss = max_rss,
         });
-        if (unit_metadata_compile_tails[lane]) |previous| unit_metadata_tests.step.dependOn(previous);
-        unit_metadata_compile_tails[lane] = &unit_metadata_tests.step;
-        const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        if (unit_metadata_baseline_compile_tails[lane]) |previous| {
+            tests.*.step.dependOn(previous);
+        } else {
+            for (unit_metadata_tests) |candidate| tests.*.step.dependOn(&candidate.step);
+        }
+        unit_metadata_baseline_compile_tails[lane] = &tests.*.step;
+    }
+    const compare_unit_metadata_inventory = b.addSystemCommand(&.{"python3"});
+    compare_unit_metadata_inventory.setName("compare consolidated metadata test inventory");
+    compare_unit_metadata_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
+    compare_unit_metadata_inventory.addArg("--baseline");
+    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    compare_unit_metadata_inventory.addArg("--candidate");
+    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    compare_unit_metadata_inventory.addArgs(&.{ "--label", "metadata consolidation" });
+    const unit_metadata_inventory_step = b.step(
+        "unit-metadata-test-inventory",
+        "Verify the two consolidated artifacts preserve the nine-shard named test inventory",
+    );
+    unit_metadata_inventory_step.dependOn(&compare_unit_metadata_inventory.step);
+
+    var unit_metadata_lane_a_pre_filters: []const []const u8 = &.{};
+    for ([_]usize{ 0, 2, 4, 6 }) |shard_index| {
+        unit_metadata_lane_a_pre_filters = compileFiltersWithAnchors(
+            b,
+            unit_metadata_lane_a_pre_filters,
+            unit_metadata_shard_filters[shard_index],
+        );
+    }
+    var unit_metadata_lane_b_pre_filters: []const []const u8 = &.{};
+    for ([_]usize{ 1, 3, 5 }) |shard_index| {
+        unit_metadata_lane_b_pre_filters = compileFiltersWithAnchors(
+            b,
+            unit_metadata_lane_b_pre_filters,
+            unit_metadata_shard_filters[shard_index],
+        );
+    }
+    const MetadataRuntimePartition = struct {
+        name: []const u8,
+        artifact_index: usize,
+        filters: []const []const u8,
+        other_filters: []const []const u8,
+    };
+    const unit_metadata_runtime_partitions = [_]MetadataRuntimePartition{
+        .{
+            .name = "metadata-unit-lane-a-pre-tests",
+            .artifact_index = 0,
+            .filters = unit_metadata_lane_a_pre_filters,
+            .other_filters = unit_metadata_shard_filters[8],
+        },
+        .{
+            .name = "metadata-unit-lane-b-pre-tests",
+            .artifact_index = 1,
+            .filters = unit_metadata_lane_b_pre_filters,
+            .other_filters = unit_metadata_shard_filters[7],
+        },
+        .{
+            .name = "metadata-replication-backfill-tests",
+            .artifact_index = 1,
+            .filters = unit_metadata_shard_filters[7],
+            .other_filters = unit_metadata_lane_b_pre_filters,
+        },
+        .{
+            .name = "metadata-storage-tests",
+            .artifact_index = 0,
+            .filters = unit_metadata_shard_filters[8],
+            .other_filters = unit_metadata_lane_a_pre_filters,
+        },
+    };
+    var unit_metadata_aggregate_runs: [unit_metadata_runtime_partitions.len]*std.Build.Step.Run = undefined;
+    var unit_metadata_focused_runs: [unit_metadata_runtime_partitions.len]*std.Build.Step.Run = undefined;
+    for (
+        unit_metadata_runtime_partitions,
+        &unit_metadata_aggregate_runs,
+        &unit_metadata_focused_runs,
+    ) |partition, *aggregate_run, *focused_run| {
         const runtime_filters = if (metadata_runtime_filter_is_default)
-            shard_filters
+            partition.filters
         else
             lib_metadata_runtime_filters;
-        addRuntimeTestFilters(b, run_unit_metadata_tests, runtime_filters);
-        // A focused caller filter generally belongs to only one aggregate
-        // artifact. Permit the other metadata shards to be empty, while
-        // keeping the default CI selection strict so a stale shard filter
-        // cannot silently remove coverage.
-        if (!metadata_runtime_filter_is_default) {
-            run_unit_metadata_tests.addArg("--allow-empty-test-filter");
-        }
-        addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
+
+        aggregate_run.* = b.addRunArtifact(unit_metadata_tests[partition.artifact_index]);
+        aggregate_run.*.setName(b.fmt("run test {s}", .{partition.name}));
+        addRuntimeTestFilters(b, aggregate_run.*, runtime_filters);
+        addRuntimeSkipTestFilters(aggregate_run.*, lib_unit_filters);
         for (root_test_skip_filters) |filter| {
-            run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+            aggregate_run.*.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (is_runtime_exclusive) {
-            for (unit_metadata_aggregate_run_tails) |previous| {
-                if (previous) |previous_step| run_unit_metadata_tests.step.dependOn(previous_step);
-            }
-        } else if (unit_metadata_aggregate_run_tails[lane]) |previous| {
-            run_unit_metadata_tests.step.dependOn(previous);
+        if (!metadata_runtime_filter_is_default) {
+            aggregate_run.*.addArg("--allow-empty-test-filter");
+            addRuntimeSkipTestFilters(aggregate_run.*, partition.other_filters);
         }
-        unit_test_step.dependOn(&run_unit_metadata_tests.step);
-        if (is_runtime_exclusive) {
-            unit_metadata_aggregate_run_tails = .{ &run_unit_metadata_tests.step, &run_unit_metadata_tests.step };
-        } else {
-            unit_metadata_aggregate_run_tails[lane] = &run_unit_metadata_tests.step;
-        }
+        unit_test_step.dependOn(&aggregate_run.*.step);
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
         // aggregate's overlap exclusion and skipped everywhere.
-        const run_focused_metadata_tests = b.addRunArtifact(unit_metadata_tests);
-        addRuntimeTestFilters(b, run_focused_metadata_tests, runtime_filters);
+        focused_run.* = b.addRunArtifact(unit_metadata_tests[partition.artifact_index]);
+        focused_run.*.setName(b.fmt("run focused test {s}", .{partition.name}));
+        addRuntimeTestFilters(b, focused_run.*, runtime_filters);
         if (!metadata_runtime_filter_is_default) {
-            run_focused_metadata_tests.addArg("--allow-empty-test-filter");
+            focused_run.*.addArg("--allow-empty-test-filter");
+            addRuntimeSkipTestFilters(focused_run.*, partition.other_filters);
         }
         for (root_test_skip_filters) |filter| {
-            run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+            focused_run.*.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (is_runtime_exclusive) {
-            for (unit_metadata_focused_run_tails) |previous| {
-                if (previous) |previous_step| run_focused_metadata_tests.step.dependOn(previous_step);
-            }
-        } else if (unit_metadata_focused_run_tails[lane]) |previous| {
-            run_focused_metadata_tests.step.dependOn(previous);
-        }
-        unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
-        lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
-        if (is_runtime_exclusive) {
-            unit_metadata_focused_run_tails = .{ &run_focused_metadata_tests.step, &run_focused_metadata_tests.step };
-        } else {
-            unit_metadata_focused_run_tails[lane] = &run_focused_metadata_tests.step;
-        }
+        unit_metadata_sharded_test_step.dependOn(&focused_run.*.step);
+        lib_metadata_test_step.dependOn(&focused_run.*.step);
     }
+
+    // Preserve the existing runtime isolation: ordinary lane work overlaps,
+    // replication backfill runs alone, and metadata storage follows it.
+    unit_metadata_aggregate_runs[2].step.dependOn(&unit_metadata_aggregate_runs[0].step);
+    unit_metadata_aggregate_runs[2].step.dependOn(&unit_metadata_aggregate_runs[1].step);
+    unit_metadata_aggregate_runs[3].step.dependOn(&unit_metadata_aggregate_runs[2].step);
+    unit_metadata_focused_runs[2].step.dependOn(&unit_metadata_focused_runs[0].step);
+    unit_metadata_focused_runs[2].step.dependOn(&unit_metadata_focused_runs[1].step);
+    unit_metadata_focused_runs[3].step.dependOn(&unit_metadata_focused_runs[2].step);
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
