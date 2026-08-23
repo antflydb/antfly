@@ -80,6 +80,10 @@ const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
+fn isExpectedControlRoundError(err: anyerror) bool {
+    return antfly.metadata.authority.isRetryableError(err);
+}
+
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
         .max_tick_batch = 32,
@@ -1133,7 +1137,14 @@ pub fn runFromIterator(
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        server.runControlRoundOnly() catch |err| return supervisor.fail("metadata", "control-round", err);
+        server.runControlRoundOnly() catch |err| {
+            // Leadership can change after a control round observes the local
+            // reconcile lease but before one of its proposals is admitted.
+            // Retry authority churn on the next tick instead of terminating a
+            // healthy follower; storage and process failures remain fatal.
+            if (!isExpectedControlRoundError(err))
+                return supervisor.fail("metadata", "control-round", err);
+        };
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
@@ -2039,6 +2050,22 @@ test "metadata runtime retries bootstrap campaign only for leaderless voters" {
 
     status.soft.leader_id = null;
     try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "metadata runtime retries authority loss from control rounds" {
+    const expected_errors = [_]anyerror{
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.MetadataLinearizableReadTimeout,
+        error.MetadataSnapshotHeadMismatch,
+        error.ReconcileLeaseNotHeld,
+    };
+    for (expected_errors) |err| {
+        try std.testing.expect(isExpectedControlRoundError(err));
+    }
+    try std.testing.expect(!isExpectedControlRoundError(error.OutOfMemory));
+    try std.testing.expect(!isExpectedControlRoundError(error.Corrupted));
 }
 
 test "metadata runtime scales bootstrap campaign retry interval with tick" {
