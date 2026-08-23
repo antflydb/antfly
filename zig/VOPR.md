@@ -868,6 +868,25 @@ execution was already owned by the DB background runtime. The focused
 DataServer campaign proves both scheduler execution and queued cancellation;
 extend the owner only when another DataServer-native service is introduced.
 
+#### Replication Backfill and Rebalancing
+
+The production snapshot and streaming runners now expose a neutral lifecycle
+hook at provider preparation, apply, durable checkpoint, cutover, polling, and
+failure-persistence boundaries. Both runners use their borrowed `std.Io` for
+persisted wall-clock timestamps, while PostgreSQL execution deadlines retain
+their existing host-monotonic clock contract. The Antfly VOPR adapter derives
+stable phase, table, source, offset, authority, and checkpoint identities
+without importing VOPR into the metadata kernel.
+
+The `replication-backfill-vopr-test` gate runs the production runners through
+clean snapshot-to-stream cutover plus source crash, target crash, cancellation,
+stale work ownership, target-topology change, source-schema change, and stream
+crash after apply but before checkpoint. Every history restarts from the
+durable production status record and exact-replays twenty times. Properties
+prove that a checkpoint never outruns applied data, repeated work is logically
+idempotent, stale ownership is rejected, snapshot and stream data are not lost,
+and every interrupted attempt recovers.
+
 #### Serverless Object-Store Protocols
 
 Real WAL, catalog, manifest, artifact, and progress-store operations now run
@@ -923,7 +942,7 @@ request microsteps as those seams are added.
 
 | Priority | Area | What to exercise |
 | --- | --- | --- |
-| P0 | Replication backfill and rebalancing | Snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, and schema changes. This is the clearest major remaining gap in [`metadata/replication_backfill.zig`](pkg/antfly/src/metadata/replication_backfill.zig). |
+| P0 implemented | Replication backfill and rebalancing | `replication-backfill-vopr-test` covers snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, schema changes, and exact replay through the production runners. |
 | P0 | Standalone and serverless supervision | Partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, watchdog or lease expiry, and restart. [`serverless/runtime/manager.zig`](pkg/antfly/src/serverless/runtime/manager.zig) still owns a native run-loop thread, making it a useful next production seam. |
 | P0 | User and authentication lifecycle | Concurrent password, API-key, permission, and row-filter changes; seed capture; revoke and rotate; durable reload; crashes between user and policy persistence; and stale-reader behavior. The native-thread seed-lease regression in [`usermgr/user_manager.zig`](pkg/antfly/src/usermgr/user_manager.zig) should become a deterministic schedule. |
 | P1 | Complete serverless workflow | Claim, build, compact or enrich, publish, and catalog visibility with duplicate workers, lease takeover, ambiguous object-store completion, retry, cancellation, and crash recovery. Object-store protocols are covered; their orchestration is not yet covered end to end. |

@@ -6853,7 +6853,10 @@ pub fn build(b: *std.Build) void {
 
     const replication_backfill_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"replication lifecycle adapter records stable VoprIo safepoints"},
+        .filters = &.{
+            "replication lifecycle adapter records stable VoprIo safepoints",
+            "replication backfill VOPR exact replays every production recovery mode",
+        },
     });
     const run_replication_backfill_vopr_tests = b.addRunArtifact(replication_backfill_vopr_tests);
     const replication_backfill_vopr_test_step = b.step(
