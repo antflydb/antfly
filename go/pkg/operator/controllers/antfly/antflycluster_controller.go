@@ -103,6 +103,12 @@ const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
 
 const haStartupGateObservationRequeueAfter = 5 * time.Second
 
+// Runtime LSN, replication health, and failure-detector evidence do not emit
+// Kubernetes events. Keep their observation clock independent from the
+// higher-frequency Lease-renewal controller so writes and failover decisions
+// never depend on unrelated object churn.
+const haRuntimeStatusObservationRequeueAfter = 5 * time.Second
+
 const (
 	antflyRuntimeUID int64 = 10001
 	antflyRuntimeGID int64 = 10001
@@ -2950,6 +2956,13 @@ func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time
 	// Putting that clock on the full reconciler turns every renewal into an
 	// expensive status/seed observation cycle and can starve the very watchdog
 	// proof that keeps the primary authoritative.
+	// Runtime status itself is not event-driven: WAL and replication progress,
+	// admin reachability, and the automatic-failover detector must still be
+	// sampled at a bounded cadence. This clock is intentionally fixed rather
+	// than derived from Lease duration or watchdog grace.
+	if ha := cluster.Spec.HighAvailability; ha != nil && ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled {
+		requeueAfter = minPositiveDuration(requeueAfter, haRuntimeStatusObservationRequeueAfter)
+	}
 	// A suspended seeded runtime has no Pod, Job, or Lease event of its own
 	// after the primary checkpoints the final receipt. Re-observe peer status
 	// until Colony accepts that exact receipt and opens the declarative gate;

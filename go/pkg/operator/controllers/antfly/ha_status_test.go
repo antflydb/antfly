@@ -6108,26 +6108,32 @@ func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves
 	}
 }
 
-func TestFullReconcileDoesNotOwnKubernetesLeaseRenewalClock(t *testing.T) {
+func TestFullReconcileOwnsRuntimeObservationButNotLeaseRenewalClock(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 
-	if got := periodicRequeueAfter(cluster); got != 0 {
-		t.Fatalf("expected dedicated Lease controller to own renewal, full reconcile requeue=%s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected independent HA runtime observation cadence %s, got %s", want, got)
 	}
 
 	cluster.Spec.DataNodes.AutoScaling = &antflyv1.AutoScalingSpec{Enabled: true}
-	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
-		t.Fatalf("expected only the independent autoscaling cadence, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected HA runtime observation to win over autoscaling, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds = 18
-	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
-		t.Fatalf("watchdog grace must not change the full reconcile cadence, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("watchdog grace must not change the fixed runtime observation cadence, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
-	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
-		t.Fatalf("expected autoscaling requeue without HA renewal, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("manual HA still requires runtime health observation, got %s", got)
+	}
+
+	cluster.Spec.HighAvailability.Mode = antflyv1.HAModeDisabled
+	cluster.Spec.DataNodes.AutoScaling = nil
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("disabled HA must stop runtime observation, got %s", got)
 	}
 }
 
@@ -6140,14 +6146,14 @@ func TestPeriodicRequeueObservesPeerSeedReceiptWhileStartupGateIsSuspended(t *te
 	}
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
-	if got := periodicRequeueAfter(cluster); got != 0 {
-		t.Fatalf("expected startup-gate observation polling to stop after declarative eligibility, got %s", got)
+	if got := periodicRequeueAfter(cluster); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline HA runtime observation after declarative eligibility, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
 	cluster.Spec.HighAvailability.Runtime.StartupGate.Policy = antflyv1.HAStartupGatePolicySuspend
-	if got := periodicRequeueAfter(cluster); got != 0 {
-		t.Fatalf("expected an intentionally suspended runtime not to poll peer seed receipts, got %s", got)
+	if got := periodicRequeueAfter(cluster); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected intentionally suspended runtime to keep only baseline HA health observation, got %s", got)
 	}
 }
 
@@ -6166,23 +6172,26 @@ func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
 		}},
 	}
 
-	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
-		t.Fatalf("expected direct HA admin retry requeue %s, got %s", want, got)
+	if got, want := haDirectAdminRetryRequeueAfter(cluster, now), 17*time.Second; got != want {
+		t.Fatalf("expected persisted direct HA admin retry deadline %s, got %s", want, got)
+	}
+	if got, want := periodicRequeueAfterAt(cluster, now), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected runtime observation to service the later direct HA admin retry, got %s", got)
 	}
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}
-	if got, want := periodicRequeueAfterAt(cluster, now), 17*time.Second; got != want {
-		t.Fatalf("expected persisted direct HA admin retry requeue %s, got %s", want, got)
+	if got, want := periodicRequeueAfterAt(cluster, now), haRuntimeStatusObservationRequeueAfter; got != want {
+		t.Fatalf("expected manual HA runtime observation to service persisted retry, got %s", got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = ""
-	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
-		t.Fatalf("expected no retry requeue without transient error, got %s", got)
+	if got := periodicRequeueAfterAt(cluster, now); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline runtime observation without transient error, got %s", got)
 	}
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminError = "HA admin API returned status 503"
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = "antfly-ha-action"
-	if got := periodicRequeueAfterAt(cluster, now); got != 0 {
-		t.Fatalf("expected no retry requeue for CLI admin job, got %s", got)
+	if got := periodicRequeueAfterAt(cluster, now); got != haRuntimeStatusObservationRequeueAfter {
+		t.Fatalf("expected only baseline runtime observation for CLI admin job, got %s", got)
 	}
 }
 
