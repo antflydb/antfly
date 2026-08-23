@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 import pytest
 from xdist.remote import Producer
@@ -88,6 +91,30 @@ PERSISTENT_PROCESS_PARAMETERS = {
     ("table_api", "serverless"): "serverless_runtime",
 }
 RESOURCE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+E2E_RESOURCE_ATTRIBUTE = "__antfly_e2e_resources__"
+FixtureFunction = TypeVar("FixtureFunction", bound=Callable[..., object])
+
+
+def e2e_resource(
+    name: str,
+    *,
+    lifetime: str | None = None,
+    identity: str | None = None,
+) -> Callable[[FixtureFunction], FixtureFunction]:
+    """Declare a resource; place this immediately below ``@pytest.fixture``."""
+
+    def decorate(function: FixtureFunction) -> FixtureFunction:
+        if getattr(function, "_fixture_function_marker", None) is not None:
+            raise TypeError("@e2e_resource must be placed below @pytest.fixture")
+        declarations = tuple(getattr(function, E2E_RESOURCE_ATTRIBUTE, ()))
+        setattr(
+            function,
+            E2E_RESOURCE_ATTRIBUTE,
+            (*declarations, (name, lifetime, identity)),
+        )
+        return function
+
+    return decorate
 
 
 def normalize_nodeid(nodeid: str) -> str:
@@ -115,6 +142,28 @@ def _fixture_scope(item: pytest.Item, fixture_name: str) -> str | None:
     return str(definitions[-1].scope)
 
 
+def _fixture_resource_declarations(
+    item: pytest.Item,
+) -> list[tuple[str, object, object, str, str]]:
+    """Return resource declarations attached to fixtures used by an item."""
+    fixture_info = getattr(item, "_fixtureinfo", None)
+    if fixture_info is None:
+        return []
+
+    declarations: list[tuple[str, object, object, str, str]] = []
+    for fixture_name in item.fixturenames:
+        definitions = fixture_info.name2fixturedefs.get(fixture_name)
+        if not definitions:
+            continue
+        definition = definitions[-1]
+        function = getattr(definition, "func", None)
+        for name, lifetime, identity in getattr(function, E2E_RESOURCE_ATTRIBUTE, ()):
+            declarations.append(
+                (str(name), lifetime, identity, fixture_name, str(definition.scope))
+            )
+    return declarations
+
+
 def scheduling_group(item: pytest.Item) -> str:
     """Return a stable group encoding process cost and isolation boundary."""
     nodeid = normalize_nodeid(item.nodeid)
@@ -138,29 +187,52 @@ def scheduling_group(item: pytest.Item) -> str:
                 persistent_processes.add(identity)
     declared_process = False
     declared_transient_process = False
-    for resource_marker in item.iter_markers("e2e_resource"):
-        if not resource_marker.args or str(resource_marker.args[0]) != "antfly_process":
+    declared_process_scopes: set[str] = set()
+    resource_declarations = [
+        (
+            str(marker.args[0]) if marker.args else "",
+            marker.kwargs.get("lifetime"),
+            marker.kwargs.get("identity"),
+            None,
+            None,
+        )
+        for marker in item.iter_markers("e2e_resource")
+    ]
+    resource_declarations.extend(_fixture_resource_declarations(item))
+    for (
+        resource_name,
+        lifetime,
+        identity,
+        fixture_name,
+        fixture_scope,
+    ) in resource_declarations:
+        if resource_name != "antfly_process":
             continue
+        declaration_context = (
+            f" (fixture {fixture_name!r})" if fixture_name is not None else ""
+        )
         declared_process = True
-        lifetime = resource_marker.kwargs.get("lifetime")
+        if fixture_scope is not None:
+            declared_process_scopes.add(fixture_scope)
         if lifetime is None:
             declared_transient_process = True
             continue
         if lifetime != "session":
             raise pytest.UsageError(
-                f"{nodeid}: antfly_process lifetime must be 'session', got {lifetime!r}"
+                f"{nodeid}{declaration_context}: antfly_process lifetime must be "
+                f"'session', got {lifetime!r}"
             )
-        identity = resource_marker.kwargs.get("identity")
         if (
             not isinstance(identity, str)
             or not RESOURCE_IDENTITY_RE.fullmatch(identity)
             or "--" in identity
         ):
             raise pytest.UsageError(
-                f"{nodeid}: a session antfly_process requires an identity containing "
-                "only letters, digits, '.', '_' or '-'"
+                f"{nodeid}{declaration_context}: a session antfly_process requires "
+                "an identity containing only letters, digits, '.', '_' or '-'"
             )
         persistent_processes.add(identity)
+    process_scopes.update(declared_process_scopes)
     process_owned = bool(process_scopes) or declared_process
     reuse_process = item.get_closest_marker("reuse_antfly_process") is not None
     force_fresh = item.get_closest_marker("fresh_antfly_process") is not None
@@ -276,6 +348,8 @@ class DurationHistory:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             return
+        if not isinstance(payload, dict):
+            return
         if payload.get("version") != DURATION_FILE_VERSION:
             return
         tests = payload.get("tests")
@@ -286,12 +360,18 @@ class DurationHistory:
                 continue
             seconds = entry.get("seconds")
             samples = entry.get("samples")
-            if not isinstance(seconds, (int, float)) or seconds < 0:
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
                 continue
-            if not isinstance(samples, int) or samples < 1:
+            try:
+                normalized_seconds = float(seconds)
+            except (OverflowError, ValueError):
+                continue
+            if not math.isfinite(normalized_seconds) or normalized_seconds < 0:
+                continue
+            if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
                 continue
             self.tests[nodeid] = {
-                "seconds": float(seconds),
+                "seconds": normalized_seconds,
                 "samples": samples,
             }
 

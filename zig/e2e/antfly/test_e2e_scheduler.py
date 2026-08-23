@@ -28,6 +28,7 @@ from e2e_scheduler import (
     DurationHistory,
     IsolationAwareScheduling,
     _consolidate_scheduling_groups,
+    e2e_resource,
     normalize_nodeid,
     scheduling_group,
 )
@@ -78,6 +79,31 @@ class FakeWorker:
 
 def mark(name: str, *args: object, **kwargs: object) -> pytest.Mark:
     return pytest.Mark(name, args, kwargs, _ispytest=True)
+
+
+def test_fixture_resource_decorator_rejects_inverted_order() -> None:
+    def fixture_function() -> None:
+        pass
+
+    fixture_definition = pytest.fixture(fixture_function)
+    with pytest.raises(TypeError, match="must be placed below @pytest.fixture"):
+        e2e_resource("antfly_process")(fixture_definition)  # type: ignore[arg-type]
+
+
+@pytest.fixture(scope="session")
+@e2e_resource(
+    "antfly_process",
+    lifetime="session",
+    identity="declared_session_process_fixture",
+)
+def declared_session_process_fixture() -> None:
+    """Exercise resource metadata attached to a real pytest fixture."""
+
+
+@pytest.fixture(scope="module")
+@e2e_resource("antfly_process")
+def declared_module_process_fixture() -> None:
+    """Exercise scope inference for a transient custom process fixture."""
 
 
 def test_normalize_nodeid_only_removes_xdist_group_suffix() -> None:
@@ -148,6 +174,32 @@ def test_declared_session_process_has_stable_identity_and_module_scope() -> None
     )
 
 
+@pytest.mark.e2e_isolation("module", group="declared-session-fixture")
+def test_fixture_resource_declaration_is_applied_to_consuming_test(
+    request: pytest.FixtureRequest,
+    declared_session_process_fixture: None,
+) -> None:
+    del declared_session_process_fixture
+    groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+    assert len(groups) == 1
+    assert str(groups[0]).startswith(
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}declared_session_process_fixture--module--"
+    )
+
+
+@pytest.mark.e2e_isolation("module", group="declared-module-fixture")
+def test_fixture_resource_declaration_preserves_fixture_scope(
+    request: pytest.FixtureRequest,
+    declared_module_process_fixture: None,
+) -> None:
+    del declared_module_process_fixture
+    groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+    assert len(groups) == 1
+    assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}module--")
+
+
 def test_dynamic_serverless_table_parameter_has_persistent_identity() -> None:
     item = FakeItem(
         "test_foreign_sources.py::test_query[serverless]",
@@ -205,6 +257,41 @@ def test_duration_history_round_trips_and_smooths_observations(tmp_path: Path) -
         "samples": 2,
         "seconds": 2.6,
     }
+
+
+@pytest.mark.parametrize("payload", [None, [], 1, "valid JSON"])
+def test_duration_history_ignores_non_object_json(
+    tmp_path: Path, payload: object
+) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    history = DurationHistory(path)
+
+    assert history.tests == {}
+
+
+def test_duration_history_ignores_invalid_numeric_entries(tmp_path: Path) -> None:
+    path = tmp_path / "durations.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tests": {
+                    "valid": {"seconds": 2.0, "samples": 1},
+                    "boolean-seconds": {"seconds": True, "samples": 1},
+                    "infinite-seconds": {"seconds": float("inf"), "samples": 1},
+                    "overflowing-seconds": {"seconds": 10**1000, "samples": 1},
+                    "boolean-samples": {"seconds": 1.0, "samples": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = DurationHistory(path)
+
+    assert history.tests == {"valid": {"seconds": 2.0, "samples": 1}}
 
 
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(
