@@ -16,12 +16,15 @@ pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 pub const Score = types.Score;
 pub const Segment = types.Segment;
+pub const MaterializationState = types.MaterializationState;
+pub const RejectionReason = types.RejectionReason;
 pub const freeSegment = types.freeSegment;
 pub const artifactNameAlloc = types.artifactNameAlloc;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const encodedSize = codec.encodedSize;
 pub const decodeAlloc = codec.decodeAlloc;
 pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
+pub const decodeHeader = codec.decodeHeader;
 pub const wire_version = codec.wire_version;
 
 test "serverless graph metric segment module compiles" {

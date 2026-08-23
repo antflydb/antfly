@@ -2908,7 +2908,7 @@ pub const HttpHandler = struct {
         }
         try self.retainPublicGraphMetricProjection(query.metrics, result.nodes);
         if (result.paths.len > 0) try self.rebuildPublicGraphPathsFromNodes(result);
-        try self.rebuildPublicGraphHitsFromNodes(result);
+        try self.rebuildPublicGraphHitsFromNodes(session.cancellation, result);
     }
 
     fn rebuildPublicGraphPathsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
@@ -2990,13 +2990,54 @@ pub const HttpHandler = struct {
         }
     }
 
-    fn rebuildPublicGraphHitsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
+    const PublicGraphHitKey = struct {
+        source_table: ?[]const u8,
+        id: []const u8,
+    };
+
+    const PublicGraphHitKeyContext = struct {
+        pub fn hash(_: @This(), key: PublicGraphHitKey) u64 {
+            var hasher = std.hash.Wyhash.init(0x6772_6170_682d_6869);
+            if (key.source_table) |table| {
+                hasher.update(&.{1});
+                hasher.update(table);
+            } else {
+                hasher.update(&.{0});
+            }
+            hasher.update(&.{0});
+            hasher.update(key.id);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), lhs: PublicGraphHitKey, rhs: PublicGraphHitKey) bool {
+            if (!std.mem.eql(u8, lhs.id, rhs.id)) return false;
+            if (lhs.source_table == null or rhs.source_table == null) return lhs.source_table == null and rhs.source_table == null;
+            return std.mem.eql(u8, lhs.source_table.?, rhs.source_table.?);
+        }
+    };
+
+    fn rebuildPublicGraphHitsFromNodes(
+        self: *HttpHandler,
+        cancellation: CancellationToken,
+        result: *db_types.GraphSearchResult,
+    ) !void {
+        var hit_indexes = std.HashMapUnmanaged(PublicGraphHitKey, usize, PublicGraphHitKeyContext, std.hash_map.default_max_load_percentage).empty;
+        defer hit_indexes.deinit(self.alloc);
+        try hit_indexes.ensureTotalCapacity(self.alloc, @intCast(result.hits.len));
+        for (result.hits, 0..) |hit, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const gop = hit_indexes.getOrPutAssumeCapacity(.{ .source_table = hit.source_table, .id = hit.id });
+            if (!gop.found_existing) gop.value_ptr.* = i;
+        }
+
         const hits = try self.alloc.alloc(db_types.SearchHit, result.nodes.len);
         errdefer if (hits.len > 0) self.alloc.free(hits);
         var initialized: usize = 0;
         errdefer for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
         for (result.nodes, 0..) |node, i| {
-            if (findPublicGraphHit(result.hits, node)) |existing| {
+            if (i % 4096 == 0) try cancellation.check();
+            if (hit_indexes.get(.{ .source_table = node.table, .id = node.key })) |existing_index| {
+                const existing = result.hits[existing_index];
                 hits[i] = try existing.clone(self.alloc);
                 hits[i].score = clampGraphMetricScore(node.distance);
             } else {
@@ -3010,15 +3051,6 @@ pub const HttpHandler = struct {
         // Pattern-query totals count matches, while traversal totals count
         // result nodes. Metric filtering/sorting applies to nodes only.
         if (result.matches.len == 0) result.total_hits = @intCast(result.nodes.len);
-    }
-
-    fn findPublicGraphHit(hits: []const db_types.SearchHit, node: graph_query_mod.GraphResultNode) ?db_types.SearchHit {
-        for (hits) |hit| {
-            if (!std.mem.eql(u8, hit.id, node.key)) continue;
-            if (hit.source_table == null and node.table == null) return hit;
-            if (hit.source_table != null and node.table != null and std.mem.eql(u8, hit.source_table.?, node.table.?)) return hit;
-        }
-        return null;
     }
 
     fn newPublicGraphHitAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !db_types.SearchHit {
@@ -4966,6 +4998,7 @@ pub const HttpHandler = struct {
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady => return error.NotFound,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded,
@@ -9079,7 +9112,7 @@ test "serverless graph metric node post-processing preserves hydrated hits and p
     };
     defer result.deinit(alloc);
 
-    try handler.rebuildPublicGraphHitsFromNodes(&result);
+    try handler.rebuildPublicGraphHitsFromNodes(.none, &result);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("{\"title\":\"kept\"}", result.hits[0].stored_data.?);
     try std.testing.expectEqual(@as(u32, 7), result.total_hits);

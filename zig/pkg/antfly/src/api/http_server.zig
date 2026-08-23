@@ -7991,6 +7991,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge => return error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
@@ -8155,6 +8156,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+                error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -8204,6 +8206,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge,
@@ -8281,6 +8284,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -11377,6 +11381,11 @@ pub const ApiHttpServer = struct {
             error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphMetricGlobalMaterializationRequiredBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
                 false,
             ),
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))

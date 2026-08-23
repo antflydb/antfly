@@ -121,6 +121,10 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     errdefer segment.deinit(alloc);
     if (!std.mem.eql(u8, segment.graph_index_name, graph_index_name) or !std.mem.eql(u8, segment.metric_name, metric_name)) return error.InvalidGraphMetricSegment;
     if (!std.mem.eql(u8, segment.source_graph_artifact_id, graph_artifact.artifact_id) or !std.mem.eql(u8, segment.source_graph_checksum, graph_artifact.checksum)) return error.MetricStale;
+    if (segment.materialization_state == .rejected) return switch (segment.rejection_reason) {
+        .build_budget_exceeded => error.GraphMetricMaterializationRejected,
+        .none => error.InvalidGraphMetricSegment,
+    };
     return segment;
 }
 

@@ -107,6 +107,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         GraphMetricGlobalMaterializationRequired,
+        GraphMetricMaterializationRejected,
         QueryCandidateBudgetExceeded,
         HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
@@ -765,6 +766,15 @@ pub fn graphMetricGlobalMaterializationRequiredBody(alloc: std.mem.Allocator) ![
     }, .{});
 }
 
+pub fn graphMetricMaterializationRejectedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_materialization_rejected",
+        .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
+        .reason = "build_budget_exceeded",
+        .retryable = false,
+    }, .{});
+}
+
 test "multi-shard graph metric rejection is actionable and non-retryable" {
     const encoded = try graphMetricGlobalMaterializationRequiredBody(std.testing.allocator);
     defer std.testing.allocator.free(encoded);
@@ -777,6 +787,22 @@ test "multi-shard graph metric rejection is actionable and non-retryable" {
     try std.testing.expectEqualStrings("graph_metric_global_materialization_required", parsed.value.code);
     try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "globally coordinated metric snapshot") != null);
     try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless graph metric build-budget rejection is actionable and non-retryable" {
+    const encoded = try graphMetricMaterializationRejectedBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        reason: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_materialization_rejected", parsed.value.code);
+    try std.testing.expectEqualStrings("build_budget_exceeded", parsed.value.reason);
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "narrow the graph") != null);
 }
 
 test "public table query maps multi-shard graph metric rejection" {
@@ -1047,6 +1073,10 @@ pub fn handleTableQueryRequest(
             error.GraphMetricGlobalMaterializationRequired => {
                 std.log.info("public table query requires global graph metric materialization table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMetricGlobalMaterializationRequiredBody(alloc), .json = true };
+            },
+            error.GraphMetricMaterializationRejected => {
+                std.log.info("public table query graph metric materialization rejected table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricMaterializationRejectedBody(alloc), .json = true };
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,

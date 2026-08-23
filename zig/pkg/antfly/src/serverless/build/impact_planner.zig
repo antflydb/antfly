@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const catalog_types = @import("../catalog/types.zig");
+const graph_metric_config = @import("graph_metric_config.zig");
+const lake_graph_metric = @import("lake_graph_metric.zig");
 
 pub const ArtifactFamily = enum {
     document_segment,
@@ -110,7 +112,7 @@ pub fn planAlloc(alloc: std.mem.Allocator, input: PlanInput) !ArtifactImpactPlan
         plan.rebuild_graph = true;
         plan.republish_graph_from_head = true;
     }
-    if (try graphMetricsChanged(before_indexes.value, after_indexes.value)) {
+    if (try graphMetricsChanged(alloc, before_indexes.value, after_indexes.value)) {
         plan.rebuild_graph_metrics = true;
     }
 
@@ -198,7 +200,7 @@ fn familyChanged(before: std.json.Value, after: std.json.Value, family: Artifact
     return false;
 }
 
-fn graphMetricsChanged(before: std.json.Value, after: std.json.Value) !bool {
+fn graphMetricsChanged(alloc: std.mem.Allocator, before: std.json.Value, after: std.json.Value) !bool {
     const before_object = switch (before) {
         .object => |value| value,
         else => return error.InvalidTableIndexMetadata,
@@ -212,11 +214,25 @@ fn graphMetricsChanged(before: std.json.Value, after: std.json.Value) !bool {
         if (classifyIndexFamily(entry.value_ptr.*) != .graph) continue;
         const after_value = after_object.get(entry.key_ptr.*) orelse continue;
         if (classifyIndexFamily(after_value) != .graph) continue;
-        const before_metrics = entry.value_ptr.*.object.get("metrics") orelse .null;
-        const after_metrics = after_value.object.get("metrics") orelse .null;
-        if (!jsonValueEql(before_metrics, after_metrics)) return true;
+        const before_metrics = try graph_metric_config.parseMetricConfigsAlloc(alloc, entry.value_ptr.*);
+        defer @import("../../graph/graph.zig").freeGraphMetricConfigs(alloc, before_metrics);
+        const after_metrics = try graph_metric_config.parseMetricConfigsAlloc(alloc, after_value);
+        defer @import("../../graph/graph.zig").freeGraphMetricConfigs(alloc, after_metrics);
+        if (!canonicalGraphMetricsEql(before_metrics, after_metrics)) return true;
     }
     return false;
+}
+
+fn canonicalGraphMetricsEql(
+    lhs: []const @import("../../graph/graph.zig").GraphMetricConfig,
+    rhs: []const @import("../../graph/graph.zig").GraphMetricConfig,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or
+            lake_graph_metric.configFingerprint(left) != lake_graph_metric.configFingerprint(right)) return false;
+    }
+    return true;
 }
 
 fn indexConfigEql(lhs: std.json.Value, rhs: std.json.Value, family: ArtifactFamily) bool {
@@ -365,4 +381,12 @@ test "serverless impact planner rebuilds graph metrics without rebuilding graph 
     try std.testing.expect(!plan.rebuild_graph);
     try std.testing.expect(plan.rebuild_graph_metrics);
     try std.testing.expect(plan.requiresHeadRepublish());
+}
+
+test "serverless impact planner ignores explicit graph metric defaults" {
+    const plan = try planAlloc(std.testing.allocator, .{
+        .before_indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}",
+        .after_indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"refresh\":\"background\",\"damping\":0.85,\"tolerance\":0.000001,\"max_iterations\":50}}}}",
+    });
+    try std.testing.expect(!plan.any());
 }

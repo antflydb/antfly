@@ -26,6 +26,16 @@ pub const Score = struct {
     }
 };
 
+pub const MaterializationState = enum(u8) {
+    ready = 0,
+    rejected = 1,
+};
+
+pub const RejectionReason = enum(u8) {
+    none = 0,
+    build_budget_exceeded = 1,
+};
+
 /// An immutable metric vector tied to the exact graph artifact from which it
 /// was computed. Scores are sorted by node id for deterministic encoding and
 /// binary-search point lookups without a per-request hash table.
@@ -36,6 +46,8 @@ pub const Segment = struct {
     source_graph_artifact_id: []u8,
     source_graph_checksum: []u8,
     config_fingerprint: u64,
+    materialization_state: MaterializationState = .ready,
+    rejection_reason: RejectionReason = .none,
     edge_filter: graph_mod.GraphMetricEdgeFilter,
     converged: bool,
     iterations_completed: u32,

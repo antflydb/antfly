@@ -23,6 +23,7 @@ const graph_mod = @import("../../graph/graph.zig");
 const metrics = @import("../../graph/metrics.zig");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const artifact_store = @import("../artifacts/store.zig");
+const fs_artifact_store = @import("../artifacts/fs_store.zig");
 const graph_segment = @import("../graph_segment/mod.zig");
 const metric_segment = @import("../graph_metric_segment/mod.zig");
 
@@ -134,13 +135,20 @@ pub fn publishManyFromGraphArtifactAlloc(
     }
     for (configs, 0..) |config, i| {
         try cancellation.check();
-        var built = try buildFromSegmentAlloc(alloc, graph, .{
+        var built = buildFromSegmentAlloc(alloc, graph, .{
             .graph_index_name = graph_index_name,
             .config = config,
             .source_graph = source_graph,
             .cancellation = cancellation,
             .limits = limits,
-        });
+        }) catch |err| switch (err) {
+            error.GraphMetricBuildBudgetExceeded => {
+                refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, .build_budget_exceeded);
+                initialized += 1;
+                continue;
+            },
+            else => return err,
+        };
         defer built.deinit(alloc);
         var metadata = try artifacts.put(built.payload);
         defer metadata.deinit(alloc);
@@ -159,6 +167,100 @@ pub fn publishManyFromGraphArtifactAlloc(
         initialized += 1;
     }
     return refs;
+}
+
+/// Publishes durable terminal status sidecars when the source graph itself is
+/// outside the materializer's admission budget. These sidecars preserve base
+/// publication, prevent retry hot loops, and let queries return an actionable
+/// rejection instead of pretending the configured metric does not exist.
+pub fn publishRejectedManyAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    reason: metric_segment.RejectionReason,
+) ![]artifact_ref.ArtifactRef {
+    const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (refs[0..initialized]) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(refs);
+    }
+    for (configs, 0..) |config, i| {
+        try cancellation.check();
+        refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, reason);
+        initialized += 1;
+    }
+    return refs;
+}
+
+fn publishRejectedAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    config: graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    reason: metric_segment.RejectionReason,
+) !artifact_ref.ArtifactRef {
+    try cancellation.check();
+    var segment = try rejectedSegmentAlloc(alloc, graph_index_name, source_graph, config, reason);
+    defer segment.deinit(alloc);
+    const payload = try metric_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var metadata = try artifacts.put(payload);
+    defer metadata.deinit(alloc);
+    const name = try metric_segment.artifactNameAlloc(alloc, graph_index_name, config.name);
+    errdefer alloc.free(name);
+    const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
+    errdefer alloc.free(artifact_id);
+    const checksum = try alloc.dupe(u8, metadata.checksum);
+    return .{
+        .kind = .graph_metric_segment,
+        .name = name,
+        .artifact_id = artifact_id,
+        .byte_len = metadata.byte_len,
+        .checksum = checksum,
+    };
+}
+
+fn rejectedSegmentAlloc(
+    alloc: Allocator,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    config: graph_mod.GraphMetricConfig,
+    reason: metric_segment.RejectionReason,
+) !metric_segment.Segment {
+    const owned_graph_index_name = try alloc.dupe(u8, graph_index_name);
+    errdefer alloc.free(owned_graph_index_name);
+    const owned_metric_name = try alloc.dupe(u8, config.name);
+    errdefer alloc.free(owned_metric_name);
+    const owned_source_graph_artifact_id = try alloc.dupe(u8, source_graph.artifact_id);
+    errdefer alloc.free(owned_source_graph_artifact_id);
+    const owned_source_graph_checksum = try alloc.dupe(u8, source_graph.checksum);
+    errdefer alloc.free(owned_source_graph_checksum);
+    var edge_filter = try cloneSortedEdgeFilterAlloc(alloc, config.edge_filter);
+    errdefer edge_filter.deinit(alloc);
+    const scores = try alloc.alloc(metric_segment.Score, 0);
+    errdefer alloc.free(scores);
+    const segment = metric_segment.Segment{
+        .graph_index_name = owned_graph_index_name,
+        .metric_name = owned_metric_name,
+        .kind = config.kind,
+        .source_graph_artifact_id = owned_source_graph_artifact_id,
+        .source_graph_checksum = owned_source_graph_checksum,
+        .config_fingerprint = configFingerprint(config),
+        .materialization_state = .rejected,
+        .rejection_reason = reason,
+        .edge_filter = edge_filter,
+        .converged = false,
+        .iterations_completed = 0,
+        .delta = 0,
+        .scores = scores,
+    };
+    return segment;
 }
 
 fn buildFromSegmentAlloc(alloc: Allocator, graph: graph_segment.Segment, options: BuildOptions) !BuildResult {
@@ -385,4 +487,55 @@ test "serverless lake graph metrics build immutable pagerank and degree vectors"
         .config = .{ .name = "pagerank" },
         .source_graph = wrong_length,
     }));
+}
+
+test "serverless lake graph metrics persist a budget rejection with exact provenance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-metric-artifacts", .{tmp.sub_path});
+    defer alloc.free(root);
+    var fs = try fs_artifact_store.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+
+    var graph = graph_segment.Segment{ .adjacencies = try alloc.alloc(graph_segment.Adjacency, 2) };
+    defer graph.deinit(alloc);
+    graph.adjacencies[0] = .{ .node_id = try alloc.dupe(u8, "a"), .out_edges = try alloc.alloc(graph_segment.Edge, 1), .in_edges = try alloc.alloc(graph_segment.Edge, 0) };
+    graph.adjacencies[0].out_edges[0] = .{ .neighbor_id = try alloc.dupe(u8, "b"), .edge_type = try alloc.dupe(u8, "cites"), .weight = 1 };
+    graph.adjacencies[1] = .{ .node_id = try alloc.dupe(u8, "b"), .out_edges = try alloc.alloc(graph_segment.Edge, 0), .in_edges = try alloc.alloc(graph_segment.Edge, 1) };
+    graph.adjacencies[1].in_edges[0] = .{ .neighbor_id = try alloc.dupe(u8, "a"), .edge_type = try alloc.dupe(u8, "cites"), .weight = 1 };
+    const graph_payload = try graph_segment.encodeAlloc(alloc, graph);
+    defer alloc.free(graph_payload);
+    var source_metadata = try artifacts.put(graph_payload);
+    defer source_metadata.deinit(alloc);
+    const source = artifact_ref.ArtifactRef{
+        .kind = .graph_segment,
+        .name = "graph",
+        .artifact_id = source_metadata.artifact_id,
+        .byte_len = source_metadata.byte_len,
+        .checksum = source_metadata.checksum,
+    };
+    const configs = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_nodes = 1 });
+    defer {
+        for (published) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(published);
+    }
+    try std.testing.expectEqual(@as(usize, 1), published.len);
+    const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+        alloc,
+        published[0].artifact_id,
+        published[0].byte_len,
+        published[0].checksum,
+        .none,
+    );
+    defer alloc.free(payload);
+    var decoded = try metric_segment.decodeAlloc(alloc, payload);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(metric_segment.MaterializationState.rejected, decoded.materialization_state);
+    try std.testing.expectEqual(metric_segment.RejectionReason.build_budget_exceeded, decoded.rejection_reason);
+    try std.testing.expectEqualStrings(source.artifact_id, decoded.source_graph_artifact_id);
+    try std.testing.expectEqualStrings(source.checksum, decoded.source_graph_checksum);
+    try std.testing.expectEqual(configFingerprint(configs[0]), decoded.config_fingerprint);
 }

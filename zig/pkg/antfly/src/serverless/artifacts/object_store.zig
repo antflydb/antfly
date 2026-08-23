@@ -275,6 +275,72 @@ pub const ObjectStore = struct {
         };
     }
 
+    pub fn verifyContent(
+        self: *ObjectStore,
+        _: std.mem.Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
+        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
+        defer meta.deinit(self.client.allocator);
+        if (meta.content_length != expected_byte_len) return error.ArtifactIntegrityMismatch;
+        if (meta.checksum_scope == .object) {
+            if (meta.checksum) |native| {
+                if (native.checksum_type == .full_object) switch (native.algorithm) {
+                    .sha256_hex => {
+                        if (!std.ascii.eqlIgnoreCase(native.value, expected_checksum)) return error.ArtifactIntegrityMismatch;
+                        return;
+                    },
+                    .sha256_base64 => {
+                        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                        _ = std.fmt.hexToBytes(&digest, expected_checksum) catch return error.ArtifactIntegrityMismatch;
+                        var encoded: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
+                        const value = std.base64.standard.Encoder.encode(&encoded, &digest);
+                        if (!std.mem.eql(u8, native.value, value)) return error.ArtifactIntegrityMismatch;
+                        return;
+                    },
+                    else => {},
+                };
+            }
+        }
+
+        // Providers without a comparable SHA-256 metadata checksum are read in
+        // bounded ranges pinned to the provider identity when one is exposed.
+        // The final digest is authoritative and memory remains O(1).
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        const chunk_bytes: u64 = 8 * 1024 * 1024;
+        var offset: u64 = 0;
+        while (offset < expected_byte_len) {
+            try cancellation.check();
+            const len = @min(chunk_bytes, expected_byte_len - offset);
+            var part = self.client.getObject(self.bucket, key, .{
+                .range = .{ .offset = offset, .length = len },
+                .version_id = meta.version_id,
+                .if_match_etag = meta.etag,
+                .skip_metadata_probe = true,
+                .max_response_bytes = @intCast(len),
+                .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+            }) catch |err| return normalizeCancellationError(err);
+            defer part.deinit(self.client.allocator);
+            if (part.body.len != len) return error.ArtifactIntegrityMismatch;
+            hasher.update(part.body);
+            offset += len;
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        try cancellation.check();
+    }
+
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
@@ -291,6 +357,7 @@ pub const ObjectStore = struct {
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .stat = erasedStat,
         .stat_with_cancellation = erasedStatWithCancellation,
+        .verify_content = erasedVerifyContent,
         .delete = erasedDelete,
     };
 
@@ -332,6 +399,11 @@ pub const ObjectStore = struct {
     fn erasedStatWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.statWithCancellation(alloc, artifact_id, cancellation);
+    }
+
+    fn erasedVerifyContent(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        try self.verifyContent(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
     }
 
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
@@ -456,6 +528,7 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     var stat = try store.stat(meta.artifact_id);
     defer stat.deinit(result_alloc);
     try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
+    try store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
 
     var query_buffer: [1024]u8 = undefined;
     var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
@@ -470,6 +543,19 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     try std.testing.expect(query_fba.ownsSlice(verified));
     query_alloc.free(verified);
     try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
+
+    const key = try keyForChecksumAlloc(result_alloc, "tenant/a", meta.checksum);
+    defer result_alloc.free(key);
+    var corrupt = try result_alloc.dupe(u8, "allocator-safe");
+    defer result_alloc.free(corrupt);
+    corrupt[0] ^= 1;
+    var client = memory.client();
+    var replaced = try client.putObject("bucket", key, corrupt, .{});
+    defer replaced.deinit(client_alloc);
+    try std.testing.expectError(
+        error.ArtifactIntegrityMismatch,
+        store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none),
+    );
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {

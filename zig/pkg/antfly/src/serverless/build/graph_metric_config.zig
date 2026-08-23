@@ -81,7 +81,7 @@ pub fn parseIndexSpecsAlloc(alloc: Allocator, indexes_json: []const u8) ![]Index
     return try specs.toOwnedSlice(alloc);
 }
 
-fn parseMetricConfigsAlloc(alloc: Allocator, index: std.json.Value) ![]graph_mod.GraphMetricConfig {
+pub fn parseMetricConfigsAlloc(alloc: Allocator, index: std.json.Value) ![]graph_mod.GraphMetricConfig {
     const metrics = index.object.get("metrics") orelse return try alloc.alloc(graph_mod.GraphMetricConfig, 0);
     if (metrics != .object) return error.InvalidIndexConfig;
     var configs = std.ArrayListUnmanaged(graph_mod.GraphMetricConfig).empty;

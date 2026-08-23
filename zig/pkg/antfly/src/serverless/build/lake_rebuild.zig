@@ -570,7 +570,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             const expected_hash = try graphMetricBindingHashAlloc(alloc, config, graph_declaration.artifact.artifact_id);
             defer alloc.free(expected_hash);
             if (!std.mem.eql(u8, existing.binding.index_config_hash, expected_hash) or
-                !try artifactRefExists(alloc, artifacts, existing.artifact))
+                !try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, spec.index_name, config, graph_declaration.artifact))
             {
                 reusable = false;
                 break;
@@ -597,12 +597,15 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             .none,
             .{},
         ) catch |err| switch (err) {
-            // A derived metric exceeding its explicit work budget must not
-            // prevent publishing the table and its graph topology.
-            error.GraphMetricBuildBudgetExceeded => {
-                std.log.warn("serverless lake graph metrics skipped after exceeding build budget index={s}", .{spec.index_name});
-                continue;
-            },
+            error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_declaration.artifact,
+                spec.configs,
+                .none,
+                .build_budget_exceeded,
+            ),
             else => return err,
         };
         defer {
@@ -1276,19 +1279,32 @@ fn graphMetricBindingHashAlloc(
     );
 }
 
-fn artifactRefExists(
+fn graphMetricArtifactReusable(
     alloc: Allocator,
     artifacts: *artifact_store.ArtifactStore,
     ref: manifest_artifact.ArtifactRef,
+    graph_index_name: []const u8,
+    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    graph_ref: manifest_artifact.ArtifactRef,
 ) !bool {
-    var metadata = artifacts.statWithCancellationUsingAllocator(alloc, ref.artifact_id, .none) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidArtifactId => return false,
+    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, .none) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
-    defer metadata.deinit(alloc);
-    return metadata.byte_len == ref.byte_len and
-        std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) and
-        std.mem.eql(u8, metadata.checksum, ref.checksum);
+    const max_header_bytes: u64 = 1024 * 1024;
+    const prefix_len: usize = @intCast(@min(ref.byte_len, max_header_bytes));
+    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, .none) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        else => return err,
+    };
+    defer alloc.free(prefix);
+    const header = graph_metric_segment.decodeHeader(prefix) catch return false;
+    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
+        std.mem.eql(u8, header.metric_name, config.name) and
+        header.kind == config.kind and
+        header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
+        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+        std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
 fn indexConfigHashAlloc(

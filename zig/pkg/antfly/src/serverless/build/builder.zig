@@ -3471,7 +3471,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                     break;
                 };
                 const metric_ref = manifest.artifacts[metric_index];
-                if (!try artifactRefExists(alloc, artifacts, metric_ref, cancellation)) {
+                if (!try graphMetricArtifactReusable(alloc, artifacts, metric_ref, spec.index_name, config, graph_ref, cancellation)) {
                     reusable = false;
                     break;
                 }
@@ -3498,17 +3498,25 @@ fn buildGraphMetricArtifactRefsAlloc(
             cancellation,
             .{},
         ) catch |err| switch (err) {
-            // Metrics are derived, optional sidecars. A configured work budget
-            // protects the publisher; exceeding it must not wedge base data.
-            error.GraphMetricBuildBudgetExceeded => {
-                std.log.warn("serverless graph metrics skipped after exceeding build budget index={s}", .{spec.index_name});
-                continue;
-            },
+            error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_ref,
+                spec.configs,
+                cancellation,
+                .build_budget_exceeded,
+            ),
             else => return err,
         };
-        defer alloc.free(built);
+        var built_refs_moved = false;
+        defer {
+            if (!built_refs_moved) for (built) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
+            alloc.free(built);
+        }
         try refs.ensureUnusedCapacity(alloc, built.len);
         for (built) |ref| refs.appendAssumeCapacity(ref);
+        built_refs_moved = true;
     }
     return try refs.toOwnedSlice(alloc);
 }
@@ -3531,20 +3539,33 @@ fn artifactRefsIdentifySamePayload(lhs: manifest_mod.ArtifactRef, rhs: manifest_
         std.mem.eql(u8, lhs.checksum, rhs.checksum);
 }
 
-fn artifactRefExists(
+fn graphMetricArtifactReusable(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     ref: manifest_mod.ArtifactRef,
+    graph_index_name: []const u8,
+    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    graph_ref: manifest_mod.ArtifactRef,
     cancellation: CancellationToken,
 ) !bool {
-    var metadata = artifacts.statWithCancellationUsingAllocator(alloc, ref.artifact_id, cancellation) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidArtifactId => return false,
+    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, cancellation) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
-    defer metadata.deinit(alloc);
-    return metadata.byte_len == ref.byte_len and
-        std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) and
-        std.mem.eql(u8, metadata.checksum, ref.checksum);
+    const max_header_bytes: u64 = 1024 * 1024;
+    const prefix_len: usize = @intCast(@min(ref.byte_len, max_header_bytes));
+    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, cancellation) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        else => return err,
+    };
+    defer alloc.free(prefix);
+    const header = graph_metric_segment_mod.decodeHeader(prefix) catch return false;
+    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
+        std.mem.eql(u8, header.metric_name, config.name) and
+        header.kind == config.kind and
+        header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
+        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+        std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
 fn namedArtifactActionForName(

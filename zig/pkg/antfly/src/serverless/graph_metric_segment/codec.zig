@@ -18,8 +18,74 @@ const bounded_decode = @import("../bounded_decode.zig");
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
-pub const wire_version: u16 = 1;
-const fixed_header_len = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4;
+pub const wire_version: u16 = 2;
+const fixed_header_len_v1 = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4;
+const fixed_header_len = fixed_header_len_v1 + 2;
+
+pub const Header = struct {
+    kind: @import("../../graph/graph.zig").GraphMetricKind,
+    materialization_state: types.MaterializationState,
+    rejection_reason: types.RejectionReason,
+    config_fingerprint: u64,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    source_graph_artifact_id: []const u8,
+    source_graph_checksum: []const u8,
+};
+
+/// Decodes only provenance and lifecycle metadata from a bounded prefix. Score
+/// vectors and edge filters are deliberately not materialized.
+pub fn decodeHeader(data: []const u8) !Header {
+    if (data.len < fixed_header_len_v1) return error.InvalidGraphMetricSegment;
+    var pos: usize = 0;
+    if (!std.mem.eql(u8, try take(data, &pos, 4), wire_magic)) return error.InvalidGraphMetricSegment;
+    const version = try readInt(u16, data, &pos);
+    if (version == 0 or version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
+    if (pos >= data.len) return error.InvalidGraphMetricSegment;
+    const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    pos += 1;
+    const materialization_state: types.MaterializationState = if (version >= 2) blk: {
+        if (pos >= data.len) return error.InvalidGraphMetricSegment;
+        const value = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
+        pos += 1;
+        break :blk value;
+    } else .ready;
+    const rejection_reason: types.RejectionReason = if (version >= 2) blk: {
+        if (pos >= data.len) return error.InvalidGraphMetricSegment;
+        const value = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
+        pos += 1;
+        break :blk value;
+    } else .none;
+    const converged_byte = (try take(data, &pos, 1))[0];
+    if (converged_byte > 1) return error.InvalidGraphMetricSegment;
+    const iterations = try readInt(u32, data, &pos);
+    const fingerprint = try readInt(u64, data, &pos);
+    const delta: f64 = @bitCast(try readInt(u64, data, &pos));
+    if (!std.math.isFinite(delta)) return error.InvalidGraphMetricSegment;
+    switch (materialization_state) {
+        .ready => if (rejection_reason != .none) return error.InvalidGraphMetricSegment,
+        .rejected => if (rejection_reason == .none or converged_byte != 0 or iterations != 0 or delta != 0) return error.InvalidGraphMetricSegment,
+    }
+    const graph_len = try readInt(u32, data, &pos);
+    const metric_len = try readInt(u32, data, &pos);
+    const artifact_len = try readInt(u32, data, &pos);
+    const checksum_len = try readInt(u32, data, &pos);
+    _ = try readInt(u32, data, &pos); // edge type count
+    const graph_index_name = try take(data, &pos, graph_len);
+    const metric_name = try take(data, &pos, metric_len);
+    const source_graph_artifact_id = try take(data, &pos, artifact_len);
+    const source_graph_checksum = try take(data, &pos, checksum_len);
+    return .{
+        .kind = kind,
+        .materialization_state = materialization_state,
+        .rejection_reason = rejection_reason,
+        .config_fingerprint = fingerprint,
+        .graph_index_name = graph_index_name,
+        .metric_name = metric_name,
+        .source_graph_artifact_id = source_graph_artifact_id,
+        .source_graph_checksum = source_graph_checksum,
+    };
+}
 
 pub fn encodedSize(segment: types.Segment) !usize {
     try validateSegment(segment);
@@ -46,6 +112,10 @@ pub fn encodeAlloc(alloc: Allocator, segment: types.Segment) ![]u8 {
     putBytes(data, &pos, wire_magic);
     putInt(u16, data, &pos, wire_version);
     data[pos] = @intFromEnum(segment.kind);
+    pos += 1;
+    data[pos] = @intFromEnum(segment.materialization_state);
+    pos += 1;
+    data[pos] = @intFromEnum(segment.rejection_reason);
     pos += 1;
     data[pos] = @intFromBool(segment.converged);
     pos += 1;
@@ -89,12 +159,25 @@ pub fn decodeAllocWithLimits(alloc: Allocator, data: []const u8, limits: bounded
 }
 
 fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decode.Budget) !types.Segment {
-    if (data.len < fixed_header_len + 4) return error.InvalidGraphMetricSegment;
+    if (data.len < fixed_header_len_v1 + 4) return error.InvalidGraphMetricSegment;
     var pos: usize = 0;
     if (!std.mem.eql(u8, take(data, &pos, 4) catch return error.InvalidGraphMetricSegment, wire_magic)) return error.InvalidGraphMetricSegment;
-    if ((readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment) != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
+    const version = readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment;
+    if (version == 0 or version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
+    const materialization_state: types.MaterializationState = if (version >= 2) blk: {
+        if (pos >= data.len) return error.InvalidGraphMetricSegment;
+        const value = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
+        pos += 1;
+        break :blk value;
+    } else .ready;
+    const rejection_reason: types.RejectionReason = if (version >= 2) blk: {
+        if (pos >= data.len) return error.InvalidGraphMetricSegment;
+        const value = std.enums.fromInt(types.RejectionReason, data[pos]) orelse return error.InvalidGraphMetricSegment;
+        pos += 1;
+        break :blk value;
+    } else .none;
     const converged_byte = data[pos];
     pos += 1;
     if (converged_byte > 1) return error.InvalidGraphMetricSegment;
@@ -144,7 +227,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         initialized += 1;
     }
     if (pos != data.len) return error.InvalidGraphMetricSegment;
-    var segment = types.Segment{ .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
+    var segment = types.Segment{ .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
     try validateSegment(segment);
     return segment;
@@ -158,6 +241,12 @@ fn validateSegment(segment: types.Segment) !void {
     _ = std.math.cast(u32, segment.source_graph_checksum.len) orelse return error.GraphMetricSegmentTooLarge;
     _ = std.math.cast(u32, segment.scores.len) orelse return error.GraphMetricSegmentTooLarge;
     if (!std.math.isFinite(segment.delta)) return error.InvalidGraphMetricSegment;
+    switch (segment.materialization_state) {
+        .ready => if (segment.rejection_reason != .none) return error.InvalidGraphMetricSegment,
+        .rejected => {
+            if (segment.rejection_reason == .none or segment.scores.len != 0 or segment.converged or segment.iterations_completed != 0 or segment.delta != 0) return error.InvalidGraphMetricSegment;
+        },
+    }
     if ((segment.edge_filter.mode == .all) != (segment.edge_filter.types.len == 0)) return error.InvalidGraphMetricSegment;
     for (segment.edge_filter.types, 0..) |edge_type, i| {
         if (edge_type.len == 0) return error.InvalidGraphMetricSegment;
@@ -208,4 +297,64 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, 0.75), decoded.score("b"));
     try std.testing.expect(decoded.score("missing") == null);
+}
+
+test "serverless graph metric segment round trips terminal materialization rejection" {
+    const alloc = std.testing.allocator;
+    var segment = types.Segment{
+        .graph_index_name = try alloc.dupe(u8, "graph"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .kind = .pagerank,
+        .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"),
+        .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"),
+        .config_fingerprint = 42,
+        .materialization_state = .rejected,
+        .rejection_reason = .build_budget_exceeded,
+        .edge_filter = .{},
+        .converged = false,
+        .iterations_completed = 0,
+        .delta = 0,
+        .scores = try alloc.alloc(types.Score, 0),
+    };
+    defer segment.deinit(alloc);
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(types.MaterializationState.rejected, decoded.materialization_state);
+    try std.testing.expectEqual(types.RejectionReason.build_budget_exceeded, decoded.rejection_reason);
+    try std.testing.expectEqual(@as(usize, 0), decoded.scores.len);
+}
+
+test "serverless graph metric segment decodes version one artifacts as ready" {
+    const alloc = std.testing.allocator;
+    var segment = types.Segment{
+        .graph_index_name = try alloc.dupe(u8, "graph"),
+        .metric_name = try alloc.dupe(u8, "degree"),
+        .kind = .degree,
+        .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"),
+        .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"),
+        .config_fingerprint = 9,
+        .edge_filter = .{},
+        .converged = true,
+        .iterations_completed = 1,
+        .delta = 0,
+        .scores = try alloc.alloc(types.Score, 0),
+    };
+    defer segment.deinit(alloc);
+    const version_two = try encodeAlloc(alloc, segment);
+    defer alloc.free(version_two);
+    const version_one = try alloc.alloc(u8, version_two.len - 2);
+    defer alloc.free(version_one);
+    @memcpy(version_one[0..7], version_two[0..7]);
+    @memcpy(version_one[7..], version_two[9..]);
+    std.mem.writeInt(u16, version_one[4..6], 1, .little);
+
+    const header = try decodeHeader(version_one);
+    try std.testing.expectEqual(types.MaterializationState.ready, header.materialization_state);
+    try std.testing.expectEqual(types.RejectionReason.none, header.rejection_reason);
+    var decoded = try decodeAlloc(alloc, version_one);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(types.MaterializationState.ready, decoded.materialization_state);
+    try std.testing.expectEqual(types.RejectionReason.none, decoded.rejection_reason);
 }
