@@ -159,4 +159,45 @@ describe("GraphIndexExplorer", () => {
     expect(await screen.findByText("Graph Explorer")).toBeTruthy();
     expect(screen.getByTestId("force-graph").textContent).toContain("2 nodes / 1 edges");
   });
+
+  it("uses traversal path identities for edges inside a foreign table", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={{
+          kind: "nodes",
+          nodes: [
+            {
+              key: "carol",
+              table: "entities",
+              depth: 2,
+              path: [
+                { key: "alice" },
+                { key: "bob", table: "entities" },
+                { key: "carol", table: "entities" },
+              ],
+              path_edges: [
+                {
+                  source: "alice",
+                  target: "bob",
+                  type: "mentions",
+                  weight: 1,
+                  metadata: { target_table: "entities" },
+                },
+                { source: "bob", target: "carol", type: "related", weight: 1 },
+              ],
+            },
+          ],
+          paths: [],
+          stats: { returned_items: 1, truncated: false },
+          took: 1,
+        }}
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("3 nodes / 2 edges");
+  });
 });

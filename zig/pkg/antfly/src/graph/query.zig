@@ -44,6 +44,25 @@ pub const max_query_name_codepoints: usize = 128;
 pub const max_edge_types: usize = 64;
 pub const max_edge_type_bytes: usize = 64 * 1024;
 
+const TraverseResultAdmissionContext = struct {
+    alloc: Allocator,
+    target_keys: *const std.StringHashMapUnmanaged(void),
+    seen: ?*node_identity.Map(void),
+
+    fn admit(raw_ctx: ?*anyopaque, node: NodeRef) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
+        if (self.target_keys.count() > 0 and !self.target_keys.contains(node.key)) return false;
+        if (self.seen) |seen| {
+            return try seen.putIfAbsent(
+                self.alloc,
+                .{ .table = node.table, .key = node.key },
+                {},
+            );
+        }
+        return true;
+    }
+};
+
 pub fn validateRequestOperationBudget(queries: anytype) !void {
     if (queries.len > max_named_queries) return error.InvalidQueryRequest;
     var complete_matches: usize = 0;
@@ -325,7 +344,18 @@ pub const GraphQueryEngine = struct {
             }
         }
 
-        const rules = traversal_mod.TraversalRules{
+        var target_set = std.StringHashMapUnmanaged(void).empty;
+        defer target_set.deinit(self.alloc);
+        for (target_keys) |key| try target_set.put(self.alloc, key, {});
+
+        var seen = node_identity.Map(void){};
+        defer seen.deinit(self.alloc);
+        var result_admission_context = TraverseResultAdmissionContext{
+            .alloc = self.alloc,
+            .target_keys = &target_set,
+            .seen = if (params.deduplicate) &seen else null,
+        };
+        var rules = traversal_mod.TraversalRules{
             .edge_types = params.edge_types,
             .direction = params.direction,
             .max_depth = params.max_depth,
@@ -335,6 +365,10 @@ pub const GraphQueryEngine = struct {
             .deduplicate = params.deduplicate,
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
+            .result_admission = .{
+                .ctx = &result_admission_context,
+                .admit_one = TraverseResultAdmissionContext.admit,
+            },
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -346,24 +380,15 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         };
 
-        var seen = node_identity.Map(void){};
-        defer seen.deinit(self.alloc);
-
         for (start_keys, 0..) |key, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
+            if (params.max_results > 0) {
+                rules.max_results = params.max_results - @as(u32, @intCast(all_results.items.len));
+            }
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
             for (trav_results) |tr| {
-                if (!targetKeyAllowed(target_keys, tr.key)) continue;
-                if (params.deduplicate) {
-                    if (!try seen.putIfAbsent(
-                        self.alloc,
-                        .{ .table = tr.target_table, .key = tr.key },
-                        {},
-                    )) continue;
-                }
-
                 var result_node = try traversalResultNodeAlloc(self.alloc, tr);
                 errdefer result_node.deinit(self.alloc);
                 try all_results.append(self.alloc, result_node);
@@ -1535,14 +1560,6 @@ fn graphEdgeWeightAllowed(params: QueryParams, weight: f64) bool {
     return true;
 }
 
-fn targetKeyAllowed(target_keys: []const []const u8, key: []const u8) bool {
-    if (target_keys.len == 0) return true;
-    for (target_keys) |target_key| {
-        if (std.mem.eql(u8, target_key, key)) return true;
-    }
-    return false;
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2062,6 +2079,39 @@ test "traverse algebraic semiring path supports deterministic result limits" {
     try std.testing.expectEqualStrings("C", result.nodes[1].key);
     try std.testing.expect(result.nodes[0].provenance != null);
     try std.testing.expect(result.nodes[1].provenance != null);
+}
+
+test "traverse counts only target-admitted nodes toward result limit" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-target-limit-s", "gq-target-limit-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // BFS encounters the non-target first. It must keep expanding through that
+    // node until one admitted result is found instead of consuming the limit.
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "Z", "e", 1.0, 0, 0, "");
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .target_nodes = .{ .keys = &.{"Z"} },
+        .params = .{
+            .max_depth = 2,
+            .max_results = 1,
+        },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("Z", result.nodes[0].key);
 }
 
 test "algebraic traversal intersects query-scoped node admission" {

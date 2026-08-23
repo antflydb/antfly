@@ -44,6 +44,18 @@ pub const TraversalRules = struct {
     deduplicate: bool = true,
     include_paths: bool = false,
     node_admission: ?NodeAdmission = null,
+    /// Optional query-scoped output admission. Rejected nodes remain eligible
+    /// for expansion; only admitted nodes count toward `max_results`.
+    result_admission: ?ResultAdmission = null,
+};
+
+pub const ResultAdmission = struct {
+    ctx: ?*anyopaque,
+    admit_one: *const fn (ctx: ?*anyopaque, node: NodeRef) anyerror!bool,
+
+    pub fn admit(self: ResultAdmission, node: NodeRef) !bool {
+        return try self.admit_one(self.ctx, node);
+    }
 };
 
 pub const TraversalResult = struct {
@@ -169,7 +181,13 @@ pub fn traverseWithEdgeReader(
         defer current.deinit(alloc);
 
         // Add to results (skip depth 0 = start node)
-        if (current.depth > 0) {
+        const include_in_results = current.depth > 0 and
+            (rules.result_admission == null or try rules.result_admission.?.admit(.{
+                .key = current.key,
+                .table = current.target_table,
+                .external = current.target_table != null,
+            }));
+        if (include_in_results) {
             const result = try traversalResultFromQueueEntry(alloc, current);
             var result_owned = true;
             errdefer if (result_owned) freeResult(alloc, result);

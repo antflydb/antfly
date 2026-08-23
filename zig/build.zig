@@ -3749,6 +3749,7 @@ pub fn build(b: *std.Build) void {
         "algebraic wildcard helpers preserve escaped literals",
         "algebraic traversal intersects query-scoped node admission",
         "traverse preserves table-scoped identities across result dedup and algebraic fallback",
+        "traverse counts only target-admitted nodes toward result limit",
         "conjunctive match supports branches anti joins inequality and optional nulls",
         "conjunctive validation rejects disconnected and unused aliases",
         "conjunctive validation bounds total recursive pattern shape",

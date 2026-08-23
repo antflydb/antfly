@@ -177,6 +177,28 @@ function edgeTargetTable(edge: Partial<Edge>) {
   return typeof table === "string" && table.length > 0 ? table : undefined;
 }
 
+function pathEdgeIdentities(
+  edge: Partial<Edge>,
+  pathNodes: Array<{ key: string; table?: string }>,
+  edgeIndex: number
+) {
+  const adjacent = pathNodes.slice(edgeIndex, edgeIndex + 2);
+  const followsPathOrder = adjacent[0]?.key === edge.source && adjacent[1]?.key === edge.target;
+  const reversesPathOrder = adjacent[1]?.key === edge.source && adjacent[0]?.key === edge.target;
+  return {
+    sourceIdentity: followsPathOrder
+      ? adjacent[0]
+      : reversesPathOrder
+        ? adjacent[1]
+        : adjacent.find((identity) => identity.key === edge.source),
+    targetIdentity: followsPathOrder
+      ? adjacent[1]
+      : reversesPathOrder
+        ? adjacent[0]
+        : adjacent.find((identity) => identity.key === edge.target),
+  };
+}
+
 function addNode(
   nodes: Map<string, GraphNode<ExplorerNodeMeta>>,
   identity: string | { key: string; table?: string },
@@ -227,27 +249,35 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
   for (const node of graphResult?.nodes ?? []) {
     if (!node.key) continue;
     const nodeIdentity = { key: node.key, table: node.table };
+    const pathNodes =
+      node.path?.map((identity, index, path) => {
+        if (typeof identity !== "string") return identity;
+        return index === path.length - 1 && identity === node.key
+          ? nodeIdentity
+          : { key: identity };
+      }) ?? [];
     addNode(nodes, nodeIdentity, {
       depth: node.depth,
       distance: node.distance,
       document: node.document as Record<string, unknown> | undefined,
-      path: node.path?.map((identity) =>
-        typeof identity === "string" ? { key: identity } : identity
-      ),
+      path: pathNodes,
       resultCount: 1,
     });
+    for (const identity of pathNodes) addNode(nodes, identity);
 
-    for (const edge of node.path_edges ?? []) {
+    for (const [edgeIndex, edge] of (node.path_edges ?? []).entries()) {
+      const { sourceIdentity, targetIdentity } = pathEdgeIdentities(edge, pathNodes, edgeIndex);
       const normalized = normalizeEdge(
         edge,
         edges.size,
         true,
-        edge.source === node.key ? nodeIdentity : undefined,
-        edge.target === node.key
-          ? nodeIdentity
-          : edge.target
-            ? { key: edge.target, table: edgeTargetTable(edge) }
-            : undefined
+        sourceIdentity ?? (edge.source === node.key ? nodeIdentity : undefined),
+        targetIdentity ??
+          (edge.target === node.key
+            ? nodeIdentity
+            : edge.target
+              ? { key: edge.target, table: edgeTargetTable(edge) }
+              : undefined)
       );
       if (normalized) {
         edges.set(normalized.id, normalized);
@@ -287,20 +317,7 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
     for (const identity of pathNodes) addNode(nodes, identity, { resultCount: 1 });
     for (const [edgeIndex, edge] of (path.edges ?? []).entries()) {
       if (!edge.source || !edge.target) continue;
-      const adjacent = pathNodes.slice(edgeIndex, edgeIndex + 2);
-      const followsPathOrder = adjacent[0]?.key === edge.source && adjacent[1]?.key === edge.target;
-      const reversesPathOrder =
-        adjacent[1]?.key === edge.source && adjacent[0]?.key === edge.target;
-      const sourceIdentity = followsPathOrder
-        ? adjacent[0]
-        : reversesPathOrder
-          ? adjacent[1]
-          : adjacent.find((identity) => identity.key === edge.source);
-      const targetIdentity = followsPathOrder
-        ? adjacent[1]
-        : reversesPathOrder
-          ? adjacent[0]
-          : adjacent.find((identity) => identity.key === edge.target);
+      const { sourceIdentity, targetIdentity } = pathEdgeIdentities(edge, pathNodes, edgeIndex);
       const normalized = normalizeEdge(
         edge,
         edges.size,

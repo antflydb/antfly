@@ -27,14 +27,13 @@ env:
 
 jobs:
   test:
+    # Preserve the required-check name while the exact runtime comes from the
+    # repository's Volta pin below.
+    name: test (24.x)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ts
-
-    strategy:
-      matrix:
-        node-version: ["24.x"]
 
     steps:
       - uses: actions/checkout@v6
@@ -44,10 +43,10 @@ jobs:
         with:
           package_json_file: ts/package.json
 
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Use pinned Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version-file: ts/package.json
           cache: 'pnpm'
           cache-dependency-path: ts/pnpm-lock.yaml
 
@@ -110,7 +109,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.x
+          node-version-file: ts/package.json
 
       - name: Configure pnpm cache
         run: pnpm config set store-dir "$PNPM_STORE_PATH"
