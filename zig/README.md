@@ -130,7 +130,8 @@ the worker; transient function- and module-scoped fixtures release theirs after
 their queued work completes.
 The scheduler infers process ownership and fixture scope for the standard E2E
 fixtures. Custom fixtures can declare `@pytest.mark.e2e_resource("antfly_process")`,
-and tests with unusual sharing requirements can use
+or add `lifetime="session", identity="fixture_name"` when that process survives
+until worker shutdown. Tests with unusual sharing requirements can use
 `@pytest.mark.e2e_isolation("test")` or `@pytest.mark.e2e_isolation("module")`.
 
 Some e2e tests start local binaries from `zig-out/bin`; build the relevant

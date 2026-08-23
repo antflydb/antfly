@@ -31,6 +31,7 @@ from xdist.workermanage import WorkerController
 DURATION_FILE_VERSION = 1
 PROCESS_GROUP_PREFIX = "antfly-process--"
 PERSISTENT_PROCESS_GROUP_PREFIX = f"{PROCESS_GROUP_PREFIX}persistent--"
+MIXED_PROCESS_GROUP_PREFIX = f"{PROCESS_GROUP_PREFIX}mixed--"
 DEFAULT_PROCESS_SECONDS = 5.0
 DEFAULT_LIGHT_SECONDS = 0.05
 
@@ -73,6 +74,20 @@ PERSISTENT_ANTFLY_PROCESS_FIXTURES = frozenset(
         "serverless_runtime",
     }
 )
+TRANSIENT_ANTFLY_PROCESS_FIXTURES = ANTFLY_PROCESS_FIXTURES - {
+    "embedded_standalone_api",
+    "embedded_standalone_cli",
+    "embedded_standalone_runtime",
+    "serverless_api",
+    "serverless_runtime",
+    "table_api",
+}
+# Dynamic fixture dependencies are not present in item.fixturenames. Map the
+# collected parameter values that select a session-lived process explicitly.
+PERSISTENT_PROCESS_PARAMETERS = {
+    ("table_api", "serverless"): "serverless_runtime",
+}
+RESOURCE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def normalize_nodeid(nodeid: str) -> str:
@@ -109,17 +124,44 @@ def scheduling_group(item: pytest.Item) -> str:
         for fixture_name in ANTFLY_PROCESS_FIXTURES.intersection(item.fixturenames)
         if (scope := _fixture_scope(item, fixture_name)) is not None
     }
-    persistent_processes = sorted(
+    persistent_processes = {
         fixture_name
         for fixture_name in PERSISTENT_ANTFLY_PROCESS_FIXTURES.intersection(
             item.fixturenames
         )
         if _fixture_scope(item, fixture_name) == "session"
-    )
-    declared_resources = {
-        str(mark.args[0]) for mark in item.iter_markers("e2e_resource") if mark.args
     }
-    process_owned = bool(process_scopes) or "antfly_process" in declared_resources
+    callspec = getattr(item, "callspec", None)
+    if callspec is not None:
+        for (parameter, value), identity in PERSISTENT_PROCESS_PARAMETERS.items():
+            if callspec.params.get(parameter) == value:
+                persistent_processes.add(identity)
+    declared_process = False
+    declared_transient_process = False
+    for resource_marker in item.iter_markers("e2e_resource"):
+        if not resource_marker.args or str(resource_marker.args[0]) != "antfly_process":
+            continue
+        declared_process = True
+        lifetime = resource_marker.kwargs.get("lifetime")
+        if lifetime is None:
+            declared_transient_process = True
+            continue
+        if lifetime != "session":
+            raise pytest.UsageError(
+                f"{nodeid}: antfly_process lifetime must be 'session', got {lifetime!r}"
+            )
+        identity = resource_marker.kwargs.get("identity")
+        if (
+            not isinstance(identity, str)
+            or not RESOURCE_IDENTITY_RE.fullmatch(identity)
+            or "--" in identity
+        ):
+            raise pytest.UsageError(
+                f"{nodeid}: a session antfly_process requires an identity containing "
+                "only letters, digits, '.', '_' or '-'"
+            )
+        persistent_processes.add(identity)
+    process_owned = bool(process_scopes) or declared_process
     reuse_process = item.get_closest_marker("reuse_antfly_process") is not None
     force_fresh = item.get_closest_marker("fresh_antfly_process") is not None
     shared_external = item.get_closest_marker("postgres_integration") is not None
@@ -131,6 +173,7 @@ def scheduling_group(item: pytest.Item) -> str:
     shared = shared or any(
         scope in {"module", "package", "session"} for scope in process_scopes
     )
+    shared = shared or bool(persistent_processes)
     shared = shared or shared_external
     explicit_group: str | None = None
     if isolation is not None:
@@ -145,10 +188,78 @@ def scheduling_group(item: pytest.Item) -> str:
     identity = explicit_group or (module_id if shared else nodeid)
     kind = "module--" if shared else "test--"
     if persistent_processes:
-        resource = PERSISTENT_PROCESS_GROUP_PREFIX
+        identities = "+".join(sorted(persistent_processes))
+        transient_process = declared_transient_process or bool(
+            TRANSIENT_ANTFLY_PROCESS_FIXTURES.intersection(item.fixturenames)
+        )
+        prefix = (
+            MIXED_PROCESS_GROUP_PREFIX
+            if transient_process
+            else PERSISTENT_PROCESS_GROUP_PREFIX
+        )
+        resource = f"{prefix}{identities}--"
     else:
         resource = PROCESS_GROUP_PREFIX if process_owned else "light--"
     return _safe_group_name(f"{resource}{kind}", identity)
+
+
+def _scheduling_group_parts(group: str) -> tuple[frozenset[str], bool, str]:
+    persistent_prefix = next(
+        (
+            prefix
+            for prefix in (
+                PERSISTENT_PROCESS_GROUP_PREFIX,
+                MIXED_PROCESS_GROUP_PREFIX,
+            )
+            if group.startswith(prefix)
+        ),
+        None,
+    )
+    if persistent_prefix is not None:
+        encoded, separator, suffix = group.removeprefix(persistent_prefix).partition(
+            "--"
+        )
+        if not separator or not encoded:
+            raise ValueError(f"invalid persistent scheduling group: {group!r}")
+        return (
+            frozenset(encoded.split("+")),
+            persistent_prefix == MIXED_PROCESS_GROUP_PREFIX,
+            suffix,
+        )
+    if group.startswith(PROCESS_GROUP_PREFIX):
+        return frozenset(), True, group.removeprefix(PROCESS_GROUP_PREFIX)
+    return frozenset(), False, group.removeprefix("light--")
+
+
+def _consolidate_scheduling_groups(groups: list[str]) -> list[str]:
+    """Keep every isolation group together under its strictest resource policy."""
+    policies: dict[str, tuple[set[str], bool]] = {}
+    for group in groups:
+        persistent, transient_process, isolation_suffix = _scheduling_group_parts(group)
+        identities, any_transient_process = policies.setdefault(
+            isolation_suffix, (set(), False)
+        )
+        identities.update(persistent)
+        policies[isolation_suffix] = (
+            identities,
+            any_transient_process or transient_process,
+        )
+
+    consolidated = []
+    for group in groups:
+        _, _, isolation_suffix = _scheduling_group_parts(group)
+        identities, transient_process = policies[isolation_suffix]
+        if identities:
+            prefix = (
+                MIXED_PROCESS_GROUP_PREFIX
+                if transient_process
+                else PERSISTENT_PROCESS_GROUP_PREFIX
+            )
+            resource = f"{prefix}{'+'.join(sorted(identities))}--"
+        else:
+            resource = PROCESS_GROUP_PREFIX if transient_process else "light--"
+        consolidated.append(f"{resource}{isolation_suffix}")
+    return consolidated
 
 
 class DurationHistory:
@@ -245,15 +356,36 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             Path(config.getoption("e2e_duration_file"))
         )
         self._retiring_nodes: set[WorkerController] = set()
-        self._persistent_process_workers: set[WorkerController] = set()
+        self._persistent_processes: dict[WorkerController, set[str]] = {}
 
     @staticmethod
     def _scope_uses_process(scope: str) -> bool:
         return scope.startswith(PROCESS_GROUP_PREFIX)
 
     @staticmethod
-    def _scope_uses_persistent_process(scope: str) -> bool:
-        return scope.startswith(PERSISTENT_PROCESS_GROUP_PREFIX)
+    def _scope_persistent_processes(scope: str) -> frozenset[str]:
+        prefix = next(
+            (
+                candidate
+                for candidate in (
+                    PERSISTENT_PROCESS_GROUP_PREFIX,
+                    MIXED_PROCESS_GROUP_PREFIX,
+                )
+                if scope.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix is None:
+            return frozenset()
+        encoded = scope.removeprefix(prefix).split("--", 1)[0]
+        return frozenset(encoded.split("+")) if encoded else frozenset()
+
+    @staticmethod
+    def _scope_uses_transient_process(scope: str) -> bool:
+        return scope.startswith(MIXED_PROCESS_GROUP_PREFIX) or (
+            scope.startswith(PROCESS_GROUP_PREFIX)
+            and not scope.startswith(PERSISTENT_PROCESS_GROUP_PREFIX)
+        )
 
     @classmethod
     def _workload_uses_process(cls, workload: dict[str, dict[str, bool]]) -> bool:
@@ -263,17 +395,39 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope, work_unit in workload.items()
         )
 
-    def _reserved_process_workers(self) -> int:
-        # xdist requires each worker to have a second queued item before it can
-        # start the first. Reserve capacity per sequential worker queue rather
-        # than per queued work unit. A session fixture keeps its worker's
-        # reservation after its own work unit completes.
-        return sum(
-            1
-            for node, workload in self.assigned_work.items()
-            if node in self._persistent_process_workers
-            or self._workload_uses_process(workload)
+    @classmethod
+    def _workload_uses_transient_process(
+        cls, workload: dict[str, dict[str, bool]]
+    ) -> bool:
+        return any(
+            cls._scope_uses_transient_process(scope)
+            and any(not complete for complete in work_unit.values())
+            for scope, work_unit in workload.items()
         )
+
+    def _reserved_process_slots(self) -> int:
+        # A sequential worker needs at most one transient slot, regardless of
+        # its runway. Session process identities remain reserved until exit.
+        return sum(
+            len(self._persistent_processes.get(node, ()))
+            + int(self._workload_uses_transient_process(workload))
+            for node, workload in self.assigned_work.items()
+        )
+
+    def _additional_process_slots(self, node: WorkerController, scope: str) -> int:
+        persistent_processes = self._scope_persistent_processes(scope)
+        additional = len(
+            persistent_processes - self._persistent_processes.get(node, set())
+        )
+        if not self._scope_uses_process(scope):
+            return additional
+        if self._scope_uses_transient_process(scope):
+            additional += int(
+                not self._workload_uses_transient_process(
+                    self.assigned_work.get(node, {})
+                )
+            )
+        return additional
 
     def _scope_duration(self, scope: str, work_unit: dict[str, bool]) -> float:
         process_owned = self._scope_uses_process(scope)
@@ -283,26 +437,55 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             if not complete
         )
 
+    def _defer_new_persistent_process(self, node: WorkerController, scope: str) -> bool:
+        requested = self._scope_persistent_processes(scope)
+        owned = self._persistent_processes.get(node, set())
+        if not requested or not owned or requested.issubset(owned):
+            return False
+        # Keep session processes on separate workers when an idle clean worker
+        # is available. This preserves parallel execution without changing the
+        # slot bound; consolidation onto one worker remains the fallback.
+        return any(
+            candidate is not node
+            and not candidate.shutting_down
+            and not self._persistent_processes.get(candidate)
+            and self._pending_of(self.assigned_work[candidate]) == 0
+            for candidate in self.nodes
+        )
+
     def _next_eligible_scope(self, node: WorkerController) -> str | None:
-        node_has_process_reservation = (
-            node in self._persistent_process_workers
-            or self._workload_uses_process(self.assigned_work.get(node, {}))
-        )
-        process_capacity = (
-            node_has_process_reservation
-            or self._reserved_process_workers() < self.process_slots
-        )
+        reserved_process_slots = self._reserved_process_slots()
+        for scope, work_unit in self.workqueue.items():
+            if not any(not complete for complete in work_unit.values()):
+                continue
+            minimum_slots = len(self._scope_persistent_processes(scope)) + int(
+                self._scope_uses_transient_process(scope)
+            )
+            if minimum_slots > self.process_slots:
+                raise pytest.UsageError(
+                    f"{scope!r} requires {minimum_slots} Antfly process slots, "
+                    f"but --e2e-process-slots is {self.process_slots}"
+                )
         eligible = [
             (scope, work_unit)
             for scope, work_unit in self.workqueue.items()
             if any(not complete for complete in work_unit.values())
-            and (process_capacity or not self._scope_uses_process(scope))
+            and not self._defer_new_persistent_process(node, scope)
+            and reserved_process_slots + self._additional_process_slots(node, scope)
+            <= self.process_slots
         ]
         if not eligible:
             return None
+        owned_processes = self._persistent_processes.get(node, set())
         return max(
             eligible,
-            key=lambda entry: self._scope_duration(entry[0], entry[1]),
+            key=lambda entry: (
+                bool(self._scope_persistent_processes(entry[0]))
+                and self._scope_persistent_processes(entry[0]).issubset(
+                    owned_processes
+                ),
+                self._scope_duration(entry[0], entry[1]),
+            ),
         )[0]
 
     def _assign_work_unit(self, node: WorkerController) -> None:
@@ -319,8 +502,11 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 if not complete
             ]
         )
-        if self._scope_uses_persistent_process(scope):
-            self._persistent_process_workers.add(node)
+        persistent_processes = self._scope_persistent_processes(scope)
+        if persistent_processes:
+            self._persistent_processes.setdefault(node, set()).update(
+                persistent_processes
+            )
 
     def _reschedule(self, node: WorkerController) -> None:
         if node.shutting_down:
@@ -339,7 +525,31 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         # This worker cannot reserve an Antfly process slot and no lightweight
         # work remains. A shutdown command lets it finish its queued item while
         # the process-reserved workers drain the remaining queue.
-        if self._pending_of(self.assigned_work[node]) <= 1:
+        pending = self._pending_of(self.assigned_work[node])
+        if pending == 0:
+            # An idle worker can safely wait for a slot. If it owns a session
+            # process that blocks all remaining work, rotate one such worker at
+            # a time so teardown releases the lifetime reservation.
+            owns_persistent_process = bool(self._persistent_processes.get(node))
+            persistent_retirement_in_flight = any(
+                self._persistent_processes.get(candidate)
+                for candidate in self._retiring_nodes
+            )
+            other_live_worker = any(
+                candidate is not node and not candidate.shutting_down
+                for candidate in self.nodes
+            )
+            if owns_persistent_process and not persistent_retirement_in_flight:
+                if not other_live_worker:
+                    raise pytest.UsageError(
+                        "all remaining work requires a new session process, but no "
+                        "worker is available to replace the current session owner; "
+                        "increase --e2e-process-slots or run without xdist"
+                    )
+                self._retiring_nodes.add(node)
+                node.shutdown()
+            return
+        if pending == 1:
             self._retiring_nodes.add(node)
             node.shutdown()
 
@@ -361,7 +571,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         exitstatus = workeroutput.get("exitstatus") if workeroutput else None
         retired_cleanly = node in self._retiring_nodes and exitstatus in {0, 1}
         self._retiring_nodes.discard(node)
-        self._persistent_process_workers.discard(node)
+        self._persistent_processes.pop(node, None)
 
         if retired_cleanly:
             workload = self.assigned_work.pop(node)
@@ -419,8 +629,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    for item in items:
-        item.add_marker(pytest.mark.xdist_group(scheduling_group(item)))
+    groups = _consolidate_scheduling_groups([scheduling_group(item) for item in items])
+    for item, group in zip(items, groups, strict=True):
+        item.add_marker(pytest.mark.xdist_group(group))
 
 
 def pytest_xdist_make_scheduler(
