@@ -57,6 +57,8 @@ import requests
 from helpers import create_index_payload, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
+pytest_plugins = ("e2e_scheduler",)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
 E2E_BACKUP_CONNECTION = "e2e-backups"
