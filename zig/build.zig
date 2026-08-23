@@ -9941,8 +9941,10 @@ pub fn build(b: *std.Build) void {
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks; Linux CI retains the tighter claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 4) * 1024 * 1024 * 1024,
+                // platform frameworks. Linux ARM64 reached 4.99 GB in the
+                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
+                // forcing the scheduler to discard a completed 4 GiB claim.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
                 // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
                 // Keep the
