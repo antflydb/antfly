@@ -29,6 +29,7 @@ from typing import TypeVar
 
 import pytest
 from xdist.remote import Producer
+from xdist.report import report_collection_diff
 from xdist.scheduler.loadgroup import LoadGroupScheduling
 from xdist.workermanage import WorkerController
 
@@ -582,6 +583,29 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             # will execute.
             getattr(self, "_collecting_nodes", set()).discard(node)
             getattr(self, "_starting_replacements", set()).discard(node)
+            return
+
+        # LoadScopeScheduling rejects a late collection that differs from the
+        # established one without registering the worker. It cannot ever
+        # become schedulable, so do not leave it advertised as future progress
+        # or retry rotations indefinitely.
+        getattr(self, "_collecting_nodes", set()).discard(node)
+        getattr(self, "_starting_replacements", set()).discard(node)
+        node.shutdown()
+        worker_id = str(getattr(getattr(node, "gateway", None), "id", "replacement"))
+        reference_node, reference_collection = next(
+            iter(self.registered_collections.items())
+        )
+        collection_diff = report_collection_diff(
+            reference_collection,
+            collection,
+            str(getattr(reference_node.gateway, "id", "established")),
+            worker_id,
+        )
+        raise pytest.UsageError(
+            f"replacement worker {worker_id} collected different tests from the "
+            f"established E2E collection\n{collection_diff}"
+        )
 
     @staticmethod
     def _scope_uses_process(scope: str) -> bool:

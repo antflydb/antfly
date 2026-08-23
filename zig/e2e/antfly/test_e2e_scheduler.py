@@ -1095,6 +1095,43 @@ def test_replacement_waits_for_collection_before_accepting_work(
     assert not scheduler.workqueue
 
 
+def test_replacement_collection_mismatch_fails_fast_and_clears_progress(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    original = FakeWorker()
+    replacement = FakeWorker()
+    original.gateway = SimpleNamespace(id="gw0")
+    replacement.gateway = SimpleNamespace(id="gw2")
+    original_nodeid = "test_process.py::test_original"
+    replacement_nodeid = "test_process.py::test_replacement"
+    scheduler.numnodes = 1
+    scheduler.collection = [original_nodeid]
+    scheduler.log = lambda message: None
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = {replacement}
+    scheduler._collecting_nodes = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {}
+    scheduler.assigned_work = {original: {}}
+    scheduler.registered_collections = {original: [original_nodeid]}
+    scheduler.workqueue = OrderedDict()
+
+    scheduler.add_node(replacement)
+    with pytest.raises(
+        pytest.UsageError,
+        match="replacement worker gw2 collected different tests",
+    ):
+        scheduler.add_node_collection(replacement, [replacement_nodeid])
+
+    assert replacement.shutting_down
+    assert replacement not in scheduler.registered_collections
+    assert replacement not in scheduler._starting_replacements
+    assert replacement not in scheduler._collecting_nodes
+
+
 def test_global_reschedule_starts_long_persistent_work_on_clean_worker_first(
     tmp_path: Path,
 ) -> None:
