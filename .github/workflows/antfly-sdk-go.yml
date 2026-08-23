@@ -44,7 +44,7 @@ env:
   GO_VERSION: "1.26.4"
 
 jobs:
-  sdk:
+  go-sdk:
     runs-on: arc-antfly-standard
     timeout-minutes: 20
     steps:

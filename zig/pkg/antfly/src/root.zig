@@ -248,6 +248,7 @@ test {
 
     // Inference
     _ = inference;
+    _ = table_schema;
     _ = @import("chunking/mod.zig");
     _ = pdf;
 

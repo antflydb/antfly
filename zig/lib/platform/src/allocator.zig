@@ -23,3 +23,28 @@ pub fn cOrFallback(fallback: std.mem.Allocator) std.mem.Allocator {
 pub fn processAllocator(fallback: std.mem.Allocator) std.mem.Allocator {
     return cOrFallback(fallback);
 }
+
+/// Return unused libc heap pages to the operating system after a coarse
+/// process-lifetime teardown boundary. glibc normally retains freed arenas for
+/// reuse, which is efficient for steady allocation shapes but can preserve the
+/// peak RSS of a server that rotates between differently shaped multi-GiB
+/// models. `malloc_trim` examines every arena on supported glibc versions and
+/// is therefore intentionally reserved for cold paths such as model eviction,
+/// not individual frees or request completion.
+///
+/// The operation is advisory: `false` means either that this target has no
+/// supported process allocator purge or that glibc did not release pages.
+pub fn reclaimUnusedProcessMemory() bool {
+    if (comptime builtin.os.tag == .linux and builtin.link_libc and builtin.abi.isGnu()) {
+        return glibc.malloc_trim(0) != 0;
+    }
+    return false;
+}
+
+const glibc = if (builtin.os.tag == .linux and builtin.link_libc and builtin.abi.isGnu()) struct {
+    extern "c" fn malloc_trim(pad: usize) c_int;
+} else struct {};
+
+test "process allocator reclamation is a portable best-effort operation" {
+    _ = reclaimUnusedProcessMemory();
+}

@@ -55,4 +55,10 @@ MCNodes      == {n1, n2, n3}
 MCMaxRetries == 3
 MCMaxSnapshots == 3
 
+\* Every node starts identically and the specification only distinguishes a
+\* node through its current state. Canonicalize states that differ solely by a
+\* node-id permutation in the safety model. The safety configuration enables
+\* this operator explicitly; the liveness configuration remains unchanged.
+MCSymmetry == Permutations(MCNodes)
+
 =============================================================================

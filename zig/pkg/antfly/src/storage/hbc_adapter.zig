@@ -1061,16 +1061,26 @@ pub const Cache = struct {
     fn reserveLocked(self: *Cache, bytes: u64) bool {
         if (bytes == 0) return true;
         const manager = self.resource_manager orelse return true;
-        var reservation = manager.reserve(.hbc_node_metadata_cache, bytes) catch return false;
-        reservation.released = true;
-        self.accounted_bytes +|= bytes;
+        const next = std.math.add(u64, self.accounted_bytes, bytes) catch return false;
+        manager.adjustUsage(.hbc_node_metadata_cache, &self.accounted_bytes, next) catch return false;
         return true;
     }
 
     fn releaseLocked(self: *Cache, bytes: u64) void {
         if (bytes == 0) return;
-        if (self.resource_manager) |manager| manager.releaseBytes(.hbc_node_metadata_cache, bytes);
-        self.accounted_bytes -|= bytes;
+        if (bytes > self.accounted_bytes) {
+            if (self.resource_manager) |manager| manager.recordAccountingError();
+            return;
+        }
+        if (self.resource_manager) |manager| {
+            manager.adjustUsage(
+                .hbc_node_metadata_cache,
+                &self.accounted_bytes,
+                self.accounted_bytes - bytes,
+            ) catch return;
+        } else {
+            self.accounted_bytes -= bytes;
+        }
     }
 
     fn observeLocked(self: *Cache) void {
@@ -2353,10 +2363,23 @@ pub const HBCIndex = struct {
 
         fn rollback(self: *HbcCacheAdmission) void {
             if (!self.active or self.reserved_bytes == 0) return;
-            if (self.index.resource_manager) |manager| {
-                manager.releaseBytes(.hbc_node_metadata_cache, self.reserved_bytes);
+            if (self.reserved_bytes > self.index.hbc_cache_bytes_accounted) {
+                if (self.index.resource_manager) |manager| manager.recordAccountingError();
+                self.active = false;
+                return;
             }
-            self.index.hbc_cache_bytes_accounted -|= self.reserved_bytes;
+            if (self.index.resource_manager) |manager| {
+                manager.adjustUsage(
+                    .hbc_node_metadata_cache,
+                    &self.index.hbc_cache_bytes_accounted,
+                    self.index.hbc_cache_bytes_accounted - self.reserved_bytes,
+                ) catch {
+                    self.active = false;
+                    return;
+                };
+            } else {
+                self.index.hbc_cache_bytes_accounted -= self.reserved_bytes;
+            }
             self.active = false;
         }
     };
@@ -3571,9 +3594,12 @@ pub const HBCIndex = struct {
     fn reserveHbcCacheDelta(self: *HBCIndex, admission: *HbcCacheAdmission, delta_bytes: u64) bool {
         if (delta_bytes == 0) return true;
         const manager = self.resource_manager orelse return true;
-        var reservation = manager.reserve(.hbc_node_metadata_cache, delta_bytes) catch return false;
-        reservation.released = true;
-        self.hbc_cache_bytes_accounted +|= delta_bytes;
+        const next = std.math.add(u64, self.hbc_cache_bytes_accounted, delta_bytes) catch return false;
+        manager.adjustUsage(
+            .hbc_node_metadata_cache,
+            &self.hbc_cache_bytes_accounted,
+            next,
+        ) catch return false;
         admission.* = .{
             .index = self,
             .reserved_bytes = delta_bytes,

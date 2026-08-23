@@ -127,6 +127,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn beginShutdown(_: *@This()) void {}
+
     pub fn hasWorkers(_: *@This()) bool {
         return false;
     }
@@ -357,12 +359,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *DerivedRuntime) void {
         const io = self.ioContext();
-
-        self.mutex.lockUncancelable(io);
-        self.shutdown = true;
-        for (self.workers.items) |worker| worker.stop = true;
-        self.cond.broadcast(io);
-        self.mutex.unlock(io);
+        self.beginShutdown();
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
@@ -385,6 +382,15 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             self.alloc.destroy(self.threaded);
         }
         self.* = undefined;
+    }
+
+    pub fn beginShutdown(self: *DerivedRuntime) void {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        for (self.workers.items) |worker| worker.stop = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
     }
 
     pub fn hasWorkers(self: *DerivedRuntime) bool {
@@ -880,6 +886,7 @@ fn workerMain(worker: *Worker) void {
             worker.catch_up_active = false;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                     close_success = false;
@@ -900,6 +907,7 @@ fn workerMain(worker: *Worker) void {
             worker.catch_up_active = false;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
+            if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                     close_success = false;
@@ -940,6 +948,7 @@ fn workerMain(worker: *Worker) void {
                     worker.catch_up_active = false;
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
+                    if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
                         closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                             close_success = false;
@@ -958,6 +967,7 @@ fn workerMain(worker: *Worker) void {
                     worker.catch_up_active = false;
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
+                    if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
                         closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
                             close_success = false;
@@ -1227,6 +1237,12 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
     };
+}
+
+fn workerIsStopping(runtime: *DerivedRuntime, worker: *const Worker, io: Io) bool {
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    return runtime.shutdown or worker.stop or runtime.last_error_name != null;
 }
 
 fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {

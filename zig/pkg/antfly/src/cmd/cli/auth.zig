@@ -20,7 +20,10 @@ const printResponse = cli.printResponse;
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse return me(allocator, io, client);
 
-    if (std.mem.eql(u8, subcommand, "me")) return me(allocator, io, client);
+    if (std.mem.eql(u8, subcommand, "me")) {
+        cli.rejectRemainingArgs(args, "auth me");
+        return me(allocator, io, client);
+    }
     if (std.mem.eql(u8, subcommand, "users")) return users(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "permissions")) return permissions(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "roles")) return roles(allocator, io, client, args);
@@ -39,9 +42,13 @@ fn me(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyCli
 
 fn users(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const sub = args.next() orelse return listUsers(allocator, io, client);
-    if (std.mem.eql(u8, sub, "list")) return listUsers(allocator, io, client);
+    if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth users list");
+        return listUsers(allocator, io, client);
+    }
     if (std.mem.eql(u8, sub, "get")) {
         const username = args.next() orelse cli.fatal("username is required", .{});
+        cli.rejectRemainingArgs(args, "auth users get");
         var resp = try client.inner.getUserByName(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -49,13 +56,22 @@ fn users(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
     if (std.mem.eql(u8, sub, "create")) return createUser(allocator, io, client, args);
     if (std.mem.eql(u8, sub, "delete")) {
         const username = args.next() orelse cli.fatal("username is required", .{});
+        cli.rejectRemainingArgs(args, "auth users delete");
         var resp = try client.inner.deleteUser(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "password")) {
         const username = args.next() orelse cli.fatal("username is required", .{});
-        const password = nextFlagValue(args, "--password") orelse cli.fatal("--password is required", .{});
+        var password_value: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--password")) {
+                cli.takeUniqueValue(args, &password_value, arg);
+            } else {
+                cli.fatal("unknown auth users password option: {s}", .{arg});
+            }
+        }
+        const password = password_value orelse cli.fatal("--password is required", .{});
         var resp = try client.inner.updateUserPassword(username, .{ .new_password = password });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -75,12 +91,15 @@ fn createUser(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     var file: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--password")) {
-            password = args.next();
+            cli.takeUniqueValue(args, &password, arg);
         } else if (std.mem.eql(u8, arg, "--file")) {
-            file = args.next();
+            cli.takeUniqueValue(args, &file, arg);
+        } else {
+            cli.fatal("unknown auth users create option: {s}", .{arg});
         }
     }
     if (file) |path| {
+        if (password != null) cli.fatal("use only one of --password or --file", .{});
         var parsed = try parseFile(antfly_client.types.CreateUserRequest, allocator, io, path);
         defer parsed.deinit();
         var resp = try client.inner.createUser(username, parsed.value);
@@ -97,6 +116,7 @@ fn permissions(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     const sub = args.next() orelse cli.fatal("permissions subcommand is required", .{});
     const username = args.next() orelse cli.fatal("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth permissions list");
         var resp = try client.inner.getUserPermissions(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -111,7 +131,13 @@ fn permissions(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
         var resource: ?[]const u8 = null;
         var resource_type: ?[]const u8 = null;
         while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--resource")) resource = args.next() else if (std.mem.eql(u8, arg, "--resource-type")) resource_type = args.next();
+            if (std.mem.eql(u8, arg, "--resource")) {
+                cli.takeUniqueValue(args, &resource, arg);
+            } else if (std.mem.eql(u8, arg, "--resource-type")) {
+                cli.takeUniqueValue(args, &resource_type, arg);
+            } else {
+                cli.fatal("unknown auth permissions remove option: {s}", .{arg});
+            }
         }
         var resp = try client.inner.removePermissionFromUser(username, .{
             .resource = resource orelse cli.fatal("--resource is required", .{}),
@@ -127,17 +153,20 @@ fn roles(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
     const sub = args.next() orelse cli.fatal("roles subcommand is required", .{});
     const username = args.next() orelse cli.fatal("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth roles list");
         var resp = try client.inner.listUserRoles(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     const role = args.next() orelse cli.fatal("role is required", .{});
     if (std.mem.eql(u8, sub, "add")) {
+        cli.rejectRemainingArgs(args, "auth roles add");
         var resp = try client.inner.addRoleToUser(username, .{ .role = role });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "remove")) {
+        cli.rejectRemainingArgs(args, "auth roles remove");
         var resp = try client.inner.removeRoleFromUser(username, .{ .role = role });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -149,18 +178,28 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     const sub = args.next() orelse cli.fatal("row-filters subcommand is required", .{});
     const username = args.next() orelse cli.fatal("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth row-filters list");
         var resp = try client.inner.listRowFilters(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     const table = args.next() orelse cli.fatal("table is required", .{});
     if (std.mem.eql(u8, sub, "get")) {
+        cli.rejectRemainingArgs(args, "auth row-filters get");
         var resp = try client.inner.getRowFilter(username, table);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "set")) {
-        const file = nextFlagValue(args, "--file") orelse cli.fatal("--file is required", .{});
+        var file_value: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--file")) {
+                cli.takeUniqueValue(args, &file_value, arg);
+            } else {
+                cli.fatal("unknown auth row-filters set option: {s}", .{arg});
+            }
+        }
+        const file = file_value orelse cli.fatal("--file is required", .{});
         var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
         defer parsed.deinit();
         var resp = try client.inner.setRowFilter(username, table, parsed.value);
@@ -168,6 +207,7 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "remove")) {
+        cli.rejectRemainingArgs(args, "auth row-filters remove");
         var resp = try client.inner.removeRowFilter(username, table);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -177,23 +217,36 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
 
 fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const sub = args.next() orelse return listSubjects(allocator, io, client);
-    if (std.mem.eql(u8, sub, "list")) return listSubjects(allocator, io, client);
+    if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth subjects list");
+        return listSubjects(allocator, io, client);
+    }
     if (std.mem.eql(u8, sub, "row-filters")) {
         const subject = args.next() orelse cli.fatal("subject is required", .{});
         const action = args.next() orelse "list";
         if (std.mem.eql(u8, action, "list")) {
+            cli.rejectRemainingArgs(args, "auth subjects row-filters list");
             var resp = try client.inner.listSubjectRowFilters(subject);
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
         const table = args.next() orelse cli.fatal("table is required", .{});
         if (std.mem.eql(u8, action, "get")) {
+            cli.rejectRemainingArgs(args, "auth subjects row-filters get");
             var resp = try client.inner.getSubjectRowFilter(subject, table);
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
         if (std.mem.eql(u8, action, "set")) {
-            const file = nextFlagValue(args, "--file") orelse cli.fatal("--file is required", .{});
+            var file_value: ?[]const u8 = null;
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--file")) {
+                    cli.takeUniqueValue(args, &file_value, arg);
+                } else {
+                    cli.fatal("unknown auth subjects row-filters set option: {s}", .{arg});
+                }
+            }
+            const file = file_value orelse cli.fatal("--file is required", .{});
             var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
             defer parsed.deinit();
             var resp = try client.inner.setSubjectRowFilter(subject, table, parsed.value);
@@ -201,6 +254,7 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             return printResponse(allocator, io, &resp);
         }
         if (std.mem.eql(u8, action, "remove")) {
+            cli.rejectRemainingArgs(args, "auth subjects row-filters remove");
             var resp = try client.inner.removeSubjectRowFilter(subject, table);
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
@@ -220,6 +274,7 @@ fn apiKeys(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     const sub = args.next() orelse cli.fatal("api-keys subcommand is required", .{});
     const username = args.next() orelse cli.fatal("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
+        cli.rejectRemainingArgs(args, "auth api-keys list");
         var resp = try client.inner.listApiKeys(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -229,9 +284,18 @@ fn apiKeys(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         var expires_in: ?[]const u8 = null;
         var file: ?[]const u8 = null;
         while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--name")) name = args.next() else if (std.mem.eql(u8, arg, "--expires-in")) expires_in = args.next() else if (std.mem.eql(u8, arg, "--file")) file = args.next();
+            if (std.mem.eql(u8, arg, "--name")) {
+                cli.takeUniqueValue(args, &name, arg);
+            } else if (std.mem.eql(u8, arg, "--expires-in")) {
+                cli.takeUniqueValue(args, &expires_in, arg);
+            } else if (std.mem.eql(u8, arg, "--file")) {
+                cli.takeUniqueValue(args, &file, arg);
+            } else {
+                cli.fatal("unknown auth api-keys create option: {s}", .{arg});
+            }
         }
         if (file) |path| {
+            if (name != null or expires_in != null) cli.fatal("--file cannot be combined with --name or --expires-in", .{});
             var parsed = try parseFile(antfly_client.types.CreateApiKeyRequest, allocator, io, path);
             defer parsed.deinit();
             var resp = try client.inner.createApiKey(username, parsed.value);
@@ -244,6 +308,7 @@ fn apiKeys(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     }
     if (std.mem.eql(u8, sub, "delete")) {
         const key_id = args.next() orelse cli.fatal("key id is required", .{});
+        cli.rejectRemainingArgs(args, "auth api-keys delete");
         var resp = try client.inner.deleteApiKey(username, key_id);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
@@ -256,7 +321,15 @@ fn parsePermission(args: *std.process.Args.Iterator) antfly_client.types.Permiss
     var resource_type: ?[]const u8 = null;
     var permission_type: ?[]const u8 = null;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--resource")) resource = args.next() else if (std.mem.eql(u8, arg, "--resource-type")) resource_type = args.next() else if (std.mem.eql(u8, arg, "--type")) permission_type = args.next();
+        if (std.mem.eql(u8, arg, "--resource")) {
+            cli.takeUniqueValue(args, &resource, arg);
+        } else if (std.mem.eql(u8, arg, "--resource-type")) {
+            cli.takeUniqueValue(args, &resource_type, arg);
+        } else if (std.mem.eql(u8, arg, "--type")) {
+            cli.takeUniqueValue(args, &permission_type, arg);
+        } else {
+            cli.fatal("unknown auth permission option: {s}", .{arg});
+        }
     }
     return .{
         .resource = resource orelse cli.fatal("--resource is required", .{}),
@@ -280,15 +353,8 @@ fn parsePermissionType(raw: []const u8) antfly_client.types.PermissionType {
     cli.fatal("invalid permission type: {s}", .{raw});
 }
 
-fn nextFlagValue(args: *std.process.Args.Iterator, flag: []const u8) ?[]const u8 {
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, flag)) return args.next();
-    }
-    return null;
-}
-
 fn parseFile(comptime T: type, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(T) {
     const data = try cli.readFileAlloc(io, allocator, path, 16 * 1024 * 1024);
     defer allocator.free(data);
-    return std.json.parseFromSlice(T, allocator, data, .{ .ignore_unknown_fields = true });
+    return std.json.parseFromSlice(T, allocator, data, .{ .ignore_unknown_fields = false });
 }

@@ -71,6 +71,7 @@ pub const QueryResponse = query.QueryResponse;
 pub const TableReadSource = table_reads.TableReadSource;
 pub const BoundTableReadSource = table_reads.BoundTableReadSource;
 pub const ProvisionedGroupStorage = provisioned_storage.ProvisionedGroupStorage;
+pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;

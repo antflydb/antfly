@@ -156,7 +156,7 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize, ?types.CancellationToken) anyerror!TransportResponse;
 
 pub const HttpContext = struct {
     io: std.Io,
@@ -226,9 +226,11 @@ const HttpxTransport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
-        return httpxRequest(&self.client, alloc, method, url, headers, body, content_type, null, max_response_size);
+        return httpxRequest(&self.client, alloc, method, url, headers, body, content_type, null, max_response_size, cancellation) catch |err|
+            return normalizeTransportCancellation(err);
     }
 };
 
@@ -272,9 +274,10 @@ const ContextHttpxTransport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         const self: *ContextHttpxTransport = @ptrCast(@alignCast(ctx.?));
-        var result = try httpxRequest(
+        var result = httpxRequest(
             &self.client,
             alloc,
             method,
@@ -284,12 +287,17 @@ const ContextHttpxTransport = struct {
             content_type,
             try self.remainingTimeoutMs(),
             max_response_size,
-        );
+            cancellation,
+        ) catch |err| return normalizeTransportCancellation(err);
         errdefer result.deinit(alloc);
         _ = try self.remainingTimeoutMs();
         return result;
     }
 };
+
+fn normalizeTransportCancellation(err: anyerror) anyerror {
+    return if (err == error.Cancelled) error.Canceled else err;
+}
 
 fn httpxRequest(
     client: *httpx.Client,
@@ -301,6 +309,7 @@ fn httpxRequest(
     content_type: ?[]const u8,
     timeout_ms: ?u64,
     max_response_size: ?usize,
+    cancellation: ?types.CancellationToken,
 ) !TransportResponse {
     var request_headers = std.ArrayListUnmanaged(HeaderPair).empty;
     defer request_headers.deinit(alloc);
@@ -314,6 +323,10 @@ fn httpxRequest(
         .body = body,
         .timeout_ms = timeout_ms,
         .max_response_size = max_response_size,
+        .cancellation = if (cancellation) |token|
+            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+        else
+            null,
     });
     defer response.deinit();
 
@@ -511,6 +524,71 @@ test "request-scoped S3 transport preserves caller IO and client config" {
     try std.testing.expectEqual(@as(u64, 0), try remainingRequestTimeoutMs(0, std.time.ns_per_s));
     try std.testing.expectEqual(@as(u64, 1), try remainingRequestTimeoutMs(250, 249 * std.time.ns_per_ms + 1));
     try std.testing.expectError(error.Timeout, remainingRequestTimeoutMs(250, 250 * std.time.ns_per_ms));
+}
+
+test "s3 read cancellation reaches active GET and HEAD transport requests" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        signal: *std.atomic.Value(bool),
+        expected_method: HttpMethod = .GET,
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            _: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            cancellation: ?types.CancellationToken,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_method, method);
+            self.signal.store(true, .release);
+            try cancellation.?.check();
+            return error.TestExpectedCancellation;
+        }
+    };
+
+    var signal = std.atomic.Value(bool).init(false);
+    var state = State{ .signal = &signal };
+    const cfg = Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.example.test"),
+            .use_ssl = true,
+            .access_key_id = try alloc.dupe(u8, "access"),
+            .secret_access_key = try alloc.dupe(u8, "secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var s3_client = Client.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = s3_client.client();
+    defer client.deinit();
+
+    try std.testing.expectError(
+        error.Canceled,
+        client.getObject("bucket", "object", .{
+            .range = .{ .offset = 0, .length = 1 },
+            .skip_metadata_probe = true,
+            .max_response_bytes = 1,
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .HEAD;
+    try std.testing.expectError(
+        error.Canceled,
+        client.statObjectWithOptions("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 pub const Client = struct {
@@ -797,7 +875,7 @@ pub const Client = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
         errdefer meta.deinit(alloc);
         // Keep an ordinary current-object read on the ordinary GetObject
         // permission path. Supplying a probed version ID would require
@@ -834,6 +912,7 @@ pub const Client = struct {
             target,
             headers.items,
             opts.max_response_bytes,
+            opts.cancellation,
         );
         errdefer response.deinit(alloc);
         switch (response.status) {
@@ -898,16 +977,27 @@ pub const Client = struct {
     }
 
     fn statObject(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        return self.statObjectVersion(alloc, bucket, key, null);
+        return self.statObjectVersion(alloc, bucket, key, null, null);
     }
 
-    fn statObjectVersion(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) !types.ObjectMetadata {
+    fn statObjectWithOptions(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+    }
+
+    fn statObjectVersion(
+        self: *Client,
+        alloc: Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        version_id: ?[]const u8,
+        cancellation: ?types.CancellationToken,
+    ) !types.ObjectMetadata {
         const query = try buildObjectQueryAlloc(alloc, version_id, null);
         defer freeQueryPairs(alloc, query);
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
-        var response = try self.performReadWithChecksumFallback(.HEAD, target, &.{}, null);
+        var response = try self.performReadWithChecksumFallback(.HEAD, target, &.{}, null, cancellation);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => {},
@@ -984,6 +1074,7 @@ pub const Client = struct {
         target: RequestTarget,
         headers: []const HeaderPair,
         max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         std.debug.assert(method == .GET or method == .HEAD);
         var checksum_headers = std.ArrayListUnmanaged(HeaderPair).empty;
@@ -992,17 +1083,17 @@ pub const Client = struct {
         checksum_headers.appendAssumeCapacity(.{ "x-amz-checksum-mode", "ENABLED" });
         checksum_headers.appendSliceAssumeCapacity(headers);
 
-        var response = self.performWithResponseLimit(method, target, checksum_headers.items, null, null, max_response_size) catch |err| switch (err) {
+        var response = self.performWithResponseLimitAndCancellation(method, target, checksum_headers.items, null, null, max_response_size, cancellation) catch |err| switch (err) {
             // httpx enforces the caller's body limit before returning the
             // response status. A checksum-permission 403 can therefore look
             // like an oversized response; retrying these safe reads without
             // checksum mode preserves the original limit and disambiguates it.
-            error.ResponseTooLarge => return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size),
+            error.ResponseTooLarge => return try self.performWithResponseLimitAndCancellation(method, target, headers, null, null, max_response_size, cancellation),
             else => return err,
         };
         if (!checksumModeFallbackStatus(response.status)) return response;
         response.deinit(self.alloc);
-        return try self.performWithResponseLimit(method, target, headers, null, null, max_response_size);
+        return try self.performWithResponseLimitAndCancellation(method, target, headers, null, null, max_response_size, cancellation);
     }
 
     fn performWithResponseLimit(
@@ -1014,6 +1105,20 @@ pub const Client = struct {
         content_type: ?[]const u8,
         max_response_size: ?usize,
     ) !TransportResponse {
+        return try self.performWithResponseLimitAndCancellation(method, target, headers, body, content_type, max_response_size, null);
+    }
+
+    fn performWithResponseLimitAndCancellation(
+        self: *Client,
+        method: HttpMethod,
+        target: RequestTarget,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
+    ) !TransportResponse {
+        if (cancellation) |token| try token.check();
         var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(self.alloc) else null;
         defer if (dynamic_credentials) |*credentials| credentials.deinit(self.alloc);
         var signing_config = self.cfg;
@@ -1055,6 +1160,7 @@ pub const Client = struct {
             body,
             content_type,
             max_response_size,
+            cancellation,
         );
     }
 
@@ -1067,6 +1173,7 @@ pub const Client = struct {
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
+        .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
     };
@@ -1109,6 +1216,11 @@ pub const Client = struct {
     fn erasedStatObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return try self.statObject(alloc, bucket, key);
+    }
+
+    fn erasedStatObjectWithOptions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return try self.statObjectWithOptions(alloc, bucket, key, opts);
     }
 
     fn erasedDeleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
@@ -2210,7 +2322,7 @@ test "s3 file upload completes a multipart lifecycle with bounded parts" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -2289,6 +2401,7 @@ test "s3 client signs and issues object operations through request fn" {
             body: ?[]const u8,
             _: ?[]const u8,
             max_response_size: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.index += 1;
@@ -2432,6 +2545,7 @@ test "s3 get object guards probed current-object reads without version permissio
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             defer self.calls += 1;
@@ -2550,6 +2664,7 @@ test "s3 metadata reads fall back when checksum mode is forbidden or unsupported
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             defer self.calls += 1;
@@ -2620,6 +2735,7 @@ test "s3 bounded reads retry when checksum permission errors exceed the response
             _: ?[]const u8,
             _: ?[]const u8,
             max_response_size: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             defer self.calls += 1;
@@ -2715,6 +2831,7 @@ test "s3 client refreshes dynamic credentials for every signed request" {
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.requests += 1;
@@ -2766,6 +2883,7 @@ test "s3 bucket existence fails closed on access denied" {
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.HEAD, method);
             return .{ .status = 403, .body = try request_alloc.alloc(u8, 0) };

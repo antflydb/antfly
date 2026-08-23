@@ -18,6 +18,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { api, type TableSchema } from "../api";
+import { createIndexArguments } from "../lib/create-index";
 import IndexForm from "./IndexForm";
 import JsonViewer from "./JsonViewer";
 
@@ -191,7 +192,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           chunker: data.chunker || undefined,
         } as IndexConfig;
       }
-      await api.indexes.create(tableName, indexConfig);
+      const { indexName, request } = createIndexArguments(indexConfig);
+      await api.indexes.create(tableName, indexName, request);
       onIndexCreated();
       onClose();
     } catch (e) {

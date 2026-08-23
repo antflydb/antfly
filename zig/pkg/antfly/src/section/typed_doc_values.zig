@@ -25,6 +25,7 @@
 //!   - bytes: variable-length byte strings
 //!   - geo_point: packed (lat, lon) as two f64s = 16 bytes
 //!   - bool: single byte (0 or 1)
+//!   - numeric: per-value tagged i64/u64/f64, preserving exact integer domains
 //!
 //! Wire format:
 //!   [value_type: u8]
@@ -49,7 +50,72 @@ pub const ValueType = enum(u8) {
     geo_point = 3,
     bool_val = 4,
     i64_val = 5,
+    numeric_val = 6,
 };
+
+pub const NumericValue = union(enum(u8)) {
+    u64_val: u64,
+    i64_val: i64,
+    f64_val: f64,
+};
+
+fn reverseOrder(order: std.math.Order) std.math.Order {
+    return switch (order) {
+        .lt => .gt,
+        .eq => .eq,
+        .gt => .lt,
+    };
+}
+
+fn compareI64ToF64(a: i64, b: f64) std.math.Order {
+    const min_i64_f = -9223372036854775808.0;
+    const max_i64_plus_one_f = 9223372036854775808.0;
+    if (b < min_i64_f) return .gt;
+    if (b >= max_i64_plus_one_f) return .lt;
+    if (b == min_i64_f) return std.math.order(a, std.math.minInt(i64));
+    const truncated: i64 = @intFromFloat(b);
+    const truncated_f: f64 = @floatFromInt(truncated);
+    if (b == truncated_f) return std.math.order(a, truncated);
+    if (b > 0) return if (a <= truncated) .lt else .gt;
+    return if (a < truncated) .lt else .gt;
+}
+
+fn compareU64ToF64(a: u64, b: f64) std.math.Order {
+    if (b < 0) return .gt;
+    if (b >= 18446744073709551616.0) return .lt;
+    const truncated: u64 = @intFromFloat(b);
+    const truncated_f: f64 = @floatFromInt(truncated);
+    if (b == truncated_f) return std.math.order(a, truncated);
+    return if (a <= truncated) .lt else .gt;
+}
+
+pub fn compareNumericValues(a: NumericValue, b: NumericValue) std.math.Order {
+    return switch (a) {
+        .i64_val => |av| switch (b) {
+            .i64_val => |bv| std.math.order(av, bv),
+            .u64_val => |bv| if (av < 0) .lt else std.math.order(@as(u64, @intCast(av)), bv),
+            .f64_val => |bv| compareI64ToF64(av, bv),
+        },
+        .u64_val => |av| switch (b) {
+            .i64_val => |bv| if (bv < 0) .gt else std.math.order(av, @as(u64, @intCast(bv))),
+            .u64_val => |bv| std.math.order(av, bv),
+            .f64_val => |bv| compareU64ToF64(av, bv),
+        },
+        .f64_val => |av| switch (b) {
+            .i64_val => |bv| reverseOrder(compareI64ToF64(bv, av)),
+            .u64_val => |bv| reverseOrder(compareU64ToF64(bv, av)),
+            .f64_val => |bv| std.math.order(av, bv),
+        },
+    };
+}
+
+pub fn numericValueAsF64(value: NumericValue) f64 {
+    return switch (value) {
+        .u64_val => |number| @floatFromInt(number),
+        .i64_val => |number| @floatFromInt(number),
+        .f64_val => |number| number,
+    };
+}
 
 pub const GeoPoint = struct {
     lat: f64,
@@ -63,6 +129,7 @@ pub const TypedValue = union(enum) {
     bytes_val: []const u8,
     geo_point: GeoPoint,
     bool_val: bool,
+    numeric_val: NumericValue,
 };
 
 fn typedValueMatchesValueType(value: TypedValue, value_type: ValueType) bool {
@@ -73,6 +140,7 @@ fn typedValueMatchesValueType(value: TypedValue, value_type: ValueType) bool {
         .bytes_val => value == .bytes_val,
         .geo_point => value == .geo_point,
         .bool_val => value == .bool_val,
+        .numeric_val => value == .numeric_val,
     };
 }
 
@@ -80,6 +148,10 @@ fn typedValueIsSerializable(value: TypedValue) bool {
     return switch (value) {
         .f64_val => |v| std.math.isFinite(v),
         .geo_point => |v| std.math.isFinite(v.lat) and std.math.isFinite(v.lon),
+        .numeric_val => |v| switch (v) {
+            .f64_val => |number| std.math.isFinite(number),
+            else => true,
+        },
         else => true,
     };
 }
@@ -106,6 +178,7 @@ fn parseValueType(raw: u8) !ValueType {
         @intFromEnum(ValueType.geo_point) => .geo_point,
         @intFromEnum(ValueType.bool_val) => .bool_val,
         @intFromEnum(ValueType.i64_val) => .i64_val,
+        @intFromEnum(ValueType.numeric_val) => .numeric_val,
         else => error.InvalidData,
     };
 }
@@ -278,6 +351,20 @@ pub const TypedDocValuesWriter = struct {
                 try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, len))));
                 try out.appendSlice(self.alloc, bytes);
             },
+            .numeric_val => switch (value.numeric_val) {
+                .u64_val => |v| {
+                    try out.append(self.alloc, 0);
+                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, v))));
+                },
+                .i64_val => |v| {
+                    try out.append(self.alloc, 1);
+                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(i64, v))));
+                },
+                .f64_val => |v| {
+                    try out.append(self.alloc, 2);
+                    try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(v)));
+                },
+            },
         }
     }
 };
@@ -379,6 +466,7 @@ pub const TypedDocValuesReader = struct {
                         self.bytes_cursor += value_len;
                         break :blk .{ .bytes_val = bytes };
                     },
+                    .numeric_val => .{ .numeric_val = try decodeNumericValue(self.chunk.data[self.chunk.values_start + pos * 9 ..][0..9].*) },
                 };
                 self.pos += 1;
                 return .{ .doc_id = doc_id, .value = value };
@@ -469,6 +557,15 @@ pub const TypedDocValuesReader = struct {
         return try decodeSerializableF64(found.chunk_data[val_off..][0..8].*);
     }
 
+    pub fn getNumeric(self: *const TypedDocValuesReader, doc_id: u32) !?NumericValue {
+        if (self.value_type != .numeric_val) return error.InvalidData;
+        const found = try self.findDoc(doc_id) orelse return null;
+        defer self.alloc.free(found.chunk_data);
+        const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 9);
+        return try decodeNumericValue(found.chunk_data[val_off..][0..9].*);
+    }
+
     /// Get a single GeoPoint value for a doc.
     pub fn getGeoPoint(self: *const TypedDocValuesReader, doc_id: u32) !?GeoPoint {
         if (self.value_type != .geo_point) return error.InvalidData;
@@ -557,6 +654,21 @@ pub const TypedDocValuesReader = struct {
         for (0..num_docs) |i| {
             const off = values_start + i * 8;
             result[i] = try decodeSerializableF64(chunk_data[off..][0..8].*);
+        }
+        return result;
+    }
+
+    pub fn readNumericChunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]NumericValue {
+        if (self.value_type != .numeric_val) return error.InvalidData;
+        const chunk_data = try self.decompressChunk(chunk_idx);
+        defer self.alloc.free(chunk_data);
+        if (chunk_data.len < 4) return error.InvalidData;
+        const num_docs = std.mem.readInt(u32, chunk_data[0..4], .little);
+        const values_start = try fixedValueSpanStart(chunk_data, num_docs, 9);
+        const result = try self.alloc.alloc(NumericValue, num_docs);
+        errdefer self.alloc.free(result);
+        for (0..num_docs) |i| {
+            result[i] = try decodeNumericValue(chunk_data[values_start + i * 9 ..][0..9].*);
         }
         return result;
     }
@@ -653,9 +765,24 @@ pub const TypedDocValuesReader = struct {
                     cursor += value_len;
                 }
             },
+            .numeric_val => {
+                const values_start = try fixedValueSpanStart(chunk_data, num_docs, 9);
+                for (0..num_docs) |i| {
+                    _ = try decodeNumericValue(chunk_data[values_start + i * 9 ..][0..9].*);
+                }
+            },
         }
     }
 };
+
+fn decodeNumericValue(raw: [9]u8) !NumericValue {
+    return switch (raw[0]) {
+        0 => .{ .u64_val = std.mem.readInt(u64, raw[1..9], .little) },
+        1 => .{ .i64_val = std.mem.readInt(i64, raw[1..9], .little) },
+        2 => .{ .f64_val = try decodeSerializableF64(raw[1..9].*) },
+        else => error.InvalidData,
+    };
+}
 
 // ============================================================================
 // Tests
@@ -707,6 +834,24 @@ test "typed doc values u64 round-trip" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 5 }, doc_ids);
 }
 
+test "typed doc values exact numeric domain round-trip and comparison" {
+    const alloc = std.testing.allocator;
+    var writer = TypedDocValuesWriter.init(alloc, .numeric_val, 2);
+    defer writer.deinit();
+    try writer.add(0, .{ .numeric_val = .{ .i64_val = -9007199254740993 } });
+    try writer.add(1, .{ .numeric_val = .{ .f64_val = 10.5 } });
+    try writer.add(2, .{ .numeric_val = .{ .u64_val = std.math.maxInt(u64) } });
+
+    const data = try writer.build();
+    defer alloc.free(data);
+    var reader = try TypedDocValuesReader.init(alloc, data);
+    try std.testing.expectEqual(NumericValue{ .i64_val = -9007199254740993 }, (try reader.getNumeric(0)).?);
+    try std.testing.expectEqual(NumericValue{ .f64_val = 10.5 }, (try reader.getNumeric(1)).?);
+    try std.testing.expectEqual(NumericValue{ .u64_val = std.math.maxInt(u64) }, (try reader.getNumeric(2)).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareNumericValues(.{ .i64_val = 10 }, .{ .f64_val = 10.5 }));
+    try std.testing.expectEqual(std.math.Order.gt, compareNumericValues(.{ .u64_val = 9007199254740993 }, .{ .f64_val = 9007199254740992.0 }));
+}
+
 test "typed doc values writer rejects mismatched value type" {
     const alloc = std.testing.allocator;
 
@@ -740,6 +885,12 @@ test "typed doc values writer rejects non-finite floating values" {
     try std.testing.expectError(error.InvalidData, f64_writer.add(0, .{ .f64_val = std.math.nan(f64) }));
     try std.testing.expectError(error.InvalidData, f64_writer.add(0, .{ .f64_val = std.math.inf(f64) }));
     try f64_writer.add(0, .{ .f64_val = 1.5 });
+
+    var numeric_writer = TypedDocValuesWriter.init(alloc, .numeric_val, 1024);
+    defer numeric_writer.deinit();
+    try std.testing.expectError(error.InvalidData, numeric_writer.add(0, .{ .numeric_val = .{ .f64_val = std.math.nan(f64) } }));
+    try std.testing.expectError(error.InvalidData, numeric_writer.add(0, .{ .numeric_val = .{ .f64_val = std.math.inf(f64) } }));
+    try numeric_writer.add(0, .{ .numeric_val = .{ .f64_val = 1.5 } });
 
     var geo_writer = TypedDocValuesWriter.init(alloc, .geo_point, 1024);
     defer geo_writer.deinit();

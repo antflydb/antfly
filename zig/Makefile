@@ -126,7 +126,7 @@ tla-check-split: tla-tools
 	  -workers auto -deadlock
 
 tla-check-snap: tla-tools
-	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
+	@echo "==> Model checking snapshot transfer spec (safety only, symmetry reduced)..."
 	source ../scripts/tla-tools.sh && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \

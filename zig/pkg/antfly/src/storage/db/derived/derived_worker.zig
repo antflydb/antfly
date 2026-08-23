@@ -460,7 +460,8 @@ const ReplayChunkBuilder = struct {
         self.seen_deleted_docs.deinit(self.alloc);
         self.seen_overwritten_docs.deinit(self.alloc);
         self.seen_changed_artifacts.deinit(self.alloc);
-        if (self.resource_manager) |manager| manager.releaseBytes(.derived_replay_window, self.tracked_bytes);
+        if (self.resource_manager) |manager|
+            manager.adjustUsage(.derived_replay_window, &self.tracked_bytes, 0) catch {};
         self.* = undefined;
     }
 

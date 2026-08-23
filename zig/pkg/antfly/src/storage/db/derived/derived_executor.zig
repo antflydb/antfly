@@ -190,6 +190,7 @@ pub const Executor = struct {
     vtable: *const VTable,
 
     const VTable = struct {
+        begin_shutdown: *const fn (ptr: *anyopaque) void,
         deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
         has_workers: *const fn (ptr: *anyopaque) bool,
         fail_if_unhealthy: *const fn (ptr: *anyopaque) anyerror!void,
@@ -207,6 +208,13 @@ pub const Executor = struct {
         wait_for_all: *const fn (ptr: *anyopaque, sequence: u64, wait: VisibilityWait) anyerror!void,
         wait_for_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) anyerror!void,
     };
+
+    /// Close worker admission and wake idle workers without joining them.
+    /// Owners use this phase before shutting down dependencies that an active
+    /// publisher may currently be waiting on.
+    pub fn beginShutdown(self: *Executor) void {
+        self.vtable.begin_shutdown(self.ptr);
+    }
 
     pub fn deinit(self: *Executor, alloc: Allocator) void {
         self.vtable.deinit(self.ptr, alloc);
@@ -559,6 +567,7 @@ fn initManual(
 }
 
 const manual_vtable = Executor.VTable{
+    .begin_shutdown = manualBeginShutdown,
     .deinit = manualDeinit,
     .has_workers = manualHasWorkers,
     .fail_if_unhealthy = manualFailIfUnhealthy,
@@ -576,6 +585,8 @@ const manual_vtable = Executor.VTable{
     .wait_for_all = manualWaitForAll,
     .wait_for_indexes = manualWaitForIndexes,
 };
+
+fn manualBeginShutdown(_: *anyopaque) void {}
 
 fn manualDeinit(ptr: *anyopaque, alloc: Allocator) void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
@@ -689,6 +700,7 @@ fn initIoThreaded(
 }
 
 const io_threaded_vtable = Executor.VTable{
+    .begin_shutdown = ioThreadedBeginShutdown,
     .deinit = ioThreadedDeinit,
     .has_workers = ioThreadedHasWorkers,
     .fail_if_unhealthy = ioThreadedFailIfUnhealthy,
@@ -706,6 +718,11 @@ const io_threaded_vtable = Executor.VTable{
     .wait_for_all = ioThreadedWaitForAll,
     .wait_for_indexes = ioThreadedWaitForIndexes,
 };
+
+fn ioThreadedBeginShutdown(ptr: *anyopaque) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.beginShutdown();
+}
 
 fn ioThreadedDeinit(ptr: *anyopaque, alloc: Allocator) void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));

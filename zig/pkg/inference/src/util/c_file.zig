@@ -63,6 +63,7 @@ const PosixC = struct {
 
     pub const MADV_RANDOM = std.c.MADV.RANDOM;
     pub const MADV_SEQUENTIAL = std.c.MADV.SEQUENTIAL;
+    pub const MADV_DONTNEED = std.c.MADV.DONTNEED;
 
     pub const POSIX_FADV_NORMAL = std.os.linux.POSIX_FADV.NORMAL;
     pub const POSIX_FADV_SEQUENTIAL = std.os.linux.POSIX_FADV.SEQUENTIAL;
@@ -148,9 +149,49 @@ pub const MmapRegion = struct {
         advise(self.data.ptr, self.data.len, .random);
     }
 
+    /// Release clean pages for a consumed file-backed range. The mapping stays
+    /// valid: a later access faults the bytes back from the file. This is an
+    /// advisory Linux optimization and deliberately cannot fail allocation or
+    /// inference when a kernel/filesystem declines either hint.
+    pub fn discardFileRange(self: *MmapRegion, offset: usize, len: usize) void {
+        if (!comptime build_options.link_libc) return;
+        if (comptime builtin.os.tag != .linux) return;
+        if (offset >= self.data.len or len == 0) return;
+
+        const clamped_len = @min(len, self.data.len - offset);
+        advise(self.data.ptr + offset, clamped_len, .dont_need);
+        _ = c.posix_fadvise(
+            self.fd,
+            @intCast(offset),
+            @intCast(clamped_len),
+            c.POSIX_FADV_DONTNEED,
+        );
+    }
+
     pub fn deinit(self: *MmapRegion) void {
+        const mapped_len = self.data.len;
+        const fd = self.fd;
+        // Model eviction must release both the process mapping and its clean
+        // page-cache residency. Repeatedly mapping different multi-GiB weight
+        // files can otherwise leave recently active file pages charged to the
+        // cgroup after munmap(), temporarily exhausting an explicit process
+        // envelope even though the evicted model owns no live memory. Both
+        // hints are best effort and affect only clean file-backed pages:
+        // anonymous, dirty, writeback, and still-shared pages remain charged.
+        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+            advise(self.data.ptr, mapped_len, .dont_need);
+        }
         std.posix.munmap(self.data);
-        closeFd(self.fd);
+        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+            _ = c.posix_fadvise(
+                fd,
+                0,
+                @intCast(mapped_len),
+                c.POSIX_FADV_DONTNEED,
+            );
+        }
+        closeFd(fd);
+        self.* = undefined;
     }
 };
 
@@ -337,7 +378,7 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
     return stat.size;
 }
 
-const Advice = enum { sequential, random };
+const Advice = enum { sequential, random, dont_need };
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
     // std.posix.openatZ preserves actionable failures such as AccessDenied,
@@ -405,6 +446,7 @@ fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
         const c_advice: u32 = switch (advice) {
             .sequential => c.MADV_SEQUENTIAL,
             .random => c.MADV_RANDOM,
+            .dont_need => c.MADV_DONTNEED,
         };
         const page_size = std.heap.page_size_min;
         const start = @intFromPtr(ptr);
@@ -452,7 +494,7 @@ test "readFile preserves non-missing open failures" {
     try std.testing.expectError(error.NotDir, readFile(allocator, path));
 }
 
-test "MmapRegion maps file data correctly and adviseRandom does not crash" {
+test "MmapRegion advice preserves readable mapped data" {
     const allocator = std.testing.allocator;
 
     // Write a temp file with known content.
@@ -477,6 +519,11 @@ test "MmapRegion maps file data correctly and adviseRandom does not crash" {
     region.adviseRandom();
 
     // Data should still be readable after advice change
+    try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+
+    // DONTNEED only releases clean page-cache residency. It must not invalidate
+    // the mapping or change the file-backed contents.
+    region.discardFileRange(7, 13);
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
 }
 

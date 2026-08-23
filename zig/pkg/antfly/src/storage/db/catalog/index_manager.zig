@@ -1413,6 +1413,7 @@ pub const IndexManager = struct {
     };
 
     pub const ObservedDynamicFieldCapabilitySet = dynamic_field_capability.ObservedDynamicFieldCapabilitySet;
+    pub const DynamicFieldObservationQuery = dynamic_field_capability.ObservationQuery;
 
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
@@ -3264,7 +3265,11 @@ pub const IndexManager = struct {
     fn releaseFullTextPendingBytes(self: *IndexManager) void {
         if (self.full_text_pending_bytes_accounted == 0) return;
         if (self.resource_manager) |manager| {
-            manager.releaseBytes(.full_text_pending_segments, self.full_text_pending_bytes_accounted);
+            manager.adjustUsage(
+                .full_text_pending_segments,
+                &self.full_text_pending_bytes_accounted,
+                0,
+            ) catch {};
         }
         self.full_text_pending_bytes_accounted = 0;
     }
@@ -6502,17 +6507,20 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(name) orelse return &.{};
         entry.analysis_mutex.lockShared();
         defer entry.analysis_mutex.unlockShared();
-        return try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
+        return try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry, .{
+            .index_name = name,
+            .coverage_read_mode = .validate,
+        });
     }
 
     fn observedDynamicFieldCapabilitiesLockedAlloc(
         self: *IndexManager,
         alloc: Allocator,
         entry: *IndexManager.TextIndex,
+        observation: dynamic_field_capability.ObservationQuery,
     ) ![]schema_mod.FieldCapability {
         _ = self;
-        const declared_capability_count = declaredRuntimeNativeDocValueFieldCapabilityCount(entry);
-        const capability_count = entry.observed_field_analyzers.len + declared_capability_count;
+        const capability_count = observedDynamicFieldCapabilityCount(entry, observation);
         if (capability_count == 0) return &.{};
 
         const capabilities = try alloc.alloc(schema_mod.FieldCapability, capability_count);
@@ -6522,14 +6530,18 @@ pub const IndexManager = struct {
             alloc.free(capabilities);
         }
         for (entry.observed_field_analyzers) |item| {
+            if (!observation.includesField(item.field_name)) continue;
             var capability = schema_mod.observedDynamicFieldCapability(entry.runtime_schema, item.field_name, item.mapping());
-            const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(alloc, entry, item.field_name, item.mapping());
-            if (coverage == .covered) {
-                capability.doc_value_coverage = "covered";
-                capability.queryability_state = "queryable";
-            } else if (schema_mod.mappingHasNativeDocValues(item.mapping())) {
-                capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
-                capability.queryability_state = "missing_doc_values";
+            if (schema_mod.mappingHasNativeDocValues(item.mapping())) {
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, item.field_name, item.mapping(), observation)) |coverage| {
+                    if (coverage == .covered) {
+                        capability.doc_value_coverage = "covered";
+                        capability.queryability_state = "queryable";
+                    } else {
+                        capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                        capability.queryability_state = "missing_doc_values";
+                    }
+                }
             }
             schema_mod.refreshSortLifecycleState(&capability);
             capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(
@@ -6539,17 +6551,36 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         if (entry.runtime_schema) |schema| {
+            for (schema.exact_fields) |field| {
+                if (!schema_mod.mappingHasNativeDocValues(field.mapping)) continue;
+                if (!observation.includesField(field.field)) continue;
+                var capability = schema_mod.exactFieldCapability(schema, field);
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, field.field, field.mapping, observation)) |coverage| {
+                    if (coverage == .covered) {
+                        capability.doc_value_coverage = "covered";
+                        capability.queryability_state = "queryable";
+                    } else {
+                        capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                        capability.queryability_state = "missing_doc_values";
+                    }
+                }
+                schema_mod.refreshSortLifecycleState(&capability);
+                capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
+                initialized += 1;
+            }
             for (schema.dynamic_templates) |template| {
                 const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
                 if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
+                if (!observation.includesField(field)) continue;
                 var capability = schema_mod.dynamicTemplateFieldCapability(schema, template);
-                const coverage = try observedDynamicFieldTypedDocValueCoverageStatus(alloc, entry, field, template.mapping);
-                if (coverage == .covered) {
-                    capability.doc_value_coverage = "covered";
-                    capability.queryability_state = "queryable";
-                } else {
-                    capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
-                    capability.queryability_state = "missing_doc_values";
+                if (try observedDynamicFieldTypedDocValueCoverageStatus(entry, field, template.mapping, observation)) |coverage| {
+                    if (coverage == .covered) {
+                        capability.doc_value_coverage = "covered";
+                        capability.queryability_state = "queryable";
+                    } else {
+                        capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
+                        capability.queryability_state = "missing_doc_values";
+                    }
                 }
                 schema_mod.refreshSortLifecycleState(&capability);
                 capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
@@ -6560,43 +6591,69 @@ pub const IndexManager = struct {
         return capabilities;
     }
 
-    fn declaredRuntimeNativeDocValueFieldCapabilityCount(entry: *TextIndex) usize {
-        const schema = entry.runtime_schema orelse return 0;
+    fn observedDynamicFieldCapabilityCount(
+        entry: *TextIndex,
+        observation: dynamic_field_capability.ObservationQuery,
+    ) usize {
         var capability_count: usize = 0;
+        for (entry.observed_field_analyzers) |item| {
+            if (observation.includesField(item.field_name)) capability_count += 1;
+        }
+        const schema = entry.runtime_schema orelse return capability_count;
+        for (schema.exact_fields) |field| {
+            if (!schema_mod.mappingHasNativeDocValues(field.mapping)) continue;
+            if (!observation.includesField(field.field)) continue;
+            capability_count += 1;
+        }
         for (schema.dynamic_templates) |template| {
-            if (schema_mod.exactDynamicTemplatePath(template) == null) continue;
+            const field = schema_mod.exactDynamicTemplatePath(template) orelse continue;
             if (!schema_mod.mappingHasNativeDocValues(template.mapping)) continue;
+            if (!observation.includesField(field)) continue;
             capability_count += 1;
         }
         return capability_count;
     }
 
     fn observedDynamicFieldTypedDocValueCoverageStatus(
-        alloc: Allocator,
         entry: *IndexManager.TextIndex,
         field: []const u8,
         mapping: schema_mod.FieldMapping,
-    ) !typed_dv_coverage.Status {
+        observation: dynamic_field_capability.ObservationQuery,
+    ) !?typed_dv_coverage.Status {
+        try observation.checkActive();
         if (!schema_mod.mappingHasNativeDocValues(mapping)) return .missing_doc_values_section;
         const snapshot = entry.persistent.snapshot();
         if (snapshot.liveDocCount() == 0) return .covered;
 
+        var has_uninitialized_coverage = false;
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
-            const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return .malformed_doc_values_section;
-            if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return .doc_values_kind_mismatch;
-            const coverage = try typed_dv_coverage.readerCoversLiveDocsAlloc(alloc, segment, &reader);
-            if (coverage != .covered) return coverage;
+            const coverage = switch (observation.coverage_read_mode) {
+                .validate => (try segment.typedDocValuesCoverageWithValidation(field, .{
+                    .execution_deadline_ns = observation.execution_deadline_ns,
+                    .cancellation = observation.cancellation,
+                })) orelse return .missing_doc_values_section,
+                .cached_only => switch (segment.cachedTypedDocValuesCoverage(field)) {
+                    .missing => return .missing_doc_values_section,
+                    .uninitialized => {
+                        has_uninitialized_coverage = true;
+                        continue;
+                    },
+                    .initialized => |coverage| coverage,
+                },
+            };
+            const value_type = coverage.value_type orelse return coverage.status;
+            if (!typedDocValueReaderMatchesMapping(value_type, mapping)) return .doc_values_kind_mismatch;
+            if (coverage.status != .covered) return coverage.status;
         }
-        return .covered;
+        return if (has_uninitialized_coverage) null else .covered;
     }
 
     fn typedDocValueReaderMatchesMapping(value_type: typed_dv.ValueType, mapping: schema_mod.FieldMapping) bool {
         return switch (mapping.field_type) {
             .datetime => value_type == .u64_val,
             .numeric => switch (value_type) {
-                .u64_val, .i64_val, .f64_val => true,
+                .u64_val, .i64_val, .f64_val, .numeric_val => true,
                 else => false,
             },
             .boolean => value_type == .bool_val,
@@ -6609,18 +6666,46 @@ pub const IndexManager = struct {
     pub fn observedDynamicFieldCapabilitySetsAlloc(
         self: *IndexManager,
         alloc: Allocator,
+        observation: dynamic_field_capability.ObservationQuery,
     ) ![]ObservedDynamicFieldCapabilitySet {
-        for (self.text_indexes.items) |*entry| entry.analysis_mutex.lockShared();
+        try observation.checkActive();
+        const locked_entries = try alloc.alloc(*TextIndex, self.text_indexes.items.len);
+        defer alloc.free(locked_entries);
+        var locked_count: usize = 0;
+        var cleanup_partial_locks = true;
+        errdefer if (cleanup_partial_locks) {
+            while (locked_count > 0) {
+                locked_count -= 1;
+                locked_entries[locked_count].analysis_mutex.unlockShared();
+            }
+        };
+        for (self.text_indexes.items) |*entry| {
+            if (observation.index_name) |name| {
+                if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            }
+            if (observation.execution_deadline_ns != null or observation.cancellation != null) {
+                if (!entry.analysis_mutex.tryLockShared()) return error.StorageReadTemporarilyUnavailable;
+            } else {
+                entry.analysis_mutex.lockShared();
+            }
+            locked_entries[locked_count] = entry;
+            locked_count += 1;
+        }
+        cleanup_partial_locks = false;
         defer {
-            var i = self.text_indexes.items.len;
-            while (i > 0) {
-                i -= 1;
-                self.text_indexes.items[i].analysis_mutex.unlockShared();
+            while (locked_count > 0) {
+                locked_count -= 1;
+                locked_entries[locked_count].analysis_mutex.unlockShared();
             }
         }
+        try observation.checkActive();
         var set_count: usize = 0;
         for (self.text_indexes.items) |*entry| {
-            if (entry.observed_field_analyzers.len > 0 or declaredRuntimeNativeDocValueFieldCapabilityCount(entry) > 0) set_count += 1;
+            try observation.checkActive();
+            if (observation.index_name) |name| {
+                if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            }
+            if (observedDynamicFieldCapabilityCount(entry, observation) > 0) set_count += 1;
         }
         if (set_count == 0) return &.{};
 
@@ -6632,11 +6717,14 @@ pub const IndexManager = struct {
         }
 
         for (self.text_indexes.items) |*entry| {
-            if (entry.observed_field_analyzers.len == 0 and declaredRuntimeNativeDocValueFieldCapabilityCount(entry) == 0) continue;
+            if (observation.index_name) |name| {
+                if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            }
+            if (observedDynamicFieldCapabilityCount(entry, observation) == 0) continue;
             sets[initialized] = blk: {
                 const index_name = try alloc.dupe(u8, entry.config.name);
                 errdefer alloc.free(index_name);
-                const field_capabilities = try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry);
+                const field_capabilities = try self.observedDynamicFieldCapabilitiesLockedAlloc(alloc, entry, observation);
                 break :blk .{
                     .index_name = index_name,
                     .field_capabilities = field_capabilities,
@@ -12118,6 +12206,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(planned);
             var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
             };
             defer if (reservation) |*active| active.release();
 
@@ -18548,6 +18637,11 @@ fn parseGeneratorChunkerJson(alloc: Allocator, object: std.json.ObjectMap) ![]u8
     return try chunking_types.stringifyAlloc(alloc, cfg);
 }
 
+pub fn validateGraphConfig(alloc: Allocator, raw: []const u8) !void {
+    var config = try parseGraphConfig(alloc, raw);
+    defer config.deinit(alloc);
+}
+
 fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -18792,15 +18886,22 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
     const kind = artifact.object.get("kind") orelse return error.InvalidIndexConfig;
     if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidIndexConfig;
 
-    const field = if (artifact.object.get("field")) |value| blk: {
-        if (value != .string) return error.InvalidIndexConfig;
-        break :blk value.string;
-    } else "";
-    const template = if (artifact.object.get("template")) |value| blk: {
-        if (value != .string) return error.InvalidIndexConfig;
-        break :blk value.string;
-    } else "";
-    if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
+    const source = artifact.object.get("source") orelse return error.InvalidIndexConfig;
+    if (source != .object) return error.InvalidIndexConfig;
+    const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
+    const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
+    if (source_type != .string or source_value != .string or source_value.string.len == 0)
+        return error.InvalidIndexConfig;
+
+    var field: []const u8 = "";
+    var template: []const u8 = "";
+    if (std.mem.eql(u8, source_type.string, "field")) {
+        field = source_value.string;
+    } else if (std.mem.eql(u8, source_type.string, "template")) {
+        template = source_value.string;
+    } else {
+        return error.InvalidIndexConfig;
+    }
     const content_type = if (artifact.object.get("content_type")) |value| blk: {
         if (value != .string) return error.InvalidIndexConfig;
         break :blk value.string;
@@ -18863,7 +18964,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
         \\}
     );
     defer cfg.deinit(alloc);
@@ -18897,13 +18998,25 @@ test "graph shorthand asset uses artifact execution only" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
+        \\  "artifact":{"name":"pages_v1","kind":"asset","source":{"type":"field","value":"image"},"producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
         \\}
     );
     defer cfg.deinit(alloc);
 
     try std.testing.expect(cfg.shorthand_asset != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":3") != null);
+}
+
+test "graph shorthand asset maps template source without field ambiguity" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ title }} {{ body }}"}}}
+    );
+    defer cfg.deinit(alloc);
+
+    const asset = cfg.shorthand_asset orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", asset.source_field);
+    try std.testing.expectEqualStrings("{{ title }} {{ body }}", asset.source_template);
 }
 
 test "graph config parses artifact mapping templates and context fields" {
@@ -19421,7 +19534,7 @@ const TextProjectionProvenance = struct {
         schema: ?schema_mod.TableSchema,
     ) !TextProjectionProvenance {
         const schema_fingerprint = if (schema) |value| blk: {
-            const encoded = try schema_mod.serializeSchema(alloc, value);
+            const encoded = try schema_mod.serializeTextProjectionSchema(alloc, value);
             defer alloc.free(encoded);
             break :blk std.hash.Wyhash.hash(0x41545052534d0001, encoded);
         } else std.hash.Wyhash.hash(0x41545052534d0001, "schema-less");
@@ -22426,6 +22539,95 @@ test "observed dynamic sortable field capability reports covered queryable state
     try std.testing.expectEqualStrings("queryable", capabilities[0].sort_lifecycle_state);
 }
 
+test "dynamic field observation keeps status cached and validates only selected sort fields" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+    const entry = manager.textIndexEntry("ft_v1").?;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    try dv_writer.add(1, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    const quantity_idx = try seg_writer.addField("quantity");
+    try seg_writer.addSection(quantity_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":10,\"quantity\":1}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":20,\"quantity\":2}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try entry.persistent.indexSegment(segment);
+
+    const price_field = try alloc.dupe(u8, "price");
+    defer alloc.free(price_field);
+    const quantity_field = try alloc.dupe(u8, "quantity");
+    defer alloc.free(quantity_field);
+    const keyword_analyzer = try alloc.dupe(u8, "keyword");
+    defer alloc.free(keyword_analyzer);
+    const observed = [_]mapper.ObservedFieldAnalyzer{
+        .{ .field_name = price_field, .analyzer_name = keyword_analyzer, .field_type = .numeric, .doc_values = true, .sortable = true },
+        .{ .field_name = quantity_field, .analyzer_name = keyword_analyzer, .field_type = .numeric, .doc_values = true, .sortable = true },
+    };
+    try mergeObservedTextFieldAnalyzers(&manager, &store, entry, &observed);
+
+    const indexed_segment = &entry.persistent.snapshot().segments[0];
+    try std.testing.expect(indexed_segment.cachedTypedDocValuesCoverage("price") == .uninitialized);
+    try std.testing.expect(indexed_segment.cachedTypedDocValuesCoverage("quantity") == .uninitialized);
+
+    const cached_sets = try manager.observedDynamicFieldCapabilitySetsAlloc(alloc, .{ .coverage_read_mode = .cached_only });
+    defer {
+        for (cached_sets) |*set| set.deinit(alloc);
+        if (cached_sets.len > 0) alloc.free(cached_sets);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cached_sets.len);
+    try std.testing.expectEqual(@as(usize, 2), cached_sets[0].field_capabilities.len);
+    for (cached_sets[0].field_capabilities) |capability| {
+        try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
+        try std.testing.expectEqualStrings("declared", capability.queryability_state);
+    }
+    try std.testing.expect(indexed_segment.cachedTypedDocValuesCoverage("price") == .uninitialized);
+    try std.testing.expect(indexed_segment.cachedTypedDocValuesCoverage("quantity") == .uninitialized);
+
+    const selected_fields = [_][]const u8{"price"};
+    const selected_sets = try manager.observedDynamicFieldCapabilitySetsAlloc(alloc, .{
+        .index_name = "ft_v1",
+        .fields = &selected_fields,
+        .coverage_read_mode = .validate,
+    });
+    defer {
+        for (selected_sets) |*set| set.deinit(alloc);
+        if (selected_sets.len > 0) alloc.free(selected_sets);
+    }
+    try std.testing.expectEqual(@as(usize, 1), selected_sets.len);
+    try std.testing.expectEqual(@as(usize, 1), selected_sets[0].field_capabilities.len);
+    try std.testing.expectEqualStrings("price", selected_sets[0].field_capabilities[0].field.?);
+    try std.testing.expectEqualStrings("covered", selected_sets[0].field_capabilities[0].doc_value_coverage);
+    try std.testing.expect(std.meta.activeTag(indexed_segment.cachedTypedDocValuesCoverage("price")) == .initialized);
+    try std.testing.expect(indexed_segment.cachedTypedDocValuesCoverage("quantity") == .uninitialized);
+}
+
 test "declared runtime sortable field capability reports covered queryable state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -22714,6 +22916,63 @@ test "fresh text generation persists provenance before its first segment" {
     try std.testing.expect(!entry.persistent.hasPhysicalSegments());
     try reopened.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }});
     try std.testing.expect(entry.persistent.hasPhysicalSegments());
+}
+
+test "non-empty text generation accepts deployed v11 schema provenance" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const fields = [_]schema_mod.FullTextField{.{
+        .path = "state",
+        .emitted_name = "state",
+        .analyzer = "keyword",
+    }};
+    const documents = [_]schema_mod.FullTextDocument{.{
+        .name = "product",
+        .fields = &fields,
+    }};
+    const schema = schema_mod.TableSchema{
+        .version = 3,
+        .default_type = "product",
+        .full_text_documents = &documents,
+    };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, schema));
+
+    const projection = try schema_mod.serializeTextProjectionSchema(alloc, schema);
+    defer alloc.free(projection);
+    try std.testing.expectEqualSlices(u8, "ASCH\x0b\x00\x00\x00", projection[0..8]);
+
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+        try manager.indexBatch(&store, &.{.{
+            .key = "doc:a",
+            .value = "{\"_type\":\"product\",\"state\":\"published\"}",
+        }});
+        try std.testing.expect(manager.textIndexEntry("ft_v1").?.persistent.hasPhysicalSegments());
+    }
+
+    var reopened = try IndexManager.init(alloc, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const entry = reopened.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("keyword", IndexManager.textFieldAnalyzerName(entry, "state").?);
+    try std.testing.expect(reopened.loadFailure("ft_v1") == null);
 }
 
 test "empty generation adopts schema provenance after schema-only crash boundary" {

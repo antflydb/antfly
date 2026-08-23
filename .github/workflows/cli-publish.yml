@@ -54,7 +54,12 @@ jobs:
             "antfly_${version}_Linux_arm64.tar.gz" \
             "antfly_${version}_Linux_x86_64.tar.gz"
           do
-            curl -fsSL "${base}/${archive}" -o "dist/release-archives/${archive}"
+            curl -fsSL \
+              --max-redirs 0 \
+              -H "X-Antfly-Download-Channel: release-automation" \
+              -H "X-Antfly-Audience: ci" \
+              "${base}/${archive}" \
+              -o "dist/release-archives/${archive}"
           done
 
       - uses: actions/setup-python@v5
