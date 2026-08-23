@@ -15,12 +15,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import e2e_scheduler as e2e_scheduler_module
 import pytest
 from e2e_scheduler import (
     MIXED_PROCESS_GROUP_PREFIX,
@@ -342,6 +342,70 @@ def test_declared_session_process_has_stable_identity_and_module_scope() -> None
     )
 
 
+def test_inferred_session_identities_in_one_module_remain_independent() -> None:
+    first = FakeItem(
+        "test_custom.py::test_first",
+        markers=[
+            mark(
+                "e2e_resource",
+                "antfly_process",
+                lifetime="session",
+                identity="runtime_a",
+            )
+        ],
+    )
+    second = FakeItem(
+        "test_custom.py::test_second",
+        markers=[
+            mark(
+                "e2e_resource",
+                "antfly_process",
+                lifetime="session",
+                identity="runtime_b",
+            )
+        ],
+    )
+
+    groups = _consolidate_scheduling_groups(
+        [
+            scheduling_group(first),  # type: ignore[arg-type]
+            scheduling_group(second),  # type: ignore[arg-type]
+        ]
+    )
+
+    assert groups[0] != groups[1]
+    assert groups[0].startswith(f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a--module--")
+    assert groups[1].startswith(f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_b--module--")
+
+
+def test_explicit_session_group_consolidates_all_required_identities() -> None:
+    groups = []
+    for nodeid, identity in (
+        ("test_custom.py::test_first", "runtime_a"),
+        ("test_custom.py::test_second", "runtime_b"),
+    ):
+        item = FakeItem(
+            nodeid,
+            markers=[
+                mark("e2e_isolation", "module", group="shared-runtime-tests"),
+                mark(
+                    "e2e_resource",
+                    "antfly_process",
+                    lifetime="session",
+                    identity=identity,
+                ),
+            ],
+        )
+        groups.append(scheduling_group(item))  # type: ignore[arg-type]
+
+    consolidated = _consolidate_scheduling_groups(groups)
+
+    assert consolidated[0] == consolidated[1]
+    assert consolidated[0].startswith(
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a+runtime_b--module--"
+    )
+
+
 @pytest.mark.e2e_isolation("module", group="declared-session-fixture")
 def test_fixture_resource_declaration_is_applied_to_consuming_test(
     request: pytest.FixtureRequest,
@@ -593,6 +657,7 @@ def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    e2e_scheduler_module = sys.modules[DurationHistory.__module__]
     history = DurationHistory(tmp_path / "durations.json")
     monkeypatch.setattr(e2e_scheduler_module, "_duration_history", history)
     monkeypatch.setattr(e2e_scheduler_module, "_duration_report_totals", {})
@@ -898,6 +963,47 @@ def test_final_transient_test_hands_its_slot_to_persistent_runway(
     scheduler.mark_test_complete(worker, 0)
 
     assert worker not in scheduler._transient_handoffs
+    assert scheduler._reserved_process_slots() == 1
+
+
+def test_transient_handoff_lane_cannot_be_reused_behind_persistent_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    worker = FakeWorker()
+    current_scope = f"{PROCESS_GROUP_PREFIX}test--current"
+    persistent_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--next"
+    )
+    later_scope = f"{PROCESS_GROUP_PREFIX}test--later"
+    current_nodeid = "test_transient.py::test_current"
+    persistent_nodeid = "test_serverless.py::test_next"
+    later_nodeid = "test_transient.py::test_later"
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {}
+    scheduler.assigned_work = {
+        worker: {current_scope: {current_nodeid: False}},
+    }
+    scheduler.workqueue = OrderedDict(
+        {
+            persistent_scope: {persistent_nodeid: False},
+            later_scope: {later_nodeid: False},
+        }
+    )
+    scheduler.registered_collections = {
+        worker: [current_nodeid, persistent_nodeid, later_nodeid]
+    }
+
+    scheduler._reschedule(worker)
+    scheduler._reschedule(worker)
+
+    assert worker.sent == [[1]]
+    assert list(scheduler.workqueue) == [later_scope]
+    assert scheduler._additional_process_slots(worker, later_scope) == 1
     assert scheduler._reserved_process_slots() == 1
 
 

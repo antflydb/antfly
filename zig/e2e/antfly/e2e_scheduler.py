@@ -305,12 +305,11 @@ def scheduling_group(item: pytest.Item) -> str:
 
     # Preserve fixture sharing at the narrowest safe boundary. Function-scoped
     # process fixtures already provide complete test isolation.
-    module_shared = reuse_process and not force_fresh
-    module_shared = module_shared or any(
-        scope in {"module", "session"} for scope in process_scopes
-    )
+    shared_module_boundary = reuse_process and not force_fresh
+    shared_module_boundary = shared_module_boundary or "module" in process_scopes
+    shared_module_boundary = shared_module_boundary or shared_external
+    module_shared = shared_module_boundary or "session" in process_scopes
     module_shared = module_shared or bool(persistent_processes)
-    module_shared = module_shared or shared_external
     class_id = (
         nodeid.rsplit("::", 1)[0] if getattr(item, "cls", None) is not None else None
     )
@@ -362,7 +361,20 @@ def scheduling_group(item: pytest.Item) -> str:
         resource = f"{prefix}{identities}--"
     else:
         resource = PROCESS_GROUP_PREFIX if process_owned else "light--"
-    return _safe_group_name(f"{resource}{kind}", identity)
+    group_identity = identity
+    if (
+        persistent_processes
+        and isolation is None
+        and not package_boundaries
+        and not shared_module_boundary
+    ):
+        # Automatically inferred module isolation preserves each session
+        # fixture's users without coupling unrelated session processes in the
+        # same module. Explicit isolation groups still consolidate every
+        # resource they name, and a single item requesting multiple identities
+        # continues to reserve all of them together.
+        group_identity = f"{identity}::session={'+'.join(sorted(persistent_processes))}"
+    return _safe_group_name(f"{resource}{kind}", group_identity)
 
 
 def _scheduling_group_parts(group: str) -> tuple[frozenset[str], bool, str]:
@@ -635,6 +647,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 not self._workload_uses_transient_process(
                     self.assigned_work.get(node, {})
                 )
+                or node in getattr(self, "_transient_handoffs", set())
             )
         return additional
 
