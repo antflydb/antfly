@@ -1125,6 +1125,44 @@ during high-concurrency queries, not ingestion. The final primary LSM reported
 253 MB of cumulative mutable snapshot copying; the detached HBC store reported
 no generic LSM scan or compaction work.
 
+A fresh whole-tree 1M qualification on the same corrected implementation
+completed in 1,711.26 seconds (1,687.23 seconds insert plus 24.03 seconds
+catch-up), versus the coworker-reported approximately 3,000 seconds. All
+1,000,000 rows were query-visible at sequence 10001 and the process crossed the
+previously failing approximately 843K boundary without a capture, publication,
+or recovery error. Live recall/NDCG was 0.9854/0.9874 with serial
+p50/p95/p99 of 35.2/654.3/691.0 ms and 77.9 peak QPS. Graceful restart selected
+native authority without rebuilding; recall/NDCG was 0.9855/0.9875, serial
+latency was 44.0/608.4/663.5 ms, and peak throughput was 89.6 QPS. Load RSS
+peaked at 3.18 GB and the complete live-plus-restart sweep did not exceed that
+RSS. The final immutable HBC generation was approximately 240 MB with a small
+active WAL; the primary source LSM occupied approximately 3.51 GB.
+
+The corrected 1M counters make the remaining boundary explicit. Native HBC
+cache usage was only approximately 71 MB at load completion and no HBC LSM
+existed, while the primary document/exact-embedding LSM accumulated 2.30 GB of
+mutable snapshot copying. Applied-sequence publication spent 274.18 seconds in
+native HBC WAL/generation publication across 223 flushes; increasingly large
+background generation checkpoints remained crash-safe and bounded, but live
+tree mutation/publication is now a material fraction of the remaining load
+time. Query traversal stays native, while exact boundary rerank still performs
+random primary-LSM reads; this preserves recall parity but explains the 1M
+cold tail and the sharp throughput optimum near concurrency 20--30.
+
+Profile-guided primary-LSM changes cache the decoded current entry in each
+persisted compaction cursor and make adaptive Snappy back off after four
+consecutive blocks fail its 12.5% savings floor, periodically reprobe, and
+immediately re-enable after a successful probe. Prefix compression remains
+enabled for every block and the on-disk codec is unchanged. A public 50K A/B
+completed in 43.93 seconds (29.80 seconds insert plus 14.13 seconds catch-up),
+with 0.9853/0.9877 live recall/NDCG and 1.30 GB peak RSS. A second diagnostic
+run completed in 44.67 seconds (42.19 plus 2.48), demonstrating that foreground
+insert versus HBC catch-up attribution is scheduler-sensitive even when total
+load is stable. The faster-insert run left 118 primary L0 runs, so compaction
+overlapped the immediate live query sweep; restart recovered serial
+p50/p95/p99 to 3.1/5.0/36.1 ms with 0.9856/0.9880 recall/NDCG. These runs support
+the CPU optimization but do not justify claiming an end-to-end 50K speedup.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1162,11 +1200,10 @@ published.
    127.6 MB of the 150.7 MB live aggregate in the external-admission run;
    bound-read copies were 23.1 MB. Do not replace multi-operation snapshots
    with unsafe live probes merely to improve a cumulative counter.
-4. Repeat the 1M lifecycle three times through Circus on a controlled host and
-   publish its mean plus range. Three current-main 50K lifecycles now average
-   41.65 seconds with a 38.72--43.14 second range, but the single follow-up 1M
-   lifecycle remains diagnostic because compaction scheduling produced
-   materially different curves on the same host.
+4. Repeat the whole-tree 1M lifecycle three times through Circus on a
+   controlled host and publish its mean plus range. The corrected fresh run is
+   1,711.26 seconds, but the 50K phase split and immediate query tails remain
+   scheduler-sensitive even when total load stays near 42--45 seconds.
 5. Add deterministic fault injection at every posting-WAL append, fsync,
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
@@ -1175,7 +1212,13 @@ published.
    explicit catalog capability once mixed-version upgrade/downgrade policy is
    defined. Keep the persisted authority marker sticky and require an explicit
    source-journal rebuild to move back to the general LSM.
-7. Profile primary document/embedding LSM snapshot rotation and post-load
-   compaction at 1M. The posting store removed normal derived HBC writes, but
-   2.52 GB of mutable clones, 3.24 GB of read-snapshot rotations, and immediate
-   post-load compaction still dominate readiness, demand, and query tails.
+7. Make soft primary compaction yield promptly to foreground query admission,
+   and reduce the number of small partitioned L0 outputs produced during bulk
+   ingest. The whole-tree 1M run still accumulated 2.30 GB of mutable clones;
+   the faster 50K insert A/B reached 118 L0 runs and let compaction dominate the
+   immediate query tail even though HBC was already ready.
+8. Bound native HBC mutation/publication CPU without weakening its durable
+   sequence. The current WAL/generation boundary correctly owns
+   `covered_source_sequence`, but 1M publication consumed 274.18 seconds.
+   Preserve source-journal retention, atomic generation leases, and boundary
+   rerank while testing cheaper delta encoding and WAL-generation rotation.

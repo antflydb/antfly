@@ -2324,6 +2324,10 @@ const PersistedRunCursor = struct {
     entry_in_block: usize = 0,
     block_offset: usize = 0,
     current_entry_len: usize = 0,
+    /// Heap maintenance compares one cursor against several peers before the
+    /// cursor advances. Keep the decoded slice view stable for that interval
+    /// instead of reparsing the same table bytes for every comparison.
+    current_entry: ?lsm_table_file.Entry = null,
     loaded_window: ?lsm_table_file.EntryDataWindow = null,
     loaded_bytes: ?[]u8 = null,
 
@@ -2347,12 +2351,14 @@ const PersistedRunCursor = struct {
 
     fn currentEntry(self: *PersistedRunCursor) !?lsm_table_file.Entry {
         _ = self.position orelse return null;
+        if (self.current_entry) |entry| return entry;
         try self.ensureCurrentWindow();
         const bytes = self.loaded_bytes orelse return error.InvalidTableFile;
         if (self.block_offset >= bytes.len) return error.InvalidTableFile;
         const entry = try lsm_table_file.parseEntryAt(bytes, self.block_offset);
         self.current_entry_len = tableEntryLogicalBytes(entry);
         if (self.current_entry_len > bytes.len - self.block_offset) return error.InvalidTableFile;
+        self.current_entry = entry;
         return entry;
     }
 
@@ -2361,6 +2367,7 @@ const PersistedRunCursor = struct {
         if (self.current_entry_len == 0) _ = (try self.currentEntry()) orelse return error.InvalidTableFile;
         self.block_offset += self.current_entry_len;
         self.current_entry_len = 0;
+        self.current_entry = null;
         self.entry_in_block += 1;
         const block = self.index.blocks[self.block_index];
         if (self.entry_in_block > block.entry_count) return error.InvalidTableFile;
