@@ -797,12 +797,20 @@ eligible TLA+ traces.
 - Obsolete fixtures change only through explicit replay-proven migration.
 - Fixed regressions do not depend on corpus scheduling or search heuristics.
 
-## Next Steps
+## Roadmap
 
-These are capability and production-seam expansions, not a second numbered
-phase plan and not dependencies of the already implemented domain suites.
+The remaining opportunities are targeted integration scenarios and operational
+tooling rather than missing foundational infrastructure. They are not a second
+numbered phase plan and are not dependencies of the already implemented domain
+suites.
 
-### 1. Deeper DataServer and Raft Microsteps
+### Implemented Extension Seams
+
+The following seams are already implemented. They remain documented here so
+new product work extends the same ownership and scheduling contracts instead of
+introducing native-only alternatives.
+
+#### Deeper DataServer and Raft Microsteps
 
 The production DataServer, public listener, health request, metadata executor,
 and lifecycle safepoints run on borrowed `VoprIo`. A production-neutral
@@ -824,7 +832,7 @@ continue to expose the lower-level persistence/apply ordering. These seams
 preserve the single production writer and its lease ownership; extend them when
 new routed operations add distinct durable or result-assembly boundaries.
 
-### 2. HTTP Lifecycle and Backpressure
+#### HTTP Lifecycle and Backpressure
 
 The common listener and executors run on `VoprIo`; tests cover normal,
 single-byte partial-write, deadline-first cancellation, chunked request bodies,
@@ -839,7 +847,7 @@ production boundary is explicit TLS termination at a reverse proxy or load
 balancer. Extend this suite when httpx gains a production server-side TLS
 implementation or another transport backend.
 
-### 3. Background Runtime Lifecycle
+#### Background Runtime Lifecycle
 
 `DurableJobLane` and both production/VOPR implementations now share
 pause/resume/drain/close/reopen semantics; tests include admission while paused,
@@ -860,7 +868,7 @@ execution was already owned by the DB background runtime. The focused
 DataServer campaign proves both scheduler execution and queued cancellation;
 extend the owner only when another DataServer-native service is introduced.
 
-### 4. Serverless Object-Store Protocols
+#### Serverless Object-Store Protocols
 
 Real WAL, catalog, manifest, artifact, and progress-store operations now run
 over the reusable `ScriptedFaultClient`, covering partial committed transfer,
@@ -876,7 +884,7 @@ selects the same generation, cancellation before restore staging is harmless,
 and retry downloads and verifies the complete chunked artifact. Extend these
 protocol campaigns when new production object-store consumers are introduced.
 
-### 5. Admission and Resource Pressure
+#### Admission and Resource Pressure
 
 The production resource manager now runs under replayable contention schedules
 that prove hard-limit denial, idempotent release, accounting, and capacity
@@ -890,7 +898,7 @@ allocator, file, socket, storage, and queue limits, and the DataServer covers
 socket admission. Continue composing these policies into deeper DataServer
 request microsteps as those seams are added.
 
-### 6. Hard Antithesis-Class Tooling and Search Quality
+#### Existing Antithesis-Class Tooling and Search Quality
 
 - Persisted pointer-free multiverse nodes, ranked counterfactual experiments,
   stable trial metadata, explicit total experiment budgets, cross-revision
@@ -910,6 +918,106 @@ request microsteps as those seams are added.
   campaign with the first real consumer rather than inventing a test-only one.
 - Add stable source/basic-block coverage as secondary guidance when the Zig
   instrumentation surface can remain outside the replay ABI.
+
+### Highest-Value New VOPR Test Suites
+
+| Priority | Area | What to exercise |
+| --- | --- | --- |
+| P0 | Replication backfill and rebalancing | Snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, and schema changes. This is the clearest major remaining gap in [`metadata/replication_backfill.zig`](pkg/antfly/src/metadata/replication_backfill.zig). |
+| P0 | Standalone and serverless supervision | Partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, watchdog or lease expiry, and restart. [`serverless/runtime/manager.zig`](pkg/antfly/src/serverless/runtime/manager.zig) still owns a native run-loop thread, making it a useful next production seam. |
+| P0 | User and authentication lifecycle | Concurrent password, API-key, permission, and row-filter changes; seed capture; revoke and rotate; durable reload; crashes between user and policy persistence; and stale-reader behavior. The native-thread seed-lease regression in [`usermgr/user_manager.zig`](pkg/antfly/src/usermgr/user_manager.zig) should become a deterministic schedule. |
+| P1 | Complete serverless workflow | Claim, build, compact or enrich, publish, and catalog visibility with duplicate workers, lease takeover, ambiguous object-store completion, retry, cancellation, and crash recovery. Object-store protocols are covered; their orchestration is not yet covered end to end. |
+| P1 | DB and index request races | Elevate meaningful native-thread regressions such as cross-index admission, reader/writer fairness, delete/materialize, capture, shutdown, and cancellation into VOPR transitions through production-safe seams. Do not mechanically port test threads. |
+| P2 | Provider boundaries | Add deterministic response adapters for inference providers and PostgreSQL/libpq covering timeout, partial response, cancellation, retry, malformed data, and admission ownership. Keep actual model execution, GPU kernels, and libpq internals in differential and integration tests. |
+| P2 | Composed query lifecycle | Exercise vector, text, graph, and global-query execution under partial failure, cancellation, resource pressure, and result-assembly races. |
+
+Start with replication backfill, followed by the standalone/serverless
+supervisor. Those areas have the richest combinations of durable state,
+ownership, concurrency, and recovery.
+
+### Antithesis-Class Features Still Worth Porting
+
+VOPR already has the important core: structured controlled choices, the major
+Antithesis assertion kinds and assertion cataloging, deterministic scheduling
+and I/O, logical checkpoints, exact replay, reduction, semantic coverage,
+starvation, causal and counterfactual analysis, and multiverse navigation. The
+documented [Antithesis assertion
+model](https://antithesis.com/docs/product/writing_tests/assertions/) is
+therefore substantially covered.
+
+The remaining high-value features are:
+
+1. **Retroactive logging and flight recording.** Keep a bounded structured
+   event ring for every history, but retain or materialize verbose data only
+   when a property fails, a history becomes novel, or a debugger requests it.
+   Antithesis describes retroactive logging in its [release
+   notes](https://antithesis.com/docs/release_notes/).
+2. **Queryable event history.** Add fielded event details and predicates such
+   as `preceded_by`, `followed_by`, actor/resource/fault filters, and time
+   windows. VOPR has canonical events and causal windows, but not a general
+   event-query layer comparable to [Antithesis event
+   logs](https://antithesis.com/docs/reference/event_logs/).
+3. **Self-contained run/results API.** Expose run metadata, property results,
+   event search, corpus entries, artifacts, quarantine state, and budget usage
+   through stable JSON plus an optional static local report. This should remain
+   a repository-owned local and CI interface rather than a hosted dependency.
+4. **Automatic debug recipes.** For each new failure fingerprint,
+   automatically run reduction, causal-window extraction, bounded
+   counterfactual experiments, selected log queries, and before/after
+   collectors, then package one reviewable artifact.
+5. **Richer property evidence.** Preserve structured details, the first
+   failure, the rarest successful witness, and declared-but-never-encountered
+   results in reports and searches. The engine has cataloging and string
+   details; the reporting layer should make them first-class.
+6. **Explicit overlapping-fault algebra.** Define how partition, delay, node
+   pause, storage corruption, resource exhaustion, and clock faults compose,
+   including precedence and exclusion groups. Antithesis schedules faults
+   independently and permits [overlapping
+   faults](https://antithesis.com/docs/environment/fault_injection/).
+7. **Structured-choice audit.** Require every scenario-level decision to be
+   an immediate typed choice rather than a random integer used as a seed or
+   interpreted later. This gives search guidance the structured alternatives
+   described by [Antithesis controlled
+   randomness](https://antithesis.com/docs/reference/sdk/generate_randomness/).
+8. **Default harness-health properties.** Automatically enable no-progress or
+   deadlock, task and descriptor leaks, allocator or storage exhaustion,
+   cleanup, replay divergence, and harness-error properties for every
+   scenario.
+9. **Search-quality regression benchmarks.** Maintain a corpus of
+   intentionally injected bugs and track discovery probability and transition
+   cost across random, guided, spliced, starvation, and checkpoint-assisted
+   search.
+
+### Conditional Work
+
+Wait for a real product or toolchain requirement before adding:
+
+- datagram campaigns, until Antfly has a production datagram consumer;
+- server-side TLS fault campaigns, until httpx has a production server TLS
+  implementation;
+- source/basic-block guidance, until Zig exposes sufficiently stable
+  instrumentation—semantic coverage remains replay truth, while compiler
+  coverage only guides exploration;
+- a graphical hosted debugger—the line-oriented debugger plus machine-readable
+  and static reports is sufficient initially; or
+- a container or hypervisor clone, which would duplicate the expensive part of
+  Antithesis without improving Antfly's in-process `std.Io` strategy.
+
+### Delivery Order
+
+1. Add replication-backfill and supervisor VOPR suites.
+2. Add authentication and complete-serverless-workflow suites.
+3. Build retroactive logging, event queries, and automatic debug recipes.
+4. Standardize local run/results artifacts and nightly corpus merging.
+5. Add DB/index/query compositions and provider model adapters.
+6. Continuously audit new production loops so they borrow `std.Io` and
+   `VoprIo` instead of creating native-only runtime paths.
+
+The defects already found—lifetime errors, listener shutdown races, hidden
+Threaded I/O, virtual socket accounting, FIN ordering, teardown deadlocks, TLS
+fail-open behavior, and ReleaseSafe fiber identity corruption—demonstrate that
+extending VOPR across the remaining orchestration boundaries is likely to pay
+off. See [Defects Found](#defects-found) for the complete inventory.
 
 ## Risks and Required Safeguards
 
@@ -968,9 +1076,11 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The remaining hard-feature opportunities are conditional: add stable
-source/basic-block guidance when Zig exposes a durable instrumentation surface,
-and add provider-specific datagram campaigns when a real product consumer
-exists. New product services should cross the existing `std.Io`, lifecycle-hook,
+The next work should exercise replication backfill, runtime supervision,
+authentication, and complete serverless orchestration through those existing
+primitives, then improve flight recording, event queries, and automated
+failure packaging. Compiler-guided coverage and provider-specific datagram
+campaigns remain conditional on stable instrumentation and real consumers.
+New product services should cross the existing `std.Io`, lifecycle-hook,
 admission, and owner seams rather than creating native-only loops, multiplying
 suite names, or weakening production ownership contracts.
