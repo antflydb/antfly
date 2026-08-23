@@ -35,6 +35,43 @@ func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
 	}
 }
 
+func TestFullReconcileIgnoresStatusFeedbackButObservesDesiredState(t *testing.T) {
+	predicate := antflyClusterDesiredStateEventPredicate()
+	oldCluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	oldCluster.Generation = 7
+	updatedStatus := oldCluster.DeepCopy()
+	updatedStatus.Status.HAStatus = caughtUpHAStatus()
+	if predicate.Update(event.UpdateEvent{ObjectOld: oldCluster, ObjectNew: updatedStatus}) {
+		t.Fatal("operator-owned status update re-enqueued the full reconciler")
+	}
+
+	cases := map[string]func(*antflyv1.AntflyCluster){
+		"spec generation": func(cluster *antflyv1.AntflyCluster) { cluster.Generation++ },
+		"label": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Labels = map[string]string{"cloud.antfly.io/instance-id": "instance-a"}
+		},
+		"annotation": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Annotations = map[string]string{"cloud.antfly.io/ha-topology-generation": "2"}
+		},
+		"finalizer": func(cluster *antflyv1.AntflyCluster) {
+			cluster.Finalizers = []string{"storage.antfly.io/seed-retention"}
+		},
+		"deletion": func(cluster *antflyv1.AntflyCluster) {
+			now := metav1.Now()
+			cluster.DeletionTimestamp = &now
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			updated := updatedStatus.DeepCopy()
+			mutate(updated)
+			if !predicate.Update(event.UpdateEvent{ObjectOld: updatedStatus, ObjectNew: updated}) {
+				t.Fatal("desired-state change did not wake full reconciliation")
+			}
+		})
+	}
+}
+
 func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)
 	clusterA := haClusterWithAutomaticKubernetesLeaseFailover()

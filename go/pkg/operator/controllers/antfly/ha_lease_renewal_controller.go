@@ -8,12 +8,14 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -36,6 +38,32 @@ func haLeaseRenewalEventPredicate() predicate.Predicate {
 	// an unbounded proof-request loop and starve that clock. Spec generations
 	// still wake renewal immediately when HA is enabled, disabled, or changed.
 	return predicate.GenerationChangedPredicate{}
+}
+
+func antflyClusterDesiredStateEventPredicate() predicate.Predicate {
+	// Status is operator-owned observed state. Re-enqueueing the full
+	// reconciler for its own status writes creates a positive feedback loop
+	// when a health counter or timestamp advances. Desired-state metadata must
+	// still wake reconciliation because Colony intentionally carries topology
+	// identity and seed intent in labels/annotations, while finalizer and
+	// deletion changes drive safe cleanup.
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			if update.ObjectOld == nil || update.ObjectNew == nil {
+				return false
+			}
+			oldObject := update.ObjectOld
+			newObject := update.ObjectNew
+			return oldObject.GetGeneration() != newObject.GetGeneration() ||
+				!reflect.DeepEqual(oldObject.GetLabels(), newObject.GetLabels()) ||
+				!reflect.DeepEqual(oldObject.GetAnnotations(), newObject.GetAnnotations()) ||
+				!reflect.DeepEqual(oldObject.GetFinalizers(), newObject.GetFinalizers()) ||
+				!reflect.DeepEqual(oldObject.GetDeletionTimestamp(), newObject.GetDeletionTimestamp())
+		},
+	}
 }
 
 func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

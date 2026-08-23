@@ -13278,7 +13278,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).
-		For(&antflyv1.AntflyCluster{}).
+		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(antflyClusterDesiredStateEventPredicate())).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
