@@ -253,13 +253,6 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kind, err := result.Discriminator()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if kind != "nodes" {
-		t.Fatalf("kind = %q, want nodes", kind)
-	}
 	value, err := DecodeGraphQueryResult(result)
 	if err != nil {
 		t.Fatal(err)

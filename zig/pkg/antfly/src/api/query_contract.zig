@@ -5289,7 +5289,9 @@ fn toOpenApiGraphQueryResult(
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
     if (query.legacy_response) {
-        const response: indexes_openapi.LegacyGraphQueryResult = .{
+        const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
+        errdefer alloc.destroy(response);
+        response.* = .{
             .kind = "legacy",
             .type = legacyGraphQueryType(query.query_type),
             .nodes = try toOpenApiLegacyGraphNodes(alloc, graph_result),
@@ -5306,7 +5308,9 @@ fn toOpenApiGraphQueryResult(
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
         const rows = try toOpenApiGraphRows(alloc, graph_result);
-        const response: indexes_openapi.GraphBindingsResult = .{
+        const response = try alloc.create(indexes_openapi.GraphBindingsResult);
+        errdefer alloc.destroy(response);
+        response.* = .{
             .kind = "bindings",
             .rows = rows,
             .stats = .{
@@ -5319,7 +5323,9 @@ fn toOpenApiGraphQueryResult(
     }
     if (query.aggregates.len > 0) {
         const aggregates = try toOpenApiGraphAggregates(alloc, query, graph_result);
-        const response: indexes_openapi.GraphAggregatesResult = .{
+        const response = try alloc.create(indexes_openapi.GraphAggregatesResult);
+        errdefer alloc.destroy(response);
+        response.* = .{
             .kind = "aggregates",
             .aggregates = aggregates,
             .stats = .{
@@ -5333,7 +5339,9 @@ fn toOpenApiGraphQueryResult(
 
     const nodes = try toOpenApiGraphNodes(alloc, graph_result);
     const paths = try toOpenApiGraphPaths(alloc, graph_result.paths);
-    const response: indexes_openapi.GraphNodesResult = .{
+    const response = try alloc.create(indexes_openapi.GraphNodesResult);
+    errdefer alloc.destroy(response);
+    response.* = .{
         .kind = "nodes",
         .nodes = nodes,
         .paths = paths,

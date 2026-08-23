@@ -194,6 +194,16 @@ describe("Antfly Query Type Integration", () => {
       expect(numeric).toEqual({ numeric_range: { field: "score", min: 0 } });
     });
 
+    it("types pre-discriminator graph responses during the compatibility window", () => {
+      const legacy: components["schemas"]["GraphQueryResult"] = {
+        type: "neighbors",
+        total: 0,
+      };
+
+      expect(legacy.kind).toBeUndefined();
+      expectTypeOf(legacy.kind).toEqualTypeOf<"legacy" | undefined>();
+    });
+
     it("rejects analyzer-backed and full-text range shapes in graph filters", () => {
       // @ts-expect-error match requires a text index and is not a stored-document predicate.
       const analyzerBacked: GraphDocumentFilter = { match: "active", field: "status" };

@@ -23541,13 +23541,6 @@ components:
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
         - $ref: '#/components/schemas/LegacyGraphQueryResult'
-      discriminator:
-        propertyName: kind
-        mapping:
-          bindings: '#/components/schemas/GraphBindingsResult'
-          aggregates: '#/components/schemas/GraphAggregatesResult'
-          nodes: '#/components/schemas/GraphNodesResult'
-          legacy: '#/components/schemas/LegacyGraphQueryResult'
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true

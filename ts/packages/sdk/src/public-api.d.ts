@@ -12264,7 +12264,7 @@ export interface components {
         /** @description Complete projected bindings from a canonical graph MATCH query. */
         GraphBindingsResult: {
             /**
-             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @description Stable discriminator for the graph result shape.
              * @enum {string}
              */
             kind: "bindings";
@@ -12284,7 +12284,7 @@ export interface components {
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {
             /**
-             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @description Stable discriminator for the graph result shape.
              * @enum {string}
              */
             kind: "aggregates";
@@ -12310,7 +12310,7 @@ export interface components {
         /** @description Nodes and any materialized paths from a canonical traversal or path query. */
         GraphNodesResult: {
             /**
-             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @description Stable discriminator for the graph result shape.
              * @enum {string}
              */
             kind: "nodes";
@@ -12374,10 +12374,10 @@ export interface components {
          */
         LegacyGraphQueryResult: {
             /**
-             * @description Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release. (enum property replaced by openapi-typescript)
+             * @description Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
              * @enum {string}
              */
-            kind: "legacy";
+            kind?: "legacy";
             /** @deprecated */
             type: components["schemas"]["GraphQueryType"];
             /** @description Result nodes. Optional for compatibility with v0.2 responses. */

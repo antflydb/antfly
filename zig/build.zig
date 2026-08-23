@@ -3758,6 +3758,7 @@ pub fn build(b: *std.Build) void {
         "conjunctive matcher admits anchors before alias evaluation",
         "prevalidated conjunctive anchors skip duplicate checks but reached nodes remain guarded",
         "conjunctive anchor selection prefers filters and ignores declaration order",
+        "bounded conjunctive matches stream complete rows before the intermediate-state budget",
         "variable length conjunctive edge preserves simple path multiplicity",
         "conjunctive cycle closure survives node admission deduplication",
         "complete graph match anchors discard retrieval shaping",

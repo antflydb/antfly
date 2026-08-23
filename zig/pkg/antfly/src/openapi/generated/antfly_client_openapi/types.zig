@@ -5107,32 +5107,26 @@ pub const GraphQueryParams = struct {
 
 /// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
 pub const GraphQueryResult = union(enum) {
-    graph_bindings_result: GraphBindingsResult,
-    graph_aggregates_result: GraphAggregatesResult,
-    graph_nodes_result: GraphNodesResult,
-    legacy_graph_query_result: LegacyGraphQueryResult,
+    legacy_graph_query_result: *LegacyGraphQueryResult,
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
 
-    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { kind: ?[]const u8 = null };
-        var probe_options = options;
-        probe_options.ignore_unknown_fields = true;
-        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.kind orelse {
-            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
         };
-        if (std.mem.eql(u8, disc_str, "bindings")) {
-            return .{ .graph_bindings_result = try std.json.parseFromSliceLeaky(GraphBindingsResult, allocator, input, options) };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
         }
-        if (std.mem.eql(u8, disc_str, "aggregates")) {
-            return .{ .graph_aggregates_result = try std.json.parseFromSliceLeaky(GraphAggregatesResult, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "nodes")) {
-            return .{ .graph_nodes_result = try std.json.parseFromSliceLeaky(GraphNodesResult, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "legacy")) {
-            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
-        }
-        return error.UnexpectedToken;
+        return false;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5142,34 +5136,51 @@ pub const GraphQueryResult = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("kind") orelse {
-            return .{ .legacy_graph_query_result = try std.json.parseFromValueLeaky(LegacyGraphQueryResult, allocator, source, options) };
-        };
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "bindings")) {
-            return .{ .graph_bindings_result = try std.json.parseFromValueLeaky(GraphBindingsResult, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "kind",
+            "type",
+            "nodes",
+            "paths",
+            "matches",
+            "total",
+            "took",
+        })) {
+            if (try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options)) |parsed| return .{ .legacy_graph_query_result = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "aggregates")) {
-            return .{ .graph_aggregates_result = try std.json.parseFromValueLeaky(GraphAggregatesResult, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "kind",
+            "nodes",
+            "paths",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "nodes")) {
-            return .{ .graph_nodes_result = try std.json.parseFromValueLeaky(GraphNodesResult, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "kind",
+            "aggregates",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "legacy")) {
-            return .{ .legacy_graph_query_result = try std.json.parseFromValueLeaky(LegacyGraphQueryResult, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "kind",
+            "rows",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
         }
         return error.UnexpectedToken;
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
-            .graph_bindings_result => |v| try jw.write(v),
-            .graph_aggregates_result => |v| try jw.write(v),
-            .graph_nodes_result => |v| try jw.write(v),
-            .legacy_graph_query_result => |v| try jw.write(v),
+            .legacy_graph_query_result => |v| try jw.write(v.*),
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
         }
     }
 };
