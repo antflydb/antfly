@@ -442,8 +442,15 @@ fn backoffWriterLockRetry() void {
     }
 }
 
-fn sleepRetryBackoff(sleep_ns: u64) void {
+fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
+    if (runtime.io_impl) |backend| {
+        backend.io().sleep(
+            .fromNanoseconds(@intCast(@min(sleep_ns, @as(u64, std.math.maxInt(i64))))),
+            .awake,
+        ) catch {};
+        return;
+    }
     std.Thread.yield() catch {};
     if (@hasDecl(std.Thread, "sleep")) {
         std.Thread.sleep(sleep_ns);
@@ -470,7 +477,7 @@ fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
     while (enrichment_types.interactive_embed_inflight.load(.monotonic) > 0) {
         if (elapsedNsSince(runtime, start_ns) >= query_yield_max_ns) return;
         if (runtimeShuttingDown(runtime)) return;
-        sleepRetryBackoff(query_yield_poll_ns);
+        sleepRetryBackoff(runtime, query_yield_poll_ns);
     }
 }
 
@@ -478,7 +485,7 @@ fn yieldToInteractiveGeneration(runtime: *EnrichmentRuntime) void {
     if (comptime builtin.os.tag == .freestanding) return;
     while (enrichment_types.interactive_generate_inflight.load(.monotonic) > 0) {
         if (runtimeShuttingDown(runtime)) return;
-        sleepRetryBackoff(query_yield_poll_ns);
+        sleepRetryBackoff(runtime, query_yield_poll_ns);
     }
 }
 
@@ -1626,7 +1633,7 @@ fn embedDenseWithRetry(
                 .abort_shutdown => return error.EnrichmentRetryAborted,
             }
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
-            sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
+            sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
         checkProviderFailureGuard(runtime) catch |err| {
@@ -1656,7 +1663,7 @@ fn embedDenseBatchWithRetry(
                 .abort_shutdown => return error.EnrichmentRetryAborted,
             }
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
-            sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
+            sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
         checkProviderFailureGuard(runtime) catch |err| {
@@ -1686,7 +1693,7 @@ fn embedDensePartsWithRetry(
                 .abort_shutdown => return error.EnrichmentRetryAborted,
             }
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
-            sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
+            sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
         checkProviderFailureGuard(runtime) catch |err| {
@@ -1715,7 +1722,7 @@ fn embedSparseWithRetry(
                 .abort_shutdown => return error.EnrichmentRetryAborted,
             }
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
-            sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
+            sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
         var owned_sparse = sparse;
@@ -1745,7 +1752,7 @@ fn embedSparseBatchWithRetry(
                 .abort_shutdown => return error.EnrichmentRetryAborted,
             }
             if (attempt == 0) noteTransientEmbedRetry(runtime, err);
-            sleepRetryBackoff(transientEmbedRetrySleepNs(attempt));
+            sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
         checkProviderFailureGuard(runtime) catch |err| {
@@ -2520,8 +2527,19 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.isolated_failed_indexes.contains(index_name);
     }
 } else struct {
+    const IoBackend = struct {
+        borrowed: Io,
+
+        fn io(self: IoBackend) Io {
+            return self.borrowed;
+        }
+    };
+
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    /// Backend-neutral executor retained from BackendRuntime. The small value
+    /// wrapper preserves the existing `io()` call sites while removing the
+    /// production dependency on `std.Io.Threaded` and enabling VoprIo.
+    io_impl: ?IoBackend,
     store: backend_erased.Store,
     owns_store: bool,
     change_journal: *change_journal_mod.Journal,
@@ -2607,13 +2625,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !EnrichmentRuntime {
-        const io_impl = backend_runtime.io_impl;
-        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null or config.enable_without_producers) and io_impl == null) return error.MissingBackendRuntimeIo;
+        const borrowed_io = backend_runtime.io();
+        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null or config.enable_without_producers) and borrowed_io == null) return error.MissingBackendRuntimeIo;
         var runtime_store = try initRuntimeStore(alloc, store);
         errdefer runtime_store.deinit();
         var runtime = EnrichmentRuntime{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .io_impl = if (borrowed_io) |io| .{ .borrowed = io } else null,
             .store = runtime_store.store,
             .owns_store = runtime_store.owned,
             .change_journal = change_journal,
@@ -3201,7 +3219,7 @@ test "enrichment visibility wait wakes immediately on applied state" {
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -3240,7 +3258,7 @@ test "enrichment visibility wait has a hard liveness timeout" {
     defer io_impl.deinit();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io_impl.io() },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -3266,7 +3284,7 @@ test "enrichment visibility wait is cancelable" {
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -3301,7 +3319,7 @@ test "enrichment visibility wait observes borrowed request cancellation" {
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io_impl.io() },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -3330,7 +3348,7 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io_impl.io() },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -4100,7 +4118,7 @@ test "enrichment replay passes are single flight" {
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io_impl = .{ .borrowed = io },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,

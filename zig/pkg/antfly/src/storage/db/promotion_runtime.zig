@@ -302,7 +302,7 @@ pub const PromotionRuntime = struct {
     // returns immediately instead of sleeping on a missed notification.
     worker_wake_generation: std.atomic.Value(u32) = .init(0),
     worker_mutex: Io.Mutex = .init,
-    io_impl: ?*background_runtime_mod.IoImpl,
+    io: ?Io,
     future: ?Io.Future(void),
 
     pub fn init(
@@ -332,7 +332,7 @@ pub const PromotionRuntime = struct {
             .shutdown_flag = .init(false),
             .worker_started = .init(false),
             .worker_wake_generation = .init(0),
-            .io_impl = backend_runtime.io_impl,
+            .io = backend_runtime.io(),
             .future = null,
         };
     }
@@ -398,8 +398,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn start(self: *PromotionRuntime) !void {
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
@@ -411,12 +410,12 @@ pub const PromotionRuntime = struct {
 
     pub fn stop(self: *PromotionRuntime) void {
         self.shutdown_flag.store(true, .release);
-        if (self.io_impl) |io_impl| {
-            self.signalWorker(io_impl.io());
+        if (self.io) |io| {
+            self.signalWorker(io);
         }
         if (self.future) |*future| {
-            if (self.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.io) |io| {
+                _ = future.await(io);
             }
             self.future = null;
         }
@@ -425,8 +424,8 @@ pub const PromotionRuntime = struct {
 
     fn wakeWorker(self: *PromotionRuntime) void {
         if (!self.worker_started.load(.acquire)) return;
-        const io_impl = self.io_impl orelse return;
-        self.signalWorker(io_impl.io());
+        const io = self.io orelse return;
+        self.signalWorker(io);
     }
 
     fn recordWorkerWake(self: *PromotionRuntime) void {
@@ -535,7 +534,7 @@ pub const PromotionRuntime = struct {
     }
 
     fn workerMain(self: *PromotionRuntime) void {
-        const io = (self.io_impl orelse return).io();
+        const io = self.io orelse return;
         var retry_delay_ms = blocked_retry_min_interval_ms;
         var retry_wake_generation = self.worker_wake_generation.load(.acquire);
         while (!self.shutdown_flag.load(.acquire)) {
@@ -1011,7 +1010,7 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
         .target_sequence = .init(9),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1046,7 +1045,7 @@ test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
         .target_sequence = .init(2),
         .error_count = .init(3),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
     lockMutex(&runtime.catch_up_mutex);
@@ -1101,7 +1100,7 @@ test "PromotionRuntime missing sink blocks only on pending resolution artifacts"
         .target_sequence = .init(9),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1150,7 +1149,7 @@ test "PromotionRuntime blocked retry observes sink wake generation" {
         .target_sequence = .init(1),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1199,7 +1198,7 @@ test "PromotionRuntime retries pending work after dynamic leadership changes wit
     var owner = AtomicToggleOwner{};
     var backend_runtime = try background_runtime_mod.BackendRuntime.init(alloc, .{});
     defer backend_runtime.deinit();
-    const test_io = (backend_runtime.io_impl orelse return error.TestUnexpectedResult).io();
+    const test_io = backend_runtime.io() orelse return error.TestUnexpectedResult;
     var runtime = try PromotionRuntime.init(
         alloc,
         map.backendStore(),

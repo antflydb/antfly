@@ -4843,6 +4843,8 @@ pub fn build(b: *std.Build) void {
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",
             "topology fence retains committed coordinator recovery obligations",
+            "ttl runtime executes production pass on borrowed VoprIo",
+            "transaction recovery executes production pass on borrowed VoprIo",
         },
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
@@ -6891,6 +6893,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "VOPR durable job",
             "backend runtime durable owner lifecycle",
+            "ttl runtime executes production pass on borrowed VoprIo",
+            "transaction recovery executes production pass on borrowed VoprIo",
+            "background maintenance services lifecycle runs on borrowed VoprIo",
         },
     });
     const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);

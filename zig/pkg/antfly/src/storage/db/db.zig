@@ -3305,7 +3305,7 @@ pub const DB = struct {
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
             var effective_executor = opts.executor;
-            if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
+            if (backend_runtime.io() == null and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
             const backend_owner_id = try backend_runtime.allocOwnerId();
@@ -17997,9 +17997,9 @@ pub const DB = struct {
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         if (self.artifact_repair_metadata_future != null) return;
-        const io_impl = self.backend_runtime.io_impl orelse return;
+        const io = self.backend_runtime.io() orelse return;
         self.artifact_repair_metadata_stop.store(false, .release);
-        self.artifact_repair_metadata_future = io_impl.io().concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
+        self.artifact_repair_metadata_future = io.concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
             std.log.warn("artifact repair metadata worker spawn failed: {}", .{err});
             return;
         };
@@ -18008,8 +18008,8 @@ pub const DB = struct {
     fn stopArtifactRepairMetadataWorker(self: *DB) void {
         self.artifact_repair_metadata_stop.store(true, .release);
         if (self.artifact_repair_metadata_future) |*future| {
-            if (self.backend_runtime.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.backend_runtime.io()) |io| {
+                _ = future.await(io);
             }
             self.artifact_repair_metadata_future = null;
         }
@@ -45678,6 +45678,111 @@ test "db close retires runtime owners for memory primary backend" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     }));
+}
+
+test "background maintenance services lifecycle runs on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer backend_runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = backend_runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+
+    const resources = db.core.batchExecutionResources();
+    var text_merge = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer text_merge.deinit();
+    var sparse_compaction = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer sparse_compaction.deinit();
+
+    var lifecycle_ok = false;
+    const Lifecycle = struct {
+        fn cycle(runtime: anytype) bool {
+            runtime.start() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.pause()) return false;
+            if (runtime.isStarted()) return false;
+            runtime.resumeAfterPause() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.stop()) return false;
+            return !runtime.isStarted();
+        }
+
+        fn run(
+            database: *DB,
+            text: *text_merge_runtime_mod.TextMergeRuntime,
+            sparse: *sparse_compaction_runtime_mod.SparseCompactionRuntime,
+            passed: *bool,
+        ) void {
+            const enrichment = database.enrichment_runtime orelse return;
+            enrichment.start() catch return;
+            if (!enrichment.isStarted()) return;
+            enrichment.stop();
+            if (enrichment.isStarted()) return;
+
+            const resolution = database.resolution_runtime orelse return;
+            resolution.start() catch return;
+            if (!resolution.worker_started.load(.acquire)) return;
+            resolution.stop();
+            if (resolution.worker_started.load(.acquire)) return;
+
+            const promotion = database.promotion_runtime orelse return;
+            promotion.start() catch return;
+            if (!promotion.worker_started.load(.acquire)) return;
+            promotion.stop();
+            if (promotion.worker_started.load(.acquire)) return;
+
+            if (!cycle(text)) return;
+            if (!cycle(sparse)) return;
+            passed.* = true;
+        }
+    };
+    _ = vopr_io.io().async(Lifecycle.run, .{ &db, &text_merge, &sparse_compaction, &lifecycle_ok });
+    const scheduler = vopr_io.scheduler();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+    }
+    try std.testing.expect(lifecycle_ok);
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "db inherits the resource manager capacity source" {
@@ -80632,7 +80737,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var cancel_waiter = CancelWaiter{ .runtime = &fair_runtime, .outcome = &cancel_outcome };
     const cancel_events_before = fair_runtime.stats().backpressure_events;
     const timeouts_before = fair_runtime.stats().backpressure_timeouts;
-    const fair_io = db.backend_runtime.io_impl.?.io();
+    const fair_io = db.backend_runtime.io().?;
     var cancel_group: std.Io.Group = .init;
     try cancel_group.concurrent(fair_io, CancelWaiter.run, .{&cancel_waiter});
     var cancel_group_active = true;

@@ -149,7 +149,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     };
 
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    /// Borrowed backend-neutral executor owned by BackendRuntime. Keeping the
+    /// interface rather than a concrete Threaded implementation lets VOPR run
+    /// the real worker, producer admission, cancellation, and teardown paths.
+    io: ?Io,
     native_storage_pool: *storage_io_mod.NativeStoragePool,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -187,7 +190,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             if (!self.active) return;
             self.active = false;
             const runtime = self.runtime;
-            const io = runtime.io_impl.?.io();
+            const io = runtime.io.?;
             runtime.mutex.lockUncancelable(io);
             std.debug.assert(runtime.producer_segment_reservations >= self.segment_count);
             std.debug.assert(runtime.producer_byte_reservations >= self.byte_count);
@@ -221,8 +224,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !TextMergeRuntime {
-        const io_impl = backend_runtime.io_impl;
-        if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        const io = backend_runtime.io();
+        if (config.enabled and io == null) return error.MissingBackendRuntimeIo;
         if (config.enabled and
             (config.max_pending_segments != 0 or config.max_pending_bytes != 0) and
             config.backpressure_max_wait_ms == 0)
@@ -231,7 +234,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         return .{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .io = io,
             .native_storage_pool = backend_runtime.nativeStoragePool(),
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
@@ -329,8 +332,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn startLocked(self: *TextMergeRuntime) !void {
         if (self.future != null or self.paused or !self.desired_running) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
         self.shutdown = false;
@@ -340,8 +342,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn stopLocked(self: *TextMergeRuntime) bool {
-        const io_impl = self.io_impl orelse return false;
-        const io = io_impl.io();
+        const io = self.io orelse return false;
         if (self.future == null) return false;
         if (builtin.is_test) test_stop_entered.store(true, .release);
 
@@ -363,8 +364,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn notify(self: *TextMergeRuntime) void {
         if (!self.config.enabled) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
         self.notified = true;
         self.cond.broadcast(io);
@@ -448,8 +448,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         if (!self.backpressureNeeded()) return .not_needed;
 
         const started_ns = self.backpressureNowNs();
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.io) |io| {
             self.mutex.lockUncancelable(io);
             self.backpressure_events += 1;
             self.mutex.unlock(io);
@@ -532,7 +531,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
-            const io = self.io_impl.?.io();
+            const io = self.io.?;
             self.mutex.lockUncancelable(io);
             if (self.admission_closed) {
                 self.mutex.unlock(io);
@@ -686,7 +685,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn removeProducerAdmissionWaiter(self: *TextMergeRuntime, waiter: *ProducerAdmissionWaiter) void {
         if (!waiter.enqueued) return;
-        const io = self.io_impl.?.io();
+        const io = self.io.?;
         self.mutex.lockUncancelable(io);
         const was_head = self.producer_admission_head == waiter;
         self.removeProducerAdmissionWaiterLocked(waiter);
@@ -695,8 +694,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn setAdmissionClosedLocked(self: *TextMergeRuntime, closed: bool) void {
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
         self.admission_closed = closed;
         self.cond.broadcast(io);
@@ -706,8 +704,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn recordBackpressureElapsed(self: *TextMergeRuntime, started_ns: u64) void {
         const elapsed_ns = self.backpressureNowNs() -| started_ns;
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.io) |io| {
             self.mutex.lockUncancelable(io);
             self.backpressure_ns += elapsed_ns;
             self.mutex.unlock(io);
@@ -717,8 +714,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn recordBackpressureTerminal(self: *TextMergeRuntime, outcome: BackpressureOutcome) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.io) |io| {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (outcome == .timed_out) self.backpressure_timeouts += 1;
@@ -735,7 +731,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn backpressureNowNs(self: *TextMergeRuntime) u64 {
-        const io = self.io_impl.?.io();
+        const io = self.io.?;
         return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
     }
 
@@ -744,7 +740,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         const elapsed_ns = self.backpressureNowNs() -| started_ns;
         if (elapsed_ns >= max_wait_ns) return false;
-        const io = self.io_impl.?.io();
+        const io = self.io.?;
         try std.Io.futexWaitTimeout(
             io,
             u32,
@@ -759,8 +755,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn signalProducerAdmissionChanged(self: *TextMergeRuntime) void {
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         _ = self.producer_wait_epoch.fetchAdd(1, .release);
         std.Io.futexWake(io, u32, &self.producer_wait_epoch.raw, std.math.maxInt(u32));
     }
@@ -775,8 +770,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn isAdmissionClosed(self: *TextMergeRuntime) bool {
-        const io_impl = self.io_impl orelse return self.admission_closed;
-        const io = io_impl.io();
+        const io = self.io orelse return self.admission_closed;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.admission_closed;
@@ -791,8 +785,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn statsAssumeApplyLockHeld(self: *TextMergeRuntime) types.TextMergeStats {
         var snapshot = self.index_manager.textMergeStatsSnapshot();
 
-        const backpressure = if (self.io_impl) |io_impl| blk: {
-            const io = io_impl.io();
+        const backpressure = if (self.io) |io| blk: {
             self.mutex.lockUncancelable(io);
             const events = self.backpressure_events;
             const ns = self.backpressure_ns;
@@ -845,7 +838,7 @@ fn quarantineBlocks(stats: types.TextMergeStats) bool {
 fn workerMain(runtime: *TextMergeRuntime) void {
     if (builtin.is_test and test_wait_for_fd_admission.swap(false, .acq_rel)) {
         test_fd_admission_entered.store(true, .release);
-        const io = runtime.io_impl.?.io();
+        const io = runtime.io.?;
         runtime.native_storage_pool.reserveDescriptorsForTest(io, 1) catch |err| {
             if (err == error.Canceled) test_fd_admission_canceled.store(true, .release);
             return;
@@ -877,7 +870,7 @@ fn workerMain(runtime: *TextMergeRuntime) void {
 
 fn waitForFdAdmissionChange(runtime: *TextMergeRuntime) void {
     const observed_epoch = runtime.fd_retry_epoch orelse return;
-    const io = runtime.io_impl.?.io();
+    const io = runtime.io.?;
     while (!isShutdown(runtime) and runtime.native_storage_pool.admissionEpoch() == observed_epoch) {
         runtime.native_storage_pool.waitForAdmissionChange(io, observed_epoch) catch return;
     }
@@ -888,8 +881,7 @@ fn waitForWork(runtime: *TextMergeRuntime) void {
     var remaining_ms = runtime.config.idle_interval_ms;
     if (remaining_ms == 0) remaining_ms = 1;
 
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
+    const io = runtime.io orelse return;
     runtime.mutex.lockUncancelable(io);
     if (runtime.notified or runtime.shutdown) {
         runtime.notified = false;
@@ -901,7 +893,7 @@ fn waitForWork(runtime: *TextMergeRuntime) void {
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
         remaining_ms -= slice_ms;
         runtime.mutex.lockUncancelable(io);
         const notified = runtime.notified;
@@ -913,17 +905,17 @@ fn waitForWork(runtime: *TextMergeRuntime) void {
 
 fn sleepMs(runtime: *TextMergeRuntime, ms: u64) void {
     var remaining_ms = if (ms == 0) 1 else ms;
+    const io = runtime.io orelse return;
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
         remaining_ms -= slice_ms;
     }
 }
 
 fn isShutdown(runtime: *TextMergeRuntime) bool {
-    const io_impl = runtime.io_impl orelse return runtime.shutdown;
-    const io = io_impl.io();
+    const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;

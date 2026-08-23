@@ -7,8 +7,8 @@ scenarios are implemented. The production DataServer now serves public HTTP on
 borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
 resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
 debug cursor are executable. The most important remaining seam is finer-grained
-scheduling inside routed data, Raft, split/merge, and individual background
-services.
+scheduling inside routed data, Raft, split/merge, and the native-only
+DataServer service loops.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -56,7 +56,7 @@ not a prerequisite for deterministic search.
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor | `zig build data-server-vopr-test` |
-| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`, `vopr/admission.zig` | `zig build vopr-runtime-test admission-vopr-test` |
+| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, and repair workers on borrowed `std.Io`; `vopr/admission.zig` | `zig build vopr-runtime-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 
 The real DataServer listener, httpx client/server transport, request lifecycle,
@@ -782,9 +782,13 @@ observation remains unavailable on virtual handles.
 `DurableJobLane` and both production/VOPR implementations now share
 pause/resume/drain/close/reopen semantics; tests include admission while paused,
 committed-job drain, close, reopen, wrapper relocation, and exact teardown.
-Adopt that protocol in transaction recovery, TTL, enrichment, text merge,
-sparse compaction, repair, and other workers, then add service-specific
-teardown-order properties.
+Transaction recovery, TTL, enrichment, text merge, sparse compaction,
+resolution, promotion, and repair now retain the backend-neutral `std.Io`
+borrowed from `BackendRuntime`; their production passes and lifecycle controls
+execute on `VoprIo`. Continue by moving the remaining DataServer-owned native
+loops—LSM maintenance, provisioned warmup/catch-up/root refresh, status refresh,
+quarantine retry, and derived-index execution—onto the same owner protocol and
+add service-specific teardown-order properties.
 
 ### 4. Serverless Object-Store Protocols
 
