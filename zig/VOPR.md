@@ -55,8 +55,8 @@ not a prerequisite for deterministic search.
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
-| Production public HTTP on deterministic I/O | `vopr/data_server.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor | `zig build data-server-vopr-test` |
-| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, and repair workers on borrowed `std.Io`; `vopr/admission.zig` | `zig build vopr-runtime-test admission-vopr-test` |
+| Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
+| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, and repair workers on borrowed `std.Io`; `vopr/admission.zig` | `zig build vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 
 The real DataServer listener, httpx client/server transport, request lifecycle,
@@ -770,12 +770,13 @@ single production writer and its lease ownership.
 ### 2. HTTP Lifecycle and Backpressure
 
 The common listener and executors run on `VoprIo`; tests cover normal,
-single-byte partial-write, deadline-first cancellation, half-close ordering,
+single-byte partial-write, deadline-first cancellation, chunked request bodies,
+chunked streaming responses, keep-alive reuse, pipelining, half-close ordering,
 accept-versus-shutdown, bounded connection/request admission, minimum socket
-capacity, descriptor reuse, and overload recovery. Next, exercise streaming
-request/response bodies, keep-alive reuse, pipelining policy, TLS termination
-boundaries, and a backend-neutral disconnect signal. Native descriptor
-observation remains unavailable on virtual handles.
+capacity, descriptor reuse, and overload recovery. Next, exercise TLS
+termination boundaries and a backend-neutral hard-disconnect signal. Native
+descriptor observation remains unavailable on virtual handles and borrowed
+lanes fail closed instead of polling a virtual descriptor through POSIX.
 
 ### 3. Background Runtime Lifecycle
 
@@ -783,12 +784,12 @@ observation remains unavailable on virtual handles.
 pause/resume/drain/close/reopen semantics; tests include admission while paused,
 committed-job drain, close, reopen, wrapper relocation, and exact teardown.
 Transaction recovery, TTL, enrichment, text merge, sparse compaction,
-resolution, promotion, and repair now retain the backend-neutral `std.Io`
-borrowed from `BackendRuntime`; their production passes and lifecycle controls
-execute on `VoprIo`. Continue by moving the remaining DataServer-owned native
-loops—LSM maintenance, provisioned warmup/catch-up/root refresh, status refresh,
-quarantine retry, and derived-index execution—onto the same owner protocol and
-add service-specific teardown-order properties.
+resolution, promotion, LSM maintenance, quarantine retry, and repair now
+retain the backend-neutral `std.Io` borrowed from `BackendRuntime`; their
+production passes and lifecycle controls execute on `VoprIo`. Continue by
+moving the remaining DataServer-owned native loops—provisioned
+warmup/catch-up/root refresh, status refresh, and derived-index execution—onto
+the same owner protocol and add service-specific teardown-order properties.
 
 ### 4. Serverless Object-Store Protocols
 

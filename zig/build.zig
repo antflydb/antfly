@@ -6813,7 +6813,11 @@ pub fn build(b: *std.Build) void {
 
     const data_server_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"production DataServer public HTTP"},
+        .filters = &.{
+            "production DataServer public HTTP",
+            "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
+            "DataServer LSM maintenance owner runs on borrowed VoprIo",
+        },
     });
     const run_data_server_vopr_tests = b.addRunArtifact(data_server_vopr_tests);
     const data_server_vopr_test_step = b.step(

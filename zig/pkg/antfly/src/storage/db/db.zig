@@ -3023,7 +3023,7 @@ pub const DB = struct {
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Spawned at open only when the load left failures behind; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_future: ?Io.Future(void) = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -18020,10 +18020,11 @@ pub const DB = struct {
     }
 
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
+        const io = self.backend_runtime.io() orelse return false;
         var slept: u64 = 0;
         while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
             if (self.artifact_repair_metadata_stop.load(.acquire)) return false;
-            sleepNs(artifact_repair_metadata_sleep_slice_ns);
+            io.sleep(.fromNanoseconds(artifact_repair_metadata_sleep_slice_ns), .awake) catch return false;
         }
         return !self.artifact_repair_metadata_stop.load(.acquire);
     }
@@ -18047,7 +18048,10 @@ pub const DB = struct {
         // into a timing assumption.
         if (comptime builtin.is_test) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
-        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+        if (self.quarantine_retry_future != null) return;
+        const io = self.backend_runtime.io() orelse return;
+        self.quarantine_retry_stop.store(false, .release);
+        self.quarantine_retry_future = io.concurrent(quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
             // the next open or via drop+recreate.
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
@@ -18057,18 +18061,19 @@ pub const DB = struct {
 
     fn stopQuarantineRetryWorker(self: *DB) void {
         self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |thread| {
-            thread.join();
-            self.quarantine_retry_thread = null;
+        if (self.quarantine_retry_future) |*future| {
+            if (self.backend_runtime.io()) |io| future.cancel(io);
+            self.quarantine_retry_future = null;
         }
     }
 
     fn quarantineRetryWorkerMain(self: *DB) void {
+        const io = self.backend_runtime.io() orelse return;
         while (true) {
             var slept: u64 = 0;
             while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
                 if (self.quarantine_retry_stop.load(.acquire)) return;
-                sleepNs(quarantine_retry_sleep_slice_ns);
+                io.sleep(.fromNanoseconds(quarantine_retry_sleep_slice_ns), .awake) catch return;
             }
             if (self.quarantine_retry_stop.load(.acquire)) return;
             const result = self.retryQuarantinedIndexLoads(false) catch |err| {

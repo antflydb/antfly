@@ -4594,7 +4594,7 @@ pub const DataServer = struct {
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
-    lsm_maintenance_thread: ?std.Thread = null,
+    lsm_maintenance_future: ?std.Io.Future(void) = null,
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_wake: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_active: std.atomic.Value(bool) = .init(false),
@@ -6607,7 +6607,7 @@ pub const DataServer = struct {
 
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.backgroundMonotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
         if (self.resourcePressureDefersBackgroundMaintenance()) {
             self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
@@ -6616,9 +6616,15 @@ pub const DataServer = struct {
         }
         if (!self.backgroundMaintenanceDue(now_ns)) return;
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread == null) {
+        try self.startLsmMaintenanceWorker();
+    }
+
+    fn startLsmMaintenanceWorker(self: *DataServer) !void {
+        if (self.lsm_maintenance_future == null) {
+            const runtime = try self.ensureBackendRuntime();
+            const io = runtime.io() orelse return error.BackendRuntimeUnavailable;
             self.lsm_maintenance_stop.store(false, .release);
-            self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
+            self.lsm_maintenance_future = try io.concurrent(lsmMaintenanceWorkerMain, .{self});
         }
     }
 
@@ -6722,11 +6728,20 @@ pub const DataServer = struct {
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread) |thread| {
-            thread.join();
-            self.lsm_maintenance_thread = null;
+        if (self.lsm_maintenance_future) |*future| {
+            if (self.backend_runtime) |runtime| {
+                if (runtime.io()) |io| future.cancel(io);
+            }
+            self.lsm_maintenance_future = null;
         }
         self.lsm_maintenance_active.store(false, .release);
+    }
+
+    fn backgroundMonotonicNs(self: *const DataServer) u64 {
+        if (self.backend_runtime) |runtime| {
+            if (runtime.io()) |io| return @intCast(std.Io.Clock.awake.now(io).toNanoseconds());
+        }
+        return platform_time.monotonicNs();
     }
 
     fn resourcePressureDefersBackgroundMaintenance(self: *DataServer) bool {
@@ -6749,30 +6764,30 @@ pub const DataServer = struct {
         var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = self.backgroundMonotonicNs();
             if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
             if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
             if (!self.haOwnerJobCanRun(.compaction_publish)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
 
             var reservation = self.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, lsm_maintenance_background_reservation_bytes) catch {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             };
             defer reservation.release();
@@ -6809,9 +6824,9 @@ pub const DataServer = struct {
                     if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         consecutive_lock_deferrals +|= 1;
-                        self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                        self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
                     } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                        if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
+                        if (delay_ns > 0) self.deferLsmObsoleteReclaim(self.backgroundMonotonicNs(), delay_ns);
                     }
                     completed = true;
                     break;
@@ -6836,9 +6851,9 @@ pub const DataServer = struct {
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
                 if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
-                    self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                    self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
                 } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                    if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
+                    if (delay_ns > 0) self.deferLsmObsoleteReclaim(self.backgroundMonotonicNs(), delay_ns);
                 }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
@@ -6860,7 +6875,7 @@ pub const DataServer = struct {
             // (deferred splits), which forces exact member scoring on every
             // query that visits them. Drain a bounded amount of that repair
             // work alongside the regular LSM maintenance.
-            const posting_now_ns = platform_time.monotonicNs();
+            const posting_now_ns = self.backgroundMonotonicNs();
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
                 const posting_steps = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
                 const next_delay_ns: u64 = if (posting_steps > 0)
@@ -6877,22 +6892,10 @@ pub const DataServer = struct {
         self.lsm_maintenance_active.store(false, .release);
     }
 
-    fn sleepLsmMaintenanceWorker() void {
-        var req = std.posix.timespec{
-            .sec = @intCast(@divTrunc(lsm_maintenance_worker_idle_sleep_ns, std.time.ns_per_s)),
-            .nsec = @intCast(@mod(lsm_maintenance_worker_idle_sleep_ns, std.time.ns_per_s)),
-        };
-        while (true) {
-            const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
-            switch (err) {
-                .SUCCESS => return,
-                .INTR => continue,
-                else => {
-                    platform.time.yieldBriefly();
-                    return;
-                },
-            }
-        }
+    fn sleepLsmMaintenanceWorker(self: *DataServer) void {
+        const runtime = self.backend_runtime orelse return;
+        const io = runtime.io() orelse return;
+        io.sleep(.fromNanoseconds(lsm_maintenance_worker_idle_sleep_ns), .awake) catch {};
     }
 
     pub fn baseUri(self: *DataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -18333,6 +18336,102 @@ test "data runtime module compiles" {
     try std.testing.expect(!dataRaftRuntimeConfig().applied_log_compaction_single_node_only);
 }
 
+test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var sim = try vopr.vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+    });
+    defer sim.deinit();
+    const io = sim.io();
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{
+            .general = io,
+            .raft_inbound = io,
+            .raft_outbound = io,
+            .api = io,
+            .inference = io,
+            .control = io,
+        },
+    });
+    defer backend_runtime.deinit();
+
+    const Metadata = struct {
+        fn execute(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: antfly.common.http.HttpRequest,
+        ) !antfly.common.http.HttpResponse {
+            return .{ .status = 503 };
+        }
+    };
+    const metadata_executor = antfly.common.http.RequestExecutor{
+        .ptr = undefined,
+        .vtable = &.{ .execute = Metadata.execute },
+    };
+    var server = try DataServer.initFromMetadataApiUrls(alloc, .{
+        .replica_root_dir = "/vopr/lsm-maintenance-owner",
+        .enable_data_raft = false,
+        .backend_runtime = backend_runtime.ptr(),
+        .metadata_request_executors = &.{metadata_executor},
+        .api_server_cfg = .{ .deployment_mode = .serverless },
+    }, &.{"http://metadata.vopr"});
+    defer server.deinit();
+
+    var lifecycle_done = false;
+    var lifecycle_failure: ?anyerror = null;
+    const Lifecycle = struct {
+        fn run(target: *DataServer, done: *bool, failure: *?anyerror) void {
+            target.startLsmMaintenanceWorker() catch |err| {
+                failure.* = err;
+                done.* = true;
+                return;
+            };
+            if (target.lsm_maintenance_future == null) {
+                failure.* = error.VoprLsmMaintenanceOwnerDidNotStart;
+                done.* = true;
+                return;
+            }
+            const worker_io = target.backend_runtime.?.io().?;
+            worker_io.sleep(.zero, .awake) catch {};
+            target.stopLsmMaintenanceBackground();
+            if (target.lsm_maintenance_future != null or target.lsm_maintenance_active.load(.acquire)) {
+                failure.* = error.VoprLsmMaintenanceOwnerDidNotStop;
+            }
+            done.* = true;
+        }
+    };
+    _ = io.async(Lifecycle.run, .{ &server, &lifecycle_done, &lifecycle_failure });
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    const scheduler = sim.scheduler();
+    var transitions: usize = 0;
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprLsmMaintenanceOwnerDeadlock;
+        var selected = enabled.items.items[0];
+        for (enabled.items.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                selected = candidate;
+                break;
+            }
+        }
+        try scheduler.executeReady(selected.id, &events, alloc);
+        transitions += 1;
+        if (transitions > 1_000) return error.VoprLsmMaintenanceOwnerTransitionBudgetExceeded;
+    }
+    try std.testing.expect(lifecycle_done);
+    if (lifecycle_failure) |err| return err;
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "data raft bootstrap campaign retries leaderless voter elections" {
     var voters = [_]u64{ 1, 2, 3 };
     var status = raft_engine.core.Status{
@@ -27483,7 +27582,7 @@ test "data server propagates standby HA write gate into provisioned write source
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();
-    try std.testing.expect(server.lsm_maintenance_thread == null);
+    try std.testing.expect(server.lsm_maintenance_future == null);
 }
 
 test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
