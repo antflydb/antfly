@@ -15,6 +15,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const sparse_types = @import("types.zig");
+const bounded_decode = @import("../bounded_decode.zig");
+
+pub const DecodeLimits = bounded_decode.Limits;
 
 pub const Header = struct {
     doc_count: u32,
@@ -35,21 +38,11 @@ const header_len: usize = 16;
 const term_record_len: usize = 20;
 
 pub fn encodeAlloc(alloc: Allocator, segment: sparse_types.Segment) ![]u8 {
-    var docs_len: usize = 0;
-    for (segment.docs) |doc| {
-        docs_len += 4 + doc.doc_id.len;
-        docs_len += 4;
-    }
-
-    var terms_blob_len: usize = 0;
-    var postings_blob_len: usize = 0;
-    for (segment.terms) |term| {
-        terms_blob_len += term.term.len;
-        postings_blob_len += term.postings.len * 8;
-    }
-
-    const table_len = segment.terms.len * term_record_len;
-    const total_len = header_len + docs_len + table_len + terms_blob_len + postings_blob_len;
+    const sizes = try encodedSizes(segment);
+    const docs_len = sizes.docs_len;
+    const terms_blob_len = sizes.terms_blob_len;
+    const table_len = sizes.table_len;
+    const total_len = sizes.total_len;
     const buf = try alloc.alloc(u8, total_len);
 
     const postings_base: usize = header_len + docs_len + table_len + terms_blob_len;
@@ -102,6 +95,65 @@ pub fn encodeAlloc(alloc: Allocator, segment: sparse_types.Segment) ![]u8 {
     return buf;
 }
 
+const EncodedSizes = struct {
+    docs_len: usize,
+    terms_blob_len: usize,
+    postings_blob_len: usize,
+    table_len: usize,
+    total_len: usize,
+};
+
+pub fn encodedSize(segment: sparse_types.Segment) !usize {
+    return (try encodedSizes(segment)).total_len;
+}
+
+fn encodedSizes(segment: sparse_types.Segment) !EncodedSizes {
+    _ = std.math.cast(u32, segment.docs.len) orelse return error.SparseSegmentTooLarge;
+    _ = std.math.cast(u32, segment.terms.len) orelse return error.SparseSegmentTooLarge;
+    var docs_len: usize = 0;
+    for (segment.docs) |doc| {
+        _ = std.math.cast(u32, doc.doc_id.len) orelse return error.SparseSegmentTooLarge;
+        docs_len = std.math.add(usize, docs_len, 8) catch return error.SparseSegmentTooLarge;
+        docs_len = std.math.add(usize, docs_len, doc.doc_id.len) catch return error.SparseSegmentTooLarge;
+    }
+
+    var terms_blob_len: usize = 0;
+    var postings_blob_len: usize = 0;
+    for (segment.terms) |term| {
+        _ = std.math.cast(u32, term.term.len) orelse return error.SparseSegmentTooLarge;
+        _ = std.math.cast(u32, term.postings.len) orelse return error.SparseSegmentTooLarge;
+        terms_blob_len = std.math.add(usize, terms_blob_len, term.term.len) catch return error.SparseSegmentTooLarge;
+        postings_blob_len = std.math.add(
+            usize,
+            postings_blob_len,
+            std.math.mul(usize, term.postings.len, 8) catch return error.SparseSegmentTooLarge,
+        ) catch return error.SparseSegmentTooLarge;
+    }
+
+    _ = std.math.cast(u32, docs_len) orelse return error.SparseSegmentTooLarge;
+    _ = std.math.cast(u32, terms_blob_len) orelse return error.SparseSegmentTooLarge;
+    _ = std.math.cast(u32, postings_blob_len) orelse return error.SparseSegmentTooLarge;
+    const table_len = std.math.mul(usize, segment.terms.len, term_record_len) catch return error.SparseSegmentTooLarge;
+    var total_len = std.math.add(usize, header_len, docs_len) catch return error.SparseSegmentTooLarge;
+    total_len = std.math.add(usize, total_len, table_len) catch return error.SparseSegmentTooLarge;
+    total_len = std.math.add(usize, total_len, terms_blob_len) catch return error.SparseSegmentTooLarge;
+    total_len = std.math.add(usize, total_len, postings_blob_len) catch return error.SparseSegmentTooLarge;
+    _ = std.math.cast(u32, total_len) orelse return error.SparseSegmentTooLarge;
+    return .{
+        .docs_len = docs_len,
+        .terms_blob_len = terms_blob_len,
+        .postings_blob_len = postings_blob_len,
+        .table_len = table_len,
+        .total_len = total_len,
+    };
+}
+
+test "lake sparse segment codec rejects forged counts before allocation" {
+    var payload = [_]u8{0} ** header_len;
+    std.mem.writeInt(u32, payload[0..4], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(std.testing.allocator, &payload));
+}
+
 pub fn decodeHeader(payload: []const u8) !Header {
     if (payload.len < header_len) return error.InvalidSparseSegmentPayload;
     return .{
@@ -117,6 +169,16 @@ pub fn termRecordLen() usize {
 }
 
 pub fn decodeDocsAlloc(alloc: Allocator, doc_count: u32, payload: []const u8) ![]sparse_types.DocumentEntry {
+    return try decodeDocsBoundedAlloc(alloc, doc_count, payload, null);
+}
+
+fn decodeDocsBoundedAlloc(
+    alloc: Allocator,
+    doc_count: u32,
+    payload: []const u8,
+    budget: ?*bounded_decode.Budget,
+) ![]sparse_types.DocumentEntry {
+    if (@as(usize, doc_count) > payload.len / 8) return error.InvalidSparseSegmentPayload;
     const docs = try alloc.alloc(sparse_types.DocumentEntry, doc_count);
     errdefer alloc.free(docs);
     var initialized: usize = 0;
@@ -130,6 +192,7 @@ pub fn decodeDocsAlloc(alloc: Allocator, doc_count: u32, payload: []const u8) ![
         const doc_id_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + doc_id_len + 4 > payload.len) return error.InvalidSparseSegmentPayload;
+        if (budget) |value| try value.admitBytes(doc_id_len);
         docs[idx] = .{
             .doc_id = try alloc.dupe(u8, payload[pos .. pos + doc_id_len]),
             .feature_count = std.mem.readInt(u32, payload[pos + doc_id_len ..][0..4], .little),
@@ -180,27 +243,64 @@ pub fn termBytes(terms_blob: []const u8, record: TermRecord) ![]const u8 {
 }
 
 pub fn decodeAlloc(alloc: Allocator, payload: []const u8) !sparse_types.Segment {
+    return try decodeAllocWithLimits(alloc, payload, .{});
+}
+
+pub fn decodeAllocWithLimits(alloc: Allocator, payload: []const u8, limits: DecodeLimits) !sparse_types.Segment {
+    var budget = try bounded_decode.Budget.init(payload.len, limits);
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_allocation_bytes);
+    return decodeBoundedAlloc(limiter.allocator(), payload, &budget) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
+        return err;
+    };
+}
+
+fn decodeBoundedAlloc(alloc: Allocator, payload: []const u8, budget: *bounded_decode.Budget) !sparse_types.Segment {
     const header = try decodeHeader(payload);
     const docs_offset = header_len;
-    const docs_end = docs_offset + header.docs_len;
+    const docs_end = std.math.add(usize, docs_offset, header.docs_len) catch return error.InvalidSparseSegmentPayload;
     if (docs_end > payload.len) return error.InvalidSparseSegmentPayload;
-    const docs = try decodeDocsAlloc(alloc, header.doc_count, payload[docs_offset..docs_end]);
+    _ = try budget.admitCount(sparse_types.DocumentEntry, header.doc_count, header.docs_len, 8);
+    const docs = try decodeDocsBoundedAlloc(alloc, header.doc_count, payload[docs_offset..docs_end], budget);
     errdefer {
         for (docs) |*doc| doc.deinit(alloc);
         alloc.free(docs);
     }
 
     const table_offset = docs_end;
-    const table_len = termRecordLen() * @as(usize, @intCast(header.term_count));
-    const table_end = table_offset + table_len;
+    const table_len = std.math.mul(usize, termRecordLen(), @intCast(header.term_count)) catch return error.InvalidSparseSegmentPayload;
+    const table_end = std.math.add(usize, table_offset, table_len) catch return error.InvalidSparseSegmentPayload;
     if (table_end > payload.len) return error.InvalidSparseSegmentPayload;
+    _ = try budget.admitCount(sparse_types.TermEntry, header.term_count, payload.len - table_offset, term_record_len);
     const records = try decodeTermTableAlloc(alloc, header.term_count, payload[table_offset..table_end]);
     defer alloc.free(records);
 
     const terms_blob_offset = table_end;
-    const terms_blob_end = terms_blob_offset + header.terms_blob_len;
+    const terms_blob_end = std.math.add(usize, terms_blob_offset, header.terms_blob_len) catch return error.InvalidSparseSegmentPayload;
     if (terms_blob_end > payload.len) return error.InvalidSparseSegmentPayload;
     const terms_blob = payload[terms_blob_offset..terms_blob_end];
+
+    var expected_term_offset: usize = 0;
+    var expected_postings_offset = terms_blob_end;
+    for (records) |record| {
+        if (record.term_offset != expected_term_offset or record.postings_offset != expected_postings_offset) {
+            return error.InvalidSparseSegmentPayload;
+        }
+        expected_term_offset = std.math.add(usize, expected_term_offset, record.term_len) catch
+            return error.InvalidSparseSegmentPayload;
+        if (expected_term_offset > terms_blob.len) return error.InvalidSparseSegmentPayload;
+        const expected_postings_len = std.math.mul(usize, record.doc_freq, 8) catch
+            return error.InvalidSparseSegmentPayload;
+        if (record.postings_len != expected_postings_len) return error.InvalidSparseSegmentPayload;
+        expected_postings_offset = std.math.add(usize, expected_postings_offset, expected_postings_len) catch
+            return error.InvalidSparseSegmentPayload;
+        if (expected_postings_offset > payload.len) return error.InvalidSparseSegmentPayload;
+        try budget.admitBytes(record.term_len);
+        _ = try budget.admitCount(sparse_types.Posting, record.doc_freq, expected_postings_len, 8);
+    }
+    if (expected_term_offset != terms_blob.len or expected_postings_offset != payload.len) {
+        return error.InvalidSparseSegmentPayload;
+    }
 
     const terms = try alloc.alloc(sparse_types.TermEntry, header.term_count);
     errdefer alloc.free(terms);
@@ -212,12 +312,17 @@ pub fn decodeAlloc(alloc: Allocator, payload: []const u8) !sparse_types.Segment 
     for (records, 0..) |record, idx| {
         const term = try alloc.dupe(u8, try termBytes(terms_blob, record));
         errdefer alloc.free(term);
-        if (@as(usize, record.postings_offset) + record.postings_len > payload.len) return error.InvalidSparseSegmentPayload;
+        const postings_end = std.math.add(usize, record.postings_offset, record.postings_len) catch return error.InvalidSparseSegmentPayload;
+        if (postings_end > payload.len) return error.InvalidSparseSegmentPayload;
         const postings = try decodePostingBlockAlloc(
             alloc,
             record.doc_freq,
-            payload[record.postings_offset .. @as(usize, record.postings_offset) + record.postings_len],
+            payload[record.postings_offset..postings_end],
         );
+        errdefer alloc.free(postings);
+        for (postings) |posting| {
+            if (posting.doc_index >= docs.len) return error.InvalidSparseSegmentPayload;
+        }
         terms[idx] = .{
             .term = term,
             .postings = postings,
@@ -299,4 +404,32 @@ test "sparse segment term table decodes postings offsets" {
     );
     defer alloc.free(postings);
     try std.testing.expectEqual(@as(f32, 3.0), postings[0].weight);
+}
+
+test "lake sparse segment decoder frees postings rejected by document bounds" {
+    const alloc = std.testing.allocator;
+    var segment = sparse_types.Segment{
+        .docs = try alloc.alloc(sparse_types.DocumentEntry, 1),
+        .terms = try alloc.alloc(sparse_types.TermEntry, 1),
+    };
+    defer sparse_types.freeSegment(alloc, &segment);
+    segment.docs[0] = .{ .doc_id = try alloc.dupe(u8, "doc-a"), .feature_count = 1 };
+    segment.terms[0] = .{
+        .term = try alloc.dupe(u8, "alpha"),
+        .postings = try alloc.dupe(sparse_types.Posting, &.{.{ .doc_index = 0, .weight = 1.0 }}),
+    };
+
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    const header = try decodeHeader(encoded[0..header_len]);
+    const table_offset = header_len + header.docs_len;
+    const records = try decodeTermTableAlloc(
+        alloc,
+        header.term_count,
+        encoded[table_offset .. table_offset + termRecordLen()],
+    );
+    defer alloc.free(records);
+    std.mem.writeInt(u32, encoded[records[0].postings_offset..][0..4], 1, .little);
+
+    try std.testing.expectError(error.InvalidSparseSegmentPayload, decodeAlloc(alloc, encoded));
 }

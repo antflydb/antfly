@@ -4282,6 +4282,22 @@ pub fn build(b: *std.Build) void {
     const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, lake_scaffold_test_mod, true, true);
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
+    unit_test_step.dependOn(&run_lake_scaffold_tests.step);
+
     const lib_data_runtime_default_filters = [_][]const u8{
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -6075,6 +6091,7 @@ pub fn build(b: *std.Build) void {
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
+            "derived coverage source totals ignore derived index fan out",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "rebuild quarantine remains an explicit failed public index status",
@@ -6141,6 +6158,7 @@ pub fn build(b: *std.Build) void {
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
             "runtime status refreshes aged live writer publications",
+            "provisioned table write source best effort publish does not advertise lock contention as an empty table",
             "hosted backup forwarding preserves external io authority",
             "backup storage resolution rejects a reused table name from another incarnation",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
@@ -7657,6 +7675,7 @@ pub fn build(b: *std.Build) void {
             "storage.persistent.",
             "storage.portable_backup.",
             "storage.resource_manager.",
+            "storage.rowsource.",
             "storage.schema.",
             "storage.shard.",
             "storage.sim_runtime.",

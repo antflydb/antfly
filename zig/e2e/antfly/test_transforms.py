@@ -383,6 +383,10 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
         ],
     )
 
+    # Publication is coordinated asynchronously. The explicit request may win
+    # and publish, or it may correctly report a no-op after the coordinator has
+    # already consumed the WAL. Assert the durable state rather than which
+    # builder won that race.
     serverless_api.build_table(table_name)
     initial_published = wait_until(
         initial_snapshot_published,
