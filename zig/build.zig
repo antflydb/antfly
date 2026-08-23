@@ -1493,11 +1493,15 @@ pub fn build(b: *std.Build) void {
     );
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, !production_lsm_only, antfly_version);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, !production_lsm_only, antfly_version);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false, antfly_version);
-    build_options.addOption(bool, "storage_kernel_experiment", true);
-    standalone_runtime_build_options.addOption(bool, "storage_kernel_experiment", true);
+    // Development libraries and hermetic tests keep their implementations
+    // local. Production artifacts use the split archive graph below and can
+    // compile LMDB out without changing the test graph's available backends.
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true, antfly_version);
+    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, !production_lsm_only, antfly_version);
+    build_options.addOption(bool, "storage_kernel_experiment", false);
+    standalone_runtime_build_options.addOption(bool, "storage_kernel_experiment", false);
+    production_build_options.addOption(bool, "storage_kernel_experiment", true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -1957,8 +1961,11 @@ pub fn build(b: *std.Build) void {
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
     const standalone_runtime_options = b.addOptions();
-    standalone_runtime_options.addOption(bool, "linked_inference", true);
-    standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", true);
+    standalone_runtime_options.addOption(bool, "linked_inference", false);
+    standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", false);
+    const production_standalone_runtime_options = b.addOptions();
+    production_standalone_runtime_options.addOption(bool, "linked_inference", true);
+    production_standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", true);
     const runtime_failure_abi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_failure_abi.zig"),
         .target = target,
@@ -2117,6 +2124,7 @@ pub fn build(b: *std.Build) void {
     };
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
+    production_antfly_imports.standalone_runtime_options = production_standalone_runtime_options;
 
     // Library module
     const lib_mod = b.addModule("antfly-zig", .{
@@ -10179,7 +10187,7 @@ pub fn build(b: *std.Build) void {
                 .sanitize_thread = sanitize_thread,
                 .pic = if (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query) true else null,
             });
-            antfly_imports.configureStorageSources(
+            production_antfly_imports.configureStorageSources(
                 b,
                 role_mod,
                 false,
