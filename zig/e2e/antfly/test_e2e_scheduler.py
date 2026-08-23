@@ -851,6 +851,7 @@ def test_new_session_identity_prefers_idle_clean_worker(tmp_path: Path) -> None:
     )
     scheduler._persistent_processes = {owner: {"serverless_runtime"}}
     scheduler.assigned_work = {owner: {}, clean: {}}
+    scheduler.registered_collections = {owner: [], clean: []}
     scheduler.workqueue = OrderedDict(
         {embedded_scope: {"test_standalone.py::test_next": False}}
     )
@@ -873,6 +874,7 @@ def test_session_owner_adds_identity_when_clean_worker_cannot_fit_scope(
     )
     scheduler._persistent_processes = {owner: {"serverless_runtime"}}
     scheduler.assigned_work = {owner: {}, clean: {}}
+    scheduler.registered_collections = {owner: [], clean: []}
     scheduler.workqueue = OrderedDict(
         {combined_scope: {"test_combined.py::test_next": False}}
     )
@@ -944,6 +946,7 @@ def test_final_transient_test_hands_its_slot_to_persistent_runway(
     persistent_nodeid = f"test_serverless.py::test_next@{persistent_scope}"
     scheduler._retiring_nodes = set()
     scheduler._starting_replacements = set()
+    scheduler._collecting_nodes = set()
     scheduler._transient_handoffs = set()
     scheduler._persistent_processes = {}
     scheduler.assigned_work = {
@@ -1037,6 +1040,7 @@ def test_last_resource_worker_starts_replacement_before_retirement(
     scheduler.assigned_work = {
         owner: {owner_scope: {"test_owner.py::test_current": False}},
     }
+    scheduler.registered_collections = {owner: ["test_owner.py::test_current"]}
     scheduler.workqueue = OrderedDict(
         {queued_scope: {"test_transient.py::test_queued": False}}
     )
@@ -1049,8 +1053,91 @@ def test_last_resource_worker_starts_replacement_before_retirement(
     assert owner.shutting_down
 
     scheduler.add_node(replacement)
-    assert replacement not in scheduler._starting_replacements
+    assert replacement in scheduler._starting_replacements
     assert replacement in scheduler.assigned_work
+
+
+def test_replacement_waits_for_collection_before_accepting_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    original = FakeWorker()
+    replacement = FakeWorker()
+    nodeid = "test_process.py::test_queued"
+    scope = f"{PROCESS_GROUP_PREFIX}test--queued"
+    scheduler.numnodes = 1
+    scheduler.collection = [nodeid]
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = {replacement}
+    scheduler._collecting_nodes = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {}
+    scheduler.assigned_work = {original: {}}
+    scheduler.registered_collections = {original: [nodeid]}
+    scheduler.workqueue = OrderedDict({scope: {nodeid: False}})
+
+    scheduler.add_node(replacement)
+    scheduler._reschedule(replacement)
+
+    assert replacement.sent == []
+    assert not replacement.shutting_down
+    assert replacement in scheduler._starting_replacements
+    assert list(scheduler.workqueue) == [scope]
+
+    original.shutting_down = True
+    scheduler.add_node_collection(replacement, [nodeid])
+    scheduler.schedule()
+
+    assert replacement not in scheduler._starting_replacements
+    assert replacement.sent == [[0]]
+    assert not scheduler.workqueue
+
+
+def test_global_reschedule_starts_long_persistent_work_on_clean_worker_first(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    clean = FakeWorker()
+    owner_nodeid = "test_a.py::test_done"
+    persistent_nodeid = "test_b.py::test_long"
+    transient_nodeid = "test_transient.py::test_short"
+    owner_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a--module--done"
+    persistent_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_b--module--long"
+    transient_scope = f"{PROCESS_GROUP_PREFIX}test--short"
+    scheduler.duration_history.tests = {
+        persistent_nodeid: {"seconds": 100.0, "samples": 1},
+        transient_nodeid: {"seconds": 1.0, "samples": 1},
+    }
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._collecting_nodes = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {owner: {"runtime_a"}}
+    scheduler.assigned_work = {
+        owner: {owner_scope: {owner_nodeid: True}},
+        clean: {},
+    }
+    collection = [owner_nodeid, persistent_nodeid, transient_nodeid]
+    scheduler.registered_collections = {owner: collection, clean: collection}
+    scheduler.workqueue = OrderedDict(
+        {
+            persistent_scope: {persistent_nodeid: False},
+            transient_scope: {transient_nodeid: False},
+        }
+    )
+
+    scheduler._reschedule_all()
+
+    assert owner.sent == []
+    assert clean.sent == [[1]]
+    assert list(scheduler.workqueue) == [transient_scope]
+    assert scheduler._persistent_processes[clean] == {"runtime_b"}
+    assert scheduler._reserved_process_slots() == 2
 
 
 def test_idle_worker_waits_while_session_owner_rotates_to_release_slot(
@@ -1073,7 +1160,10 @@ def test_idle_worker_waits_while_session_owner_rotates_to_release_slot(
         waiter: {},
     }
     scheduler.workqueue = OrderedDict({transient_scope: {waiting_nodeid: False}})
-    scheduler.registered_collections = {waiter: [waiting_nodeid]}
+    scheduler.registered_collections = {
+        owner: ["test_serverless.py::test_done", waiting_nodeid],
+        waiter: [waiting_nodeid],
+    }
 
     scheduler._reschedule(waiter)
     assert not waiter.shutting_down
@@ -1228,6 +1318,7 @@ def test_lightweight_runway_waits_for_transient_slot_release(tmp_path: Path) -> 
             }
         }
     )
+    scheduler.registered_collections = {owner: [], active: [], successor: []}
 
     scheduler._reschedule(successor)
 
@@ -1256,6 +1347,7 @@ def test_lightweight_runway_waits_when_session_owner_can_continue(
     scheduler.workqueue = OrderedDict(
         {matching_scope: {"test_serverless.py::test_next": False}}
     )
+    scheduler.registered_collections = {owner: [], successor: []}
 
     scheduler._reschedule(successor)
 

@@ -22,7 +22,7 @@ import math
 import os
 import re
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from fcntl import LOCK_EX, flock
 from pathlib import Path
 from typing import TypeVar
@@ -562,12 +562,26 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         )
         self._retiring_nodes: set[WorkerController] = set()
         self._starting_replacements: set[WorkerController] = set()
+        self._collecting_nodes: set[WorkerController] = set()
         self._transient_handoffs: set[WorkerController] = set()
         self._persistent_processes: dict[WorkerController, set[str]] = {}
 
     def add_node(self, node: WorkerController) -> None:
         super().add_node(node)
-        getattr(self, "_starting_replacements", set()).discard(node)
+        self.__dict__.setdefault("_collecting_nodes", set()).add(node)
+
+    def add_node_collection(
+        self,
+        node: WorkerController,
+        collection: Sequence[str],
+    ) -> None:
+        super().add_node_collection(node, collection)
+        if node in self.registered_collections:
+            # workerready only means the process connected. Work cannot be
+            # indexed safely until the replacement submits the collection it
+            # will execute.
+            getattr(self, "_collecting_nodes", set()).discard(node)
+            getattr(self, "_starting_replacements", set()).discard(node)
 
     @staticmethod
     def _scope_uses_process(scope: str) -> bool:
@@ -692,6 +706,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         return any(
             candidate is not node
             and not candidate.shutting_down
+            and candidate in self.registered_collections
             and not self._persistent_processes.get(candidate)
             and self._pending_of(self.assigned_work[candidate]) == 0
             and reserved_process_slots
@@ -712,7 +727,9 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         remaining_nodes = [
             node
             for node in self.nodes
-            if node is not candidate and not node.shutting_down
+            if node is not candidate
+            and not node.shutting_down
+            and node in self.registered_collections
         ]
         unlocked_duration = 0.0
         reuse_value = 0.0
@@ -789,6 +806,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         """Return whether a future worker event can reopen scheduling capacity."""
         if getattr(self, "_starting_replacements", set()):
             return True
+        if getattr(self, "_collecting_nodes", set()):
+            return True
         if any(
             candidate.shutting_down for candidate in self.nodes if candidate is not node
         ):
@@ -802,9 +821,56 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         return any(
             candidate is not node
             and not candidate.shutting_down
+            and candidate in self.registered_collections
             and self._next_eligible_scope(candidate) is not None
             for candidate in self.nodes
         )
+
+    def _reschedule_priority(
+        self,
+        node: WorkerController,
+    ) -> tuple[bool, float, bool, int]:
+        """Rank safe assignments globally without weakening resource reuse."""
+        if (
+            node.shutting_down
+            or node not in self.registered_collections
+            or self._pending_of(self.assigned_work[node]) > 2
+        ):
+            return False, 0.0, False, 0
+        scope = self._next_eligible_scope(node)
+        if scope is None:
+            return False, 0.0, False, 0
+        requested = self._scope_persistent_processes(scope)
+        owned = self._persistent_processes.get(node, set())
+        reuses_reserved_capacity = (
+            bool(requested)
+            and requested.issubset(owned)
+            and self._additional_process_slots(node, scope) == 0
+        )
+        return (
+            reuses_reserved_capacity,
+            self._scope_duration(scope, self.workqueue[scope]),
+            not bool(owned),
+            -self._pending_of(self.assigned_work[node]),
+        )
+
+    def _reschedule_all(self) -> None:
+        """Reconsider ready workers in resource- and duration-aware order."""
+        candidates = sorted(
+            self.nodes,
+            key=self._reschedule_priority,
+            reverse=True,
+        )
+        for candidate in candidates:
+            self._reschedule(candidate)
+
+    def schedule(self) -> None:
+        if self.collection is None:
+            super().schedule()
+            return
+        # Late collections come from replacement workers. Reopen scheduling
+        # with the same global priority used for resource-release events.
+        self._reschedule_all()
 
     def _next_eligible_scope(self, node: WorkerController) -> str | None:
         reserved_process_slots = self._reserved_process_slots()
@@ -870,7 +936,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self.__dict__.setdefault("_transient_handoffs", set()).add(node)
 
     def _reschedule(self, node: WorkerController) -> None:
-        if node.shutting_down:
+        if node.shutting_down or node not in self.registered_collections:
             return
         if not self.workqueue:
             node.shutdown()
@@ -932,8 +998,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         if not self._workload_uses_transient_process(self.assigned_work[node]):
             getattr(self, "_transient_handoffs", set()).discard(node)
         # Reconsider every idle worker whenever a resource slot is released.
-        for candidate in self.nodes:
-            self._reschedule(candidate)
+        self._reschedule_all()
 
     def remove_node(self, node: WorkerController) -> str | None:
         workeroutput = getattr(node, "workeroutput", None)
@@ -941,6 +1006,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         retired_cleanly = node in self._retiring_nodes and exitstatus in {0, 1}
         self._retiring_nodes.discard(node)
         getattr(self, "_starting_replacements", set()).discard(node)
+        getattr(self, "_collecting_nodes", set()).discard(node)
         getattr(self, "_transient_handoffs", set()).discard(node)
         self._persistent_processes.pop(node, None)
 
@@ -957,8 +1023,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 }
                 if incomplete:
                     self.workqueue.setdefault(scope, {}).update(incomplete)
-            for candidate in list(self.assigned_work):
-                self._reschedule(candidate)
+            self._reschedule_all()
             return None
 
         crashitem = super().remove_node(node)
