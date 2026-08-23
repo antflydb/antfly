@@ -8508,13 +8508,12 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateReadCache(table_name);
                 self.invalidateRuntimeStatusCache(table_name);
                 self.markRepairHandoffPendingBestEffort(table_name, group_id);
-                // Structural reconciliation records the exact affected groups
-                // and wakes repair after releasing its table-wide reservation.
-                // Starting repair here would make it collide with that owner
-                // and incur the scheduler's bounded-contention retry delay.
-                if (!self.structuralReconcileStatusPendingBestEffort(table_name)) {
-                    self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
-                }
+                // Preserve every exact debt edge even while structural
+                // reconciliation owns the table status fence. Plain enqueue
+                // only updates the deduplicated exact-debt queue; the structural
+                // owner upgrades its affected groups to runnable after it has
+                // transferred status authority and released admission.
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
@@ -10484,14 +10483,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.statusUsesPublishedSnapshotLocked(table_name);
-    }
-
-    fn structuralReconcileStatusPendingBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
-        self.table_activity_mutex.lockUncancelable(io);
-        defer self.table_activity_mutex.unlock(io);
-        const index = self.findTableActivityLocked(table_name, null) orelse return false;
-        return self.active_table_activities.items[index].structural_reconcile_status_pending > 0;
     }
 
     fn readCompatibleMaintenanceActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
@@ -33562,10 +33553,24 @@ test "structural repair handoff keeps status fenced through final shard visibili
     const alloc = std.testing.allocator;
     const DebtCapture = struct {
         enqueue_calls: usize = 0,
+        regular_enqueue_calls: usize = 0,
+        runnable_enqueue_calls: usize = 0,
+        unrelated_enqueue_calls: usize = 0,
 
-        fn onDebt(ptr: *anyopaque, _: []const u8, _: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
+        fn onDebt(ptr: *anyopaque, _: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (action == .enqueue or action == .enqueue_runnable) self.enqueue_calls += 1;
+            switch (action) {
+                .enqueue => {
+                    self.enqueue_calls += 1;
+                    self.regular_enqueue_calls += 1;
+                    if (group_id == 7003) self.unrelated_enqueue_calls += 1;
+                },
+                .enqueue_runnable => {
+                    self.enqueue_calls += 1;
+                    self.runnable_enqueue_calls += 1;
+                },
+                else => {},
+            }
         }
     };
     var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
@@ -33591,9 +33596,25 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_pending,
     );
-    try std.testing.expectEqual(@as(usize, 0), debt_capture.enqueue_calls);
-    request.handoffDeferredRepairDebt(&source);
+    // A repair discovered outside this request must retain its exact queue
+    // edge rather than waiting for bounded lost-wakeup discovery merely
+    // because the same table has a structural status reservation.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7003,
+        null,
+        .index_repair_pending,
+    );
     try std.testing.expectEqual(@as(usize, 2), debt_capture.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 0), debt_capture.runnable_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
+    request.handoffDeferredRepairDebt(&source);
+    try std.testing.expectEqual(@as(usize, 4), debt_capture.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 2), debt_capture.runnable_enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
 
     // Foreground write admission remains independent, while status stays
     // snapshot-only until every affected shard publishes final visibility.
@@ -33875,9 +33896,11 @@ test "structural reconcile publishes durable index repair debt once per group" {
         ProvisionedTableWriteSource.StructuralReconcileOutcome.complete,
         try source.reconcileTableStructureStep(alloc, &request),
     );
-    // The structural worker records the handoff during its quantum but must
-    // not wake repair until after releasing its table-wide reservation.
-    try std.testing.expectEqual(@as(usize, 0), capture.enqueue_calls);
+    // The structural worker preserves the exact debt edge during its quantum,
+    // but must not request runnable repair admission until after releasing its
+    // table-wide reservation.
+    try std.testing.expectEqual(@as(usize, 1), capture.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.runnable_enqueue_calls);
     var rebuilding = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer rebuilding.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), rebuilding.items.len);
@@ -33896,7 +33919,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     reconcile_active = false;
     source.releaseStructuralReconcileStatus("docs");
     request.publishDeferredRepairDebt(&source);
-    try std.testing.expect(capture.enqueue_calls >= 1);
+    try std.testing.expectEqual(@as(usize, 2), capture.enqueue_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.runnable_enqueue_calls);
     const first_pass_enqueue_calls = capture.enqueue_calls;
 
