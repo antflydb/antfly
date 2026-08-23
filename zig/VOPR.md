@@ -4,9 +4,9 @@ Status (2026-08-22): Phases 0 through 5 and their stated exit conditions are
 implemented. The Phase 4 scenario has generated/replayable plan choices and
 split-to-merge composition. Finer-grained control inside its real
 DataServer/HTTP integration remains an explicitly bounded production-seam
-expansion, not a replay-kernel dependency; the simulator must not counterfeit
-that control by opening a second writer or weakening production lease
-ownership.
+expansion assigned to Next Step 2 and the `SimIo` adapter, not a change to the
+stable replay kernel; the simulator must not counterfeit that control by
+opening a second writer or weakening production lease ownership.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and chaos tests
 
@@ -73,10 +73,13 @@ those pieces. The important ideas are:
 7. Record complete replay artifacts, minimize failures, and promote them to
    permanent regression fixtures.
 
-The goal is not to reproduce Antithesis's deterministic hypervisor. The first
-system should remain an in-process Zig simulator built around Antfly's existing
-dependency seams. Exact replay of an explicit decision prefix provides most of
-the debugging and branching value without requiring arbitrary heap snapshots.
+The goal is not to reproduce a general-purpose binary hypervisor. VOPR should
+remain an in-process Zig simulator, but its next runtime layer should be an
+application-scoped deterministic virtual OS implemented as a real
+`std.Io.VTable`. That makes production code using `std.Io` directly simulatable
+without a hosted service. Exact replay of an explicit decision prefix remains
+the source of truth for rewind and branching; arbitrary heap snapshots are not
+required for deterministic time travel.
 
 The first vertical slice should convert the three-node metadata VOPR campaign.
 It should be able to explore workload, message, node, and fault orderings;
@@ -116,9 +119,12 @@ References:
 - [Coverage instrumentation](https://antithesis.com/docs/instrumentation/coverage_instrumentation/)
 - [Deterministic debugging](https://antithesis.com/docs/product/debugging/)
 
-These are design influences, not a claim that the proposed in-process engine
-will initially provide hypervisor-level determinism, arbitrary process rewind,
-or the same search algorithms.
+These are design influences, not a claim that the current in-process engine
+already provides hypervisor-level determinism or identical search algorithms.
+The self-contained roadmap below deliberately ports the useful hard features
+at Antfly's `std.Io` boundary: deterministic task scheduling, synchronization,
+files, sockets, clocks, entropy, registered process lifecycles, fault injection,
+counterfactual causality, and an interactive multiverse debugger.
 
 ## Goals
 
@@ -141,18 +147,25 @@ or the same search algorithms.
 
 - Allow deterministic parallel campaign workers.
 - Support semantic coverage before compiler-level coverage is available.
-- Make it straightforward to package the same workloads and properties for the
-  hosted Antithesis product later.
+- Keep the complete deterministic exploration and debugging workflow runnable
+  locally and in CI without depending on a hosted testing service.
+- Make production components that use `std.Io` run unchanged on either the
+  ordinary threaded backend or VOPR's deterministic backend.
 - Separate harness failures from product property violations.
 
 ## Non-Goals
 
-- Building a deterministic virtual machine or hypervisor.
-- Snapshotting arbitrary Zig heaps, threads, sockets, or external processes in
-  the first implementation.
+- Building a general-purpose machine-code virtual machine capable of running
+  arbitrary unmodified binaries or operating systems.
+- Treating raw heap, native thread-stack, socket, or external-process snapshots
+  as the replay source of truth. Rewind reconstructs a clean world and replays
+  explicit choices; logical snapshots remain an optimization.
 - Replacing unit, integration, differential, TLA+, or production-like end-to-end
   tests.
-- Modeling every operating-system failure immediately.
+- Silently falling back to real threads, clocks, entropy, files, sockets, or
+  processes when a deterministic `std.Io` capability is unsupported.
+- Modeling operating-system behavior that Antfly and its registered in-process
+  dependencies do not use.
 - Proving liveness while a deliberately unrecoverable fault remains active.
 - Making wall-clock campaign duration itself deterministic. Individual
   histories must be deterministic; a nightly controller may run as many
@@ -466,25 +479,33 @@ digest should be recorded for divergence diagnostics.
 
 ### Logical Concurrency
 
-The MVP does not require OS threads. Parallel clients and background work are
-modeled as actor state machines with start, poll, and completion transitions.
-This exposes the relevant interleavings while preserving determinism.
+The implemented atomic scheduler models parallel clients and background work as
+actor state machines with start, poll, and completion transitions. That remains
+the fast path for focused scenarios.
 
-Production threaded implementations still require separate stress and thread
-sanitizer tests. Later, selected thread scheduling points may be exposed as
-simulator transitions if the production seams permit it.
+The next runtime layer adds stackful simulated tasks behind `std.Io`. Each
+`async`, `concurrent`, group, select, futex wait, queue wait, sleep, file
+operation, and socket operation becomes either an immediate deterministic
+result or a parked task plus a scheduler-visible completion. The scheduler
+selects one runnable task or completion at a time. Code between `std.Io`
+boundaries is atomic until optional instrumentation adds stable safepoints.
+
+Native stress and thread-sanitizer tests remain complementary. They validate
+the ordinary threaded backend, while the simulated backend systematically
+controls logical scheduling and synchronization choices.
 
 ### Runtime Capability Boundary
 
-VOPR should use the successful shape of `std.Io`—small copyable handles backed
-by an explicit context pointer and vtable—without implementing the complete
-`std.Io.VTable` as part of the deterministic kernel. In Zig 0.16 that vtable
-owns concurrency, futexes, files, processes, clocks, entropy, networking, and
-other OS behavior. Implementing it merely to control background jobs would
-couple VOPR to a very large surface and invite accidental nondeterministic
-fallbacks.
+VOPR already uses the successful shape of `std.Io`—small copyable handles
+backed by an explicit context pointer and vtable—for its narrow runtime. The
+self-contained target is now a real deterministic `std.Io.VTable`. In Zig 0.16
+that interface provides exactly the interception surface needed for the hard
+features: futures and groups, cancellation, futexes, batched operations,
+directories, files and mappings, registered processes, clocks, entropy, and
+sockets.
 
-The generic package therefore defines narrow capabilities:
+The existing generic package retains these narrow capabilities as its stable
+internal scheduler API:
 
 - `Executor`: submit, cancel, and idle state for stable logical tasks
 - `Clock`: logical nanosecond time
@@ -498,17 +519,60 @@ cancellation, or teardown. Entropy is deliberately absent from `Runtime`;
 simulation entropy remains an explicit `ChoiceSource` decision.
 
 A production adapter may dispatch `Executor` tasks through `std.Io.Threaded`.
-The implemented `SimRuntime` instead queues tasks and timers and exposes them
-through `SchedulerPort` as stable transitions. Application code receives
-`Runtime`, never `SchedulerPort`, so it cannot drive or inspect the simulator.
+The implemented `SimRuntime` queues atomic tasks and timers and exposes them
+through `SchedulerPort` as stable transitions. The planned `SimIo` composes
+that scheduler with a fiber backend so ordinary synchronous-looking `std.Io`
+code can park and resume without driving the scheduler recursively. Application
+code receives `std.Io` or the narrow `Runtime`; only the runner receives
+`SchedulerPort`.
 
-An actual `std.Io` backend is optional future work for dependencies that truly
-require the complete interface. It must have a reviewed capability matrix and
-must never silently delegate time, randomness, filesystem, network, process,
-or scheduling operations to a real threaded backend during deterministic
-replay. Arbitrary blocking `async`/`concurrent` callbacks also require a proven
-fiber or equivalent suspension design; the atomic state-machine scheduler does
-not pretend to provide that behavior.
+`SimIo` is implemented in capability stages, but every stage presents a
+complete vtable. Unimplemented entries return their documented unsupported
+error or a stable harness error; they never delegate to `std.Io.Threaded`.
+Scenario construction declares the required capability set and fails before
+the first choice if the backend cannot satisfy it.
+
+Capability preflight is mandatory because some `std.Io.VTable` entries are
+infallible at the type level. If an undeclared infallible operation is somehow
+reached, the handler latches a deterministic capability violation, returns only
+the inert value needed to unwind the current transition, and forces a harness
+error before another product transition can run. That return value is never a
+modeled product result. Tests must exercise every unsupported entry so a Zig
+toolchain upgrade cannot introduce an accidental host fallback or an
+uninitialized function pointer.
+
+The capability stages are:
+
+1. **Tasks and synchronization**: futures, groups, cancellation, queues,
+   select, futexes, mutex/event/condition behavior, sleeps, and all clock and
+   entropy calls.
+2. **Modeled files**: directory and file handles backed by `ModeledDevice`,
+   positional and streaming I/O, sync, rename, truncate, locks, mappings, file
+   descriptor limits, partial operations, corruption, and crash durability.
+3. **Virtual sockets**: listen/connect/accept, DNS, reads/writes, shutdown,
+   backpressure, half-close, asymmetric loss, delay, reorder, duplicate,
+   partition, clog, and jam behavior.
+4. **Registered processes and resources**: spawn/replace/wait/kill for
+   explicitly registered in-process programs, process-local namespaces,
+   pause/crash/restart, memory/file/socket quotas, and deterministic CPU work
+   budgets. Registered programs must keep mutable state in an instance or an
+   explicit virtual-process context; mutable process-global state is rejected
+   unless the model proves it is immutable or safely shared. Arbitrary external
+   executables fail closed.
+5. **Instrumented preemption and debugging**: optional stable safepoints inside
+   CPU-bound code, basic-block feedback, counterfactual causal search, artifact
+   capture before/at/after a failure, and interactive rewind and branching.
+
+The public Zig `std.Io` layout is toolchain-version-specific, so it is an
+adapter ABI rather than the VOPR trace ABI. Artifacts record the Zig version,
+SimIo capability digest, virtual-OS model version, and instrumentation-map
+digest. Exact replay fails closed when any behavior-relevant value is
+incompatible.
+
+Rewind does not copy fiber stacks. It reconstructs a clean world and replays to
+the selected choice prefix; scenario-owned logical snapshots may accelerate
+that replay only when their existing configuration and prefix digests match.
+This preserves deterministic debugging without pointer-bearing heap images.
 
 ## Simulated World Interface
 
@@ -1347,13 +1411,19 @@ the same lifecycle as metadata scenarios.
 
 ### Production-Like Processes
 
-Process/container chaos remains a distinct higher layer. A future adapter may
-drive real Antfly binaries and record commands and fault events in the same
-artifact envelope, but it will not have in-process scheduling control.
+Native process/container chaos remains a distinct differential layer, but the
+self-contained deterministic layer should simulate registered Antfly programs
+through `SimIo`. A registered process receives its own virtual process ID,
+environment, current directory, file/socket handle tables, resource budget,
+clock view, and task tree. Spawn, wait, kill, pause, crash, and restart are
+explicit transitions. The backend does not claim to execute arbitrary external
+binaries: an unregistered executable is rejected deterministically.
 
-The in-process workload and property definitions should also map naturally to
-actual Antithesis test commands and fallback JSONL assertions if hosted testing
-is adopted.
+This gives the repository the application-relevant process, thread, network,
+clock, storage, and resource-fault behavior normally obtained from a hosted
+deterministic environment. Real binaries and containers remain useful as a
+non-deterministic compatibility check, not as a prerequisite for VOPR search,
+replay, reduction, causality, or multiverse debugging.
 
 ## Module Layout
 
@@ -1385,6 +1455,12 @@ lib/vopr/
     observation.zig
     runtime.zig
     sim_runtime.zig
+    sim_io.zig
+    sim_io_task.zig
+    sim_io_file.zig
+    sim_io_net.zig
+    sim_io_process.zig
+    sim_io_instrumentation.zig
     time.zig
     fault.zig
     vopr-trace-v1.schema.json
@@ -1782,8 +1858,8 @@ Phase 0 is considered green.
   scheduler-only `SchedulerPort` contracts
 - rename the unpromoted generic replay ABI to `vopr-trace-v1` and add the
   required application `system` header field
-- explicitly defer a complete `std.Io` backend until a dependency requires it
-  and blocking/capability semantics are proven
+- explicitly keep a complete `std.Io` backend out of the Phase 0.5 exit
+  condition until blocking and capability semantics are proven
 
 Exit condition: the standalone package passes the complete Phase 0 suite in
 Debug and ReleaseSafe, Antfly consumes it only through the `vopr` module, and
@@ -1806,13 +1882,12 @@ contract. A general modeled component should move below VOPR only when it is
 useful without exploration semantics, as the modeled storage device already
 is.
 
-The `std.Io` decision is equally explicit. VOPR adopts the handle/vtable shape
-for narrow `Executor`, `Clock`, `Timers`, `Runtime`, and `SchedulerPort`
-capabilities, but does not implement a simulated `std.Io.VTable`. The latter
-would falsely promise deterministic files, sockets, futexes, processes, and
-arbitrary blocking callbacks. A full backend remains conditional on a concrete
-production dependency and a reviewed capability matrix with no real-I/O
-fallbacks.
+Phase 0.5 intentionally stopped at the narrow runtime because a simulated
+`std.Io.VTable` without fibers, a capability matrix, and fail-closed behavior
+would have made a false determinism claim. Those prerequisites are now an
+explicit post-Phase-5 roadmap rather than an unresolved architecture question.
+The narrow runtime remains the scheduler kernel beneath `SimIo`, so this next
+layer extends rather than replaces the completed phase.
 
 ### Phase 1: Traceable Metadata Campaign
 
@@ -1921,9 +1996,10 @@ itself, so the adapter requires callers to reach quiescence before drain and
 fails loudly on misuse; `closeOwner` cancels queued transitions. This makes the
 lifetime distinction explicit instead of introducing hidden recursive
 scheduling. The `zig build vopr-runtime-test` gate is included in `sim-test`.
-Phase 2's exit condition is met. Long-lived services that directly require the
-full `std.Io` filesystem/network surface remain later integration work and do
-not justify widening the simulation runtime contract.
+Phase 2's exit condition is met. Long-lived services that require the full
+`std.Io` concurrency, filesystem, and network surface are assigned to the
+post-Phase-5 `SimIo` roadmap. The narrow runtime contract remains stable and
+does not widen; the full vtable is an adapter layered above it.
 
 ### Phase 3: Coverage, Corpus, and Reduction
 
@@ -2292,6 +2368,190 @@ coverage already provides stable host-independent guidance. Future causal
 enrichment with domain-specific message and storage-operation links can improve
 triage without reopening the phase or changing replay semantics.
 
+## Next Steps
+
+These are ordered by expected correctness value. Each new scenario must use the
+common artifact, campaign, replay, reduction, promotion, and fixture paths; a
+new suite-local seed runner is not sufficient.
+
+### 1. Distributed Transaction Lifecycle
+
+Replace the current three-transition, memory-backed transaction scenario with
+a separate production-shaped scenario that retains the focused scenario as a
+fast conformance gate. Drive real multi-table-group coordination, participant
+prepare and phase-two delivery, durable session ownership, recovery indexes,
+and table-group intent resolution.
+
+Scheduler-visible operations should include:
+
+- begin, read, write-intent, savepoint, commit, abort, and idempotent retry
+- prepare and phase-two delivery to each selected participant
+- ambiguous coordinator response before or after durable decision
+- coordinator and participant crash/restart at every persistence boundary
+- session lease renewal, expiry, adoption, release, and stale-owner attempt
+- recovery scan pages, repair handoff, retry deadline, and intent cleanup
+- split, merge, or leadership change while a transaction remains unresolved
+
+Properties must require one globally consistent terminal decision; forbid
+aborted visibility; preserve every acknowledged commit through crash; keep a
+retry under the same transaction ID idempotent; fence stale owners; and, after
+quiescence, resolve every durable intent or retain an explicit bounded repair
+obligation. The scenario should export the existing transaction TLA+ sidecar
+and add a differential oracle over the client history. The focused gate should
+be `distributed-transaction-vopr-test` and join `sim-test` and `chaos-test`.
+
+### 2. DataServer and Public Data-Plane Microsteps
+
+Decompose `DistributedDataVoprScenario`'s terminal physical transition without
+opening a second DB writer or bypassing production lease ownership. First add
+borrowed-lease and request-executor suspension points, then expose:
+
+- public request admission, routing, execution, acknowledgement, and timeout
+- per-group data-Raft message delivery, persistence, application, and snapshot
+- writer-lease acquisition, handoff, invalidation, and close
+- split/merge copy, catch-up, cutover, rollback, cleanup, and identity transfer
+- point reads, scans, full-text queries, and cross-range result assembly
+- node-local storage completions, crash recovery, and status publication
+
+The acknowledged-operation model remains authoritative. Online properties
+check routing and ownership safety; the quiet suffix checks that all successful
+writes are readable exactly once through both point and set-valued queries,
+topology has no gap or overlap, retired owners cannot publish, and replicas at
+the same applied index agree. This scenario should become the primary consumer
+of `SimIo` sockets, task scheduling, and modeled files.
+
+### 3. Enrichment, Index, Repair, and Compaction Workflows
+
+Build a derived-state scenario around the real enrichment runtime, index
+generation lifecycle, repair jobs, compaction schedulers, durable job stores,
+and `DurableJobLane`. Select provider request/result, checkpoint write,
+generation publication, cancellation, leadership loss, retry-time advance,
+repair, compaction, cleanup, and crash/restart as independent transitions.
+
+Use deterministic inference/extraction providers with structured success,
+transient, permanent, malformed, partial, capacity, and cancellation outcomes.
+Properties must ensure derived state never advances beyond its source; stale
+generations never publish; retry and cancellation debt survives restart;
+cancellation is not terminal before durable cleanup; resource budgets remain
+bounded; acknowledged documents survive repair and compaction; and every
+nonterminal obligation completes or reaches an allowed terminal state after
+healing.
+
+### 4. Backup, Restore, and HA Seed Lifecycle
+
+Compose portable backup manifests, object-store transfer, HA seed capture and
+activation, restore-job persistence, topology reconstruction, retention pins,
+and generation garbage collection. Expose partial upload/download, delayed
+visibility, duplicate request, manifest publication, cancellation, crash,
+resume, leadership change, retention, activation, and GC as choices.
+
+The oracle records the source table identities, configurations, acknowledged
+documents, and index-generation state. A restore must become atomically usable
+or fail closed; a partial restore cannot report success; idempotency keys cannot
+alias principals or resources; cancellation racing successful completion must
+have one durable winner; active backups and restores remain pinned; and GC must
+never remove the only required generation. Run both modeled-object-store and
+real local-object-store differential modes.
+
+### 5. Clock, Lease, Retention, and TTL Faults
+
+Generalize node clock domains into a reusable fault surface and apply it across
+metadata cooldowns, transaction leases, TTL deletion, job backoff, HA
+retention, backup pins, and generation GC. Select forward and backward realtime
+jumps, temporary skew, frequency changes, monotonic advance, timer delivery,
+and node pause independently; multiple clock faults may overlap subject to an
+explicit budget.
+
+Properties must separate realtime expiry from monotonic deadlines, prohibit
+early lease takeover and premature deletion, fence expired owners, preserve
+retry deadlines through restart, prevent timestamp regression from resurrecting
+deleted or retired state, and require eligible cleanup after clocks stabilize.
+Every time-sensitive production path in these scenarios must consume the
+injected `std.Io` clock; a host-clock call is a harness failure.
+
+### Self-Contained Antithesis-Class Runtime on `std.Io`
+
+The five domain scenarios should be developed alongside `SimIo`, not after a
+monolithic virtual OS is complete. Each capability is admitted only when a real
+scenario and conformance test consume it.
+
+Implementation order:
+
+1. **Inventory and fail-closed shell.** Generate a Zig-version-pinned
+   `std.Io.VTable`, implement deterministic unsupported handlers for every
+   entry, declare capability requirements, and add a syscall audit proving a
+   simulated history cannot reach `std.Io.Threaded`.
+2. **Fiber task kernel.** Implement futures, groups, select, cancellation,
+   queues, futexes, timers, and deterministic entropy over stackful simulated
+   tasks. Every park, wake, cancel, spurious wake, eager completion, and runnable
+   task selection has a stable choice identity.
+3. **Modeled files and sockets.** Adapt `ModeledDevice` and the virtual HTTP
+   network to actual `std.Io` file/directory and socket handles. Preserve the
+   existing durability and message models while allowing production code to
+   use standard interfaces unchanged.
+4. **Registered process and resource model.** Run registered Antfly entrypoints
+   with isolated virtual process state; add kill, pause, restart, quota,
+   descriptor exhaustion, memory pressure, and deterministic CPU-work
+   modulation. Reject arbitrary executables rather than escaping the model.
+5. **Instrumented preemption and coverage.** Add optional stable safepoints for
+   CPU-bound regions and basic-block feedback for search energy. Coverage and
+   symbol maps are build sidecars, never implicit replay inputs; any safepoint
+   selected by a trace is part of the scenario compatibility digest.
+6. **Counterfactual causality.** For selected prefixes before a failure, replay
+   alternate enabled decisions under bounded descendant budgets and report how
+   often the same fingerprint remains reachable. Store the experiment
+   configuration and child artifact digests so the causal report is itself
+   reproducible.
+7. **Multiverse debugger.** Add `sim-debug` commands to seek by choice or event,
+   inspect tasks/futures/futexes/files/sockets/processes and domain observations,
+   list enabled alternatives, branch or inject a fault, continue, and export a
+   canonical child artifact. Seeking always means clean replay or a
+   replay-proven logical checkpoint, never mutation of an unversioned heap
+   snapshot.
+8. **Time-travel artifact collection.** Let scenarios register deterministic
+   logical collectors for manifests, task graphs, network queues, storage
+   namespaces, and domain state. A failure can request artifacts from a prefix,
+   the failure boundary, and a bounded diagnostic future by replaying those
+   moments.
+
+`SimIo` is accepted only when all of the following hold:
+
+- the same production component passes behavioral conformance on
+  `std.Io.Threaded` and `SimIo`
+- retained histories exact-replay 100 consecutive times in Debug and
+  ReleaseSafe with no real-I/O audit events
+- meta-tests discover, replay, and reduce bugs requiring task preemption,
+  cancellation, futex wake ordering, network backpressure, clock skew, process
+  crash, storage publication, and resource exhaustion
+- counterfactual reports and debugger-created branches exact-replay from a
+  clean world
+- unsupported operations fail before affecting product state and are reported
+  as harness capability errors, never product failures
+- disabling instrumentation changes search efficiency only; it cannot change
+  the meaning of an already compatible artifact
+
+#### SimIo implementation progress (2026-08-22)
+
+The fail-closed shell and fiber task kernel are implemented in
+`lib/vopr/src/sim_io.zig` and `sim_io_task.zig`. Construction performs
+capability preflight; the complete Zig 0.16 vtable is based only on
+`std.Io.failing`; infallible unsupported paths latch a harness violation; and a
+conformance test proves that no vtable entry aliases `std.Io.Threaded`.
+Canonical trace backend IDs pin the Zig version, supported capability set,
+virtual-OS model, and instrumentation map without changing `vopr-trace-v1`.
+
+Stackful tasks now expose future and group execution, await, cancellation,
+sleep, and futex wake selection through the existing `SchedulerPort`. Standard
+`std.Io.Mutex`, queues, and `Select` run on those primitives. Task resumption,
+futex waiter selection, and time advance all have logical stable IDs; no trace
+identity contains a pointer. The focused scenario records a real `std.Io`
+fiber history and exact-replays it 100 times from a clean world. These tests run
+through `zig build vopr-test` in Debug and ReleaseSafe.
+
+Modeled files, sockets, registered processes/resources, instrumentation,
+counterfactual tooling, and the five domain scenarios remain required work;
+the partial capability set does not advertise them.
+
 ## Risks and Mitigations
 
 ### False Determinism
@@ -2393,11 +2653,13 @@ reduced case as a permanent regression.
 The following decisions should be treated as defaults unless implementation
 work uncovers a concrete contradiction:
 
-1. Build an in-process deterministic simulator, not a hypervisor.
+1. Build an in-process, application-scoped deterministic virtual OS behind
+   `std.Io`, not a general-purpose binary hypervisor.
 2. Use the metadata VOPR cluster as the first vertical slice.
 3. Make single-transition scheduling the core abstraction.
 4. Record explicit structured choices; seeds are discovery metadata only.
-5. Use semantic coverage before compiler coverage.
+5. Use semantic coverage as the stable replay-independent signal and add
+   compiler/basic-block coverage as secondary search feedback.
 6. Keep replay from a clean world as the source of truth; add snapshots only as
    an optimization.
 7. Use non-fatal named properties and a deterministic quiet suffix.
@@ -2406,8 +2668,11 @@ work uncovers a concrete contradiction:
    artifact; keep the ordinary unit-test runner behavior simple and never ship
    the VOPR shell as a production binary.
 10. Migrate existing suites incrementally and preserve their focused oracles.
-11. Keep real HTTP, threaded, and process chaos tests as complementary layers.
-12. Require explicit human review before fixture promotion.
+11. Run real HTTP, threaded, filesystem, socket, and registered process code on
+    `SimIo`; keep native process chaos as a differential compatibility layer.
+12. Fail closed on every unsupported `std.Io` capability and prohibit hidden
+    fallback to the host runtime during replay.
+13. Require explicit human review before fixture promotion.
 
 ## Resolved Design Decisions and Follow-ons
 
@@ -2429,33 +2694,40 @@ Implementation resolved the Phase 0 design questions as follows:
 - the corpus manager remains Zig-native so selection, mutation, coverage, and
   replay share one deterministic implementation; external orchestration may
   allocate workers and wall-clock budgets but does not select transitions
-- compiler coverage remains optional secondary feedback because the current
-  Zig/LLVM instrumentation surface is not stable enough to join the replay ABI
+- compiler coverage remains secondary feedback because the current Zig/LLVM
+  instrumentation surface is not stable enough to join the replay ABI; stable
+  instrumented safepoints may affect scheduling only when their map digest is
+  an explicit scenario compatibility input
 - VOPR command steps compile in test mode through a dedicated runner because
   Antfly scenarios use test-only allocators, I/O, and temporary directories;
   this is a command boundary, not permission for production code to import
   `std.testing`
 
-One bounded expansion remains outside the phased exit conditions. The
-distributed public-data scenario generates and replays its transport and fault
-plan, but its terminal physical history can be decomposed further only after
-DataServer borrowed-lease and HTTP execution seams become scheduler-controlled.
+One bounded expansion remains outside the completed Phase 0-5 exit conditions.
+The distributed public-data scenario generates and replays its transport and
+fault plan, but its terminal physical history can be decomposed further only
+after DataServer borrowed-lease and HTTP execution seams become
+scheduler-controlled.
 Opening competing simulated writers would invalidate the test, so the current
 integration transition deliberately preserves production ownership. Physical
 temporary directories remain acceptable for that integration shell; every
-durability claim inside the history uses `ModeledDevice`. This expansion does
-not change the standalone runtime boundary or trace format decisions above.
+durability claim inside the history uses `ModeledDevice`. This expansion is
+Next Step 2 and should consume `SimIo`; it does not change the stable narrow
+scheduler kernel or the `vopr-trace-v1` format.
 
 ## Conclusion
 
-Antfly does not need to start over to gain Antithesis-like testing behavior. It
-already has deterministic cores, virtualized network and storage components,
-seeded workloads, reference models, reduction, fixtures, and formal trace
-checking. The opportunity is to connect them through one explicit decision and
-transition model.
+Antfly does not need a hosted deterministic-testing service to gain the hard
+Antithesis-like behavior relevant to this codebase. It already has deterministic
+cores, virtualized network and storage components, seeded workloads, reference
+models, reduction, fixtures, and formal trace checking. The opportunity is to
+connect production code to those components through `std.Io` and one explicit
+decision and transition model.
 
 The decisive first step is not adding more random seeds or more named chaos
 tests. It is making each workload, scheduling, and fault decision visible and
-replayable. Once that exists, autonomous exploration, semantic feedback,
-branching, minimization, and durable regression promotion become incremental
-capabilities on a shared foundation.
+replayable. The next decisive step is a fail-closed fiber-backed `SimIo`, grown
+only through real Antfly consumers. That makes deterministic task scheduling,
+virtual files and sockets, process/resource faults, counterfactual causality,
+and multiverse debugging incremental capabilities on a self-contained shared
+foundation.

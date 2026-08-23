@@ -3,10 +3,11 @@
 
 //! Narrow runtime capabilities shared by production and deterministic worlds.
 //!
-//! This intentionally is not a `std.Io` implementation. `std.Io.VTable`
-//! includes the entire filesystem, network, process, synchronization, time,
-//! entropy, and concurrency surface. Code should depend on these capabilities
-//! unless it genuinely needs that complete contract.
+//! This remains the small stable scheduler kernel beneath `SimIo`.
+//! `std.Io.VTable` includes the entire filesystem, network, process,
+//! synchronization, time, entropy, and concurrency surface. Focused components
+//! should depend on these narrow capabilities; production components that need
+//! the complete contract run through the layered SimIo adapter.
 
 const std = @import("std");
 const event = @import("event.zig");
