@@ -1419,8 +1419,10 @@ const ExperimentalPostingMaterializedValue = struct {
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
-    retained_segment: posting_segment_store_mod.RetainedSegment,
-    segment: vectorindex_posting_segment.VerifiedReader,
+    /// One complete base followed by ordered immutable replacement deltas.
+    /// Readers search deltas newest-first and then the mmap-friendly base.
+    retained_segments: []posting_segment_store_mod.RetainedSegment,
+    segments: []vectorindex_posting_segment.VerifiedReader,
     vector_directory: ?vectorindex_hbc_vector_directory.Reader = null,
     // Full WAL records borrow directly from this one retained buffer. Only
     // decoded replacement patches allocate individual owned values, avoiding
@@ -1434,8 +1436,10 @@ const ExperimentalPostingReadState = struct {
         while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
         if (self.wal_bytes) |bytes| self.alloc.free(bytes);
-        self.segment.deinit();
-        self.retained_segment.deinit(self.alloc);
+        for (self.segments) |*segment| segment.deinit();
+        self.alloc.free(self.segments);
+        for (self.retained_segments) |*segment| segment.deinit(self.alloc);
+        self.alloc.free(self.retained_segments);
         self.* = undefined;
     }
 
@@ -1444,12 +1448,32 @@ const ExperimentalPostingReadState = struct {
             return materialized.bytes orelse error.NotFound;
         }
         if (self.vector_directory) |directory| switch (kind) {
-            .vector_leaf => return try directory.get(.leaf, posting_id),
-            .vector_metadata => return try directory.get(.metadata, posting_id),
+            .vector_leaf, .vector_metadata => {
+                // Immutable deltas override the compact directory in the base.
+                var index = self.segments.len;
+                while (index > 1) {
+                    index -= 1;
+                    if (try self.segments[index].getValue(posting_id, experimentalPostingSegmentKind(kind).?)) |value_bytes| return value_bytes;
+                    if (try self.segments[index].getValue(posting_id, experimentalPostingSegmentTombstoneKind(kind).?)) |_| return error.NotFound;
+                }
+                return switch (kind) {
+                    .vector_leaf => try directory.get(.leaf, posting_id),
+                    .vector_metadata => try directory.get(.metadata, posting_id),
+                    else => unreachable,
+                };
+            },
             else => {},
         };
         const entry_kind = experimentalPostingSegmentKind(kind) orelse return null;
-        return try self.segment.getValue(posting_id, entry_kind);
+        var index = self.segments.len;
+        while (index > 1) {
+            index -= 1;
+            if (try self.segments[index].getValue(posting_id, entry_kind)) |value_bytes| return value_bytes;
+            if (experimentalPostingSegmentTombstoneKind(kind)) |tombstone_kind| {
+                if (try self.segments[index].getValue(posting_id, tombstone_kind)) |_| return error.NotFound;
+            }
+        }
+        return try self.segments[0].getValue(posting_id, entry_kind);
     }
 
     fn replaceMaterialized(
@@ -1536,6 +1560,42 @@ fn experimentalPostingSegmentKind(kind: vectorindex_posting_wal.RecordKind) ?vec
         .vector_leaf => .vector_leaf,
         .vector_metadata => .vector_metadata,
         .index_metadata => .index_metadata,
+        else => null,
+    };
+}
+
+fn experimentalPostingSegmentTombstoneKind(kind: vectorindex_posting_wal.RecordKind) ?vectorindex_posting_segment.EntryKind {
+    return switch (kind) {
+        .base => .base_tombstone,
+        .quantized_checkpoint => .quantized_checkpoint_tombstone,
+        .posting_state => .posting_state_tombstone,
+        .node_range => .node_range_tombstone,
+        .vector_leaf => .vector_leaf_tombstone,
+        .vector_metadata => .vector_metadata_tombstone,
+        .index_metadata => .index_metadata_tombstone,
+        else => null,
+    };
+}
+
+fn experimentalPostingWalKindFromSegment(kind: vectorindex_posting_segment.EntryKind) ?struct {
+    kind: vectorindex_posting_wal.RecordKind,
+    tombstone: bool,
+} {
+    return switch (kind) {
+        .base => .{ .kind = .base, .tombstone = false },
+        .quantized_checkpoint => .{ .kind = .quantized_checkpoint, .tombstone = false },
+        .posting_state => .{ .kind = .posting_state, .tombstone = false },
+        .node_range => .{ .kind = .node_range, .tombstone = false },
+        .vector_leaf => .{ .kind = .vector_leaf, .tombstone = false },
+        .vector_metadata => .{ .kind = .vector_metadata, .tombstone = false },
+        .index_metadata => .{ .kind = .index_metadata, .tombstone = false },
+        .base_tombstone => .{ .kind = .base, .tombstone = true },
+        .quantized_checkpoint_tombstone => .{ .kind = .quantized_checkpoint, .tombstone = true },
+        .posting_state_tombstone => .{ .kind = .posting_state, .tombstone = true },
+        .node_range_tombstone => .{ .kind = .node_range, .tombstone = true },
+        .vector_leaf_tombstone => .{ .kind = .vector_leaf, .tombstone = true },
+        .vector_metadata_tombstone => .{ .kind = .vector_metadata, .tombstone = true },
+        .index_metadata_tombstone => .{ .kind = .index_metadata, .tombstone = true },
         else => null,
     };
 }
@@ -1686,6 +1746,29 @@ fn collectExperimentalPostingLatestValues(
     }
 }
 
+/// Extends the live changes with every immutable delta entry, newest first.
+/// Full compaction needs this enumeration (especially for vector-directory
+/// keys); ordinary delta rotation deliberately excludes it to avoid rewriting
+/// prior deltas into every new delta.
+fn collectExperimentalPostingCompactionValues(
+    alloc: Allocator,
+    generation: *ExperimentalPostingReadGeneration,
+    latest: *ExperimentalPostingLatestValues,
+) !void {
+    try collectExperimentalPostingLatestValues(alloc, generation, latest);
+    const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
+    var segment_index = root.segments.len;
+    while (segment_index > 1) {
+        segment_index -= 1;
+        var entries = root.segments[segment_index].entries();
+        while (try entries.next()) |entry| {
+            const decoded = experimentalPostingWalKindFromSegment(entry.kind) orelse continue;
+            const result = try latest.getOrPut(alloc, experimentalPostingValueKey(entry.id, decoded.kind));
+            if (!result.found_existing) result.value_ptr.* = if (decoded.tombstone) null else entry.value;
+        }
+    }
+}
+
 /// Collects only live overlays above the immutable root. This is used to
 /// collapse many per-batch generations without duplicating values already
 /// materialized by the root segment/WAL snapshot.
@@ -1767,6 +1850,8 @@ const ExperimentalPostingCheckpointBuildResult = struct {
     posting_count: u64,
 };
 
+const ExperimentalPostingCheckpointKind = enum { full, delta };
+
 /// A retained immutable generation can be rewritten independently of source
 /// replay. Publication later carries forward the exact durable WAL suffix
 /// appended after `flattened_wal_bytes`.
@@ -1774,6 +1859,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     owner_alloc: Allocator,
     source_generation: *ExperimentalPostingReadGeneration,
     metadata: IndexMetadata,
+    kind: ExperimentalPostingCheckpointKind,
     segment_generation: u64,
     covered_source_sequence: u64,
     flattened_wal_bytes: u64,
@@ -1799,14 +1885,21 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.resource_manager,
             &self.force_progress,
         );
-        const result = HBCIndex.buildExperimentalPostingCheckpointFromGeneration(
-            allocator(),
-            self.source_generation,
-            self.metadata,
-            self.covered_source_sequence,
-            self.resource_manager,
-            &self.force_progress,
-        ) catch |err| {
+        const result = switch (self.kind) {
+            .full => HBCIndex.buildExperimentalPostingCheckpointFromGeneration(
+                allocator(),
+                self.source_generation,
+                self.metadata,
+                self.covered_source_sequence,
+                self.resource_manager,
+                &self.force_progress,
+            ),
+            .delta => HBCIndex.buildExperimentalPostingDeltaFromGeneration(
+                allocator(),
+                self.source_generation,
+                self.covered_source_sequence,
+            ),
+        } catch |err| {
             self.build_error = err;
             self.completed.store(true, .release);
             return;
@@ -1861,12 +1954,26 @@ pub const ExperimentalPostingWalAppendOptions = struct {
 /// reduces whole-index rewrites while keeping restart work explicitly bounded.
 const managedPostingOverlayCollapseBytes: u64 = 32 * 1024 * 1024;
 const managedPostingIdleCheckpointWalBytes: u64 = 64 * 1024 * 1024;
+const managedPostingDeltaCheckpointWalBytes: u64 = 128 * 1024 * 1024;
 const managedPostingCheckpointHardWalBytes: u64 = 256 * 1024 * 1024;
-const managedPostingCheckpointPolicy: posting_segment_store_mod.CheckpointPolicy = .{
-    .min_wal_bytes = 128 * 1024 * 1024,
-    .max_wal_bytes = 128 * 1024 * 1024,
-    .wal_to_segment_percent = 100,
-};
+const managedPostingMaxDeltaSegments: usize = 6;
+
+fn shouldStartExperimentalPostingCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
+    // A delta writes only changed tree state, while a max-chain checkpoint
+    // faults and rewrites the entire visible generation. Give that full merge
+    // twice the WAL budget so its cost is amortized without weakening the
+    // existing hard recovery bound.
+    const threshold = if (delta_segment_count < managedPostingMaxDeltaSegments)
+        managedPostingDeltaCheckpointWalBytes
+    else
+        managedPostingCheckpointHardWalBytes;
+    return wal_bytes >= threshold;
+}
+
+fn shouldStartExperimentalPostingIdleCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
+    return wal_bytes >= managedPostingIdleCheckpointWalBytes and
+        delta_segment_count < managedPostingMaxDeltaSegments;
+}
 
 const ExperimentalPostingMaintenanceCapture = struct {
     covered_source_sequence: u64,
@@ -2513,9 +2620,21 @@ pub const HBCIndex = struct {
         defer alloc.free(posting_root);
         var opened = try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
         defer opened.deinit();
-        var segment = try vectorindex_posting_segment.VerifiedReader.init(alloc, opened.segment.bytes());
-        defer segment.deinit();
-        var current = (try segment.getValue(0, .index_metadata)) orelse return error.MissingHbcNativeMetadata;
+        var current: ?[]const u8 = null;
+        var segment_index = opened.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            var segment = try vectorindex_posting_segment.VerifiedReader.init(alloc, opened.segments[segment_index].bytes());
+            defer segment.deinit();
+            if (try segment.getValue(0, .index_metadata)) |value_bytes| {
+                current = value_bytes;
+                break;
+            }
+            if (segment_index > 0 and (try segment.getValue(0, .index_metadata_tombstone)) != null) {
+                return error.MissingHbcNativeMetadata;
+            }
+        }
+        var current_bytes = current orelse return error.MissingHbcNativeMetadata;
         var owned: ?[]u8 = null;
         defer if (owned) |bytes| alloc.free(bytes);
         var wal = try opened.store.recoverWal();
@@ -2526,21 +2645,21 @@ pub const HBCIndex = struct {
                 .index_metadata => {
                     if (owned) |bytes| alloc.free(bytes);
                     owned = null;
-                    current = record.payload;
+                    current_bytes = record.payload;
                 },
                 .mutation => {
                     if (record.payload.len < 6 or
                         record.payload[5] != @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata)) continue;
-                    const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, record.payload, current);
+                    const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, record.payload, current_bytes);
                     if (owned) |bytes| alloc.free(bytes);
                     owned = decoded.replacement;
-                    current = decoded.replacement;
+                    current_bytes = decoded.replacement;
                 },
                 .index_metadata_tombstone, .tombstone => return error.MissingHbcNativeMetadata,
                 else => {},
             }
         }
-        return IndexMetadata.decode(current);
+        return IndexMetadata.decode(current_bytes);
     }
 
     pub fn openWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: HBCConfig, lsm_options: hbc_backend.LsmOptions) !HBCIndex {
@@ -3868,7 +3987,7 @@ pub const HBCIndex = struct {
             source_generation.release();
             return err;
         };
-        const segment_generation = std.math.add(u64, checkpoint.segment_generation, 1) catch {
+        const segment_generation = std.math.add(u64, checkpoint.latestSegmentGeneration(), 1) catch {
             self.alloc.destroy(build);
             staging_store.deinit();
             source_generation.release();
@@ -3878,6 +3997,7 @@ pub const HBCIndex = struct {
             .owner_alloc = self.alloc,
             .source_generation = source_generation,
             .metadata = self.metadata,
+            .kind = if (checkpoint.delta_segment_count < managedPostingMaxDeltaSegments) .delta else .full,
             .segment_generation = segment_generation,
             .covered_source_sequence = posting_store.covered_source_sequence,
             .flattened_wal_bytes = posting_store.wal_committed_bytes,
@@ -3890,10 +4010,12 @@ pub const HBCIndex = struct {
             return err;
         };
         self.experimental_posting_checkpoint_build = build;
-        std.log.info("dense posting checkpoint build started generation={} sequence={} wal_prefix_bytes={}", .{
+        std.log.info("dense posting checkpoint build started generation={} sequence={} wal_prefix_bytes={} kind={s} chain_deltas={}", .{
             build.segment_generation,
             build.covered_source_sequence,
             build.flattened_wal_bytes,
+            @tagName(build.kind),
+            checkpoint.delta_segment_count,
         });
         return true;
     }
@@ -3931,18 +4053,29 @@ pub const HBCIndex = struct {
         }
         const result = build.result orelse return error.MissingPostingCheckpoint;
         const staged = build.staged orelse return error.MissingPostingCheckpoint;
-        try posting_store.publishStagedCheckpointPreservingWalTail(
-            build.segment_generation,
-            build.covered_source_sequence,
-            result.segment_bytes,
-            build.flattened_wal_bytes,
-            staged,
-        );
-        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} source=immutable_generation_background wal_tail_bytes={}", .{
+        switch (build.kind) {
+            .full => try posting_store.publishStagedCheckpointPreservingWalTail(
+                build.segment_generation,
+                build.covered_source_sequence,
+                result.segment_bytes,
+                build.flattened_wal_bytes,
+                staged,
+            ),
+            .delta => try posting_store.publishStagedDeltaPreservingWalTail(
+                build.segment_generation,
+                build.covered_source_sequence,
+                result.segment_bytes,
+                build.flattened_wal_bytes,
+                staged,
+            ),
+        }
+        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} kind={s} wal_tail_bytes={} chain_deltas={}", .{
             build.segment_generation,
             build.covered_source_sequence,
             result.segment_bytes.len,
+            @tagName(build.kind),
             posting_store.wal_committed_bytes,
+            posting_store.deltaSegmentCount(),
         });
         self.discardExperimentalPostingDeltaBaseState();
         self.refreshExperimentalPostingReadGenerationBestEffort(posting_store.covered_source_sequence);
@@ -3985,7 +4118,11 @@ pub const HBCIndex = struct {
             });
         }
         if (self.experimental_posting_checkpoint_build == null and
-            posting_store.shouldCheckpoint(managedPostingCheckpointPolicy))
+            posting_store.checkpoint != null and
+            shouldStartExperimentalPostingCheckpoint(
+                posting_store.wal_committed_bytes,
+                posting_store.deltaSegmentCount(),
+            ))
         {
             if (!try self.startExperimentalPostingCheckpointBuild(posting_store)) {
                 // A live immutable generation is normally available. Retain
@@ -4012,15 +4149,25 @@ pub const HBCIndex = struct {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
         const posting_store = &self.experimental_posting_write_store.?;
-        const generation_before = if (posting_store.checkpoint) |checkpoint| checkpoint.segment_generation else 0;
+        const generation_before = posting_store.latestSegmentGeneration() orelse 0;
         const build_before = self.experimental_posting_checkpoint_build != null;
         try self.maintainExperimentalPostingCheckpoint(posting_store);
+        // Readiness is commonly followed immediately by query traffic. An
+        // ordinary delta is cheap enough to stage at that boundary, but a
+        // max-chain full rewrite faults every old mmap and competes with the
+        // first queries. Keep the already-bounded chain and WAL in that case;
+        // normal mutation maintenance amortizes the full compactor to the
+        // 256 MiB hard recovery bound, and an explicit future maintenance
+        // scheduler may choose a true low-load window.
         if (self.experimental_posting_checkpoint_build == null and
-            posting_store.wal_committed_bytes >= managedPostingIdleCheckpointWalBytes)
+            shouldStartExperimentalPostingIdleCheckpoint(
+                posting_store.wal_committed_bytes,
+                posting_store.deltaSegmentCount(),
+            ))
         {
             _ = try self.startExperimentalPostingCheckpointBuild(posting_store);
         }
-        const generation_after = if (posting_store.checkpoint) |checkpoint| checkpoint.segment_generation else 0;
+        const generation_after = posting_store.latestSegmentGeneration() orelse 0;
         return generation_after != generation_before or
             (!build_before and self.experimental_posting_checkpoint_build != null);
     }
@@ -4536,7 +4683,7 @@ pub const HBCIndex = struct {
 
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
-        try collectExperimentalPostingLatestValues(alloc, generation, &latest);
+        try collectExperimentalPostingCompactionValues(alloc, generation, &latest);
 
         var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
@@ -4548,16 +4695,16 @@ pub const HBCIndex = struct {
                 yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
             }
             const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
-            try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
+            try writer.appendValueBorrowedAt(node_id, .base, covered_source_sequence, packed_node);
             posting_count += 1;
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .node_range)) |range| {
-                try writer.appendValueAt(node_id, .node_range, covered_source_sequence, range);
+                try writer.appendValueBorrowedAt(node_id, .node_range, covered_source_sequence, range);
             }
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .posting_state)) |posting_state| {
-                try writer.appendPostingStateAt(node_id, covered_source_sequence, posting_state);
+                try writer.appendValueBorrowedAt(node_id, .posting_state, covered_source_sequence, posting_state);
             }
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
-                try writer.appendQuantizedCheckpointAt(node_id, covered_source_sequence, quantized);
+                try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
             }
         }
 
@@ -4641,6 +4788,43 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Encodes only complete replacement values changed since the immutable
+    /// root. WAL patches have already been materialized by the read generation,
+    /// so recovery never depends on an older WAL after CURRENT rotates. Exact
+    /// per-kind tombstones distinguish deletion from absence in this delta.
+    fn buildExperimentalPostingDeltaFromGeneration(
+        alloc: Allocator,
+        generation: *ExperimentalPostingReadGeneration,
+        covered_source_sequence: u64,
+    ) !ExperimentalPostingCheckpointBuildResult {
+        var latest: ExperimentalPostingLatestValues = .empty;
+        defer latest.deinit(alloc);
+        try collectExperimentalPostingLatestValues(alloc, generation, &latest);
+
+        var writer = vectorindex_posting_segment.Writer.init(alloc);
+        defer writer.deinit();
+        var posting_count: u64 = 0;
+        var it = latest.iterator();
+        while (it.next()) |entry| {
+            const id = experimentalPostingValueKeyId(entry.key_ptr.*);
+            const record_kind = try experimentalPostingValueKeyKind(entry.key_ptr.*);
+            if (entry.value_ptr.*) |value_bytes| {
+                const segment_kind = experimentalPostingSegmentKind(record_kind) orelse
+                    return error.InvalidPostingPatchTarget;
+                try writer.appendValueBorrowedAt(id, segment_kind, covered_source_sequence, value_bytes);
+                if (record_kind == .base) posting_count += 1;
+            } else {
+                const tombstone_kind = experimentalPostingSegmentTombstoneKind(record_kind) orelse
+                    return error.InvalidPostingPatchTarget;
+                try writer.appendValueBorrowedAt(id, tombstone_kind, covered_source_sequence, &.{});
+            }
+        }
+        return .{
+            .segment_bytes = try writer.build(),
+            .posting_count = posting_count,
+        };
+    }
+
     /// Materializes the currently committed packed HBC node and RaBitQ values
     /// into a durable immutable generation. The caller supplies the upstream
     /// source sequence whose complete effects are represented by this state.
@@ -4661,7 +4845,7 @@ pub const HBCIndex = struct {
         defer posting_store.deinit();
 
         const generation = if (posting_store.checkpoint) |checkpoint|
-            std.math.add(u64, checkpoint.segment_generation, 1) catch return error.PostingSegmentGenerationOverflow
+            std.math.add(u64, checkpoint.latestSegmentGeneration(), 1) catch return error.PostingSegmentGenerationOverflow
         else
             1;
         var writer = vectorindex_posting_segment.Writer.init(self.alloc);
@@ -4892,20 +5076,39 @@ pub const HBCIndex = struct {
     fn loadExperimentalPostingState(self: *HBCIndex, expected_source_sequence: ?u64) !*ExperimentalPostingReadState {
         var opened = try self.openExperimentalPostingStoreWithSegment();
         defer opened.store.deinit();
-        var segment_bytes_owned = true;
-        errdefer if (segment_bytes_owned) opened.segment.deinit(self.alloc);
+        var retained_segments_owned = true;
+        errdefer if (retained_segments_owned) {
+            for (opened.segments) |*retained| retained.deinit(self.alloc);
+            self.alloc.free(opened.segments);
+        };
         if (opened.store.checkpoint == null) return error.MissingPostingCheckpoint;
         if (expected_source_sequence) |expected| if (opened.store.covered_source_sequence != expected) {
             return error.PostingCheckpointSequenceMismatch;
         };
 
-        const segment_bytes = opened.segment.bytes();
-        var segment = try vectorindex_posting_segment.VerifiedReader.init(self.alloc, segment_bytes);
-        var segment_owned = true;
-        errdefer if (segment_owned) segment.deinit();
-        if (try segment.getValue(0, .index_metadata)) |encoded_metadata| {
-            _ = try self.decodeExperimentalPostingMetadata(encoded_metadata);
+        const segments = try self.alloc.alloc(vectorindex_posting_segment.VerifiedReader, opened.segments.len);
+        var segment_count: usize = 0;
+        var segments_owned = true;
+        errdefer if (segments_owned) {
+            for (segments[0..segment_count]) |*segment| segment.deinit();
+            self.alloc.free(segments);
+        };
+        for (opened.segments, 0..) |retained, index| {
+            segments[index] = try vectorindex_posting_segment.VerifiedReader.init(self.alloc, retained.bytes());
+            segment_count += 1;
         }
+        var encoded_metadata: ?[]const u8 = null;
+        var segment_index = segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            if (try segments[segment_index].getValue(0, .index_metadata)) |value_bytes| {
+                encoded_metadata = value_bytes;
+                break;
+            }
+            if (segment_index > 0 and (try segments[segment_index].getValue(0, .index_metadata_tombstone)) != null) break;
+        }
+        const metadata_bytes = encoded_metadata orelse return error.MissingHbcNativeMetadata;
+        _ = try self.decodeExperimentalPostingMetadata(metadata_bytes);
         var wal = try opened.store.recoverWal();
         var wal_owned = true;
         errdefer if (wal_owned) wal.deinit();
@@ -4934,7 +5137,7 @@ pub const HBCIndex = struct {
         // The directory validates its compact index eagerly and values lazily.
         // Avoid the generic segment payload CRC here: hashing the entire nested
         // container would fault every metadata page on an otherwise cold mmap.
-        const vector_directory = if (try segment.getNestedContainer(0, .vector_directory)) |bytes|
+        const vector_directory = if (try segments[0].getNestedContainer(0, .vector_directory)) |bytes|
             try vectorindex_hbc_vector_directory.Reader.init(bytes)
         else
             null;
@@ -4943,13 +5146,13 @@ pub const HBCIndex = struct {
         state.* = .{
             .alloc = self.alloc,
             .covered_source_sequence = opened.store.covered_source_sequence,
-            .retained_segment = opened.segment,
-            .segment = segment,
+            .retained_segments = opened.segments,
+            .segments = segments,
             .vector_directory = vector_directory,
             .wal_committed_bytes = @intCast(wal.replay.committed_bytes),
         };
-        segment_bytes_owned = false;
-        segment_owned = false;
+        retained_segments_owned = false;
+        segments_owned = false;
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
         try state.materializeWal(&wal);
@@ -9857,7 +10060,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         try std.testing.expectError(error.PostingCheckpointSequenceMismatch, reopened.activateExperimentalPostingReads(4));
         try reopened.activateExperimentalPostingReads(3);
         try std.testing.expect(reopened.experimentalPostingReadsEnabled());
-        try std.testing.expect(reopened.experimental_posting_read_generation.?.root.?.retained_segment.isMapped());
+        try std.testing.expect(reopened.experimental_posting_read_generation.?.root.?.retained_segments[0].isMapped());
 
         var results = try reopened.search(&[_]f32{ 1.0, 0.0 }, 1);
         defer results.deinit();
@@ -9998,7 +10201,8 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
             }
             std.Thread.yield() catch {};
         }
-        try std.testing.expectEqual(@as(u64, 2), posting_store.checkpoint.?.segment_generation);
+        try std.testing.expectEqual(@as(u64, 2), posting_store.checkpoint.?.latestSegmentGeneration());
+        try std.testing.expectEqual(@as(u8, 1), posting_store.checkpoint.?.delta_segment_count);
         try std.testing.expectEqual(@as(u64, 4), posting_store.checkpoint.?.covered_source_sequence);
         try std.testing.expect(posting_store.wal_committed_bytes > 0);
         try std.testing.expect(flattened_wal_bytes > 0);
@@ -10022,6 +10226,52 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 5), results.items.items.len);
     try std.testing.expectEqualStrings("doc:5", results.items.items[0].metadata.?);
+
+    // Full compaction must enumerate vector mappings and metadata that exist
+    // only in immutable deltas; rebuilding only the base directory would
+    // silently lose ids 2-4 here.
+    const compacted = try reopened.publishExperimentalPostingCheckpoint(4);
+    try std.testing.expectEqual(@as(u64, 3), compacted.generation);
+    var compacted_store = try reopened.openExperimentalPostingStore();
+    defer compacted_store.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compacted_store.deltaSegmentCount());
+    var compacted_results = try reopened.search(&[_]f32{ 0.5, 0.5 }, 5);
+    defer compacted_results.deinit();
+    try std.testing.expectEqual(@as(usize, 5), compacted_results.items.items.len);
+}
+
+test "idle posting checkpoint defers a max-chain full rewrite" {
+    try std.testing.expect(!shouldStartExperimentalPostingIdleCheckpoint(
+        managedPostingIdleCheckpointWalBytes - 1,
+        0,
+    ));
+    try std.testing.expect(shouldStartExperimentalPostingIdleCheckpoint(
+        managedPostingIdleCheckpointWalBytes,
+        managedPostingMaxDeltaSegments - 1,
+    ));
+    try std.testing.expect(!shouldStartExperimentalPostingIdleCheckpoint(
+        managedPostingIdleCheckpointWalBytes,
+        managedPostingMaxDeltaSegments,
+    ));
+}
+
+test "max-chain full checkpoint receives the hard WAL budget" {
+    try std.testing.expect(!shouldStartExperimentalPostingCheckpoint(
+        managedPostingDeltaCheckpointWalBytes - 1,
+        0,
+    ));
+    try std.testing.expect(shouldStartExperimentalPostingCheckpoint(
+        managedPostingDeltaCheckpointWalBytes,
+        managedPostingMaxDeltaSegments - 1,
+    ));
+    try std.testing.expect(!shouldStartExperimentalPostingCheckpoint(
+        managedPostingCheckpointHardWalBytes - 1,
+        managedPostingMaxDeltaSegments,
+    ));
+    try std.testing.expect(shouldStartExperimentalPostingCheckpoint(
+        managedPostingCheckpointHardWalBytes,
+        managedPostingMaxDeltaSegments,
+    ));
 }
 
 test "posting WAL mutations provide read your writes without derived LSM persistence" {

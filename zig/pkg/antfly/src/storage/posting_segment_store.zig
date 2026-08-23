@@ -114,12 +114,12 @@ pub const Store = struct {
     /// This avoids reading and checksumming a large immutable segment twice on
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
-        var retained_segment: ?RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segment);
+        var retained_segments: ?[]RetainedSegment = null;
+        var store = try openInternal(alloc, storage, root_dir, &retained_segments);
         errdefer store.deinit();
         return .{
             .store = store,
-            .segment = retained_segment orelse return error.MissingPostingCheckpoint,
+            .segments = retained_segments orelse return error.MissingPostingCheckpoint,
         };
     }
 
@@ -127,7 +127,7 @@ pub const Store = struct {
         alloc: Allocator,
         storage: lsm_backend.Storage,
         root_dir: []const u8,
-        retained_segment: ?*?RetainedSegment,
+        retained_segments: ?*?[]RetainedSegment,
     ) !Store {
         const owned_root = try alloc.dupe(u8, root_dir);
         storage.createDirPath(owned_root) catch |err| {
@@ -167,11 +167,18 @@ pub const Store = struct {
         store.wal_generation = checkpoint.wal_generation;
         store.covered_source_sequence = checkpoint.covered_source_sequence;
 
-        var retained = try store.readSegmentRetainedFor(checkpoint);
-        var segment_owned = true;
-        defer if (segment_owned) retained.deinit(alloc);
-        const segment_bytes = retained.bytes();
-        store.segment_bytes = @intCast(segment_bytes.len);
+        const retained = try alloc.alloc(RetainedSegment, checkpoint.segmentCount());
+        var retained_count: usize = 0;
+        errdefer {
+            for (retained[0..retained_count]) |*segment| segment.deinit(alloc);
+            alloc.free(retained);
+        }
+        for (0..checkpoint.segmentCount()) |index| {
+            retained[index] = try store.readSegmentRetainedFor(checkpoint.segment(index));
+            retained_count += 1;
+            store.segment_bytes = std.math.add(u64, store.segment_bytes, retained[index].bytes().len) catch
+                return error.PostingSegmentTooLarge;
+        }
         var recovered = try store.recoverWal();
         defer recovered.deinit();
         if (recovered.replay.committed_bytes < checkpoint.wal_committed_bytes) {
@@ -194,9 +201,13 @@ pub const Store = struct {
             checkpoint.covered_source_sequence,
             recovered.replay.covered_source_sequence,
         );
-        if (retained_segment) |out| {
+        if (retained_segments) |out| {
             out.* = retained;
-            segment_owned = false;
+            retained_count = 0;
+        } else {
+            for (retained) |*segment| segment.deinit(alloc);
+            alloc.free(retained);
+            retained_count = 0;
         }
         return store;
     }
@@ -204,6 +215,14 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.alloc.free(self.root_dir);
         self.* = undefined;
+    }
+
+    pub fn latestSegmentGeneration(self: *const Store) ?u64 {
+        return if (self.checkpoint) |checkpoint| checkpoint.latestSegmentGeneration() else null;
+    }
+
+    pub fn deltaSegmentCount(self: *const Store) usize {
+        return if (self.checkpoint) |checkpoint| checkpoint.delta_segment_count else 0;
     }
 
     pub fn markAuthoritative(self: *Store) !void {
@@ -312,7 +331,7 @@ pub const Store = struct {
     ) !StagedCheckpointSegment {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
-            if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
+            if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
         }
         const reader = try posting_segment.Reader.init(segment_bytes);
         const admission_checksum = reader.admissionChecksum();
@@ -374,6 +393,28 @@ pub const Store = struct {
         );
     }
 
+    /// Publishes a small immutable replacement delta over the current base
+    /// generation. CURRENT names the complete ordered chain atomically; the
+    /// old base and deltas remain live and mmap-safe until a later full
+    /// checkpoint compacts the chain.
+    pub fn publishStagedDeltaPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: []const u8,
+        flattened_wal_bytes: u64,
+        staged: StagedCheckpointSegment,
+    ) !void {
+        return try self.publishCheckpointInternalMode(
+            segment_generation,
+            covered_source_sequence,
+            segment_bytes,
+            flattened_wal_bytes,
+            staged,
+            .delta,
+        );
+    }
+
     fn publishCheckpointInternal(
         self: *Store,
         segment_generation: u64,
@@ -382,9 +423,36 @@ pub const Store = struct {
         flattened_wal_bytes: ?u64,
         staged: ?StagedCheckpointSegment,
     ) !void {
+        return try self.publishCheckpointInternalMode(
+            segment_generation,
+            covered_source_sequence,
+            segment_bytes,
+            flattened_wal_bytes,
+            staged,
+            .full,
+        );
+    }
+
+    const PublicationMode = enum { full, delta };
+
+    fn publishCheckpointInternalMode(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: []const u8,
+        flattened_wal_bytes: ?u64,
+        staged: ?StagedCheckpointSegment,
+        mode: PublicationMode,
+    ) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
-            if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
+            if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
+        }
+        if (mode == .delta) {
+            const current = self.checkpoint orelse return error.MissingPostingCheckpoint;
+            if (current.delta_segment_count >= posting_wal.Checkpoint.max_delta_segments) {
+                return error.TooManyPostingDeltaSegments;
+            }
         }
         if (staged == null) _ = try posting_segment.Reader.init(segment_bytes);
 
@@ -462,7 +530,7 @@ pub const Store = struct {
         defer self.alloc.free(next_wal_path);
         try atomicReplace(self.alloc, self.storage, next_wal_path, tail);
 
-        const next_checkpoint: posting_wal.Checkpoint = .{
+        var next_checkpoint: posting_wal.Checkpoint = .{
             .segment_generation = segment_generation,
             .segment_checksum = effective_segment_checksum,
             .segment_admission_checksum = segment_admission_checksum,
@@ -470,6 +538,24 @@ pub const Store = struct {
             .wal_committed_bytes = @intCast(tail.len),
             .covered_source_sequence = covered_source_sequence,
         };
+        if (mode == .delta) {
+            const current = self.checkpoint.?;
+            next_checkpoint.segment_generation = current.segment_generation;
+            next_checkpoint.segment_checksum = current.segment_checksum;
+            next_checkpoint.segment_admission_checksum = current.segment_admission_checksum;
+            next_checkpoint.delta_segment_count = current.delta_segment_count + 1;
+            next_checkpoint.delta_segments = current.delta_segments;
+            next_checkpoint.delta_segments[current.delta_segment_count] = .{
+                .generation = segment_generation,
+                .checksum = effective_segment_checksum,
+                .admission_checksum = segment_admission_checksum,
+            };
+        }
+        const next_segment_bytes: u64 = if (mode == .delta)
+            std.math.add(u64, self.segment_bytes, @as(u64, @intCast(segment_bytes.len))) catch
+                return error.PostingSegmentTooLarge
+        else
+            @intCast(segment_bytes.len);
         const encoded = next_checkpoint.encode();
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
@@ -482,16 +568,21 @@ pub const Store = struct {
         self.wal_committed_bytes = @intCast(tail.len);
         self.last_committed_batch = tail_last_committed_batch;
         self.covered_source_sequence = tail_covered_source_sequence;
-        self.segment_bytes = @intCast(segment_bytes.len);
+        self.segment_bytes = next_segment_bytes;
 
-        if (previous) |old| {
-            const old_segment_path = try self.segmentPathAlloc(old.segment_generation);
-            defer self.alloc.free(old_segment_path);
-            deleteFileBestEffort(self.storage, old_segment_path);
+        if (mode == .full) {
+            if (previous) |old| {
+                for (0..old.segmentCount()) |index| {
+                    const old_segment_path = self.segmentPathAlloc(old.segment(index).generation) catch continue;
+                    defer self.alloc.free(old_segment_path);
+                    deleteFileBestEffort(self.storage, old_segment_path);
+                }
+            }
         }
-        const old_wal_path = try self.walPathAlloc(previous_wal_generation);
-        defer self.alloc.free(old_wal_path);
-        deleteFileBestEffort(self.storage, old_wal_path);
+        if (self.walPathAlloc(previous_wal_generation)) |old_wal_path| {
+            defer self.alloc.free(old_wal_path);
+            deleteFileBestEffort(self.storage, old_wal_path);
+        } else |_| {}
     }
 
     pub fn recoverWal(self: *Store) !RecoveredWal {
@@ -514,48 +605,36 @@ pub const Store = struct {
 
     pub fn readSegmentAlloc(self: *Store) ![]u8 {
         const checkpoint = self.checkpoint orelse return error.MissingPostingCheckpoint;
-        const path = try self.segmentPathAlloc(checkpoint.segment_generation);
-        defer self.alloc.free(path);
-        const bytes = try self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes));
-        errdefer self.alloc.free(bytes);
-        if (checkpoint.segment_admission_checksum != 0) {
-            if ((posting_segment.admissionChecksum(bytes) catch 0) != checkpoint.segment_admission_checksum) {
-                return error.PostingSegmentChecksumMismatch;
-            }
-        } else if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) {
-            return error.PostingSegmentChecksumMismatch;
-        }
-        _ = try posting_segment.Reader.init(bytes);
-        return bytes;
+        return try self.readSegmentAllocFor(checkpoint.segment(0));
     }
 
-    fn readSegmentAllocFor(self: *Store, checkpoint: posting_wal.Checkpoint) ![]u8 {
-        const path = try self.segmentPathAlloc(checkpoint.segment_generation);
+    fn readSegmentAllocFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) ![]u8 {
+        const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
         const bytes = self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes)) catch |err| switch (err) {
             error.FileNotFound => return error.MissingPostingSegment,
             else => return err,
         };
         errdefer self.alloc.free(bytes);
-        if (checkpoint.segment_admission_checksum != 0) {
-            if ((posting_segment.admissionChecksum(bytes) catch 0) != checkpoint.segment_admission_checksum) {
+        if (descriptor.admission_checksum != 0) {
+            if ((posting_segment.admissionChecksum(bytes) catch 0) != descriptor.admission_checksum) {
                 return error.PostingSegmentChecksumMismatch;
             }
-        } else if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) {
+        } else if (std.hash.Crc32.hash(bytes) != descriptor.checksum) {
             return error.PostingSegmentChecksumMismatch;
         }
         _ = try posting_segment.Reader.init(bytes);
         return bytes;
     }
 
-    fn readSegmentRetainedFor(self: *Store, checkpoint: posting_wal.Checkpoint) !RetainedSegment {
-        const path = try self.segmentPathAlloc(checkpoint.segment_generation);
+    fn readSegmentRetainedFor(self: *Store, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
+        const path = try self.segmentPathAlloc(descriptor.generation);
         defer self.alloc.free(path);
         if (mapSegmentFile(path)) |mapped| {
-            const published_checksum_matches = mapped.len <= max_segment_bytes and (if (checkpoint.segment_admission_checksum != 0)
-                (posting_segment.admissionChecksum(mapped) catch 0) == checkpoint.segment_admission_checksum
+            const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
+                (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
             else
-                std.hash.Crc32.hash(mapped) == checkpoint.segment_checksum);
+                std.hash.Crc32.hash(mapped) == descriptor.checksum);
             if (published_checksum_matches) {
                 if (posting_segment.Reader.init(mapped)) |_| {
                     std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
@@ -564,7 +643,7 @@ pub const Store = struct {
             }
             std.posix.munmap(mapped);
         } else |_| {}
-        return .{ .heap = try self.readSegmentAllocFor(checkpoint) };
+        return .{ .heap = try self.readSegmentAllocFor(descriptor) };
     }
 
     fn replaceWal(self: *Store, contents: []const u8) !void {
@@ -609,12 +688,15 @@ pub const Store = struct {
 
 pub const OpenedWithSegment = struct {
     store: Store,
-    segment: RetainedSegment,
+    /// Ordered oldest-to-newest: one complete base followed by replacement
+    /// deltas. The slice and every retained mmap/heap buffer are owned here.
+    segments: []RetainedSegment,
 
     pub fn deinit(self: *OpenedWithSegment) void {
         const alloc = self.store.alloc;
         self.store.deinit();
-        self.segment.deinit(alloc);
+        for (self.segments) |*segment| segment.deinit(alloc);
+        alloc.free(self.segments);
         self.* = undefined;
     }
 };
@@ -826,6 +908,65 @@ test "storage.posting segment publication preserves the exact committed WAL tail
     var replay = try store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("same-sequence-tail", replay.replay.latest(3, .base).?.payload);
+}
+
+test "storage.posting delta publication survives restart and full compaction" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-delta-chain");
+    defer store.deinit();
+    var base_writer = posting_segment.Writer.init(alloc);
+    defer base_writer.deinit();
+    try base_writer.appendBaseAt(7, 10, "base-v1");
+    try base_writer.appendValueAt(9, .vector_leaf, 10, "leaf-v1");
+    const base = try base_writer.build();
+    defer alloc.free(base);
+    try store.publishCheckpoint(1, 10, base);
+
+    try store.appendBatch(try store.nextBatchId(), &.{
+        .{ .kind = .base, .posting_id = 7, .source_sequence = 11, .payload = "base-v2" },
+        .{ .kind = .vector_leaf_tombstone, .posting_id = 9, .source_sequence = 11, .payload = &.{} },
+    }, 11);
+    const flattened_wal_bytes = store.wal_committed_bytes;
+    var delta_writer = posting_segment.Writer.init(alloc);
+    defer delta_writer.deinit();
+    try delta_writer.appendBaseAt(7, 11, "base-v2");
+    try delta_writer.appendValueAt(9, .vector_leaf_tombstone, 11, &.{});
+    const delta = try delta_writer.build();
+    defer alloc.free(delta);
+    const staged = try store.stageCheckpointSegment(2, delta);
+    try store.publishStagedDeltaPreservingWalTail(2, 11, delta, flattened_wal_bytes, staged);
+    try std.testing.expectEqual(@as(u8, 1), store.checkpoint.?.delta_segment_count);
+    try std.testing.expectEqual(@as(u64, 2), store.latestSegmentGeneration().?);
+    _ = try memory.storage().fileSize("/posting-delta-chain/segment-1.afps");
+    _ = try memory.storage().fileSize("/posting-delta-chain/segment-2.afps");
+
+    store.deinit();
+    var opened = try Store.openWithSegmentAlloc(alloc, memory.storage(), "/posting-delta-chain");
+    try std.testing.expectEqual(@as(usize, 2), opened.segments.len);
+    var base_reader = try posting_segment.VerifiedReader.init(alloc, opened.segments[0].bytes());
+    defer base_reader.deinit();
+    var delta_reader = try posting_segment.VerifiedReader.init(alloc, opened.segments[1].bytes());
+    defer delta_reader.deinit();
+    try std.testing.expectEqualStrings("base-v1", (try base_reader.getValue(7, .base)).?);
+    try std.testing.expectEqualStrings("base-v2", (try delta_reader.getValue(7, .base)).?);
+    try std.testing.expect((try delta_reader.getValue(9, .vector_leaf_tombstone)) != null);
+    store = opened.store;
+    for (opened.segments) |*segment| segment.deinit(alloc);
+    alloc.free(opened.segments);
+
+    var compacted_writer = posting_segment.Writer.init(alloc);
+    defer compacted_writer.deinit();
+    try compacted_writer.appendBaseAt(7, 11, "base-v2");
+    const compacted = try compacted_writer.build();
+    defer alloc.free(compacted);
+    try store.publishCheckpoint(3, 11, compacted);
+    try std.testing.expectEqual(@as(u8, 0), store.checkpoint.?.delta_segment_count);
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-delta-chain/segment-1.afps"));
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-delta-chain/segment-2.afps"));
+    _ = try memory.storage().fileSize("/posting-delta-chain/segment-3.afps");
 }
 
 test "storage.posting segment publication rejects a non-commit WAL boundary" {

@@ -60,6 +60,7 @@ const replacement_patch_magic: [4]u8 = "AFPD".*;
 const replacement_patch_version: u8 = 2;
 const replacement_patch_header_len: usize = 32;
 const replacement_patch_anchor_len: usize = 8;
+const replacement_patch_anchor_stride: usize = 16;
 const replacement_patch_min_copy_len: usize = 16;
 const replacement_patch_copy_op: u8 = 0;
 const replacement_patch_literal_op: u8 = 1;
@@ -80,20 +81,30 @@ pub fn encodeReplacementPatchAlloc(
         return error.PostingWalRecordTooLarge;
     }
 
+    // A point insertion or deletion in a packed posting preserves one long
+    // prefix and suffix. This is the overwhelmingly common mutation shape,
+    // and encoding it directly avoids allocating and populating an anchor
+    // hash table for every changed node. More fragmented replacements fall
+    // through to the general shifted-run matcher below.
+    if (try encodePrefixSuffixReplacementPatchAlloc(alloc, target, base, replacement)) |patch| {
+        return patch;
+    }
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.resize(alloc, replacement_patch_header_len);
 
-    // Index every base anchor. Keeping one exact offset per anchor is enough
-    // for packed posting payloads, whose long unchanged spans have diverse
-    // code bytes; candidates are verified byte-for-byte before use.
+    // Index sparse base anchors. Replacement scanning remains byte-aligned, so
+    // shifted runs still find the next aligned anchor while the per-mutation
+    // hash table is four times smaller than the original four-byte sampling.
+    // Runs too short to contain an aligned anchor are cheaper as literals.
     var anchors = std.AutoHashMapUnmanaged(u64, u32).empty;
     defer anchors.deinit(alloc);
     if (base.len >= replacement_patch_anchor_len) {
-        const anchor_count = (base.len - replacement_patch_anchor_len) / 4 + 1;
+        const anchor_count = (base.len - replacement_patch_anchor_len) / replacement_patch_anchor_stride + 1;
         try anchors.ensureTotalCapacity(alloc, @intCast(anchor_count));
         var base_offset: usize = 0;
-        while (base_offset + replacement_patch_anchor_len <= base.len) : (base_offset += 4) {
+        while (base_offset + replacement_patch_anchor_len <= base.len) : (base_offset += replacement_patch_anchor_stride) {
             const anchor = std.mem.readInt(u64, base[base_offset..][0..replacement_patch_anchor_len], .little);
             const gop = anchors.getOrPutAssumeCapacity(anchor);
             if (!gop.found_existing) gop.value_ptr.* = @intCast(base_offset);
@@ -129,11 +140,7 @@ pub fn encodeReplacementPatchAlloc(
             try appendReplacementPatchLiteral(alloc, &out, replacement[literal_start..replacement_offset]);
             op_count += 1;
         }
-        try out.append(alloc, replacement_patch_copy_op);
-        var copy_header: [8]u8 = undefined;
-        std.mem.writeInt(u32, copy_header[0..4], @intCast(copy_offset), .big);
-        std.mem.writeInt(u32, copy_header[4..8], @intCast(copy_len), .big);
-        try out.appendSlice(alloc, &copy_header);
+        try appendReplacementPatchCopy(alloc, &out, copy_offset, copy_len);
         op_count += 1;
         replacement_offset += copy_len;
         literal_start = replacement_offset;
@@ -143,17 +150,102 @@ pub fn encodeReplacementPatchAlloc(
         op_count += 1;
     }
 
-    @memcpy(out.items[0..4], &replacement_patch_magic);
-    out.items[4] = replacement_patch_version;
-    out.items[5] = @intFromEnum(target);
-    @memset(out.items[6..8], 0);
-    std.mem.writeInt(u32, out.items[8..12], @intCast(base.len), .big);
-    std.mem.writeInt(u32, out.items[12..16], @intCast(replacement.len), .big);
-    std.mem.writeInt(u32, out.items[16..20], op_count, .big);
-    @memset(out.items[20..24], 0);
-    std.mem.writeInt(u32, out.items[24..28], std.hash.Crc32.hash(base), .big);
-    std.mem.writeInt(u32, out.items[28..32], std.hash.Crc32.hash(replacement), .big);
+    finishReplacementPatchHeader(out.items[0..replacement_patch_header_len], target, base, replacement, op_count);
     return try out.toOwnedSlice(alloc);
+}
+
+fn encodePrefixSuffixReplacementPatchAlloc(
+    alloc: Allocator,
+    target: RecordKind,
+    base: []const u8,
+    replacement: []const u8,
+) !?[]u8 {
+    const common_len = @min(base.len, replacement.len);
+    const prefix_len = std.mem.indexOfDiff(u8, base[0..common_len], replacement[0..common_len]) orelse common_len;
+
+    // Do not let the suffix overlap the already-accounted prefix. Comparing
+    // backwards is cheap for point edits and stops immediately for unrelated
+    // replacements, which are delegated to the general encoder.
+    var suffix_len: usize = 0;
+    const max_suffix_len = common_len - prefix_len;
+    while (suffix_len < max_suffix_len and
+        base[base.len - suffix_len - 1] == replacement[replacement.len - suffix_len - 1])
+    {
+        suffix_len += 1;
+    }
+
+    const prefix_copy_len = if (prefix_len >= replacement_patch_min_copy_len) prefix_len else 0;
+    const suffix_copy_len = if (suffix_len >= replacement_patch_min_copy_len) suffix_len else 0;
+    const literal_len = replacement.len - prefix_copy_len - suffix_copy_len;
+    const copy_count: usize = @as(usize, @intFromBool(prefix_copy_len != 0)) +
+        @as(usize, @intFromBool(suffix_copy_len != 0));
+    const literal_count: usize = @intFromBool(literal_len != 0);
+    const encoded_len = replacement_patch_header_len + copy_count * 9 + literal_count * 5 + literal_len;
+    // Keep the general matcher for fragmented changes where it can recover
+    // several shifted runs. The direct path is selected only when the one-edit
+    // representation is already decisively compact.
+    if (encoded_len >= replacement.len / 8) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, encoded_len);
+    try out.resize(alloc, replacement_patch_header_len);
+    var op_count: u32 = 0;
+    if (prefix_copy_len != 0) {
+        try appendReplacementPatchCopy(alloc, &out, 0, prefix_copy_len);
+        op_count += 1;
+    }
+    if (literal_len != 0) {
+        try appendReplacementPatchLiteral(
+            alloc,
+            &out,
+            replacement[prefix_copy_len .. replacement.len - suffix_copy_len],
+        );
+        op_count += 1;
+    }
+    if (suffix_copy_len != 0) {
+        try appendReplacementPatchCopy(alloc, &out, base.len - suffix_copy_len, suffix_copy_len);
+        op_count += 1;
+    }
+    std.debug.assert(out.items.len == encoded_len);
+    finishReplacementPatchHeader(out.items[0..replacement_patch_header_len], target, base, replacement, op_count);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendReplacementPatchCopy(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    copy_offset: usize,
+    copy_len: usize,
+) !void {
+    if (copy_offset > std.math.maxInt(u32) or copy_len > std.math.maxInt(u32)) {
+        return error.PostingWalRecordTooLarge;
+    }
+    try out.append(alloc, replacement_patch_copy_op);
+    var copy_header: [8]u8 = undefined;
+    std.mem.writeInt(u32, copy_header[0..4], @intCast(copy_offset), .big);
+    std.mem.writeInt(u32, copy_header[4..8], @intCast(copy_len), .big);
+    try out.appendSlice(alloc, &copy_header);
+}
+
+fn finishReplacementPatchHeader(
+    header: []u8,
+    target: RecordKind,
+    base: []const u8,
+    replacement: []const u8,
+    op_count: u32,
+) void {
+    std.debug.assert(header.len == replacement_patch_header_len);
+    @memcpy(header[0..4], &replacement_patch_magic);
+    header[4] = replacement_patch_version;
+    header[5] = @intFromEnum(target);
+    @memset(header[6..8], 0);
+    std.mem.writeInt(u32, header[8..12], @intCast(base.len), .big);
+    std.mem.writeInt(u32, header[12..16], @intCast(replacement.len), .big);
+    std.mem.writeInt(u32, header[16..20], op_count, .big);
+    @memset(header[20..24], 0);
+    std.mem.writeInt(u32, header[24..28], std.hash.Crc32.hash(base), .big);
+    std.mem.writeInt(u32, header[28..32], std.hash.Crc32.hash(replacement), .big);
 }
 
 fn appendReplacementPatchLiteral(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
@@ -620,10 +712,18 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
 }
 
 pub const Checkpoint = struct {
-    pub const encoded_len: usize = 52;
+    pub const max_delta_segments: usize = 8;
+    const legacy_encoded_len: usize = 52;
+    pub const encoded_len: usize = 48 + 4 + max_delta_segments * 16 + 4;
     const checkpoint_magic: [4]u8 = "AFPC".*;
-    const checkpoint_version: u16 = 2;
+    const checkpoint_version: u16 = 3;
     const min_checkpoint_version: u16 = 1;
+
+    pub const Segment = struct {
+        generation: u64 = 0,
+        checksum: u32 = 0,
+        admission_checksum: u32 = 0,
+    };
 
     segment_generation: u64,
     segment_checksum: u32,
@@ -631,6 +731,27 @@ pub const Checkpoint = struct {
     wal_generation: u64,
     wal_committed_bytes: u64,
     covered_source_sequence: u64,
+    delta_segment_count: u8 = 0,
+    delta_segments: [max_delta_segments]Segment = [_]Segment{.{}} ** max_delta_segments,
+
+    pub fn latestSegmentGeneration(self: Checkpoint) u64 {
+        if (self.delta_segment_count == 0) return self.segment_generation;
+        return self.delta_segments[self.delta_segment_count - 1].generation;
+    }
+
+    pub fn segmentCount(self: Checkpoint) usize {
+        return 1 + @as(usize, self.delta_segment_count);
+    }
+
+    pub fn segment(self: Checkpoint, index: usize) Segment {
+        std.debug.assert(index < self.segmentCount());
+        if (index == 0) return .{
+            .generation = self.segment_generation,
+            .checksum = self.segment_checksum,
+            .admission_checksum = self.segment_admission_checksum,
+        };
+        return self.delta_segments[index - 1];
+    }
 
     pub fn encode(self: Checkpoint) [encoded_len]u8 {
         var out: [encoded_len]u8 = undefined;
@@ -643,24 +764,36 @@ pub const Checkpoint = struct {
         std.mem.writeInt(u64, out[24..32], self.wal_generation, .big);
         std.mem.writeInt(u64, out[32..40], self.wal_committed_bytes, .big);
         std.mem.writeInt(u64, out[40..48], self.covered_source_sequence, .big);
-        std.mem.writeInt(u32, out[48..52], std.hash.Crc32.hash(out[0..48]), .big);
+        out[48] = self.delta_segment_count;
+        @memset(out[49..52], 0);
+        var offset: usize = 52;
+        for (self.delta_segments) |segment_descriptor| {
+            std.mem.writeInt(u64, out[offset..][0..8], segment_descriptor.generation, .big);
+            std.mem.writeInt(u32, out[offset + 8 ..][0..4], segment_descriptor.checksum, .big);
+            std.mem.writeInt(u32, out[offset + 12 ..][0..4], segment_descriptor.admission_checksum, .big);
+            offset += 16;
+        }
+        std.mem.writeInt(u32, out[offset..][0..4], std.hash.Crc32.hash(out[0..offset]), .big);
         return out;
     }
 
     pub fn decode(bytes: []const u8) !Checkpoint {
-        if (bytes.len != encoded_len) return error.InvalidPostingCheckpoint;
+        if (bytes.len != legacy_encoded_len and bytes.len != encoded_len) return error.InvalidPostingCheckpoint;
         if (!std.mem.eql(u8, bytes[0..4], &checkpoint_magic)) return error.BadPostingCheckpointMagic;
         const encoded_version = std.mem.readInt(u16, bytes[4..6], .big);
         if (encoded_version < min_checkpoint_version or encoded_version > checkpoint_version) return error.UnsupportedPostingCheckpointVersion;
+        if ((encoded_version < 3 and bytes.len != legacy_encoded_len) or
+            (encoded_version >= 3 and bytes.len != encoded_len)) return error.InvalidPostingCheckpoint;
         if (std.mem.readInt(u16, bytes[6..8], .big) != 0 or
             (encoded_version == 1 and std.mem.readInt(u32, bytes[20..24], .big) != 0))
         {
             return error.UnsupportedPostingCheckpointFlags;
         }
-        if (std.mem.readInt(u32, bytes[48..52], .big) != std.hash.Crc32.hash(bytes[0..48])) {
+        const checkpoint_checksum_offset: usize = if (encoded_version >= 3) encoded_len - 4 else 48;
+        if (std.mem.readInt(u32, bytes[checkpoint_checksum_offset..][0..4], .big) != std.hash.Crc32.hash(bytes[0..checkpoint_checksum_offset])) {
             return error.PostingCheckpointChecksumMismatch;
         }
-        return .{
+        var checkpoint: Checkpoint = .{
             .segment_generation = std.mem.readInt(u64, bytes[8..16], .big),
             .segment_checksum = std.mem.readInt(u32, bytes[16..20], .big),
             .segment_admission_checksum = if (encoded_version >= 2) std.mem.readInt(u32, bytes[20..24], .big) else 0,
@@ -668,6 +801,30 @@ pub const Checkpoint = struct {
             .wal_committed_bytes = std.mem.readInt(u64, bytes[32..40], .big),
             .covered_source_sequence = std.mem.readInt(u64, bytes[40..48], .big),
         };
+        if (encoded_version >= 3) {
+            checkpoint.delta_segment_count = bytes[48];
+            if (checkpoint.delta_segment_count > max_delta_segments or
+                !std.mem.allEqual(u8, bytes[49..52], 0)) return error.UnsupportedPostingCheckpointFlags;
+            var offset: usize = 52;
+            for (&checkpoint.delta_segments) |*segment_descriptor| {
+                segment_descriptor.* = .{
+                    .generation = std.mem.readInt(u64, bytes[offset..][0..8], .big),
+                    .checksum = std.mem.readInt(u32, bytes[offset + 8 ..][0..4], .big),
+                    .admission_checksum = std.mem.readInt(u32, bytes[offset + 12 ..][0..4], .big),
+                };
+                offset += 16;
+            }
+            var previous_generation = checkpoint.segment_generation;
+            for (checkpoint.delta_segments[0..checkpoint.delta_segment_count]) |segment_descriptor| {
+                if (segment_descriptor.generation <= previous_generation) return error.InvalidPostingCheckpoint;
+                previous_generation = segment_descriptor.generation;
+            }
+            for (checkpoint.delta_segments[checkpoint.delta_segment_count..]) |segment_descriptor| {
+                if (segment_descriptor.generation != 0 or segment_descriptor.checksum != 0 or
+                    segment_descriptor.admission_checksum != 0) return error.InvalidPostingCheckpoint;
+            }
+        }
+        return checkpoint;
     }
 };
 
@@ -760,6 +917,17 @@ pub fn testCheckpointRoundTripAndChecksum() !void {
         .wal_generation = 9,
         .wal_committed_bytes = 4096,
         .covered_source_sequence = 1234,
+        .delta_segment_count = 2,
+        .delta_segments = .{
+            .{ .generation = 9, .checksum = 1, .admission_checksum = 2 },
+            .{ .generation = 11, .checksum = 3, .admission_checksum = 4 },
+            .{},
+            .{},
+            .{},
+            .{},
+            .{},
+            .{},
+        },
     };
     var encoded = expected.encode();
     const decoded = try Checkpoint.decode(&encoded);
@@ -767,11 +935,23 @@ pub fn testCheckpointRoundTripAndChecksum() !void {
 
     // V1 used the same fixed layout but reserved bytes 20..24. It remains
     // readable and deliberately requests the legacy whole-file checksum.
-    var legacy = encoded;
+    var legacy: [Checkpoint.legacy_encoded_len]u8 = undefined;
+    @memcpy(legacy[0..48], encoded[0..48]);
     std.mem.writeInt(u16, legacy[4..6], 1, .big);
     @memset(legacy[20..24], 0);
     std.mem.writeInt(u32, legacy[48..52], std.hash.Crc32.hash(legacy[0..48]), .big);
     try std.testing.expectEqual(@as(u32, 0), (try Checkpoint.decode(&legacy)).segment_admission_checksum);
+
+    var unordered_delta = expected.encode();
+    std.mem.writeInt(u64, unordered_delta[68..76], 8, .big);
+    std.mem.writeInt(u32, unordered_delta[Checkpoint.encoded_len - 4 ..][0..4], std.hash.Crc32.hash(unordered_delta[0 .. Checkpoint.encoded_len - 4]), .big);
+    try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&unordered_delta));
+
+    var dirty_unused_delta = expected.encode();
+    std.mem.writeInt(u64, dirty_unused_delta[84..92], 12, .big);
+    std.mem.writeInt(u32, dirty_unused_delta[Checkpoint.encoded_len - 4 ..][0..4], std.hash.Crc32.hash(dirty_unused_delta[0 .. Checkpoint.encoded_len - 4]), .big);
+    try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&dirty_unused_delta));
+
     encoded[10] ^= 1;
     try std.testing.expectError(error.PostingCheckpointChecksumMismatch, Checkpoint.decode(&encoded));
 }
@@ -892,6 +1072,25 @@ test "posting WAL replacement patches preserve shifted binary runs" {
     const patch = try encodeReplacementPatchAlloc(alloc, .quantized_checkpoint, &base, &replacement);
     defer alloc.free(patch);
     try std.testing.expect(patch.len < replacement.len / 8);
+    const decoded = try applyReplacementPatchAlloc(alloc, patch, &base);
+    defer alloc.free(decoded.replacement);
+    try std.testing.expectEqualSlices(u8, &replacement, decoded.replacement);
+}
+
+test "posting WAL replacement patches fast path a point insertion" {
+    const alloc = std.testing.allocator;
+    var base: [4096]u8 = undefined;
+    for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 193 +% i / 11);
+    var replacement: [4112]u8 = undefined;
+    @memcpy(replacement[0..2048], base[0..2048]);
+    @memset(replacement[2048..2064], 0x5a);
+    @memcpy(replacement[2064..], base[2048..]);
+
+    const patch = try encodeReplacementPatchAlloc(alloc, .base, &base, &replacement);
+    defer alloc.free(patch);
+    // Header, prefix copy, insertion literal, and suffix copy.
+    try std.testing.expectEqual(@as(usize, 32 + 9 + 5 + 16 + 9), patch.len);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, patch[16..20], .big));
     const decoded = try applyReplacementPatchAlloc(alloc, patch, &base);
     defer alloc.free(decoded.replacement);
     try std.testing.expectEqualSlices(u8, &replacement, decoded.replacement);

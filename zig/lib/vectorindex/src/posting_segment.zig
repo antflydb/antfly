@@ -45,6 +45,13 @@ pub const EntryKind = enum(u8) {
     vector_metadata = 9,
     index_metadata = 10,
     vector_directory = 11,
+    base_tombstone = 12,
+    quantized_checkpoint_tombstone = 13,
+    posting_state_tombstone = 14,
+    node_range_tombstone = 15,
+    vector_leaf_tombstone = 16,
+    vector_metadata_tombstone = 17,
+    index_metadata_tombstone = 18,
 };
 
 pub const DeltaValue = struct {
@@ -58,7 +65,8 @@ const PendingEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
     sequence: u64,
-    value: []u8,
+    value: []const u8,
+    owned: bool,
 };
 
 const EntryKey = struct {
@@ -98,7 +106,7 @@ pub const Writer = struct {
     }
 
     pub fn deinit(self: *Writer) void {
-        for (self.entries.items) |entry| self.alloc.free(entry.value);
+        for (self.entries.items) |entry| if (entry.owned) self.alloc.free(@constCast(entry.value));
         self.entries.deinit(self.alloc);
         self.* = undefined;
     }
@@ -183,6 +191,14 @@ pub const Writer = struct {
         try self.appendEntry(.{ .posting_id = id, .kind = kind, .sequence = sequence }, value);
     }
 
+    /// Borrows an immutable value until `build` returns. Checkpoint builders
+    /// retain the mmap/query generation that owns these bytes, so compaction
+    /// can stream values into its output without first allocating one heap
+    /// copy per entry.
+    pub fn appendValueBorrowedAt(self: *Writer, id: PostingId, kind: EntryKind, sequence: u64, value: []const u8) !void {
+        try self.appendEntryBorrowed(.{ .posting_id = id, .kind = kind, .sequence = sequence }, value);
+    }
+
     /// Transfers ownership of `value`, including on error.
     pub fn appendValueOwnedAt(self: *Writer, id: PostingId, kind: EntryKind, sequence: u64, value: []u8) !void {
         try self.appendEntryOwned(.{ .posting_id = id, .kind = kind, .sequence = sequence }, value);
@@ -217,6 +233,18 @@ pub const Writer = struct {
             .kind = key.kind,
             .sequence = key.sequence,
             .value = owned,
+            .owned = true,
+        });
+    }
+
+    fn appendEntryBorrowed(self: *Writer, key: EntryKey, value: []const u8) !void {
+        if (self.finished) return error.PostingSegmentWriterFinished;
+        try self.entries.append(self.alloc, .{
+            .posting_id = key.posting_id,
+            .kind = key.kind,
+            .sequence = key.sequence,
+            .value = value,
+            .owned = false,
         });
     }
 
@@ -247,8 +275,9 @@ pub const Writer = struct {
             try out.appendSlice(self.alloc, entry.value);
             const value_len = entry.value.len;
             const checksum = std.hash.Crc32.hash(entry.value);
-            self.alloc.free(entry.value);
+            if (entry.owned) self.alloc.free(@constCast(entry.value));
             entry.value = &.{};
+            entry.owned = false;
             index_entries.appendAssumeCapacity(.{
                 .posting_id = entry.posting_id,
                 .kind = entry.kind,
@@ -408,6 +437,13 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.vector_metadata) => .vector_metadata,
             @intFromEnum(EntryKind.index_metadata) => .index_metadata,
             @intFromEnum(EntryKind.vector_directory) => .vector_directory,
+            @intFromEnum(EntryKind.base_tombstone) => .base_tombstone,
+            @intFromEnum(EntryKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
+            @intFromEnum(EntryKind.posting_state_tombstone) => .posting_state_tombstone,
+            @intFromEnum(EntryKind.node_range_tombstone) => .node_range_tombstone,
+            @intFromEnum(EntryKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
+            @intFromEnum(EntryKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
+            @intFromEnum(EntryKind.index_metadata_tombstone) => .index_metadata_tombstone,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -490,6 +526,10 @@ pub const VerifiedReader = struct {
         return if (result) |found| found.value else null;
     }
 
+    pub fn entries(self: *VerifiedReader) VerifiedEntryIterator {
+        return .{ .reader = self };
+    }
+
     /// Returns a nested container without checksumming its complete payload.
     /// The posting segment index still authenticates the container bounds;
     /// the nested format must validate its own header/index and lazily verify
@@ -519,6 +559,31 @@ pub const VerifiedReader = struct {
         }
         self.verification[index].store(valid, .release);
         return bytes;
+    }
+};
+
+pub const VerifiedEntry = struct {
+    id: PostingId,
+    kind: EntryKind,
+    sequence: u64,
+    value: []const u8,
+};
+
+pub const VerifiedEntryIterator = struct {
+    reader: *VerifiedReader,
+    index: usize = 0,
+
+    pub fn next(self: *VerifiedEntryIterator) !?VerifiedEntry {
+        if (self.index >= self.reader.reader.entry_count) return null;
+        const index = self.index;
+        self.index += 1;
+        const entry = try self.reader.reader.indexEntry(index);
+        return .{
+            .id = entry.posting_id,
+            .kind = entry.kind,
+            .sequence = entry.sequence,
+            .value = try self.reader.verifiedValue(index, entry),
+        };
     }
 };
 
@@ -655,6 +720,20 @@ pub fn testRejectsDuplicateLogicalEntries() !void {
     try std.testing.expectError(error.DuplicatePostingSegmentEntry, writer.build());
 }
 
+pub fn testBorrowedValuesStreamIntoOwnedSegment() !void {
+    const alloc = std.testing.allocator;
+    var borrowed: [25]u8 = "borrowed-checkpoint-value".*;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendValueBorrowedAt(4, .base, 9, &borrowed);
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    borrowed[0] = 'X';
+    const reader = try Reader.init(bytes);
+    try std.testing.expectEqualStrings("borrowed-checkpoint-value", (try reader.getBase(4)).?);
+}
+
 pub fn testValidatesFooterAndVersion() !void {
     const alloc = std.testing.allocator;
     var writer = Writer.init(alloc);
@@ -727,6 +806,10 @@ test "posting segment stores base centroid and ordered delta values" {
 
 test "posting segment rejects duplicate logical entries" {
     try testRejectsDuplicateLogicalEntries();
+}
+
+test "posting segment streams borrowed values into owned output" {
+    try testBorrowedValuesStreamIntoOwnedSegment();
 }
 
 test "posting segment validates footer and version" {

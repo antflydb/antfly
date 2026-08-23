@@ -1163,6 +1163,135 @@ overlapped the immediate live query sweep; restart recovered serial
 p50/p95/p99 to 3.1/5.0/36.1 ms with 0.9856/0.9880 recall/NDCG. These runs support
 the CPU optimization but do not justify claiming an end-to-end 50K speedup.
 
+Removing the redundant whole-payload CRC from staged-generation publication
+while retaining an eager index/footer admission checksum and lazy per-entry
+CRCs produced the fastest exact 50K load so far: 36.06 seconds (24.38 seconds
+insert plus 11.68 seconds catch-up), with live/restart recall of 0.9851/0.9858.
+The immediate query sweep was noisy (live serial p50/p95/p99
+5.2/8.7/609.9 ms), so this is a load result rather than a query-latency win.
+The corresponding public 1M lifecycle completed in 1,571.56 seconds
+(1,551.96 plus 19.60), 8.16% faster than the prior 1,711.26-second run. Live
+and restart recall were both 0.9900; live serial p50/p95/p99 was
+33.8/687.9/713.0 ms at 80.0 peak QPS, and restart was 32.2/637.1/658.4 ms at
+94.9 peak QPS. Load RSS/demand peaked at approximately 4.07/2.04 GB.
+
+The admission checksum did not remove the main native publication cost:
+`posting_publish_ns` was still 278.87 seconds across 248 flush calls. The run
+wrote complete HBC generations growing from approximately 37 MB to 251 MB
+about fourteen times. This identifies repeated O(live-tree) materialization,
+not staging verification, as the remaining HBC-native load bottleneck. A
+RaBit-only structural split reconstruction experiment was rejected despite a
+38.62-second 50K load because recall collapsed to 0.6325; RaBit codes remain
+appropriate for distance bounds, not exact topology construction.
+
+The next native-format revision replaces repeated complete checkpoints with
+one mmap base plus at most six ordered immutable replacement deltas. `CURRENT`
+names the complete chain and covered source sequence in one checksummed 184-byte
+record. Each delta has per-derived-family tombstones, publication carries the
+exact concurrent WAL suffix into the next generation, queries lease the whole
+chain, and the seventh rotation compacts it into a new complete base before
+unlinking obsolete files. Normal delta construction includes only changes
+above the immutable root; full compaction also enumerates delta-only vector
+mappings and metadata. Focused restart and full-compaction regressions verify
+that same-sequence WAL tails and mappings introduced only in deltas survive.
+
+The first public 1M qualification of that bounded chain completed in 1,443.92
+seconds (1,418.38 seconds insert plus 25.54 seconds catch-up), 127.64 seconds or
+8.1% faster than the admission-checksum full-generation run. It crossed the
+former approximately 843K mutation-boundary failure cleanly and reached exact
+visibility at source sequence 10001. The run published six deltas, compacted
+them into one 248 MB base, and finished with a small active WAL; restart chose
+that native authority without an HBC LSM rebuild. Live recall/NDCG was
+0.9865/0.9883 with serial p50/p95/p99 of 33.8/719.3/739.2 ms. Restart was
+0.9866/0.9883 at 32.8/647.6/673.3 ms. The valid pre-HTTP-429 throughput peaks
+were 93.1 and 101.2 QPS respectively.
+
+The delta result exposes two separate remaining costs. Attributable load demand
+fell to 1.34 GB and the native physical-footprint ledger peaked at 731 MB, but
+cache-inclusive RSS briefly reached 4.93 GB while full compaction faulted the
+six mapped deltas and the segment writer duplicated their live payloads.
+`posting_publish_ns` was still 294.12 seconds across 227 flushes: background
+delta publication removed repeated full-generation work but did not eliminate
+foreground mutation encoding. Checkpoint writers now borrow values from their
+pinned immutable generation until the final contiguous segment is built, and
+the WAL encoder fast-paths a single insertion/deletion as direct prefix,
+literal, and suffix operations before falling back to sparse shifted-run
+matching. A first public 50K sample before sparse-anchor tuning remained
+scheduler-noisy at 46.38 seconds ready, but publication CPU fell from 4.06
+seconds over 23 calls to 3.55 seconds over 21 calls; load-only RSS/demand fell
+from approximately 1.60 GB/929 MB to 1.51 GB/734 MB. Live recall/NDCG remained
+0.9854/0.9878 with serial p50/p95/p99 of 2.9/3.2/12.6 ms. Restart selected
+native authority at sequence 501 without rebuilding and returned
+0.9853/0.9878 recall/NDCG at 2.9/3.3/12.3 ms and 952 QPS peak.
+Sampling general replacement anchors every 16 rather than four base bytes
+reduced the next 50K sample to 3.24 seconds of publication over 20 flushes and
+a 56.8 MB WAL, without changing its approximately 46-second noisy total.
+Live/restart recall was 0.9849/0.9854, serial p50 remained 2.9 ms, and both p99
+values were approximately 12 ms. Load-only RSS/demand was 1.49 GB/731 MB.
+
+The corresponding sparse-anchor 1M qualification completed in 1,397.78
+seconds (1,372.32 seconds insert plus 25.46 seconds catch-up). This is another
+46.14 seconds faster than the first delta run, 173.78 seconds or 11.1% faster
+than the full-generation admission baseline, and less than half of the
+coworker-reported approximately 3,000 seconds. Publication fell to 255.94
+seconds over 221 flushes, a 13.0% CPU/wall reduction from the first delta run.
+It crossed the approximately 843K boundary cleanly and reached exact visibility
+at sequence 10001. Live recall/NDCG was 0.9861/0.9880, serial p50/p95/p99 was
+34.8/710.0/728.1 ms, and the valid pre-429 peak was 94.6 QPS.
+Restart selected native authority at sequence 10001 without rebuilding;
+recall/NDCG was 0.9863/0.9882, serial p50/p95/p99 was 33.6/641.2/664.3 ms,
+and the valid throughput peak was 101.2 QPS.
+
+Borrowing pinned mmap payloads reduced the first six-delta full-compaction RSS
+peak from approximately 3.89 GB to 3.31 GB. Load-cutoff RSS/demand was
+4.12/1.62 GB, versus 4.93/1.34 GB for the first delta implementation; the
+native physical-footprint ledger remained approximately 713 MB. An immediately
+scheduled post-readiness full compaction raised cache-inclusive RSS to 4.70 GB
+without raising attributable demand. An initial attempt to defer only the idle
+checkpoint hook was insufficient: the final source mutation had already
+crossed the ordinary 128 MiB threshold and started generation 15 as a full
+rewrite at sequence 10001. That run still completed in 1,386.52 seconds
+(1,369.07 seconds insert plus 17.45 seconds catch-up), but its query sweep used
+the resulting single approximately 252 MB generation, not the six-delta chain.
+Live recall/NDCG was 0.9867/0.9884 with p50/p95/p99 of
+34.4/713.5/739.5 ms and 98.8 peak QPS; restart returned 0.9868/0.9884 at
+35.4/637.8/661.8 ms and 104.5 peak QPS. Publication consumed 249.39 seconds
+over 218 flushes. Load-only RSS/demand/physical-footprint-ledger peaks were
+3.85/1.30/0.69 GB.
+
+The corrected policy is cost-aware rather than benchmark-aware. Incremental
+deltas still start at 128 MiB, while a max-chain full merge receives the
+existing 256 MiB hard recovery budget because it faults and rewrites the whole
+visible generation. A fresh public 1M qualification started its only full merge
+at sequence 6838 with a 269.56 MB capture (the small excess is one atomic source
+batch), produced a 172.28 MB base, then finished with six deltas and no active
+WAL at exact source sequence 10001. It completed in 1,392.62 seconds
+(1,369.04 seconds insert plus 23.58 seconds catch-up), 178.94 seconds or 11.4%
+faster than the 1,571.56-second complete-generation admission baseline and less
+than half of the coworker-reported approximately 3,000 seconds. Publication
+fell to 241.59 seconds across 224 flushes. Load-only RSS/demand/physical-ledger
+peaks were 4.18/1.65/0.88 GB; the complete live process peaked at 4.18 GB RSS
+and 2.70 GB attributable demand during query cache warming.
+
+This qualification genuinely queried the retained base plus six mmap deltas:
+no generation 15 build occurred before, during, or after the live sweep. Live
+recall/NDCG was 0.9862/0.9881, serial p50/p95/p99 was
+35.9/731.2/756.2 ms, and peak throughput was 98.6 QPS. Restart selected the
+same native authority directly while the compatibility mirror remained at
+sequence 126; recall/NDCG was 0.9863/0.9882, serial latency was
+37.0/659.3/683.2 ms, and peak throughput was 104.8 QPS. The bounded chain
+therefore preserved recall and throughput, with only a small plausible serial
+fan-out cost relative to the immediately preceding compacted sample.
+
+The remaining format tradeoff is disk and mapped-address amplification, not
+generic HBC LSM work. The final 172.28 MB base plus six 131--170 MB deltas used
+1.08 GB (about 4.3 times one compacted generation), although pages remain
+reclaimable and queries fault only what they visit. The next high-upside format
+experiment should retain replacement patches or copy-on-write chunks in indexed
+immutable deltas and materialize/cache a value on first access. More frequent
+full rewrites would reduce disk but give back the load-time and RSS gains this
+experiment was designed to obtain.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1217,8 +1346,10 @@ published.
    ingest. The whole-tree 1M run still accumulated 2.30 GB of mutable clones;
    the faster 50K insert A/B reached 118 L0 runs and let compaction dominate the
    immediate query tail even though HBC was already ready.
-8. Bound native HBC mutation/publication CPU without weakening its durable
-   sequence. The current WAL/generation boundary correctly owns
-   `covered_source_sequence`, but 1M publication consumed 274.18 seconds.
-   Preserve source-journal retention, atomic generation leases, and boundary
-   rerank while testing cheaper delta encoding and WAL-generation rotation.
+8. Bound native HBC mutation/publication CPU and delta disk amplification
+   without weakening its durable sequence. The current WAL/generation boundary
+   correctly owns `covered_source_sequence`, but the cost-aware 1M run still
+   spent 241.59 seconds in publication and retained 1.08 GB across its bounded
+   chain. Preserve source-journal retention, atomic generation leases, and
+   boundary rerank while testing indexed patch-native or chunked-copy-on-write
+   deltas and cheaper WAL-generation rotation.
