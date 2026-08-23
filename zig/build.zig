@@ -63,8 +63,7 @@ const RuntimeLibraryUnit = enum {
     // data, metadata, and HA control over the opaque storage-owner ABI.
     control_api_probe,
     // Distributed/API control plus standalone composition.
-    // Under the storage-kernel experiment, physical storage and restore
-    // staging live in the separate storage unit.
+    // Physical storage and restore staging live in the separate storage unit.
     distributed,
     // Serverless execution over immutable published artifacts. Physical
     // aggregation folds cross the existing coarse storage-owner ABI.
@@ -1434,13 +1433,8 @@ pub fn build(b: *std.Build) void {
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
-    const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
-    const storage_kernel_experiment = b.option(bool, "storage-kernel-experiment", "Compile the CAPI storage implementation as its own linked runtime unit") orelse false;
-    const production_lsm_only = b.option(bool, "production-lsm-only", "Compile LMDB out of production runtime units") orelse linked_runtime_libraries;
+    const production_lsm_only = b.option(bool, "production-lsm-only", "Compile LMDB out of production runtime units") orelse true;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
-    if (storage_kernel_experiment and !linked_runtime_libraries) {
-        @panic("-Dstorage-kernel-experiment=true requires -Dlinked-runtime-libraries=true");
-    }
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
     }
@@ -1502,8 +1496,8 @@ pub fn build(b: *std.Build) void {
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, !production_lsm_only, antfly_version);
     const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, !production_lsm_only, antfly_version);
     const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false, antfly_version);
-    build_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
-    standalone_runtime_build_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
+    build_options.addOption(bool, "storage_kernel_experiment", true);
+    standalone_runtime_build_options.addOption(bool, "storage_kernel_experiment", true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -1963,8 +1957,8 @@ pub fn build(b: *std.Build) void {
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
     const standalone_runtime_options = b.addOptions();
-    standalone_runtime_options.addOption(bool, "linked_inference", linked_runtime_libraries);
-    standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", linked_runtime_libraries);
+    standalone_runtime_options.addOption(bool, "linked_inference", true);
+    standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", true);
     const runtime_failure_abi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_failure_abi.zig"),
         .target = target,
@@ -2626,26 +2620,19 @@ pub fn build(b: *std.Build) void {
     capi_mod.addImport("kernel_error_identity", runtime_failure_identity_mod);
     capi_mod.addImport("local_query_client", local_query_client_mod);
     const capi_build_options = b.addOptions();
-    capi_build_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
+    capi_build_options.addOption(bool, "storage_kernel_experiment", true);
     capi_mod.addOptions("capi_build_options", capi_build_options);
 
-    // Unlinked and focused CAPI builds compile the storage ABI as a standalone
-    // PIC object. Linked release builds instead include the same exports in the
-    // distributed storage-kernel archive below, so the executable and shared
-    // libraries reuse one optimized storage graph.
-    const capi_object = b.addObject(.{
-        .name = "antfly-storage-kernel",
-        .root_module = capi_mod,
-        .max_rss = 8 * 1024 * 1024 * 1024,
-    });
+    // The linked runtime graph below includes the C ABI exports in its owning
+    // storage archive, so the executable and shared libraries reuse one
+    // optimized storage graph.
     const libantfly_link_mod = b.createModule(.{
-        .root_source_file = if (linked_runtime_libraries) b.path("pkg/antfly/src/capi/link_anchor.zig") else null,
+        .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
         .strip = strip,
     });
-    if (!linked_runtime_libraries) libantfly_link_mod.addObject(capi_object);
     addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = b.addLibrary(.{
         .linkage = .dynamic,
@@ -10040,7 +10027,7 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_main_mod,
     });
 
-    if (linked_runtime_libraries) {
+    {
         var api_runtime_artifact: ?*std.Build.Step.Compile = null;
         var application_runtime_artifact: ?*std.Build.Step.Compile = null;
         var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
@@ -10058,16 +10045,12 @@ pub fn build(b: *std.Build) void {
             const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
                 unit != .application_pic_probe and unit != .control_probe and
                 unit != .cli_pic_probe and unit != .control_api_probe and
-                unit != .local_query and
-                (unit != .cli or !storage_kernel_experiment) and
-                (unit != .storage_kernel or storage_kernel_experiment) and
-                (unit != .enrichment_compute or storage_kernel_experiment);
+                unit != .local_query and unit != .cli;
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
-                unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
-                (unit == .distributed and !storage_kernel_experiment);
+                unit == .storage_runtime_pic_probe or unit == .application_pic_probe;
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
-            unit_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
+            unit_options.addOption(bool, "storage_kernel_experiment", true);
 
             const role_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
@@ -10081,7 +10064,7 @@ pub fn build(b: *std.Build) void {
                 role_mod,
                 false,
                 link_libc,
-                storage_kernel_experiment and !owns_storage_kernel and unit != .local_query,
+                !owns_storage_kernel and unit != .local_query,
             );
             role_mod.addOptions("capi_build_options", capi_build_options);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
@@ -10098,20 +10081,14 @@ pub fn build(b: *std.Build) void {
 
             const role_artifact = b.addLibrary(.{
                 .name = switch (unit) {
-                    .storage_kernel => if (storage_kernel_experiment)
-                        "antfly-storage-kernel"
-                    else
-                        "antfly-storage-kernel-disabled",
+                    .storage_kernel => "antfly-storage-kernel",
                     .data_pic_probe => "antfly-data-pic-probe",
                     .storage_runtime_pic_probe => "antfly-storage-runtime-pic-probe",
                     .application_pic_probe => "antfly-application-pic-probe",
                     .control_probe => "antfly-control-probe",
                     .cli_pic_probe => "antfly-cli-pic-probe",
                     .control_api_probe => "antfly-control-api-probe",
-                    .distributed => if (storage_kernel_experiment)
-                        "antfly-runtime-distributed"
-                    else
-                        "antfly-storage-kernel",
+                    .distributed => "antfly-runtime-distributed",
                     .serverless => "antfly-runtime-serverless",
                     .local_query => "antfly-runtime-local_query",
                     else => b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
@@ -10138,9 +10115,7 @@ pub fn build(b: *std.Build) void {
                     .control_probe => 8 * 1024 * 1024 * 1024,
                     .cli_pic_probe => 8 * 1024 * 1024 * 1024,
                     .control_api_probe => 11 * 1024 * 1024 * 1024,
-                    .distributed => @as(usize, if (target.result.os.tag == .macos)
-                        (if (storage_kernel_experiment) 11 else 18)
-                    else if (storage_kernel_experiment) 9 else 11) * 1024 * 1024 * 1024,
+                    .distributed => @as(usize, if (target.result.os.tag == .macos) 11 else 9) * 1024 * 1024 * 1024,
                     .serverless => 5 * 1024 * 1024 * 1024,
                     .enrichment_compute => 4 * 1024 * 1024 * 1024,
                     .local_query => 8 * 1024 * 1024 * 1024,
@@ -10190,13 +10165,10 @@ pub fn build(b: *std.Build) void {
                 },
                 .inference => {
                     inference_runtime_artifact = role_artifact;
-                    role_artifact.step.dependOn(if (storage_kernel_experiment)
-                        &application_runtime_artifact.?.step
-                    else
-                        &api_runtime_artifact.?.step);
+                    role_artifact.step.dependOn(&application_runtime_artifact.?.step);
                 },
                 .cli => role_artifact.step.dependOn(&application_runtime_artifact.?.step),
-                .storage_kernel => if (storage_kernel_experiment) {
+                .storage_kernel => {
                     storage_runtime_artifact = role_artifact;
                 },
                 else => {},
@@ -10249,7 +10221,7 @@ pub fn build(b: *std.Build) void {
                 );
                 control_api_probe_step.dependOn(&install_control_api_probe.step);
             }
-            if (unit == .storage_kernel and storage_kernel_experiment) {
+            if (unit == .storage_kernel) {
                 const owner_test_mod = b.createModule(.{
                     .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_test_root.zig"),
                     .target = target,
@@ -10406,8 +10378,7 @@ pub fn build(b: *std.Build) void {
                 metadata_runtime_owner_test_step.dependOn(&run_metadata_runtime_owner_tests.step);
             }
             if (owns_storage_kernel or unit == .api_kernel or unit == .serverless or unit == .enrichment_compute or unit == .local_query or
-                unit == .control_api_probe or
-                (storage_kernel_experiment and unit == .distributed))
+                unit == .control_api_probe or unit == .distributed)
             {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
@@ -10443,12 +10414,10 @@ pub fn build(b: *std.Build) void {
             }
         }
 
-        if (storage_kernel_experiment) {
-            // Start the API unit only after physical storage. This preserves
-            // useful overlap on larger builders while the Darwin max_rss
-            // claims keep the 20 GiB release runner below its measured peak.
-            api_runtime_artifact.?.step.dependOn(&storage_runtime_artifact.?.step);
-        }
+        // Start the API unit only after physical storage. This preserves useful
+        // overlap on larger builders while the Darwin max_rss claims keep the
+        // 20 GiB release runner below its measured peak.
+        api_runtime_artifact.?.step.dependOn(&storage_runtime_artifact.?.step);
 
         // These focused suites exercise the storage archive exactly as it is
         // composed into the final executable. Their intentionally external API,
@@ -10466,7 +10435,7 @@ pub fn build(b: *std.Build) void {
             tests.root_module.linkLibrary(inference_runtime_artifact.?);
             tests.root_module.linkLibrary(enrichment_compute_artifact.?);
         }
-        if (storage_kernel_experiment) {
+        {
             // The focused CAPI test root owns its DB directly rather than
             // linking the storage-owner archive, but its experimental query
             // and enrichment calls still cross the same provider archives.

@@ -370,10 +370,9 @@ Neither the executable nor shared C API library contained production LMDB
 implementation symbols. The shared library exported the intended `antfly_db_*`
 surface and did not retain distributed runtime entry points.
 
-Decision: the skeleton validates the link topology, PIC reuse, opaque handle
-convention, and section GC, so it remains available behind
-`-Dstorage-kernel-experiment=true`. It is not enabled by default and is not a
-go decision by itself.
+Decision at this checkpoint: the skeleton validated the link topology, PIC
+reuse, opaque handle convention, and section GC, so it remained available as
+an opt-in experiment. It was not yet a go decision by itself.
 
 ### Phase 2a one-call local-query probe
 
@@ -1314,8 +1313,8 @@ before continuing the opaque storage ownership cut; the result follows.
 
 The serverless/API placement invalidated the 425.652-second baseline that had
 motivated a separately compiled storage kernel. The next experiment therefore
-disabled `-Dstorage-kernel-experiment` and let the existing PIC distributed
-archive own the C API exports again. The executable and both C API shared
+disabled the then-current separate-storage experiment and let the existing PIC
+distributed archive own the C API exports again. The executable and both C API shared
 libraries link that exact archive; section GC retains only public C API roots in
 the shared libraries. No source behavior or runtime call path changes at this
 boundary.
@@ -4553,7 +4552,7 @@ hosting, or offline command names is counterproductive.
 
 ## Holistic target architecture
 
-The current structural candidate is the opt-in six-unit source-selected
+The accepted structural result is the six-unit source-selected
 topology above: storage plus local query, distributed/API control, serverless
 plus remote CLI, enrichment compute, inference, and an independent API kernel.
 It gives distributed, API, and serverless only control sources, co-generates
@@ -4830,41 +4829,24 @@ C API.
 
 ## Reproduction commands
 
-The current linked production build is:
+The current linked production build uses the separate storage archive:
 
 ```sh
 zig build \
   -Dtarget=aarch64-linux-musl \
   -Doptimize=ReleaseFast \
   -Dstrip=true \
-  -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=true
 ```
 
-The opt-in separate-storage experiment adds:
-
-```sh
-zig build \
-  -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
-  -Dstrip=true \
-  -Dlinked-runtime-libraries=true \
-  -Dproduction-lsm-only=true \
-  -Dstorage-kernel-experiment=true
-```
-
-The atomic physical-source cut is complete in the opt-in data, metadata, HA,
-and API consumer unit. One normal-runner archive has succeeded, but its storage
-and distributed units remain above the performance gate and repeated proof is
-still missing. Production must not enable it until the behavioral, compiler,
-memory, graph, artifact, and normal-runner gates above pass.
+The former combined storage/application topology is retained in repository
+history rather than exposed as a second production build mode.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 
 ```sh
 zig build \
   -Doptimize=Debug \
-  -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test storage-lmdb-test
@@ -4896,7 +4878,6 @@ zig build \
   -Dtarget=aarch64-linux-musl \
   -Doptimize=ReleaseFast \
   -Dstrip=true \
-  -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=true \
   --time-report \
   --webui=127.0.0.1:19125

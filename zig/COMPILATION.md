@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-08-12
+Last updated: 2026-08-23
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -9,7 +9,7 @@ probes and superseded measurements, is preserved in
 
 ## Status at a glance
 
-The accepted candidate is an opt-in six-unit architecture. It builds the
+The production build uses a six-unit architecture. It builds the
 complete product as one statically linked `antfly` executable, always includes
 embedded standalone inference, compiles production without LMDB, and reuses the
 same compiled storage implementation in the executable and `libantfly` C API.
@@ -44,9 +44,7 @@ about five minutes, serverless at about four minutes, and enrichment at about
 
 Current decision:
 
-- Keep the six-unit composition as the accepted experimental architecture.
-- Keep `-Dstorage-kernel-experiment=true` opt-in until explicit production
-  approval and the remaining performance gates pass.
+- Ship the six-unit composition as the production architecture.
 - Work on storage first and inference second. API, distributed/standalone,
   serverless/CLI, and enrichment no longer need top-level composition changes.
 - Do not substitute a larger runner, swap, cache priming, `-j1`, or merging
@@ -92,7 +90,7 @@ The work has two related objectives:
 
 ## Current compilation architecture
 
-The opt-in candidate produces six independently code-generated static
+The production topology produces six independently code-generated static
 libraries and links them into one executable:
 
 ```text
@@ -121,10 +119,8 @@ These are compiled libraries, not processes or internal services. Calls remain
 direct in-process ABI calls. The executable retains one command dispatcher and
 one implementation of each owned subsystem.
 
-The legacy/default linked layout remains available when
-`-Dstorage-kernel-experiment=false`. It is a compatibility and comparison path,
-not the accepted performance candidate. Documentation and measurements must
-state explicitly which topology they use.
+The former combined storage/application layout is retained in repository
+history for comparison; it is no longer a supported build topology.
 
 ### Unit ownership
 
@@ -383,9 +379,9 @@ Repeat this loop until the exit criteria are satisfied:
 2. Select one coarse ownership boundary from the largest remaining emitted
    implementation family. State what control remains outside and what complete
    operation moves inside.
-3. Implement it behind the opt-in experiment while preserving the product and
-   ABI constraints above.
-4. Validate behavior in experiment-enabled and compatibility configurations.
+3. Implement it within the split runtime graph while preserving the product
+   and ABI constraints above.
+4. Validate behavior in production-LSM and LMDB compatibility configurations.
 5. Run graph gates, cross-archive ABI tests, symbol/artifact audits, and a
    genuinely cold local ARM64 comparison.
 6. Send only a locally credible candidate to the unchanged normal runner.
@@ -483,16 +479,12 @@ zig build antfly capi \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
-  -Dlinked-runtime-libraries=true \
-  -Dproduction-lsm-only=true \
-  -Dstorage-kernel-experiment=true
+  -Dproduction-lsm-only=true
 ```
 
 The production packaging script at
-`../scripts/packaging/build_zig_release_archive.sh` uses the same `antfly` and
-`capi` targets, but it does not currently enable
-`-Dstorage-kernel-experiment=true`. Changing that default is the separate
-production-approval decision described above.
+`../scripts/packaging/build_zig_release_archive.sh` uses the same unconditional
+split-storage `antfly` and `capi` topology.
 
 For a genuine cold comparison, add different empty paths on both sides:
 
@@ -507,9 +499,7 @@ zig build antfly capi \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
-  -Dlinked-runtime-libraries=true \
-  -Dproduction-lsm-only=true \
-  -Dstorage-kernel-experiment=true
+  -Dproduction-lsm-only=true
 ```
 
 Do not compare a cold candidate with a warm baseline.
@@ -522,9 +512,7 @@ zig build antfly capi \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
-  -Dlinked-runtime-libraries=true \
-  -Dproduction-lsm-only=true \
-  -Dstorage-kernel-experiment=true
+  -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke lib-standalone-runtime-test \
   -Doptimize=Debug \
@@ -534,7 +522,6 @@ zig build capi-test capi-smoke lib-standalone-runtime-test \
 
 zig build \
   -Doptimize=Debug \
-  -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test storage-lmdb-test
@@ -576,9 +563,7 @@ zig build antfly capi \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
-  -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=true \
-  -Dstorage-kernel-experiment=true \
   --time-report \
   --webui=127.0.0.1:19125
 ```
