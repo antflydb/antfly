@@ -21,7 +21,9 @@ pub const TermEntry = types.TermEntry;
 pub const Segment = types.Segment;
 pub const freeSegment = types.freeSegment;
 pub const encodeAlloc = codec.encodeAlloc;
+pub const encodedSize = codec.encodedSize;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
 
 test "serverless text segment module compiles" {
     _ = types;
@@ -32,5 +34,7 @@ test "serverless text segment module compiles" {
     _ = Segment;
     _ = freeSegment;
     _ = encodeAlloc;
+    _ = encodedSize;
     _ = decodeAlloc;
+    _ = decodeAllocWithLimits;
 }

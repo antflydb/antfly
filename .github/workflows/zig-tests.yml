@@ -806,9 +806,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   e2e-base-tests:
@@ -870,7 +871,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
 
       - name: Install E2E executable
@@ -970,9 +971,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   e2e-full-tests:
@@ -1033,7 +1035,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
 
       - name: Install E2E executable

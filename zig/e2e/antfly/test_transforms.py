@@ -384,9 +384,9 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     )
 
     initial_build = serverless_api.build_table(table_name)
-    # The background publisher may win before this explicit request. Preserve
-    # the truthful per-request `published` result and assert the user-visible
-    # publication outcome instead of requiring this caller to win the race.
+    # Publication is coordinated asynchronously. The explicit request may win
+    # or report a truthful no-op after the coordinator consumed the WAL, so
+    # assert both the response shape and the durable user-visible outcome.
     assert isinstance(initial_build.get("published"), bool), initial_build
     initial_published = wait_until(
         initial_snapshot_published,

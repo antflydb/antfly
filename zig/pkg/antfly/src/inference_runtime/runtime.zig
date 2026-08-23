@@ -255,6 +255,8 @@ pub fn runFromIterator(
         return try inference.compare_generate.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "finetune")) {
         return try inference.finetune_cli.main(init, try collectArgs(alloc, args));
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        return try inference.cuda_info.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try inference.native_smoke.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "list")) {
@@ -830,6 +832,7 @@ fn printUsage() void {
         \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
+        \\  cuda-info   Inspect the compiled CUDA artifact or validate a CUDA device
         \\  smoke       Run a model smoke test
         \\  list        List available models
         \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL

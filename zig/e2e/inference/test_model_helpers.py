@@ -18,6 +18,9 @@ import requests
 from . import models
 from .conftest import (
     InferenceServer,
+    _backend_selection_diagnostic,
+    _managed_model_id,
+    _parse_backend_exceptions,
     _positive_timeout,
     _server_budget_args,
     capacity_retry_delay,
@@ -35,9 +38,18 @@ from .models import (
     bootstrap_models_for_listing,
     find_local_model_path,
 )
+from .test_generate import (
+    test_configured_generation_smoke as run_configured_generation_smoke,
+)
 
 
 def test_server_budget_args_validate_and_preserve_values(monkeypatch):
+    for env_name in (
+        "ANTFLY_INFERENCE_BACKEND_BUDGET_MB",
+        "ANTFLY_INFERENCE_COMBINED_BUDGET_MB",
+        "ANTFLY_INFERENCE_KV_BUDGET_MB",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", "7000")
     monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "0")
 
@@ -47,6 +59,46 @@ def test_server_budget_args_validate_and_preserve_values(monkeypatch):
         "--scratch-budget-mb",
         "0",
     ]
+
+
+def test_configured_generation_smoke_uses_exact_model_and_first_use_timeout(
+    monkeypatch,
+):
+    model = "owner/model:gguf:Q4_0"
+    monkeypatch.setenv("ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL", model)
+
+    class Api:
+        request = None
+
+        def generate(self, messages, **kwargs):
+            self.request = (messages, kwargs)
+            return {
+                "id": "chatcmpl-smoke",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Hello"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+    api = Api()
+    run_configured_generation_smoke(api)
+
+    assert api.request is not None
+    _, kwargs = api.request
+    assert kwargs["model"] == model
+    assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert kwargs["request_timeout"] > 0
 
 
 @pytest.mark.parametrize("value", ["-1", "invalid", "1.5"])
@@ -774,6 +826,81 @@ def test_live_server_tail_read_does_not_move_shared_output_offset():
         assert server.output.tell() == position
     finally:
         server.output.close()
+
+
+def test_server_output_backend_scan_searches_full_capture_without_moving_offset(
+    tmp_path,
+):
+    server = InferenceServer.__new__(InferenceServer)
+    server.output = tempfile.TemporaryFile(mode="w+b")
+    server.proc = SimpleNamespace(poll=lambda: 0)
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
+    try:
+        server.output.write(f"selected backend cuda for {cuda_model}\n".encode())
+        server.output.write(b"x" * (70 * 1024))
+        server.output.write(f"selected backend native for {native_model}\n".encode())
+        server.output.seek(7)
+        position = server.output.tell()
+
+        assert server.output_contains(f"selected backend cuda for {cuda_model}")
+        assert not server.output_contains("selected backend metal for model")
+        selections = server.backend_selections({"cuda", "metal", "native"})
+        assert selections == {
+            ("cuda", str(cuda_model)),
+            ("native", str(native_model)),
+        }
+        assert (
+            _managed_model_id(str(native_model), str(models_path)) == "owner/cpu-model"
+        )
+        assert (
+            _backend_selection_diagnostic(
+                selections,
+                "cuda",
+                {("owner/cpu-model", "native")},
+                str(models_path),
+            )
+            is None
+        )
+        assert server.output.tell() == position
+    finally:
+        server.output.close()
+
+
+def test_backend_selection_policy_rejects_unexpected_and_stale_exceptions(tmp_path):
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
+    selections = {("cuda", str(cuda_model)), ("native", str(native_model))}
+
+    assert "disallowed selections" in _backend_selection_diagnostic(
+        selections, "cuda", set(), str(models_path)
+    )
+    assert "unused exceptions" in _backend_selection_diagnostic(
+        {("cuda", str(cuda_model))},
+        "cuda",
+        {("owner/cpu-model", "native")},
+        str(models_path),
+    )
+
+
+def test_backend_exception_parser_is_exact_and_validated():
+    supported = {"cuda", "native"}
+    assert _parse_backend_exceptions(
+        "owner/whisper=native, owner/sparse=native", supported
+    ) == {("owner/whisper", "native"), ("owner/sparse", "native")}
+
+    with pytest.raises(pytest.UsageError, match="owner/model=backend"):
+        _parse_backend_exceptions("owner/whisper", supported)
+    with pytest.raises(pytest.UsageError, match="must use owner/model"):
+        _parse_backend_exceptions("whisper=native", supported)
+    with pytest.raises(pytest.UsageError, match="must be one of"):
+        _parse_backend_exceptions("owner/whisper=metal", supported)
+    with pytest.raises(pytest.UsageError, match="duplicate"):
+        _parse_backend_exceptions(
+            "owner/whisper=native,owner/whisper=native", supported
+        )
 
 
 def test_live_server_http_diagnostic_is_reported_once(capsys):

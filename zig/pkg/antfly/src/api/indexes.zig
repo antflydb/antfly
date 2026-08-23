@@ -2209,6 +2209,46 @@ test "settled terminal enrichment debt is degraded rather than rebuilding" {
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
 }
 
+test "derived coverage source totals ignore derived index fan out" {
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "visual",
+            .kind = .dense_vector,
+            .coverage_generation = 42,
+            .coverage_config_hash = 99,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .coverage_produced_count = 2,
+        },
+        .{
+            .name = "relationships",
+            .kind = .graph,
+            .doc_count = 50,
+            .node_count = 50,
+        },
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 2,
+            .doc_count = 50,
+            .index_count = indexes.len,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{1}, 42, 99, null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
+    try std.testing.expect(!aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+
+    const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
+    try std.testing.expect(!view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
 test "derived coverage aggregation rejects mixed config observations" {
     var indexes_a = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
