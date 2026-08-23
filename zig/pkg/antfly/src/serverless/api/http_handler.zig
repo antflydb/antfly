@@ -756,7 +756,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, .none);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("table index list encode failed table={s} err={}", .{ table_name, err });
@@ -774,7 +774,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, .none);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -791,7 +791,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         indexes_json: []const u8,
         only_index_name: ?[]const u8,
+        cancellation: CancellationToken,
     ) ![]ServerlessGraphMetricStatus {
+        try cancellation.check();
         const specs = try build_mod.graph_metric_config.parseIndexSpecsAlloc(self.alloc, indexes_json);
         defer build_mod.graph_metric_config.freeIndexSpecs(self.alloc, specs);
         var status_count: usize = 0;
@@ -821,10 +823,12 @@ pub const HttpHandler = struct {
         else
             null;
         defer if (maybe_session) |*session| session.deinit();
+        if (maybe_session) |*session| session.setCancellation(cancellation);
 
         for (specs) |spec| {
             if (only_index_name) |name| if (!std.mem.eql(u8, spec.index_name, name)) continue;
             for (spec.configs) |config| {
+                try cancellation.check();
                 const owned_index_name = try self.alloc.dupe(u8, spec.index_name);
                 var index_name_moved = false;
                 errdefer if (!index_name_moved) self.alloc.free(owned_index_name);
@@ -850,56 +854,39 @@ pub const HttpHandler = struct {
                     if (graph_index != null and metric_index != null) {
                         const metric_ref = session.artifactRef(metric_index.?).?;
                         const graph_ref = session.artifactRef(graph_index.?).?;
-                        const verified = blk: {
-                            session.verifyArtifact(metric_index.?) catch break :blk false;
-                            break :blk true;
-                        };
-                        if (verified) {
-                            status.published_generation = if (metric_ref.published_generation != 0)
-                                metric_ref.published_generation
-                            else
-                                session.manifest.version;
-                            status.materializer_fingerprint = metric_ref.materializer_fingerprint;
-                        }
-                        const prefix_len = try graph_metric_segment_mod.headerProbeLen(
-                            metric_ref.byte_len,
-                            spec.index_name,
-                            config.name,
-                            graph_ref.artifact_id,
-                            graph_ref.checksum,
-                        );
-                        const prefix = if (verified)
-                            // Use a dedicated integrity-seeded block cache key,
-                            // never a legacy range entry that may have been
-                            // populated before status reads authenticated the
-                            // object against its manifest identity.
-                            session.fetchArtifactBlockRangeAlloc(metric_index.?, query_mod.cache.graph_metric_status_header_block_id, 0, prefix_len) catch null
+                        status.published_generation = if (metric_ref.published_generation != 0)
+                            metric_ref.published_generation
                         else
-                            null;
-                        if (prefix) |payload| {
-                            defer self.alloc.free(payload);
-                            if (graph_metric_segment_mod.decodeHeader(payload)) |header| {
-                                status.materializer_fingerprint = header.materializer_fingerprint;
-                                const valid_identity = std.mem.eql(u8, header.graph_index_name, spec.index_name) and
-                                    std.mem.eql(u8, header.metric_name, config.name) and
-                                    header.kind == config.kind and
-                                    header.config_fingerprint == status.config_fingerprint;
-                                const valid_source = std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
-                                    std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
-                                const current_policy = header.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
-                                status.state = if (!valid_identity or !valid_source or !current_policy)
-                                    .stale
-                                else switch (header.materialization_state) {
-                                    .ready => .ready,
-                                    .rejected => .rejected,
-                                };
-                                status.rejection_reason = header.rejection_reason;
-                            } else |_| {
-                                status.state = .unavailable;
-                            }
-                        } else {
-                            status.state = .unavailable;
+                            session.manifest.version;
+                        status.materializer_fingerprint = metric_ref.materializer_fingerprint;
+                        if (metric_ref.metadata_version >= 5) {
+                            const source_checksum = blk: {
+                                artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                                break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+                            };
+                            const valid_identity = metric_ref.graph_metric_config_fingerprint == status.config_fingerprint;
+                            const valid_source = if (source_checksum) |digest|
+                                std.mem.eql(u8, &digest, &metric_ref.graph_metric_source_checksum)
+                            else
+                                false;
+                            const current_policy = metric_ref.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
+                            status.state = if (!valid_identity or !valid_source or !current_policy)
+                                .stale
+                            else switch (metric_ref.graph_metric_materialization_state) {
+                                .ready => .ready,
+                                .rejected => .rejected,
+                            };
+                            status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
+                            statuses[initialized] = status;
+                            initialized += 1;
+                            status_moved = true;
+                            continue;
                         }
+                        // Legacy metric refs lack authenticated lifecycle
+                        // metadata. Report them as stale and let the normal
+                        // head-republish path upgrade them; status reads must
+                        // never scan user-sized score payloads.
+                        status.state = .stale;
                     }
                 }
                 statuses[initialized] = status;
@@ -3889,9 +3876,13 @@ pub const HttpHandler = struct {
         defer self.alloc.free(payload);
         var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
         defer graph_segment_mod.freeSegment(self.alloc, &segment);
+        var adjacency_index = try graph_segment_mod.AdjacencyIndex.initWithCancellation(self.alloc, segment, session.cancellation);
+        defer adjacency_index.deinit(self.alloc);
 
         const ServerlessPatternEdgeReader = struct {
             segment: *const graph_segment_mod.Segment,
+            adjacency_index: *const graph_segment_mod.AdjacencyIndex,
+            cancellation: CancellationToken,
 
             pub fn getEdges(
                 reader: @This(),
@@ -3901,14 +3892,20 @@ pub const HttpHandler = struct {
                 edge_types: []const []const u8,
                 direction: graph_mod.EdgeDirection,
             ) ![]graph_mod.Edge {
+                try reader.cancellation.check();
                 // Serverless snapshots contain one table-local graph segment.
                 if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
-                const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
+                const adjacency = reader.adjacency_index.find(reader.segment.*, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
                 var edge_count: usize = 0;
+                var scanned: usize = 0;
                 if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
+                    if (scanned % 4096 == 0) try reader.cancellation.check();
+                    scanned += 1;
                     if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
                 };
                 if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
+                    if (scanned % 4096 == 0) try reader.cancellation.check();
+                    scanned += 1;
                     if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
                 };
                 const edges = try alloc.alloc(graph_mod.Edge, edge_count);
@@ -3919,7 +3916,8 @@ pub const HttpHandler = struct {
                 }
 
                 if (direction == .out or direction == .both) {
-                    for (adjacency.out_edges) |edge| {
+                    for (adjacency.out_edges, 0..) |edge, edge_index| {
+                        if (edge_index % 4096 == 0) try reader.cancellation.check();
                         if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
                         const source = try alloc.dupe(u8, adjacency.node_id);
                         errdefer alloc.free(source);
@@ -3940,7 +3938,8 @@ pub const HttpHandler = struct {
                     }
                 }
                 if (direction == .in or direction == .both) {
-                    for (adjacency.in_edges) |edge| {
+                    for (adjacency.in_edges, 0..) |edge, edge_index| {
+                        if (edge_index % 4096 == 0) try reader.cancellation.check();
                         if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
                         const source = try alloc.dupe(u8, edge.neighbor_id);
                         errdefer alloc.free(source);
@@ -3974,6 +3973,7 @@ pub const HttpHandler = struct {
                 table: ?[]const u8,
                 probes: []const graph_mod.EdgeProbe,
             ) ![]?graph_mod.Edge {
+                try reader.cancellation.check();
                 const results = try alloc.alloc(?graph_mod.Edge, probes.len);
                 @memset(results, null);
                 errdefer {
@@ -3982,8 +3982,10 @@ pub const HttpHandler = struct {
                 }
                 if (table != null) return results;
                 for (probes, 0..) |probe, probe_index| {
-                    const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, probe.source) orelse continue;
-                    for (adjacency.out_edges) |edge| {
+                    if (probe_index % 1024 == 0) try reader.cancellation.check();
+                    const adjacency = reader.adjacency_index.find(reader.segment.*, probe.source) orelse continue;
+                    for (adjacency.out_edges, 0..) |edge, edge_index| {
+                        if (edge_index % 4096 == 0) try reader.cancellation.check();
                         if (!std.mem.eql(u8, edge.neighbor_id, probe.target) or
                             !std.mem.eql(u8, edge.edge_type, probe.edge_type)) continue;
                         const source = try alloc.dupe(u8, probe.source);
@@ -4022,7 +4024,7 @@ pub const HttpHandler = struct {
 
         const raw_matches = try graph_pattern_mod.matchPatternWithEdgeReader(
             self.alloc,
-            ServerlessPatternEdgeReader{ .segment = &segment },
+            ServerlessPatternEdgeReader{ .segment = &segment, .adjacency_index = &adjacency_index, .cancellation = session.cancellation },
             start_key_refs,
             named_query.query.pattern,
             .{
@@ -5014,6 +5016,14 @@ pub const HttpHandler = struct {
                 return error.UnsupportedSyncLevel;
             },
         }
+        if (sync_level == .full_index and status_before_write.graph_metrics_configured != 0 and
+            !status_before_write.graph_metrics_supported)
+        {
+            return error.UnsupportedSyncLevel;
+        }
+        if (sync_level == .full_index and status_before_write.graph_metrics_rejected != 0) {
+            return error.GraphMetricMaterializationRejected;
+        }
 
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
@@ -5048,10 +5058,11 @@ pub const HttpHandler = struct {
             };
             defer status.deinit(self.alloc);
 
+            if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.GraphMetricMaterializationRejected;
             if (tableSyncLevelSatisfied(sync_level, end_lsn, status)) return;
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) {
                 std.log.err(
-                    "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} active_stage={any}",
+                    "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} graph_metrics_configured={} graph_metrics_pending={} graph_metrics_rejected={} active_stage={any}",
                     .{
                         table_name,
                         sync_level,
@@ -5063,6 +5074,9 @@ pub const HttpHandler = struct {
                         status.chunk_preview_complete,
                         status.chunk_embeddings_complete,
                         status.rerank_terms_complete,
+                        status.graph_metrics_configured,
+                        status.graph_metrics_pending,
+                        status.graph_metrics_rejected,
                         status.enrichment_active_stage,
                     },
                 );
@@ -5105,6 +5119,8 @@ pub const HttpHandler = struct {
     }
 
     fn fullIndexSyncSatisfied(status: catalog_types.BuildStatus) bool {
+        if (!status.graph_metrics_supported and status.graph_metrics_configured != 0) return false;
+        if (status.graph_metrics_pending != 0 or status.graph_metrics_rejected != 0) return false;
         if (status.head_republish_recommended or status.pending_materialization_rebuild) return false;
         if (!status.enrichment_complete) return false;
         if (!fullTextSyncSatisfied(status)) return false;
@@ -5147,7 +5163,8 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
-            error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady, error.MetricNotConfigured => return error.NotFound,
+            error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotConfigured => return error.NotFound,
+            error.MetricNotReady => return error.IndexRebuilding,
             error.InvalidGraphMetricNodeId => return error.InvalidQueryRequest,
             error.GraphMetricPolicyStale => return error.IndexRebuilding,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
@@ -5219,7 +5236,7 @@ pub const HttpHandler = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
-        _: api_operation.RequestContext,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -5227,7 +5244,10 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null) catch return error.InternalFailure;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.InternalFailure,
+        };
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         return encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch return error.InternalFailure;
     }
@@ -5237,7 +5257,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        _: api_operation.RequestContext,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -5245,7 +5265,10 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name) catch return error.InternalFailure;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.InternalFailure,
+        };
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         return (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch return error.InternalFailure) orelse error.NotFound;
     }
@@ -5572,16 +5595,6 @@ fn freeOwnedGraphEdge(alloc: Allocator, edge: graph_mod.Edge) void {
     alloc.free(edge.target);
     alloc.free(edge.edge_type);
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
-}
-
-fn findGraphSegmentAdjacency(
-    adjacencies: []const graph_segment_mod.Adjacency,
-    doc_id: []const u8,
-) ?graph_segment_mod.Adjacency {
-    for (adjacencies) |adjacency| {
-        if (std.mem.eql(u8, adjacency.node_id, doc_id)) return adjacency;
-    }
-    return null;
 }
 
 fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
@@ -10378,6 +10391,18 @@ test "serverless full_index sync waits for enrichment and index publication" {
     status.artifact_actions.dense_vector = .rebuild;
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
     status.artifact_actions.dense_vector = .reuse;
+
+    status.graph_metrics_configured = 1;
+    status.graph_metrics_supported = false;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_metrics_supported = true;
+    status.graph_metrics_pending = 1;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_metrics_pending = 0;
+    status.graph_metrics_rejected = 1;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_metrics_rejected = 0;
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
 
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));

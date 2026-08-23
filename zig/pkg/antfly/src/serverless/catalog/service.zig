@@ -29,6 +29,7 @@ const builder_mod = @import("../build/builder.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const graph_metric_config = @import("../build/graph_metric_config.zig");
 const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
+const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const impact_planner = @import("../build/impact_planner.zig");
 const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
@@ -47,29 +48,77 @@ const PublicationPlanPurpose = enum {
     publication,
 };
 
-fn graphMetricMaterializationStaleAlloc(alloc: Allocator, manifest: manifest_mod.Manifest, indexes_json: []const u8) !bool {
+const GraphMetricReadiness = struct {
+    configured: usize = 0,
+    pending: usize = 0,
+    rejected: usize = 0,
+};
+
+fn graphMetricReadinessAlloc(alloc: Allocator, manifest: ?manifest_mod.Manifest, indexes_json: []const u8) !GraphMetricReadiness {
     const current = graph_metric_policy.materializerFingerprint(.{});
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
     defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    var readiness = GraphMetricReadiness{};
     for (specs) |spec| {
+        const graph_artifact = if (manifest) |value|
+            findManifestNamedArtifact(value, .graph_segment, spec.index_name)
+        else
+            null;
         for (spec.configs) |config| {
+            readiness.configured += 1;
+            const value = manifest orelse {
+                readiness.pending += 1;
+                continue;
+            };
             const name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
             defer alloc.free(name);
-            const artifact = findManifestNamedArtifact(manifest, .graph_metric_segment, name) orelse return true;
-            if (artifact.materializer_fingerprint != current) return true;
+            const artifact = findManifestNamedArtifact(value, .graph_metric_segment, name) orelse {
+                readiness.pending += 1;
+                continue;
+            };
+            const source_digest = if (graph_artifact) |graph_ref| blk: {
+                artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+            } else null;
+            const current_artifact = artifact.metadata_version >= 5 and
+                artifact.graph_metric_control_len != 0 and
+                artifact.graph_metric_routing_footer_len != 0 and
+                artifact.materializer_fingerprint == current and
+                artifact.graph_metric_config_fingerprint == lake_graph_metric.configFingerprint(config) and
+                source_digest != null and
+                std.mem.eql(u8, &source_digest.?, &artifact.graph_metric_source_checksum);
+            if (!current_artifact) {
+                readiness.pending += 1;
+                continue;
+            }
+            if (artifact.graph_metric_materialization_state == .rejected) readiness.rejected += 1;
         }
     }
-    return false;
+    return readiness;
+}
+
+fn graphMetricMaterializationStaleAlloc(alloc: Allocator, manifest: manifest_mod.Manifest, indexes_json: []const u8) !bool {
+    return (try graphMetricReadinessAlloc(alloc, manifest, indexes_json)).pending != 0;
 }
 
 test "serverless catalog schedules idle graph metric policy upgrades from manifest metadata" {
-    var artifacts = [_]manifest_mod.ArtifactRef{.{
-        .kind = .graph_metric_segment,
-        .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .byte_len = 1,
-        .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .materializer_fingerprint = 0,
-    }};
+    var artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .graph_segment,
+            .name = "graph_idx",
+            .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .byte_len = 1,
+            .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+        .{
+            .kind = .graph_metric_segment,
+            .name = "9:graph_idx4:rank",
+            .artifact_id = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .byte_len = 1,
+            .checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .materializer_fingerprint = 0,
+        },
+    };
     var manifest = manifest_mod.Manifest{
         .namespace = "docs",
         .version = 1,
@@ -80,9 +129,15 @@ test "serverless catalog schedules idle graph metric policy upgrades from manife
         .artifacts = &artifacts,
     };
     const indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
-    artifacts[0].name = "9:graph_idx4:rank";
     try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
-    artifacts[0].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(std.testing.allocator, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(std.testing.allocator, specs);
+    artifacts[1].metadata_version = 5;
+    artifacts[1].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    artifacts[1].graph_metric_control_len = 1;
+    artifacts[1].graph_metric_routing_footer_len = 1;
+    artifacts[1].graph_metric_config_fingerprint = lake_graph_metric.configFingerprint(specs[0].configs[0]);
+    artifacts[1].graph_metric_source_checksum = @splat(0xaa);
     try std.testing.expect(!try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
     manifest.artifacts = manifest.artifacts[0..0];
     try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
@@ -508,6 +563,16 @@ pub const CatalogService = struct {
         const pending_materialization_rebuild =
             !head_republish_recommended and
             (plan.artifact_actions.any() or plan.derived_output_actions.any());
+        const graph_metrics_supported = self.manifests.supportsArtifactKind(.graph_metric_segment);
+        var graph_metric_readiness = try graphMetricReadinessAlloc(
+            self.alloc,
+            published_head.manifest,
+            plan.table_definition.indexes_json,
+        );
+        if (!graph_metrics_supported and graph_metric_readiness.configured != 0) {
+            graph_metric_readiness.pending = graph_metric_readiness.configured;
+            graph_metric_readiness.rejected = 0;
+        }
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
@@ -531,6 +596,10 @@ pub const CatalogService = struct {
             .document_lineage_versions = head_document_lineage_versions,
             .head_republish_recommended = head_republish_recommended,
             .pending_materialization_rebuild = pending_materialization_rebuild,
+            .graph_metrics_configured = graph_metric_readiness.configured,
+            .graph_metrics_supported = graph_metrics_supported,
+            .graph_metrics_pending = graph_metric_readiness.pending,
+            .graph_metrics_rejected = graph_metric_readiness.rejected,
             .pending_materialization_families = pending_materialization_families,
             .head_artifact_actions = head_actions.artifact_actions,
             .head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions),

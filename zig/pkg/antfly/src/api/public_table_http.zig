@@ -71,6 +71,7 @@ pub const TableApi = struct {
     pub const ExecuteBatchError = error{
         InvalidBatchRequest,
         UnsupportedSyncLevel,
+        GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
         MethodNotAllowed,
@@ -935,6 +936,11 @@ pub fn handleTableBatch(
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
+        error.GraphMetricMaterializationRejected => return .{
+            .status = 422,
+            .body = try graphMetricMaterializationRejectedBody(alloc),
+            .json = true,
+        },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },

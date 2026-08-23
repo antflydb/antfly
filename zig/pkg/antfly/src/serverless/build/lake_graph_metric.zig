@@ -126,6 +126,14 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
         .edge_generation = built.artifact.edge_generation,
         .computed_at_ms = built.artifact.computed_at_ms,
         .materializer_fingerprint = built.artifact.materializer_fingerprint,
+        .graph_metric_control_len = built.artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = built.artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = built.artifact.graph_metric_control_checksum,
+        .graph_metric_routing_checksum = built.artifact.graph_metric_routing_checksum,
+        .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
+        .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = built.artifact.graph_metric_rejection_reason,
     };
 }
 
@@ -357,7 +365,7 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
     errdefer alloc.free(name);
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
     errdefer alloc.free(artifact_id);
-    return .{
+    const ref = artifact_ref.ArtifactRef{
         .kind = .graph_metric_segment,
         .name = name,
         .artifact_id = artifact_id,
@@ -368,7 +376,16 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
         .edge_generation = built.artifact.edge_generation,
         .computed_at_ms = built.artifact.computed_at_ms,
         .materializer_fingerprint = built.artifact.materializer_fingerprint,
+        .graph_metric_control_len = built.artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = built.artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = built.artifact.graph_metric_control_checksum,
+        .graph_metric_routing_checksum = built.artifact.graph_metric_routing_checksum,
+        .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
+        .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = built.artifact.graph_metric_rejection_reason,
     };
+    return ref;
 }
 
 fn findCompatibleHitsPairIndex(configs: []const graph_mod.GraphMetricConfig, index: usize) ?usize {
@@ -434,7 +451,7 @@ fn publishRejectedAlloc(
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
     errdefer alloc.free(artifact_id);
     const checksum = try alloc.dupe(u8, metadata.checksum);
-    return .{
+    var ref = artifact_ref.ArtifactRef{
         .kind = .graph_metric_segment,
         .name = name,
         .artifact_id = artifact_id,
@@ -446,6 +463,8 @@ fn publishRejectedAlloc(
         .computed_at_ms = provenance.computed_at_ms,
         .materializer_fingerprint = segment.materializer_fingerprint,
     };
+    try populateGraphMetricIntegrity(&ref, segment, payload);
+    return ref;
 }
 
 fn rejectedSegmentAlloc(
@@ -674,7 +693,7 @@ fn encodeMetricResultAlloc(
     const artifact_id = try std.fmt.allocPrint(alloc, "lake-graph-metric:{d}:{s}:{d}", .{ name.len, name, payload.len });
     errdefer alloc.free(artifact_id);
     const checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{payload.len});
-    return .{ .payload = payload, .artifact = .{
+    var artifact = artifact_ref.ArtifactRef{
         .kind = .graph_metric_segment,
         .name = name,
         .artifact_id = artifact_id,
@@ -685,7 +704,22 @@ fn encodeMetricResultAlloc(
         .edge_generation = options.provenance.edge_generation,
         .computed_at_ms = options.provenance.computed_at_ms,
         .materializer_fingerprint = segment.materializer_fingerprint,
-    } };
+    };
+    try populateGraphMetricIntegrity(&artifact, segment, payload);
+    return .{ .payload = payload, .artifact = artifact };
+}
+
+fn populateGraphMetricIntegrity(ref: *artifact_ref.ArtifactRef, segment: metric_segment.Segment, payload: []const u8) !void {
+    const integrity = try metric_segment.artifactIntegrity(segment, payload);
+    ref.graph_metric_control_len = integrity.control_len;
+    ref.graph_metric_routing_footer_len = integrity.routing_footer_len;
+    ref.graph_metric_control_checksum = integrity.control_checksum;
+    ref.graph_metric_routing_checksum = integrity.routing_checksum;
+    ref.graph_metric_config_fingerprint = segment.config_fingerprint;
+    ref.graph_metric_source_checksum = artifact_store.sha256DigestFromChecksum(segment.source_graph_checksum) catch
+        return error.ArtifactIntegrityMismatch;
+    ref.graph_metric_materialization_state = @enumFromInt(@intFromEnum(segment.materialization_state));
+    ref.graph_metric_rejection_reason = @enumFromInt(@intFromEnum(segment.rejection_reason));
 }
 
 fn validateOptions(graph_payload: []const u8, options: BuildOptions) !void {

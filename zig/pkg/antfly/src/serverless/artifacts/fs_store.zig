@@ -170,7 +170,15 @@ pub const FsStore = struct {
             }
             try self.rememberVerifiedFile(artifact_id, verified);
         }
-        return try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+        const payload = try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+        errdefer alloc.free(payload);
+        const after_read = try file.stat(io);
+        if (after_read.inode != before.inode or after_read.size != before.size or !std.meta.eql(after_read.mtime, before.mtime)) {
+            self.forgetVerifiedFile(artifact_id);
+            return error.ArtifactIntegrityMismatch;
+        }
+        try cancellation.check();
+        return payload;
     }
 
     pub fn stat(self: *FsStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
@@ -259,14 +267,18 @@ pub const FsStore = struct {
         gop.value_ptr.* = verified;
     }
 
+    fn forgetVerifiedFile(self: *FsStore, artifact_id: []const u8) void {
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        if (self.verified_files.fetchRemove(artifact_id)) |removed| self.alloc.free(removed.key);
+    }
+
     pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
         defer self.alloc.free(path);
         try deleteFile(path);
-        lockAtomic(&self.verified_mu);
-        defer self.verified_mu.unlock();
-        if (self.verified_files.fetchRemove(artifact_id)) |removed| self.alloc.free(removed.key);
+        self.forgetVerifiedFile(artifact_id);
     }
 
     const vtable: artifact_store.ArtifactStore.VTable = .{

@@ -22,8 +22,9 @@ const artifact_ref = @import("artifact_ref.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 15;
+pub const wire_version: u16 = 16;
 pub const rolling_compatible_write_version: u16 = 12;
+pub const legacy_graph_metric_write_version: u16 = artifact_ref.graph_metric_min_manifest_wire_version;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -149,7 +150,11 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 fn artifactEncodedSizeForVersion(artifact: manifest_types.ArtifactRef, version: u16) usize {
     const provenance_bytes: usize = if (version >= 14) 2 + 8 + 8 + 8 else 0;
     const materializer_bytes: usize = if (version >= 15) 8 else 0;
-    return 1 + 4 + 4 + 8 + 4 + provenance_bytes + materializer_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+    const graph_metric_integrity_bytes: usize = if (version >= 16 and artifact.kind == .graph_metric_segment)
+        4 + 4 + 32 + 32 + 8 + 32 + 1 + 1
+    else
+        0;
+    return 1 + 4 + 4 + 8 + 4 + provenance_bytes + materializer_bytes + graph_metric_integrity_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
@@ -209,7 +214,10 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
 }
 
 pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest, target_version: u16) ![]u8 {
-    if (target_version != rolling_compatible_write_version and target_version != wire_version) {
+    if (target_version != rolling_compatible_write_version and
+        target_version != legacy_graph_metric_write_version and
+        target_version != wire_version)
+    {
         return error.UnsupportedManifestWriteVersion;
     }
     if (target_version < artifact_ref.graph_metric_min_manifest_wire_version) {
@@ -219,6 +227,23 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
                 artifact.computed_at_ms != 0 or artifact.materializer_fingerprint != 0)
             {
                 return error.ManifestRequiresWireVersion15;
+            }
+        }
+    }
+    if (target_version >= artifact_ref.graph_metric_range_integrity_manifest_wire_version) {
+        for (manifest.artifacts) |artifact| {
+            if (artifact.kind != .graph_metric_segment or artifact.metadata_version < 5) continue;
+            if (artifact.graph_metric_control_len == 0 or artifact.graph_metric_routing_footer_len == 0 or
+                (artifact.graph_metric_materialization_state == .ready and artifact.graph_metric_rejection_reason != .none) or
+                (artifact.graph_metric_materialization_state == .rejected and artifact.graph_metric_rejection_reason == .none))
+            {
+                return error.InvalidManifest;
+            }
+        }
+    } else {
+        for (manifest.artifacts) |artifact| {
+            if (artifact.kind == .graph_metric_segment and artifact.metadata_version >= 5) {
+                return error.ManifestRequiresWireVersion16;
             }
         }
     }
@@ -374,6 +399,24 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
             std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
             pos += 8;
         }
+        if (target_version >= 16 and artifact.kind == .graph_metric_segment) {
+            std.mem.writeInt(u32, buf[pos..][0..4], artifact.graph_metric_control_len, .little);
+            pos += 4;
+            std.mem.writeInt(u32, buf[pos..][0..4], artifact.graph_metric_routing_footer_len, .little);
+            pos += 4;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_control_checksum);
+            pos += 32;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_routing_checksum);
+            pos += 32;
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.graph_metric_config_fingerprint, .little);
+            pos += 8;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_source_checksum);
+            pos += 32;
+            buf[pos] = @intFromEnum(artifact.graph_metric_materialization_state);
+            pos += 1;
+            buf[pos] = @intFromEnum(artifact.graph_metric_rejection_reason);
+            pos += 1;
+        }
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
         pos += artifact.name.len;
         @memcpy(buf[pos..][0..artifact.artifact_id.len], artifact.artifact_id);
@@ -449,7 +492,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != 13 and version != 14 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != 13 and version != 14 and version != 15 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -828,6 +871,40 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             pos += 8;
             break :blk value;
         } else 0;
+        var graph_metric_control_len: u32 = 0;
+        var graph_metric_routing_footer_len: u32 = 0;
+        var graph_metric_control_checksum: [32]u8 = @splat(0);
+        var graph_metric_routing_checksum: [32]u8 = @splat(0);
+        var graph_metric_config_fingerprint: u64 = 0;
+        var graph_metric_source_checksum: [32]u8 = @splat(0);
+        var graph_metric_materialization_state: artifact_ref.GraphMetricMaterializationState = .ready;
+        var graph_metric_rejection_reason: artifact_ref.GraphMetricRejectionReason = .none;
+        if (version >= 16 and kind == .graph_metric_segment) {
+            const integrity_len: usize = 4 + 4 + 32 + 32 + 8 + 32 + 1 + 1;
+            if (pos + integrity_len > data.len) return error.InvalidManifest;
+            graph_metric_control_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            graph_metric_routing_footer_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            @memcpy(&graph_metric_control_checksum, data[pos..][0..32]);
+            pos += 32;
+            @memcpy(&graph_metric_routing_checksum, data[pos..][0..32]);
+            pos += 32;
+            graph_metric_config_fingerprint = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            @memcpy(&graph_metric_source_checksum, data[pos..][0..32]);
+            pos += 32;
+            graph_metric_materialization_state = std.enums.fromInt(artifact_ref.GraphMetricMaterializationState, data[pos]) orelse return error.InvalidManifest;
+            pos += 1;
+            graph_metric_rejection_reason = std.enums.fromInt(artifact_ref.GraphMetricRejectionReason, data[pos]) orelse return error.InvalidManifest;
+            pos += 1;
+            if ((metadata_version >= 5 and (graph_metric_control_len == 0 or graph_metric_routing_footer_len == 0)) or
+                (graph_metric_materialization_state == .ready and graph_metric_rejection_reason != .none) or
+                (graph_metric_materialization_state == .rejected and graph_metric_rejection_reason == .none))
+            {
+                return error.InvalidManifest;
+            }
+        }
 
         if (pos + name_len + artifact_id_len + checksum_len > data.len) return error.InvalidManifest;
         const name = if (name_len > 0) try alloc.dupe(u8, data[pos .. pos + name_len]) else &.{};
@@ -850,6 +927,14 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .edge_generation = edge_generation,
             .computed_at_ms = computed_at_ms,
             .materializer_fingerprint = materializer_fingerprint,
+            .graph_metric_control_len = graph_metric_control_len,
+            .graph_metric_routing_footer_len = graph_metric_routing_footer_len,
+            .graph_metric_control_checksum = graph_metric_control_checksum,
+            .graph_metric_routing_checksum = graph_metric_routing_checksum,
+            .graph_metric_config_fingerprint = graph_metric_config_fingerprint,
+            .graph_metric_source_checksum = graph_metric_source_checksum,
+            .graph_metric_materialization_state = graph_metric_materialization_state,
+            .graph_metric_rejection_reason = graph_metric_rejection_reason,
         };
         initialized += 1;
     }
@@ -1083,11 +1168,17 @@ test "serverless manifest codec round-trips deterministically" {
         .artifact_id = try alloc.dupe(u8, "metric-0001"),
         .byte_len = 256,
         .checksum = try alloc.dupe(u8, "sha256:metric"),
-        .metadata_version = 4,
+        .metadata_version = 5,
         .published_generation = 40,
         .edge_generation = 39,
         .computed_at_ms = 123,
         .materializer_fingerprint = 0x1234,
+        .graph_metric_control_len = 73,
+        .graph_metric_routing_footer_len = 17,
+        .graph_metric_control_checksum = @splat(0x11),
+        .graph_metric_routing_checksum = @splat(0x22),
+        .graph_metric_config_fingerprint = 0x5678,
+        .graph_metric_source_checksum = @splat(0x33),
     };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
@@ -1116,20 +1207,25 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(manifest_types.ArtifactKind.sparse_segment, decoded.artifacts[2].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded.artifacts[4].kind);
-    try std.testing.expectEqual(@as(u16, 4), decoded.artifacts[4].metadata_version);
+    try std.testing.expectEqual(@as(u16, 5), decoded.artifacts[4].metadata_version);
     try std.testing.expectEqual(@as(u64, 40), decoded.artifacts[4].published_generation);
     try std.testing.expectEqual(@as(u64, 39), decoded.artifacts[4].edge_generation);
     try std.testing.expectEqual(@as(u64, 123), decoded.artifacts[4].computed_at_ms);
     try std.testing.expectEqual(@as(u64, 0x1234), decoded.artifacts[4].materializer_fingerprint);
+    try std.testing.expectEqual(@as(u32, 73), decoded.artifacts[4].graph_metric_control_len);
+    try std.testing.expectEqual(@as(u32, 17), decoded.artifacts[4].graph_metric_routing_footer_len);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x11} ** 32), &decoded.artifacts[4].graph_metric_control_checksum);
 
-    // v15 adds the materializer fingerprint. Compact it out first to exercise
-    // the still-supported v14 layout, then compact provenance for v13.
+    // v16 adds authenticated graph-metric ranges and v15 adds the materializer
+    // fingerprint. Compact both out to exercise the supported v14 layout,
+    // then compact provenance for v13.
+    const graph_metric_integrity_bytes: usize = 4 + 4 + 32 + 32 + 8 + 32 + 1 + 1;
     const materializer_bytes: usize = 8;
     const provenance_bytes: usize = 2 + 8 + 8 + 8;
     var current_artifact_bytes: usize = 0;
     for (manifest.artifacts) |artifact| current_artifact_bytes += artifactEncodedSize(artifact);
     const prefix_len = encoded_a.len - current_artifact_bytes;
-    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len);
+    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len - graph_metric_integrity_bytes);
     defer alloc.free(encoded_v14);
     @memcpy(encoded_v14[0..prefix_len], encoded_a[0..prefix_len]);
     var src_pos = prefix_len;
@@ -1139,6 +1235,7 @@ test "serverless manifest codec round-trips deterministically" {
         const retained_header_bytes = artifact_header_bytes + provenance_bytes;
         @memcpy(encoded_v14[dst_pos..][0..retained_header_bytes], encoded_a[src_pos..][0..retained_header_bytes]);
         src_pos += retained_header_bytes + materializer_bytes;
+        if (artifact.kind == .graph_metric_segment) src_pos += graph_metric_integrity_bytes;
         dst_pos += retained_header_bytes;
         const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
         @memcpy(encoded_v14[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);
@@ -1251,6 +1348,18 @@ test "serverless manifest rollout writer stays v12 until graph metrics are enabl
     try std.testing.expectError(
         error.ManifestRequiresWireVersion15,
         encodeForVersionAlloc(alloc, manifest, rolling_compatible_write_version),
+    );
+    const encoded_v15 = try encodeForVersionAlloc(alloc, manifest, legacy_graph_metric_write_version);
+    defer alloc.free(encoded_v15);
+    try std.testing.expectEqual(legacy_graph_metric_write_version, std.mem.readInt(u16, encoded_v15[4..6], .little));
+    var decoded_v15 = try decodeAlloc(alloc, encoded_v15);
+    defer decoded_v15.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), decoded_v15.artifacts.len);
+    try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded_v15.artifacts[0].kind);
+    graph_artifacts[0].metadata_version = 5;
+    try std.testing.expectError(
+        error.ManifestRequiresWireVersion16,
+        encodeForVersionAlloc(alloc, manifest, legacy_graph_metric_write_version),
     );
     try std.testing.expectError(
         error.UnsupportedManifestWriteVersion,

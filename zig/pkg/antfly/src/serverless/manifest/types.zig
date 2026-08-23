@@ -125,6 +125,14 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
         .edge_generation = artifact.edge_generation,
         .computed_at_ms = artifact.computed_at_ms,
         .materializer_fingerprint = artifact.materializer_fingerprint,
+        .graph_metric_control_len = artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+        .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+        .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };
 }
 

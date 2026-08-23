@@ -18,6 +18,17 @@
 /// First manifest version that old readers can safely consume when graph
 /// metric artifact references are present.
 pub const graph_metric_min_manifest_wire_version: u16 = 15;
+pub const graph_metric_range_integrity_manifest_wire_version: u16 = 16;
+
+pub const GraphMetricMaterializationState = enum(u8) {
+    ready = 0,
+    rejected = 1,
+};
+
+pub const GraphMetricRejectionReason = enum(u8) {
+    none = 0,
+    build_budget_exceeded = 1,
+};
 
 pub const ArtifactKind = enum(u8) {
     text_segment = 1,
@@ -51,6 +62,17 @@ pub const ArtifactRef = struct {
     /// catalog scheduling can detect stale materializations without fetching
     /// the object payload. Zero denotes a pre-v15 manifest.
     materializer_fingerprint: u64 = 0,
+    /// Authenticated range metadata for graph-metric wire v5+. Fixed-size
+    /// digests avoid per-reference allocations and let point/status reads stay
+    /// bounded without trusting object-store range responses.
+    graph_metric_control_len: u32 = 0,
+    graph_metric_routing_footer_len: u32 = 0,
+    graph_metric_control_checksum: [32]u8 = @splat(0),
+    graph_metric_routing_checksum: [32]u8 = @splat(0),
+    graph_metric_config_fingerprint: u64 = 0,
+    graph_metric_source_checksum: [32]u8 = @splat(0),
+    graph_metric_materialization_state: GraphMetricMaterializationState = .ready,
+    graph_metric_rejection_reason: GraphMetricRejectionReason = .none,
 };
 
 test "manifest artifact kinds include lake-native artifacts" {

@@ -39,6 +39,13 @@ pub fn validateSha256Checksum(checksum: []const u8) !void {
     }
 }
 
+pub fn sha256DigestFromChecksum(checksum: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    try validateSha256Checksum(checksum);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, checksum) catch return error.InvalidArtifactId;
+    return digest;
+}
+
 pub fn validateSha256ArtifactIdentity(artifact_id: []const u8, checksum: []const u8) !void {
     try validateSha256Checksum(checksum);
     const id_checksum = try sha256ChecksumFromArtifactId(artifact_id);

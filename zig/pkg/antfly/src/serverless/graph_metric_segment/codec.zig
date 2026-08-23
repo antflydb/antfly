@@ -20,7 +20,7 @@ const graph_mod = @import("../../graph/graph.zig");
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
-pub const wire_version: u16 = 4;
+pub const wire_version: u16 = 5;
 const fixed_header_len_v1 = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const fixed_header_len_v2 = fixed_header_len_v1 + 2;
 const fixed_header_len = fixed_header_len_v2 + 8;
@@ -30,7 +30,8 @@ pub const score_block_entries: usize = 1024;
 pub const max_routing_bytes: usize = 8 * 1024 * 1024;
 pub const max_score_node_id_bytes: usize = 4096;
 const routing_header_len = routing_magic.len + @sizeOf(u32);
-const routing_entry_fixed_len = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32);
+const routing_entry_fixed_len_v4 = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32);
+const routing_entry_fixed_len = routing_entry_fixed_len_v4 + std.crypto.hash.sha2.Sha256.digest_length;
 
 pub const Header = struct {
     version: u16,
@@ -59,6 +60,14 @@ pub const RoutingEntry = struct {
     first_node_id: []const u8,
     offset: u64,
     len: usize,
+    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0),
+};
+
+pub const ArtifactIntegrity = struct {
+    control_len: u32,
+    routing_footer_len: u32,
+    control_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    routing_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 pub const RoutingIndex = struct {
@@ -200,7 +209,7 @@ pub fn routingFooterLenFromTrailer(artifact_byte_len: u64, trailer: []const u8) 
 
 /// Decodes a routing footer whose node-id slices borrow from `footer`.
 pub fn decodeRoutingIndexAlloc(alloc: Allocator, footer: []const u8, artifact_byte_len: u64) !RoutingIndex {
-    return decodeRoutingIndexWithCancellationAlloc(alloc, footer, artifact_byte_len, .none);
+    return decodeRoutingIndexForVersionWithCancellationAlloc(alloc, footer, artifact_byte_len, wire_version, .none);
 }
 
 pub fn decodeRoutingIndexWithCancellationAlloc(
@@ -209,7 +218,18 @@ pub fn decodeRoutingIndexWithCancellationAlloc(
     artifact_byte_len: u64,
     cancellation: CancellationToken,
 ) !RoutingIndex {
+    return decodeRoutingIndexForVersionWithCancellationAlloc(alloc, footer, artifact_byte_len, wire_version, cancellation);
+}
+
+pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
+    alloc: Allocator,
+    footer: []const u8,
+    artifact_byte_len: u64,
+    segment_version: u16,
+    cancellation: CancellationToken,
+) !RoutingIndex {
     try cancellation.check();
+    if (segment_version < 4 or segment_version > wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     if (footer.len < routing_trailer_len) return error.InvalidGraphMetricSegment;
     const footer_len = try routingFooterLenFromTrailer(artifact_byte_len, footer[footer.len - routing_trailer_len ..]);
     if (footer_len != footer.len) return error.InvalidGraphMetricSegment;
@@ -217,7 +237,8 @@ pub fn decodeRoutingIndexWithCancellationAlloc(
     var pos: usize = 0;
     if (!std.mem.eql(u8, try take(footer, &pos, routing_magic.len), routing_magic)) return error.InvalidGraphMetricSegment;
     const entry_count = try readInt(u32, footer, &pos);
-    if (@as(usize, entry_count) > (footer.len - routing_header_len - routing_trailer_len) / routing_entry_fixed_len) {
+    const entry_fixed_len: usize = if (segment_version >= 5) routing_entry_fixed_len else routing_entry_fixed_len_v4;
+    if (@as(usize, entry_count) > (footer.len - routing_header_len - routing_trailer_len) / entry_fixed_len) {
         return error.InvalidGraphMetricSegment;
     }
     const entries = try alloc.alloc(RoutingEntry, entry_count);
@@ -229,6 +250,10 @@ pub fn decodeRoutingIndexWithCancellationAlloc(
         if (first_node_id_len == 0 or first_node_id_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
         const offset = try readInt(u64, footer, &pos);
         const len_u32 = try readInt(u32, footer, &pos);
+        var checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
+        if (segment_version >= 5) {
+            @memcpy(&checksum, try take(footer, &pos, checksum.len));
+        }
         if (len_u32 == 0) return error.InvalidGraphMetricSegment;
         const first_node_id = try take(footer, &pos, first_node_id_len);
         const end = std.math.add(u64, offset, len_u32) catch return error.InvalidGraphMetricSegment;
@@ -236,13 +261,39 @@ pub fn decodeRoutingIndexWithCancellationAlloc(
         if (entry_index > 0 and std.mem.order(u8, entries[entry_index - 1].first_node_id, first_node_id) != .lt) {
             return error.InvalidGraphMetricSegment;
         }
-        entry.* = .{ .first_node_id = first_node_id, .offset = offset, .len = len_u32 };
+        entry.* = .{ .first_node_id = first_node_id, .offset = offset, .len = len_u32, .checksum = checksum };
         previous_end = end;
     }
     if (pos + routing_trailer_len != footer.len) return error.InvalidGraphMetricSegment;
     if (entries.len > 0 and previous_end.? != footer_offset) return error.InvalidGraphMetricSegment;
     try cancellation.check();
     return .{ .entries = entries, .footer_offset = footer_offset };
+}
+
+pub fn artifactIntegrity(segment: types.Segment, payload: []const u8) !ArtifactIntegrity {
+    if (payload.len > std.math.maxInt(u32)) return error.GraphMetricSegmentTooLarge;
+    const control_len = try controlProbeLen(
+        payload.len,
+        segment.graph_index_name,
+        segment.metric_name,
+        segment.source_graph_artifact_id,
+        segment.source_graph_checksum,
+        segment.edge_filter,
+    );
+    const control = try decodeControl(payload[0..control_len], segment.edge_filter);
+    if (control.score_data_offset != control_len) return error.InvalidGraphMetricSegment;
+    if (payload.len < routing_trailer_len) return error.InvalidGraphMetricSegment;
+    const routing_len = try routingFooterLenFromTrailer(payload.len, payload[payload.len - routing_trailer_len ..]);
+    var control_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[0..control_len], &control_checksum, .{});
+    var routing_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[payload.len - routing_len ..], &routing_checksum, .{});
+    return .{
+        .control_len = @intCast(control_len),
+        .routing_footer_len = @intCast(routing_len),
+        .control_checksum = control_checksum,
+        .routing_checksum = routing_checksum,
+    };
 }
 
 pub fn decodeScoreBlockWithCancellation(block: []const u8, cancellation: CancellationToken) !DecodedScoreBlock {
@@ -419,6 +470,9 @@ pub fn encodeAllocWithCancellation(alloc: Allocator, segment: types.Segment, can
         putInt(u32, data, &pos, @intCast(first_node_id.len));
         putInt(u64, data, &pos, @intCast(block_offset));
         putInt(u32, data, &pos, @intCast(block_len));
+        var block_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data[block_offset..][0..block_len], &block_checksum, .{});
+        putBytes(data, &pos, &block_checksum);
         putBytes(data, &pos, first_node_id);
         block_offset += block_len;
     }
@@ -534,7 +588,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         initialized += 1;
     }
     if (version >= 4) {
-        try validateRoutingFooter(data, pos, scores, cancellation);
+        try validateRoutingFooter(data, pos, scores, version, cancellation);
     } else if (pos != data.len) return error.InvalidGraphMetricSegment;
     var segment = types.Segment{ .metadata_version = version, .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
@@ -597,7 +651,7 @@ fn routingEncodedSize(scores: []const types.Score) !usize {
     return size;
 }
 
-fn validateRoutingFooter(data: []const u8, footer_offset: usize, scores: []const types.Score, cancellation: CancellationToken) !void {
+fn validateRoutingFooter(data: []const u8, footer_offset: usize, scores: []const types.Score, version: u16, cancellation: CancellationToken) !void {
     try cancellation.check();
     if (footer_offset > data.len or data.len - footer_offset < routing_header_len + routing_trailer_len) {
         return error.InvalidGraphMetricSegment;
@@ -633,11 +687,20 @@ fn validateRoutingFooter(data: []const u8, footer_offset: usize, scores: []const
         const first_len = try readInt(u32, footer, &pos);
         const offset = try readInt(u64, footer, &pos);
         const encoded_block_len = try readInt(u32, footer, &pos);
+        var encoded_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
+        if (version >= 5) @memcpy(&encoded_checksum, try take(footer, &pos, encoded_checksum.len));
         const first = try take(footer, &pos, first_len);
         if (!std.mem.eql(u8, first, scores[score_start].node_id) or
             offset != expected_offset or encoded_block_len != block_len)
         {
             return error.InvalidGraphMetricSegment;
+        }
+        if (version >= 5) {
+            var actual_checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            const block_offset = std.math.cast(usize, offset) orelse return error.InvalidGraphMetricSegment;
+            if (block_offset > data.len or block_len > data.len - block_offset) return error.InvalidGraphMetricSegment;
+            std.crypto.hash.sha2.Sha256.hash(data[block_offset..][0..block_len], &actual_checksum, .{});
+            if (!std.mem.eql(u8, &actual_checksum, &encoded_checksum)) return error.InvalidGraphMetricSegment;
         }
         expected_offset += block_len;
     }
@@ -751,6 +814,11 @@ test "serverless graph metric routing resolves exact scores without decoding the
         "node:missing",
         .none,
     ));
+
+    const corrupted = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupted);
+    corrupted[@as(usize, @intCast(entry.offset)) + @sizeOf(u32)] ^= 0x01;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, decodeAlloc(alloc, corrupted));
 }
 
 test "serverless graph metric segment round trips terminal materialization rejection" {

@@ -47,6 +47,12 @@ pub const NamespaceQueryExecutionMetrics = struct {
     }
 };
 
+pub const AuthenticatedSubrange = struct {
+    relative_offset: usize,
+    len: usize,
+    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
 pub const QueryRuntime = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -311,6 +317,61 @@ pub const QuerySession = struct {
                 self.cancellation,
             );
         errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
+    /// Fetches a bounded range and authenticates every byte against digests
+    /// rooted in the published manifest or an already-authenticated routing
+    /// footer. Subranges must exactly and contiguously cover the response.
+    pub fn fetchArtifactAuthenticatedRangeAlloc(
+        self: *QuerySession,
+        index: usize,
+        offset: u64,
+        len: usize,
+        subranges: []const AuthenticatedSubrange,
+    ) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0 or subranges.len == 0) return error.InvalidArtifactRange;
+        var covered: usize = 0;
+        for (subranges) |subrange| {
+            if (subrange.len == 0 or subrange.relative_offset != covered) return error.InvalidArtifactRange;
+            covered = std.math.add(usize, covered, subrange.len) catch return error.InvalidArtifactRange;
+            if (covered > len) return error.InvalidArtifactRange;
+        }
+        if (covered != len) return error.InvalidArtifactRange;
+
+        const result = if (self.cache) |cache|
+            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                offset,
+                len,
+                self.cancellation,
+            )
+        else
+            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                offset,
+                len,
+                self.cancellation,
+            );
+        errdefer self.alloc.free(result);
+        if (result.len != len) return error.ArtifactIntegrityMismatch;
+        for (subranges, 0..) |subrange, subrange_index| {
+            if (subrange_index % 64 == 0) try self.checkCancellation();
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(
+                result[subrange.relative_offset..][0..subrange.len],
+                &actual,
+                .{},
+            );
+            if (!std.mem.eql(u8, &actual, &subrange.checksum)) return error.ArtifactIntegrityMismatch;
+        }
         try self.checkCancellation();
         return result;
     }
