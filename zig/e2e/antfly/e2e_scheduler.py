@@ -131,39 +131,63 @@ def _safe_group_name(prefix: str, identity: str) -> str:
     return f"{prefix}{readable}-{digest}"
 
 
-def _fixture_scope(item: pytest.Item, fixture_name: str) -> str | None:
+def _scope_name(scope: object) -> str:
+    """Normalize pytest's Scope enum and test doubles to their public names."""
+    return str(getattr(scope, "value", scope))
+
+
+def _fixture_definition(item: pytest.Item, fixture_name: str) -> object | None:
     fixture_info = getattr(item, "_fixtureinfo", None)
     definitions = (
         fixture_info.name2fixturedefs.get(fixture_name)
         if fixture_info is not None
         else None
     )
-    if not definitions:
+    return definitions[-1] if definitions else None
+
+
+def _effective_fixture_scope(
+    item: pytest.Item,
+    fixture_name: str,
+    definition: object,
+) -> str:
+    """Return the cache scope pytest will actually use for this item."""
+    callspec = getattr(item, "callspec", None)
+    parameter_scopes = getattr(callspec, "_arg2scope", {})
+    if fixture_name in parameter_scopes:
+        return _scope_name(parameter_scopes[fixture_name])
+    return _scope_name(definition.scope)  # type: ignore[attr-defined]
+
+
+def _fixture_scope(item: pytest.Item, fixture_name: str) -> str | None:
+    definition = _fixture_definition(item, fixture_name)
+    if definition is None:
         return None
-    return str(definitions[-1].scope)
+    return _effective_fixture_scope(item, fixture_name, definition)
 
 
 def _fixture_resource_declarations(
     item: pytest.Item,
-) -> list[tuple[str, object, object, str, str, str]]:
+) -> list[tuple[str, object, object, str, str, str, str]]:
     """Return resource declarations attached to fixtures used by an item."""
     fixture_info = getattr(item, "_fixtureinfo", None)
     if fixture_info is None:
         return []
 
-    declarations: list[tuple[str, object, object, str, str, str]] = []
+    declarations: list[tuple[str, object, object, str, str, str, str]] = []
     for fixture_name in item.fixturenames:
         definitions = fixture_info.name2fixturedefs.get(fixture_name)
         if not definitions:
             continue
         definition = definitions[-1]
         function = getattr(definition, "func", None)
-        base_id = str(getattr(definition, "baseid", ""))
-        if not base_id:
+        fixture_base_id = str(getattr(definition, "baseid", ""))
+        provenance_base_id = fixture_base_id
+        if not provenance_base_id:
             module = str(getattr(function, "__module__", ""))
             qualified_name = str(getattr(function, "__qualname__", fixture_name))
-            base_id = f"{module}.{qualified_name}"
-        provenance = f"{base_id}:{fixture_name}"
+            provenance_base_id = f"{module}.{qualified_name}"
+        provenance = f"{provenance_base_id}:{fixture_name}"
         default_identity = (
             f"{fixture_name}."
             f"{hashlib.sha1(provenance.encode('utf-8')).hexdigest()[:10]}"
@@ -175,8 +199,9 @@ def _fixture_resource_declarations(
                     lifetime,
                     identity,
                     fixture_name,
-                    str(definition.scope),
+                    _effective_fixture_scope(item, fixture_name, definition),
                     default_identity,
+                    fixture_base_id,
                 )
             )
     return declarations
@@ -190,6 +215,12 @@ def scheduling_group(item: pytest.Item) -> str:
         scope
         for fixture_name in ANTFLY_PROCESS_FIXTURES.intersection(item.fixturenames)
         if (scope := _fixture_scope(item, fixture_name)) is not None
+    }
+    package_boundaries = {
+        str(getattr(definition, "baseid", "")) or "."
+        for fixture_name in ANTFLY_PROCESS_FIXTURES.intersection(item.fixturenames)
+        if (definition := _fixture_definition(item, fixture_name)) is not None
+        and _effective_fixture_scope(item, fixture_name, definition) == "package"
     }
     persistent_processes = {
         fixture_name
@@ -214,6 +245,7 @@ def scheduling_group(item: pytest.Item) -> str:
             None,
             None,
             "",
+            "",
         )
         for marker in item.iter_markers("e2e_resource")
     ]
@@ -225,6 +257,7 @@ def scheduling_group(item: pytest.Item) -> str:
         fixture_name,
         fixture_scope,
         default_identity,
+        fixture_base_id,
     ) in resource_declarations:
         if resource_name != "antfly_process":
             continue
@@ -234,6 +267,8 @@ def scheduling_group(item: pytest.Item) -> str:
         declared_process = True
         if fixture_scope is not None:
             declared_process_scopes.add(fixture_scope)
+            if fixture_scope == "package":
+                package_boundaries.add(fixture_base_id or ".")
         if fixture_scope == "session" and lifetime is None:
             lifetime = "session"
         if lifetime == "session" and identity is None and fixture_name is not None:
@@ -272,13 +307,21 @@ def scheduling_group(item: pytest.Item) -> str:
     # process fixtures already provide complete test isolation.
     module_shared = reuse_process and not force_fresh
     module_shared = module_shared or any(
-        scope in {"module", "package", "session"} for scope in process_scopes
+        scope in {"module", "session"} for scope in process_scopes
     )
     module_shared = module_shared or bool(persistent_processes)
     module_shared = module_shared or shared_external
-    boundary = (
-        "module" if module_shared else "class" if "class" in process_scopes else "test"
+    class_id = (
+        nodeid.rsplit("::", 1)[0] if getattr(item, "cls", None) is not None else None
     )
+    if package_boundaries:
+        boundary = "package"
+    elif module_shared:
+        boundary = "module"
+    elif "class" in process_scopes and class_id is not None:
+        boundary = "class"
+    else:
+        boundary = "test"
     explicit_group: str | None = None
     if isolation is not None:
         policy = str(isolation.args[0]) if isolation.args else "module"
@@ -293,8 +336,16 @@ def scheduling_group(item: pytest.Item) -> str:
         identity = explicit_group
     elif boundary == "module":
         identity = module_id
+    elif boundary == "package":
+        # The shallowest applicable package owns every nested package fixture
+        # too, so grouping at it preserves all package-scoped lifecycles.
+        identity = min(
+            package_boundaries,
+            key=lambda package: (package.count("/"), len(package), package),
+        )
     elif boundary == "class":
-        identity = nodeid.rsplit("::", 1)[0]
+        assert class_id is not None
+        identity = class_id
     else:
         identity = nodeid
     kind = f"{boundary}--"
@@ -587,11 +638,15 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         # Keep session processes on separate workers when an idle clean worker
         # is available. This preserves parallel execution without changing the
         # slot bound; consolidation onto one worker remains the fallback.
+        reserved_process_slots = self._reserved_process_slots()
         return any(
             candidate is not node
             and not candidate.shutting_down
             and not self._persistent_processes.get(candidate)
             and self._pending_of(self.assigned_work[candidate]) == 0
+            and reserved_process_slots
+            + self._additional_process_slots(candidate, scope)
+            <= self.process_slots
             for candidate in self.nodes
         )
 
@@ -692,6 +747,42 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 node.shutdown()
             return
         if pending == 1:
+            # A lightweight worker with one queued item can wait for a process
+            # slot: assigning it the newly eligible unit will also unblock its
+            # current item. Do not discard every clean successor while a
+            # session owner is draining. If a persistent reservation is the
+            # blocker, start rotating that owner now.
+            if not self._workload_uses_process(
+                self.assigned_work[node]
+            ) and not self._persistent_processes.get(node):
+                transient_release_pending = any(
+                    candidate is not node
+                    and self._workload_uses_transient_process(workload)
+                    for candidate, workload in self.assigned_work.items()
+                )
+                persistent_owners = [
+                    candidate
+                    for candidate in self.nodes
+                    if candidate is not node
+                    and not candidate.shutting_down
+                    and self._persistent_processes.get(candidate)
+                ]
+                owner_can_continue = any(
+                    self._next_eligible_scope(candidate) is not None
+                    for candidate in persistent_owners
+                )
+                if transient_release_pending or owner_can_continue:
+                    return
+                persistent_retirement_in_flight = any(
+                    self._persistent_processes.get(candidate)
+                    for candidate in self._retiring_nodes
+                )
+                if not persistent_retirement_in_flight:
+                    persistent_owner = next(iter(persistent_owners), None)
+                    if persistent_owner is not None:
+                        self._retiring_nodes.add(persistent_owner)
+                        persistent_owner.shutdown()
+                return
             self._retiring_nodes.add(node)
             node.shutdown()
 

@@ -43,6 +43,8 @@ class FakeItem:
         fixtures: dict[str, str] | None = None,
         fixture_baseids: dict[str, str] | None = None,
         fixture_functions: dict[str, object] | None = None,
+        fixture_parameter_scopes: dict[str, str] | None = None,
+        test_class: bool = False,
         markers: list[pytest.Mark] | None = None,
         params: dict[str, object] | None = None,
     ):
@@ -60,8 +62,15 @@ class FakeItem:
             definition.baseid = (fixture_baseids or {}).get(name, "")
             definition.func = (fixture_functions or {}).get(name)
         self._markers = markers or []
-        if params is not None:
-            self.callspec = SimpleNamespace(params=params)
+        self.cls = object() if test_class else None
+        if params is not None or fixture_parameter_scopes:
+            self.callspec = SimpleNamespace(
+                params=params or {},
+                _arg2scope={
+                    name: SimpleNamespace(value=scope)
+                    for name, scope in (fixture_parameter_scopes or {}).items()
+                },
+            )
 
     def iter_markers(self, name: str):
         return (mark for mark in self._markers if mark.name == name)
@@ -115,6 +124,13 @@ def declared_class_process_fixture() -> None:
     """Exercise class-level process isolation without module serialization."""
 
 
+@pytest.fixture(scope="function")
+@e2e_resource("antfly_process")
+def declared_parametrized_process_fixture(request: pytest.FixtureRequest) -> object:
+    """Exercise pytest's per-param effective scope metadata."""
+    return request.param
+
+
 def test_normalize_nodeid_only_removes_xdist_group_suffix() -> None:
     assert normalize_nodeid("test_a.py::test_case@group") == "test_a.py::test_case"
     assert normalize_nodeid("test_a.py::test_case[user@example.com]") == (
@@ -155,14 +171,17 @@ def test_class_scoped_process_fixture_stays_class_grouped() -> None:
     first = FakeItem(
         "test_custom.py::TestProcess::test_first",
         fixtures={"backup_api": "class"},
+        test_class=True,
     )
     second = FakeItem(
         "test_custom.py::TestProcess::test_second",
         fixtures={"backup_api": "class"},
+        test_class=True,
     )
     unrelated = FakeItem(
         "test_custom.py::TestOtherProcess::test_first",
         fixtures={"backup_api": "class"},
+        test_class=True,
     )
 
     first_group = scheduling_group(first)  # type: ignore[arg-type]
@@ -172,6 +191,123 @@ def test_class_scoped_process_fixture_stays_class_grouped() -> None:
     assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}class--")
     assert first_group == second_group
     assert first_group != unrelated_group
+
+
+def test_class_scoped_process_fixture_outside_class_stays_test_grouped() -> None:
+    first = FakeItem(
+        "test_custom.py::test_first",
+        fixtures={"backup_api": "class"},
+    )
+    second = FakeItem(
+        "test_custom.py::test_second",
+        fixtures={"backup_api": "class"},
+    )
+
+    first_group = scheduling_group(first)  # type: ignore[arg-type]
+    second_group = scheduling_group(second)  # type: ignore[arg-type]
+
+    assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}test--")
+    assert first_group != second_group
+
+
+def test_package_scoped_process_fixture_stays_package_grouped() -> None:
+    @e2e_resource("antfly_process")
+    def package_runtime() -> None:
+        pass
+
+    first = FakeItem(
+        "pkg/test_first.py::test_process",
+        fixtures={"runtime": "package"},
+        fixture_baseids={"runtime": "pkg"},
+        fixture_functions={"runtime": package_runtime},
+    )
+    second = FakeItem(
+        "pkg/test_second.py::test_process",
+        fixtures={"runtime": "package"},
+        fixture_baseids={"runtime": "pkg"},
+        fixture_functions={"runtime": package_runtime},
+    )
+    unrelated = FakeItem(
+        "other/test_process.py::test_process",
+        fixtures={"runtime": "package"},
+        fixture_baseids={"runtime": "other"},
+        fixture_functions={"runtime": package_runtime},
+    )
+
+    first_group = scheduling_group(first)  # type: ignore[arg-type]
+    second_group = scheduling_group(second)  # type: ignore[arg-type]
+    unrelated_group = scheduling_group(unrelated)  # type: ignore[arg-type]
+
+    assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}package--")
+    assert first_group == second_group
+    assert first_group != unrelated_group
+
+
+def test_root_package_process_fixtures_share_root_boundary() -> None:
+    @e2e_resource("antfly_process")
+    def first_runtime() -> None:
+        pass
+
+    @e2e_resource("antfly_process")
+    def second_runtime() -> None:
+        pass
+
+    first = FakeItem(
+        "test_first.py::test_process",
+        fixtures={"first_runtime": "package"},
+        fixture_functions={"first_runtime": first_runtime},
+    )
+    second = FakeItem(
+        "test_second.py::test_process",
+        fixtures={"second_runtime": "package"},
+        fixture_functions={"second_runtime": second_runtime},
+    )
+
+    first_group = scheduling_group(first)  # type: ignore[arg-type]
+    second_group = scheduling_group(second)  # type: ignore[arg-type]
+
+    assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}package--")
+    assert first_group == second_group
+
+
+def test_effective_parameter_scope_overrides_fixture_definition_scope() -> None:
+    @e2e_resource("antfly_process")
+    def declared_runtime() -> None:
+        pass
+
+    widened_first = FakeItem(
+        "test_custom.py::test_first[value]",
+        fixtures={"stateful_api": "function"},
+        fixture_parameter_scopes={"stateful_api": "module"},
+    )
+    widened_second = FakeItem(
+        "test_custom.py::test_second[value]",
+        fixtures={"stateful_api": "function"},
+        fixture_parameter_scopes={"stateful_api": "module"},
+    )
+    narrowed = FakeItem(
+        "test_custom.py::test_narrowed[value]",
+        fixtures={"serverless_runtime": "session"},
+        fixture_parameter_scopes={"serverless_runtime": "function"},
+    )
+    narrowed_declaration = FakeItem(
+        "test_custom.py::test_declared_narrowed[value]",
+        fixtures={"runtime": "session"},
+        fixture_functions={"runtime": declared_runtime},
+        fixture_parameter_scopes={"runtime": "function"},
+    )
+
+    first_group = scheduling_group(widened_first)  # type: ignore[arg-type]
+    second_group = scheduling_group(widened_second)  # type: ignore[arg-type]
+    narrowed_group = scheduling_group(narrowed)  # type: ignore[arg-type]
+    narrowed_declaration_group = scheduling_group(  # type: ignore[arg-type]
+        narrowed_declaration
+    )
+
+    assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}module--")
+    assert first_group == second_group
+    assert narrowed_group.startswith(f"{PROCESS_GROUP_PREFIX}test--")
+    assert narrowed_declaration_group.startswith(f"{PROCESS_GROUP_PREFIX}test--")
 
 
 def test_explicit_isolation_and_resource_override_fixture_inference() -> None:
@@ -255,6 +391,34 @@ class TestFixtureResourceClassScope:
 
         assert len(groups) == 1
         assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}class--")
+
+
+def test_real_class_scoped_fixture_outside_class_uses_test_group(
+    request: pytest.FixtureRequest,
+    declared_class_process_fixture: None,
+) -> None:
+    del declared_class_process_fixture
+    groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+    assert len(groups) == 1
+    assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}test--")
+
+
+@pytest.mark.parametrize(
+    "declared_parametrized_process_fixture",
+    [None],
+    indirect=True,
+    scope="module",
+)
+def test_real_effective_parameter_scope_is_used(
+    request: pytest.FixtureRequest,
+    declared_parametrized_process_fixture: object,
+) -> None:
+    del declared_parametrized_process_fixture
+    groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+    assert len(groups) == 1
+    assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}module--")
 
 
 def test_inferred_session_identity_includes_fixture_provenance() -> None:
@@ -595,6 +759,28 @@ def test_new_session_identity_prefers_idle_clean_worker(tmp_path: Path) -> None:
     assert scheduler._next_eligible_scope(clean) == embedded_scope
 
 
+def test_session_owner_adds_identity_when_clean_worker_cannot_fit_scope(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    clean = FakeWorker()
+    combined_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}embedded_standalone_runtime+"
+        "serverless_runtime--module--combined"
+    )
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {owner: {}, clean: {}}
+    scheduler.workqueue = OrderedDict(
+        {combined_scope: {"test_combined.py::test_next": False}}
+    )
+
+    assert scheduler._next_eligible_scope(owner) == combined_scope
+    assert scheduler._next_eligible_scope(clean) is None
+
+
 def test_assigning_session_process_makes_worker_reservation_sticky(
     tmp_path: Path,
 ) -> None:
@@ -673,6 +859,101 @@ def test_idle_worker_waits_while_session_owner_rotates_to_release_slot(
 
     assert scheduler.remove_node(owner) is None
     assert waiter.sent == [[0]]
+
+
+def test_lightweight_runway_preserves_successor_for_session_rotation(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker(exitstatus=0)
+    successor = FakeWorker()
+    completed_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--done"
+    )
+    transient_scope = f"{PROCESS_GROUP_PREFIX}test--waiting"
+    waiting_nodeid = "test_process.py::test_waiting"
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {completed_scope: {"test_serverless.py::test_done": True}},
+        successor: {"light--test--queued": {"test_light.py::test_queued": False}},
+    }
+    scheduler.workqueue = OrderedDict({transient_scope: {waiting_nodeid: False}})
+    scheduler.registered_collections = {
+        successor: ["test_light.py::test_queued", waiting_nodeid]
+    }
+
+    scheduler._reschedule(successor)
+
+    assert owner.shutting_down
+    assert owner in scheduler._retiring_nodes
+    assert not successor.shutting_down
+
+    assert scheduler.remove_node(owner) is None
+    assert successor.sent == [[1]]
+
+
+def test_lightweight_runway_waits_for_transient_slot_release(tmp_path: Path) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    active = FakeWorker()
+    successor = FakeWorker()
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {},
+        active: {
+            f"{PROCESS_GROUP_PREFIX}test--active": {
+                "test_process.py::test_active": False
+            }
+        },
+        successor: {"light--test--queued": {"test_light.py::test_queued": False}},
+    }
+    scheduler.workqueue = OrderedDict(
+        {
+            f"{PROCESS_GROUP_PREFIX}test--waiting": {
+                "test_process.py::test_waiting": False
+            }
+        }
+    )
+
+    scheduler._reschedule(successor)
+
+    assert not owner.shutting_down
+    assert not successor.shutting_down
+    assert scheduler._retiring_nodes == set()
+
+
+def test_lightweight_runway_waits_when_session_owner_can_continue(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    successor = FakeWorker()
+    matching_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--next"
+    )
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {},
+        successor: {"light--test--queued": {"test_light.py::test_queued": False}},
+    }
+    scheduler.workqueue = OrderedDict(
+        {matching_scope: {"test_serverless.py::test_next": False}}
+    )
+
+    scheduler._reschedule(successor)
+
+    assert not owner.shutting_down
+    assert not successor.shutting_down
+    assert scheduler._retiring_nodes == set()
 
 
 def test_intentionally_retired_worker_requeues_only_incomplete_work(
