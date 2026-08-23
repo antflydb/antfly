@@ -710,7 +710,7 @@ pub const HttpHandler = struct {
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
             error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
-            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 metrics, 64 edge types per filter, and 128-byte metric names)"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, and 128-byte metric names)"),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -756,7 +756,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("table index list encode failed table={s} err={}", .{ table_name, err });
@@ -774,7 +774,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -790,11 +790,15 @@ pub const HttpHandler = struct {
         self: *HttpHandler,
         table_name: []const u8,
         indexes_json: []const u8,
+        only_index_name: ?[]const u8,
     ) ![]ServerlessGraphMetricStatus {
         const specs = try build_mod.graph_metric_config.parseIndexSpecsAlloc(self.alloc, indexes_json);
         defer build_mod.graph_metric_config.freeIndexSpecs(self.alloc, specs);
         var status_count: usize = 0;
-        for (specs) |spec| status_count = std.math.add(usize, status_count, spec.configs.len) catch return error.OutOfMemory;
+        for (specs) |spec| {
+            if (only_index_name) |name| if (!std.mem.eql(u8, spec.index_name, name)) continue;
+            status_count = std.math.add(usize, status_count, spec.configs.len) catch return error.OutOfMemory;
+        }
         if (status_count == 0) return try self.alloc.alloc(ServerlessGraphMetricStatus, 0);
 
         const statuses = try self.alloc.alloc(ServerlessGraphMetricStatus, status_count);
@@ -819,6 +823,7 @@ pub const HttpHandler = struct {
         defer if (maybe_session) |*session| session.deinit();
 
         for (specs) |spec| {
+            if (only_index_name) |name| if (!std.mem.eql(u8, spec.index_name, name)) continue;
             for (spec.configs) |config| {
                 const owned_index_name = try self.alloc.dupe(u8, spec.index_name);
                 var index_name_moved = false;
@@ -845,8 +850,19 @@ pub const HttpHandler = struct {
                     const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name);
                     if (graph_index != null and metric_index != null) {
                         const metric_ref = session.artifactRef(metric_index.?).?;
-                        const prefix_len: usize = @intCast(@min(metric_ref.byte_len, 1024 * 1024));
-                        const prefix = session.fetchArtifactRangeAlloc(metric_index.?, 0, prefix_len) catch null;
+                        const verified = blk: {
+                            session.verifyArtifact(metric_index.?) catch break :blk false;
+                            break :blk true;
+                        };
+                        const prefix_len: usize = @intCast(@min(metric_ref.byte_len, graph_metric_status_prefix_bytes));
+                        const prefix = if (verified)
+                            // Use a dedicated integrity-seeded block cache key,
+                            // never a legacy range entry that may have been
+                            // populated before status reads authenticated the
+                            // object against its manifest identity.
+                            session.fetchArtifactBlockRangeAlloc(metric_index.?, query_mod.cache.graph_metric_status_header_block_id, 0, prefix_len) catch null
+                        else
+                            null;
                         if (prefix) |payload| {
                             defer self.alloc.free(payload);
                             if (graph_metric_segment_mod.decodeHeader(payload)) |header| {
@@ -910,7 +926,7 @@ pub const HttpHandler = struct {
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
-            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 metrics, 64 edge types per filter, and 128-byte metric names)"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, and 128-byte metric names)"),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -5192,7 +5208,7 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json) catch return error.InternalFailure;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null) catch return error.InternalFailure;
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         return encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch return error.InternalFailure;
     }
@@ -5210,7 +5226,7 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json) catch return error.InternalFailure;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name) catch return error.InternalFailure;
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         return (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch return error.InternalFailure) orelse error.NotFound;
     }
@@ -6360,6 +6376,10 @@ const GraphMetricMaterializationState = enum {
     stale,
     unavailable,
 };
+
+// Policy-bounded graph/metric names plus SHA-256 provenance fit comfortably
+// in this prefix; score vectors remain out of the control-plane status path.
+const graph_metric_status_prefix_bytes: u64 = 4096;
 
 const ServerlessGraphMetricStatus = struct {
     index_name: []u8,

@@ -34,6 +34,7 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const graph_metric_config = @import("graph_metric_config.zig");
+const graph_metric_policy = @import("graph_metric_policy.zig");
 const lake_graph_metric = @import("lake_graph_metric.zig");
 const publication_plan = @import("publication_plan.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
@@ -3448,6 +3449,8 @@ fn buildGraphMetricArtifactRefsAlloc(
         try alloc.alloc(graph_metric_config.IndexSpec, 0);
     defer graph_metric_config.freeIndexSpecs(alloc, previous_specs);
 
+    const graph_metric_limits = lake_graph_metric.Limits{};
+    var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
     for (specs) |spec| {
         try cancellation.check();
         const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
@@ -3489,14 +3492,15 @@ fn buildGraphMetricArtifactRefsAlloc(
             continue;
         }
 
-        const built = lake_graph_metric.publishManyFromGraphArtifactAlloc(
+        const built = lake_graph_metric.publishManyFromGraphArtifactWithBudgetAlloc(
             alloc,
             artifacts,
             spec.index_name,
             graph_ref,
             spec.configs,
             cancellation,
-            .{},
+            graph_metric_limits,
+            &graph_metric_budget,
         ) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                 alloc,
@@ -3506,7 +3510,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                 spec.configs,
                 cancellation,
                 .build_budget_exceeded,
-                .{},
+                graph_metric_limits,
             ),
             else => return err,
         };

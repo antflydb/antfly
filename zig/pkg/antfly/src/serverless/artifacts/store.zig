@@ -264,16 +264,22 @@ pub const ArtifactStore = struct {
     ) !void {
         try cancellation.check();
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch return error.ArtifactIntegrityMismatch;
+
+        // A backend verifier owns the complete identity, length, and content
+        // check. Calling stat here as well would duplicate provider HEADs on
+        // every verification and defeat backend identity caches.
+        if (self.vtable.verify_content) |verify_content| {
+            try verify_content(self.ptr, result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+            return;
+        }
+
+        // Portable backends without a native verifier first validate the
+        // declared metadata, then hash bounded ranges below.
         var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
         defer metadata.deinit(result_alloc);
         if (metadata.byte_len != expected_byte_len or
             !std.mem.eql(u8, metadata.artifact_id, artifact_id) or
             !std.mem.eql(u8, metadata.checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
-
-        if (self.vtable.verify_content) |verify_content| {
-            try verify_content(self.ptr, result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
-            return;
-        }
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         const chunk_bytes: usize = 8 * 1024 * 1024;

@@ -30,6 +30,7 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 const lake_sidecar_algebraic = @import("lake_sidecar_algebraic.zig");
 const lake_sidecar_graph = @import("lake_sidecar_graph.zig");
 const graph_metric_config = @import("graph_metric_config.zig");
+const graph_metric_policy = @import("graph_metric_policy.zig");
 const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
 const lake_graph_metric = @import("lake_graph_metric.zig");
 const lake_sidecar_sparse = @import("lake_sidecar_sparse.zig");
@@ -549,6 +550,8 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     try declarations.ensureUnusedCapacity(alloc, base_declarations.len);
     for (base_declarations) |declaration| declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
 
+    const graph_metric_limits = lake_graph_metric.Limits{};
+    var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
     for (specs) |spec| {
         const graph_declaration = findDeclaration(base_declarations, spec.index_name) orelse continue;
         if (graph_declaration.binding.sidecar_kind != .graph or graph_declaration.artifact.kind != .graph_segment) return error.SidecarArtifactKindMismatch;
@@ -588,14 +591,15 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             continue;
         }
 
-        const built = lake_graph_metric.publishManyFromGraphArtifactAlloc(
+        const built = lake_graph_metric.publishManyFromGraphArtifactWithBudgetAlloc(
             alloc,
             artifacts,
             spec.index_name,
             graph_declaration.artifact,
             spec.configs,
             .none,
-            .{},
+            graph_metric_limits,
+            &graph_metric_budget,
         ) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                 alloc,
@@ -605,7 +609,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 spec.configs,
                 .none,
                 .build_budget_exceeded,
-                .{},
+                graph_metric_limits,
             ),
             else => return err,
         };

@@ -47,6 +47,7 @@ pub fn parseIndexSpecsAlloc(alloc: Allocator, indexes_json: []const u8) ![]Index
     if (parsed.value != .object) return error.InvalidIndexConfig;
 
     var specs = std.ArrayListUnmanaged(IndexSpec).empty;
+    var total_metric_count: usize = 0;
     errdefer {
         for (specs.items) |*spec| spec.deinit(alloc);
         specs.deinit(alloc);
@@ -66,6 +67,13 @@ pub fn parseIndexSpecsAlloc(alloc: Allocator, indexes_json: []const u8) ![]Index
             configs_moved = true;
             continue;
         }
+        const limits = graph_metric_policy.Limits{};
+        if (entry.key_ptr.*.len == 0 or entry.key_ptr.*.len > limits.max_graph_index_name_bytes) {
+            return error.GraphMetricConfigurationLimitExceeded;
+        }
+        total_metric_count = std.math.add(usize, total_metric_count, configs.len) catch
+            return error.GraphMetricConfigurationLimitExceeded;
+        try graph_metric_policy.validateCatalogFanout(specs.items.len + 1, total_metric_count, limits);
         const index_name = try alloc.dupe(u8, entry.key_ptr.*);
         var spec = IndexSpec{ .index_name = index_name, .configs = configs };
         configs_moved = true;

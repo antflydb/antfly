@@ -10,20 +10,27 @@
 
 const std = @import("std");
 const graph_mod = @import("../../graph/graph.zig");
+const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
 pub const materializer_epoch: u32 = 1;
 
 pub const Limits = struct {
-    max_graph_payload_bytes: usize = 512 * 1024 * 1024,
+    // Keep graph admission aligned with the decoder and query-runtime
+    // artifact contract. Larger topology artifacts cannot be served safely by
+    // this runtime and are represented by durable rejected metric sidecars.
+    max_graph_payload_bytes: usize = (bounded_decode.Limits{}).max_artifact_bytes,
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
     max_nodes: usize = 1_000_000,
     max_edges: usize = 10_000_000,
     max_work_items: u64 = 500_000_000,
     max_total_work_items: u64 = 1_000_000_000,
+    max_graph_indexes: usize = 16,
     max_metrics: usize = 16,
+    max_total_metrics: usize = 64,
+    max_graph_index_name_bytes: usize = 256,
     max_edge_filter_types: usize = 64,
     max_metric_name_bytes: usize = 128,
     max_edge_type_bytes: usize = 256,
@@ -51,18 +58,29 @@ pub const Budget = struct {
 
 pub fn validateLimits(limits: Limits) !void {
     if (limits.max_graph_payload_bytes == 0 or
+        limits.max_graph_payload_bytes > (bounded_decode.Limits{}).max_artifact_bytes or
         limits.max_metric_payload_bytes == 0 or
         limits.max_total_metric_payload_bytes == 0 or
         limits.max_nodes == 0 or
         limits.max_edges == 0 or
         limits.max_work_items == 0 or
         limits.max_total_work_items == 0 or
+        limits.max_graph_indexes == 0 or
         limits.max_metrics == 0 or
+        limits.max_total_metrics == 0 or
+        limits.max_graph_index_name_bytes == 0 or
         limits.max_edge_filter_types == 0 or
         limits.max_metric_name_bytes == 0 or
         limits.max_edge_type_bytes == 0)
     {
         return error.InvalidGraphMetricBuildOptions;
+    }
+}
+
+pub fn validateCatalogFanout(graph_index_count: usize, metric_count: usize, limits: Limits) !void {
+    try validateLimits(limits);
+    if (graph_index_count > limits.max_graph_indexes or metric_count > limits.max_total_metrics) {
+        return error.GraphMetricConfigurationLimitExceeded;
     }
 }
 
@@ -99,6 +117,22 @@ pub fn metricWorkItems(kind: graph_mod.GraphMetricKind, node_count: usize, edge_
     };
 }
 
+/// Total work charged for one materialization. Projection scans every source
+/// node and outbound edge once before the metric kernel sees the filtered
+/// graph, so those passes must be included in admission as well.
+pub fn materializationWorkItems(
+    kind: graph_mod.GraphMetricKind,
+    source_node_count: usize,
+    source_edge_count: usize,
+    projected_node_count: usize,
+    projected_edge_count: usize,
+    max_iterations: u32,
+) !u64 {
+    const projection = try workItems(source_node_count, source_edge_count, 1, 1);
+    const kernel = try metricWorkItems(kind, projected_node_count, projected_edge_count, max_iterations);
+    return std.math.add(u64, projection, kernel) catch error.GraphMetricBuildBudgetExceeded;
+}
+
 pub fn materializerFingerprint(limits: Limits) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hash(&hasher, materializer_epoch);
@@ -127,9 +161,26 @@ test "serverless graph metric policy bounds aggregate work and configuration fan
         error.GraphMetricConfigurationLimitExceeded,
         validateConfigs(&configs, .{ .max_metrics = 1 }),
     );
+    try std.testing.expectError(
+        error.GraphMetricConfigurationLimitExceeded,
+        validateCatalogFanout(2, 2, .{ .max_graph_indexes = 1 }),
+    );
+    try std.testing.expectError(
+        error.GraphMetricConfigurationLimitExceeded,
+        validateCatalogFanout(1, 2, .{ .max_total_metrics = 1 }),
+    );
 }
 
 test "serverless graph metric policy fingerprint changes with materialization limits" {
     const baseline = materializerFingerprint(.{});
     try std.testing.expect(baseline != materializerFingerprint(.{ .max_nodes = 999_999 }));
+}
+
+test "serverless graph metric graph admission cannot exceed decoder capacity" {
+    const decoder_limit = (bounded_decode.Limits{}).max_artifact_bytes;
+    try std.testing.expectEqual(decoder_limit, (Limits{}).max_graph_payload_bytes);
+    try std.testing.expectError(
+        error.InvalidGraphMetricBuildOptions,
+        validateLimits(.{ .max_graph_payload_bytes = decoder_limit + 1 }),
+    );
 }

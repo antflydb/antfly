@@ -237,6 +237,23 @@ pub const QuerySession = struct {
         return result;
     }
 
+    /// Authenticates an artifact against the manifest without materializing it
+    /// in the query allocator. Object and filesystem backends use their
+    /// bounded identity caches after the first full verification.
+    pub fn verifyArtifact(self: *QuerySession, index: usize) !void {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactForQuery(artifact);
+        try self.artifacts.verifyContentWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            artifact.byte_len,
+            artifact.checksum,
+            self.cancellation,
+        );
+        try self.checkCancellation();
+    }
+
     pub fn fetchArtifactRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
