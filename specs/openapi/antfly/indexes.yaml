@@ -3333,7 +3333,10 @@ components:
           type: string
           pattern: '^[0-9]+$'
           description: Decimal string so counts remain lossless in JavaScript.
-        exact: { type: boolean }
+        exact:
+          type: boolean
+          enum: [true]
+          description: Always true. Exact aggregate execution fails instead of returning a partial value.
     PatternMatch:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3366,7 +3369,7 @@ components:
       type: object
       additionalProperties: false
       required: [kind, rows, stats, took]
-      description: Complete projected bindings from a canonical graph MATCH query.
+      description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
         kind:
           type: string

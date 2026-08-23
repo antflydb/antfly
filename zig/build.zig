@@ -3792,6 +3792,8 @@ pub fn build(b: *std.Build) void {
         "graph merge enforces query-wide row limit and exact distinct identity",
         "graph merge rejects missing and inexact aggregate shards",
         "graph query dependency sorting enforces request-wide operation bounds",
+        "graph query dependency sorting accepts path result endpoints",
+        "stateful path results materialize endpoint nodes for result refs",
         "pattern response omits paths unless requested",
         "graph aggregate response preserves exact decimal counts",
         "graph aggregate response fails closed on missing or inexact results",

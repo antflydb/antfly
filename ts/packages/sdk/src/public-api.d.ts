@@ -12261,7 +12261,7 @@ export interface components {
             /** @description True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input. */
             truncated: boolean;
         };
-        /** @description Complete projected bindings from a canonical graph MATCH query. */
+        /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
         GraphBindingsResult: {
             /**
              * @description Stable discriminator for the graph result shape.
@@ -12279,7 +12279,11 @@ export interface components {
         GraphAggregateValue: {
             /** @description Decimal string so counts remain lossless in JavaScript. */
             value: string;
-            exact: boolean;
+            /**
+             * @description Always true. Exact aggregate execution fails instead of returning a partial value.
+             * @enum {boolean}
+             */
+            exact: true;
         };
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {

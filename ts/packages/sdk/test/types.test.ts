@@ -16,8 +16,12 @@ import type {
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
+  GraphAggregatesResult,
+  GraphBindingsResult,
   GraphDocumentFilter,
   GraphMatchQuery,
+  GraphNodesResult,
+  LegacyGraphQueryResult,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -195,13 +199,39 @@ describe("Antfly Query Type Integration", () => {
     });
 
     it("types pre-discriminator graph responses during the compatibility window", () => {
-      const legacy: components["schemas"]["GraphQueryResult"] = {
+      const legacy: LegacyGraphQueryResult = {
         type: "neighbors",
         total: 0,
       };
 
       expect(legacy.kind).toBeUndefined();
       expectTypeOf(legacy.kind).toEqualTypeOf<"legacy" | undefined>();
+    });
+
+    it("exports each canonical graph result variant", () => {
+      const bindings: GraphBindingsResult = {
+        kind: "bindings",
+        rows: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+      const aggregates: GraphAggregatesResult = {
+        kind: "aggregates",
+        aggregates: { count: { value: "0", exact: true } },
+        stats: { returned_items: 1, truncated: false },
+        took: 0,
+      };
+      const nodes: GraphNodesResult = {
+        kind: "nodes",
+        nodes: [],
+        paths: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+
+      expect(bindings.kind).toBe("bindings");
+      expect(aggregates.aggregates.count?.exact).toBe(true);
+      expect(nodes.kind).toBe("nodes");
     });
 
     it("rejects analyzer-backed and full-text range shapes in graph filters", () => {

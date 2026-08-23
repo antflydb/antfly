@@ -4341,6 +4341,7 @@ pub const GoogleGeneratorConfig = struct {
 pub const GraphAggregateValue = struct {
     /// Decimal string so counts remain lossless in JavaScript.
     value: []const u8,
+    /// Always true. Exact aggregate execution fails instead of returning a partial value.
     exact: bool,
 };
 
@@ -4420,7 +4421,7 @@ pub const GraphArtifactSourceConfig = struct {
     mention_edge_type: ?[]const u8 = null,
 };
 
-/// Complete projected bindings from a canonical graph MATCH query.
+/// A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
 pub const GraphBindingsResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,

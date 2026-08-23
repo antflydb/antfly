@@ -23292,7 +23292,8 @@ components:
         - rows
         - stats
         - took
-      description: Complete projected bindings from a canonical graph MATCH query.
+      description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query.
+        Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
         kind:
           type: string
@@ -23322,6 +23323,9 @@ components:
           description: Decimal string so counts remain lossless in JavaScript.
         exact:
           type: boolean
+          enum:
+            - true
+          description: Always true. Exact aggregate execution fails instead of returning a partial value.
     GraphAggregatesResult:
       x-go-type-skip-optional-pointer: true
       type: object

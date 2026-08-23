@@ -17,13 +17,14 @@ T = TypeVar("T", bound="GraphBindingsResult")
 
 @_attrs_define
 class GraphBindingsResult:
-    """Complete projected bindings from a canonical graph MATCH query.
+    """A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to
+    determine whether enumeration was exhaustive.
 
-    Attributes:
-        kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
-        rows (list[GraphResultRow]):
-        stats (GraphQueryStats):
-        took (int): Query execution time.
+        Attributes:
+            kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
+            rows (list[GraphResultRow]):
+            stats (GraphQueryStats):
+            took (int): Query execution time.
     """
 
     kind: GraphBindingsResultKind

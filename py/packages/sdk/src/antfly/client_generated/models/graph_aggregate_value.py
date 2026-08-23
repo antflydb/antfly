@@ -14,7 +14,7 @@ class GraphAggregateValue:
     """
     Attributes:
         value (str): Decimal string so counts remain lossless in JavaScript.
-        exact (bool):
+        exact (bool): Always true. Exact aggregate execution fails instead of returning a partial value.
     """
 
     value: str

@@ -26,10 +26,12 @@ import type {
   Edge,
   EdgeDirection,
   EdgeTypeConfig,
+  GraphNodesResult,
   GraphPathEndpoint,
   GraphQuery,
   GraphQueryResult,
   IndexStatus,
+  LegacyGraphQueryResult,
   PathWeightMode,
   QueryRequest,
 } from "@antfly/sdk";
@@ -57,15 +59,12 @@ type ExplorerEdge = GraphEdge & {
   pathEdge?: boolean;
 };
 
-type CanonicalGraphNodesResult = Extract<GraphQueryResult, { kind: "nodes" }>;
-type LegacyGraphResult = Extract<GraphQueryResult, { total: number }>;
-
 type GraphVisualizationWireResult = {
   kind?: "nodes" | "legacy";
   type?: string;
   nodes?: (
-    | CanonicalGraphNodesResult["nodes"][number]
-    | NonNullable<LegacyGraphResult["nodes"]>[number]
+    | GraphNodesResult["nodes"][number]
+    | NonNullable<LegacyGraphQueryResult["nodes"]>[number]
   )[];
   paths?: {
     nodes?: (string | { key: string; table?: string })[];

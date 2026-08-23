@@ -290,6 +290,35 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
     );
 }
 
+test "graph query dependency sorting accepts path result endpoints" {
+    const alloc = std.testing.allocator;
+    for ([_]graph_query_mod.QueryType{ .shortest_path, .k_shortest_paths }) |query_type| {
+        const queries = [_]types.NamedGraphQuery{
+            .{
+                .name = "dependent",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.path" } },
+                },
+            },
+            .{
+                .name = "path",
+                .query = .{
+                    .query_type = query_type,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{"doc:start"} },
+                    .target_nodes = .{ .keys = &.{"doc:end"} },
+                    .k = 1,
+                },
+            },
+        };
+        const sorted = try sortGraphQueriesByDependencies(alloc, &queries);
+        defer alloc.free(sorted);
+        try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, sorted);
+    }
+}
+
 pub fn executeGraphQueries(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -463,7 +492,7 @@ fn graphQueryDependencyIndex(
     const dep_index = by_name.get(dep_name) orelse return error.InvalidQueryRequest;
     const dependency = queries[dep_index].query;
     switch (dependency.query_type) {
-        .neighbors, .traverse => if (result_ref.binding != null) return error.InvalidQueryRequest,
+        .neighbors, .traverse, .shortest_path, .k_shortest_paths => if (result_ref.binding != null) return error.InvalidQueryRequest,
         .pattern => {
             const binding = result_ref.binding orelse return error.InvalidQueryRequest;
             if (dependency.match_pattern == null or dependency.aggregates.len > 0)
@@ -477,7 +506,6 @@ fn graphQueryDependencyIndex(
             }
             if (!returned) return error.InvalidQueryRequest;
         },
-        .shortest_path, .k_shortest_paths => return error.InvalidQueryRequest,
     }
     return dep_index;
 }
@@ -1403,17 +1431,7 @@ pub fn executeSingleNonPatternQueryWithSets(
             } else try alloc.alloc(types.GraphPath, 0);
             path = null;
             errdefer freeOwnedGraphPaths(alloc, paths);
-            const name = try alloc.dupe(u8, named.name);
-            errdefer alloc.free(name);
-            const hits = try alloc.alloc(types.SearchHit, 0);
-            return .{
-                .name = name,
-                .nodes = &.{},
-                .paths = paths,
-                .matches = &.{},
-                .hits = hits,
-                .total_hits = @intCast(paths.len),
-            };
+            return try buildPathGraphSearchResult(alloc, req, named, paths, executor);
         },
         .k_shortest_paths => {
             if (start_keys.len == 0 or target_keys.len == 0 or named.query.k == 0) {
@@ -1430,17 +1448,7 @@ pub fn executeSingleNonPatternQueryWithSets(
             if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
                 paths = try filterGraphPaths(alloc, req, paths, executor.ctx, executor.filter_keys);
             }
-            const name = try alloc.dupe(u8, named.name);
-            errdefer alloc.free(name);
-            const hits = try alloc.alloc(types.SearchHit, 0);
-            return .{
-                .name = name,
-                .nodes = &.{},
-                .paths = paths,
-                .matches = &.{},
-                .hits = hits,
-                .total_hits = @intCast(paths.len),
-            };
+            return try buildPathGraphSearchResult(alloc, req, named, paths, executor);
         },
         .pattern => return error.UnsupportedQueryRequest,
         else => {},
@@ -1501,6 +1509,52 @@ pub fn executeSingleNonPatternQueryWithSets(
         .matches = &.{},
         .hits = hits,
         .total_hits = total_hits,
+    };
+}
+
+fn buildPathGraphSearchResult(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    named: *const types.NamedGraphQuery,
+    paths: []types.GraphPath,
+    executor: NonPatternQueryExecutor,
+) !types.GraphSearchResult {
+    const nodes = if (paths.len > 0)
+        try alloc.alloc(graph_query_mod.GraphResultNode, paths.len)
+    else
+        @constCast((&[_]graph_query_mod.GraphResultNode{})[0..]);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |*node| node.deinit(alloc);
+        if (nodes.len > 0) alloc.free(nodes);
+    }
+    for (paths, 0..) |*path, i| {
+        nodes[i] = try graph_query_mod.pathToResultNode(alloc, path);
+        initialized_nodes += 1;
+    }
+
+    const hits = if (nodes.len > 0)
+        try alloc.alloc(types.SearchHit, nodes.len)
+    else
+        @constCast((&[_]types.SearchHit{})[0..]);
+    var initialized_hits: usize = 0;
+    errdefer {
+        for (hits[0..initialized_hits]) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    for (nodes, 0..) |node, i| {
+        hits[i] = try buildGraphNodeHit(alloc, req, named.query, node, executor);
+        initialized_hits += 1;
+    }
+
+    const name = try alloc.dupe(u8, named.name);
+    return .{
+        .name = name,
+        .nodes = nodes,
+        .paths = paths,
+        .matches = &.{},
+        .hits = hits,
+        .total_hits = @intCast(paths.len),
     };
 }
 
@@ -4749,6 +4803,129 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
     try std.testing.expect(result.hits[0].stored_data != null);
     try std.testing.expectEqualStrings("{\"title\":\"child\",\"body\":\"details about the architecture\"}", result.hits[0].stored_data.?);
+}
+
+test "stateful path results materialize endpoint nodes for result refs" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn makePath(alloc_inner: Allocator, source: []const u8, target: []const u8) !types.GraphPath {
+            const nodes = try alloc_inner.alloc([]const u8, 2);
+            errdefer alloc_inner.free(nodes);
+            nodes[0] = try alloc_inner.dupe(u8, source);
+            errdefer alloc_inner.free(nodes[0]);
+            nodes[1] = try alloc_inner.dupe(u8, target);
+            errdefer alloc_inner.free(nodes[1]);
+
+            const edges = try alloc_inner.alloc(paths_mod.PathEdge, 1);
+            errdefer alloc_inner.free(edges);
+            const edge_source = try alloc_inner.dupe(u8, source);
+            errdefer alloc_inner.free(edge_source);
+            const edge_target = try alloc_inner.dupe(u8, target);
+            errdefer alloc_inner.free(edge_target);
+            const edge_type = try alloc_inner.dupe(u8, "links");
+            errdefer alloc_inner.free(edge_type);
+            edges[0] = .{
+                .source = edge_source,
+                .target = edge_target,
+                .edge_type = edge_type,
+                .weight = 1,
+            };
+            return .{
+                .nodes = nodes,
+                .edges = edges,
+                .total_weight = 1,
+                .length = 1,
+            };
+        }
+
+        fn findShortestPath(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror!?types.GraphPath {
+            return try makePath(alloc_inner, source, target);
+        }
+
+        fn findKShortestPaths(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror![]types.GraphPath {
+            const paths = try alloc_inner.alloc(types.GraphPath, 1);
+            errdefer alloc_inner.free(paths);
+            paths[0] = try makePath(alloc_inner, source, target);
+            return paths;
+        }
+
+        fn executeGraphQuery(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const []const u8,
+            _: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            key: []const u8,
+        ) anyerror!?[]u8 {
+            try std.testing.expectEqualStrings("doc:end", key);
+            return try alloc_inner.dupe(u8, "{\"title\":\"endpoint\"}");
+        }
+    };
+
+    for ([_]graph_query_mod.QueryType{ .shortest_path, .k_shortest_paths }) |query_type| {
+        var named = types.NamedGraphQuery{
+            .name = "path",
+            .query = .{
+                .query_type = query_type,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"doc:start"} },
+                .target_nodes = .{ .keys = &.{"doc:end"} },
+                .k = 1,
+                .include_documents = true,
+            },
+        };
+        var result = try executeSingleNonPatternQueryWithSets(alloc, .{}, &named, &.{}, .{
+            .ctx = null,
+            .find_shortest_path = Harness.findShortestPath,
+            .find_k_shortest_paths = Harness.findKShortestPaths,
+            .execute_graph_query = Harness.executeGraphQuery,
+            .load_projected_document = Harness.loadProjectedDocument,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(@as(usize, 1), result.paths.len);
+        try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+        try std.testing.expectEqualStrings("doc:end", result.nodes[0].key);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("{\"title\":\"endpoint\"}", result.hits[0].stored_data.?);
+
+        const named_sets = [_]NamedResultSet{.{
+            .name = result.name,
+            .hits = result.hits,
+            .total_hits = result.total_hits,
+            .graph_result = &result,
+        }};
+        const resolved = try resolveGraphSelectorFromSets(
+            alloc,
+            .{ .result_ref = .{ .ref = "$graph_results.path" } },
+            &named_sets,
+            .{},
+        );
+        defer freeOwnedKeySlice(alloc, resolved);
+        try std.testing.expectEqual(@as(usize, 1), resolved.len);
+        try std.testing.expectEqualStrings("doc:end", resolved[0]);
+    }
 }
 
 test "executeSearchGraphWithSets preserves node ordinals" {
