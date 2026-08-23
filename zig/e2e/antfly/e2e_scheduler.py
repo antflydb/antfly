@@ -145,22 +145,39 @@ def _fixture_scope(item: pytest.Item, fixture_name: str) -> str | None:
 
 def _fixture_resource_declarations(
     item: pytest.Item,
-) -> list[tuple[str, object, object, str, str]]:
+) -> list[tuple[str, object, object, str, str, str]]:
     """Return resource declarations attached to fixtures used by an item."""
     fixture_info = getattr(item, "_fixtureinfo", None)
     if fixture_info is None:
         return []
 
-    declarations: list[tuple[str, object, object, str, str]] = []
+    declarations: list[tuple[str, object, object, str, str, str]] = []
     for fixture_name in item.fixturenames:
         definitions = fixture_info.name2fixturedefs.get(fixture_name)
         if not definitions:
             continue
         definition = definitions[-1]
         function = getattr(definition, "func", None)
+        base_id = str(getattr(definition, "baseid", ""))
+        if not base_id:
+            module = str(getattr(function, "__module__", ""))
+            qualified_name = str(getattr(function, "__qualname__", fixture_name))
+            base_id = f"{module}.{qualified_name}"
+        provenance = f"{base_id}:{fixture_name}"
+        default_identity = (
+            f"{fixture_name}."
+            f"{hashlib.sha1(provenance.encode('utf-8')).hexdigest()[:10]}"
+        )
         for name, lifetime, identity in getattr(function, E2E_RESOURCE_ATTRIBUTE, ()):
             declarations.append(
-                (str(name), lifetime, identity, fixture_name, str(definition.scope))
+                (
+                    str(name),
+                    lifetime,
+                    identity,
+                    fixture_name,
+                    str(definition.scope),
+                    default_identity,
+                )
             )
     return declarations
 
@@ -196,6 +213,7 @@ def scheduling_group(item: pytest.Item) -> str:
             marker.kwargs.get("identity"),
             None,
             None,
+            "",
         )
         for marker in item.iter_markers("e2e_resource")
     ]
@@ -206,6 +224,7 @@ def scheduling_group(item: pytest.Item) -> str:
         identity,
         fixture_name,
         fixture_scope,
+        default_identity,
     ) in resource_declarations:
         if resource_name != "antfly_process":
             continue
@@ -218,7 +237,7 @@ def scheduling_group(item: pytest.Item) -> str:
         if fixture_scope == "session" and lifetime is None:
             lifetime = "session"
         if lifetime == "session" and identity is None and fixture_name is not None:
-            identity = fixture_name
+            identity = default_identity
         if lifetime is None:
             if identity is not None:
                 raise pytest.UsageError(
@@ -249,14 +268,17 @@ def scheduling_group(item: pytest.Item) -> str:
     shared_external = item.get_closest_marker("postgres_integration") is not None
     isolation = item.get_closest_marker("e2e_isolation")
 
-    # A reusable runtime or any module/session fixture must stay on one worker.
-    # Function-scoped process fixtures already provide complete test isolation.
-    shared = reuse_process and not force_fresh
-    shared = shared or any(
+    # Preserve fixture sharing at the narrowest safe boundary. Function-scoped
+    # process fixtures already provide complete test isolation.
+    module_shared = reuse_process and not force_fresh
+    module_shared = module_shared or any(
         scope in {"module", "package", "session"} for scope in process_scopes
     )
-    shared = shared or bool(persistent_processes)
-    shared = shared or shared_external
+    module_shared = module_shared or bool(persistent_processes)
+    module_shared = module_shared or shared_external
+    boundary = (
+        "module" if module_shared else "class" if "class" in process_scopes else "test"
+    )
     explicit_group: str | None = None
     if isolation is not None:
         policy = str(isolation.args[0]) if isolation.args else "module"
@@ -264,11 +286,18 @@ def scheduling_group(item: pytest.Item) -> str:
             raise pytest.UsageError(
                 f"{nodeid}: e2e_isolation must be 'test' or 'module', got {policy!r}"
             )
-        shared = policy == "module"
+        boundary = policy
         if group := isolation.kwargs.get("group"):
             explicit_group = str(group)
-    identity = explicit_group or (module_id if shared else nodeid)
-    kind = "module--" if shared else "test--"
+    if explicit_group is not None:
+        identity = explicit_group
+    elif boundary == "module":
+        identity = module_id
+    elif boundary == "class":
+        identity = nodeid.rsplit("::", 1)[0]
+    else:
+        identity = nodeid
+    kind = f"{boundary}--"
     if persistent_processes:
         identities = "+".join(sorted(persistent_processes))
         transient_process = declared_transient_process or bool(

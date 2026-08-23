@@ -41,6 +41,8 @@ class FakeItem:
         nodeid: str,
         *,
         fixtures: dict[str, str] | None = None,
+        fixture_baseids: dict[str, str] | None = None,
+        fixture_functions: dict[str, object] | None = None,
         markers: list[pytest.Mark] | None = None,
         params: dict[str, object] | None = None,
     ):
@@ -53,6 +55,10 @@ class FakeItem:
                 for name, scope in fixture_scopes.items()
             }
         )
+        for name, definitions in self._fixtureinfo.name2fixturedefs.items():
+            definition = definitions[-1]
+            definition.baseid = (fixture_baseids or {}).get(name, "")
+            definition.func = (fixture_functions or {}).get(name)
         self._markers = markers or []
         if params is not None:
             self.callspec = SimpleNamespace(params=params)
@@ -103,6 +109,12 @@ def declared_module_process_fixture() -> None:
     """Exercise scope inference for a transient custom process fixture."""
 
 
+@pytest.fixture(scope="class")
+@e2e_resource("antfly_process")
+def declared_class_process_fixture() -> None:
+    """Exercise class-level process isolation without module serialization."""
+
+
 def test_normalize_nodeid_only_removes_xdist_group_suffix() -> None:
     assert normalize_nodeid("test_a.py::test_case@group") == "test_a.py::test_case"
     assert normalize_nodeid("test_a.py::test_case[user@example.com]") == (
@@ -137,6 +149,29 @@ def test_reused_or_session_process_fixture_stays_module_grouped() -> None:
     assert session_group.startswith(
         f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--"
     )
+
+
+def test_class_scoped_process_fixture_stays_class_grouped() -> None:
+    first = FakeItem(
+        "test_custom.py::TestProcess::test_first",
+        fixtures={"backup_api": "class"},
+    )
+    second = FakeItem(
+        "test_custom.py::TestProcess::test_second",
+        fixtures={"backup_api": "class"},
+    )
+    unrelated = FakeItem(
+        "test_custom.py::TestOtherProcess::test_first",
+        fixtures={"backup_api": "class"},
+    )
+
+    first_group = scheduling_group(first)  # type: ignore[arg-type]
+    second_group = scheduling_group(second)  # type: ignore[arg-type]
+    unrelated_group = scheduling_group(unrelated)  # type: ignore[arg-type]
+
+    assert first_group.startswith(f"{PROCESS_GROUP_PREFIX}class--")
+    assert first_group == second_group
+    assert first_group != unrelated_group
 
 
 def test_explicit_isolation_and_resource_override_fixture_inference() -> None:
@@ -181,8 +216,9 @@ def test_fixture_resource_declaration_is_applied_to_consuming_test(
 
     assert len(groups) == 1
     assert str(groups[0]).startswith(
-        f"{PERSISTENT_PROCESS_GROUP_PREFIX}declared_session_process_fixture--module--"
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}declared_session_process_fixture."
     )
+    assert "--module--" in str(groups[0])
 
 
 @pytest.mark.e2e_isolation("module", group="declared-module-fixture")
@@ -195,6 +231,71 @@ def test_fixture_resource_declaration_preserves_fixture_scope(
 
     assert len(groups) == 1
     assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}module--")
+
+
+class TestFixtureResourceClassScope:
+    def test_first_method_uses_class_group(
+        self,
+        request: pytest.FixtureRequest,
+        declared_class_process_fixture: None,
+    ) -> None:
+        del declared_class_process_fixture
+        groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+        assert len(groups) == 1
+        assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}class--")
+
+    def test_second_method_uses_same_class_group(
+        self,
+        request: pytest.FixtureRequest,
+        declared_class_process_fixture: None,
+    ) -> None:
+        del declared_class_process_fixture
+        groups = [mark.args[0] for mark in request.node.iter_markers("xdist_group")]
+
+        assert len(groups) == 1
+        assert str(groups[0]).startswith(f"{PROCESS_GROUP_PREFIX}class--")
+
+
+def test_inferred_session_identity_includes_fixture_provenance() -> None:
+    @e2e_resource("antfly_process")
+    def first_runtime() -> None:
+        pass
+
+    @e2e_resource("antfly_process")
+    def second_runtime() -> None:
+        pass
+
+    first = FakeItem(
+        "test_a.py::test_runtime",
+        fixtures={"runtime": "session"},
+        fixture_baseids={"runtime": "test_a.py"},
+        fixture_functions={"runtime": first_runtime},
+    )
+    second = FakeItem(
+        "test_b.py::test_runtime",
+        fixtures={"runtime": "session"},
+        fixture_baseids={"runtime": "test_b.py"},
+        fixture_functions={"runtime": second_runtime},
+    )
+    shared_definition = FakeItem(
+        "test_c.py::test_runtime",
+        fixtures={"runtime": "session"},
+        fixture_baseids={"runtime": "test_a.py"},
+        fixture_functions={"runtime": first_runtime},
+    )
+
+    first_group = scheduling_group(first)  # type: ignore[arg-type]
+    second_group = scheduling_group(second)  # type: ignore[arg-type]
+    shared_group = scheduling_group(shared_definition)  # type: ignore[arg-type]
+    first_identity = first_group.split("--", 4)[2]
+    second_identity = second_group.split("--", 4)[2]
+    shared_identity = shared_group.split("--", 4)[2]
+
+    assert first_group.startswith(f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime.")
+    assert second_group.startswith(f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime.")
+    assert first_identity != second_identity
+    assert first_identity == shared_identity
 
 
 def test_dynamic_serverless_table_parameter_has_persistent_identity() -> None:
