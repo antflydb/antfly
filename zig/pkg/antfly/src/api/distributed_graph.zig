@@ -10114,7 +10114,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         },
         .identity_read_generation = 77,
         .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
-        .cancellation = &cancellation,
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     };
     const base_result = db_mod.types.SearchResult{
         .alloc = std.testing.allocator,

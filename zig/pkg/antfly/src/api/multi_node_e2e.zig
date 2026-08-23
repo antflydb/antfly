@@ -1204,7 +1204,7 @@ fn expectGraphNodeKeys(
     }
 }
 
-fn expectGraphNodesResult(result: indexes_openapi.GraphQueryResult) !*indexes_openapi.GraphNodesResult {
+fn expectGraphNodesResult(result: indexes_openapi.GraphQueryResult) !indexes_openapi.GraphNodesResult {
     return switch (result) {
         .graph_nodes_result => |nodes| nodes,
         else => error.TestUnexpectedResult,

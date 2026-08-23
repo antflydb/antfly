@@ -6202,7 +6202,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
 
 test "public api e2e supports graph queries" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
@@ -6395,7 +6395,7 @@ test "public api e2e supports graph queries" {
 
 test "public api e2e graph queries respect full_index sync level" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
@@ -6529,7 +6529,7 @@ test "public api e2e graph queries respect full_index sync level" {
 
 test "public api e2e restores graph indexes from table backup" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
