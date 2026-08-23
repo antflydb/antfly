@@ -1047,6 +1047,23 @@ test "index wait prefers authoritative readiness contract" {
     });
     try std.testing.expectEqualStrings("ready", summary.state);
     try std.testing.expect(summary.ready);
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "degraded",
+        .readiness = .{
+            .state = .failed,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 11,
+            .pending_reasons = &.{},
+        },
+    });
+    try std.testing.expectEqualStrings("failed", summary.state);
+    try std.testing.expect(!summary.ready);
+    try std.testing.expect(summary.failed);
+    try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(summary));
 }
 
 test "index wait progress reporting is immediate periodic and state sensitive" {

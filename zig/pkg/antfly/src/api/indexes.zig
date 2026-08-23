@@ -1577,6 +1577,7 @@ const AggregatedIndexStatus = struct {
     public_runtime_view_projected: bool = false,
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
+    load_error_matches_desired_incarnation: bool = false,
     repair_state: ?[]const u8 = null,
     // This is proof about an observed repair, not the neutral element for an
     // AND reduction. A repair-free aggregate must not suppress live catch-up
@@ -1735,9 +1736,19 @@ fn aggregateIndexStatusIndexed(
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
         // Integrity failures are current index-scoped facts even when the
-        // surrounding runtime snapshot is stale or failed. Capture them before
-        // gating materialization counters on freshness.
-        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
+        // surrounding runtime snapshot is stale or failed. Preserve an old
+        // incarnation's diagnostic, but prefer and separately identify a
+        // failure that belongs to the desired incarnation so readiness never
+        // conflates the two.
+        if (item.load_error) |load_error| {
+            const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+            if (matches_desired_incarnation) {
+                if (!aggregate.load_error_matches_desired_incarnation) aggregate.load_error = load_error;
+                aggregate.load_error_matches_desired_incarnation = true;
+            } else if (aggregate.load_error == null) {
+                aggregate.load_error = load_error;
+            }
+        }
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
@@ -2369,7 +2380,31 @@ test "derived coverage aggregation rejects mixed config observations" {
     try std.testing.expectEqual(@as(u64, 2), aggregate.table_doc_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_config_mismatch_count);
+    try std.testing.expect(aggregate.load_error_matches_desired_incarnation);
     try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 0, 41));
+
+    var aggregate_status = std.ArrayListUnmanaged(u8).empty;
+    defer aggregate_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &aggregate_status,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .partial,
+        false,
+        0,
+        41,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        aggregate.runtime_present,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_status.items, "\"readiness\":{\"state\":\"failed\"") != null);
 
     var reasons = std.ArrayListUnmanaged(u8).empty;
     defer reasons.deinit(std.testing.allocator);
@@ -2762,6 +2797,7 @@ test "derived coverage aggregation rejects stale index incarnations" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
         .kind = .dense_vector,
+        .load_error = "OldIncarnationLoadFailure",
         .doc_count = 7,
         .term_count = 11,
         .node_count = 9,
@@ -2808,7 +2844,33 @@ test "derived coverage aggregation rejects stale index incarnations" {
     try std.testing.expectEqual(@as(u64, 0), aggregate.replay_applied_sequence);
     try std.testing.expect(aggregate.replay_catch_up_required);
     try std.testing.expect(aggregate.backfill_active);
+    try std.testing.expect(!aggregate.load_error_matches_desired_incarnation);
     try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+
+    var aggregate_status = std.ArrayListUnmanaged(u8).empty;
+    defer aggregate_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &aggregate_status,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        aggregate.runtime_present,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_status.items, "\"error\":\"load failed: OldIncarnationLoadFailure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_status.items, "\"readiness\":{\"state\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_status.items, "\"incarnation_pending\"") != null);
 
     var shard_status = std.ArrayListUnmanaged(u8).empty;
     defer shard_status.deinit(std.testing.allocator);
@@ -2858,6 +2920,9 @@ test "derived coverage aggregation rejects stale index incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"hbc_cache\":{\"total_bytes\":0,\"accounted_bytes\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"hbc_posting\":{\"scanned_nodes\":0,\"scanned_postings\":0,\"dirty_postings\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"enrichment_runtime\":{\"enabled\":false,\"target_sequence\":0,\"applied_sequence\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"error\":\"load failed: OldIncarnationLoadFailure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"readiness\":{\"state\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"incarnation_pending\"") != null);
 }
 
 test "derived coverage rejects unknown freshness for aggregate and shard views" {
@@ -3464,6 +3529,20 @@ fn appendSingleIndexRuntimeStatus(
         const state = repair_state.?;
         backfill_active = std.mem.eql(u8, state, "rebuilding") or std.mem.eql(u8, state, "waiting");
     }
+    // Enrichment and coverage failures are terminal only for the desired
+    // incarnation. The visible projections above already enforce freshness
+    // and identity, so keep readiness aligned with the legacy terminal state
+    // without allowing a retained replacement snapshot to poison its
+    // successor.
+    const enrichment_degraded = index_type == .embeddings and
+        ((embeddings_materialization_current and item.enrichment_failed) or
+            (if (embeddings_view) |view| view.coverage_degraded else false));
+    const terminal_enrichment_failure = enrichment_degraded or
+        (if (visible_enrichment) |stats| stats.worker_failed else false);
+    const terminal_load_failure = load_error != null and if (@hasField(@TypeOf(item), "load_error_matches_desired_incarnation"))
+        item.load_error_matches_desired_incarnation
+    else
+        index_type != .embeddings or coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
 
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
@@ -3505,8 +3584,6 @@ fn appendSingleIndexRuntimeStatus(
     } else if (repair_blocks_readiness and repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        const enrichment_degraded = (embeddings_materialization_current and item.enrichment_failed) or
-            (if (embeddings_view) |view| view.coverage_degraded else false);
         try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, visible_enrichment));
     }
     if (load_error) |err_name| {
@@ -3751,8 +3828,9 @@ fn appendSingleIndexRuntimeStatus(
         runtime_present,
         metadata,
         backfill_active,
+        terminal_load_failure,
+        terminal_enrichment_failure,
         repair_state,
-        load_error,
         replay_applied_sequence,
         replay_target_sequence,
         replay_catch_up_required,
@@ -3774,8 +3852,9 @@ fn appendIndexReadinessStatus(
     runtime_present: bool,
     metadata: ?runtime_status.RuntimeStatusMetadata,
     backfill_active: bool,
+    terminal_load_failure: bool,
+    terminal_enrichment_failure: bool,
     repair_state: ?[]const u8,
-    load_error: ?[]const u8,
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
@@ -3798,7 +3877,7 @@ fn appendIndexReadinessStatus(
         std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")
     else
         false;
-    const failed = load_error != null or repair_failed;
+    const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
     const publication_pending = index_type == .embeddings and incarnation_current and
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
@@ -5697,11 +5776,19 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
     defer alloc.free(failed_encoded);
     try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"backfill_state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"worker_failed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"readiness\":{\"state\":\"failed\"") != null);
 
     const healthy_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer alloc.free(healthy_encoded);
     try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"ready\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"failed\"") == null);
+
+    indexes[0].enrichment_failed = false;
+    local_items[0].stats.enrichment.worker_failed = true;
+    const worker_failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer alloc.free(worker_failed_encoded);
+    try std.testing.expect(std.mem.indexOf(u8, worker_failed_encoded, "\"backfill_state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, worker_failed_encoded, "\"readiness\":{\"state\":\"failed\"") != null);
 }
 
 test "single embeddings index encoder keeps published visibility separate from replay debt" {
