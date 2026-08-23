@@ -1563,6 +1563,10 @@ and campaign must remain distinct operations.
   and HA scenarios
 - labeled progress and failure artifact paths
 
+The storage domains enter this gate through the shared `storage-vopr-test`
+dependency, while metadata, Raft, HA, and the longer focused LSM/HA matrices
+retain their labeled campaign nodes.
+
 `chaos-soak-test`:
 
 - broader scenario set

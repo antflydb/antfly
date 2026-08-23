@@ -7539,6 +7539,7 @@ pub fn build(b: *std.Build) void {
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
     storage_vopr_step.dependOn(&run_db_split_vopr_tests.step);
     sim_test_step.dependOn(storage_vopr_step);
+    chaos_test_step.dependOn(storage_vopr_step);
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
