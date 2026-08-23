@@ -57,12 +57,15 @@ type ExplorerEdge = GraphEdge & {
   pathEdge?: boolean;
 };
 
+type CanonicalGraphNodesResult = Extract<GraphQueryResult, { kind: "nodes" }>;
+type LegacyGraphResult = Extract<GraphQueryResult, { total: number }>;
+
 type GraphVisualizationWireResult = {
   kind?: "nodes" | "legacy";
   type?: string;
   nodes?: (
-    | Extract<GraphQueryResult, { kind: "nodes" }>["nodes"][number]
-    | NonNullable<Extract<GraphQueryResult, { kind: "legacy" }>["nodes"]>[number]
+    | CanonicalGraphNodesResult["nodes"][number]
+    | NonNullable<LegacyGraphResult["nodes"]>[number]
   )[];
   paths?: {
     nodes?: (string | { key: string; table?: string })[];
@@ -221,18 +224,8 @@ function graphVisualizationResult(
   result: GraphQueryResult | null
 ): GraphVisualizationWireResult | null {
   if (!result) return null;
-  if (result.kind === "nodes" || result.kind === "legacy") return result;
-
-  // Transitional compatibility for graph result envelopes emitted before the
-  // stable `kind` discriminator was introduced.
-  const legacy = result as unknown as GraphVisualizationWireResult;
-  if (
-    legacy.kind === undefined &&
-    typeof legacy.type === "string" &&
-    typeof legacy.total === "number"
-  ) {
-    return legacy;
-  }
+  if (result.kind === "nodes" || result.kind === "legacy" || result.kind === undefined)
+    return result;
   return null;
 }
 
@@ -349,8 +342,7 @@ function nodeTypeColors() {
 
 function resultSummary(result: GraphQueryResult | null) {
   if (!result) return { total: 0, paths: 0 };
-  const wireResult = result as GraphQueryResult & { kind?: GraphQueryResult["kind"] };
-  if (wireResult.kind === undefined) {
+  if (result.kind === undefined) {
     const legacy = graphVisualizationResult(result);
     return {
       total:
