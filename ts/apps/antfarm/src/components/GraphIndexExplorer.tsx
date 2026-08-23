@@ -171,7 +171,11 @@ function graphVisualizationResult(
   // Transitional compatibility for graph result envelopes emitted before the
   // stable `kind` discriminator was introduced.
   const legacy = result as unknown as GraphVisualizationWireResult;
-  if (legacy.kind === undefined && (legacy.nodes !== undefined || legacy.paths !== undefined)) {
+  if (
+    legacy.kind === undefined &&
+    typeof legacy.type === "string" &&
+    typeof legacy.total === "number"
+  ) {
     return legacy;
   }
   return null;
@@ -271,7 +275,7 @@ function resultSummary(result: GraphQueryResult | null) {
     case "aggregates":
       return { total: Object.keys(result.aggregates).length, paths: 0 };
     case "legacy":
-      return { total: result.total, paths: result.paths.length };
+      return { total: result.total, paths: result.paths?.length ?? 0 };
   }
 }
 

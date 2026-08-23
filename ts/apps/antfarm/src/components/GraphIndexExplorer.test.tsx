@@ -1,4 +1,4 @@
-import type { IndexStatus } from "@antfly/sdk";
+import type { GraphQueryResult, IndexStatus } from "@antfly/sdk";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GraphIndexExplorer } from "./GraphIndexExplorer";
@@ -116,5 +116,20 @@ describe("GraphIndexExplorer", () => {
         },
       })
     );
+  });
+
+  it("summarizes a minimal pre-discriminator legacy result", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={{ type: "neighbors", total: 12 } as unknown as GraphQueryResult}
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByText("12")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("0 nodes");
   });
 });
