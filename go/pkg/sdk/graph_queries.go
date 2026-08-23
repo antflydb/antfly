@@ -76,12 +76,47 @@ func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
 	if kind != "" {
 		return result.ValueByDiscriminator()
 	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		return nil, err
+	}
+	// Only omission selects the v0.2 fallback. A present null or non-string
+	// discriminator is a malformed current response, not a legacy response.
+	if _, present := envelope["kind"]; present {
+		return nil, fmt.Errorf("antfly: graph result has an invalid discriminator")
+	}
+	rawType, hasType := envelope["type"]
+	rawTotal, hasTotal := envelope["total"]
+	if !hasType || !hasTotal {
+		return nil, fmt.Errorf("antfly: legacy graph result requires type and total")
+	}
+	var legacyType GraphQueryType
+	if err := json.Unmarshal(rawType, &legacyType); err != nil {
+		return nil, fmt.Errorf("antfly: invalid legacy graph result type: %w", err)
+	}
+	switch legacyType {
+	case GraphQueryTypeNeighbors, GraphQueryTypeTraverse, GraphQueryTypeShortestPath,
+		GraphQueryTypeKShortestPaths, GraphQueryTypePattern:
+	default:
+		return nil, fmt.Errorf("antfly: unknown legacy graph result type %q", legacyType)
+	}
+	var total *int
+	if err := json.Unmarshal(rawTotal, &total); err != nil {
+		return nil, fmt.Errorf("antfly: invalid legacy graph result total: %w", err)
+	}
+	if total == nil {
+		return nil, fmt.Errorf("antfly: legacy graph result total must be an integer")
+	}
 	legacy, err := result.AsLegacyGraphQueryResult()
 	if err != nil {
 		return nil, err
 	}
-	if legacy.Type == "" {
-		return nil, fmt.Errorf("antfly: graph result is missing its discriminator")
+	if legacy.Type != legacyType {
+		return nil, fmt.Errorf("antfly: inconsistent legacy graph result type")
 	}
 	return legacy, nil
 }

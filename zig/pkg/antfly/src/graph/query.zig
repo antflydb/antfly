@@ -43,12 +43,14 @@ pub const max_match_queries_per_request: usize = 8;
 pub const max_query_name_codepoints: usize = 128;
 
 pub fn validateRequestOperationBudget(queries: anytype) !void {
+    if (queries.len > max_named_queries) return error.InvalidQueryRequest;
     var complete_matches: usize = 0;
     for (queries) |named_query| {
+        if (!isValidQueryName(named_query.name)) return error.InvalidQueryRequest;
         if (named_query.query.match_pattern == null) continue;
         complete_matches += 1;
         if (complete_matches > max_match_queries_per_request)
-            return error.QueryCandidateBudgetExceeded;
+            return error.GraphMatchOperationLimitExceeded;
     }
 }
 

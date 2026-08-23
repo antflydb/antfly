@@ -287,6 +287,20 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		t.Fatalf("legacy type = %q, want neighbors", legacy.Type)
 	}
 
+	for _, malformed := range []string{
+		`{"type":"neighbors"}`,
+		`{"type":"neighbors","total":null}`,
+		`{"type":"unknown","total":0}`,
+		`{"kind":null,"type":"neighbors","total":0}`,
+	} {
+		if err := json.Unmarshal([]byte(malformed), &result); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeGraphQueryResult(result); err == nil {
+			t.Fatalf("expected malformed legacy graph result to fail: %s", malformed)
+		}
+	}
+
 	if err := json.Unmarshal([]byte(`{"kind":"unknown"}`), &result); err != nil {
 		t.Fatal(err)
 	}

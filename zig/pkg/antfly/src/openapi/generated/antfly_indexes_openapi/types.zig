@@ -2623,16 +2623,16 @@ pub const LegacyGraphQueryResult = struct {
     /// Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
     kind: ?[]const u8 = null,
     type: GraphQueryType,
-    /// Result nodes.
-    nodes: []const GraphResultNode,
-    /// Result paths.
-    paths: []const Path,
+    /// Result nodes. Optional for compatibility with v0.2 responses.
+    nodes: ?[]const GraphResultNode = null,
+    /// Result paths. Optional for compatibility with v0.2 responses.
+    paths: ?[]const Path = null,
     /// Deprecated graph_searches pattern results; use rows for graph_queries.
     matches: ?[]const PatternMatch = null,
     /// Deprecated graph_searches result count; use stats or a named count aggregate.
     total: i64,
-    /// Query execution time
-    took: i64,
+    /// Query execution time; optional for compatibility with v0.2 responses
+    took: ?i64 = null,
 };
 
 /// Configuration for result fusion when combining multiple search indexes.

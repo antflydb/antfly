@@ -265,6 +265,7 @@ pub const GraphKeyNodeSelector = types.GraphKeyNodeSelector;
 pub const GraphMatch = types.GraphMatch;
 pub const GraphMatchEdge = types.GraphMatchEdge;
 pub const GraphMatchNode = types.GraphMatchNode;
+pub const GraphMatchOperationLimitExceededError = types.GraphMatchOperationLimitExceededError;
 pub const GraphMatchQuery = types.GraphMatchQuery;
 pub const GraphNodeSelector = types.GraphNodeSelector;
 pub const GraphNodesResult = types.GraphNodesResult;

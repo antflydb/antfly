@@ -20,6 +20,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
+const graph_query_mod = @import("../graph/query.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -110,6 +111,7 @@ pub const TableApi = struct {
         QueryCandidateBudgetExceeded,
         GraphDistinctBudgetExceeded,
         GraphAnchorFilterRequiresIndex,
+        GraphMatchOperationLimitExceeded,
         HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
@@ -769,6 +771,42 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+fn graphMatchOperationCountFromBody(alloc: std.mem.Allocator, body: []const u8) usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return graph_query_mod.max_match_queries_per_request + 1;
+    defer parsed.deinit();
+    if (parsed.value != .object) return graph_query_mod.max_match_queries_per_request + 1;
+    if (parsed.value.object.get("graph_queries")) |queries| {
+        if (queries != .object) return graph_query_mod.max_match_queries_per_request + 1;
+        var count: usize = 0;
+        var it = queries.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .object and entry.value_ptr.object.get("match") != null) count += 1;
+        }
+        return count;
+    }
+    const queries = parsed.value.object.get("graph_searches") orelse return graph_query_mod.max_match_queries_per_request + 1;
+    if (queries != .object) return graph_query_mod.max_match_queries_per_request + 1;
+    var count: usize = 0;
+    var it = queries.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const query_type = entry.value_ptr.object.get("type") orelse continue;
+        if (query_type == .string and std.mem.eql(u8, query_type.string, "pattern")) count += 1;
+    }
+    return count;
+}
+
+pub fn graphMatchOperationLimitExceededBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_match_operation_limit_exceeded",
+        .message = "too many named MATCH operations; put multiple aggregates over one pattern in the same MATCH return object",
+        .retryable = false,
+        .maximum = graph_query_mod.max_match_queries_per_request,
+        .actual = graphMatchOperationCountFromBody(alloc, body),
+    }, .{});
+}
+
 pub fn handleTableBatch(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -928,6 +966,10 @@ pub fn handleTableQueryRequest(
             error.GraphAnchorFilterRequiresIndex => {
                 std.log.warn("public table graph anchor filter lacks native index coverage table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphAnchorFilterRequiresIndexBody(alloc), .json = true };
+            },
+            error.GraphMatchOperationLimitExceeded => {
+                std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -3170,7 +3212,7 @@ test "public table query handler maps candidate budget exhaustion" {
 }
 
 test "public table query handler maps exact graph execution failures" {
-    const Kind = enum { distinct_budget, anchor_filter };
+    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit };
     const Backend = struct {
         fn iface(kind: *Kind) TableApi {
             return .{
@@ -3202,6 +3244,7 @@ test "public table query handler maps exact graph execution failures" {
             return switch (kind.*) {
                 .distinct_budget => error.GraphDistinctBudgetExceeded,
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
+                .match_operation_limit => error.GraphMatchOperationLimitExceeded,
             };
         }
     };
@@ -3253,6 +3296,57 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!anchor_error.retryable);
+
+    kind = .match_operation_limit;
+    var match_body = std.ArrayListUnmanaged(u8).empty;
+    defer match_body.deinit(std.testing.allocator);
+    try match_body.appendSlice(std.testing.allocator, "{\"graph_queries\":{");
+    for (0..graph_query_mod.max_match_queries_per_request + 1) |i| {
+        if (i > 0) try match_body.append(std.testing.allocator, ',');
+        try match_body.print(std.testing.allocator, "\"q{d}\":{{\"match\":{{}}}}", .{i});
+    }
+    try match_body.appendSlice(std.testing.allocator, "}}");
+    var limit_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        match_body.items,
+        null,
+        Backend.iface(&kind),
+    );
+    defer limit_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), limit_resp.status);
+    var limit = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        limit_resp.body,
+        .{},
+    );
+    defer limit.deinit();
+    const limit_error = switch (limit.value) {
+        .graph_match_operation_limit_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!limit_error.retryable);
+    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
+    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
+
+    const legacy_limit_body =
+        \\{"graph_searches":{"first":{"type":"pattern"},"neighbors":{"type":"neighbors"},"second":{"type":"pattern"}}}
+    ;
+    const legacy_error_body = try graphMatchOperationLimitExceededBody(std.testing.allocator, legacy_limit_body);
+    defer std.testing.allocator.free(legacy_error_body);
+    var legacy_limit = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        legacy_error_body,
+        .{},
+    );
+    defer legacy_limit.deinit();
+    const legacy_limit_error = switch (legacy_limit.value) {
+        .graph_match_operation_limit_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
 }
 
 test "public table query handler maps unsupported exact sort" {

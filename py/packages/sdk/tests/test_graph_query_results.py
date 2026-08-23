@@ -8,10 +8,7 @@ def test_pre_discriminator_graph_result_decodes_as_legacy() -> None:
         {
             "neighbors": {
                 "type": "neighbors",
-                "nodes": [],
-                "paths": [],
                 "total": 12,
-                "took": 3,
             }
         }
     )

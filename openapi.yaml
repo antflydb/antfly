@@ -8311,12 +8311,47 @@ components:
           type: boolean
           enum:
             - false
+    GraphMatchOperationLimitExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - error
+        - message
+        - retryable
+        - maximum
+        - actual
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - graph_match_operation_limit_exceeded
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+        maximum:
+          type: integer
+          format: uint64
+          description: Maximum named MATCH operations accepted in one request.
+        actual:
+          type: integer
+          format: uint64
+          description: Named MATCH operations supplied by the request.
     QueryUnprocessableError:
       oneOf:
         - $ref: '#/components/schemas/ExactSortError'
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
         - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+        - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
       discriminator:
         propertyName: error
         mapping:
@@ -8324,6 +8359,7 @@ components:
           query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
           graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+          graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.
@@ -14489,6 +14525,7 @@ components:
         graph_searches:
           deprecated: true
           type: object
+          maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/LegacyGraphQuery'
           description: >
@@ -23286,10 +23323,7 @@ components:
       deprecated: true
       required:
         - type
-        - nodes
-        - paths
         - total
-        - took
       description: Deprecated graph_searches response envelope.
       properties:
         kind:
@@ -23306,13 +23340,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GraphResultNode'
-          description: Result nodes.
+          description: Result nodes. Optional for compatibility with v0.2 responses.
         paths:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
             $ref: '#/components/schemas/Path'
-          description: Result paths.
+          description: Result paths. Optional for compatibility with v0.2 responses.
         matches:
           deprecated: true
           x-go-type-skip-optional-pointer: true
@@ -23330,7 +23364,7 @@ components:
           type: integer
           format: int64
           x-go-type: time.Duration
-          description: Query execution time
+          description: Query execution time; optional for compatibility with v0.2 responses
     GraphQueryResult:
       description: A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path
         results cannot be confused with the deprecated graph_searches envelope.

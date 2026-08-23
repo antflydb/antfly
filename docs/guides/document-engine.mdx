@@ -276,7 +276,9 @@ node. Because exact anchors are cursor-scanned in `_id` order, fields used by th
 anchor or authorization filters must have native index coverage. Antfly returns
 `graph_anchor_filter_requires_index` when it cannot prove that complete scan;
 index the referenced fields rather than relying on stored-source fallback.
-Graph work is budgeted across the whole request, not once per named operation.
+MATCH and compatibility-pattern expansion work is budgeted across the whole
+request, not once per named operation. Traversal and path operations retain
+their explicit per-operation depth and result bounds.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 that budget, the request fails instead of returning a partial count.
 Exact `count(distinct alias)` sets also share a request-scoped identity and byte

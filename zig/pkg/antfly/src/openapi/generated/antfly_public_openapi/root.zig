@@ -90,6 +90,7 @@ pub const ForeignColumn = types.ForeignColumn;
 pub const ForeignSource = types.ForeignSource;
 pub const GraphAnchorFilterRequiresIndexError = types.GraphAnchorFilterRequiresIndexError;
 pub const GraphDistinctBudgetExceededError = types.GraphDistinctBudgetExceededError;
+pub const GraphMatchOperationLimitExceededError = types.GraphMatchOperationLimitExceededError;
 pub const HierarchyAncestor = types.HierarchyAncestor;
 pub const HierarchyAncestors = types.HierarchyAncestors;
 pub const HierarchyArtifact = types.HierarchyArtifact;

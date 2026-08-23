@@ -373,6 +373,9 @@ from .graph_match import GraphMatch
 from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
 from .graph_match_nodes import GraphMatchNodes
+from .graph_match_operation_limit_exceeded_error import GraphMatchOperationLimitExceededError
+from .graph_match_operation_limit_exceeded_error_error import GraphMatchOperationLimitExceededErrorError
+from .graph_match_operation_limit_exceeded_error_status import GraphMatchOperationLimitExceededErrorStatus
 from .graph_match_query import GraphMatchQuery
 from .graph_nodes_result import GraphNodesResult
 from .graph_nodes_result_kind import GraphNodesResultKind
@@ -1267,6 +1270,9 @@ __all__ = (
     "GraphMatchEdge",
     "GraphMatchNode",
     "GraphMatchNodes",
+    "GraphMatchOperationLimitExceededError",
+    "GraphMatchOperationLimitExceededErrorError",
+    "GraphMatchOperationLimitExceededErrorStatus",
     "GraphMatchQuery",
     "GraphNodesResult",
     "GraphNodesResultKind",

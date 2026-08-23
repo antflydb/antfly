@@ -222,7 +222,6 @@ pub const SearchGraphExecutor = struct {
 const VisitState = enum { unvisited, visiting, done };
 
 pub fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.NamedGraphQuery) ![]usize {
-    if (queries.len > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
     try graph_query_mod.validateRequestOperationBudget(queries);
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
@@ -271,7 +270,7 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
     const too_many_complete_matches = [_]types.NamedGraphQuery{complete_match} **
         (graph_query_mod.max_match_queries_per_request + 1);
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphMatchOperationLimitExceeded,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many_complete_matches),
     );
 

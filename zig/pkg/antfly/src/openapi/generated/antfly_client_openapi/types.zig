@@ -4884,6 +4884,17 @@ pub const GraphMatchNode = struct {
     filter: ?GraphDocumentFilter = null,
 };
 
+pub const GraphMatchOperationLimitExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Maximum named MATCH operations accepted in one request.
+    maximum: i64,
+    /// Named MATCH operations supplied by the request.
+    actual: i64,
+};
+
 /// Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted.
 pub const GraphMatchQuery = struct {
     index: []const u8,
@@ -7418,16 +7429,16 @@ pub const LegacyGraphQueryResult = struct {
     /// Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
     kind: ?[]const u8 = null,
     type: GraphQueryType,
-    /// Result nodes.
-    nodes: []const GraphResultNode,
-    /// Result paths.
-    paths: []const Path,
+    /// Result nodes. Optional for compatibility with v0.2 responses.
+    nodes: ?[]const GraphResultNode = null,
+    /// Result paths. Optional for compatibility with v0.2 responses.
+    paths: ?[]const Path = null,
     /// Deprecated graph_searches pattern results; use rows for graph_queries.
     matches: ?[]const PatternMatch = null,
     /// Deprecated graph_searches result count; use stats or a named count aggregate.
     total: i64,
-    /// Query execution time
-    took: i64,
+    /// Query execution time; optional for compatibility with v0.2 responses
+    took: ?i64 = null,
 };
 
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
@@ -8717,6 +8728,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
+    graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const Probe = struct { @"error": ?[]const u8 = null };
@@ -8737,6 +8749,9 @@ pub const QueryUnprocessableError = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
         }
         return error.UnexpectedToken;
     }
@@ -8767,6 +8782,9 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -8776,6 +8794,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
+            .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
         }
     }
 };

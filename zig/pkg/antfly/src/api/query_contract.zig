@@ -5600,7 +5600,7 @@ test "deprecated graph search preserves its response envelope" {
 
 test "generated graph result union decodes pre-discriminator legacy responses" {
     const raw =
-        \\{"type":"neighbors","nodes":[],"paths":[],"total":12,"took":3}
+        \\{"type":"neighbors","total":12}
     ;
 
     var stdlib_parsed = try std.json.parseFromSlice(

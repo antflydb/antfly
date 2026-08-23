@@ -52,9 +52,13 @@ pub fn parseSupportedGraphQueriesAlloc(
 ) ![]const db_mod.types.NamedGraphQuery {
     if (request.graph_queries != null and request.graph_searches != null)
         return error.InvalidQueryRequest;
-    if (request.graph_queries) |queries| {
-        if (queries.map.count() > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
-    }
+    const query_count = if (request.graph_queries) |queries|
+        queries.map.count()
+    else if (request.graph_searches) |queries|
+        queries.map.count()
+    else
+        0;
+    if (query_count > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
     errdefer freeNamedGraphQueries(alloc, items.items);
@@ -76,6 +80,7 @@ pub fn parseSupportedGraphQueriesAlloc(
     } else if (request.graph_searches) |graph_searches| {
         var it = graph_searches.map.iterator();
         while (it.next()) |entry| {
+            if (!graph_query_mod.isValidQueryName(entry.key_ptr.*)) return error.InvalidQueryRequest;
             const name = try alloc.dupe(u8, entry.key_ptr.*);
             var name_owned = true;
             errdefer if (name_owned) alloc.free(name);
@@ -444,6 +449,16 @@ test "parse supported graph queries accepts deprecated graph searches" {
     try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
     try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
     try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
+}
+
+test "deprecated graph searches share canonical name admission" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_searches":{"":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]}}}}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries rejects canonical and legacy fields together" {

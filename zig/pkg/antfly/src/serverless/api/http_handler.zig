@@ -3112,6 +3112,8 @@ pub const HttpHandler = struct {
             graph_pattern_mod.default_max_distinct_identities,
             graph_pattern_mod.default_max_distinct_identity_bytes,
         );
+        var request_cache = PublicGraphRequestCache.init(self, session);
+        defer request_cache.deinit();
 
         var available_sets = std.ArrayListUnmanaged(GraphResultSet).empty;
         defer available_sets.deinit(self.alloc);
@@ -3132,6 +3134,7 @@ pub const HttpHandler = struct {
                 available_sets.items,
                 &request_work_budget,
                 &request_distinct_budget,
+                &request_cache,
             );
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
@@ -3152,18 +3155,19 @@ pub const HttpHandler = struct {
         available_sets: []const GraphResultSet,
         request_work_budget: *graph_pattern_mod.WorkBudget,
         request_distinct_budget: *graph_pattern_mod.DistinctBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
         return switch (named_query.query.query_type) {
             .neighbors => try self.executePublicNeighborsQueryAlloc(session, source_table, named_query, available_sets),
             .traverse => try self.executePublicTraverseQueryAlloc(session, source_table, named_query, available_sets),
             .shortest_path => try self.executePublicShortestPathQueryAlloc(session, source_table, named_query, available_sets),
             .pattern => try self.executePublicPatternQueryAlloc(
-                session,
                 source_table,
                 named_query,
                 available_sets,
                 request_work_budget,
                 request_distinct_budget,
+                request_cache,
             ),
             else => error.UnsupportedQueryRequest,
         };
@@ -3384,12 +3388,12 @@ pub const HttpHandler = struct {
 
     fn executePublicPatternQueryAlloc(
         self: *HttpHandler,
-        session: *query_mod.QuerySession,
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
         request_work_budget: *graph_pattern_mod.WorkBudget,
         request_distinct_budget: *graph_pattern_mod.DistinctBudget,
+        request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
         const conjunctive_pattern = named_query.query.match_pattern;
         const target_keys = if (named_query.query.target_nodes) |selector|
@@ -3406,15 +3410,13 @@ pub const HttpHandler = struct {
         // Canonical MATCH needs the complete published document relation both
         // to enumerate its selected anchor and to evaluate alias filters.
         const need_docs = conjunctive_pattern != null or named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
-        const docs: []const query_materializer.Document = if (need_docs) try self.allocPublishedDocumentsAlloc(session) else &.{};
-        defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
+        const docs: []const query_materializer.Document = if (need_docs) try request_cache.documents() else &.{};
 
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
             .docs = docs,
-            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
+            .cache = &request_cache.filter_cache,
         };
-        defer filter_ctx.cache.deinit();
 
         const start_keys = if (conjunctive_pattern) |pattern|
             try allocConjunctiveAnchorKeys(self.alloc, docs, pattern, &filter_ctx)
@@ -3424,11 +3426,7 @@ pub const HttpHandler = struct {
         const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
         defer self.alloc.free(start_key_refs);
 
-        const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
-        const payload = try session.fetchArtifactAlloc(graph_index);
-        defer self.alloc.free(payload);
-        var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
-        defer graph_segment_mod.freeSegment(self.alloc, &segment);
+        const segment = try request_cache.graphSegment(named_query.query.index_name);
 
         const ServerlessPatternEdgeReader = struct {
             segment: *const graph_segment_mod.Segment,
@@ -3553,7 +3551,7 @@ pub const HttpHandler = struct {
             }
         };
 
-        const edge_reader = ServerlessPatternEdgeReader{ .segment = &segment };
+        const edge_reader = ServerlessPatternEdgeReader{ .segment = segment };
         const match_opts = graph_pattern_mod.MatchOptions{
             .max_results = if (named_query.query.return_limit > 0)
                 std.math.add(u32, named_query.query.return_limit, 1) catch named_query.query.return_limit
@@ -4753,6 +4751,7 @@ pub const HttpHandler = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
+            error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
             error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -5023,7 +5022,68 @@ fn findMaterializedDocumentBody(docs: []const query_materializer.Document, doc_i
 const PatternDocumentFilterContext = struct {
     alloc: Allocator,
     docs: []const query_materializer.Document,
-    cache: db_query_graph.PreparedPatternFilterCache,
+    cache: *db_query_graph.PreparedPatternFilterCache,
+};
+
+const CachedPublicGraphSegment = struct {
+    index_name: []u8,
+    segment: graph_segment_mod.Segment,
+};
+
+/// Immutable published data and compiled node filters are request resources.
+/// Keep one copy per source snapshot/index so named MATCH operations share
+/// decoding and materialization costs while their execution remains ordered.
+const PublicGraphRequestCache = struct {
+    handler: *HttpHandler,
+    session: *query_mod.QuerySession,
+    published_documents: ?[]query_materializer.Document = null,
+    segments: std.ArrayListUnmanaged(CachedPublicGraphSegment) = .empty,
+    filter_cache: db_query_graph.PreparedPatternFilterCache,
+
+    fn init(handler: *HttpHandler, session: *query_mod.QuerySession) PublicGraphRequestCache {
+        return .{
+            .handler = handler,
+            .session = session,
+            .filter_cache = db_query_graph.PreparedPatternFilterCache.init(handler.alloc),
+        };
+    }
+
+    fn deinit(self: *PublicGraphRequestCache) void {
+        self.filter_cache.deinit();
+        if (self.published_documents) |docs| query_materializer.freeDocuments(self.handler.alloc, docs);
+        for (self.segments.items) |*entry| {
+            self.handler.alloc.free(entry.index_name);
+            graph_segment_mod.freeSegment(self.handler.alloc, &entry.segment);
+        }
+        self.segments.deinit(self.handler.alloc);
+        self.* = undefined;
+    }
+
+    fn documents(self: *PublicGraphRequestCache) ![]const query_materializer.Document {
+        if (self.published_documents == null) {
+            self.published_documents = try self.handler.allocPublishedDocumentsAlloc(self.session);
+        }
+        return self.published_documents.?;
+    }
+
+    fn graphSegment(self: *PublicGraphRequestCache, index_name: []const u8) !*const graph_segment_mod.Segment {
+        for (self.segments.items) |*entry| {
+            if (std.mem.eql(u8, entry.index_name, index_name)) return &entry.segment;
+        }
+        const graph_index = query_mod.graph_reader.findGraphArtifactIndex(self.session, index_name) orelse
+            return error.GraphSegmentNotFound;
+        const payload = try self.session.fetchArtifactAlloc(graph_index);
+        defer self.handler.alloc.free(payload);
+        var segment = try graph_segment_mod.decodeAlloc(self.handler.alloc, payload);
+        errdefer graph_segment_mod.freeSegment(self.handler.alloc, &segment);
+        const owned_name = try self.handler.alloc.dupe(u8, index_name);
+        errdefer self.handler.alloc.free(owned_name);
+        try self.segments.append(self.handler.alloc, .{
+            .index_name = owned_name,
+            .segment = segment,
+        });
+        return &self.segments.items[self.segments.items.len - 1].segment;
+    }
 };
 
 fn allocConjunctiveAnchorKeys(

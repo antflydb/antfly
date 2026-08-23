@@ -3778,6 +3778,7 @@ pub fn build(b: *std.Build) void {
         "graph aggregate response preserves exact decimal counts",
         "graph aggregate response fails closed on missing or inexact results",
         "generated graph result union decodes pre-discriminator legacy responses",
+        "deprecated graph searches share canonical name admission",
         "api query contract preflight summarizes query lanes and result refs",
         "parse supported graph queries accepts pattern requests",
         "graph node filters reject analyzer-backed text clauses",

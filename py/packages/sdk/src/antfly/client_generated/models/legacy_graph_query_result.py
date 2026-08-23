@@ -24,43 +24,45 @@ class LegacyGraphQueryResult:
 
     Attributes:
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
-        nodes (list[GraphResultNode]): Result nodes.
-        paths (list[Path]): Result paths.
         total (int): Deprecated graph_searches result count; use stats or a named count aggregate.
-        took (int): Query execution time
         kind (LegacyGraphQueryResultKind | Unset): Stable discriminator emitted by current servers. Optional only so
             current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
+        nodes (list[GraphResultNode] | Unset): Result nodes. Optional for compatibility with v0.2 responses.
+        paths (list[Path] | Unset): Result paths. Optional for compatibility with v0.2 responses.
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
+        took (int | Unset): Query execution time; optional for compatibility with v0.2 responses
     """
 
     type_: GraphQueryType
-    nodes: list[GraphResultNode]
-    paths: list[Path]
     total: int
-    took: int
     kind: LegacyGraphQueryResultKind | Unset = UNSET
+    nodes: list[GraphResultNode] | Unset = UNSET
+    paths: list[Path] | Unset = UNSET
     matches: list[PatternMatch] | Unset = UNSET
+    took: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         type_ = self.type_.value
 
-        nodes = []
-        for nodes_item_data in self.nodes:
-            nodes_item = nodes_item_data.to_dict()
-            nodes.append(nodes_item)
-
-        paths = []
-        for paths_item_data in self.paths:
-            paths_item = paths_item_data.to_dict()
-            paths.append(paths_item)
-
         total = self.total
-
-        took = self.took
 
         kind: str | Unset = UNSET
         if not isinstance(self.kind, Unset):
             kind = self.kind.value
+
+        nodes: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.nodes, Unset):
+            nodes = []
+            for nodes_item_data in self.nodes:
+                nodes_item = nodes_item_data.to_dict()
+                nodes.append(nodes_item)
+
+        paths: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.paths, Unset):
+            paths = []
+            for paths_item_data in self.paths:
+                paths_item = paths_item_data.to_dict()
+                paths.append(paths_item)
 
         matches: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.matches, Unset):
@@ -69,21 +71,26 @@ class LegacyGraphQueryResult:
                 matches_item = matches_item_data.to_dict()
                 matches.append(matches_item)
 
+        took = self.took
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "type": type_,
-                "nodes": nodes,
-                "paths": paths,
                 "total": total,
-                "took": took,
             }
         )
         if kind is not UNSET:
             field_dict["kind"] = kind
+        if nodes is not UNSET:
+            field_dict["nodes"] = nodes
+        if paths is not UNSET:
+            field_dict["paths"] = paths
         if matches is not UNSET:
             field_dict["matches"] = matches
+        if took is not UNSET:
+            field_dict["took"] = took
 
         return field_dict
 
@@ -96,23 +103,7 @@ class LegacyGraphQueryResult:
         d = dict(src_dict)
         type_ = GraphQueryType(d.pop("type"))
 
-        nodes = []
-        _nodes = d.pop("nodes")
-        for nodes_item_data in _nodes:
-            nodes_item = GraphResultNode.from_dict(nodes_item_data)
-
-            nodes.append(nodes_item)
-
-        paths = []
-        _paths = d.pop("paths")
-        for paths_item_data in _paths:
-            paths_item = Path.from_dict(paths_item_data)
-
-            paths.append(paths_item)
-
         total = d.pop("total")
-
-        took = d.pop("took")
 
         _kind = d.pop("kind", UNSET)
         kind: LegacyGraphQueryResultKind | Unset
@@ -120,6 +111,24 @@ class LegacyGraphQueryResult:
             kind = UNSET
         else:
             kind = LegacyGraphQueryResultKind(_kind)
+
+        _nodes = d.pop("nodes", UNSET)
+        nodes: list[GraphResultNode] | Unset = UNSET
+        if _nodes is not UNSET:
+            nodes = []
+            for nodes_item_data in _nodes:
+                nodes_item = GraphResultNode.from_dict(nodes_item_data)
+
+                nodes.append(nodes_item)
+
+        _paths = d.pop("paths", UNSET)
+        paths: list[Path] | Unset = UNSET
+        if _paths is not UNSET:
+            paths = []
+            for paths_item_data in _paths:
+                paths_item = Path.from_dict(paths_item_data)
+
+                paths.append(paths_item)
 
         _matches = d.pop("matches", UNSET)
         matches: list[PatternMatch] | Unset = UNSET
@@ -130,14 +139,16 @@ class LegacyGraphQueryResult:
 
                 matches.append(matches_item)
 
+        took = d.pop("took", UNSET)
+
         legacy_graph_query_result = cls(
             type_=type_,
+            total=total,
+            kind=kind,
             nodes=nodes,
             paths=paths,
-            total=total,
-            took=took,
-            kind=kind,
             matches=matches,
+            took=took,
         )
 
         return legacy_graph_query_result

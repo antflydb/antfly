@@ -299,6 +299,7 @@ pub const Detail = enum(c_int) {
     enrichment_worker_failed,
     graph_distinct_budget_exceeded,
     graph_anchor_filter_requires_index,
+    graph_match_operation_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -416,6 +417,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
         error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
         error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
+        error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -888,6 +890,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
+        .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
     };
 }
 

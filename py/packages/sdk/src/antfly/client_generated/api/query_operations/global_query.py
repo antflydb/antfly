@@ -9,6 +9,7 @@ from ...models.error import Error
 from ...models.exact_sort_error import ExactSortError
 from ...models.graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
 from ...models.graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
+from ...models.graph_match_operation_limit_exceeded_error import GraphMatchOperationLimitExceededError
 from ...models.hierarchy_cursor_stale_error import HierarchyCursorStaleError
 from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from ...models.query_request import QueryRequest
@@ -51,6 +52,7 @@ def _parse_response(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -80,6 +82,7 @@ def _parse_response(
             ExactSortError
             | GraphAnchorFilterRequiresIndexError
             | GraphDistinctBudgetExceededError
+            | GraphMatchOperationLimitExceededError
             | QueryCandidateBudgetExceededError
         ):
             try:
@@ -106,11 +109,19 @@ def _parse_response(
                 return componentsschemas_query_unprocessable_error_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_3 = GraphAnchorFilterRequiresIndexError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_unprocessable_error_type_3 = GraphAnchorFilterRequiresIndexError.from_dict(data)
+            componentsschemas_query_unprocessable_error_type_4 = GraphMatchOperationLimitExceededError.from_dict(data)
 
-            return componentsschemas_query_unprocessable_error_type_3
+            return componentsschemas_query_unprocessable_error_type_4
 
         response_422 = _parse_response_422(response.json())
 
@@ -157,6 +168,7 @@ def _build_response(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -181,6 +193,7 @@ def sync_detailed(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -252,7 +265,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -277,6 +290,7 @@ def sync(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -349,7 +363,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return sync_detailed(
@@ -369,6 +383,7 @@ async def asyncio_detailed(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -440,7 +455,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -463,6 +478,7 @@ async def asyncio(
     | ExactSortError
     | GraphAnchorFilterRequiresIndexError
     | GraphDistinctBudgetExceededError
+    | GraphMatchOperationLimitExceededError
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
@@ -535,7 +551,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return (

@@ -2968,7 +2968,32 @@ export interface components {
             /** @enum {boolean} */
             retryable: false;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"];
+        GraphMatchOperationLimitExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_match_operation_limit_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /**
+             * Format: uint64
+             * @description Maximum named MATCH operations accepted in one request.
+             */
+            maximum: number;
+            /**
+             * Format: uint64
+             * @description Named MATCH operations supplied by the request.
+             */
+            actual: number;
+        };
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -12281,10 +12306,10 @@ export interface components {
             kind: "legacy";
             /** @deprecated */
             type: components["schemas"]["GraphQueryType"];
-            /** @description Result nodes. */
-            nodes: components["schemas"]["GraphResultNode"][];
-            /** @description Result paths. */
-            paths: components["schemas"]["Path"][];
+            /** @description Result nodes. Optional for compatibility with v0.2 responses. */
+            nodes?: components["schemas"]["GraphResultNode"][];
+            /** @description Result paths. Optional for compatibility with v0.2 responses. */
+            paths?: components["schemas"]["Path"][];
             /**
              * @deprecated
              * @description Deprecated graph_searches pattern results; use rows for graph_queries.
@@ -12297,9 +12322,9 @@ export interface components {
             total: number;
             /**
              * Format: int64
-             * @description Query execution time
+             * @description Query execution time; optional for compatibility with v0.2 responses
              */
-            took: number;
+            took?: number;
         };
         /** @description A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope. */
         GraphQueryResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["LegacyGraphQueryResult"];

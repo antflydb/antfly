@@ -1530,6 +1530,17 @@ pub const GraphDistinctBudgetExceededError = struct {
     max_distinct_identity_bytes: i64,
 };
 
+pub const GraphMatchOperationLimitExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Maximum named MATCH operations accepted in one request.
+    maximum: i64,
+    /// Named MATCH operations supplied by the request.
+    actual: i64,
+};
+
 pub const HierarchyAncestor = struct {
     id: ?[]const u8 = null,
     document: ?std.json.Value = null,
@@ -2433,6 +2444,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
+    graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const Probe = struct { @"error": ?[]const u8 = null };
@@ -2453,6 +2465,9 @@ pub const QueryUnprocessableError = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
         }
         return error.UnexpectedToken;
     }
@@ -2483,6 +2498,9 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -2492,6 +2510,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
+            .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
         }
     }
 };
