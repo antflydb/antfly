@@ -121,6 +121,26 @@ def test_process_slot_configuration_rejects_non_positive_values(slots: int) -> N
         pytest_configure(config)  # type: ignore[arg-type]
 
 
+def test_parallel_configuration_rejects_incompatible_distribution_mode() -> None:
+    options = {
+        "e2e_process_slots": 2,
+        "dist": "load",
+        "tx": ["popen", "popen"],
+    }
+    config = SimpleNamespace(
+        getoption=lambda name, default=None: options.get(name, default)
+    )
+
+    with pytest.raises(
+        pytest.UsageError,
+        match=(
+            "parallel Antfly E2E requires --dist=loadgroup so fixture isolation "
+            "and --e2e-process-slots remain enforced"
+        ),
+    ):
+        pytest_configure(config)  # type: ignore[arg-type]
+
+
 def test_fixture_resource_decorator_rejects_inverted_order() -> None:
     def fixture_function() -> None:
         pass

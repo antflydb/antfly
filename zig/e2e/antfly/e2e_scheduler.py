@@ -1114,6 +1114,13 @@ def pytest_configure(config: pytest.Config) -> None:
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
+    dist = config.getoption("dist", "no")
+    if dist not in {"no", "loadgroup"} and config.getoption("tx", ()):
+        raise pytest.UsageError(
+            "parallel Antfly E2E requires --dist=loadgroup so fixture isolation "
+            "and --e2e-process-slots remain enforced; remove the explicit "
+            f"--dist={dist} override or use scripts/ci/zig-antfly-e2e-pytest.sh"
+        )
     if not hasattr(config, "workerinput"):
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
         _duration_report_totals = {}
