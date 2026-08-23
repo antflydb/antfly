@@ -26,14 +26,10 @@ const default_wait_poll_ms: u64 = 1000;
 // progress reporting for minutes.
 const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
-// Server status now fails closed while publication is non-authoritative, but a
-// scheduler handoff can still discover a final replay tail shortly after an
-// otherwise-ready snapshot. Require a half-second continuous-ready window so
-// `wait` also covers that handoff under scheduler contention. Keep its sampling
-// delay independent of the requested polling interval: fast local polling must
-// not weaken correctness, while the normal 1s interval should not add several
-// seconds once readiness is first observed.
-const ready_confirmation_observations: u8 = 6;
+// The explicit server readiness contract covers scheduler/publication
+// handoffs. Retain one confirmation for mixed-version deployments where an
+// older server can still return the legacy derived status shape.
+const ready_confirmation_observations: u8 = 2;
 const ready_confirmation_delay_ms: u64 = 100;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 
@@ -466,7 +462,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         (if (@hasField(Stats, "dense_publish_pending")) stats.dense_publish_pending orelse false else false) or
         (if (@hasField(Stats, "replay_catch_up_required")) stats.replay_catch_up_required orelse false else false) or
         (if (@hasField(Stats, "catch_up_active")) stats.catch_up_active orelse false else false);
-    const state = if (error_text != null)
+    const legacy_state = if (error_text != null)
         "failed"
     else if (config_mismatch)
         "config_mismatch"
@@ -495,9 +491,17 @@ fn summarizeStats(stats: anytype) IndexSummary {
         stats.doc_count
     else
         indexed;
-    const ready = !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
-        (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
-    const failed = error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
+    const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
+    const state = if (readiness) |value| @tagName(value.state) else legacy_state;
+    const ready = if (readiness) |value|
+        value.state == .ready
+    else
+        !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
+            (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
+    const failed = if (readiness) |value|
+        value.state == .failed
+    else
+        error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
     return .{
         .state = state,
         .progress = progress,
@@ -1009,6 +1013,40 @@ test "index wait requires complete compatible coverage" {
     });
     try std.testing.expectEqualStrings("running", summary.state);
     try std.testing.expect(!summary.ready);
+}
+
+test "index wait prefers authoritative readiness contract" {
+    var summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "ready",
+        .readiness = .{
+            .state = .pending,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 10,
+            .pending_reasons = &.{"publication"},
+        },
+    });
+    try std.testing.expectEqualStrings("pending", summary.state);
+    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.failed);
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = true,
+        .backfill_state = "running",
+        .dense_publish_pending = true,
+        .readiness = .{
+            .state = .ready,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 11,
+            .pending_reasons = &.{},
+        },
+    });
+    try std.testing.expectEqualStrings("ready", summary.state);
+    try std.testing.expect(summary.ready);
 }
 
 test "index wait progress reporting is immediate periodic and state sensitive" {

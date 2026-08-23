@@ -5625,6 +5625,9 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 }
 
 const ServerlessIndexStatus = struct {
+    readiness_ready: bool,
+    readiness_target_revision: u64,
+    readiness_published_revision: u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -5713,7 +5716,23 @@ fn appendServerlessIndexStatusJson(
     out: *std.ArrayListUnmanaged(u8),
     status: ServerlessIndexStatus,
 ) !void {
-    try out.appendSlice(alloc, "{\"rebuilding\":");
+    try out.appendSlice(alloc, "{\"readiness\":{\"state\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
+    const readiness_identity = try std.fmt.allocPrint(
+        alloc,
+        ",\"incarnation\":\"sv-{x:0>16}\",\"target_revision\":{},\"published_revision\":{},\"pending_reasons\":",
+        .{ status.readiness_target_revision, status.readiness_target_revision, status.readiness_published_revision },
+    );
+    defer alloc.free(readiness_identity);
+    try out.appendSlice(alloc, readiness_identity);
+    if (status.readiness_ready) {
+        try out.appendSlice(alloc, "[]}");
+    } else if (status.materialization_blocked) {
+        try out.appendSlice(alloc, "[\"materialization\",\"publication\"]}");
+    } else {
+        try out.appendSlice(alloc, "[\"publication\"]}");
+    }
+    try out.appendSlice(alloc, ",\"rebuilding\":");
     try out.appendSlice(alloc, if (status.rebuilding) "true" else "false");
     try out.appendSlice(alloc, ",\"backfill_active\":");
     try out.appendSlice(alloc, if (status.backfill_active) "true" else "false");
@@ -5915,6 +5934,9 @@ fn serverlessIndexStatus(
     } else null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
     return .{
+        .readiness_ready = built and materialization_blocker == null,
+        .readiness_target_revision = status.next_version,
+        .readiness_published_revision = status.head_version,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -6495,6 +6517,13 @@ fn testJoinProfileFieldValue(response: anytype, field: []const u8) ?std.json.Val
 
 const ServerlessIndexStatusTestResponse = struct {
     const Status = struct {
+        readiness: ?struct {
+            state: []const u8,
+            incarnation: ?[]const u8 = null,
+            target_revision: ?u64 = null,
+            published_revision: ?u64 = null,
+            pending_reasons: []const []const u8,
+        } = null,
         rebuilding: ?bool = null,
         backfill_active: ?bool = null,
         doc_count: ?u64 = null,
@@ -8195,6 +8224,8 @@ test "http handler index status exposes graph publication actions" {
     var parsed_planned = try parseServerlessIndexStatusTestResponse(alloc, planned.body, "graph_idx");
     defer parsed_planned.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_planned.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_planned.value.status.readiness.?.state);
+    try std.testing.expect(parsed_planned.value.status.readiness.?.pending_reasons.len > 0);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -8209,6 +8240,8 @@ test "http handler index status exposes graph publication actions" {
     var parsed_head = try parseServerlessIndexStatusTestResponse(alloc, head.body, "graph_idx");
     defer parsed_head.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_head.value.status.head_publication_action.?);
+    try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {

@@ -1453,7 +1453,7 @@ fn appendMinimalIndexRuntimeStatus(
 ) !void {
     try out.appendSlice(alloc, "{\"index_type\":");
     try appendJsonString(alloc, out, indexTypeName(index_type));
-    try out.append(alloc, '}');
+    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]}}");
 }
 
 /// Collapse the durable repair state machine into the small vocabulary that is
@@ -1927,13 +1927,17 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
             aggregate.coverage_skipped_count,
             aggregate.coverage_terminal_failed_count,
         );
-    if (aggregate.catch_up_active or
-        (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence and !complete_materialization)) return;
+    // A dense session can remain active while flushing an already-published
+    // applied watermark. Once every source has a terminal outcome and the
+    // corresponding artifacts are query-visible, that internal finalization
+    // is not public readiness debt. A session still blocks when materialized
+    // coverage is incomplete.
+    if (aggregate.replay_target_sequence == 0 or
+        aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
+    if (aggregate.catch_up_target_sequence > aggregate.catch_up_applied_sequence) return;
     if (!complete_materialization) return;
     if (!embeddingsArtifactPublishComplete(aggregate.*, kind == .sparse_vector, aggregate.coverage_produced_count)) return;
 
-    aggregate.replay_applied_sequence = @max(aggregate.replay_applied_sequence, aggregate.replay_target_sequence);
-    aggregate.catch_up_applied_sequence = @max(aggregate.catch_up_applied_sequence, aggregate.catch_up_target_sequence);
     aggregate.replay_catch_up_required = false;
     aggregate.catch_up_active = false;
     aggregate.catch_up_phase = .idle;
@@ -2996,15 +3000,15 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
-    if (readiness_complete and !enrichment_pending) {
-        view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
+    const merged_replay_current = view.replay_applied_sequence >= view.replay_target_sequence and
+        !view.replay_catch_up_required;
+    if (readiness_complete and merged_replay_current and !enrichment_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
         return view;
     }
-    if (all_sources_settled and !enrichment_pending) {
-        view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
+    if (all_sources_settled and merged_replay_current and !enrichment_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
@@ -3403,7 +3407,11 @@ fn appendSingleIndexRuntimeStatus(
     var catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
     var catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
     if (index_type == .embeddings) {
-        if (embeddings_materialization_current and dense_catch_up.active and !active_generation_serviceable) {
+        if (embeddings_materialization_current and dense_catch_up.active and
+            !active_generation_serviceable and
+            (dense_catch_up.current_target_sequence > dense_catch_up.current_sequence or
+                embeddings_view == null or embeddings_view.?.backfill_active))
+        {
             catch_up_active = true;
             catch_up_phase = dense_catch_up.phase;
             catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
@@ -3732,9 +3740,108 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"enrichment_runtime\":");
         try appendEnrichmentRuntimeStatus(alloc, out, visible_enrichment orelse .{});
     }
+    try appendIndexReadinessStatus(
+        alloc,
+        out,
+        index_type,
+        item,
+        embeddings_coverage_policy,
+        coverage_generation,
+        coverage_config_hash,
+        runtime_present,
+        metadata,
+        backfill_active,
+        repair_state,
+        load_error,
+        replay_applied_sequence,
+        replay_target_sequence,
+        replay_catch_up_required,
+        catch_up_active,
+    );
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
     try out.append(alloc, '}');
+}
+
+fn appendIndexReadinessStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_type: ApiIndexType,
+    item: anytype,
+    embeddings_coverage_policy: EmbeddingsCoveragePolicy,
+    coverage_generation: u64,
+    coverage_config_hash: u64,
+    runtime_present: bool,
+    metadata: ?runtime_status.RuntimeStatusMetadata,
+    backfill_active: bool,
+    repair_state: ?[]const u8,
+    load_error: ?[]const u8,
+    replay_applied_sequence: u64,
+    replay_target_sequence: u64,
+    replay_catch_up_required: bool,
+    catch_up_active: bool,
+) !void {
+    const Item = @TypeOf(item);
+    const observation_fresh = runtime_present and if (metadata) |md|
+        md.freshness == .fresh
+    else if (@hasField(Item, "runtime_fresh"))
+        item.runtime_fresh
+    else
+        true;
+    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
+        item.expected_group_count == item.fresh_group_count
+    else
+        true;
+    const incarnation_current = index_type != .embeddings or
+        (coverage_generation != 0 and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+    const repair_failed = if (repair_state) |state|
+        std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")
+    else
+        false;
+    const failed = load_error != null or repair_failed;
+    const publication_pending = index_type == .embeddings and incarnation_current and
+        replay_target_sequence > replay_applied_sequence;
+    const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
+        (!incarnation_current or backfill_active);
+    const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or
+        backfill_active or repair_state != null or replay_catch_up_required or catch_up_active or
+        publication_pending or coverage_pending);
+
+    try out.appendSlice(alloc, ",\"readiness\":{\"state\":");
+    try appendJsonString(alloc, out, if (failed) "failed" else if (pending) "pending" else "ready");
+    if (index_type == .embeddings and coverage_generation != 0) {
+        const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
+        defer alloc.free(incarnation);
+        try out.appendSlice(alloc, ",\"incarnation\":");
+        try appendJsonString(alloc, out, incarnation);
+    }
+    try out.appendSlice(alloc, ",\"target_revision\":");
+    try appendIntValue(alloc, out, replay_target_sequence);
+    try out.appendSlice(alloc, ",\"published_revision\":");
+    try appendIntValue(alloc, out, replay_applied_sequence);
+    try out.appendSlice(alloc, ",\"pending_reasons\":[");
+    var emitted = false;
+    const appendReason = struct {
+        fn run(
+            reason_alloc: std.mem.Allocator,
+            reason_out: *std.ArrayListUnmanaged(u8),
+            reason: []const u8,
+            did_emit: *bool,
+        ) !void {
+            if (did_emit.*) try reason_out.append(reason_alloc, ',');
+            did_emit.* = true;
+            try appendJsonString(reason_alloc, reason_out, reason);
+        }
+    }.run;
+    if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
+    if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
+    if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);
+    if (repair_state != null) try appendReason(alloc, out, "repair", &emitted);
+    if (backfill_active) try appendReason(alloc, out, "backfill", &emitted);
+    if (coverage_pending) try appendReason(alloc, out, "coverage", &emitted);
+    if (replay_catch_up_required or catch_up_active) try appendReason(alloc, out, "replay", &emitted);
+    if (publication_pending) try appendReason(alloc, out, "publication", &emitted);
+    try out.appendSlice(alloc, "]}");
 }
 
 fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.ResolverReplayDiagnostics) !void {
@@ -6065,7 +6172,7 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
 }
 
-test "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery" {
+test "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery" {
     const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
     var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
     defer parsed_config.deinit();
@@ -6082,12 +6189,12 @@ test "managed embeddings readiness ignores inactive stale catch-up after rate-li
         .coverage_generation = 42,
         .coverage_config_hash = config_hash,
         .coverage_identity_ready = true,
-        .replay_applied_sequence = 4,
+        .replay_applied_sequence = 8,
         .replay_target_sequence = 8,
-        .replay_catch_up_required = true,
-        .catch_up_active = false,
-        .catch_up_phase = .idle,
-        .catch_up_applied_sequence = 4,
+        .replay_catch_up_required = false,
+        .catch_up_active = true,
+        .catch_up_phase = .applied_sequence_flush,
+        .catch_up_applied_sequence = 8,
         .catch_up_target_sequence = 8,
         .backfill_active = true,
         .backfill_progress = 0.5,
