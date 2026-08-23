@@ -22637,8 +22637,8 @@ components:
         result_ref:
           type: string
           description: '`$query_results` selects the final ranked query results. `$graph_results.<query-name>`
-            selects a prior graph query result. Prior MATCH results require `binding`; traversal results
-            prohibit it. Path-producing results cannot currently be used as node selectors.'
+            selects a prior graph query result. Prior MATCH results require `binding`; traversal and path
+            results prohibit it. A path result selects the endpoint node of each returned path.'
         binding:
           type: string
           minLength: 1

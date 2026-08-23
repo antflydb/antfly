@@ -205,9 +205,10 @@ regardless of whether retrieval was lexical, vector, or fused:
 }
 ```
 
-Traversal outputs can seed another traversal with
-`$graph_results.<query-name>`. MATCH produces rows with multiple aliases, so a
-downstream selector must also name the returned `binding`:
+Traversal and path outputs can seed another graph operation with
+`$graph_results.<query-name>`. A path result contributes the endpoint node of
+each returned path. MATCH produces rows with multiple aliases, so a downstream
+selector must also name the returned `binding`:
 
 ```jsonc
 {"result_ref": "$graph_results.authors_and_posts", "binding": "post", "limit": 100}
@@ -215,9 +216,9 @@ downstream selector must also name the returned `binding`:
 
 Omit `limit` only when the referenced result is complete. Antfly rejects
 unbounded references to truncated result pages rather than returning a partial
-answer. Path-producing results are not currently valid node selectors.
-Table-qualified identities use `{"key":"…","table":"…"}`; omitting `table`,
-or explicitly naming the queried table, has the same identity semantics.
+answer. Table-qualified identities use `{"key":"…","table":"…"}`; omitting
+`table`, or explicitly naming the queried table, has the same identity
+semantics.
 
 `match` expresses branched conjunctive patterns and can return rows or exact
 named counts. Node filters are non-scoring stored-document predicates; they do

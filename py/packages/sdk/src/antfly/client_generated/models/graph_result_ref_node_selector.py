@@ -15,8 +15,8 @@ class GraphResultRefNodeSelector:
     """
     Attributes:
         result_ref (str): `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects
-            a prior graph query result. Prior MATCH results require `binding`; traversal results prohibit it. Path-producing
-            results cannot currently be used as node selectors.
+            a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A
+            path result selects the endpoint node of each returned path.
         binding (str | Unset): Binding alias to select from a prior MATCH result. Valid only with
             `$graph_results.<query-name>` when that query returns MATCH rows.
         limit (int | Unset): Maximum referenced results to use. Omit only when the referenced result is complete.
