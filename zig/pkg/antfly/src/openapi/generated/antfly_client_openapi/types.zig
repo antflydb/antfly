@@ -4833,6 +4833,7 @@ pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     k: i64,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -4843,7 +4844,7 @@ pub const GraphKShortestPaths = struct {
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
 };
 
@@ -4870,7 +4871,7 @@ pub const GraphMatch = struct {
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
-    /// Empty or omitted matches every edge type.
+    /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
@@ -5066,6 +5067,7 @@ pub const GraphQuery = union(enum) {
 
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -5153,6 +5155,7 @@ pub const GraphQueryResult = union(enum) {
 pub const GraphQueryStats = struct {
     /// Number of primary result items returned (nodes, paths, rows, or aggregates).
     returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
     truncated: bool,
 };
 
@@ -5306,6 +5309,7 @@ pub const GraphReturn = union(enum) {
 pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -5316,7 +5320,7 @@ pub const GraphShortestPath = struct {
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
 };
 
@@ -5330,6 +5334,7 @@ pub const GraphTemplateValue = std.json.Value;
 
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
@@ -5341,7 +5346,7 @@ pub const GraphTraversal = struct {
     include_paths: ?bool = null,
     /// Include each result node's stored document.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
     /// Non-scoring structured stored-document predicate for reached nodes.
     filter: ?GraphDocumentFilter = null,
@@ -8050,6 +8055,7 @@ pub const PathWeightMode = enum {
 
 /// Deprecated linear graph_searches pattern edge.
 pub const PatternEdgeStep = struct {
+    /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
@@ -8634,9 +8640,9 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 Unicode characters and must not begin with `$`, which is reserved for result namespaces. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
-    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
@@ -9267,9 +9273,9 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 Unicode characters and must not begin with `$`, which is reserved for result namespaces. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
-    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,

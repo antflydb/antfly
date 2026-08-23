@@ -14517,11 +14517,13 @@ components:
 
             64 named graph operations, of which at most 8 may be named `match`
 
-            operations; operation names must be 1-128 characters. Put multiple
+            operations; operation names must be 1-128 Unicode characters and
 
-            counts over one pattern in the same `match` return object so they
+            must not begin with `$`, which is reserved for result namespaces.
 
-            share one complete anchor scan.
+            Put multiple counts over one pattern in the same `match` return
+
+            object so they share one complete anchor scan.
         graph_searches:
           deprecated: true
           type: object
@@ -14532,6 +14534,8 @@ components:
             Deprecated compatibility alias for the v0.2 graph query contract.
 
             Use `graph_queries`; requests containing both fields are rejected.
+
+            Names beginning with `$` are reserved for result namespaces.
         expand_strategy:
           type: string
           enum:
@@ -22371,9 +22375,14 @@ components:
           type: string
         types:
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
-          description: Empty or omitted matches every edge type.
+            minLength: 1
+            maxLength: 65536
+          description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
+            at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         min_hops:
@@ -22665,8 +22674,13 @@ components:
           $ref: '#/components/schemas/GraphNodeSelector'
         edge_types:
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 65536
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         max_depth:
@@ -22700,8 +22714,7 @@ components:
           type: array
           items:
             type: string
-          description: Document fields to include when include_documents is true. Omit to include all
-            fields.
+          description: Requires include_documents=true. Omit to include all document fields.
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for reached nodes.
@@ -22744,8 +22757,13 @@ components:
           $ref: '#/components/schemas/GraphPathEndpoint'
         edge_types:
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 65536
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         max_depth:
@@ -22772,8 +22790,7 @@ components:
           type: array
           items:
             type: string
-          description: Document fields to include when include_documents is true. Omit to include all
-            fields.
+          description: Requires include_documents=true. Omit to include all document fields.
     GraphShortestPathQuery:
       type: object
       additionalProperties: false
@@ -22803,8 +22820,13 @@ components:
           maximum: 100
         edge_types:
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 65536
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         max_depth:
@@ -22831,8 +22853,7 @@ components:
           type: array
           items:
             type: string
-          description: Document fields to include when include_documents is true. Omit to include all
-            fields.
+          description: Requires include_documents=true. Omit to include all document fields.
     GraphKShortestPathsQuery:
       type: object
       additionalProperties: false
@@ -22926,8 +22947,13 @@ components:
         edge_types:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 65536
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         max_depth:
@@ -22979,8 +23005,14 @@ components:
         types:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 65536
+          description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
+            at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         min_hops:
@@ -23199,6 +23231,8 @@ components:
           description: Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated:
           type: boolean
+          description: True when execution stopped before exhaustive enumeration; an unbounded result
+            reference rejects truncated input.
     GraphBindingsResult:
       x-go-type-skip-optional-pointer: true
       type: object

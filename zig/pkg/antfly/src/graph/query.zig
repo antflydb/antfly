@@ -41,6 +41,8 @@ pub const max_named_queries: usize = 64;
 /// one MATCH return object and share its scan.
 pub const max_match_queries_per_request: usize = 8;
 pub const max_query_name_codepoints: usize = 128;
+pub const max_edge_types: usize = 64;
+pub const max_edge_type_bytes: usize = 64 * 1024;
 
 pub fn validateRequestOperationBudget(queries: anytype) !void {
     if (queries.len > max_named_queries) return error.InvalidQueryRequest;
@@ -56,8 +58,55 @@ pub fn validateRequestOperationBudget(queries: anytype) !void {
 
 pub fn isValidQueryName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_query_name_codepoints * 4) return false;
+    // `$...` is reserved for typed result namespaces such as
+    // `$query_results` and `$graph_results.<name>`. Keeping operation names
+    // out of that namespace makes resolution identical in every executor.
+    if (name[0] == '$') return false;
     const codepoints = std.unicode.utf8CountCodepoints(name) catch return false;
     return codepoints >= 1 and codepoints <= max_query_name_codepoints;
+}
+
+pub fn validateEdgeTypes(edge_types: []const []const u8) !void {
+    if (edge_types.len > max_edge_types) return error.InvalidArgument;
+    var total_bytes: usize = 0;
+    for (edge_types, 0..) |edge_type, i| {
+        if (edge_type.len == 0) return error.InvalidArgument;
+        total_bytes = std.math.add(usize, total_bytes, edge_type.len) catch
+            return error.InvalidArgument;
+        if (total_bytes > max_edge_type_bytes) return error.InvalidArgument;
+        for (edge_types[0..i]) |prior| {
+            if (std.mem.eql(u8, prior, edge_type)) return error.InvalidArgument;
+        }
+    }
+}
+
+/// Executors collect one extra item to distinguish an exact result whose size
+/// equals the public limit from a result that was actually truncated.
+pub fn resultCollectionLimit(limit: u32) usize {
+    if (limit == 0) return std.math.maxInt(usize);
+    return @as(usize, limit) + 1;
+}
+
+pub fn resultCountIsTruncated(count: usize, limit: u32) bool {
+    return limit > 0 and count > limit;
+}
+
+test "graph public operation names and edge filters stay unambiguous and bounded" {
+    try std.testing.expect(isValidQueryName("walk"));
+    try std.testing.expect(!isValidQueryName("$query_results"));
+    try std.testing.expect(!isValidQueryName("$graph_results.walk"));
+
+    try validateEdgeTypes(&.{ "cites", "related" });
+    try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{""}));
+    try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{ "cites", "cites" }));
+    const too_many = [_][]const u8{"edge"} ** (max_edge_types + 1);
+    try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_many));
+    const too_large = [_][]const u8{"x" ** (max_edge_type_bytes + 1)};
+    try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_large));
+
+    try std.testing.expectEqual(@as(usize, 101), resultCollectionLimit(100));
+    try std.testing.expect(!resultCountIsTruncated(100, 100));
+    try std.testing.expect(resultCountIsTruncated(101, 100));
 }
 
 // ============================================================================

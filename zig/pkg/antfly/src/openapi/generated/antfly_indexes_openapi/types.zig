@@ -1700,6 +1700,7 @@ pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     k: i64,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -1710,7 +1711,7 @@ pub const GraphKShortestPaths = struct {
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with each path.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
 };
 
@@ -1737,7 +1738,7 @@ pub const GraphMatch = struct {
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
-    /// Empty or omitted matches every edge type.
+    /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
@@ -1922,6 +1923,7 @@ pub const GraphQuery = union(enum) {
 
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -2009,6 +2011,7 @@ pub const GraphQueryResult = union(enum) {
 pub const GraphQueryStats = struct {
     /// Number of primary result items returned (nodes, paths, rows, or aggregates).
     returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
     truncated: bool,
 };
 
@@ -2162,6 +2165,7 @@ pub const GraphReturn = union(enum) {
 pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
@@ -2172,7 +2176,7 @@ pub const GraphShortestPath = struct {
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on nodes returned with the path.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
 };
 
@@ -2186,6 +2190,7 @@ pub const GraphTemplateValue = std.json.Value;
 
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
+    /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
@@ -2197,7 +2202,7 @@ pub const GraphTraversal = struct {
     include_paths: ?bool = null,
     /// Include each result node's stored document.
     include_documents: ?bool = null,
-    /// Document fields to include when include_documents is true. Omit to include all fields.
+    /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
     /// Non-scoring structured stored-document predicate for reached nodes.
     filter: ?GraphDocumentFilter = null,
@@ -2783,6 +2788,7 @@ pub const PathWeightMode = enum {
 
 /// Deprecated linear graph_searches pattern edge.
 pub const PatternEdgeStep = struct {
+    /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,

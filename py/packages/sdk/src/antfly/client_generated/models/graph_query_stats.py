@@ -14,7 +14,8 @@ class GraphQueryStats:
     """
     Attributes:
         returned_items (int): Number of primary result items returned (nodes, paths, rows, or aggregates).
-        truncated (bool):
+        truncated (bool): True when execution stopped before exhaustive enumeration; an unbounded result reference
+            rejects truncated input.
     """
 
     returned_items: int

@@ -284,12 +284,14 @@ class QueryRequest:
             familiar scalar syntax with document queries but deliberately excludes
             analyzer-backed and index-only clauses. A request may contain at most
             64 named graph operations, of which at most 8 may be named `match`
-            operations; operation names must be 1-128 characters. Put multiple
-            counts over one pattern in the same `match` return object so they
-            share one complete anchor scan.
+            operations; operation names must be 1-128 Unicode characters and
+            must not begin with `$`, which is reserved for result namespaces.
+            Put multiple counts over one pattern in the same `match` return
+            object so they share one complete anchor scan.
         graph_searches (QueryRequestGraphSearches | Unset): Deprecated compatibility alias for the v0.2 graph query
             contract.
             Use `graph_queries`; requests containing both fields are rejected.
+            Names beginning with `$` are reserved for result namespaces.
         expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
             - union: Include nodes from both search and graph results
             - intersection: Only include nodes appearing in both

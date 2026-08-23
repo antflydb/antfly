@@ -23,7 +23,7 @@ class GraphQueryParams:
     """Deprecated graph_searches traversal and path parameters.
 
     Attributes:
-        edge_types (list[str] | Unset):
+        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node

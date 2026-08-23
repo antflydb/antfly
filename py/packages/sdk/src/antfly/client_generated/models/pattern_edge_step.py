@@ -17,7 +17,8 @@ class PatternEdgeStep:
     """Deprecated linear graph_searches pattern edge.
 
     Attributes:
-        types (list[str] | Unset):
+        types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
+            at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node

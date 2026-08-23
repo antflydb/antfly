@@ -38,7 +38,7 @@ class GraphKShortestPaths:
         from_ (GraphPathEndpoint):
         to (GraphPathEndpoint):
         k (int):
-        edge_types (list[str] | Unset):
+        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node
@@ -60,8 +60,7 @@ class GraphKShortestPaths:
             Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
             Alias-to-alias predicates belong in GraphMatch.where.
         include_documents (bool | Unset): Include stored documents on nodes returned with each path. Default: False.
-        fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
-            fields.
+        fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
     """
 
     from_: GraphPathEndpoint

@@ -38,7 +38,7 @@ class GraphTraversal:
     Attributes:
         start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
             exactly one explicit, exact selector form.
-        edge_types (list[str] | Unset):
+        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node
@@ -50,8 +50,7 @@ class GraphTraversal:
         deduplicate_nodes (bool | Unset):  Default: True.
         include_paths (bool | Unset):  Default: False.
         include_documents (bool | Unset): Include each result node's stored document. Default: False.
-        fields (list[str] | Unset): Document fields to include when include_documents is true. Omit to include all
-            fields.
+        fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
         filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
             GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
             GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |

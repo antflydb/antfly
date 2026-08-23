@@ -8805,10 +8805,12 @@ fn parseLegacyPatternSteps(
     }
 
     for (value, 0..) |step, i| {
-        const edge_types = if (step.edge) |edge|
-            if (edge.types) |types| try cloneFields(alloc, types) else &.{}
+        const requested_edge_types = if (step.edge) |edge|
+            edge.types orelse &.{}
         else
             &.{};
+        graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
+        const edge_types = try cloneFields(alloc, requested_edge_types);
         errdefer freeOwnedStringSlice(alloc, edge_types);
         steps[i] = .{
             .alias = try alloc.dupe(u8, step.alias orelse ""),
@@ -8864,7 +8866,9 @@ fn parseLegacyGraphQueryParams(
         return error.InvalidQueryRequest;
     const node_filter = try parseLegacyPatternNodeFilter(alloc, value.node_filter);
     errdefer freePatternNodeFilter(alloc, node_filter);
-    const edge_types = if (value.edge_types) |types| try cloneFields(alloc, types) else &.{};
+    const requested_edge_types = value.edge_types orelse &.{};
+    graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
+    const edge_types = try cloneFields(alloc, requested_edge_types);
     return .{
         .edge_types = edge_types,
         .direction = if (value.direction) |direction| switch (direction) {
@@ -8889,11 +8893,15 @@ fn parseLegacyGraphQueryParams(
 
 fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphTraverseQuery) !graph_query_mod.GraphQuery {
     const traversal = value.traverse;
+    if (traversal.fields != null and traversal.include_documents != true)
+        return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, value.index);
     errdefer alloc.free(index);
     const start = try parseGraphNodeSelector(alloc, traversal.start);
     errdefer freeGraphNodeSelector(alloc, start);
-    const edge_types = if (traversal.edge_types) |types| try cloneFields(alloc, types) else &.{};
+    const requested_edge_types = traversal.edge_types orelse &.{};
+    graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
+    const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -8928,13 +8936,17 @@ fn parseGraphPathQuery(
     query_type: graph_query_mod.QueryType,
 ) !graph_query_mod.GraphQuery {
     if (k == 0 or k > 100) return error.InvalidQueryRequest;
+    if (path.fields != null and path.include_documents != true)
+        return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, index_value);
     errdefer alloc.free(index);
     const starts = try parseGraphPathEndpointSelector(alloc, path.from);
     errdefer freeGraphNodeSelector(alloc, starts);
     const targets = try parseGraphPathEndpointSelector(alloc, path.to);
     errdefer freeGraphNodeSelector(alloc, targets);
-    const edge_types = if (path.edge_types) |types| try cloneFields(alloc, types) else &.{};
+    const requested_edge_types = path.edge_types orelse &.{};
+    graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
+    const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -9115,7 +9127,9 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         errdefer alloc.free(from);
         const to = try alloc.dupe(u8, edge.to);
         errdefer alloc.free(to);
-        const types = if (edge.types) |types_value| try cloneFields(alloc, types_value) else &.{};
+        const requested_types = edge.types orelse &.{};
+        graph_query_mod.validateEdgeTypes(requested_types) catch return error.InvalidQueryRequest;
+        const types = try cloneFields(alloc, requested_types);
         errdefer freeOwnedStringSlice(alloc, types);
         edges[i] = .{
             .from = from,

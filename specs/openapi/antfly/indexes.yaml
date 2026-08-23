@@ -2502,7 +2502,10 @@ components:
         edge_types:
           x-go-type-skip-optional-pointer: true
           type: array
-          items: { type: string }
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction: { $ref: "#/components/schemas/EdgeDirection" }
         max_depth:
           x-go-type-skip-optional-pointer: true
@@ -2551,7 +2554,10 @@ components:
         types:
           x-go-type-skip-optional-pointer: true
           type: array
-          items: { type: string }
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
         direction: { $ref: "#/components/schemas/EdgeDirection" }
         min_hops:
           x-go-type-skip-optional-pointer: true
@@ -2841,7 +2847,10 @@ components:
           $ref: '#/components/schemas/GraphNodeSelector'
         edge_types:
           type: array
-          items: { type: string }
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
         max_depth:
@@ -2866,7 +2875,7 @@ components:
         fields:
           type: array
           items: { type: string }
-          description: Document fields to include when include_documents is true. Omit to include all fields.
+          description: Requires include_documents=true. Omit to include all document fields.
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for reached nodes.
@@ -2888,7 +2897,10 @@ components:
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
         edge_types:
           type: array
-          items: { type: string }
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction: { $ref: '#/components/schemas/EdgeDirection' }
         max_depth:
           type: integer
@@ -2908,7 +2920,7 @@ components:
         fields:
           type: array
           items: { type: string }
-          description: Document fields to include when include_documents is true. Omit to include all fields.
+          description: Requires include_documents=true. Omit to include all document fields.
     GraphKShortestPaths:
       type: object
       additionalProperties: false
@@ -2922,7 +2934,10 @@ components:
           maximum: 100
         edge_types:
           type: array
-          items: { type: string }
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: At most 64 unique edge types totaling at most 64 KiB.
         direction: { $ref: '#/components/schemas/EdgeDirection' }
         max_depth:
           type: integer
@@ -2942,7 +2957,7 @@ components:
         fields:
           type: array
           items: { type: string }
-          description: Document fields to include when include_documents is true. Omit to include all fields.
+          description: Requires include_documents=true. Omit to include all document fields.
     GraphMatchNode:
       type: object
       additionalProperties: false
@@ -2964,8 +2979,10 @@ components:
         to: { type: string }
         types:
           type: array
-          items: { type: string }
-          description: Empty or omitted matches every edge type.
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 65536 }
+          description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
         direction: { $ref: '#/components/schemas/EdgeDirection' }
         min_hops:
           type: integer
@@ -3264,7 +3281,9 @@ components:
           type: integer
           format: uint64
           description: Number of primary result items returned (nodes, paths, rows, or aggregates).
-        truncated: { type: boolean }
+        truncated:
+          type: boolean
+          description: True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
     GraphBindingsResult:
       x-go-type-skip-optional-pointer: true
       type: object

@@ -6769,9 +6769,10 @@ export interface components {
              *     familiar scalar syntax with document queries but deliberately excludes
              *     analyzer-backed and index-only clauses. A request may contain at most
              *     64 named graph operations, of which at most 8 may be named `match`
-             *     operations; operation names must be 1-128 characters. Put multiple
-             *     counts over one pattern in the same `match` return object so they
-             *     share one complete anchor scan.
+             *     operations; operation names must be 1-128 Unicode characters and
+             *     must not begin with `$`, which is reserved for result namespaces.
+             *     Put multiple counts over one pattern in the same `match` return
+             *     object so they share one complete anchor scan.
              */
             graph_queries?: {
                 [key: string]: components["schemas"]["GraphQuery"];
@@ -6780,6 +6781,7 @@ export interface components {
              * @deprecated
              * @description Deprecated compatibility alias for the v0.2 graph query contract.
              *     Use `graph_queries`; requests containing both fields are rejected.
+             *     Names beginning with `$` are reserved for result namespaces.
              */
             graph_searches?: {
                 [key: string]: components["schemas"]["LegacyGraphQuery"];
@@ -11837,7 +11839,7 @@ export interface components {
         GraphMatchEdge: {
             from: string;
             to: string;
-            /** @description Empty or omitted matches every edge type. */
+            /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             /** @default 1 */
@@ -11946,6 +11948,7 @@ export interface components {
         GraphNodeSelector: components["schemas"]["GraphKeyNodeSelector"] | components["schemas"]["GraphIdentityNodeSelector"] | components["schemas"]["GraphResultRefNodeSelector"];
         GraphTraversal: {
             start: components["schemas"]["GraphNodeSelector"];
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             /**
@@ -11968,7 +11971,7 @@ export interface components {
              * @default false
              */
             include_documents?: boolean;
-            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
+            /** @description Requires include_documents=true. Omit to include all document fields. */
             fields?: string[];
             /** @description Non-scoring structured stored-document predicate for reached nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
@@ -11988,6 +11991,7 @@ export interface components {
         GraphShortestPath: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             /** @default 10 */
@@ -12004,7 +12008,7 @@ export interface components {
              * @default false
              */
             include_documents?: boolean;
-            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
+            /** @description Requires include_documents=true. Omit to include all document fields. */
             fields?: string[];
         };
         GraphShortestPathQuery: {
@@ -12015,6 +12019,7 @@ export interface components {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             k: number;
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             /** @default 10 */
@@ -12031,7 +12036,7 @@ export interface components {
              * @default false
              */
             include_documents?: boolean;
-            /** @description Document fields to include when include_documents is true. Omit to include all fields. */
+            /** @description Requires include_documents=true. Omit to include all document fields. */
             fields?: string[];
         };
         GraphKShortestPathsQuery: {
@@ -12082,6 +12087,7 @@ export interface components {
          * @description Deprecated graph_searches traversal and path parameters.
          */
         GraphQueryParams: {
+            /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             max_depth?: number;
@@ -12105,6 +12111,7 @@ export interface components {
          * @description Deprecated linear graph_searches pattern edge.
          */
         PatternEdgeStep: {
+            /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: string[];
             direction?: components["schemas"]["EdgeDirection"];
             /** @default 1 */
@@ -12227,6 +12234,7 @@ export interface components {
              * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
              */
             returned_items: number;
+            /** @description True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input. */
             truncated: boolean;
         };
         /** @description Complete projected bindings from a canonical graph MATCH query. */

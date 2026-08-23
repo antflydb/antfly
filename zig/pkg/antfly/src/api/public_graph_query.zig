@@ -437,12 +437,15 @@ fn dependencyIndex(
 }
 
 fn findResultSetByRef(available_sets: anytype, ref: []const u8) ?@TypeOf(available_sets[0]) {
-    for (available_sets) |set| {
-        if (std.mem.eql(u8, set.name, ref)) return set;
-    }
+    // Resolve the public namespace before consulting result names. Graph
+    // operation names cannot begin with `$`, so reserved retrieval references
+    // can never be shadowed by a graph result in one executor but not another.
     const name = if (std.mem.startsWith(u8, ref, "$graph_results."))
         ref["$graph_results.".len..]
-    else if (std.mem.eql(u8, ref, "$query_results"))
+    else if (std.mem.eql(u8, ref, "$query_results") or
+        std.mem.eql(u8, ref, "$full_text_results") or
+        std.mem.eql(u8, ref, "$embeddings_results") or
+        std.mem.eql(u8, ref, "$fused_results"))
         ref
     else
         return null;
@@ -522,6 +525,43 @@ test "deprecated graph searches share canonical name admission" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+}
+
+test "graph operation names cannot shadow reserved result namespaces" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_queries":{"$query_results":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]}}}}}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+
+    const ResultSet = struct { name: []const u8 };
+    const sets = [_]ResultSet{.{ .name = "walk" }};
+    try std.testing.expect(findResultSetByRef(&sets, "walk") == null);
+    try std.testing.expect(findResultSetByRef(&sets, "$graph_results.walk") != null);
+}
+
+test "canonical graph edge filters and document projections are explicit" {
+    const alloc = std.testing.allocator;
+
+    var duplicate_types = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"edge_types":["cites","cites"]}}}}
+    , .{});
+    defer duplicate_types.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, duplicate_types.value));
+
+    var traversal_fields = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"fields":["title"]}}}}
+    , .{});
+    defer traversal_fields.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, traversal_fields.value));
+
+    var path_fields = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_queries":{"path":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-b"},"fields":["title"]}}}}
+    , .{});
+    defer path_fields.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, path_fields.value));
 }
 
 test "parse supported graph queries rejects canonical and legacy fields together" {

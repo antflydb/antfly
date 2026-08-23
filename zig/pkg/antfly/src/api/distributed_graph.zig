@@ -2246,6 +2246,8 @@ fn executeDistributedTraverse(
     admission: *GraphNodeAdmissionContext,
 ) !db_mod.types.GraphSearchResult {
     const include_paths = graph_query.query.params.include_paths;
+    const result_limit = graph_query.query.params.max_results;
+    const collection_limit = graph_query_mod.resultCollectionLimit(result_limit);
     const max_depth: u32 = switch (graph_query.query.query_type) {
         .neighbors => 1,
         .traverse => graph_query.query.params.max_depth,
@@ -2281,7 +2283,7 @@ fn executeDistributedTraverse(
         );
     }
 
-    while (frontier.len > 0) {
+    while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
         var next_frontier = std.ArrayListUnmanaged(FrontierState).empty;
         defer {
             for (next_frontier.items) |*item| item.deinit(alloc);
@@ -2372,17 +2374,17 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (state.nodes.items.len >= collection_limit) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
             } else {
                 const fanout_start_ns = platform_time.monotonicNs();
@@ -2453,17 +2455,17 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
-                                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                                if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
                             }
                         }
 
-                        if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                        if (state.nodes.items.len >= collection_limit) break;
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
             }
         } else {
@@ -2527,22 +2529,29 @@ fn executeDistributedTraverse(
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
                             merged_node_owned = false;
-                            if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                            if (state.nodes.items.len >= collection_limit) break;
                         } else {
                             merged_node.deinit(alloc);
                             merged_node_owned = false;
                         }
                     }
 
-                    if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                    if (state.nodes.items.len >= collection_limit) break;
                 }
 
-                if (graph_query.query.params.max_results > 0 and state.nodes.items.len >= graph_query.query.params.max_results) break;
+                if (state.nodes.items.len >= collection_limit) break;
             }
         }
 
         freeFrontier(alloc, frontier);
         frontier = try next_frontier.toOwnedSlice(alloc);
+    }
+
+    const truncated = graph_query_mod.resultCountIsTruncated(state.nodes.items.len, result_limit);
+    if (truncated) {
+        const public_len: usize = @intCast(result_limit);
+        for (state.nodes.items[public_len..]) |*node| node.deinit(alloc);
+        state.nodes.items.len = public_len;
     }
 
     const hydrated_hits = if (graphResultHydrationRequested(req, graph_query.query))
@@ -2573,6 +2582,7 @@ fn executeDistributedTraverse(
         .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
         .hits = hits,
         .total_hits = total_hits,
+        .truncated = truncated,
     };
 }
 

@@ -17,6 +17,7 @@ T = TypeVar("T", bound="QueryRequestGraphSearches")
 class QueryRequestGraphSearches:
     """Deprecated compatibility alias for the v0.2 graph query contract.
     Use `graph_queries`; requests containing both fields are rejected.
+    Names beginning with `$` are reserved for result namespaces.
 
     """
 

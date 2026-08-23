@@ -3240,11 +3240,25 @@ pub const HttpHandler = struct {
             seen.deinit(self.alloc);
         }
 
+        const result_limit = named_query.query.params.max_results;
+        const bounded = result_limit > 0;
+        const collection_limit = graph_query_mod.resultCollectionLimit(result_limit);
+        var truncated = false;
         for (start_keys) |start_key| {
-            const bounded = named_query.query.params.max_results > 0;
-            if (bounded and nodes.items.len >= named_query.query.params.max_results) break;
-            const remaining: u32 = if (bounded)
-                named_query.query.params.max_results - @as(u32, @intCast(nodes.items.len))
+            if (nodes.items.len >= collection_limit) {
+                truncated = true;
+                break;
+            }
+            const remaining: usize = if (bounded)
+                collection_limit - nodes.items.len
+            else
+                0;
+            // Ask an individual traversal for one result beyond the remaining
+            // collection budget. This preserves completeness signaling when its
+            // local cap is reached, including when global de-duplication consumes
+            // that probe.
+            const traversal_limit: u32 = if (bounded)
+                @intCast(@min(remaining + 1, std.math.maxInt(u32)))
             else
                 0;
             const traversal_nodes = try graph_traversal.traverseWithEdgeReader(self.alloc, edge_reader, start_key, .{
@@ -3253,12 +3267,13 @@ pub const HttpHandler = struct {
                 .max_depth = named_query.query.params.max_depth,
                 .min_weight = named_query.query.params.min_weight,
                 .max_weight = named_query.query.params.max_weight,
-                .max_results = remaining,
+                .max_results = traversal_limit,
                 .deduplicate = named_query.query.params.deduplicate,
                 .include_paths = named_query.query.params.include_paths,
                 .node_admission = admission,
             });
             defer graph_traversal.freeOwnedResults(self.alloc, traversal_nodes);
+            const traversal_overflow = bounded and traversal_nodes.len > remaining;
 
             for (traversal_nodes) |node| {
                 if (named_query.query.params.deduplicate) {
@@ -3280,7 +3295,20 @@ pub const HttpHandler = struct {
                         null,
                     .path_edges = null,
                 });
+                if (nodes.items.len >= collection_limit) {
+                    truncated = true;
+                    break;
+                }
             }
+            if (traversal_overflow) truncated = true;
+            if (nodes.items.len >= collection_limit) break;
+        }
+
+        if (graph_query_mod.resultCountIsTruncated(nodes.items.len, result_limit)) {
+            truncated = true;
+            const public_len: usize = @intCast(result_limit);
+            for (nodes.items[public_len..]) |*node| node.deinit(self.alloc);
+            nodes.items.len = public_len;
         }
 
         const total_hits: u32 = @intCast(nodes.items.len);
@@ -3299,6 +3327,7 @@ pub const HttpHandler = struct {
             .nodes = owned_nodes,
             .hits = hits,
             .total_hits = total_hits,
+            .truncated = truncated,
         };
     }
 
