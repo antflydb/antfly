@@ -26,6 +26,14 @@ const default_wait_poll_ms: u64 = 1000;
 // progress reporting for minutes.
 const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
+// Server status now fails closed while publication is non-authoritative. A
+// second live observation covers the remaining scheduler handoff where queued
+// derived work becomes active immediately after an otherwise-ready snapshot.
+// Keep its delay independent of the requested polling interval: fast local
+// polling must not weaken correctness, while the normal 1s interval should
+// not add a full second once readiness is first observed.
+const ready_confirmation_observations: u8 = 2;
+const ready_confirmation_delay_ms: u64 = 100;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -449,10 +457,21 @@ fn summarizeStats(stats: anytype) IndexSummary {
         const coverage = stats.coverage orelse break :blk true;
         break :blk !index_readiness.coverageReady(coverage);
     } else false;
+    // Prefer explicit lifecycle facts over a stale/coarsely-derived state
+    // label. This also keeps mixed-version responses safe when they contain a
+    // nominally ready label beside authoritative replay/publication debt.
+    const readiness_pending = (rebuilding orelse false) or
+        (if (@hasField(Stats, "backfill_active")) stats.backfill_active orelse false else false) or
+        (if (@hasField(Stats, "dense_publish_pending")) stats.dense_publish_pending orelse false else false) or
+        (if (@hasField(Stats, "replay_catch_up_required")) stats.replay_catch_up_required orelse false else false) or
+        (if (@hasField(Stats, "catch_up_active")) stats.catch_up_active orelse false else false);
     const state = if (error_text != null)
         "failed"
     else if (config_mismatch)
         "config_mismatch"
+    else if (readiness_pending and
+        (reported_state == null or std.mem.eql(u8, reported_state.?, "ready")))
+        "running"
     else if (coverage_incomplete and ((reported_state != null and std.mem.eql(u8, reported_state.?, "ready")) or
         (reported_state == null and rebuilding == false)))
         if (coverage_missing) "coverage_unavailable" else "coverage_incomplete"
@@ -475,7 +494,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         stats.doc_count
     else
         indexed;
-    const ready = !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
+    const ready = !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
         (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
     const failed = error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
     return .{
@@ -653,6 +672,7 @@ fn waitForIndexWithFetcher(
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
     var progress_reporter = WaitProgressReporter{};
     var consecutive_failures: u32 = 0;
+    var consecutive_ready: u8 = 0;
     while (true) {
         const request_timeout_ms = requestWaitTimeoutMs(started_ns, timeout_ns, clock.now()) orelse
             return timedOut(progress_reporter.last_state);
@@ -662,6 +682,7 @@ fn waitForIndexWithFetcher(
                 return timedOut(progress_reporter.last_state);
             }
             if (!retryableWaitTransportError(err)) return err;
+            consecutive_ready = 0;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", now_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
@@ -679,6 +700,7 @@ fn waitForIndexWithFetcher(
                 cli.expectHttpSuccess(resp);
                 cli.fatal("index {s} returned HTTP {d}", .{ name, resp.status_code });
             }
+            consecutive_ready = 0;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", response_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
@@ -693,12 +715,15 @@ fn waitForIndexWithFetcher(
             const summary = summarizeIndex(parsed.value);
             switch (waitDisposition(summary)) {
                 .ready => {
-                    try writeIndexSummary(allocator, io, parsed.value);
-                    resp.deinit();
-                    return .{ .ready = {} };
+                    consecutive_ready +|= 1;
+                    if (consecutive_ready >= ready_confirmation_observations) {
+                        try writeIndexSummary(allocator, io, parsed.value);
+                        resp.deinit();
+                        return .{ .ready = {} };
+                    }
                 },
                 .failed => cli.fatal("index {s} entered terminal state {s}; run index list --output json for diagnostics", .{ name, summary.state }),
-                .waiting => {},
+                .waiting => consecutive_ready = 0,
             }
             if (progress_reporter.shouldReport(summary.state, response_ns)) {
                 printWaitProgress(name, summary);
@@ -707,7 +732,8 @@ fn waitForIndexWithFetcher(
             cli.fatal("index {s} returned an unreadable HTTP {d} response", .{ name, resp.status_code });
         }
         resp.deinit();
-        sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, poll_ms, name);
+        const delay_ms = if (consecutive_ready > 0) ready_confirmation_delay_ms else poll_ms;
+        sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, delay_ms, name);
     }
 }
 
@@ -970,6 +996,18 @@ test "index wait requires complete compatible coverage" {
     });
     try std.testing.expectEqualStrings("ready", summary.state);
     try std.testing.expect(summary.ready);
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "ready",
+        .backfill_active = false,
+        .dense_publish_pending = true,
+        .replay_catch_up_required = true,
+        .coverage = coverage,
+    });
+    try std.testing.expectEqualStrings("running", summary.state);
+    try std.testing.expect(!summary.ready);
 }
 
 test "index wait progress reporting is immediate periodic and state sensitive" {
@@ -1072,8 +1110,44 @@ test "index wait retries bounded HTTP and transport failures" {
         1,
     );
     try std.testing.expect(outcome == .ready);
-    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
     try std.testing.expect(fake.smallest_timeout_ms > 0);
+}
+
+test "index wait rejects a transient ready snapshot" {
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn fetch(ptr: *anyopaque, _: []const u8, _: []const u8, _: u64) anyerror!IndexStatusResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const call = self.calls;
+            self.calls += 1;
+            const running = call == 1;
+            return fakeExternalIndexStatusResponse(
+                self.allocator,
+                200,
+                if (running) "running" else "ready",
+                running,
+            );
+        }
+    };
+
+    var fake = Fake{ .allocator = std.testing.allocator };
+    const outcome = try waitForIndexWithFetcher(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .ptr = &fake, .fetch_fn = Fake.fetch },
+        .system(),
+        "docs",
+        "external_idx",
+        1000,
+        1,
+    );
+    try std.testing.expect(outcome == .ready);
+    // ready -> running must reset confirmation; only the final two ready
+    // observations may complete the wait.
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }
 
 test "index wait deadline rejects a response that arrives late" {
