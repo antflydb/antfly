@@ -42,6 +42,8 @@ pub const KindStats = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     inserts: u64 = 0,
+    transient_serves: u64 = 0,
+    policy_bypasses: u64 = 0,
     evictions: u64 = 0,
     invalidations: u64 = 0,
     waits: u64 = 0,
@@ -97,6 +99,7 @@ pub const Cache = struct {
         value: Value,
         byte_cost: usize,
         ref_count: usize,
+        transient_ref_count: std.atomic.Value(usize) = .init(0),
         last_access: u64,
         invalidated: bool = false,
         lru_prev: ?*Entry = null,
@@ -154,6 +157,8 @@ pub const Cache = struct {
         hits: CounterU64 = .init(0),
         misses: CounterU64 = .init(0),
         inserts: CounterU64 = .init(0),
+        transient_serves: CounterU64 = .init(0),
+        policy_bypasses: CounterU64 = .init(0),
         evictions: CounterU64 = .init(0),
         invalidations: CounterU64 = .init(0),
         waits: CounterU64 = .init(0),
@@ -163,6 +168,8 @@ pub const Cache = struct {
                 .hits = self.hits.load(.monotonic),
                 .misses = self.misses.load(.monotonic),
                 .inserts = self.inserts.load(.monotonic),
+                .transient_serves = self.transient_serves.load(.monotonic),
+                .policy_bypasses = self.policy_bypasses.load(.monotonic),
                 .evictions = self.evictions.load(.monotonic),
                 .invalidations = self.invalidations.load(.monotonic),
                 .waits = self.waits.load(.monotonic),
@@ -228,6 +235,7 @@ pub const Cache = struct {
     evict_mutex: std.atomic.Mutex = .unlocked,
     resource_accounting_mutex: std.atomic.Mutex = .unlocked,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    reclaimer_identity: u64 = 0,
     resource_accounted_bytes: u64 = 0,
     stats: AtomicStats = .{},
 
@@ -242,6 +250,10 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
+        if (self.resource_manager) |manager| {
+            manager.unregisterReclaimer(self.reclaimer_identity);
+            self.reclaimer_identity = 0;
+        }
         self.releaseResourceUsage();
         for (self.shards) |*shard| {
             for (0..priority_count) |priority| {
@@ -268,9 +280,49 @@ pub const Cache = struct {
 
     pub fn attachResourceManager(self: *Cache, resource_manager: *resource_manager_mod.ResourceManager) void {
         const locked = lockAtomic(&self.resource_accounting_mutex);
-        defer if (locked) self.resource_accounting_mutex.unlock();
-        self.resource_manager = resource_manager;
-        resource_manager.observeUsage(.lsm_block_table_cache, &self.resource_accounted_bytes, @intCast(self.currentBytes()));
+        if (self.resource_manager == resource_manager and self.reclaimer_identity != 0) {
+            if (locked) self.resource_accounting_mutex.unlock();
+            return;
+        }
+        const old_manager = self.resource_manager;
+        const old_reclaimer = self.reclaimer_identity;
+        const current_bytes: u64 = @intCast(self.currentBytes());
+        if (old_manager == null or old_manager.? != resource_manager) {
+            if (old_manager) |manager| {
+                manager.observeUsage(.lsm_block_table_cache, &self.resource_accounted_bytes, 0);
+            } else {
+                self.resource_accounted_bytes = 0;
+            }
+            self.resource_manager = resource_manager;
+            resource_manager.observeUsage(.lsm_block_table_cache, &self.resource_accounted_bytes, current_bytes);
+        }
+        self.reclaimer_identity = 0;
+        if (locked) self.resource_accounting_mutex.unlock();
+
+        if (old_manager) |manager| manager.unregisterReclaimer(old_reclaimer);
+        const identity = resource_manager.registerReclaimer(
+            .lsm_block_table_cache,
+            self,
+            reclaimForResourceManager,
+        ) catch return;
+        const store_locked = lockAtomic(&self.resource_accounting_mutex);
+        if (self.resource_manager == resource_manager and self.reclaimer_identity == 0) {
+            self.reclaimer_identity = identity;
+            if (store_locked) self.resource_accounting_mutex.unlock();
+        } else {
+            if (store_locked) self.resource_accounting_mutex.unlock();
+            resource_manager.unregisterReclaimer(identity);
+        }
+    }
+
+    fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        const self: *Cache = @ptrCast(@alignCast(context));
+        if (target_bytes == 0) return 0;
+        const before = self.currentBytes();
+        while (before -| self.currentBytes() < target_bytes) {
+            if (!self.evictOne()) break;
+        }
+        return @intCast(before -| self.currentBytes());
     }
 
     pub fn snapshotStats(self: *const Cache) Stats {
@@ -334,6 +386,21 @@ pub const Cache = struct {
             estimateTableBlockCost(path, block),
             block_offset,
             block_len,
+            false,
+        );
+    }
+
+    pub fn putTransientRunTableBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
+        errdefer self.allocator.free(block);
+        return try self.putWithBlock(
+            path,
+            run_id,
+            generation,
+            .{ .run_table_block = block },
+            estimateTableBlockCost(path, block),
+            block_offset,
+            block_len,
+            true,
         );
     }
 
@@ -347,6 +414,21 @@ pub const Cache = struct {
             estimateTableBlockCost(path, block),
             block_offset,
             block_len,
+            false,
+        );
+    }
+
+    pub fn putTransientRunTablePhysicalBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
+        errdefer self.allocator.free(block);
+        return try self.putWithBlock(
+            path,
+            run_id,
+            generation,
+            .{ .run_table_physical_block = block },
+            estimateTableBlockCost(path, block),
+            block_offset,
+            block_len,
+            true,
         );
     }
 
@@ -467,6 +549,7 @@ pub const Cache = struct {
             self.bumpHit(kind);
             return .{
                 .cache = self,
+                .allocator = self.allocator,
                 .entry = entry,
                 .kind = kind,
             };
@@ -488,10 +571,10 @@ pub const Cache = struct {
     }
 
     fn put(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize) !Handle {
-        return try self.putWithBlock(path, run_id, generation, value, byte_cost, 0, 0);
+        return try self.putWithBlock(path, run_id, generation, value, byte_cost, 0, 0, false);
     }
 
-    fn putWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32) !Handle {
+    fn putWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32, force_transient: bool) !Handle {
         const kind = std.meta.activeTag(value);
         const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
         const owned_path = try self.allocator.dupe(u8, path);
@@ -512,6 +595,13 @@ pub const Cache = struct {
             .last_access = 0,
         };
 
+        // Retention is optional. Reserve its aggregate budget before making
+        // the entry visible; when the budget cannot be reclaimed, ownership
+        // stays in a transient handle so the read still succeeds.
+        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and self.admitResourceGrowth(byte_cost);
+        var reservation_active = retention_admitted;
+        errdefer if (reservation_active) self.releaseResourceBytes(byte_cost);
+
         const shard = self.shardForKey(key);
         const locked = lockAtomic(&shard.mutex);
         errdefer if (locked) shard.mutex.unlock();
@@ -519,12 +609,31 @@ pub const Cache = struct {
             existing.ref_count += 1;
             existing.last_access = self.nextAccess();
             self.touchEntryLocked(shard, existing);
+            if (reservation_active) {
+                self.releaseResourceBytes(byte_cost);
+                reservation_active = false;
+            }
             entry.deinit(self.allocator);
             self.allocator.destroy(entry);
             if (locked) shard.mutex.unlock();
             return .{
                 .cache = self,
+                .allocator = self.allocator,
                 .entry = existing,
+                .kind = kind,
+            };
+        }
+
+        if (!retention_admitted) {
+            entry.ref_count = 0;
+            entry.transient_ref_count.store(1, .release);
+            self.bumpTransientServe(kind);
+            if (force_transient) self.bumpPolicyBypass(kind);
+            if (locked) shard.mutex.unlock();
+            return .{
+                .cache = null,
+                .allocator = self.allocator,
+                .entry = entry,
                 .kind = kind,
             };
         }
@@ -536,11 +645,14 @@ pub const Cache = struct {
             existing.ref_count += 1;
             existing.last_access = self.nextAccess();
             self.touchEntryLocked(shard, existing);
+            self.releaseResourceBytes(byte_cost);
+            reservation_active = false;
             entry.deinit(self.allocator);
             self.allocator.destroy(entry);
             if (locked) shard.mutex.unlock();
             return .{
                 .cache = self,
+                .allocator = self.allocator,
                 .entry = existing,
                 .kind = kind,
             };
@@ -552,11 +664,13 @@ pub const Cache = struct {
         _ = self.kind_bytes[@intFromEnum(kind)].fetchAdd(byte_cost, .monotonic);
         _ = self.entry_count.fetchAdd(1, .monotonic);
         self.bumpInsert(kind);
+        reservation_active = false;
         if (locked) shard.mutex.unlock();
-        self.refreshResourceUsage();
+        self.refreshResourcePressure();
         self.evictToBudget();
         return .{
             .cache = self,
+            .allocator = self.allocator,
             .entry = entry,
             .kind = kind,
         };
@@ -643,20 +757,63 @@ pub const Cache = struct {
         _ = self.kind_bytes[@intFromEnum(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
         _ = self.entry_count.fetchSub(1, .monotonic);
         self.bumpEviction(entry.kind);
+        const byte_cost = entry.byte_cost;
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
-        self.refreshResourceUsage();
+        self.releaseResourceBytes(byte_cost);
     }
 
     fn nextAccess(self: *Cache) u64 {
         return self.access_clock.fetchAdd(1, .monotonic) + 1;
     }
 
-    fn refreshResourceUsage(self: *Cache) void {
+    fn admitResourceGrowth(self: *Cache, bytes: usize) bool {
+        if (bytes == 0 or self.resource_manager == null) return true;
+        while (true) {
+            const locked = lockAtomic(&self.resource_accounting_mutex);
+            const manager = self.resource_manager orelse {
+                if (locked) self.resource_accounting_mutex.unlock();
+                return true;
+            };
+            const next = std.math.add(u64, self.resource_accounted_bytes, @as(u64, @intCast(bytes))) catch {
+                if (locked) self.resource_accounting_mutex.unlock();
+                return false;
+            };
+            manager.adjustUsage(.lsm_block_table_cache, &self.resource_accounted_bytes, next) catch {
+                if (locked) self.resource_accounting_mutex.unlock();
+                // ResourceManager deliberately does not call the requester's
+                // own reclaimer. Shed an unpinned LSM entry here, then retry
+                // once the exact released bytes have been published.
+                if (!self.evictOne()) return false;
+                continue;
+            };
+            if (locked) self.resource_accounting_mutex.unlock();
+            return true;
+        }
+    }
+
+    fn releaseResourceBytes(self: *Cache, bytes: usize) void {
+        if (bytes == 0) return;
+        const locked = lockAtomic(&self.resource_accounting_mutex);
+        defer if (locked) self.resource_accounting_mutex.unlock();
+        const manager = self.resource_manager orelse return;
+        const amount: u64 = @intCast(bytes);
+        if (amount > self.resource_accounted_bytes) {
+            manager.recordAccountingError();
+            return;
+        }
+        manager.adjustUsage(
+            .lsm_block_table_cache,
+            &self.resource_accounted_bytes,
+            self.resource_accounted_bytes - amount,
+        ) catch return;
+        self.refreshPressureTarget(manager);
+    }
+
+    fn refreshResourcePressure(self: *Cache) void {
         const manager = self.resource_manager orelse return;
         const locked = lockAtomic(&self.resource_accounting_mutex);
         defer if (locked) self.resource_accounting_mutex.unlock();
-        manager.observeUsage(.lsm_block_table_cache, &self.resource_accounted_bytes, @intCast(self.currentBytes()));
         self.refreshPressureTarget(manager);
     }
 
@@ -736,6 +893,14 @@ pub const Cache = struct {
         _ = self.stats.byKind(kind).inserts.fetchAdd(1, .monotonic);
     }
 
+    fn bumpTransientServe(self: *Cache, kind: Kind) void {
+        _ = self.stats.byKind(kind).transient_serves.fetchAdd(1, .monotonic);
+    }
+
+    fn bumpPolicyBypass(self: *Cache, kind: Kind) void {
+        _ = self.stats.byKind(kind).policy_bypasses.fetchAdd(1, .monotonic);
+    }
+
     fn bumpEviction(self: *Cache, kind: Kind) void {
         _ = self.stats.byKind(kind).evictions.fetchAdd(1, .monotonic);
     }
@@ -794,22 +959,37 @@ else
     };
 
 pub const Handle = struct {
-    cache: *Cache,
+    cache: ?*Cache,
+    allocator: Allocator,
     entry: *Cache.Entry,
     kind: Kind,
 
     pub fn retain(self: *const Handle) Handle {
-        self.cache.retainEntry(self.entry);
+        if (self.cache) |cache| {
+            cache.retainEntry(self.entry);
+        } else {
+            _ = self.entry.transient_ref_count.fetchAdd(1, .acq_rel);
+        }
         return .{
             .cache = self.cache,
+            .allocator = self.allocator,
             .entry = self.entry,
             .kind = self.kind,
         };
     }
 
     pub fn release(self: *Handle) void {
-        self.cache.release(self.entry);
+        if (self.cache) |cache| {
+            cache.release(self.entry);
+        } else if (self.entry.transient_ref_count.fetchSub(1, .acq_rel) == 1) {
+            self.entry.deinit(self.allocator);
+            self.allocator.destroy(self.entry);
+        }
         self.* = undefined;
+    }
+
+    pub fn isRetained(self: *const Handle) bool {
+        return self.cache != null;
     }
 
     pub fn runState(self: *const Handle) *const State {
@@ -962,7 +1142,7 @@ test "cache retains and releases run state" {
     try std.testing.expectEqual(@as(u64, 1), stats.run_state.hits);
 }
 
-test "cache evicts unpinned entries by budget" {
+test "cache serves oversized entries transiently" {
     const allocator = std.testing.allocator;
     var cache = Cache.init(allocator, 1);
     defer cache.deinit();
@@ -970,15 +1150,31 @@ test "cache evicts unpinned entries by budget" {
     var first_state: State = .{};
     try first_state.upsert(allocator, .{ .name = "ns" }, "a", "value-a", false);
     var first = try cache.putRunState("run-1", 1, 1, first_state);
+    try std.testing.expect(!first.isRetained());
+    try std.testing.expectEqualStrings("value-a", try first.runState().get(.{ .name = "ns" }, "a"));
     first.release();
 
-    var second_state: State = .{};
-    try second_state.upsert(allocator, .{ .name = "ns" }, "b", "value-b", false);
-    var second = try cache.putRunState("run-2", 2, 2, second_state);
-    defer second.release();
-
-    try std.testing.expect(cache.currentBytes() > 1);
+    try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
     try std.testing.expect(cache.retainRunState("run-1", 1, 1) == null);
+}
+
+test "cache policy serves table blocks transiently without consuming capacity" {
+    const allocator = std.testing.allocator;
+    var cache = Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    const block = try allocator.dupe(u8, "decoded vector block");
+    var handle = try cache.putTransientRunTableBlock("run-vector", 7, 3, 128, @intCast(block.len), block);
+    defer handle.release();
+
+    try std.testing.expectEqualStrings("decoded vector block", handle.runTableBlock());
+    try std.testing.expectEqual(@as(usize, 0), cache.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
+    try std.testing.expect(cache.retainRunTableBlock("run-vector", 7, 3, 128, @intCast(block.len)) == null);
+    const stats = cache.snapshotStats().run_table_block;
+    try std.testing.expectEqual(@as(u64, 1), stats.transient_serves);
+    try std.testing.expectEqual(@as(u64, 1), stats.policy_bypasses);
+    try std.testing.expectEqual(@as(u64, 0), stats.inserts);
 }
 
 test "cache pending load waiter survives finish removal" {
@@ -1053,7 +1249,7 @@ test "cache reports shared byte usage to resource manager" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = 1,
-        .hard_limit_bytes = 2,
+        .hard_limit_bytes = 1024 * 1024,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
 
@@ -1064,16 +1260,92 @@ test "cache reports shared byte usage to resource manager" {
     var state: State = .{};
     try state.upsert(allocator, .{ .name = "ns" }, "key", "value", false);
     var inserted = try cache.putRunState("run-1", 1, 1, state);
+    try std.testing.expect(inserted.isRetained());
 
     var stats = resource_manager.snapshot();
     try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes > 0);
     try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].soft_limit_events > 0);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].hard_limit_rejections > 0);
 
     inserted.release();
     cache.invalidatePath("run-1");
     stats = resource_manager.snapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes);
+}
+
+test "cache falls back to a transient handle when retention exceeds the resource envelope" {
+    const allocator = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 2,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+
+    var cache = Cache.init(allocator, 1024 * 1024);
+    cache.attachResourceManager(&resource_manager);
+    defer cache.deinit();
+
+    var state: State = .{};
+    try state.upsert(allocator, .{ .name = "ns" }, "key", "value", false);
+    var handle = try cache.putRunState("run-transient", 1, 1, state);
+    try std.testing.expect(!handle.isRetained());
+    try std.testing.expectEqualStrings("value", try handle.runState().get(.{ .name = "ns" }, "key"));
+    try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    try std.testing.expect(resource_manager.sliceStats(.lsm_block_table_cache).hard_limit_rejections > 0);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshotStats().run_state.transient_serves);
+    handle.release();
+}
+
+test "cache transfers existing usage when resource manager changes" {
+    const allocator = std.testing.allocator;
+    var first_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer first_manager.deinit(std.testing.allocator);
+    var second_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer second_manager.deinit(std.testing.allocator);
+
+    var cache = Cache.init(allocator, 1024 * 1024);
+    cache.attachResourceManager(&first_manager);
+    defer cache.deinit();
+
+    var state: State = .{};
+    try state.upsert(allocator, .{ .name = "ns" }, "key", "value", false);
+    var inserted = try cache.putRunState("run-transfer", 1, 1, state);
+    inserted.release();
+    const bytes: u64 = @intCast(cache.currentBytes());
+    try std.testing.expect(bytes > 0);
+
+    cache.attachResourceManager(&second_manager);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        first_manager.sliceStats(.lsm_block_table_cache).used_bytes,
+    );
+    try std.testing.expectEqual(
+        bytes,
+        second_manager.sliceStats(.lsm_block_table_cache).used_bytes,
+    );
+}
+
+test "shared LSM cache yields to foreground aggregate admission" {
+    const allocator = std.testing.allocator;
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 900, .hard_limit_bytes = 1024 },
+    });
+    defer resource_manager.deinit(std.testing.allocator);
+    var cache = Cache.init(allocator, 1024 * 1024);
+    cache.attachResourceManager(&resource_manager);
+    defer cache.deinit();
+
+    var state: State = .{};
+    try state.upsert(allocator, .{ .name = "ns" }, "key", "value", false);
+    var inserted = try cache.putRunState("run-reclaim", 1, 1, state);
+    inserted.release();
+    try std.testing.expect(cache.currentBytes() > 24);
+
+    var foreground = try resource_manager.reserve(.dense_apply_working_set, 1000);
+    defer foreground.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
+    try std.testing.expectEqual(@as(u64, 1000), resource_manager.snapshot().memory.used_bytes);
 }
 
 test "cache shrinks against resource manager pressure target" {

@@ -424,6 +424,364 @@ validated transition. Other reservation handles remain strict and must be
 released before their owning manager is destroyed unless their public wrapper
 explicitly carries an equivalent lifetime pin.
 
+## Storage cache governance
+
+### Diagnosis and ownership boundary
+
+The strongest current explanation for the VectorDBBench scale discontinuity is
+a cache-capacity and admission-churn problem before it is an index-sharding
+problem. A retained 768-dimensional exact vector requires
+3,072 payload bytes plus entry, hash, and CLOCK bookkeeping. The former
+provisioned policy limited the entire shared HBC cache to
+`min(process limit / 12, 2 GiB)` and began shrinking it at 75% of that value.
+That geometry can retain only a mid-six-figure exact-vector working set after
+routing nodes, quantized sets, and metadata take their share. It provides a
+concrete mechanism by which a 50k corpus can be wholly warm while a 1M corpus
+crosses a sharp latency and QPS elbow; the matched benchmark rollout below is
+still required to establish how much of the observed result it explains.
+Sharding may improve CPU parallelism and working-set
+locality, but identical per-shard cache policy merely moves or multiplies this
+boundary.
+
+Primary LSM values remain the authoritative embedding representation. HBC's
+exact-vector cache is a derivative read optimization, not a second database:
+
+1. a write follows the existing WAL/LSM transaction and dense-index update;
+2. mutation invalidates the affected derivative HBC entry;
+3. a read miss loads the authoritative LSM value, validates and decodes it,
+   computes the exact distance, and may admit a retained copy;
+4. eviction drops only that retained copy and never changes durable state.
+
+There is consequently no write-side check-and-set against an independent
+vector store and no dual-write recovery protocol. A future mmap-friendly
+vector segment or LSM value separation must remain a versioned, rebuildable
+derivative with generation validation; it must not become a second authority.
+
+### Node envelope and hierarchy
+
+One `ResourceManager` is authoritative for each process/container memory
+domain in both standalone and distributed data roles. It derives its envelope
+from the operator limit and finite cgroup limit as described above. A cache,
+DB, index, or shard must never infer that it owns the full machine limit.
+
+The intended hierarchy is:
+
+1. retain safety headroom outside the managed hard limit;
+2. charge non-reclaimable residency and transient reservations to their
+   existing logical slices and to the aggregate host ledger;
+3. let reclaimable caches consume unused aggregate capacity within
+   manager-owned elastic ceilings;
+4. rotate reclamation across registered cache owners so one standalone index
+   is not always drained first, and apportion pressure by explicit owner
+   weights while the node ledger remains the final admission authority.
+
+Future child leases are quotas, not independent physical ledgers. They may
+borrow unused capacity and must return it when a higher-value class or
+transient operation applies pressure. The current implementation provides one
+shared provisioned cache across namespaces, weighted namespace shares, and
+weighted rotating reclamation across standalone cache owners. These weights
+choose the first source of bytes under pressure; they are not rigid partitions
+and do not prevent borrowing unused capacity.
+Distributed placement can advertise node capacity, but each target process
+rechecks local admission. Standalone derives the same aggregate, HBC, and LSM
+envelopes from the detected process/cgroup limit without a network control
+plane.
+
+The first storage-cache implementation retains the existing
+`hbc_node_metadata_cache` physical slice for metric and accounting
+compatibility. Provisioned HBC now receives an elastic hard ceiling of one
+third of the effective process limit, bounded from 128 MiB through 16 GiB, and
+a normal-pressure target of seven eighths of that ceiling. This is a maximum,
+not a reservation: unused HBC capacity costs nothing, and the aggregate
+managed-host budget still protects LSM, write working sets, full-text,
+inference, and the process safety reserve. This removes that configured 2 GiB
+ceiling; it does not by itself prove that the observed QPS elbow is gone or
+promise that an undersized container can hold every exact vector.
+
+The provisioned LSM block/table cache follows the same rule with a one-quarter
+hard ceiling bounded from 64 MiB through 8 GiB and a seven-eighths target. Its
+ceiling may overlap HBC's because neither is reserved: their observed physical
+bytes compete in the aggregate ledger, and a foreground denial synchronously
+reclaims HBC first and then LSM. This lets the authoritative vector miss path
+scale with the node without recreating a fixed 512 MiB cliff.
+
+### Cache classes and reclaim order
+
+The HBC physical charge is subdivided by policy rather than by rigid ledgers:
+
+| Class | Value | Current base protected target | Reclaim behavior |
+| --- | --- | ---: | --- |
+| routing nodes | required across many searches | 1/8 of HBC target | protected while a lower-value class can yield |
+| quantized routing payloads | avoids LSM reads and routing decode/compute | 1/4 | protected while a lower-value class can yield |
+| exact vectors | avoids LSM fetch/decode during final rerank | 0; elastic remainder plus bounded adaptive share | first reclaim source when above its adaptive target |
+| result metadata | useful but cheap to reload | 1/32 | reclaimed after vectors and before routing state |
+
+Protected targets are not reservations or hard partitions. Exact vectors can
+borrow the whole pool when routing state is small. As routing state grows, it
+reclaims borrowed bytes from exact vectors. If every class is within its
+target, aggregate pressure can still evict metadata, quantized payloads, and
+nodes in that order; process survival always outranks cache protection.
+
+The shared LSM block/table cache and both shared and standalone HBC caches now
+register lifetime-safe shrink callbacks with ResourceManager. A denied
+foreground reservation computes its aggregate deficit, invokes cache owners
+outside the accounting mutex, and retries admission. HBC is asked before LSM,
+and owners within a cache class rotate across requests. ResourceManager samples
+query profiles and maintains a slow EWMA of observed benefit per byte—hits
+multiplied by measured miss-service latency, divided by resident bytes—inside
+priority bands. Only one in 64 observations takes the manager lock. Static
+node, quantized, and metadata minima remain in force; at most one quarter of
+the target is adaptively distributed, with per-class caps, so noisy feedback
+cannot starve routing state or swing the whole cache. No cache may maintain a
+private memory-limit heuristic once it is attached to a node manager.
+
+### Admission, concurrency, and CLOCK
+
+Cache admission is optional work and must not become the QPS bottleneck. The
+former blanket `active_searches > 1` guard prevented nodes, quantized payloads,
+and exact vectors from warming under benchmark or production concurrency. It
+also made warmup behavior depend on whether requests happened to serialize.
+
+Shared exact-vector, node, and quantized entries use retained leases and may be
+populated during concurrent searches. Published node and quantized entries are
+immutable: mutation clones the retained value, modifies the clone, persists it,
+and atomically replaces the cached generation. No cache API exposes an unpinned
+node or quantized pointer across eviction.
+ResourceManager returns a concurrent exact-vector admission stride:
+
+- normal pressure below the cache target admits every shared-cache miss;
+- a cache at its steady target samples one in eight misses even if synchronous
+  eviction has already returned the pressure reading to normal;
+- soft HBC or aggregate pressure samples one in eight optional vector misses;
+- hard pressure stops optional concurrent vector admission until reclamation.
+
+This rate limits lock and allocation churn under pressure or saturation; it
+does not permanently select a hash subset of the corpus. Repeated misses can
+therefore warm over time without turning a full cache into an insert/evict lock
+convoy. Routing nodes and quantized payloads use retained handles and may warm
+during concurrent search.
+
+Shared CLOCK reference bits are atomic. Node, quantized, vector, and metadata
+borrow/hit paths refresh recency while holding the shared map lock, without an
+exclusive lock upgrade. Exact-vector publication uses 256 striped single-flight
+locks: duplicate fills converge on one insertion, while vector, node,
+quantized, and metadata cloning occurs outside the global map/admission
+critical section. Every vector write path, including
+external/`skip_vector_store` writes, unconditionally invalidates the key before
+commit. Exact-vector miss fills use a fixed 4,096-stripe generation fence: the
+reader captures an even stripe epoch before the authoritative LSM read and
+rechecks it while holding the cache admission lock. A fill that overlaps a
+commit or abort is returned to its caller but is not retained. Stripe
+collisions only suppress optional fills during an active mutation; they never
+hide or invalidate an unrelated resident entry. `skip_vector_store` values are
+seeded only after successful publication, when their authoritative external
+LSM transaction is already visible.
+
+Cache insertion never returns an unpinned view into cache-owned memory. The
+caller continues using its request-owned scratch/value, while later hits use a
+retained lease and keep detached storage physically accounted until release.
+This separates admission from lifetime: eviction can run immediately after a
+miss without invalidating the current request's result.
+
+LSM block/table retention follows the same pre-admission rule. It reserves the
+entry's exact byte cost in the aggregate ledger before publishing the entry in
+the shared map. If neither HBC nor an unpinned LSM victim can make room, the
+load still returns a reference-counted transient handle; the value is usable
+for the current request but is never linked into the cache or charged as
+retained residency. This is intentional graceful degradation under pressure,
+not an allocation failure or a post-allocation accounting observation.
+
+Attaching a `ResourceManager` is idempotent. Reattaching the same manager keeps
+observer ledgers and reclaimer identities intact. Moving an index or cache to a
+different manager first debits every old observer contribution, then credits
+the same live search, routing, apply, local-cache, and detached-pinned bytes to
+the new owner. A manager change must never reset a local counter while leaving
+its old physical charge behind.
+
+### Pressure response
+
+Owners react in increasing order of disruption:
+
+1. stop or sample low-value cache admission;
+2. evict exact vectors consuming elastic/borrowed capacity;
+3. evict excess metadata, quantized payloads, then routing nodes;
+4. reduce allocation-producing query concurrency;
+5. defer compaction, repair, and other background work where its slice policy
+   permits;
+6. throttle writes before WAL/apply when write-side hard admission requires
+   it;
+7. reject retryably rather than exceed the process envelope.
+
+Cache owners perform pin-safe victim selection. Detaching removes resident
+cache bytes, but any reader-retained allocation moves to pinned accounting and
+is not released from the aggregate ledger until the final lease drops.
+ResourceManager owns targets, admission, and
+pressure decisions; it must not reach into cache data structures or choose a
+format-specific victim. A cache hit never creates a new memory charge.
+
+### Telemetry and rollout
+
+The HBC status surface reports per-class used/peak bytes, hits, misses,
+insertions, replacements, sampled admissions, admission skips, and evictions,
+plus total accounted and detached pinned bytes. Shared retained vector and
+metadata borrows are included in hit/miss counters. ResourceManager reports
+reclaim requests and reclaimed bytes in its snapshot and benchmark resource
+logs; LSM cache stats and benchmark logs count pressure-denied transient serves
+separately from retained inserts. Query profiles report cache and rerank LSM
+hits/misses and artifact read/decode time. Operators should graph those values
+with aggregate and HBC soft/hard limits, process working set, active searches,
+and p50/p95/p99 query latency. A capacity cliff is confirmed when exact-vector
+bytes flatten at the HBC target while rerank LSM misses and eviction churn rise.
+
+Filtered prefix execution batches metadata for all candidate members of a leaf
+through the sorted LSM path before vector scoring. Profiles expose candidates,
+rejections, batch count, and batch-metadata time. This removes the former scalar metadata
+point lookup and cache-lock cycle per quantized candidate; selective 1% and
+10% benchmark lanes in the production-boundary matrix quantify the end-to-end
+gain independently of unfiltered dense search.
+
+Selective exact scoring follows the same storage geometry. Production indexes
+whose full vectors live in embedding artifacts must never probe HBC's vector
+namespace first: that namespace is not the authoritative full-vector store.
+The scorer normalizes candidates, resolves HBC metadata in sorted batches, and
+then scores bounded batches of at most 1024 external artifacts using one sorted
+primary-store multi-get. Missing or recoverably corrupt artifacts reject only
+their candidate. Direct-field indexes backfilled before vector-artifact
+materialization use a second bounded, sorted primary-document batch only for
+artifact misses; current writes and explicitly external embeddings never take
+that compatibility path. A single reusable batch workspace is charged to
+`dense_search_working_set` for its lifetime, while retained transaction pages
+are observed once after each multi-get. Because exact scoring is single-pass,
+its request-local decoded-vector cache is disabled; a governed shared-vector
+cache may still admit a value when its policy enables that cache.
+
+The exact/HBC route is a cost decision, not a corpus-percentage threshold. The
+planner compares storage-equivalent work for candidate full-vector reads with
+HBC's resident quantized inspection plus external rerank reads. Resident
+quantized bytes are bandwidth-normalized rather than charged as artifact I/O
+only when exact scoring would cross into the external artifact store; built-in
+indexes compare their resident exact and quantized payloads without that
+conversion. The initial conservative external conversion is 11 resident bytes
+per external-storage work byte, calibrated from the production-shaped 50k and
+1M phase profiles and bounded by the candidate-linear built-in exact guardrail.
+This preserves the bounded exact route for 50k/1% while preventing a cold
+10,000-artifact exact scan at 1M/1%. Its HBC estimate also accounts for the
+eligible-hit rate, requested result count, resolved search width, and leaf
+size. The existing dimension-aware exact component ceiling remains a safety
+bound, but there is no `active_count / 100` discontinuity. The telemetry field
+names retain `estimated_*_storage_bytes` for API compatibility, but their
+values are storage-equivalent work bytes, not predicted physical reads.
+Composed public query profiles expose both estimates and the exact phases:
+candidate prepare, metadata lookup, artifact key/read/decode, distance time,
+batch geometry, workspace bytes, scalar versus batch reads, missing vectors,
+request-cache entries, and LSM cache hits/misses.
+
+The planner emits nanosecond work estimates from the first query. Its
+dimension-aware cold priors cover filter membership, quantized scoring,
+external artifact-miss service, and exact distance; the 11:1 byte model remains
+the compatibility estimate, not the production decision whenever an index
+snapshot is available. Each HBC index maintains a slow EWMA for those
+components and rerank cache-hit rate. A component is replaced independently as
+either route measures it, so an exact-only or HBC-only workload does not leave
+the alternate route uncosted. Artifact read/decode is learned per cache miss
+and then weighted by the observed hit rate. The planner incorporates the
+ResourceManager HBC slice's current pressure and residency and retains the
+prior route inside a 20% hysteresis band; exact wins an equal-cost tie. The
+dimension-aware component budget remains authoritative. Profiles expose both
+storage-equivalent estimates and `estimated_*_work_ns` values.
+
+Filtered HBC treats resolved search width as a ceiling. The existing candidate
+frontier is consumed in adaptive waves whose next size is based on observed
+eligible vectors per explored leaf; traversal never restarts. For L2-squared,
+posting nodes persist a Euclidean covering radius in the backward-compatible
+`HBN2` packed-node value. `HBN1`, NaN/stale radii, cosine, and inner-product
+fall back to the configured width. Mutable internal ancestors are expanded,
+not trusted as proof objects, because a foreground posting append does not
+rewrite the entire ancestor chain. Once the frontier consists of bounded leaf
+postings, search may stop only when the next `distance(query, centroid) -
+covering_radius` lower bound exceeds the retained result upper bound. Profiles
+report wave geometry, eligible yield, bound resolutions/fallbacks, frontier at
+stop, and both sides of the stopping inequality.
+
+The flat RaBitQ centroid directory follows the same rule. It retains the full
+compact posting frontier (IDs, quantized centroids, and radii), starts with the
+configured probe count, and advances in yield-sized waves. Unknown legacy
+radii sort ahead of bounded postings and force visitation. A fixed directory
+probe count is therefore an initial work target, never an unsafe recall
+cutoff.
+
+External reranking consumes the quantized-error ambiguous set in sorted
+batches of at most 128 vectors. After every batch it compares the kth-smallest
+upper bound among scored/permanently retained candidates with the minimum
+lower bound of the unscored set. Only a strict separation skips the remaining
+artifact reads. Batch count, maximum batch size, and candidates skipped by the
+proof are public profile fields.
+
+Permanent coverage includes generation-crossing stale-fill rejection,
+request-owned miss results, pre-admitted LSM retention with transient fallback,
+idempotent manager reattachment and ledger transfer, dynamic policy derivation,
+envelope-based provisioned sizing, cross-namespace aggregate eviction, class-aware reclaim,
+shared-cache warming during concurrent search, CLOCK hit refresh, exact byte
+release, and local-cache concurrency safety. Benchmark rollout should compare
+50k and 1M at matched recall, cold and warm phases, several concurrency levels,
+and at least two explicit memory envelopes. Report cache bytes and miss ratios
+with QPS; QPS alone cannot distinguish cache capacity from search quality or
+CPU saturation.
+
+When retained decoded-vector caching is active, HBC marks exact-vector LSM
+reads as transient. The LSM still retains indexes and bloom filters, and it may
+reuse a block already resident for another reader, but a vector miss does not
+publish a second serialized copy into the LSM block cache. If decoded-vector
+caching is disabled, bypassed, or unavailable, HBC restores normal LSM block
+admission. `policy_bypasses` distinguishes this deliberate ownership choice
+from pressure-denied `transient_serves`.
+
+Reclaim dispatch apportions work among registered cache owners by weight and
+rotates its starting owner. The shared HBC cache similarly computes weighted
+namespace shares from the node target: a namespace may borrow unused capacity,
+but when a peer needs room, an over-share namespace is the first victim source.
+Protected cache classes and the aggregate node hard limit still take
+precedence over fairness.
+
+Further tuning requires benchmark evidence rather than another policy guess.
+Derived mmap vector segments should be evaluated only if governed LSM/HBC
+caching and progressive reranking still leave artifact I/O dominant.
+
+The reproducible production-boundary driver is
+`scripts/run_resource_manager_cache_matrix.sh`. It builds the production
+standalone server and harness in `ReleaseFast` by default, assigns an explicit
+process memory envelope to every child,
+and records commands, environment, per-case logs, status, and JSONL summaries
+under `zig/bench/results/resource-manager-cache-matrix/`. Its default matrix
+covers dense and 1%/10% filtered-dense searches at 50k, 600k, 700k, 800k, and 1M,
+full-text and graph endpoints at 50k and 1M, 2 GiB and 8 GiB envelopes, cold
+first-pass versus later-pass latency, 1/16-thread endpoints through the
+concurrency sweep, and a longer 1M/1% posting-maintenance/query soak. The
+driver fails production runs below 150 QPS at 50k/1%, below 80% of matched
+unfiltered QPS at 1M/1%, when 1% selectivity regresses below 70% of the matched
+10% lane, when the maximum thread lane falls below 70% of one-thread QPS, when
+RSS exceeds 125% of the explicit process envelope, when HBC-accounted bytes
+exceed that envelope, when the maintenance soak falls below 70% of its base
+lane, or without separately populated cold/warm phases. The release-blocker
+recall suite runs before an evidence-producing matrix.
+Run the reduced
+endpoint/integration check before the evidence-producing matrix:
+
+```sh
+RESOURCE_CACHE_MATRIX_SMOKE=1 scripts/run_resource_manager_cache_matrix.sh
+scripts/run_resource_manager_cache_matrix.sh
+```
+
+The driver records failures and continues the matrix. Resume an interrupted
+rollout without repeating recorded cases by setting
+`RESOURCE_CACHE_MATRIX_RESUME=1` with the same output directory.
+
+The smoke matrix is a correctness check and does not close the performance
+follow-up. A rollout is complete only when the retained JSONL and resource
+logs demonstrate the elbow behavior at matched recall on representative
+hardware; production weights and adaptive bounds must not be tuned from the
+small smoke corpus.
+
 ## Failure semantics
 
 - A request larger than a stable hard limit is a permanent resource-limit

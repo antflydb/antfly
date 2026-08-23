@@ -5903,6 +5903,7 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "distributed grouped hierarchy expands only the globally merged page",
             "distributed grouped unit expansion rejects a cross-revision result",
@@ -6528,6 +6529,9 @@ pub fn build(b: *std.Build) void {
         "resource manager records index repair activation pause separately from cleanup",
         "catchUpIndex refuses to open an apply window after its deadline",
         "cache reports shared byte usage to resource manager",
+        "cache falls back to a transient handle when retention exceeds the resource envelope",
+        "cache transfers existing usage when resource manager changes",
+        "shared LSM cache yields to foreground aggregate admission",
         "lsm backend resource manager throttles projected immutable state",
         "lsm backend resource manager rejects before wal apply",
         "derived backlog tracker accounts and releases payload bytes",
@@ -6535,10 +6539,33 @@ pub fn build(b: *std.Build) void {
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
         "hbc shared cache evicts across namespaces under one resource budget",
+        "hbc shared cache CLOCK refreshes recency on borrowed vector hits",
+        "hbc shared vector replacement cannot return an older external value",
+        "hbc vector fill captured before a committed mutation cannot repopulate stale data",
+        "hbc shared detached leases remain physically accounted until release",
+        "hbc standalone detached leases remain physically accounted until release",
+        "hbc standalone cache yields to foreground aggregate admission",
+        "hbc concurrent vector admission samples at a full steady target",
+        "hbc shared cache reclaims exact vectors before protected routing nodes",
+        "hbc shared cache reclaims an over-quota namespace for a borrowing peer",
+        "hbc shared vector cache warms during concurrent search",
+        "hbc shared vector publication coalesces concurrent duplicate fills",
+        "hbc retained node and quantized handles survive threaded eviction",
+        "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors",
+        "searchWithRequest applies filter prefix and distance bounds",
         "hbc cache reports byte usage to resource manager",
+        "hbc resource manager reattachment is idempotent and transfers local cache usage",
         "hbc cache shrinks to resource budget under pressure",
+        "resource manager derives elastic HBC cache-class policy from pressure",
+        "resource manager bounds adaptive HBC benefit-per-byte targets",
+        "resource manager apportions reclaim across weighted cache owners",
+        "foreground admission reclaims cache bytes and retries atomically",
+        "classified batch chooses foreground requester when cache slice is first",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "provisioned lsm cache is an elastic share of the node envelope",
+        "provisioned HBC cache is an elastic share of the node envelope",
+        "standalone resource manager derives elastic storage cache envelopes",
         "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
         "capacity reservation revalidation fails closed when available space falls",
@@ -7387,7 +7414,12 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "dense search route reports exact native filter budget decisions",
+        "dense search route uses measured per-index costs pressure and hysteresis",
         "one percent filtered route preserves exact recall with candidate-linear IO",
+        "production external exact scorer uses bounded sorted artifact batches",
+        "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds",
+        "flat rabitq filtered traversal advances past its initial probe wave safely",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
@@ -9779,6 +9811,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     public_query_guardrail_mod.addImport("antfly-zig", lib_mod);
+    public_query_guardrail_mod.addImport("httpx", httpx_mod);
+    const public_query_guardrail_build_options = b.addOptions();
+    public_query_guardrail_build_options.addOption(bool, "standalone_only", false);
+    public_query_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_guardrail_build_options);
 
     const public_query_guardrail = b.addExecutable(.{
         .name = "public_query_guardrail",
@@ -9812,6 +9848,31 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
+
+    // The direct handler compatibility lane still intentionally exercises
+    // internal API construction. Production scale qualification needs only
+    // the standalone process boundary, so keep a build that does not compile
+    // unreachable direct-executor code into the rollout harness.
+    const public_query_standalone_guardrail_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    public_query_standalone_guardrail_mod.addImport("antfly-zig", lib_mod);
+    public_query_standalone_guardrail_mod.addImport("httpx", httpx_mod);
+    const public_query_standalone_guardrail_build_options = b.addOptions();
+    public_query_standalone_guardrail_build_options.addOption(bool, "standalone_only", true);
+    public_query_standalone_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_standalone_guardrail_build_options);
+    const public_query_standalone_guardrail = b.addExecutable(.{
+        .name = "public_query_standalone_guardrail",
+        .root_module = public_query_standalone_guardrail_mod,
+    });
+    const run_public_query_standalone_guardrail = b.addRunArtifact(public_query_standalone_guardrail);
+    if (b.args) |args| run_public_query_standalone_guardrail.addArgs(args);
+    const build_public_query_standalone_guardrail_step = b.step("public-query-standalone-guardrail-build", "Build the production standalone public-query cache qualification harness");
+    build_public_query_standalone_guardrail_step.dependOn(&public_query_standalone_guardrail.step);
+    const public_query_standalone_guardrail_step = b.step("public-query-standalone-guardrail", "Run the production standalone public-query cache qualification harness");
+    public_query_standalone_guardrail_step.dependOn(&run_public_query_standalone_guardrail.step);
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,
