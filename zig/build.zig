@@ -4136,6 +4136,14 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_chaos_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_chaos_tests);
     const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
     lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
+
+    const lib_lsm_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"LSM VOPR"},
+    });
+    const run_lib_lsm_vopr_tests = addFilteredTestRunArtifact(b, lib_lsm_vopr_tests);
+    const lib_lsm_vopr_test_step = b.step("lsm-vopr-test", "Run replayable real-backend LSM VOPR campaigns");
+    lib_lsm_vopr_test_step.dependOn(&run_lib_lsm_vopr_tests.step);
     const lib_ha_chaos_default_filters = [_][]const u8{
         "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
         "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
@@ -7501,6 +7509,7 @@ pub fn build(b: *std.Build) void {
     const storage_vopr_step = b.step("storage-vopr-test", "Run storage modeled-time/model-I/O VOPR smoke and simulation checks");
     storage_vopr_step.dependOn(&run_storage_sim_runtime_tests.step);
     storage_vopr_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    storage_vopr_step.dependOn(&run_lib_lsm_vopr_tests.step);
     storage_vopr_step.dependOn(&run_lmdb_vopr_tests.step);
     storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
     storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);

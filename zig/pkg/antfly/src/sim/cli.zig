@@ -43,7 +43,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
                 !std.mem.eql(u8, scenario, "transaction") and
                 !std.mem.eql(u8, scenario, "distributed-data") and
                 !std.mem.eql(u8, scenario, "raft") and
-                !std.mem.eql(u8, scenario, "lmdb")) return error.UnsupportedScenario;
+                !std.mem.eql(u8, scenario, "lmdb") and
+                !std.mem.eql(u8, scenario, "lsm")) return error.UnsupportedScenario;
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -65,6 +66,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         33
     else if (std.mem.eql(u8, scenario, "lmdb"))
         13
+    else if (std.mem.eql(u8, scenario, "lsm"))
+        49
     else
         3;
     if (transition_budget == 0) return error.InvalidTransitionBudget;
@@ -93,6 +96,9 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     } else if (std.mem.eql(u8, scenario, "lmdb")) blk: {
         if (transition_budget != 13) return error.LmdbScenarioRequiresThirteenTransitions;
         break :blk try antfly.lmdb_vopr.record(alloc, seed);
+    } else if (std.mem.eql(u8, scenario, "lsm")) blk: {
+        if (transition_budget != 49) return error.LsmScenarioRequiresFortyNineTransitions;
+        break :blk try antfly.lsm_vopr.record(alloc, seed);
     } else blk: {
         if (transition_budget != 3) return error.TransactionScenarioRequiresThreeTransitions;
         break :blk try antfly.transaction_vopr.record(alloc, seed);
@@ -137,6 +143,8 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.raft_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
         return antfly.lmdb_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
+        return antfly.lsm_vopr.replay(alloc, recorded);
     return error.UnsupportedScenario;
 }
 
@@ -425,6 +433,30 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name)) {
+        const target = if (recorded.failures.items.len > 0)
+            recorded.failures.items[0].fingerprint
+        else
+            return error.FailingTraceRequired;
+        var reduced = try vopr.reducer.reduce(
+            antfly.lsm_vopr.CliScenario,
+            alloc,
+            &recorded,
+            target,
+            .{ .max_attempts = attempts },
+        );
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
         var reduced = try antfly.metadata_sim_harness.reduceDistributedDataVoprCampaign(alloc, &recorded, attempts);
         defer reduced.deinit();
@@ -566,6 +598,8 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/sim/fixtures/raft";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
         return "pkg/antfly/src/sim/fixtures/lmdb";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/lsm";
     return error.UnsupportedScenario;
 }
 

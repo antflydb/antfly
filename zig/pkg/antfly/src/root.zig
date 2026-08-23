@@ -155,6 +155,7 @@ pub const mem_backend = @import("storage/mem_backend.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
+pub const lsm_vopr = @import("storage/lsm_vopr.zig");
 pub const lmdb = @import("storage/lmdb.zig");
 pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
 pub const lmdb_engine = @import("lmdb_engine");
@@ -340,5 +341,6 @@ test {
     _ = storage_maintenance;
     _ = backend_conformance_test;
     _ = lsm_backend_sim_test;
+    _ = lsm_vopr;
     _ = db;
 }

@@ -1303,9 +1303,10 @@ existing differential trace corpus and compare selected histories with etcd.
 
 ### Modeled Storage
 
-Status: partially implemented. WAL and LMDB use the common runner. Persistent
-index, DB split, and index manager have modeled VOPR build gates but still need
-common artifact/CLI parity; LSM retains its focused simulator pending migration.
+Status: partially implemented. WAL, LMDB, and LSM use the common runner.
+Persistent index, DB split, and index manager have modeled VOPR build gates but
+still need common artifact/CLI parity. The focused LSM fault matrix remains a
+required complementary gate for specialized split and full-text behavior.
 
 Adapt WAL, LMDB, persistent index, DB split, index manager, and LSM campaigns to
 the common trace/property interface. Preserve their focused reference models
@@ -1398,7 +1399,7 @@ pkg/antfly/src/sim/
     raft/              # promoted-fixture namespace
     wal/               # planned promoted-fixture namespace
     lmdb/              # promoted-fixture namespace
-    lsm/               # planned migration namespace
+    lsm/               # promoted-fixture namespace
     ha/                # planned migration namespace
   scenarios/           # planned registry/consolidation; adapters may stay by domain
     metadata.zig
@@ -1424,12 +1425,15 @@ cleaner dependency direction. The stable rule is:
 - production code only depends on narrow runtime, clock, entropy, transport,
   and storage interfaces, never on the explorer or `SchedulerPort`
 
-LSM and HA remain forward migration targets, not removed scope. Raft now wraps
+HA remains a forward migration target, not removed scope. Raft now wraps
 the real `RawNode` cluster with independent message, persistence, apply,
 restart, partition, proposal, and compaction choices. LMDB now wraps the
-existing C-versus-Zig action union and crash publication oracle. The remaining
-focused suites keep their existing runners and oracles until they reach exact
-replay parity, then join the same scenario registry and fixture policy.
+existing C-versus-Zig action union and crash publication oracle. LSM now runs a
+live real backend against the memory oracle with generated KV operations,
+explicit compaction/maintenance, crash recovery, and modeled storage faults.
+The remaining focused suites keep their existing runners and oracles until they
+reach exact replay parity, then join the same scenario registry and fixture
+policy.
 
 The CLI is a standalone command surface, not additional behavior in Antfly's
 ordinary unit-test runner. Its scenario implementations intentionally use
