@@ -15,7 +15,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
+
+func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
+	predicate := haLeaseRenewalEventPredicate()
+	oldCluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	oldCluster.Generation = 7
+	updatedStatus := oldCluster.DeepCopy()
+	updatedStatus.Status.HAStatus = caughtUpHAStatus()
+	if predicate.Update(event.UpdateEvent{ObjectOld: oldCluster, ObjectNew: updatedStatus}) {
+		t.Fatal("status-only update bypassed the dedicated renewal cadence")
+	}
+
+	updatedSpec := updatedStatus.DeepCopy()
+	updatedSpec.Generation++
+	if !predicate.Update(event.UpdateEvent{ObjectOld: updatedStatus, ObjectNew: updatedSpec}) {
+		t.Fatal("HA spec generation change did not wake Lease renewal immediately")
+	}
+}
 
 func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers(t *testing.T) {
 	now := time.Unix(1_750_000_000, 0)

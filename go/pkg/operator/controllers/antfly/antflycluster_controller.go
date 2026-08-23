@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -2888,7 +2889,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	r.checkPVCTopologyHealth(ctx, workingCluster)
 
 	// Update status
-	if err := r.updateStatus(ctx, workingCluster); err != nil {
+	if err := r.updateStatusIfChanged(ctx, workingCluster, &antflyCluster.Status); err != nil {
 		if stderrors.Is(err, errHAStatusCheckpointed) {
 			return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 		}
@@ -4917,6 +4918,28 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 }
 
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	return r.updateStatusFrom(ctx, cluster, nil)
+}
+
+func (r *AntflyClusterReconciler) updateStatusIfChanged(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	previous *antflyv1.AntflyClusterStatus,
+) error {
+	return r.updateStatusFrom(ctx, cluster, previous)
+}
+
+func (r *AntflyClusterReconciler) updateStatusFrom(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	previous *antflyv1.AntflyClusterStatus,
+) error {
+	persist := func() error {
+		if previous != nil && reflect.DeepEqual(previous, &cluster.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, cluster)
+	}
 	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
 	originalPhase := cluster.Status.Phase
 	mode := effectiveTopologyMode(cluster)
@@ -5059,7 +5082,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		}
 		r.updateHAAdminJobExecutionCondition(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
-		return r.Status().Update(ctx, cluster)
+		return persist()
 	}
 
 	// Get current status of StatefulSets and Deployment
@@ -5209,7 +5232,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
-	return r.Status().Update(ctx, cluster)
+	return persist()
 }
 
 func preserveConditionDuringMetadataTopologyObservation(
@@ -13250,7 +13273,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
-		For(&antflyv1.AntflyCluster{}).
+		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(haLeaseRenewalEventPredicate())).
 		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
 		return err
 	}

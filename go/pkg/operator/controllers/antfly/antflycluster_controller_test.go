@@ -14862,7 +14862,7 @@ func TestUpdateStatus_Standalone(t *testing.T) {
 		Scheme: s,
 	}
 
-	err = reconciler.updateStatus(context.Background(), cluster)
+	err = reconciler.updateStatusIfChanged(context.Background(), cluster, cluster.Status.DeepCopy())
 	g.Expect(err).NotTo(HaveOccurred())
 
 	updated := &antflyv1.AntflyCluster{}
@@ -14877,6 +14877,13 @@ func TestUpdateStatus_Standalone(t *testing.T) {
 	g.Expect(updated.Status.StandaloneStatus.PodName).To(Equal("test-standalone-standalone-0"))
 	g.Expect(updated.Status.StandaloneStatus.PodIP).To(Equal("10.0.0.10"))
 	g.Expect(updated.Status.StandaloneStatus.ObservedConfigHash).ToNot(BeEmpty())
+
+	reconciler.Client = statusUpdateRejectingClient{
+		Client: client,
+		err:    stderrors.New("unchanged status must not be written"),
+	}
+	err = reconciler.updateStatusIfChanged(context.Background(), updated, updated.Status.DeepCopy())
+	g.Expect(err).NotTo(HaveOccurred())
 }
 
 func TestDetectSidecarInjectionStatus_ScopedToClusterInstance(t *testing.T) {

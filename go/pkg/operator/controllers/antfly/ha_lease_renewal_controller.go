@@ -14,6 +14,7 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 const (
@@ -26,6 +27,15 @@ const (
 // capture and every topology transition stay on the main reconciler.
 type haLeaseRenewalReconciler struct {
 	parent *AntflyClusterReconciler
+}
+
+func haLeaseRenewalEventPredicate() predicate.Predicate {
+	// Status observations are intentionally excluded. The controller's own
+	// fixed-cadence RequeueAfter is the renewal clock; allowing the main
+	// reconciler's status writes to enqueue this key can turn health churn into
+	// an unbounded proof-request loop and starve that clock. Spec generations
+	// still wake renewal immediately when HA is enabled, disabled, or changed.
+	return predicate.GenerationChangedPredicate{}
 }
 
 func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
