@@ -20179,10 +20179,37 @@ test "managed structural catch-up leaves pending enrichment with the asynchronou
     }
     try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
 
-    switch (try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true)) {
-        .asynchronous => |target_sequence| try std.testing.expect(target_sequence > 0),
+    const target_sequence = switch (try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true)) {
+        .asynchronous => |target_sequence| target_sequence,
         else => return error.TestUnexpectedResult,
-    }
+    };
+    try std.testing.expect(target_sequence > 0);
+
+    // An uncached source still has a valid resident asynchronous owner, but it
+    // has no cached status authority to bridge. Its direct status reads are
+    // serialized with structural work and observe the resident DB instead.
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
+    defer observations.deinit(alloc);
+    try appendStructuralRuntimeStatusObservation(
+        &source,
+        alloc,
+        "docs",
+        7001,
+        &db,
+        db.core.index_manager.lsm_root_generation,
+        .artifact_rebuild,
+        &observations,
+    );
+    try std.testing.expectEqual(@as(usize, 0), observations.items.len);
+    try std.testing.expect(markLatestStructuralIndexPublicationPending(
+        &observations,
+        "semantic_idx",
+        target_sequence,
+        true,
+    ) == null);
+
     const enrichment = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
     const stats = enrichment.stats();
     try std.testing.expect(stats.applied_sequence < stats.target_sequence);
@@ -21634,6 +21661,11 @@ fn markLatestStructuralIndexPublicationPending(
     producer_target_sequence: u64,
     requires_blocking: bool,
 ) ?ProvisionedTableWriteSource.PublicationHandoffTarget {
+    // Uncached sources publish no snapshot authority and therefore need no
+    // handoff fence: their direct status reads are serialized with structural
+    // reconciliation and inspect the resident DB. The asynchronous producer
+    // remains authoritative without manufacturing a cached observation.
+    if (observations.items.len == 0) return null;
     const observation = &observations.items[observations.items.len - 1];
     for (observation.status.stats.indexes) |*item| {
         if (!std.mem.eql(u8, item.name, index_name)) continue;
