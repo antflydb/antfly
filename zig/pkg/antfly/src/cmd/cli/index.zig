@@ -26,13 +26,14 @@ const default_wait_poll_ms: u64 = 1000;
 // progress reporting for minutes.
 const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
-// Server status now fails closed while publication is non-authoritative. A
-// second live observation covers the remaining scheduler handoff where queued
-// derived work becomes active immediately after an otherwise-ready snapshot.
-// Keep its delay independent of the requested polling interval: fast local
-// polling must not weaken correctness, while the normal 1s interval should
-// not add a full second once readiness is first observed.
-const ready_confirmation_observations: u8 = 2;
+// Server status now fails closed while publication is non-authoritative, but a
+// scheduler handoff can still discover a final replay tail shortly after an
+// otherwise-ready snapshot. Require a half-second continuous-ready window so
+// `wait` also covers that handoff under scheduler contention. Keep its sampling
+// delay independent of the requested polling interval: fast local polling must
+// not weaken correctness, while the normal 1s interval should not add several
+// seconds once readiness is first observed.
+const ready_confirmation_observations: u8 = 6;
 const ready_confirmation_delay_ms: u64 = 100;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
 
@@ -1110,7 +1111,7 @@ test "index wait retries bounded HTTP and transport failures" {
         1,
     );
     try std.testing.expect(outcome == .ready);
-    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3 + ready_confirmation_observations), fake.calls);
     try std.testing.expect(fake.smallest_timeout_ms > 0);
 }
 
@@ -1123,7 +1124,9 @@ test "index wait rejects a transient ready snapshot" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const call = self.calls;
             self.calls += 1;
-            const running = call == 1;
+            // Exercise a regression at the last sample before the continuous
+            // readiness window would otherwise complete.
+            const running = call == ready_confirmation_observations - 1;
             return fakeExternalIndexStatusResponse(
                 self.allocator,
                 200,
@@ -1141,13 +1144,12 @@ test "index wait rejects a transient ready snapshot" {
         .system(),
         "docs",
         "external_idx",
-        1000,
+        2000,
         1,
     );
     try std.testing.expect(outcome == .ready);
-    // ready -> running must reset confirmation; only the final two ready
-    // observations may complete the wait.
-    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    // The late ready -> running edge must reset the full stability window.
+    try std.testing.expectEqual(@as(usize, ready_confirmation_observations * 2), fake.calls);
 }
 
 test "index wait deadline rejects a response that arrives late" {
