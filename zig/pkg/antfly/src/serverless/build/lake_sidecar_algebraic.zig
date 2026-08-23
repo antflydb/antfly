@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const aggregate_math = algebraic_segment.aggregate_math;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
@@ -33,6 +34,7 @@ pub const AlgebraicGroupBySidecarBuildOptions = struct {
     op: algebraic_segment.AggregateOp,
     artifact_id: []const u8 = &.{},
     limits: lake_build_limits.Limits = .{},
+    cancellation: CancellationToken = .none,
 };
 
 pub const AlgebraicGroupBySidecarBuildResult = struct {
@@ -60,6 +62,7 @@ pub const AlgebraicExpressionSidecarBuildOptions = struct {
     expressions: []const algebraic_segment.ExpressionSpec,
     artifact_id: []const u8 = &.{},
     limits: lake_build_limits.Limits = .{},
+    cancellation: CancellationToken = .none,
 };
 
 pub const AlgebraicExpressionSidecarBuildResult = struct {
@@ -111,7 +114,9 @@ fn buildAlgebraicGroupBySidecarBoundedAlloc(
         folds.deinit(alloc);
     }
 
-    while (try source.next(alloc)) |batch| {
+    while (true) {
+        try options.cancellation.check();
+        const batch = try source.next(alloc) orelse break;
         try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
@@ -160,7 +165,7 @@ pub fn publishAlgebraicGroupBySidecarFromRowSourceAlloc(
     defer alloc.free(built.payload);
     errdefer freeOwnedDeclaration(alloc, built.declaration);
 
-    var metadata = try artifacts.put(built.payload);
+    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
     var metadata_owned = true;
     errdefer if (metadata_owned) metadata.deinit(alloc);
 
@@ -204,7 +209,9 @@ fn buildAlgebraicExpressionSidecarBoundedAlloc(
         accumulator.* = initExpressionAccumulator(spec.op);
     }
 
-    while (try source.next(alloc)) |batch| {
+    while (true) {
+        try options.cancellation.check();
+        const batch = try source.next(alloc) orelse break;
         try budget.admitBatch(batch);
         try source_binding.validateBatchAgainstBinding(binding, batch);
         try appendBatchExpressions(accumulators, batch, options);
@@ -247,7 +254,7 @@ pub fn publishAlgebraicExpressionSidecarFromRowSourceAlloc(
     defer alloc.free(built.payload);
     errdefer freeOwnedDeclaration(alloc, built.declaration);
 
-    var metadata = try artifacts.put(built.payload);
+    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
     var metadata_owned = true;
     errdefer if (metadata_owned) metadata.deinit(alloc);
 

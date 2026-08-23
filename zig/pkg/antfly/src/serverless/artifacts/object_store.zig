@@ -192,7 +192,12 @@ pub const ObjectStore = struct {
     }
 
     pub fn put(self: *ObjectStore, alloc: std.mem.Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try sha256StringAlloc(alloc, contents);
+        return try self.putWithCancellation(alloc, contents, .none);
+    }
+
+    pub fn putWithCancellation(self: *ObjectStore, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
@@ -203,10 +208,11 @@ pub const ObjectStore = struct {
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
         const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
-        var result = try self.client.putObject(self.bucket, key, contents, .{
+        var result = self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
-        });
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
         defer result.deinit(self.client.allocator);
 
         return .{
@@ -405,6 +411,7 @@ pub const ObjectStore = struct {
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
+        .put_with_cancellation = erasedPutWithCancellation,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
@@ -423,6 +430,11 @@ pub const ObjectStore = struct {
     fn erasedPut(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.put(alloc, contents);
+    }
+
+    fn erasedPutWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.putWithCancellation(alloc, contents, cancellation);
     }
 
     fn erasedGetAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -490,8 +502,21 @@ fn dupeWithCancellationAlloc(
 }
 
 fn sha256StringAlloc(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
+    return sha256StringWithCancellationAlloc(alloc, contents, .none);
+}
+
+fn sha256StringWithCancellationAlloc(alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < contents.len) {
+        try cancellation.check();
+        const len = @min(chunk_bytes, contents.len - offset);
+        hasher.update(contents[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
 
     const out = try alloc.alloc(u8, 64);
     for (digest, 0..) |byte, idx| {

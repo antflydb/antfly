@@ -132,6 +132,10 @@ pub const PutOptions = struct {
     /// the body. S3-compatible implementations persist this as provider
     /// checksum metadata so later integrity checks remain metadata-only.
     checksum_sha256_base64: ?[]const u8 = null,
+    /// Borrowed for the duration of the upload. Remote providers interrupt
+    /// their active transport; local providers check between bounded chunks
+    /// and never publish a partially written object.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const GetOptions = struct {

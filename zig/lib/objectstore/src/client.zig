@@ -55,7 +55,11 @@ pub const Client = struct {
     }
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
-        return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
+        if (opts.cancellation) |token| try token.check();
+        var result = try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
+        errdefer result.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return result;
     }
 
     pub fn putFile(self: *Client, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
@@ -65,14 +69,27 @@ pub const Client = struct {
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
-        if (self.vtable.put_file) |put_file| return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+        if (opts.cancellation) |token| try token.check();
+        if (self.vtable.put_file) |put_file| {
+            var result = try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
+            errdefer result.deinit(self.allocator);
+            if (opts.cancellation) |token| try token.check();
+            return result;
+        }
         const file = try openFilePath(io, src_path);
         defer file.close(io);
         const stat = try file.stat(io);
         if (stat.size > fallback_upload_limit_bytes) return error.StreamingUploadUnsupported;
         const body = try self.allocator.alloc(u8, @intCast(stat.size));
         defer self.allocator.free(body);
-        if (try file.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var copied: usize = 0;
+        while (copied < body.len) {
+            if (opts.cancellation) |token| try token.check();
+            const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
+            if (try file.readPositionalAll(io, body[copied..][0..chunk_len], copied) != chunk_len) return error.SourceFileChanged;
+            copied += chunk_len;
+        }
         var extra: [1]u8 = undefined;
         if (try file.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
         return try self.putObject(bucket, key, body, opts);

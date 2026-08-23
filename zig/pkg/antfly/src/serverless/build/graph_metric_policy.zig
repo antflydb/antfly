@@ -15,12 +15,18 @@ const bounded_decode = @import("../bounded_decode.zig");
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
 pub const materializer_epoch: u32 = 1;
+const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
     // Keep graph admission aligned with the decoder and query-runtime
     // artifact contract. Larger topology artifacts cannot be served safely by
     // this runtime and are represented by durable rejected metric sidecars.
     max_graph_payload_bytes: usize = (bounded_decode.Limits{}).max_artifact_bytes,
+    // Unique topology payloads are charged once per table publication. Two
+    // maximum-sized graphs may be materialized in one run; additional graphs
+    // receive durable budget-rejection sidecars instead of consuming several
+    // GiB of background I/O and decode CPU.
+    max_total_graph_payload_bytes: usize = 512 * 1024 * 1024,
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
     max_nodes: usize = 1_000_000,
@@ -40,6 +46,39 @@ pub const Budget = struct {
     limits: Limits,
     work_items: u64 = 0,
     metric_payload_bytes: usize = 0,
+    graph_payload_bytes: usize = 0,
+    graph_identity_count: usize = 0,
+    graph_identities: [max_tracked_graph_indexes][32]u8 = undefined,
+
+    /// Charges one immutable topology identity at most once. The digest is
+    /// bookkeeping only: artifact authentication remains the responsibility
+    /// of ArtifactStore before decoding.
+    pub fn chargeGraphPayload(self: *Budget, artifact_id: []const u8, checksum: []const u8, byte_len: u64) !void {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(artifact_id);
+        hasher.update(&.{0});
+        hasher.update(checksum);
+        var encoded_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_len, byte_len, .little);
+        hasher.update(&encoded_len);
+        var identity: [32]u8 = undefined;
+        hasher.final(&identity);
+        for (self.graph_identities[0..self.graph_identity_count]) |existing| {
+            if (std.mem.eql(u8, &existing, &identity)) return;
+        }
+        if (self.graph_identity_count >= self.limits.max_graph_indexes or
+            self.graph_identity_count >= self.graph_identities.len)
+        {
+            return error.GraphMetricBuildBudgetExceeded;
+        }
+        const admitted_bytes = std.math.cast(usize, byte_len) orelse return error.GraphMetricBuildBudgetExceeded;
+        const next = std.math.add(usize, self.graph_payload_bytes, admitted_bytes) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        if (next > self.limits.max_total_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+        self.graph_identities[self.graph_identity_count] = identity;
+        self.graph_identity_count += 1;
+        self.graph_payload_bytes = next;
+    }
 
     pub fn chargeWork(self: *Budget, amount: u64) !void {
         const next = std.math.add(u64, self.work_items, amount) catch
@@ -59,13 +98,14 @@ pub const Budget = struct {
 pub fn validateLimits(limits: Limits) !void {
     if (limits.max_graph_payload_bytes == 0 or
         limits.max_graph_payload_bytes > (bounded_decode.Limits{}).max_artifact_bytes or
+        limits.max_total_graph_payload_bytes == 0 or
         limits.max_metric_payload_bytes == 0 or
         limits.max_total_metric_payload_bytes == 0 or
         limits.max_nodes == 0 or
         limits.max_edges == 0 or
         limits.max_work_items == 0 or
         limits.max_total_work_items == 0 or
-        limits.max_graph_indexes == 0 or
+        limits.max_graph_indexes == 0 or limits.max_graph_indexes > max_tracked_graph_indexes or
         limits.max_metrics == 0 or
         limits.max_total_metrics == 0 or
         limits.max_graph_index_name_bytes == 0 or
@@ -169,6 +209,15 @@ test "serverless graph metric policy bounds aggregate work and configuration fan
         error.GraphMetricConfigurationLimitExceeded,
         validateCatalogFanout(1, 2, .{ .max_total_metrics = 1 }),
     );
+}
+
+test "serverless graph metric policy charges each unique topology once" {
+    var budget = Budget{ .limits = .{ .max_graph_payload_bytes = 10, .max_total_graph_payload_bytes = 12 } };
+    try budget.chargeGraphPayload("sha256:a", "a", 10);
+    try budget.chargeGraphPayload("sha256:a", "a", 10);
+    try std.testing.expectEqual(@as(usize, 10), budget.graph_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), budget.graph_identity_count);
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, budget.chargeGraphPayload("sha256:b", "b", 3));
 }
 
 test "serverless graph metric policy fingerprint changes with materialization limits" {

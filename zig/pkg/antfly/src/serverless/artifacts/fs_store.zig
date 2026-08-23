@@ -61,7 +61,12 @@ pub const FsStore = struct {
     }
 
     pub fn put(self: *FsStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try sha256StringAlloc(alloc, contents);
+        return try self.putWithCancellation(alloc, contents, .none);
+    }
+
+    pub fn putWithCancellation(self: *FsStore, alloc: Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
@@ -70,7 +75,7 @@ pub const FsStore = struct {
         defer self.alloc.free(path);
 
         const existing_valid = if (fileExists(path)) blk: {
-            verifyPathContent(path, @intCast(contents.len), checksum, .none) catch |err| switch (err) {
+            verifyPathContent(path, @intCast(contents.len), checksum, cancellation) catch |err| switch (err) {
                 error.ArtifactIntegrityMismatch, error.FileNotFound => break :blk false,
                 else => return err,
             };
@@ -78,7 +83,7 @@ pub const FsStore = struct {
         } else false;
         if (!existing_valid) {
             try ensureParentDir(path);
-            try writeFileAtomically(path, contents);
+            try writeFileAtomicallyWithCancellation(path, contents, cancellation);
         }
 
         return .{
@@ -212,6 +217,7 @@ pub const FsStore = struct {
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
+        .put_with_cancellation = erasedPutWithCancellation,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
@@ -230,6 +236,11 @@ pub const FsStore = struct {
     fn erasedPut(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.put(alloc, contents);
+    }
+
+    fn erasedPutWithCancellation(ptr: *anyopaque, alloc: Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.putWithCancellation(alloc, contents, cancellation);
     }
 
     fn erasedGetAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) ![]u8 {
@@ -394,12 +405,18 @@ fn ensureParentDir(path: []const u8) !void {
 }
 
 fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
+    return writeFileAtomicallyWithCancellation(path, contents, .none);
+}
+
+fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
+    try cancellation.check();
     const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
     defer std.heap.page_allocator.free(tmp_path);
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
+    errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
     {
         var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
@@ -407,9 +424,18 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
 
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
-        try writer.interface.writeAll(contents);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var offset: usize = 0;
+        while (offset < contents.len) {
+            try cancellation.check();
+            const len = @min(cancellation_chunk_bytes, contents.len - offset);
+            try writer.interface.writeAll(contents[offset..][0..len]);
+            offset += len;
+        }
         try writer.end();
     }
+
+    try cancellation.check();
 
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.renameAbsolute(tmp_path, path, io) catch |err| {
@@ -425,8 +451,21 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
 }
 
 fn sha256StringAlloc(alloc: Allocator, contents: []const u8) ![]u8 {
+    return sha256StringWithCancellationAlloc(alloc, contents, .none);
+}
+
+fn sha256StringWithCancellationAlloc(alloc: Allocator, contents: []const u8, cancellation: CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < contents.len) {
+        try cancellation.check();
+        const len = @min(chunk_bytes, contents.len - offset);
+        hasher.update(contents[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
 
     const out = try alloc.alloc(u8, 64);
     for (digest, 0..) |byte, idx| {

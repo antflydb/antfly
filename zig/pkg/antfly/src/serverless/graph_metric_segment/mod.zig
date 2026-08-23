@@ -21,12 +21,25 @@ pub const RejectionReason = types.RejectionReason;
 pub const freeSegment = types.freeSegment;
 pub const artifactNameAlloc = types.artifactNameAlloc;
 pub const encodeAlloc = codec.encodeAlloc;
+pub const encodeAllocWithCancellation = codec.encodeAllocWithCancellation;
 pub const encodedSize = codec.encodedSize;
+pub const encodedSizeWithCancellation = codec.encodedSizeWithCancellation;
 pub const decodeAlloc = codec.decodeAlloc;
 pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
+pub const decodeAllocWithCancellation = codec.decodeAllocWithCancellation;
+pub const decodeAllocWithLimitsAndCancellation = codec.decodeAllocWithLimitsAndCancellation;
 pub const decodeHeader = codec.decodeHeader;
+pub const decodeControl = codec.decodeControl;
+pub const decodeRoutingIndexAlloc = codec.decodeRoutingIndexAlloc;
+pub const decodeRoutingIndexWithCancellationAlloc = codec.decodeRoutingIndexWithCancellationAlloc;
+pub const routingFooterLenFromTrailer = codec.routingFooterLenFromTrailer;
+pub const decodeScoreBlockWithCancellation = codec.decodeScoreBlockWithCancellation;
+pub const scoreFromBlockWithCancellation = codec.scoreFromBlockWithCancellation;
 pub const wire_version = codec.wire_version;
 pub const headerProbeLen = codec.headerProbeLen;
+pub const controlProbeLen = codec.controlProbeLen;
+pub const routing_trailer_len = codec.routing_trailer_len;
+pub const score_block_entries = codec.score_block_entries;
 
 test "serverless graph metric segment module compiles" {
     _ = types;

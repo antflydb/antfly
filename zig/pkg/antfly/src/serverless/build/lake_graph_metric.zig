@@ -92,7 +92,7 @@ pub fn buildFromGraphPayloadAlloc(alloc: Allocator, graph_payload: []const u8, o
 pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, graph_payload: []const u8, options: BuildOptions) !artifact_ref.ArtifactRef {
     var built = try buildFromGraphPayloadAlloc(alloc, graph_payload, options);
     defer built.deinit(alloc);
-    var metadata = try artifacts.put(built.payload);
+    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
     defer metadata.deinit(alloc);
     const name = try alloc.dupe(u8, built.artifact.name);
     errdefer alloc.free(name);
@@ -164,6 +164,7 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
 ) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
+    try batch_budget.chargeGraphPayload(source_graph.artifact_id, source_graph.checksum, source_graph.byte_len);
     var prepared = try prepareGraphArtifactAlloc(alloc, artifacts, source_graph, cancellation, limits);
     defer prepared.deinit(alloc);
     return try publishManyFromPreparedGraphWithBudgetAlloc(
@@ -266,9 +267,9 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
                 else => return err,
             };
             defer built_pair.deinit(alloc);
-            refs[i] = try putBuildResultAlloc(alloc, artifacts, &built_pair.first);
+            refs[i] = try putBuildResultAlloc(alloc, artifacts, &built_pair.first, cancellation);
             initialized[i] = true;
-            refs[pair_index] = try putBuildResultAlloc(alloc, artifacts, &built_pair.second);
+            refs[pair_index] = try putBuildResultAlloc(alloc, artifacts, &built_pair.second, cancellation);
             initialized[pair_index] = true;
             processed[i] = true;
             processed[pair_index] = true;
@@ -291,7 +292,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
             else => return err,
         };
         defer built.deinit(alloc);
-        refs[i] = try putBuildResultAlloc(alloc, artifacts, &built);
+        refs[i] = try putBuildResultAlloc(alloc, artifacts, &built, cancellation);
         initialized[i] = true;
         processed[i] = true;
     }
@@ -314,8 +315,8 @@ fn validatePublicationOptions(
     try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs);
 }
 
-fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, built: *const BuildResult) !artifact_ref.ArtifactRef {
-    var metadata = try artifacts.put(built.payload);
+fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, built: *const BuildResult, cancellation: CancellationToken) !artifact_ref.ArtifactRef {
+    var metadata = try artifacts.putWithCancellation(built.payload, cancellation);
     defer metadata.deinit(alloc);
     const name = try alloc.dupe(u8, built.artifact.name);
     errdefer alloc.free(name);
@@ -381,9 +382,9 @@ fn publishRejectedAlloc(
     try cancellation.check();
     var segment = try rejectedSegmentAlloc(alloc, graph_index_name, source_graph, config, reason, limits);
     defer segment.deinit(alloc);
-    const payload = try metric_segment.encodeAlloc(alloc, segment);
+    const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, cancellation);
     defer alloc.free(payload);
-    var metadata = try artifacts.put(payload);
+    var metadata = try artifacts.putWithCancellation(payload, cancellation);
     defer metadata.deinit(alloc);
     const name = try metric_segment.artifactNameAlloc(alloc, graph_index_name, config.name);
     errdefer alloc.free(name);
@@ -601,7 +602,7 @@ fn encodeMetricResultAlloc(
     options: BuildOptions,
     result: metrics.Result,
 ) !BuildResult {
-    const scores = try makeScoresAlloc(alloc, node_ids, result.scores);
+    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, options.cancellation);
     var scores_owned = true;
     defer if (scores_owned) {
         for (scores) |*score| score.deinit(alloc);
@@ -611,10 +612,10 @@ fn encodeMetricResultAlloc(
     var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
     scores_owned = false;
     defer segment.deinit(alloc);
-    const encoded_size = try metric_segment.encodedSize(segment);
+    const encoded_size = try metric_segment.encodedSizeWithCancellation(segment, options.cancellation);
     if (encoded_size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     if (options.batch_budget) |budget| try budget.chargePayload(encoded_size);
-    const payload = try metric_segment.encodeAlloc(alloc, segment);
+    const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, options.cancellation);
     errdefer alloc.free(payload);
     const name = try artifactNameAlloc(alloc, options.graph_index_name, options.config.name);
     errdefer alloc.free(name);
@@ -661,18 +662,22 @@ fn makeMetricSegmentAlloc(alloc: Allocator, options: BuildOptions, result: metri
     };
 }
 
-fn makeScoresAlloc(alloc: Allocator, node_ids: []const []const u8, values: []const f64) ![]metric_segment.Score {
+fn makeScoresAlloc(alloc: Allocator, node_ids: []const []const u8, values: []const f64, cancellation: CancellationToken) ![]metric_segment.Score {
     if (node_ids.len != values.len) return error.InvalidGraphMetricScore;
+    try cancellation.check();
     const scores = try alloc.alloc(metric_segment.Score, node_ids.len);
     errdefer alloc.free(scores);
     var initialized: usize = 0;
     errdefer for (scores[0..initialized]) |*score| score.deinit(alloc);
     for (node_ids, values, 0..) |node_id, value, i| {
+        if (i % 4096 == 0) try cancellation.check();
         if (!std.math.isFinite(value)) return error.InvalidGraphMetricScore;
         scores[i] = .{ .node_id = try alloc.dupe(u8, node_id), .value = value };
         initialized += 1;
     }
+    try cancellation.check();
     std.mem.sort(metric_segment.Score, scores, {}, lessScore);
+    try cancellation.check();
     return scores;
 }
 

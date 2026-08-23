@@ -109,6 +109,9 @@ const CacheWriteLane = enum {
 };
 
 pub const graph_metric_status_header_block_id = "graph-metric-status-header-v1";
+pub const graph_metric_control_block_id = "graph-metric-control-v1";
+pub const graph_metric_routing_block_id = "graph-metric-routing-v1";
+pub const graph_metric_score_block_id = "graph-metric-score-exact";
 
 fn classifyBlockId(block_id: []const u8) BlockClass {
     if (std.mem.eql(u8, block_id, "vector-header")) return .routing;
@@ -118,6 +121,8 @@ fn classifyBlockId(block_id: []const u8) BlockClass {
     if (std.mem.eql(u8, block_id, "sparse-table")) return .routing;
     if (std.mem.eql(u8, block_id, "sparse-terms")) return .routing;
     if (std.mem.eql(u8, block_id, graph_metric_status_header_block_id)) return .routing;
+    if (std.mem.eql(u8, block_id, graph_metric_control_block_id)) return .routing;
+    if (std.mem.eql(u8, block_id, graph_metric_routing_block_id)) return .routing;
     return .payload;
 }
 

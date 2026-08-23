@@ -232,9 +232,21 @@ pub const OperationPlan = struct {
 pub const RowSourceProvider = struct {
     ptr: *anyopaque,
     open_fn: *const fn (*anyopaque, Allocator, source_binding.Binding) anyerror!rowsource.Source,
+    open_with_cancellation_fn: ?*const fn (*anyopaque, Allocator, source_binding.Binding, CancellationToken) anyerror!rowsource.Source = null,
 
     pub fn open(self: RowSourceProvider, alloc: Allocator, binding: source_binding.Binding) !rowsource.Source {
         return try self.open_fn(self.ptr, alloc, binding);
+    }
+
+    pub fn openWithCancellation(self: RowSourceProvider, alloc: Allocator, binding: source_binding.Binding, cancellation: CancellationToken) !rowsource.Source {
+        try cancellation.check();
+        var source = if (self.open_with_cancellation_fn) |open_with_cancellation|
+            try open_with_cancellation(self.ptr, alloc, binding, cancellation)
+        else
+            try self.open_fn(self.ptr, alloc, binding);
+        errdefer source.deinit(alloc);
+        try cancellation.check();
+        return source;
     }
 };
 
@@ -624,6 +636,20 @@ fn appendExternalGraphMetricDeclarationsAlloc(
         }
 
         const built = build: {
+            graph_metric_budget.chargeGraphPayload(
+                graph_declaration.artifact.artifact_id,
+                graph_declaration.artifact.checksum,
+                graph_declaration.artifact.byte_len,
+            ) catch break :build try lake_graph_metric.publishRejectedManyAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_declaration.artifact,
+                spec.configs,
+                cancellation,
+                .build_budget_exceeded,
+                graph_metric_limits,
+            );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_declaration.artifact)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
                 prepared_graph = null;
@@ -816,9 +842,9 @@ pub fn executeOperationsWithOptionsAlloc(
             .rebuild => {
                 const group_count = countPendingRebuildsForSnapshot(plan.operations, completed, operation.binding);
                 if (group_count == 1) {
-                    var source = try source_provider.open(alloc, operation.binding);
+                    var source = try source_provider.openWithCancellation(alloc, operation.binding, options.cancellation);
                     defer source.deinit(alloc);
-                    const declaration = try executeRebuildOperationAlloc(alloc, artifacts, source, operation, options.limits);
+                    const declaration = try executeRebuildOperationAlloc(alloc, artifacts, source, operation, options.limits, options.cancellation);
                     errdefer freeOwnedDeclaration(alloc, declaration);
                     executed[operation_idx] = try makeExecutedOperation(alloc, operation, declaration, declaration.artifact.artifact_id);
                     completed[operation_idx] = true;
@@ -827,9 +853,9 @@ pub fn executeOperationsWithOptionsAlloc(
 
                 const merged_binding = try mergedRebuildBindingAlloc(alloc, plan.operations, completed, operation.binding);
                 defer source_binding.freeOwned(alloc, merged_binding);
-                var source = try source_provider.open(alloc, merged_binding);
+                var source = try source_provider.openWithCancellation(alloc, merged_binding, options.cancellation);
                 defer source.deinit(alloc);
-                var replay = try lake_replay.Buffer.captureAlloc(alloc, source, options.limits);
+                var replay = try lake_replay.Buffer.captureWithCancellationAlloc(alloc, source, options.limits, options.cancellation);
                 defer replay.deinit(alloc);
 
                 for (plan.operations, 0..) |group_operation, group_idx| {
@@ -843,6 +869,7 @@ pub fn executeOperationsWithOptionsAlloc(
                         cursor.rowSource(),
                         group_operation,
                         options.limits,
+                        options.cancellation,
                     );
                     errdefer freeOwnedDeclaration(alloc, declaration);
                     executed[group_idx] = try makeExecutedOperation(
@@ -1751,7 +1778,9 @@ fn executeRebuildOperationAlloc(
     source: rowsource.Source,
     operation: Operation,
     limits: lake_build_limits.Limits,
+    cancellation: CancellationToken,
 ) !sidecar_manifest.DeclaredArtifact {
+    try cancellation.check();
     const build_spec = operation.build_spec orelse return error.MissingLakeRebuildBuildSpec;
     return switch (build_spec) {
         .text => |spec| blk: {
@@ -1760,6 +1789,7 @@ fn executeRebuildOperationAlloc(
                 .text_column = spec.text_column,
                 .config_json = spec.config_json,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -1771,6 +1801,7 @@ fn executeRebuildOperationAlloc(
                 .vector_column = spec.vector_column,
                 .embedding_name = spec.embedding_name,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -1781,6 +1812,7 @@ fn executeRebuildOperationAlloc(
                 .name = operation.name,
                 .sparse_column = spec.sparse_column,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -1791,6 +1823,7 @@ fn executeRebuildOperationAlloc(
                 .name = operation.name,
                 .graph_column = spec.graph_column,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -1803,6 +1836,7 @@ fn executeRebuildOperationAlloc(
                 .value_column = spec.value_column,
                 .op = spec.op,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -1813,6 +1847,7 @@ fn executeRebuildOperationAlloc(
                 .name = operation.name,
                 .expressions = spec.expressions,
                 .limits = limits,
+                .cancellation = cancellation,
             });
             const declaration = result.declaration;
             result = undefined;

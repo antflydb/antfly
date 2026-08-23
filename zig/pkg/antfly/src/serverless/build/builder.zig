@@ -3499,6 +3499,16 @@ fn buildGraphMetricArtifactRefsAlloc(
         }
 
         const built = build: {
+            graph_metric_budget.chargeGraphPayload(graph_ref.artifact_id, graph_ref.checksum, graph_ref.byte_len) catch break :build try lake_graph_metric.publishRejectedManyAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_ref,
+                spec.configs,
+                cancellation,
+                .build_budget_exceeded,
+                graph_metric_limits,
+            );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_ref)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
                 prepared_graph = null;

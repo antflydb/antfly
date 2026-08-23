@@ -69,6 +69,7 @@ pub const ArtifactStore = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
+        put_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u8,
         get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror![]u8 = null,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
@@ -85,7 +86,18 @@ pub const ArtifactStore = struct {
     }
 
     pub fn put(self: *ArtifactStore, contents: []const u8) !ArtifactMetadata {
-        return try self.vtable.put(self.ptr, self.allocator, contents);
+        return try self.putWithCancellation(contents, .none);
+    }
+
+    pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        try cancellation.check();
+        var metadata = if (self.vtable.put_with_cancellation) |put_with_cancellation|
+            try put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
+        else
+            try self.vtable.put(self.ptr, self.allocator, contents);
+        errdefer metadata.deinit(self.allocator);
+        try cancellation.check();
+        return metadata;
     }
 
     pub fn getAlloc(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {

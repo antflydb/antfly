@@ -715,7 +715,15 @@ pub const Client = struct {
             try headers.append(alloc, .{ "x-amz-checksum-sha256", value });
         }
 
-        var response = try self.perform(.PUT, target, headers.items, body, opts.content_type);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .PUT,
+            target,
+            headers.items,
+            body,
+            opts.content_type,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -752,6 +760,7 @@ pub const Client = struct {
         opts: types.PutOptions,
         multipart_threshold: u64,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
@@ -780,7 +789,7 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, initiate_pairs);
         var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
         defer initiate_target.deinit(alloc);
-        var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
+        var initiated = try self.performWithResponseLimitAndCancellation(.POST, initiate_target, &.{}, null, opts.content_type, null, opts.cancellation);
         defer initiated.deinit(alloc);
         if (initiated.status != 200) return unexpectedStatusError(initiated.status);
         const upload_id = try requiredTagAlloc(alloc, initiated.body, "UploadId");
@@ -798,6 +807,7 @@ pub const Client = struct {
         var offset: u64 = 0;
         var part_number: u32 = 1;
         while (offset < stat.size) : (part_number += 1) {
+            if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -812,7 +822,7 @@ pub const Client = struct {
             defer freeQueryPairs(alloc, query_pairs);
             var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
             defer target.deinit(alloc);
-            var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
+            var response = try self.performWithResponseLimitAndCancellation(.PUT, target, &.{}, buffer[0..wanted], null, null, opts.cancellation);
             defer response.deinit(alloc);
             if (response.status != 200) return unexpectedStatusError(response.status);
             const etag = response.etag orelse return error.MissingMultipartEtag;
@@ -831,7 +841,7 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, complete_pairs);
         var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
         defer complete_target.deinit(alloc);
-        var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
+        var response = try self.performWithResponseLimitAndCancellation(.POST, complete_target, &.{}, completion_xml, "application/xml", null, opts.cancellation);
         defer response.deinit(alloc);
         if (response.status != 200) return unexpectedStatusError(response.status);
         if (findBlock(response.body, "Error", 0) != null) return error.MultipartCompletionFailed;

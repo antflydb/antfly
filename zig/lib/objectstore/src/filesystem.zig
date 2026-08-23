@@ -89,6 +89,7 @@ pub const FilesystemClient = struct {
     }
 
     fn putObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         try self.makeBucket(bucket);
 
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
@@ -107,11 +108,11 @@ pub const FilesystemClient = struct {
         }
 
         try ensureParentDir(self.io, object_path);
-        const etag = try sha256HexAlloc(alloc, body);
+        const etag = try sha256HexAllocWithCancellation(alloc, body, opts.cancellation);
         errdefer alloc.free(etag);
         const staging_path = try stagingPathAlloc(alloc, self.root_dir, bucket);
         defer alloc.free(staging_path);
-        try writeObjectAtomically(self.io, object_path, staging_path, body, etag, opts.content_type orelse "");
+        try writeObjectAtomically(self.io, object_path, staging_path, body, etag, opts.content_type orelse "", opts.cancellation);
 
         return .{
             .etag = etag,
@@ -119,6 +120,7 @@ pub const FilesystemClient = struct {
     }
 
     fn putFile(self: *FilesystemClient, alloc: Allocator, source_io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         try self.makeBucket(bucket);
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
@@ -146,6 +148,7 @@ pub const FilesystemClient = struct {
             staging_path,
             src_path,
             opts.content_type orelse "",
+            opts.cancellation,
         );
         return .{ .etag = etag };
     }
@@ -672,7 +675,7 @@ fn openFilePath(io: std.Io, path: []const u8) !std.Io.File {
         try std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
-fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, body: []const u8, etag: []const u8, content_type: []const u8) !void {
+fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, body: []const u8, etag: []const u8, content_type: []const u8, cancellation: ?types.CancellationToken) !void {
     if (etag.len != 64 or content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
 
     errdefer if (std.fs.path.isAbsolute(tmp_path))
@@ -696,10 +699,19 @@ fn writeObjectAtomically(io: std.Io, path: []const u8, tmp_path: []const u8, bod
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(&fixed);
         try writer.interface.writeAll(content_type);
-        try writer.interface.writeAll(body);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var offset: usize = 0;
+        while (offset < body.len) {
+            if (cancellation) |token| try token.check();
+            const len = @min(cancellation_chunk_bytes, body.len - offset);
+            try writer.interface.writeAll(body[offset..][0..len]);
+            offset += len;
+        }
         try writer.end();
         try file.sync(io);
     }
+
+    if (cancellation) |token| try token.check();
 
     if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
@@ -715,6 +727,7 @@ fn writeObjectFileAtomically(
     tmp_path: []const u8,
     src_path: []const u8,
     content_type: []const u8,
+    cancellation: ?types.CancellationToken,
 ) ![]u8 {
     if (content_type.len > max_content_type_bytes) return error.InvalidObjectMetadata;
     const source = try openFilePath(source_io, src_path);
@@ -746,6 +759,7 @@ fn writeObjectFileAtomically(
     var read_buf: [256 * 1024]u8 = undefined;
     var offset: u64 = 0;
     while (offset < source_stat.size) {
+        if (cancellation) |token| try token.check();
         const wanted: usize = @intCast(@min(source_stat.size - offset, read_buf.len));
         const n = try source.readPositionalAll(source_io, read_buf[0..wanted], offset);
         if (n != wanted) return error.SourceFileChanged;
@@ -767,6 +781,7 @@ fn writeObjectFileAtomically(
     encodeObjectHeader(&placeholder, source_stat.size, content_type.len, etag);
     try output.writePositionalAll(io, &placeholder, 0);
     try output.sync(io);
+    if (cancellation) |token| try token.check();
     output.unlock(io);
     output_locked = false;
     output.close(io);
@@ -942,8 +957,21 @@ fn partCount(content_length: u64) usize {
 }
 
 fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    return sha256HexAllocWithCancellation(alloc, body, null);
+}
+
+fn sha256HexAllocWithCancellation(alloc: Allocator, body: []const u8, cancellation: ?types.CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < body.len) {
+        if (cancellation) |token| try token.check();
+        const len = @min(chunk_bytes, body.len - offset);
+        hasher.update(body[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
     return try digestHexAlloc(alloc, &digest);
 }
 

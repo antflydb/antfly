@@ -342,7 +342,15 @@ pub const JsonApiClient = struct {
         defer headers.deinit(alloc);
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
 
-        var response = try self.perform(.POST, url, headers.items, body, opts.content_type orelse "application/octet-stream");
+        var response = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            url,
+            headers.items,
+            body,
+            opts.content_type orelse "application/octet-stream",
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -381,6 +389,7 @@ pub const JsonApiClient = struct {
         opts: types.PutOptions,
         resumable_threshold: u64,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
@@ -409,7 +418,7 @@ pub const JsonApiClient = struct {
             .{ "X-Upload-Content-Length", size_text },
             .{ "X-Upload-Content-Type", upload_type },
         };
-        var initiated = try self.perform(.POST, initiate_url, &initiate_headers, "{}", "application/json");
+        var initiated = try self.performWithResponseLimitAndCancellation(.POST, initiate_url, &initiate_headers, "{}", "application/json", null, opts.cancellation);
         defer initiated.deinit(alloc);
         if (initiated.status != 200 and initiated.status != 201) return mapUnexpectedStatus(initiated.status);
         const session_url = initiated.location orelse return error.MissingResumableUploadLocation;
@@ -422,6 +431,7 @@ pub const JsonApiClient = struct {
         var final_response: ?TransportResponse = null;
         defer if (final_response) |*response| response.deinit(alloc);
         while (offset < stat.size) {
+            if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
             if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -430,7 +440,7 @@ pub const JsonApiClient = struct {
             const content_range = try std.fmt.allocPrint(alloc, "bytes {d}-{d}/{d}", .{ offset, last, stat.size });
             defer alloc.free(content_range);
             const headers = [_]HeaderPair{.{ "Content-Range", content_range }};
-            var response = try self.perform(.PUT, session_url, &headers, buffer[0..wanted], upload_type);
+            var response = try self.performWithResponseLimitAndCancellation(.PUT, session_url, &headers, buffer[0..wanted], upload_type, null, opts.cancellation);
             if (offset + wanted < stat.size) {
                 defer response.deinit(alloc);
                 if (response.status != 308) return mapUnexpectedStatus(response.status);
