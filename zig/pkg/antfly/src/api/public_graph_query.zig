@@ -180,6 +180,33 @@ pub fn resolveGraphSelectorAlloc(
                     return error.UnsupportedQueryRequest;
                 break :blk try resolveMatchBindingKeysAlloc(alloc, graph_result.matches, binding, result_ref.limit);
             }
+            const Set = @TypeOf(set);
+            if (@hasField(Set, "graph_result") and std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
+                const graph_result = set.graph_result orelse return error.InvalidQueryRequest;
+                // Canonical node/path operations expose identities through
+                // nodes, never through optional hydrated hits. Legacy pattern
+                // results retain their compatibility fallback below.
+                if (graph_result.matches.len == 0 and graph_result.aggregates.len == 0) {
+                    if (result_ref.limit == 0 and
+                        (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.nodes.len))
+                        return error.UnsupportedQueryRequest;
+                    const count: usize = if (result_ref.limit == 0)
+                        graph_result.nodes.len
+                    else
+                        @min(graph_result.nodes.len, result_ref.limit);
+                    const duped = try alloc.alloc([]u8, count);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (duped[0..initialized]) |key| alloc.free(key);
+                        if (duped.len > 0) alloc.free(duped);
+                    }
+                    for (graph_result.nodes[0..count], 0..) |node, i| {
+                        duped[i] = try alloc.dupe(u8, node.key);
+                        initialized += 1;
+                    }
+                    break :blk duped;
+                }
+            }
             if (result_ref.limit == 0 and resultSetMayBeIncompleteForUnboundedRef(set)) return error.UnsupportedQueryRequest;
             const count: usize = if (result_ref.limit == 0) set.hits.len else @min(set.hits.len, result_ref.limit);
             const duped = try alloc.alloc([]u8, count);
@@ -294,6 +321,43 @@ pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
         .{ .identities = &.{.{ .key = "doc:a", .table = "other" }} },
         &sets,
     ));
+
+    var result_nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "doc:path-target",
+        .depth = 2,
+        .distance = 2,
+        .path = null,
+        .path_edges = null,
+    }};
+    const graph_result = db_mod.types.GraphSearchResult{
+        .name = @constCast("path"),
+        .nodes = &result_nodes,
+        .hits = &.{},
+        .total_hits = 1,
+    };
+    const graph_sets = [_]struct {
+        name: []const u8,
+        hits: []const db_mod.types.SearchHit,
+        total_hits: u32,
+        graph_result: ?*const db_mod.types.GraphSearchResult,
+    }{.{
+        .name = "path",
+        .hits = &.{},
+        .total_hits = 1,
+        .graph_result = &graph_result,
+    }};
+    const path_keys = try resolveGraphSelectorAlloc(
+        alloc,
+        "docs",
+        .{ .result_ref = .{ .ref = "$graph_results.path" } },
+        &graph_sets,
+    );
+    defer {
+        for (path_keys) |key| alloc.free(key);
+        if (path_keys.len > 0) alloc.free(path_keys);
+    }
+    try std.testing.expectEqual(@as(usize, 1), path_keys.len);
+    try std.testing.expectEqualStrings("doc:path-target", path_keys[0]);
 }
 
 fn resultSetMayBeIncompleteForUnboundedRef(set: anytype) bool {
@@ -354,7 +418,7 @@ fn dependencyIndex(
     const dep_index = by_name.get(dep_name) orelse return error.InvalidQueryRequest;
     const dependency = queries[dep_index].query;
     switch (dependency.query_type) {
-        .neighbors, .traverse => if (result_ref.binding != null) return error.InvalidQueryRequest,
+        .neighbors, .traverse, .shortest_path, .k_shortest_paths => if (result_ref.binding != null) return error.InvalidQueryRequest,
         .pattern => {
             const binding = result_ref.binding orelse return error.InvalidQueryRequest;
             if (dependency.match_pattern == null or dependency.aggregates.len > 0)
@@ -368,7 +432,6 @@ fn dependencyIndex(
             }
             if (!returned) return error.InvalidQueryRequest;
         },
-        .shortest_path, .k_shortest_paths => return error.InvalidQueryRequest,
     }
     return dep_index;
 }
@@ -685,6 +748,24 @@ test "graph query dependencies require compatible explicit outputs" {
 
     invalid[1].query.start_nodes.result_ref.ref = "$graph_results.missing";
     try std.testing.expectError(error.InvalidQueryRequest, sortQueriesByDependencies(alloc, &invalid));
+
+    const path_dependency = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "path", .query = .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"b"} },
+        } },
+        .{ .name = "after_path", .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.path" } },
+        } },
+    };
+    const path_order = try sortQueriesByDependencies(alloc, &path_dependency);
+    defer alloc.free(path_order);
+    try std.testing.expectEqualStrings("path", path_dependency[path_order[0]].name);
+    try std.testing.expectEqualStrings("after_path", path_dependency[path_order[1]].name);
 }
 
 test "parse supported graph queries accepts pattern node filter queries" {

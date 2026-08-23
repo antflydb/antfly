@@ -1357,6 +1357,55 @@ pub const CountAggregateSpec = struct {
     distinct: bool = false,
 };
 
+/// Deduplicated execution plan for a list of named aggregate expressions.
+/// Aliases remain borrowed from the caller; only the slices are owned. Keeping
+/// this plan in the graph layer makes duplicate-expression budget and ownership
+/// semantics identical for distributed and serverless executors.
+pub const CountAggregatePlan = struct {
+    unique_specs: []CountAggregateSpec,
+    output_indexes: []usize,
+
+    pub fn init(alloc: Allocator, specs: []const CountAggregateSpec) !CountAggregatePlan {
+        if (specs.len > max_count_aggregates) return error.InvalidArgument;
+        var unique = std.ArrayListUnmanaged(CountAggregateSpec).empty;
+        errdefer unique.deinit(alloc);
+        const output_indexes = try alloc.alloc(usize, specs.len);
+        errdefer if (output_indexes.len > 0) alloc.free(output_indexes);
+
+        for (specs, 0..) |spec, output_index| {
+            var unique_index: ?usize = null;
+            for (unique.items, 0..) |prior, i| {
+                if (countAggregateSpecEql(prior, spec)) {
+                    unique_index = i;
+                    break;
+                }
+            }
+            if (unique_index == null) {
+                unique_index = unique.items.len;
+                try unique.append(alloc, spec);
+            }
+            output_indexes[output_index] = unique_index.?;
+        }
+
+        return .{
+            .unique_specs = try unique.toOwnedSlice(alloc),
+            .output_indexes = output_indexes,
+        };
+    }
+
+    pub fn deinit(self: *CountAggregatePlan, alloc: Allocator) void {
+        if (self.unique_specs.len > 0) alloc.free(self.unique_specs);
+        if (self.output_indexes.len > 0) alloc.free(self.output_indexes);
+        self.* = undefined;
+    }
+};
+
+fn countAggregateSpecEql(left: CountAggregateSpec, right: CountAggregateSpec) bool {
+    if (left.distinct != right.distinct) return false;
+    if (left.alias == null or right.alias == null) return left.alias == null and right.alias == null;
+    return std.mem.eql(u8, left.alias.?, right.alias.?);
+}
+
 pub const CountAggregateResult = struct {
     value: u128,
     distinct_values: []node_identity.Ref = &.{},
@@ -2683,6 +2732,11 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
         .{ .alias = "b", .distinct = true },
         .{ .alias = "b", .distinct = true },
     };
+    var duplicate_plan = try CountAggregatePlan.init(alloc, &duplicate_specs);
+    defer duplicate_plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_plan.unique_specs.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, duplicate_plan.output_indexes);
+
     const duplicates = try aggregateConjunctivePatternWithEdgeReader(
         alloc,
         Reader{ .targets = &targets },

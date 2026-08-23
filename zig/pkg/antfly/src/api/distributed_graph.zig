@@ -1716,7 +1716,7 @@ fn executeDistributedPattern(
     }
 
     // Hydrate documents if requested.
-    const hits = if (graph_query.query.include_documents)
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
         try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
@@ -1890,12 +1890,6 @@ fn matchAnchorPageIsTerminal(
     };
 }
 
-fn countAggregateSpecEql(left: graph_pattern_mod.CountAggregateSpec, right: graph_pattern_mod.CountAggregateSpec) bool {
-    if (left.distinct != right.distinct) return false;
-    if (left.alias == null or right.alias == null) return left.alias == null and right.alias == null;
-    return std.mem.eql(u8, left.alias.?, right.alias.?);
-}
-
 fn executeDistributedConjunctivePattern(
     alloc: std.mem.Allocator,
     edge_reader: DistributedEdgeReader,
@@ -1938,33 +1932,21 @@ fn executeDistributedConjunctivePattern(
         .work_budget = request_work_budget,
     };
 
-    var unique_specs = std.ArrayListUnmanaged(graph_pattern_mod.CountAggregateSpec).empty;
-    defer unique_specs.deinit(alloc);
-    const aggregate_indexes = try alloc.alloc(usize, graph_query.query.aggregates.len);
-    defer if (aggregate_indexes.len > 0) alloc.free(aggregate_indexes);
+    const requested_specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
+    defer if (requested_specs.len > 0) alloc.free(requested_specs);
     for (graph_query.query.aggregates, 0..) |aggregate, output_index| {
-        const spec = graph_pattern_mod.CountAggregateSpec{
+        requested_specs[output_index] = .{
             .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
             .distinct = aggregate.distinct,
         };
-        var unique_index: ?usize = null;
-        for (unique_specs.items, 0..) |prior, i| {
-            if (countAggregateSpecEql(prior, spec)) {
-                unique_index = i;
-                break;
-            }
-        }
-        if (unique_index == null) {
-            unique_index = unique_specs.items.len;
-            try unique_specs.append(alloc, spec);
-        }
-        aggregate_indexes[output_index] = unique_index.?;
     }
-    const aggregate_accumulators = try alloc.alloc(AggregatePageAccumulator, unique_specs.items.len);
+    var aggregate_plan = try graph_pattern_mod.CountAggregatePlan.init(alloc, requested_specs);
+    defer aggregate_plan.deinit(alloc);
+    const aggregate_accumulators = try alloc.alloc(AggregatePageAccumulator, aggregate_plan.unique_specs.len);
     defer if (aggregate_accumulators.len > 0) alloc.free(aggregate_accumulators);
     var initialized_accumulators: usize = 0;
     defer for (aggregate_accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
-    for (unique_specs.items, 0..) |spec, i| {
+    for (aggregate_plan.unique_specs, 0..) |spec, i| {
         aggregate_accumulators[i] = .{ .distinct = spec.distinct };
         initialized_accumulators += 1;
     }
@@ -2009,13 +1991,13 @@ fn executeDistributedConjunctivePattern(
         defer alloc.free(start_keys);
         for (page.hits, 0..) |hit, i| start_keys[i] = hit.id;
 
-        if (unique_specs.items.len > 0) {
+        if (aggregate_plan.unique_specs.len > 0) {
             const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
                 alloc,
                 edge_reader,
                 start_keys,
                 pattern,
-                unique_specs.items,
+                aggregate_plan.unique_specs,
                 base_opts,
             );
             defer {
@@ -2056,11 +2038,11 @@ fn executeDistributedConjunctivePattern(
         cursor_key = next_cursor;
     }
 
-    if (unique_specs.items.len > 0) {
+    if (aggregate_plan.unique_specs.len > 0) {
         const aggregates = try materializeAggregateResults(
             alloc,
             graph_query.query.aggregates,
-            aggregate_indexes,
+            aggregate_plan.output_indexes,
             aggregate_accumulators,
         );
         const name = state.name;
@@ -2079,7 +2061,7 @@ fn executeDistributedConjunctivePattern(
         for (unique_nodes) |*node| node.deinit(alloc);
         if (unique_nodes.len > 0) alloc.free(unique_nodes);
     }
-    const hits = if (graph_query.query.include_documents or req.expand_strategy != null)
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
         try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
@@ -2563,10 +2545,14 @@ fn executeDistributedTraverse(
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
 
+    const hydrated_hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
     state.hits = try adoptHydratedHits(
         alloc,
         state.hits,
-        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields),
+        hydrated_hits,
     );
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
@@ -2617,7 +2603,21 @@ fn executeDistributedShortestPath(
         alloc.free(nodes);
     };
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields);
+    const paths = if (path_result) |result| blk: {
+        const out = try alloc.alloc(db_mod.types.GraphPath, 1);
+        errdefer alloc.free(out);
+        out[0] = try cloneGraphPath(alloc, result.path);
+        break :blk out;
+    } else @constCast((&[_]db_mod.types.GraphPath{})[0..]);
+    errdefer {
+        for (paths) |path| graph_paths_mod.freePath(alloc, path);
+        if (paths.len > 0) alloc.free(paths);
+    }
+
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -2626,7 +2626,7 @@ fn executeDistributedShortestPath(
     return .{
         .name = try alloc.dupe(u8, graph_query.name),
         .nodes = nodes,
-        .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
+        .paths = paths,
         .hits = hits,
         .total_hits = if (path_result != null) 1 else 0,
     };
@@ -2844,7 +2844,10 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_paths);
     }
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields);
+    const hits = if (graphResultHydrationRequested(req, graph_query.query))
+        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+    else
+        try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -3318,9 +3321,23 @@ fn adoptHydratedHits(
     for (owned_old_hits.items) |*hit| hit.deinit(alloc);
     owned_old_hits.deinit(alloc);
     var out = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (new_hits) |*hit| hit.deinit(alloc);
+        if (new_hits.len > 0) alloc.free(new_hits);
+    }
     try out.appendSlice(alloc, new_hits);
     if (new_hits.len > 0) alloc.free(new_hits);
     return out;
+}
+
+fn graphResultHydrationRequested(
+    req: db_mod.types.SearchRequest,
+    query: graph_query_mod.GraphQuery,
+) bool {
+    // Expansion consumes hydrated graph hits internally. Otherwise the public
+    // include_documents flag is the sole authority for stored-data reads and
+    // response documents.
+    return query.include_documents or req.expand_strategy != null;
 }
 
 fn hydrateHitsForResultNodes(
@@ -4911,6 +4928,21 @@ test "distributed graph duplicate distinct aggregates share one merge payload" {
     try std.testing.expect(aggregates[0].distinct_values_owned);
     try std.testing.expect(!aggregates[1].distinct_values_owned);
     try std.testing.expectEqual(aggregates[0].distinct_values.ptr, aggregates[1].distinct_values.ptr);
+}
+
+test "distributed graph result hydration follows the public document option" {
+    var req = db_mod.types.SearchRequest{};
+    var query = graph_query_mod.GraphQuery{
+        .query_type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+    };
+    try std.testing.expect(!graphResultHydrationRequested(req, query));
+    query.include_documents = true;
+    try std.testing.expect(graphResultHydrationRequested(req, query));
+    query.include_documents = false;
+    req.expand_strategy = .@"union";
+    try std.testing.expect(graphResultHydrationRequested(req, query));
 }
 
 test "distributed graph exact distinct merge budget spans cursor pages" {
@@ -9401,7 +9433,9 @@ test "distributed graph executes result dependencies before declaration order" {
     try std.testing.expectEqualStrings("dependent", results[1].name);
     try std.testing.expectEqualStrings("doc:c", results[1].nodes[0].key);
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
-    try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.hydrate_calls);
+    try std.testing.expectEqual(@as(usize, 0), results[0].hits.len);
+    try std.testing.expectEqual(@as(usize, 0), results[1].hits.len);
 }
 
 test "distributed graph traverse routes cross-table frontier by table generation" {

@@ -3399,13 +3399,27 @@ pub const HttpHandler = struct {
             for (owned_paths) |path| graph_paths.freePath(self.alloc, path);
             if (owned_paths.len > 0) self.alloc.free(owned_paths);
         }
-        const hits = try self.buildGraphPathDocumentHitsAlloc(named_query.query, owned_paths, request_cache);
+        const nodes = try self.alloc.alloc(graph_query_mod.GraphResultNode, owned_paths.len);
+        var initialized_nodes: usize = 0;
+        errdefer {
+            for (nodes[0..initialized_nodes]) |*node| node.deinit(self.alloc);
+            if (nodes.len > 0) self.alloc.free(nodes);
+        }
+        for (owned_paths, 0..) |*path, i| {
+            nodes[i] = try graph_query_mod.pathToResultNode(self.alloc, path);
+            initialized_nodes += 1;
+        }
+        // Result identities exist independently of document hydration. This
+        // keeps `$graph_results.<name>` composition stable when callers toggle
+        // include_documents and mirrors the distributed path executor.
+        const hits = try self.buildGraphNodeDocumentHitsAlloc(named_query.query, nodes, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
         }
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
+            .nodes = nodes,
             .paths = owned_paths,
             .hits = hits,
             .total_hits = total_hits,
@@ -3475,15 +3489,17 @@ pub const HttpHandler = struct {
 
         if (conjunctive_pattern) |pattern| {
             if (named_query.query.aggregates.len > 0) {
-                const specs = try self.alloc.alloc(graph_pattern_mod.CountAggregateSpec, named_query.query.aggregates.len);
-                defer self.alloc.free(specs);
-                for (named_query.query.aggregates, 0..) |aggregate, i| specs[i] = .{
+                const requested_specs = try self.alloc.alloc(graph_pattern_mod.CountAggregateSpec, named_query.query.aggregates.len);
+                defer self.alloc.free(requested_specs);
+                for (named_query.query.aggregates, 0..) |aggregate, i| requested_specs[i] = .{
                     .alias = if (std.mem.eql(u8, aggregate.of, "*")) null else aggregate.of,
                     .distinct = aggregate.distinct,
                 };
+                var aggregate_plan = try graph_pattern_mod.CountAggregatePlan.init(self.alloc, requested_specs);
+                defer aggregate_plan.deinit(self.alloc);
                 var stream = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(
                     self.alloc,
-                    specs,
+                    aggregate_plan.unique_specs,
                     request_distinct_budget,
                 );
                 defer stream.deinit(self.alloc);
@@ -3506,19 +3522,36 @@ pub const HttpHandler = struct {
                     for (computed) |*aggregate| aggregate.deinit(self.alloc);
                     if (computed.len > 0) self.alloc.free(computed);
                 }
-                const aggregates = try self.alloc.alloc(db_types.GraphAggregateResult, computed.len);
+                const aggregates = try self.alloc.alloc(db_types.GraphAggregateResult, named_query.query.aggregates.len);
                 var initialized: usize = 0;
                 errdefer {
                     for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(self.alloc);
                     if (aggregates.len > 0) self.alloc.free(aggregates);
                 }
-                for (computed, 0..) |*aggregate, i| {
-                    aggregates[i] = .{
-                        .name = try self.alloc.dupe(u8, named_query.query.aggregates[i].name),
-                        .value = aggregate.value,
-                        .distinct_values = aggregate.distinct_values,
-                    };
-                    aggregate.distinct_values = &.{};
+                const distinct_value_owners = try self.alloc.alloc(?usize, computed.len);
+                defer if (distinct_value_owners.len > 0) self.alloc.free(distinct_value_owners);
+                @memset(distinct_value_owners, null);
+                for (named_query.query.aggregates, 0..) |aggregate, i| {
+                    const computed_index = aggregate_plan.output_indexes[i];
+                    const value = &computed[computed_index];
+                    const name = try self.alloc.dupe(u8, aggregate.name);
+                    errdefer self.alloc.free(name);
+                    if (distinct_value_owners[computed_index]) |owner| {
+                        aggregates[i] = .{
+                            .name = name,
+                            .value = value.value,
+                            .distinct_values = aggregates[owner].distinct_values,
+                            .distinct_values_owned = false,
+                        };
+                    } else {
+                        distinct_value_owners[computed_index] = i;
+                        aggregates[i] = .{
+                            .name = name,
+                            .value = value.value,
+                            .distinct_values = value.distinct_values,
+                        };
+                        value.distinct_values = &.{};
+                    }
                     initialized += 1;
                 }
                 return .{
@@ -3733,26 +3766,24 @@ pub const HttpHandler = struct {
         nodes: []const graph_query_mod.GraphResultNode,
         request_cache: *PublicGraphRequestCache,
     ) ![]db_types.SearchHit {
+        if (!query.include_documents) return try self.alloc.alloc(db_types.SearchHit, 0);
         const hits = try self.alloc.alloc(db_types.SearchHit, nodes.len);
         var initialized: usize = 0;
         errdefer {
             for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
         }
-        const projected_fields = if (query.include_documents and !query.include_all_fields)
+        const projected_fields = if (!query.include_all_fields)
             try dupFieldsAlloc(self.alloc, query.fields)
         else
             null;
         defer freeFields(self.alloc, projected_fields);
         for (nodes, 0..) |node, i| {
-            const stored_data = if (query.include_documents)
-                if (try request_cache.documentBody(node.key)) |body|
-                    if (query.include_all_fields)
-                        try self.alloc.dupe(u8, body)
-                    else
-                        try projectBodyFieldsAlloc(self.alloc, body, projected_fields.?)
+            const stored_data = if (try request_cache.documentBody(node.key)) |body|
+                if (query.include_all_fields)
+                    try self.alloc.dupe(u8, body)
                 else
-                    null
+                    try projectBodyFieldsAlloc(self.alloc, body, projected_fields.?)
             else
                 null;
             errdefer if (stored_data) |body| self.alloc.free(body);
@@ -3764,47 +3795,6 @@ pub const HttpHandler = struct {
             initialized += 1;
         }
         return hits;
-    }
-
-    fn buildGraphPathDocumentHitsAlloc(
-        self: *HttpHandler,
-        query: graph_query_mod.GraphQuery,
-        paths: []const graph_paths.Path,
-        request_cache: *PublicGraphRequestCache,
-    ) ![]db_types.SearchHit {
-        if (!query.include_documents) return try self.alloc.alloc(db_types.SearchHit, 0);
-        var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
-        errdefer {
-            for (hits.items) |*hit| hit.deinit(self.alloc);
-            hits.deinit(self.alloc);
-        }
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer seen.deinit(self.alloc);
-        const projected_fields = if (!query.include_all_fields)
-            try dupFieldsAlloc(self.alloc, query.fields)
-        else
-            null;
-        defer freeFields(self.alloc, projected_fields);
-        for (paths) |path| {
-            for (path.nodes) |key| {
-                if (seen.contains(key)) continue;
-                try seen.put(self.alloc, key, {});
-                const stored_data = if (try request_cache.documentBody(key)) |body|
-                    if (query.include_all_fields)
-                        try self.alloc.dupe(u8, body)
-                    else
-                        try projectBodyFieldsAlloc(self.alloc, body, projected_fields.?)
-                else
-                    null;
-                errdefer if (stored_data) |body| self.alloc.free(body);
-                try hits.append(self.alloc, .{
-                    .id = try self.alloc.dupe(u8, key),
-                    .score = 0,
-                    .stored_data = stored_data,
-                });
-            }
-        }
-        return try hits.toOwnedSlice(self.alloc);
     }
 
     fn queryGraphNeighborsResponse(self: *HttpHandler, session: *query_mod.QuerySession, namespace: []const u8, req: query_mod.GraphNeighborsRequest) !HttpResponse {

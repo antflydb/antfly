@@ -945,34 +945,63 @@ fn resolveTargetKeys(gq: GraphQuery) []const []const u8 {
     return &.{};
 }
 
-fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphResultNode {
+pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphResultNode {
     // Target is last node
     const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
 
     // Copy path nodes
     const path_nodes = try alloc.alloc([]const u8, path.nodes.len);
-    errdefer alloc.free(path_nodes);
-    for (path.nodes, 0..) |n, i| path_nodes[i] = try alloc.dupe(u8, n);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (path_nodes[0..initialized_nodes]) |node| alloc.free(node);
+        if (path_nodes.len > 0) alloc.free(path_nodes);
+    }
+    for (path.nodes, 0..) |n, i| {
+        path_nodes[i] = try alloc.dupe(u8, n);
+        initialized_nodes += 1;
+    }
 
     // Copy path edges
     const path_edges = try alloc.alloc(PathEdgeInfo, path.edges.len);
-    errdefer alloc.free(path_edges);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (path_edges[0..initialized_edges]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        if (path_edges.len > 0) alloc.free(path_edges);
+    }
     for (path.edges, 0..) |e, i| {
-        path_edges[i] = .{
-            .source = try alloc.dupe(u8, e.source),
-            .target = try alloc.dupe(u8, e.target),
-            .edge_type = try alloc.dupe(u8, e.edge_type),
-            .weight = e.weight,
-            .metadata = if (e.metadata.len > 0) try alloc.dupe(u8, e.metadata) else "",
-        };
+        path_edges[i] = try pathEdgeInfoFromPathEdge(alloc, e);
+        initialized_edges += 1;
     }
 
+    const key = try alloc.dupe(u8, target_key);
     return .{
-        .key = try alloc.dupe(u8, target_key),
+        .key = key,
         .depth = path.length,
         .distance = path.total_weight,
         .path = path_nodes,
         .path_edges = path_edges,
+    };
+}
+
+fn pathEdgeInfoFromPathEdge(alloc: Allocator, edge: paths_mod.PathEdge) !PathEdgeInfo {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+        .metadata = metadata,
     };
 }
 
@@ -2288,6 +2317,34 @@ test "k_shortest_paths via engine" {
     try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
     // First path should be shorter/lighter
     try std.testing.expect(result.nodes[0].distance <= result.nodes[1].distance);
+}
+
+test "path result node conversion preserves endpoint semantics and allocation safety" {
+    var nodes = [_][]const u8{ "A", "B" };
+    var edges = [_]paths_mod.PathEdge{.{
+        .source = "A",
+        .target = "B",
+        .edge_type = "links",
+        .weight = 2,
+        .metadata = "{\"visible\":true}",
+    }};
+    const path = paths_mod.Path{
+        .nodes = &nodes,
+        .edges = &edges,
+        .total_weight = 2,
+        .length = 1,
+    };
+    const Runner = struct {
+        fn run(alloc: Allocator, source: paths_mod.Path) !void {
+            var node = try pathToResultNode(alloc, &source);
+            defer node.deinit(alloc);
+            try std.testing.expectEqualStrings("B", node.key);
+            try std.testing.expectEqual(@as(u32, 1), node.depth);
+            try std.testing.expectEqualStrings("links", node.path_edges.?[0].edge_type);
+            try std.testing.expectEqualStrings("{\"visible\":true}", node.path_edges.?[0].metadata);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{path});
 }
 
 test "k_shortest_paths k one can execute through algebraic shortest path proof" {
