@@ -6754,6 +6754,53 @@ pub fn build(b: *std.Build) void {
     const transaction_vopr_test_step = b.step("transaction-vopr-test", "Run deterministic transaction VOPR and formal trace export tests");
     transaction_vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
 
+    const distributed_transaction_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"distributed transaction lifecycle VOPR records and exact replays"},
+    });
+    const run_distributed_transaction_vopr_tests = b.addRunArtifact(distributed_transaction_vopr_tests);
+    const distributed_transaction_vopr_test_step = b.step("distributed-transaction-vopr-test", "Run distributed transaction lifecycle VOPR campaigns");
+    distributed_transaction_vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
+
+    const data_plane_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"data plane microstep VOPR records and exact replays"},
+    });
+    const run_data_plane_vopr_tests = b.addRunArtifact(data_plane_vopr_tests);
+    const data_plane_vopr_test_step = b.step("data-plane-vopr-test", "Run data-plane routing, persistence, apply, split, and read VOPR campaigns");
+    data_plane_vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
+
+    const derived_workflow_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"derived workflow VOPR records and exact replays"},
+    });
+    const run_derived_workflow_vopr_tests = b.addRunArtifact(derived_workflow_vopr_tests);
+    const derived_workflow_vopr_test_step = b.step("derived-workflow-vopr-test", "Run enrichment, indexing, repair, and compaction VOPR campaigns");
+    derived_workflow_vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
+
+    const backup_restore_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"backup restore lifecycle VOPR records and exact replays"},
+    });
+    const run_backup_restore_vopr_tests = b.addRunArtifact(backup_restore_vopr_tests);
+    const backup_restore_vopr_test_step = b.step("backup-restore-vopr-test", "Run backup publication, retention, restore, activation, and GC VOPR campaigns");
+    backup_restore_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
+
+    const clock_fault_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"clock lease TTL fault VOPR records and exact replays"},
+    });
+    const run_clock_fault_vopr_tests = b.addRunArtifact(clock_fault_vopr_tests);
+    const clock_fault_vopr_test_step = b.step("clock-fault-vopr-test", "Run wall-clock, monotonic-clock, lease, retention, and TTL fault VOPR campaigns");
+    clock_fault_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
+
+    const domain_vopr_test_step = b.step("domain-vopr-test", "Run all cross-domain Antfly VOPR protocol campaigns");
+    domain_vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
+    domain_vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
+    domain_vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
+    domain_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
+    domain_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
+
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"VOPR durable job"},
@@ -6813,6 +6860,11 @@ pub fn build(b: *std.Build) void {
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_sim_contract_tests.step);
     sim_test_step.dependOn(&run_transaction_vopr_tests.step);
+    sim_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
+    sim_test_step.dependOn(&run_data_plane_vopr_tests.step);
+    sim_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
+    sim_test_step.dependOn(&run_backup_restore_vopr_tests.step);
+    sim_test_step.dependOn(&run_clock_fault_vopr_tests.step);
     sim_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
@@ -6832,6 +6884,11 @@ pub fn build(b: *std.Build) void {
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
+    chaos_progress_tail = chainLabeledRun(b, distributed_transaction_vopr_tests, "distributed-transaction-vopr-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, data_plane_vopr_tests, "data-plane-vopr-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, derived_workflow_vopr_tests, "derived-workflow-vopr-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, backup_restore_vopr_tests, "backup-restore-vopr-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, clock_fault_vopr_tests, "clock-fault-vopr-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_raft_vopr_tests, "raft-vopr-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);

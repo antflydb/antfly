@@ -95,6 +95,7 @@ pub const tracing = @import("tracing/mod.zig");
 
 // Deterministic simulation contracts and replay artifacts.
 pub const sim = @import("vopr");
+pub const domain_vopr = @import("sim/domain_vopr.zig");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
@@ -338,6 +339,7 @@ test {
     _ = ttl;
     _ = transactions;
     _ = transaction_vopr;
+    _ = domain_vopr;
     _ = schema;
     _ = object_storage;
     _ = host_environment;
