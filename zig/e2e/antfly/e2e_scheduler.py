@@ -1050,10 +1050,33 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._reschedule_all()
             return None
 
-        crashitem = super().remove_node(node)
+        workload = self.assigned_work.pop(node)
+        if not self._pending_of(workload):
+            return None
+
+        # Preserve xdist's crash-reporting contract while delaying assignment
+        # until every failed scope is back in the queue. Calling the parent
+        # implementation here would immediately reschedule in worker insertion
+        # order, bypassing the resource- and duration-aware global priority.
+        crashitem = next(
+            (
+                nodeid
+                for work_unit in workload.values()
+                for nodeid, complete in work_unit.items()
+                if not complete
+            ),
+            None,
+        )
+        if crashitem is None:
+            raise RuntimeError(
+                "Unable to identify crashitem on a workload with pending items"
+            )
+
+        self.workqueue.update(workload)
         for scope in list(self.workqueue):
             if all(self.workqueue[scope].values()):
                 del self.workqueue[scope]
+        self._reschedule_all()
         return crashitem
 
 

@@ -1441,3 +1441,60 @@ def test_retiring_worker_crash_is_reported_and_requeued(
     }
     assert crashed_node not in scheduler._retiring_nodes
     assert crashed_node not in scheduler._persistent_processes
+
+
+def test_crash_recovery_preserves_global_duration_priority(tmp_path: Path) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    clean = FakeWorker()
+    crashed = FakeWorker(exitstatus=2)
+    owner_nodeid = "test_a.py::test_done"
+    persistent_nodeid = "test_b.py::test_long"
+    transient_nodeid = "test_transient.py::test_short"
+    crash_nodeid = "test_crash.py::test_retry"
+    owner_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a--module--done"
+    persistent_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_b--module--long"
+    transient_scope = f"{PROCESS_GROUP_PREFIX}test--short"
+    crash_scope = "light--test--crash"
+    collection = [
+        owner_nodeid,
+        persistent_nodeid,
+        transient_nodeid,
+        crash_nodeid,
+    ]
+    scheduler.duration_history.tests = {
+        persistent_nodeid: {"seconds": 100.0, "samples": 1},
+        transient_nodeid: {"seconds": 1.0, "samples": 1},
+        crash_nodeid: {"seconds": 0.1, "samples": 1},
+    }
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._collecting_nodes = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {owner: {"runtime_a"}}
+    scheduler.assigned_work = {
+        owner: {owner_scope: {owner_nodeid: True}},
+        clean: {},
+        crashed: {crash_scope: {crash_nodeid: False}},
+    }
+    scheduler.registered_collections = {
+        owner: collection,
+        clean: collection,
+        crashed: collection,
+    }
+    scheduler.workqueue = OrderedDict(
+        {
+            persistent_scope: {persistent_nodeid: False},
+            transient_scope: {transient_nodeid: False},
+        }
+    )
+
+    assert scheduler.remove_node(crashed) == crash_nodeid
+
+    assert clean.sent == [[1]]
+    assert owner.sent == [[3]]
+    assert list(scheduler.workqueue) == [transient_scope]
+    assert scheduler._persistent_processes[clean] == {"runtime_b"}
+    assert scheduler._reserved_process_slots() == 2
