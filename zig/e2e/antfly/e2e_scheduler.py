@@ -30,6 +30,7 @@ from xdist.workermanage import WorkerController
 
 DURATION_FILE_VERSION = 1
 PROCESS_GROUP_PREFIX = "antfly-process--"
+PERSISTENT_PROCESS_GROUP_PREFIX = f"{PROCESS_GROUP_PREFIX}persistent--"
 DEFAULT_PROCESS_SECONDS = 5.0
 DEFAULT_LIGHT_SECONDS = 0.05
 
@@ -61,6 +62,15 @@ ANTFLY_PROCESS_FIXTURES = frozenset(
         "stateful_api",
         "stateful_auth_api",
         "table_api",
+    }
+)
+
+# These are the process-owning roots among the session-scoped fixtures above.
+# Depending fixtures such as serverless_api share the same worker reservation.
+PERSISTENT_ANTFLY_PROCESS_FIXTURES = frozenset(
+    {
+        "embedded_standalone_runtime",
+        "serverless_runtime",
     }
 )
 
@@ -99,6 +109,13 @@ def scheduling_group(item: pytest.Item) -> str:
         for fixture_name in ANTFLY_PROCESS_FIXTURES.intersection(item.fixturenames)
         if (scope := _fixture_scope(item, fixture_name)) is not None
     }
+    persistent_processes = sorted(
+        fixture_name
+        for fixture_name in PERSISTENT_ANTFLY_PROCESS_FIXTURES.intersection(
+            item.fixturenames
+        )
+        if _fixture_scope(item, fixture_name) == "session"
+    )
     declared_resources = {
         str(mark.args[0]) for mark in item.iter_markers("e2e_resource") if mark.args
     }
@@ -127,7 +144,10 @@ def scheduling_group(item: pytest.Item) -> str:
             explicit_group = str(group)
     identity = explicit_group or (module_id if shared else nodeid)
     kind = "module--" if shared else "test--"
-    resource = PROCESS_GROUP_PREFIX if process_owned else "light--"
+    if persistent_processes:
+        resource = PERSISTENT_PROCESS_GROUP_PREFIX
+    else:
+        resource = PROCESS_GROUP_PREFIX if process_owned else "light--"
     return _safe_group_name(f"{resource}{kind}", identity)
 
 
@@ -225,10 +245,15 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             Path(config.getoption("e2e_duration_file"))
         )
         self._retiring_nodes: set[WorkerController] = set()
+        self._persistent_process_workers: set[WorkerController] = set()
 
     @staticmethod
     def _scope_uses_process(scope: str) -> bool:
         return scope.startswith(PROCESS_GROUP_PREFIX)
+
+    @staticmethod
+    def _scope_uses_persistent_process(scope: str) -> bool:
+        return scope.startswith(PERSISTENT_PROCESS_GROUP_PREFIX)
 
     @classmethod
     def _workload_uses_process(cls, workload: dict[str, dict[str, bool]]) -> bool:
@@ -241,11 +266,13 @@ class IsolationAwareScheduling(LoadGroupScheduling):
     def _reserved_process_workers(self) -> int:
         # xdist requires each worker to have a second queued item before it can
         # start the first. Reserve capacity per sequential worker queue rather
-        # than per queued work unit: a worker can never run two units at once.
+        # than per queued work unit. A session fixture keeps its worker's
+        # reservation after its own work unit completes.
         return sum(
             1
-            for workload in self.assigned_work.values()
-            if self._workload_uses_process(workload)
+            for node, workload in self.assigned_work.items()
+            if node in self._persistent_process_workers
+            or self._workload_uses_process(workload)
         )
 
     def _scope_duration(self, scope: str, work_unit: dict[str, bool]) -> float:
@@ -257,8 +284,9 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         )
 
     def _next_eligible_scope(self, node: WorkerController) -> str | None:
-        node_has_process_reservation = self._workload_uses_process(
-            self.assigned_work.get(node, {})
+        node_has_process_reservation = (
+            node in self._persistent_process_workers
+            or self._workload_uses_process(self.assigned_work.get(node, {}))
         )
         process_capacity = (
             node_has_process_reservation
@@ -291,6 +319,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 if not complete
             ]
         )
+        if self._scope_uses_persistent_process(scope):
+            self._persistent_process_workers.add(node)
 
     def _reschedule(self, node: WorkerController) -> None:
         if node.shutting_down:
@@ -327,12 +357,17 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._reschedule(candidate)
 
     def remove_node(self, node: WorkerController) -> str | None:
-        if node in self._retiring_nodes:
-            self._retiring_nodes.remove(node)
+        workeroutput = getattr(node, "workeroutput", None)
+        exitstatus = workeroutput.get("exitstatus") if workeroutput else None
+        retired_cleanly = node in self._retiring_nodes and exitstatus in {0, 1}
+        self._retiring_nodes.discard(node)
+        self._persistent_process_workers.discard(node)
+
+        if retired_cleanly:
             workload = self.assigned_work.pop(node)
             # Depending on event timing, xdist may stop before its last queued
             # item. Put only genuinely incomplete items back into circulation;
-            # this was an intentional retirement, not a test-process crash.
+            # the worker confirmed a normal exit after intentional retirement.
             for scope, work_unit in workload.items():
                 incomplete = {
                     nodeid: False

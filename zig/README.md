@@ -125,6 +125,9 @@ and cluster work has a separate concurrency budget of two. Set
 `ANTFLY_E2E_WORKERS` and `ANTFLY_E2E_PROCESS_SLOTS` to tune those limits, or set
 `ANTFLY_E2E_WORKERS=1` for a sequential debugging run. Test duration history is
 stored under `e2e/antfly/.pytest_cache` locally and in the ARC cache in CI.
+Session-scoped process fixtures retain their process slot for the lifetime of
+the worker; transient function- and module-scoped fixtures release theirs after
+their queued work completes.
 The scheduler infers process ownership and fixture scope for the standard E2E
 fixtures. Custom fixtures can declare `@pytest.mark.e2e_resource("antfly_process")`,
 and tests with unusual sharing requirements can use
