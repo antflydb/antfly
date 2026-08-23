@@ -549,7 +549,13 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             Path(config.getoption("e2e_duration_file"))
         )
         self._retiring_nodes: set[WorkerController] = set()
+        self._starting_replacements: set[WorkerController] = set()
+        self._transient_handoffs: set[WorkerController] = set()
         self._persistent_processes: dict[WorkerController, set[str]] = {}
+
+    def add_node(self, node: WorkerController) -> None:
+        super().add_node(node)
+        getattr(self, "_starting_replacements", set()).discard(node)
 
     @staticmethod
     def _scope_uses_process(scope: str) -> bool:
@@ -598,13 +604,23 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope, work_unit in workload.items()
         )
 
+    def _worker_reserved_process_slots(self, node: WorkerController) -> int:
+        transient_slots = int(
+            self._workload_uses_transient_process(self.assigned_work[node])
+        )
+        # A queued persistent-only scope can reuse the lane occupied by the
+        # worker's final transient test: pytest tears down that test's fixture
+        # before setting up the next item. Keep the future persistent capacity
+        # reserved without double-counting the non-overlapping transition.
+        if node in getattr(self, "_transient_handoffs", set()):
+            transient_slots -= 1
+        return len(self._persistent_processes.get(node, ())) + transient_slots
+
     def _reserved_process_slots(self) -> int:
         # A sequential worker needs at most one transient slot, regardless of
         # its runway. Session process identities remain reserved until exit.
         return sum(
-            len(self._persistent_processes.get(node, ()))
-            + int(self._workload_uses_transient_process(workload))
-            for node, workload in self.assigned_work.items()
+            self._worker_reserved_process_slots(node) for node in self.assigned_work
         )
 
     def _additional_process_slots(self, node: WorkerController, scope: str) -> int:
@@ -629,6 +645,27 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for nodeid, complete in work_unit.items()
             if not complete
         )
+
+    def _transient_handoff_fits(
+        self,
+        node: WorkerController,
+        scope: str,
+        reserved_process_slots: int,
+    ) -> bool:
+        """Allow a final transient test to hand its lane to persistent work."""
+        if (
+            self._pending_of(self.assigned_work[node]) != 1
+            or not self._workload_uses_transient_process(self.assigned_work[node])
+            or self._scope_uses_transient_process(scope)
+        ):
+            return False
+        requested = self._scope_persistent_processes(scope)
+        if not requested:
+            return False
+        additional_persistent = len(
+            requested - self._persistent_processes.get(node, set())
+        )
+        return reserved_process_slots - 1 + additional_persistent <= self.process_slots
 
     def _defer_new_persistent_process(self, node: WorkerController, scope: str) -> bool:
         requested = self._scope_persistent_processes(scope)
@@ -655,10 +692,7 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         candidate: WorkerController,
     ) -> tuple[float, float, int]:
         """Prefer retirements that unlock work without discarding useful reuse."""
-        candidate_workload = self.assigned_work[candidate]
-        released_slots = len(self._persistent_processes.get(candidate, ())) + int(
-            self._workload_uses_transient_process(candidate_workload)
-        )
+        released_slots = self._worker_reserved_process_slots(candidate)
         reserved_after_retirement = max(
             0, self._reserved_process_slots() - released_slots
         )
@@ -687,9 +721,32 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 )
         return unlocked_duration, -reuse_value, released_slots
 
+    def _replacement_controller(self) -> object | None:
+        config = getattr(self, "config", None)
+        pluginmanager = getattr(config, "pluginmanager", None)
+        if pluginmanager is None:
+            return None
+        controller = pluginmanager.getplugin("dsession")
+        return (
+            controller if callable(getattr(controller, "_clone_node", None)) else None
+        )
+
+    def _start_replacement(self, node: WorkerController) -> bool:
+        """Keep intentional resource rotation from consuming the worker pool."""
+        controller = self._replacement_controller()
+        if controller is None:
+            return False
+        # xdist exposes worker replacement only through DSession. This is the
+        # same path it uses for crashed workers, without charging the crash
+        # restart budget or reporting an intentional teardown as a failure.
+        replacement = controller._clone_node(node)  # type: ignore[attr-defined]
+        self.__dict__.setdefault("_starting_replacements", set()).add(replacement)
+        return True
+
     def _retire_best_resource_worker(self) -> bool:
         """Retire one drainable resource worker while preserving a successor."""
         live_nodes = [node for node in self.nodes if not node.shutting_down]
+        can_replace = self._replacement_controller() is not None
         candidates = [
             node
             for node in live_nodes
@@ -698,11 +755,16 @@ class IsolationAwareScheduling(LoadGroupScheduling):
                 self._persistent_processes.get(node)
                 or self._workload_uses_process(self.assigned_work[node])
             )
-            and any(successor is not node for successor in live_nodes)
+            and (can_replace or any(successor is not node for successor in live_nodes))
         ]
         if not candidates:
             return False
         candidate = max(candidates, key=self._retirement_score)
+        replacement_started = self._start_replacement(candidate)
+        if not replacement_started and not any(
+            successor is not candidate for successor in live_nodes
+        ):
+            return False
         self._retiring_nodes.add(candidate)
         candidate.shutdown()
         return True
@@ -712,6 +774,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         node: WorkerController,
     ) -> bool:
         """Return whether a future worker event can reopen scheduling capacity."""
+        if getattr(self, "_starting_replacements", set()):
+            return True
         if any(
             candidate.shutting_down for candidate in self.nodes if candidate is not node
         ):
@@ -747,8 +811,11 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for scope, work_unit in self.workqueue.items()
             if any(not complete for complete in work_unit.values())
             and not self._defer_new_persistent_process(node, scope)
-            and reserved_process_slots + self._additional_process_slots(node, scope)
-            <= self.process_slots
+            and (
+                reserved_process_slots + self._additional_process_slots(node, scope)
+                <= self.process_slots
+                or self._transient_handoff_fits(node, scope, reserved_process_slots)
+            )
         ]
         if not eligible:
             return None
@@ -768,6 +835,9 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         scope = self._next_eligible_scope(node)
         if scope is None:
             return
+        transient_handoff = self._transient_handoff_fits(
+            node, scope, self._reserved_process_slots()
+        )
         work_unit = self.workqueue.pop(scope)
         self.assigned_work.setdefault(node, {})[scope] = work_unit
         worker_collection = self.registered_collections[node]
@@ -783,6 +853,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._persistent_processes.setdefault(node, set()).update(
                 persistent_processes
             )
+        if transient_handoff:
+            self.__dict__.setdefault("_transient_handoffs", set()).add(node)
 
     def _reschedule(self, node: WorkerController) -> None:
         if node.shutting_down:
@@ -844,6 +916,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         nodeid = self.registered_collections[node][item_index]
         scope = self._split_scope(nodeid)
         self.assigned_work[node][scope][nodeid] = True
+        if not self._workload_uses_transient_process(self.assigned_work[node]):
+            getattr(self, "_transient_handoffs", set()).discard(node)
         # Reconsider every idle worker whenever a resource slot is released.
         for candidate in self.nodes:
             self._reschedule(candidate)
@@ -853,6 +927,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         exitstatus = workeroutput.get("exitstatus") if workeroutput else None
         retired_cleanly = node in self._retiring_nodes and exitstatus in {0, 1}
         self._retiring_nodes.discard(node)
+        getattr(self, "_starting_replacements", set()).discard(node)
+        getattr(self, "_transient_handoffs", set()).discard(node)
         self._persistent_processes.pop(node, None)
 
         if retired_cleanly:
@@ -880,6 +956,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
 
 _duration_history: DurationHistory | None = None
+_duration_report_totals: dict[str, float] = {}
+_executed_duration_nodeids: set[str] = set()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -901,12 +979,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _duration_history
+    global _duration_history, _duration_report_totals, _executed_duration_nodeids
     slots = int(config.getoption("e2e_process_slots"))
     if slots < 1:
         raise pytest.UsageError("--e2e-process-slots must be a positive integer")
     if not hasattr(config, "workerinput"):
         _duration_history = DurationHistory(Path(config.getoption("e2e_duration_file")))
+        _duration_report_totals = {}
+        _executed_duration_nodeids = set()
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -926,12 +1006,34 @@ def pytest_xdist_make_scheduler(
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if _duration_history is None:
+        return
+    nodeid = normalize_nodeid(report.nodeid)
+    duration = max(0.0, float(report.duration))
+    if math.isfinite(duration):
+        _duration_report_totals[nodeid] = (
+            _duration_report_totals.get(nodeid, 0.0) + duration
+        )
+    if report.when == "call" and (
+        not report.skipped or getattr(report, "wasxfail", None) is not None
+    ):
+        _executed_duration_nodeids.add(nodeid)
+
+
+def _flush_duration_reports() -> None:
     if _duration_history is not None:
-        _duration_history.observe(report.nodeid, report.duration)
+        for nodeid in _executed_duration_nodeids:
+            _duration_history.observe(nodeid, _duration_report_totals.get(nodeid, 0.0))
+    _duration_report_totals.clear()
+    _executed_duration_nodeids.clear()
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
     if _duration_history is not None:
+        # Setup and teardown are material E2E costs, but only retain their total
+        # when the test reached a real call phase. Environment-dependent skips
+        # and setup failures must not train expensive full-CI tests toward zero.
+        _flush_duration_reports()
         error = _duration_history.save()
         if error is not None:
             terminal_reporter = session.config.pluginmanager.get_plugin(

@@ -20,8 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import e2e_scheduler as e2e_scheduler_module
 import pytest
-
 from e2e_scheduler import (
     MIXED_PROCESS_GROUP_PREFIX,
     PERSISTENT_PROCESS_GROUP_PREFIX,
@@ -589,6 +589,41 @@ def test_duration_history_merges_observations_from_stale_writers(
     }
 
 
+def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = DurationHistory(tmp_path / "durations.json")
+    monkeypatch.setattr(e2e_scheduler_module, "_duration_history", history)
+    monkeypatch.setattr(e2e_scheduler_module, "_duration_report_totals", {})
+    monkeypatch.setattr(e2e_scheduler_module, "_executed_duration_nodeids", set())
+
+    for when, duration in (("setup", 2.0), ("call", 0.1), ("teardown", 0.2)):
+        e2e_scheduler_module.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="test_optional.py::test_skipped@group",
+                duration=duration,
+                when=when,
+                skipped=when == "call",
+            )
+        )
+    for when, duration in (("setup", 3.0), ("call", 4.0), ("teardown", 1.0)):
+        e2e_scheduler_module.pytest_runtest_logreport(
+            SimpleNamespace(
+                nodeid="test_real.py::test_executed@group",
+                duration=duration,
+                when=when,
+                skipped=False,
+            )
+        )
+
+    e2e_scheduler_module._flush_duration_reports()
+
+    assert history.observed == {"test_real.py::test_executed": 8.0}
+    assert e2e_scheduler_module._duration_report_totals == {}
+    assert e2e_scheduler_module._executed_duration_nodeids == set()
+
+
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(
     tmp_path: Path,
 ) -> None:
@@ -829,6 +864,89 @@ def test_transient_process_capacity_is_released_after_completion(
     assert scheduler._next_eligible_scope(other_node) == next_scope
 
 
+def test_final_transient_test_hands_its_slot_to_persistent_runway(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    worker = FakeWorker()
+    transient_scope = f"{PROCESS_GROUP_PREFIX}test--transient"
+    persistent_scope = (
+        f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--next"
+    )
+    transient_nodeid = f"test_transient.py::test_current@{transient_scope}"
+    persistent_nodeid = f"test_serverless.py::test_next@{persistent_scope}"
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {}
+    scheduler.assigned_work = {
+        worker: {transient_scope: {transient_nodeid: False}},
+    }
+    scheduler.workqueue = OrderedDict({persistent_scope: {persistent_nodeid: False}})
+    scheduler.registered_collections = {worker: [transient_nodeid, persistent_nodeid]}
+
+    scheduler._reschedule(worker)
+
+    assert worker.sent == [[1]]
+    assert not worker.shutting_down
+    assert scheduler._persistent_processes[worker] == {"serverless_runtime"}
+    assert worker in scheduler._transient_handoffs
+    assert scheduler._reserved_process_slots() == 1
+
+    scheduler.mark_test_complete(worker, 0)
+
+    assert worker not in scheduler._transient_handoffs
+    assert scheduler._reserved_process_slots() == 1
+
+
+def test_last_resource_worker_starts_replacement_before_retirement(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    replacement = FakeWorker()
+    cloned: list[FakeWorker] = []
+
+    def clone_node(node: FakeWorker) -> FakeWorker:
+        assert node is owner
+        cloned.append(replacement)
+        return replacement
+
+    controller = SimpleNamespace(_clone_node=clone_node)
+    scheduler.config = SimpleNamespace(
+        pluginmanager=SimpleNamespace(
+            getplugin=lambda name: controller if name == "dsession" else None
+        )
+    )
+    owner_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--owner"
+    queued_scope = f"{PROCESS_GROUP_PREFIX}test--queued"
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {owner_scope: {"test_owner.py::test_current": False}},
+    }
+    scheduler.workqueue = OrderedDict(
+        {queued_scope: {"test_transient.py::test_queued": False}}
+    )
+
+    scheduler._reschedule(owner)
+
+    assert cloned == [replacement]
+    assert replacement in scheduler._starting_replacements
+    assert owner in scheduler._retiring_nodes
+    assert owner.shutting_down
+
+    scheduler.add_node(replacement)
+    assert replacement not in scheduler._starting_replacements
+    assert replacement in scheduler.assigned_work
+
+
 def test_idle_worker_waits_while_session_owner_rotates_to_release_slot(
     tmp_path: Path,
 ) -> None:
@@ -905,7 +1023,7 @@ def test_process_runway_preserves_last_successor_for_queued_work(
     second = FakeWorker()
     first_scope = f"{PROCESS_GROUP_PREFIX}test--first"
     second_scope = f"{PROCESS_GROUP_PREFIX}test--second"
-    queued_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}new_runtime--module--queued"
+    queued_scope = f"{MIXED_PROCESS_GROUP_PREFIX}new_runtime--module--queued"
     scheduler._retiring_nodes = set()
     scheduler._persistent_processes = {}
     scheduler.assigned_work = {
