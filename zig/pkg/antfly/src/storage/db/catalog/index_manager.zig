@@ -1782,6 +1782,17 @@ pub const IndexManager = struct {
             self.observeWorkingBytes();
         }
 
+        /// A runtime write transaction consumes its read buffers even when
+        /// commit fails. Compensation may still need the vector loader, so
+        /// detach the invalid override and discard every borrowed raw value
+        /// before rollback opens a fresh committed probe.
+        fn detachTxnOverrideAfterCommitFailure(self: *@This()) void {
+            self.txn_override = null;
+            self.clearRawCacheKeys();
+            self.raw_read_value_bytes = 0;
+            self.observeWorkingBytes();
+        }
+
         fn recycleRawReadStateIfNeeded(self: *@This()) void {
             if (!self.recycle_raw_reads) return;
             if (self.raw_cache_key_bytes +| self.raw_read_value_bytes >= self.rawReadLimitBytes()) {
@@ -14721,6 +14732,9 @@ pub const IndexManager = struct {
             return err;
         };
         batch.commit() catch |err| {
+            if (active_dense_vector_load_session) |session| {
+                session.detachTxnOverrideAfterCommitFailure();
+            }
             self.rollbackPendingDenseVectors(entry, pending);
             return err;
         };

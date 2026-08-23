@@ -135,6 +135,7 @@ fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle), all
 fn releaseHeldValues(held_values: *std.ArrayListUnmanaged([]u8), allocator: Allocator) void {
     for (held_values.items) |value| allocator.free(value);
     held_values.deinit(allocator);
+    held_values.* = .empty;
 }
 
 fn recordCursorValueBorrow(backend: anytype) void {
@@ -3687,6 +3688,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.closed) return error.TransactionClosed;
             var bulk_idx = self.bulk_appends.entries.items.len;
             while (bulk_idx > 0) {
                 bulk_idx -= 1;
@@ -3711,6 +3713,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             if (keys.len != values.len) return error.InvalidBatch;
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
@@ -3827,12 +3830,14 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
@@ -3844,12 +3849,14 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
+            if (self.closed) return error.TransactionClosed;
             try self.ensureCursorSnapshot();
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
             return try LocalCursor.init(cursor_alloc, self.backend, &self.cursor_overlay.?, self.cursor_immutable_memtables, self.cursor_runs, self.cursor_l0_groups, self.cursor_levels, self.namespace, false);
@@ -6478,6 +6485,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            if (self.closed) return error.TransactionClosed;
             var bulk_idx = self.bulk_appends.entries.items.len;
             while (bulk_idx > 0) {
                 bulk_idx -= 1;
@@ -6513,6 +6521,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             keys: []const []const u8,
             values: []?[]const u8,
         ) !void {
+            if (self.closed) return error.TransactionClosed;
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
 
@@ -6561,12 +6570,14 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
@@ -6578,12 +6589,14 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
+            if (self.closed) return error.TransactionClosed;
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, "", true);
             self.invalidateCursorSnapshot();
         }
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
+            if (self.closed) return error.TransactionClosed;
             try self.ensureCursorSnapshot();
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
             return try LocalCursor.init(cursor_alloc, self.backend, &self.cursor_overlay.?, self.cursor_immutable_memtables, self.cursor_runs, self.cursor_l0_groups, self.cursor_levels, namespace, false);

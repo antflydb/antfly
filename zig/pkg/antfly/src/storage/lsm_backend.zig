@@ -14185,6 +14185,40 @@ test "lsm backend namespace write batch getManySorted merges overlay and committ
     try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
 }
 
+test "lsm backend closed write transactions reject access after terminal commit failure" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    const namespace = backend_types.Namespace{ .name = "docs" };
+    const keys = [_][]const u8{"doc:a"};
+    var values = [_]?[]const u8{null};
+
+    var bound = try runtime_mod.BoundWriteTxn(Backend).open(&backend, namespace);
+    defer {
+        bound.closed = false;
+        bound.abort();
+    }
+    bound.closed = true;
+    try std.testing.expectError(error.TransactionClosed, bound.get("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.getManySorted(&keys, &values));
+    try std.testing.expectError(error.TransactionClosed, bound.put("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.appendPut("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.delete("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.openCursor());
+
+    var namespaced = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+    defer {
+        namespaced.closed = false;
+        namespaced.abort();
+    }
+    namespaced.closed = true;
+    try std.testing.expectError(error.TransactionClosed, namespaced.get(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.getManySorted(namespace, &keys, &values));
+    try std.testing.expectError(error.TransactionClosed, namespaced.put(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.appendPut(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.delete(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.openCursor(namespace));
+}
+
 test "lsm backend bound read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();
