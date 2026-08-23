@@ -5336,7 +5336,18 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     if (!generated_text_enabled) return;
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
+    completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr) catch |err| {
+        if (!isDocumentWideOcrFailure(err)) return err;
+        try markPendingGeneratedUnitTextFailures(
+            alloc,
+            extraction.units,
+            "pending_ocr",
+            "ocr_text",
+            .ocr,
+            "render_resource",
+            err,
+        );
+    };
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
 }
 
@@ -5571,7 +5582,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
                 const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
-                    if (shouldYieldRequestError(runtime, err)) return err;
+                    if (!isOcrPageRenderFailure(err) and shouldYieldRequestError(runtime, err)) return err;
                     try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
                     try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
                     continue;
@@ -5972,6 +5983,45 @@ fn applyRuntimeGeneratedUnitText(
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn isDocumentWideOcrFailure(err: anyerror) bool {
+    return switch (err) {
+        error.DocumentExtractionWorkingSetTooLarge,
+        error.PdfDecodeWorkingSetTooLarge,
+        error.DecodedStreamTooLarge,
+        => true,
+        else => false,
+    };
+}
+
+fn isOcrPageRenderFailure(err: anyerror) bool {
+    return switch (err) {
+        error.RenderedPageTooLarge,
+        error.MissingCcittEol,
+        error.JpegDecodeFailed,
+        error.UnsupportedPdfRendering,
+        error.InvalidPageBox,
+        => true,
+        else => false,
+    };
+}
+
+fn markPendingGeneratedUnitTextFailures(
+    alloc: Allocator,
+    units: []document_extraction_mod.Unit,
+    pending_status: []const u8,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    stage: []const u8,
+    err: anyerror,
+) !void {
+    for (units) |*unit| {
+        const status = unit.extraction_status orelse continue;
+        if (!std.mem.eql(u8, status, pending_status)) continue;
+        try setRuntimeGeneratedUnitFailureStage(alloc, unit, kind, stage);
+        try markRuntimeGeneratedUnitTextFailure(alloc, unit, method, kind, err);
+    }
 }
 
 fn markRuntimeGeneratedUnitTextFailure(
@@ -13098,6 +13148,64 @@ test "synchronous document extraction OCR batches honor request execution item c
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "document-wide OCR resource failure preserves units and marks pending pages" {
+    const alloc = std.testing.allocator;
+    var units = [_]document_extraction_mod.Unit{
+        .{
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+            .unit_type = try alloc.dupe(u8, "page"),
+            .text = try alloc.dupe(u8, "retained native text"),
+            .method = try alloc.dupe(u8, "pdf_ocr_pending"),
+            .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+            .page_number = 1,
+        },
+        .{
+            .unit_id = try alloc.dupe(u8, "image:000002"),
+            .unit_type = try alloc.dupe(u8, "image"),
+            .text = try alloc.dupe(u8, "pending image"),
+            .method = try alloc.dupe(u8, "pdf_ocr_pending"),
+            .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+            .page_number = 2,
+        },
+        .{
+            .unit_id = try alloc.dupe(u8, "page:000003"),
+            .unit_type = try alloc.dupe(u8, "page"),
+            .text = try alloc.dupe(u8, "already complete"),
+            .method = try alloc.dupe(u8, "pdf_text"),
+            .extraction_status = try alloc.dupe(u8, "completed_embedded_preferred"),
+            .page_number = 3,
+        },
+    };
+    defer for (&units) |*unit| unit.deinit(alloc);
+
+    try markPendingGeneratedUnitTextFailures(
+        alloc,
+        &units,
+        "pending_ocr",
+        "ocr_text",
+        .ocr,
+        "render_resource",
+        error.DocumentExtractionWorkingSetTooLarge,
+    );
+
+    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+    try std.testing.expectEqualStrings("pdf_text", units[0].method);
+    try std.testing.expectEqualStrings("retained native text", units[0].text);
+    try std.testing.expectEqualStrings("render_resource", units[0].ocr_failure_stage.?);
+    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "DocumentExtractionWorkingSetTooLarge") != null);
+    try std.testing.expectEqualStrings("failed_ocr", units[1].extraction_status.?);
+    try std.testing.expectEqualStrings("", units[1].text);
+    try std.testing.expectEqualStrings("completed_embedded_preferred", units[2].extraction_status.?);
+    try std.testing.expectEqualStrings("already complete", units[2].text);
+
+    try std.testing.expect(isDocumentWideOcrFailure(error.DocumentExtractionWorkingSetTooLarge));
+    try std.testing.expect(!isDocumentWideOcrFailure(error.OutOfMemory));
+    try std.testing.expect(isOcrPageRenderFailure(error.RenderedPageTooLarge));
+    try std.testing.expect(isOcrPageRenderFailure(error.MissingCcittEol));
+    try std.testing.expect(isOcrPageRenderFailure(error.JpegDecodeFailed));
+    try std.testing.expect(!isOcrPageRenderFailure(error.OutOfMemory));
 }
 
 test "document extraction rejects and records Florence prompt echoes" {

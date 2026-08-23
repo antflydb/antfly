@@ -4507,6 +4507,7 @@ pub fn build(b: *std.Build) void {
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
+            "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
             "generated text provider config is validated while parsing extraction config",
             "public enrichment validation rejects invalid execution and producer config",
