@@ -132,4 +132,31 @@ describe("GraphIndexExplorer", () => {
     expect(screen.getByText("12")).toBeTruthy();
     expect(screen.getByTestId("force-graph").textContent).toContain("0 nodes");
   });
+
+  it("keeps same-key path endpoints distinct across tables", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={{
+          kind: "nodes",
+          nodes: [],
+          paths: [
+            {
+              nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
+              edges: [{ source: "shared", target: "shared", type: "mentions", weight: 1 }],
+              total_weight: 1,
+              length: 1,
+            },
+          ],
+          stats: { returned_items: 1, truncated: false },
+          took: 1,
+        }}
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("2 nodes / 1 edges");
+  });
 });

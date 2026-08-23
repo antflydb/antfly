@@ -132,7 +132,11 @@ const shortestPathResult: GraphQueryResult = {
   nodes: [],
   paths: [
     {
-      nodes: ["paper:graph-rag", "paper:agent-memory", "paper:entity-links"],
+      nodes: [
+        { key: "paper:graph-rag" },
+        { key: "paper:agent-memory" },
+        { key: "paper:entity-links" },
+      ],
       edges: [
         { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
         {
@@ -143,6 +147,7 @@ const shortestPathResult: GraphQueryResult = {
         },
       ],
       total_weight: 0.63,
+      length: 2,
     },
   ],
   stats: { returned_items: 1, truncated: false },

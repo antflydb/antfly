@@ -27,15 +27,17 @@ const legacy_header_len = 4 + 2 + 4;
 const header_len = 4 + 2 + 4 + 4;
 const no_neighbor_table = std.math.maxInt(u32);
 
-fn edgeEncodedSize(edge: graph_types.Edge) !usize {
+fn edgeEncodedSize(edge: graph_types.Edge, version: u16) !usize {
     _ = std.math.cast(u32, edge.neighbor_id.len) orelse return error.GraphSegmentTooLarge;
     _ = std.math.cast(u32, edge.edge_type.len) orelse return error.GraphSegmentTooLarge;
-    var size: usize = 16;
+    if (version == legacy_wire_version and edge.neighbor_table_id != null) return error.InvalidGraphSegment;
+    var size: usize = if (version == wire_version) 16 else 12;
     size = std.math.add(usize, size, edge.neighbor_id.len) catch return error.GraphSegmentTooLarge;
     return std.math.add(usize, size, edge.edge_type.len) catch error.GraphSegmentTooLarge;
 }
 
 pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
+    const version = encodingVersion(segment);
     const size = try encodedSize(segment);
 
     const buf = try alloc.alloc(u8, size);
@@ -44,18 +46,22 @@ pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
     var pos: usize = 0;
     @memcpy(buf[pos..][0..4], wire_magic);
     pos += 4;
-    std.mem.writeInt(u16, buf[pos..][0..2], wire_version, .little);
+    std.mem.writeInt(u16, buf[pos..][0..2], version, .little);
     pos += 2;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(segment.neighbor_tables.len), .little);
-    pos += 4;
+    if (version == wire_version) {
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(segment.neighbor_tables.len), .little);
+        pos += 4;
+    }
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(segment.adjacencies.len), .little);
     pos += 4;
 
-    for (segment.neighbor_tables) |table| {
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(table.len), .little);
-        pos += 4;
-        @memcpy(buf[pos..][0..table.len], table);
-        pos += table.len;
+    if (version == wire_version) {
+        for (segment.neighbor_tables) |table| {
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(table.len), .little);
+            pos += 4;
+            @memcpy(buf[pos..][0..table.len], table);
+            pos += table.len;
+        }
     }
 
     for (segment.adjacencies) |adjacency| {
@@ -67,8 +73,8 @@ pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
         pos += 4;
         @memcpy(buf[pos..][0..adjacency.node_id.len], adjacency.node_id);
         pos += adjacency.node_id.len;
-        for (adjacency.out_edges) |edge| pos += encodeEdge(buf[pos..], edge);
-        for (adjacency.in_edges) |edge| pos += encodeEdge(buf[pos..], edge);
+        for (adjacency.out_edges) |edge| pos += encodeEdge(buf[pos..], edge, version);
+        for (adjacency.in_edges) |edge| pos += encodeEdge(buf[pos..], edge, version);
     }
 
     std.debug.assert(pos == buf.len);
@@ -76,13 +82,16 @@ pub fn encodeAlloc(alloc: Allocator, segment: graph_types.Segment) ![]u8 {
 }
 
 pub fn encodedSize(segment: graph_types.Segment) !usize {
+    const version = encodingVersion(segment);
     _ = std.math.cast(u32, segment.neighbor_tables.len) orelse return error.GraphSegmentTooLarge;
     _ = std.math.cast(u32, segment.adjacencies.len) orelse return error.GraphSegmentTooLarge;
-    var size: usize = header_len;
-    for (segment.neighbor_tables) |table| {
-        _ = std.math.cast(u32, table.len) orelse return error.GraphSegmentTooLarge;
-        size = std.math.add(usize, size, 4) catch return error.GraphSegmentTooLarge;
-        size = std.math.add(usize, size, table.len) catch return error.GraphSegmentTooLarge;
+    var size: usize = if (version == wire_version) header_len else legacy_header_len;
+    if (version == wire_version) {
+        for (segment.neighbor_tables) |table| {
+            _ = std.math.cast(u32, table.len) orelse return error.GraphSegmentTooLarge;
+            size = std.math.add(usize, size, 4) catch return error.GraphSegmentTooLarge;
+            size = std.math.add(usize, size, table.len) catch return error.GraphSegmentTooLarge;
+        }
     }
     for (segment.adjacencies) |adjacency| {
         _ = std.math.cast(u32, adjacency.node_id.len) orelse return error.GraphSegmentTooLarge;
@@ -92,14 +101,18 @@ pub fn encodedSize(segment: graph_types.Segment) !usize {
         size = std.math.add(usize, size, adjacency.node_id.len) catch return error.GraphSegmentTooLarge;
         for (adjacency.out_edges) |edge| {
             if (edge.neighbor_table_id) |id| if (id >= segment.neighbor_tables.len) return error.InvalidGraphSegment;
-            size = std.math.add(usize, size, try edgeEncodedSize(edge)) catch return error.GraphSegmentTooLarge;
+            size = std.math.add(usize, size, try edgeEncodedSize(edge, version)) catch return error.GraphSegmentTooLarge;
         }
         for (adjacency.in_edges) |edge| {
             if (edge.neighbor_table_id) |id| if (id >= segment.neighbor_tables.len) return error.InvalidGraphSegment;
-            size = std.math.add(usize, size, try edgeEncodedSize(edge)) catch return error.GraphSegmentTooLarge;
+            size = std.math.add(usize, size, try edgeEncodedSize(edge, version)) catch return error.GraphSegmentTooLarge;
         }
     }
     return size;
+}
+
+fn encodingVersion(segment: graph_types.Segment) u16 {
+    return if (segment.neighbor_tables.len == 0) legacy_wire_version else wire_version;
 }
 
 test "lake graph segment codec rejects forged adjacency counts before allocation" {
@@ -219,7 +232,7 @@ fn decodeNeighborTablesAlloc(
     return tables;
 }
 
-fn encodeEdge(buf: []u8, edge: graph_types.Edge) usize {
+fn encodeEdge(buf: []u8, edge: graph_types.Edge, version: u16) usize {
     var pos: usize = 0;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(edge.neighbor_id.len), .little);
     pos += 4;
@@ -227,8 +240,10 @@ fn encodeEdge(buf: []u8, edge: graph_types.Edge) usize {
     pos += 4;
     std.mem.writeInt(u32, buf[pos..][0..4], @bitCast(edge.weight), .little);
     pos += 4;
-    std.mem.writeInt(u32, buf[pos..][0..4], edge.neighbor_table_id orelse no_neighbor_table, .little);
-    pos += 4;
+    if (version == wire_version) {
+        std.mem.writeInt(u32, buf[pos..][0..4], edge.neighbor_table_id orelse no_neighbor_table, .little);
+        pos += 4;
+    }
     @memcpy(buf[pos..][0..edge.neighbor_id.len], edge.neighbor_id);
     pos += edge.neighbor_id.len;
     @memcpy(buf[pos..][0..edge.edge_type.len], edge.edge_type);
@@ -322,6 +337,7 @@ test "serverless graph segment codec round-trips" {
 
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
+    try std.testing.expectEqual(wire_version, std.mem.readInt(u16, encoded[4..6], .little));
     var decoded = try decodeAlloc(alloc, encoded);
     defer graph_types.freeSegment(alloc, &decoded);
 
@@ -330,6 +346,32 @@ test "serverless graph segment codec round-trips" {
     try std.testing.expectEqualStrings("doc-b", decoded.adjacencies[0].out_edges[0].neighbor_id);
     try std.testing.expectEqualStrings("cites", decoded.adjacencies[1].in_edges[0].edge_type);
     try std.testing.expectEqualStrings("entities", decoded.neighborTable(decoded.adjacencies[0].out_edges[0]).?);
+}
+
+test "serverless graph segment codec keeps local artifacts on v1" {
+    const alloc = std.testing.allocator;
+    var segment = graph_types.Segment{
+        .adjacencies = try alloc.alloc(graph_types.Adjacency, 1),
+    };
+    defer graph_types.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "doc-a"),
+        .out_edges = try alloc.alloc(graph_types.Edge, 1),
+        .in_edges = try alloc.alloc(graph_types.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "doc-b"),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 1,
+    };
+
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(legacy_wire_version, std.mem.readInt(u16, encoded[4..6], .little));
+
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer graph_types.freeSegment(alloc, &decoded);
+    try std.testing.expectEqualStrings("doc-b", decoded.adjacencies[0].out_edges[0].neighbor_id);
 }
 
 test "serverless graph segment codec decodes legacy v1 artifacts" {

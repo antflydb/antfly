@@ -41,6 +41,7 @@ type GraphMode = "neighbors" | "traverse" | "shortest_path";
 
 type ExplorerNodeMeta = {
   key: string;
+  table?: string;
   depth?: number;
   distance?: number;
   document?: Record<string, unknown>;
@@ -59,7 +60,10 @@ type GraphVisualizationWireResult = {
   kind?: "nodes" | "legacy";
   type?: string;
   nodes?: Extract<GraphQueryResult, { kind: "nodes" }>["nodes"];
-  paths?: Extract<GraphQueryResult, { kind: "nodes" }>["paths"];
+  paths?: {
+    nodes?: (string | { key: string; table?: string })[];
+    edges?: Partial<Edge>[];
+  }[];
   stats?: { returned_items: number };
   total?: number;
 };
@@ -110,6 +114,14 @@ function documentLabel(key: string, document?: Record<string, unknown>) {
   return displayKey(key);
 }
 
+function qualifiedDocumentLabel(
+  identity: { key: string; table?: string },
+  document?: Record<string, unknown>
+) {
+  const label = documentLabel(identity.key, document);
+  return identity.table ? displayKey(`${identity.table}/${label}`) : label;
+}
+
 function formatNumber(value: number | undefined, fallback = "-") {
   if (value === undefined || Number.isNaN(value)) return fallback;
   return Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(value);
@@ -130,15 +142,19 @@ function controlId(prefix: string, value: string) {
 function normalizeEdge(
   edge: Partial<Edge>,
   fallbackIndex: number,
-  pathEdge = false
+  pathEdge = false,
+  sourceIdentity?: { key: string; table?: string },
+  targetIdentity?: { key: string; table?: string }
 ): ExplorerEdge | null {
   const source = edge.source;
   const target = edge.target;
   if (!source || !target) return null;
+  const sourceId = graphNodeId(sourceIdentity ?? { key: source });
+  const targetId = graphNodeId(targetIdentity ?? { key: target });
   return {
-    id: `${source}->${target}:${edge.type ?? "edge"}:${fallbackIndex}`,
-    source,
-    target,
+    id: `${sourceId}->${targetId}:${edge.type ?? "edge"}:${fallbackIndex}`,
+    source: sourceId,
+    target: targetId,
     weight: edge.weight ?? 1,
     type: edge.type,
     metadata: edge.metadata,
@@ -146,16 +162,29 @@ function normalizeEdge(
   };
 }
 
+function graphNodeId(identity: { key: string; table?: string }) {
+  // A JSON tuple is unambiguous even when user-controlled names contain the
+  // separator characters commonly used by ad-hoc composite keys.
+  return JSON.stringify([identity.table ?? null, identity.key]);
+}
+
+function edgeTargetTable(edge: Partial<Edge>) {
+  const table = edge.metadata?.target_table;
+  return typeof table === "string" && table.length > 0 ? table : undefined;
+}
+
 function addNode(
   nodes: Map<string, GraphNode<ExplorerNodeMeta>>,
-  key: string,
+  identity: string | { key: string; table?: string },
   patch?: Partial<ExplorerNodeMeta>
 ) {
-  const existing = nodes.get(key);
-  const metadata = { ...(existing?.metadata ?? { key }), key, ...patch };
-  nodes.set(key, {
-    id: key,
-    label: documentLabel(key, metadata.document),
+  const normalized = typeof identity === "string" ? { key: identity } : identity;
+  const id = graphNodeId(normalized);
+  const existing = nodes.get(id);
+  const metadata = { ...(existing?.metadata ?? normalized), ...normalized, ...patch };
+  nodes.set(id, {
+    id,
+    label: qualifiedDocumentLabel(normalized, metadata.document),
     type: metadata.depth === 0 ? "start" : "document",
     metric: metadata.resultCount ?? (metadata.depth !== undefined ? 1 / (metadata.depth + 1) : 1),
     metadata,
@@ -193,7 +222,8 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
 
   for (const node of graphResult?.nodes ?? []) {
     if (!node.key) continue;
-    addNode(nodes, node.key, {
+    const nodeIdentity = { key: node.key, table: node.table };
+    addNode(nodes, nodeIdentity, {
       depth: node.depth,
       distance: node.distance,
       document: node.document as Record<string, unknown> | undefined,
@@ -202,40 +232,82 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
     });
 
     for (const edge of node.path_edges ?? []) {
-      const normalized = normalizeEdge(edge, edges.size, true);
+      const normalized = normalizeEdge(
+        edge,
+        edges.size,
+        true,
+        edge.source === node.key ? nodeIdentity : undefined,
+        edge.target === node.key
+          ? nodeIdentity
+          : edge.target
+            ? { key: edge.target, table: edgeTargetTable(edge) }
+            : undefined
+      );
       if (normalized) {
         edges.set(normalized.id, normalized);
-        addNode(nodes, normalized.source);
-        addNode(nodes, normalized.target);
+        if (!nodes.has(normalized.source)) addNode(nodes, edge.source ?? "");
+        if (!nodes.has(normalized.target)) {
+          addNode(nodes, { key: edge.target ?? "", table: edgeTargetTable(edge) });
+        }
       }
     }
 
     for (const edge of node.edges ?? []) {
-      const normalized = normalizeEdge(edge, edges.size);
+      const normalized = normalizeEdge(
+        edge,
+        edges.size,
+        false,
+        edge.source === node.key ? nodeIdentity : undefined,
+        edge.target === node.key
+          ? nodeIdentity
+          : edge.target
+            ? { key: edge.target, table: edgeTargetTable(edge) }
+            : undefined
+      );
       if (normalized) {
         edges.set(normalized.id, normalized);
-        addNode(nodes, normalized.source);
-        addNode(nodes, normalized.target);
+        if (!nodes.has(normalized.source)) addNode(nodes, edge.source ?? "");
+        if (!nodes.has(normalized.target)) {
+          addNode(nodes, { key: edge.target ?? "", table: edgeTargetTable(edge) });
+        }
       }
     }
   }
 
   for (const path of graphResult?.paths ?? []) {
-    for (const key of path.nodes ?? []) addNode(nodes, key, { resultCount: 1 });
-    for (const edge of path.edges ?? []) {
+    const pathNodes = (path.nodes ?? []).map((node) =>
+      typeof node === "string" ? { key: node } : node
+    );
+    for (const identity of pathNodes) addNode(nodes, identity, { resultCount: 1 });
+    for (const [edgeIndex, edge] of (path.edges ?? []).entries()) {
       if (!edge.source || !edge.target) continue;
-      const normalized: ExplorerEdge = {
-        id: `${edge.source}->${edge.target}:${edge.type ?? "path"}:${edges.size}`,
-        source: edge.source,
-        target: edge.target,
-        weight: edge.weight ?? 1,
-        type: edge.type,
-        metadata: edge.metadata,
-        pathEdge: true,
-      };
+      const adjacent = pathNodes.slice(edgeIndex, edgeIndex + 2);
+      const followsPathOrder = adjacent[0]?.key === edge.source && adjacent[1]?.key === edge.target;
+      const reversesPathOrder =
+        adjacent[1]?.key === edge.source && adjacent[0]?.key === edge.target;
+      const sourceIdentity = followsPathOrder
+        ? adjacent[0]
+        : reversesPathOrder
+          ? adjacent[1]
+          : adjacent.find((identity) => identity.key === edge.source);
+      const targetIdentity = followsPathOrder
+        ? adjacent[1]
+        : reversesPathOrder
+          ? adjacent[0]
+          : adjacent.find((identity) => identity.key === edge.target);
+      const normalized = normalizeEdge(
+        edge,
+        edges.size,
+        true,
+        sourceIdentity,
+        targetIdentity ?? { key: edge.target, table: edgeTargetTable(edge) }
+      );
+      if (!normalized) continue;
       edges.set(normalized.id, normalized);
-      addNode(nodes, normalized.source);
-      addNode(nodes, normalized.target);
+      if (!nodes.has(normalized.source)) addNode(nodes, sourceIdentity ?? edge.source);
+      if (!nodes.has(normalized.target)) {
+        addNode(nodes, targetIdentity ?? { key: edge.target, table: edgeTargetTable(edge) });
+      }
     }
   }
 
