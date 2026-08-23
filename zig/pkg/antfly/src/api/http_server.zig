@@ -685,6 +685,25 @@ pub const RequestLifecycleHook = struct {
     }
 };
 
+/// Public query response assembly boundary. This is separate from the generic
+/// ingress lifecycle because DataServer uses it to expose completed query
+/// work only after storage/read leases have been released. Implementations may
+/// suspend, so callers must reach it only while owning the response bytes.
+pub const QueryResultLifecycleEvent = struct {
+    operation_id: []const u8,
+    table_name: []const u8,
+    response_bytes: usize,
+};
+
+pub const QueryResultLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: QueryResultLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: QueryResultLifecycleHook, event: QueryResultLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
 /// Optional request-count admission owner for an embedded inference runtime.
 /// API-only processes omit this and use their local fallback admission gate.
 pub const InferenceRequestAdmissionSource = struct {
@@ -725,6 +744,9 @@ pub const ApiHttpServerConfig = struct {
     /// Optional deterministic suspension/observation seam. The owner must
     /// outlive the API server and every in-flight request.
     request_lifecycle_hook: ?RequestLifecycleHook = null,
+    /// Optional query assembly seam. The owner must outlive the API server and
+    /// every in-flight query.
+    query_result_lifecycle_hook: ?QueryResultLifecycleHook = null,
     /// Explicit in-process transport for the reserved local-inference virtual
     /// connection. The destination route owns admission and no public listener
     /// connection is consumed. Configured connections are always remote.
@@ -2116,6 +2138,20 @@ pub const ApiHttpServer = struct {
     ) !void {
         const hook = self.cfg.request_lifecycle_hook orelse return;
         try hook.reach(.{ .phase = phase, .operation_id = operation_id });
+    }
+
+    fn reachQueryResultLifecycle(
+        self: *ApiHttpServer,
+        operation_id: []const u8,
+        table_name: []const u8,
+        response_bytes: usize,
+    ) !void {
+        const hook = self.cfg.query_result_lifecycle_hook orelse return;
+        try hook.reach(.{
+            .operation_id = operation_id,
+            .table_name = table_name,
+            .response_bytes = response_bytes,
+        });
     }
 
     pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
@@ -11429,6 +11465,8 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        errdefer self.alloc.free(response_body);
+        try self.reachQueryResultLifecycle("public.table.query", table_name, response_body.len);
         return contextual_operations.json(response_body, false);
     }
 
@@ -11497,6 +11535,11 @@ pub const ApiHttpServer = struct {
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
+            try self.reachQueryResultLifecycle(
+                if (route_table_name == null) "public.global.multi_query" else "public.table.multi_query",
+                table_name,
+                response_body.len,
+            );
 
             var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
                 .allocate = .alloc_always,
@@ -28466,6 +28509,74 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings(case.body, multi_resp.body);
         }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
+    }
+}
+
+test "api http server exposes operation-specific query result assembly" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":[]}]}") };
+        }
+    };
+    const Observer = struct {
+        events: [2]QueryResultLifecycleEvent = undefined,
+        count: usize = 0,
+
+        fn hook(self: *@This()) QueryResultLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reach };
+        }
+
+        fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    };
+
+    var reads = FakeReads{};
+    var observer = Observer{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_result_lifecycle_hook = observer.hook(),
+    }, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var single = try server.handlePublicTableQuery("docs", "{\"query\":{\"match_all\":{}}}", null);
+    defer single.deinit(alloc);
+    var multi = try server.handlePublicTableMultiQuery("docs", "{\"query\":{\"match_all\":{}}}\n", null);
+    defer multi.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), observer.count);
+    try std.testing.expectEqualStrings("public.table.query", observer.events[0].operation_id);
+    try std.testing.expectEqualStrings("public.table.multi_query", observer.events[1].operation_id);
+    for (observer.events) |event| {
+        try std.testing.expectEqualStrings("docs", event.table_name);
+        try std.testing.expect(event.response_bytes > 0);
     }
 }
 

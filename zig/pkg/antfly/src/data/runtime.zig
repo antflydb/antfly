@@ -3000,6 +3000,9 @@ pub const DataRequestLifecyclePhase = enum {
     remote_forward_started,
     remote_forward_completed,
     proposal_accepted,
+    /// The production apply watermark proves this proposal crossed the Raft
+    /// persistence boundary. Reached outside Raft locks after the apply wait.
+    proposal_persisted,
     apply_confirmed,
     visibility_confirmed,
     response_ack_ready,
@@ -3010,17 +3013,24 @@ pub const DataRequestLifecyclePhase = enum {
     merge_copy_completed,
     merge_cutover_completed,
     merge_rollback_completed,
+    /// A topology operation has durably transferred serving ownership and
+    /// released its transition-scoped writer leases.
+    writer_handoff_completed,
+    /// Transition runtime/lane cleanup has completed outside writer ownership.
+    transition_cleanup_completed,
     query_result_assembled,
 };
 
 pub const DataRequestLifecycleEvent = struct {
     phase: DataRequestLifecyclePhase,
+    operation_id: []const u8 = "",
     group_id: u64 = 0,
     related_group_id: u64 = 0,
     target_node_id: u64 = 0,
     log_index: u64 = 0,
     transition_id: u64 = 0,
     table_name: []const u8 = "",
+    response_bytes: usize = 0,
 };
 
 pub const DataRequestLifecycleHook = struct {
@@ -4962,6 +4972,11 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (self.data_request_lifecycle_hook != null) {
+            if (api_server_cfg.query_result_lifecycle_hook != null)
+                return error.AmbiguousQueryResultLifecycleOwner;
+            api_server_cfg.query_result_lifecycle_hook = self.apiQueryResultLifecycleHook();
+        }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
         // Runtimes that do not supply engine-owned persistence keep API job
@@ -6969,6 +6984,23 @@ pub const DataServer = struct {
         try hook.reach(event);
     }
 
+    fn apiQueryResultLifecycleHook(self: *DataServer) antfly.public_api.http_server.QueryResultLifecycleHook {
+        return .{ .ptr = self, .reach_fn = reachApiQueryResultLifecycle };
+    }
+
+    fn reachApiQueryResultLifecycle(
+        ptr: *anyopaque,
+        event: antfly.public_api.http_server.QueryResultLifecycleEvent,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.reachDataRequestLifecycle(.{
+            .phase = .query_result_assembled,
+            .operation_id = event.operation_id,
+            .table_name = event.table_name,
+            .response_bytes = event.response_bytes,
+        });
+    }
+
     pub fn refreshRemoteMetadataSnapshot(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         var snapshot = try remote_metadata.fetchSnapshot();
@@ -7840,6 +7872,17 @@ pub const DataServer = struct {
                         });
                         return error.RaftBatchWriteOutcomeUnknown;
                     };
+                    // Raft never exposes an entry to the apply state machine
+                    // before Ready persistence completes. The observed apply
+                    // watermark therefore provides a production-safe durable
+                    // observation without adding a suspension inside Raft's
+                    // storage/Ready ownership critical section.
+                    self.reachDataRequestLifecycle(.{
+                        .phase = .proposal_persisted,
+                        .group_id = group_id,
+                        .log_index = index,
+                        .table_name = table_name,
+                    }) catch return error.RaftBatchWriteOutcomeUnknown;
                     const apply_sm = self.data_raft_apply orelse
                         return error.RaftBatchWriteOutcomeUnknown;
                     const outcome = apply_sm.takeApplyOutcome(group_id, index) orelse
@@ -9866,7 +9909,23 @@ pub const DataServer = struct {
         }
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
+            .phase = .writer_handoff_completed,
+            .operation_id = "split.finalize",
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
             .phase = .split_cutover_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
+            .phase = .transition_cleanup_completed,
+            .operation_id = "split.finalize",
             .group_id = op.source_group_id,
             .related_group_id = op.destination_group_id,
             .transition_id = op.transition_id,
@@ -9895,6 +9954,14 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
             .phase = .split_rollback_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
+            .phase = .transition_cleanup_completed,
+            .operation_id = "split.rollback",
             .group_id = op.source_group_id,
             .related_group_id = op.destination_group_id,
             .transition_id = op.transition_id,
@@ -10608,7 +10675,23 @@ pub const DataServer = struct {
         }
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
+            .phase = .writer_handoff_completed,
+            .operation_id = "merge.finalize",
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
             .phase = .merge_cutover_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
+            .phase = .transition_cleanup_completed,
+            .operation_id = "merge.finalize",
             .group_id = op.donor_group_id,
             .related_group_id = op.receiver_group_id,
             .transition_id = op.transition_id,
@@ -10638,6 +10721,14 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
             .phase = .merge_rollback_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
+        try self.reachDataRequestLifecycle(.{
+            .phase = .transition_cleanup_completed,
+            .operation_id = "merge.rollback",
             .group_id = op.donor_group_id,
             .related_group_id = op.receiver_group_id,
             .transition_id = op.transition_id,

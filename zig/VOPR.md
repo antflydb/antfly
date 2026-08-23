@@ -776,16 +776,22 @@ phase plan and not dependencies of the already implemented domain suites.
 The production DataServer, public listener, health request, metadata executor,
 and lifecycle safepoints run on borrowed `VoprIo`. A production-neutral
 DataServer lifecycle seam now exposes routing, remote forwarding, proposal
-acceptance, apply confirmation, visibility confirmation, and response-ack
-readiness with stable group/table/log identities. Split and merge prepare,
+acceptance, persistence observation, apply confirmation, visibility
+confirmation, and response-ack readiness with stable group/table/log
+identities. Persistence is observed safely from the production apply watermark,
+which Raft cannot publish before Ready storage completes, rather than adding a
+suspension inside Raft storage ownership. Split and merge prepare,
 copy, cutover, and rollback completions carry stable transition identities;
 synchronous paths reach them after transition locks and writer leases are
-released, and durable split-copy jobs explicitly release their per-source lane
-before suspending. Independent Raft campaigns already expose persistence and
-apply ordering. Continue with a safe production persistence observation,
-writer handoff and cleanup boundaries, and operation-specific query result
-assembly. Every new point must preserve the single production writer and its
-lease ownership.
+released, durable split-copy jobs explicitly release their per-source lane
+before suspending, and finalize/rollback paths expose writer-handoff and
+transition-runtime cleanup boundaries only after those scoped leases close.
+Single-table, routed multi-query, and global multi-query result assembly now
+crosses a production-neutral API seam carrying stable operation/table identity
+and response size after read/storage leases release. Independent Raft campaigns
+continue to expose the lower-level persistence/apply ordering. These seams
+preserve the single production writer and its lease ownership; extend them when
+new routed operations add distinct durable or result-assembly boundaries.
 
 ### 2. HTTP Lifecycle and Backpressure
 

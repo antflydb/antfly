@@ -50,7 +50,9 @@ pub const DataHook = struct {
         result = vopr.id.derive("data-request-lifecycle.target-node", result, event.target_node_id);
         result = vopr.id.derive("data-request-lifecycle.log-index", result, event.log_index);
         result = vopr.id.derive("data-request-lifecycle.transition", result, event.transition_id);
-        return vopr.id.derive("data-request-lifecycle.table", result, vopr.id.digest(event.table_name));
+        result = vopr.id.derive("data-request-lifecycle.operation", result, vopr.id.digest(event.operation_id));
+        result = vopr.id.derive("data-request-lifecycle.table", result, vopr.id.digest(event.table_name));
+        return vopr.id.derive("data-request-lifecycle.response-bytes", result, event.response_bytes);
     }
 
     fn reach(ptr: *anyopaque, event: data_runtime.DataRequestLifecycleEvent) !void {
@@ -113,18 +115,32 @@ test "data request lifecycle adapter records stable semantic VoprIo safepoints" 
         .transition_id = 3,
         .table_name = "docs",
     };
+    const query = data_runtime.DataRequestLifecycleEvent{
+        .phase = .query_result_assembled,
+        .operation_id = "public.table.query",
+        .table_name = "docs",
+        .response_bytes = 128,
+    };
     try hook.reach(routed);
     try hook.reach(accepted);
     try hook.reach(cutover);
+    try hook.reach(query);
 
     try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(routed)));
     try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(accepted)));
     try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(cutover)));
+    try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(query)));
     try std.testing.expect(DataHook.stableId(accepted) != DataHook.stableId(.{
         .phase = .proposal_accepted,
         .group_id = 7,
         .log_index = 12,
         .table_name = "docs",
+    }));
+    try std.testing.expect(DataHook.stableId(query) != DataHook.stableId(.{
+        .phase = .query_result_assembled,
+        .operation_id = "public.global.multi_query",
+        .table_name = "docs",
+        .response_bytes = 128,
     }));
     try vopr_io.ensureNoCapabilityViolation();
 }
