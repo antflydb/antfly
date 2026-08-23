@@ -1229,12 +1229,10 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     errdefer if (version_id) |value| alloc.free(value);
     const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
     errdefer if (content_type) |value| alloc.free(value);
-    var checksum: ?types.ObjectChecksum = if (parsed.value.metadata) |metadata|
-        if (metadata.antfly_sha256) |value| .{
-            .algorithm = .sha256_hex,
-            .value = try alloc.dupe(u8, value),
-        } else null
-    else if (parsed.value.md5Hash) |value| .{
+    // Custom metadata is caller-controlled and is therefore not an
+    // authenticated checksum of the stored object. Only expose digests that
+    // GCS computes from the object bytes.
+    var checksum: ?types.ObjectChecksum = if (parsed.value.md5Hash) |value| .{
         .algorithm = .md5_base64,
         .value = try alloc.dupe(u8, value),
     } else if (parsed.value.crc32c) |value| .{
@@ -1636,17 +1634,27 @@ test "json api metadata falls back to the always-available crc32c checksum" {
     try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
 }
 
-test "json api metadata prefers persisted Antfly SHA-256" {
+test "json api metadata never promotes caller-owned SHA-256 over provider checksum" {
     const alloc = std.testing.allocator;
-    const expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var meta = try parseObjectMetadataResponse(
         alloc,
         "bucket",
         "{\"name\":\"metric\",\"generation\":\"9\",\"size\":\"4\",\"crc32c\":\"crc-body\",\"metadata\":{\"antfly_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
     );
     defer meta.deinit(alloc);
-    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, meta.checksum.?.algorithm);
-    try std.testing.expectEqualStrings(expected, meta.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc32c_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("crc-body", meta.checksum.?.value);
+}
+
+test "json api metadata does not expose caller-owned SHA-256 as a checksum" {
+    const alloc = std.testing.allocator;
+    var meta = try parseObjectMetadataResponse(
+        alloc,
+        "bucket",
+        "{\"name\":\"metric\",\"generation\":\"9\",\"size\":\"4\",\"metadata\":{\"antfly_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+    );
+    defer meta.deinit(alloc);
+    try std.testing.expect(meta.checksum == null);
 }
 
 test "gcs read cancellation reaches active media and metadata requests" {
@@ -1744,7 +1752,7 @@ test "json api client put object encodes upload url and returns etag" {
     try std.testing.expectEqualStrings("etag-2", put.etag.?);
 }
 
-test "json api client persists SHA-256 metadata for cold verification" {
+test "json api client persists informational caller SHA-256 metadata" {
     const alloc = std.testing.allocator;
     const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const State = struct {

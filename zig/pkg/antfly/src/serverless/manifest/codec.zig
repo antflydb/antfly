@@ -18,10 +18,12 @@ const bounded_decode = @import("../bounded_decode.zig");
 const catalog_types = @import("../catalog/types.zig");
 const manifest_base_source = @import("base_source.zig");
 const manifest_types = @import("types.zig");
+const artifact_ref = @import("artifact_ref.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
 pub const wire_version: u16 = 15;
+pub const rolling_compatible_write_version: u16 = 12;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -144,8 +146,14 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
     return policy;
 }
 
+fn artifactEncodedSizeForVersion(artifact: manifest_types.ArtifactRef, version: u16) usize {
+    const provenance_bytes: usize = if (version >= 14) 2 + 8 + 8 + 8 else 0;
+    const materializer_bytes: usize = if (version >= 15) 8 else 0;
+    return 1 + 4 + 4 + 8 + 4 + provenance_bytes + materializer_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+}
+
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
-    return 1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + 8 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+    return artifactEncodedSizeForVersion(artifact, wire_version);
 }
 
 fn publishedSearchSourceEncodedSize(source: search_sources.SearchSourceDescriptor) usize {
@@ -197,6 +205,23 @@ fn baseSourceEncodedSize(base_source: manifest_types.BaseSourceDescriptor) usize
 }
 
 pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
+    return try encodeForVersionAlloc(alloc, manifest, wire_version);
+}
+
+pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest, target_version: u16) ![]u8 {
+    if (target_version != rolling_compatible_write_version and target_version != wire_version) {
+        return error.UnsupportedManifestWriteVersion;
+    }
+    if (target_version < artifact_ref.graph_metric_min_manifest_wire_version) {
+        for (manifest.artifacts) |artifact| {
+            if (artifact.kind == .graph_metric_segment or artifact.metadata_version != 0 or
+                artifact.published_generation != 0 or artifact.edge_generation != 0 or
+                artifact.computed_at_ms != 0 or artifact.materializer_fingerprint != 0)
+            {
+                return error.ManifestRequiresWireVersion15;
+            }
+        }
+    }
     const derived_output_items: []const search_sources.DerivedOutputDescriptor = manifest.stats.derived_outputs.items orelse &.{};
     const published_source_items: []const search_sources.SearchSourceDescriptor = manifest.stats.published_search_sources.items orelse &.{};
     const base_source_len: u32 = if (manifest.base_source) |base_source|
@@ -210,7 +235,7 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         publishedSearchSourcesEncodedSize(manifest.stats.published_search_sources) +
         base_source_len;
     for (derived_output_items) |output| size += derivedOutputEncodedSize(output);
-    for (manifest.artifacts) |artifact| size += artifactEncodedSize(artifact);
+    for (manifest.artifacts) |artifact| size += artifactEncodedSizeForVersion(artifact, target_version);
 
     const buf = try alloc.alloc(u8, size);
     errdefer alloc.free(buf);
@@ -218,7 +243,7 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
     var pos: usize = 0;
     @memcpy(buf[pos..][0..4], wire_magic);
     pos += 4;
-    std.mem.writeInt(u16, buf[pos..][0..2], wire_version, .little);
+    std.mem.writeInt(u16, buf[pos..][0..2], target_version, .little);
     pos += 2;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(manifest.namespace.len), .little);
     pos += 4;
@@ -335,16 +360,20 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         pos += 8;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(artifact.checksum.len), .little);
         pos += 4;
-        std.mem.writeInt(u16, buf[pos..][0..2], artifact.metadata_version, .little);
-        pos += 2;
-        std.mem.writeInt(u64, buf[pos..][0..8], artifact.published_generation, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], artifact.edge_generation, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], artifact.computed_at_ms, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
-        pos += 8;
+        if (target_version >= 14) {
+            std.mem.writeInt(u16, buf[pos..][0..2], artifact.metadata_version, .little);
+            pos += 2;
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.published_generation, .little);
+            pos += 8;
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.edge_generation, .little);
+            pos += 8;
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.computed_at_ms, .little);
+            pos += 8;
+        }
+        if (target_version >= 15) {
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
+            pos += 8;
+        }
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
         pos += artifact.name.len;
         @memcpy(buf[pos..][0..artifact.artifact_id.len], artifact.artifact_id);
@@ -1192,6 +1221,41 @@ test "serverless manifest codec rejects bad magic" {
     const alloc = std.testing.allocator;
     const bad = [_]u8{ 'B', 'A', 'D', '!', 1, 0 };
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, &bad));
+}
+
+test "serverless manifest rollout writer stays v12 until graph metrics are enabled" {
+    const alloc = std.testing.allocator;
+    var manifest = manifest_types.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &.{},
+    };
+    const encoded = try encodeForVersionAlloc(alloc, manifest, rolling_compatible_write_version);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(rolling_compatible_write_version, std.mem.readInt(u16, encoded[4..6], .little));
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", decoded.namespace);
+
+    var graph_artifacts = [_]manifest_types.ArtifactRef{.{
+        .kind = .graph_metric_segment,
+        .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .byte_len = 1,
+        .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }};
+    manifest.artifacts = &graph_artifacts;
+    try std.testing.expectError(
+        error.ManifestRequiresWireVersion15,
+        encodeForVersionAlloc(alloc, manifest, rolling_compatible_write_version),
+    );
+    try std.testing.expectError(
+        error.UnsupportedManifestWriteVersion,
+        encodeForVersionAlloc(alloc, manifest, 13),
+    );
 }
 
 test "serverless lake manifest base source decoder rejects forged string-list counts before allocation" {

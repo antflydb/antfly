@@ -667,6 +667,25 @@ The listener is configured with:
 - `ANTFLY_SERVERLESS_BIND_PORT`
 - `ANTFLY_SERVERLESS_TICK_INTERVAL_MS`
 
+### Manifest rollout gate
+
+Serverless manifest writers default to wire version 12 so a rolling deployment
+cannot publish data that readers from the previous release reject. Deploy a new
+release in two phases:
+
+1. Roll out the new query/API binaries everywhere while leaving
+   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=12` (the default).
+2. After every reader is on the new release, set
+   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=15` on maintenance or combined
+   publishers.
+
+Graph metric materialization remains dormant while the gate is at version 12.
+Once version 15 is enabled, catalog reconciliation detects configured metrics
+without artifacts and schedules their publication. Readers remain backward
+compatible with version 12 manifests throughout the rollout. Setting any value
+other than 12 or the current version fails startup rather than risking a
+partially compatible deployment.
+
 ## Image And CI Path
 
 The Zig runtime image is owned by `antfly-zig`, not by the Go control plane

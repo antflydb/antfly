@@ -130,6 +130,7 @@ const TopQueue = std.PriorityQueue(BorrowedScore, void, compareWorstFirst);
 const OwnedTopQueue = std.PriorityQueue(Score, void, compareOwnedWorstFirst);
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
 const max_score_range_requests: usize = 32;
+const max_top_score_range_requests: usize = 64;
 const coalesced_score_window_bytes: u64 = 8 * 1024 * 1024;
 
 pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_id: []const u8) !?Score {
@@ -351,6 +352,42 @@ fn planScoreFetchRangesAlloc(
     return try ranges.toOwnedSlice(alloc);
 }
 
+fn planAllScoreFetchRangesAlloc(
+    alloc: Allocator,
+    entries: []const metric_segment.codec.RoutingEntry,
+) ![]ScoreFetchRange {
+    var ranges = std.ArrayListUnmanaged(ScoreFetchRange).empty;
+    errdefer ranges.deinit(alloc);
+    for (entries, 0..) |entry, block_index| {
+        const entry_end = std.math.add(u64, entry.offset, entry.len) catch return error.InvalidGraphMetricSegment;
+        if (ranges.items.len == 0) {
+            try ranges.append(alloc, .{
+                .first_block = block_index,
+                .last_block = block_index,
+                .offset = entry.offset,
+                .len = entry.len,
+            });
+            continue;
+        }
+        const range = &ranges.items[ranges.items.len - 1];
+        const range_end = std.math.add(u64, range.offset, range.len) catch return error.InvalidGraphMetricSegment;
+        const combined_len = entry_end - range.offset;
+        if (entry.offset != range_end or combined_len > coalesced_score_window_bytes) {
+            try ranges.append(alloc, .{
+                .first_block = block_index,
+                .last_block = block_index,
+                .offset = entry.offset,
+                .len = entry.len,
+            });
+        } else {
+            range.last_block = block_index;
+            range.len = std.math.cast(usize, combined_len) orelse return error.GraphMetricQueryBudgetExceeded;
+        }
+    }
+    if (ranges.items.len > max_top_score_range_requests) return error.GraphMetricQueryBudgetExceeded;
+    return try ranges.toOwnedSlice(alloc);
+}
+
 pub fn openAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8) !metric_segment.Segment {
     return try loadVerifiedAlloc(alloc, session, graph_index_name, metric_name);
 }
@@ -421,35 +458,44 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     defer if (selected_owned) for (selected.items) |*item| item.deinit(alloc);
     try selected.ensureTotalCapacityPrecise(alloc, @min(top_k, @as(usize, control.score_count)));
     var selected_bytes: usize = 0;
-    for (routing.entries, 0..) |entry, block_index| {
+    const fetch_ranges = try planAllScoreFetchRangesAlloc(alloc, routing.entries);
+    defer alloc.free(fetch_ranges);
+    for (fetch_ranges) |range| {
         try session.checkCancellation();
-        const payload = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_score_block_id, entry.offset, entry.len);
+        const payload = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_score_block_id, range.offset, range.len);
         defer alloc.free(payload);
-        const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(payload, session.cancellation);
-        const expected_score_count = if (block_index + 1 < routing.entries.len)
-            metric_segment.score_block_entries
-        else
-            @as(usize, control.score_count) - block_index * metric_segment.score_block_entries;
-        if (decoded_block.len != expected_score_count or
-            (decoded_block.len > 0 and !std.mem.eql(u8, decoded_block.scores[0].node_id, entry.first_node_id)))
-        {
-            return error.InvalidGraphMetricSegment;
-        }
-        for (decoded_block.scores) |candidate| {
-            const borrowed = BorrowedScore{ .node_id = candidate.node_id, .value = candidate.value };
-            const should_insert = selected.count() < top_k or
-                (top_k > 0 and scoreOrder(borrowed, borrowedFromOwned(selected.peek().?)) == .lt);
-            if (!should_insert) continue;
-            const owned_node_id = try alloc.dupe(u8, candidate.node_id);
-            errdefer alloc.free(owned_node_id);
-            if (selected.count() == top_k) {
-                var removed = selected.pop().?;
-                selected_bytes -= @sizeOf(Score) + removed.node_id.len;
-                removed.deinit(alloc);
+        for (range.first_block..range.last_block + 1) |block_index| {
+            const entry = routing.entries[block_index];
+            if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;
+            const relative_offset = std.math.cast(usize, entry.offset - range.offset) orelse return error.InvalidGraphMetricSegment;
+            const relative_end = std.math.add(usize, relative_offset, entry.len) catch return error.InvalidGraphMetricSegment;
+            if (relative_end > payload.len) return error.InvalidGraphMetricSegment;
+            const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(payload[relative_offset..relative_end], session.cancellation);
+            const expected_score_count = if (block_index + 1 < routing.entries.len)
+                metric_segment.score_block_entries
+            else
+                @as(usize, control.score_count) - block_index * metric_segment.score_block_entries;
+            if (decoded_block.len != expected_score_count or
+                (decoded_block.len > 0 and !std.mem.eql(u8, decoded_block.scores[0].node_id, entry.first_node_id)))
+            {
+                return error.InvalidGraphMetricSegment;
             }
-            selected_bytes = std.math.add(usize, selected_bytes, @sizeOf(Score) + owned_node_id.len) catch return error.GraphMetricQueryBudgetExceeded;
-            if (selected_bytes > limits.max_result_bytes) return error.GraphMetricQueryBudgetExceeded;
-            try selected.push(alloc, .{ .node_id = owned_node_id, .value = candidate.value });
+            for (decoded_block.scores) |candidate| {
+                const borrowed = BorrowedScore{ .node_id = candidate.node_id, .value = candidate.value };
+                const should_insert = selected.count() < top_k or
+                    (top_k > 0 and scoreOrder(borrowed, borrowedFromOwned(selected.peek().?)) == .lt);
+                if (!should_insert) continue;
+                const owned_node_id = try alloc.dupe(u8, candidate.node_id);
+                errdefer alloc.free(owned_node_id);
+                if (selected.count() == top_k) {
+                    var removed = selected.pop().?;
+                    selected_bytes -= @sizeOf(Score) + removed.node_id.len;
+                    removed.deinit(alloc);
+                }
+                selected_bytes = std.math.add(usize, selected_bytes, @sizeOf(Score) + owned_node_id.len) catch return error.GraphMetricQueryBudgetExceeded;
+                if (selected_bytes > limits.max_result_bytes) return error.GraphMetricQueryBudgetExceeded;
+                try selected.push(alloc, .{ .node_id = owned_node_id, .value = candidate.value });
+            }
         }
     }
     std.mem.sort(Score, selected.items, {}, lessOwnedScore);
@@ -596,6 +642,20 @@ test "serverless graph metric range planning caps broad point batches" {
     try std.testing.expectEqual(@as(usize, 2), sparse.len);
     try std.testing.expectEqual(@as(usize, 1024), sparse[0].len);
     try std.testing.expectEqual(@as(usize, 1024), sparse[1].len);
+}
+
+test "serverless graph metric top range planning coalesces contiguous blocks" {
+    const alloc = std.testing.allocator;
+    var entries: [977]metric_segment.codec.RoutingEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .first_node_id = "node",
+        .offset = index * 256 * 1024,
+        .len = 256 * 1024,
+    };
+    const ranges = try planAllScoreFetchRangesAlloc(alloc, &entries);
+    defer alloc.free(ranges);
+    try std.testing.expectEqual(@as(usize, 31), ranges.len);
+    for (ranges) |range| try std.testing.expect(range.len <= coalesced_score_window_bytes);
 }
 
 test "serverless graph metric point reads authenticate before fetching ranges" {

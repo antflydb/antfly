@@ -1410,8 +1410,17 @@ fn graphMetricArtifactReusable(
         graph_ref.artifact_id,
         graph_ref.checksum,
     );
-    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, cancellation) catch |err| switch (err) {
+    const prefix = artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        ref.artifact_id,
+        ref.byte_len,
+        ref.checksum,
+        0,
+        prefix_len,
+        cancellation,
+    ) catch |err| switch (err) {
         error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return false,
         else => return err,
     };
     defer alloc.free(prefix);

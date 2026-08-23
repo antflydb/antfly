@@ -20,7 +20,10 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 
-const cache_record_magic = "AFQCR001";
+// v2 invalidates range/block entries written before provider identities were
+// pinned across verification and fetch. Full entries remain cheap to rebuild
+// and sharing one record format keeps startup reconciliation fail-closed.
+const cache_record_magic = "AFQCR002";
 const cache_record_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 const cache_record_header_len = cache_record_magic.len + @sizeOf(u64) + cache_record_digest_len;
 const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
@@ -472,7 +475,56 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getRangeOrFetchImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            null,
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    pub fn getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return try self.getRangeOrFetchImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            .{ .byte_len = expected_byte_len, .checksum = expected_checksum },
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    const ExpectedArtifact = struct {
+        byte_len: u64,
+        checksum: []const u8,
+    };
+
+    fn getRangeOrFetchImplAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected: ?ExpectedArtifact,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
+        if (expected) |value| try validateExpectedRange(artifact_id, value, offset, len);
         const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
         defer self.alloc.free(range_path);
         const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, range_path, len, cancellation) catch |err| switch (err) {
@@ -490,7 +542,18 @@ pub const QueryCache = struct {
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        const contents = if (expected) |value|
+            try artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                value.byte_len,
+                value.checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else
+            try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
         errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, range_path, contents, .range, cancellation);
@@ -531,7 +594,55 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getBlockOrFetchRangeImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            block_id,
+            null,
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    pub fn getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return try self.getBlockOrFetchRangeImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            block_id,
+            .{ .byte_len = expected_byte_len, .checksum = expected_checksum },
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    fn getBlockOrFetchRangeImplAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected: ?ExpectedArtifact,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
+        if (expected) |value| try validateExpectedRange(artifact_id, value, offset, len);
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
         const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
@@ -551,7 +662,18 @@ pub const QueryCache = struct {
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        const contents = if (expected) |value|
+            try artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                value.byte_len,
+                value.checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else
+            try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
         errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, block_path, contents, switch (block_class) {
@@ -562,6 +684,12 @@ pub const QueryCache = struct {
         return contents;
     }
 };
+
+fn validateExpectedRange(artifact_id: []const u8, expected: QueryCache.ExpectedArtifact, offset: u64, len: usize) !void {
+    artifacts_mod.validateSha256ArtifactIdentity(artifact_id, expected.checksum) catch return error.ArtifactIntegrityMismatch;
+    const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
+    if (end > expected.byte_len) return error.InvalidRange;
+}
 
 fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});

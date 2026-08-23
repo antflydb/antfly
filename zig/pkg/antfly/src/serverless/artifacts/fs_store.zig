@@ -129,6 +129,50 @@ pub const FsStore = struct {
         return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
     }
 
+    pub fn getVerifiedRangeAllocWithCancellation(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
+        if (end > expected_byte_len) return error.InvalidRange;
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
+
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(io, path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const before = try file.stat(io);
+        if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
+        const verified = VerifiedFile{
+            .inode = before.inode,
+            .byte_len = before.size,
+            .mtime_ns = before.mtime.toNanoseconds(),
+        };
+        if (!self.isVerifiedFile(artifact_id, verified)) {
+            try verifyOpenFileContent(file, io, expected_byte_len, expected_checksum, cancellation);
+            const after = try file.stat(io);
+            if (after.inode != before.inode or after.size != before.size or !std.meta.eql(after.mtime, before.mtime)) {
+                return error.ArtifactIntegrityMismatch;
+            }
+            try self.rememberVerifiedFile(artifact_id, verified);
+        }
+        return try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+    }
+
     pub fn stat(self: *FsStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         return try self.statWithCancellation(alloc, artifact_id, .none);
     }
@@ -188,6 +232,17 @@ pub const FsStore = struct {
         try verifyPathContent(path, expected_byte_len, expected_checksum, cancellation);
         const after = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
         if (after.inode != before.inode or after.size != before.size or !std.meta.eql(after.mtime, before.mtime)) return error.ArtifactIntegrityMismatch;
+        try self.rememberVerifiedFile(artifact_id, verified);
+    }
+
+    fn isVerifiedFile(self: *FsStore, artifact_id: []const u8, verified: VerifiedFile) bool {
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        const cached = self.verified_files.get(artifact_id) orelse return false;
+        return std.meta.eql(cached, verified);
+    }
+
+    fn rememberVerifiedFile(self: *FsStore, artifact_id: []const u8, verified: VerifiedFile) !void {
         const owned_id = try self.alloc.dupe(u8, artifact_id);
         errdefer self.alloc.free(owned_id);
         lockAtomic(&self.verified_mu);
@@ -222,6 +277,7 @@ pub const FsStore = struct {
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
+        .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
         .stat = erasedStat,
         .stat_with_cancellation = erasedStatWithCancellation,
         .verify_content = erasedVerifyContent,
@@ -263,6 +319,11 @@ pub const FsStore = struct {
         return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, cancellation);
     }
 
+    fn erasedGetVerifiedRangeAllocWithCancellation(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, offset: u64, len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.getVerifiedRangeAllocWithCancellation(alloc, artifact_id, expected_byte_len, expected_checksum, offset, len, cancellation);
+    }
+
     fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.stat(alloc, artifact_id);
@@ -293,7 +354,11 @@ fn verifyPathContent(path: []const u8, expected_byte_len: u64, expected_checksum
     else
         try std.Io.Dir.cwd().openFile(io_impl.io(), path, .{});
     defer file.close(io_impl.io());
-    var reader = file.reader(io_impl.io(), &.{});
+    return try verifyOpenFileContent(file, io_impl.io(), expected_byte_len, expected_checksum, cancellation);
+}
+
+fn verifyOpenFileContent(file: std.Io.File, io: std.Io, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
+    var reader = file.reader(io, &.{});
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [1024 * 1024]u8 = undefined;
     var total: u64 = 0;
@@ -371,6 +436,17 @@ fn readFileRangeAllocWithCancellation(
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
+    return try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+}
+
+fn readOpenFileRangeAllocWithCancellation(
+    alloc: Allocator,
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64,
+    len: usize,
+    cancellation: CancellationToken,
+) ![]u8 {
     const stat = try file.stat(io);
     if (offset > stat.size) return error.InvalidRange;
     const available = stat.size - offset;

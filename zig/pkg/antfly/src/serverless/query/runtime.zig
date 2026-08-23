@@ -259,9 +259,26 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
+            try cache.getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -272,9 +289,27 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getBlockOrFetchRangeAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
+            try cache.getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;

@@ -28,6 +28,7 @@ pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
     opened: object_store_support.OpenedObjectStore,
     clock: platform_clock.Clock,
+    write_version: u16 = manifest_codec.wire_version,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -87,13 +88,21 @@ pub const ObjectStore = struct {
             .allocator = self.alloc,
             .ptr = self,
             .vtable = &vtable,
+            .write_version = self.write_version,
         };
+    }
+
+    pub fn setWriteVersion(self: *ObjectStore, write_version: u16) !void {
+        if (write_version != manifest_codec.rolling_compatible_write_version and write_version != manifest_codec.wire_version) {
+            return error.UnsupportedManifestWriteVersion;
+        }
+        self.write_version = write_version;
     }
 
     pub fn put(self: *ObjectStore, manifest: manifest_types.Manifest) !void {
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, manifest.namespace, manifest.version);
         defer self.alloc.free(key);
-        const encoded = try manifest_codec.encodeAlloc(self.alloc, manifest);
+        const encoded = try manifest_codec.encodeForVersionAlloc(self.alloc, manifest, self.write_version);
         defer self.alloc.free(encoded);
 
         if (try self.tryGetEncoded(self.alloc, key)) |existing| {

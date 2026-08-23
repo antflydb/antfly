@@ -847,7 +847,8 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
-                metadata_republish.graph_metric_policy_changed = try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
+                metadata_republish.graph_metric_policy_changed = self.manifests.supportsArtifactKind(.graph_metric_segment) and
+                    try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,

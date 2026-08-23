@@ -132,9 +132,10 @@ pub const PutOptions = struct {
     /// the body. S3-compatible implementations persist this as provider
     /// checksum metadata so later integrity checks remain metadata-only.
     checksum_sha256_base64: ?[]const u8 = null,
-    /// Optional full-object SHA-256 in lowercase hexadecimal form. GCS JSON
-    /// uploads persist this in immutable object custom metadata so later cold
-    /// range readers can authenticate content with a metadata request.
+    /// Optional caller-computed SHA-256 in lowercase hexadecimal form. GCS JSON
+    /// uploads persist this as informational custom metadata only. Providers do
+    /// not validate custom metadata against object bytes, so consumers must not
+    /// treat it as an authenticated `ObjectChecksum`.
     checksum_sha256_hex: ?[]const u8 = null,
     /// Borrowed for the duration of the upload. Remote providers interrupt
     /// their active transport; local providers check between bounded chunks

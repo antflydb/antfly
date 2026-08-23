@@ -54,6 +54,9 @@ pub const BootstrapConfig = struct {
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024,
     query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024,
+    /// Hold at v12 for the reader-first rollout, then set to the current wire
+    /// version once every serverless reader has been upgraded.
+    manifest_write_version: u16 = manifest_mod.codec.rolling_compatible_write_version,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: []const u8 = search_sources.default_sparse_embedding_index_name,
     chunk_embedding_index_name: []const u8 = search_sources.default_chunk_embedding_index_name,
@@ -372,6 +375,7 @@ pub const OwnedStack = struct {
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[1]));
             break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
+        try self.manifests_impl.setWriteVersion(cfg.manifest_write_version);
         self.manifests = self.manifests_impl.manifestStore();
         errdefer self.manifests.deinit();
 
@@ -520,6 +524,11 @@ pub const OwnedStack = struct {
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
+    if (cfg.manifest_write_version != manifest_mod.codec.rolling_compatible_write_version and
+        cfg.manifest_write_version != manifest_mod.codec.wire_version)
+    {
+        return error.UnsupportedManifestWriteVersion;
+    }
     if (cfg.query_cache_dir) |path| {
         if (std.mem.trim(u8, path, &std.ascii.whitespace).len == 0) return error.InvalidQueryCacheDir;
         if (cfg.query_cache_max_bytes == 0) return error.InvalidQueryCacheBudget;

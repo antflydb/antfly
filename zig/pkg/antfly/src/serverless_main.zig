@@ -32,6 +32,7 @@ const CliConfig = struct {
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: ?u64 = null,
     query_cache_payload_max_bytes: ?u64 = null,
+    manifest_write_version: ?u16 = null,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: ?[]const u8 = null,
     chunk_embedding_index_name: ?[]const u8 = null,
@@ -125,6 +126,12 @@ pub fn runFromIterator(
         .query_cache_dir = cli.query_cache_dir orelse init.environ_map.get("ANTFLY_SERVERLESS_QUERY_CACHE_DIR"),
         .query_cache_max_bytes = cli.query_cache_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES", serverless_default_query_cache_max_bytes),
         .query_cache_payload_max_bytes = cli.query_cache_payload_max_bytes orelse try parseEnvIntOrDefault(init.environ_map, u64, "ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES", serverless_default_query_cache_payload_max_bytes),
+        .manifest_write_version = cli.manifest_write_version orelse try parseEnvIntOrDefault(
+            init.environ_map,
+            u16,
+            "ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION",
+            serverless.manifest.codec.rolling_compatible_write_version,
+        ),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
         .chunk_embedding_index_name = cli.chunk_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME") orelse "serverless_chunk",
@@ -295,6 +302,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--query-cache-payload-max-bytes")) {
             cfg.query_cache_payload_max_bytes = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--manifest-write-version")) {
+            cfg.manifest_write_version = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--embedding-indexes-json")) {
@@ -606,6 +617,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --catalog-uri <uri>
         \\  --query-cache-dir <path>
         \\  --query-cache-max-bytes <bytes>
+        \\  --manifest-write-version <12|15>
         \\  --query-cache-payload-max-bytes <bytes>
         \\  --host <host>
         \\  --port <port>
@@ -636,6 +648,7 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 4294967296
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 67108864
+        \\  ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION default: 12 (set 15 after all readers are upgraded)
         \\  ANTFLY_SERVERLESS_BIND_HOST      default: 127.0.0.1
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)

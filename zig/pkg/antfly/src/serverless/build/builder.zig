@@ -386,7 +386,7 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
-        const graph_metric_specs = if (targets.include_graph)
+        const graph_metric_specs = if (targets.include_graph and self.manifests.supportsArtifactKind(.graph_metric_segment))
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
             try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
@@ -637,7 +637,7 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
-        const graph_metric_specs = if (targets.include_graph)
+        const graph_metric_specs = if (targets.include_graph and self.manifests.supportsArtifactKind(.graph_metric_segment))
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
             try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
@@ -3661,8 +3661,17 @@ fn graphMetricArtifactReusable(
         graph_ref.artifact_id,
         graph_ref.checksum,
     );
-    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, cancellation) catch |err| switch (err) {
+    const prefix = artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        ref.artifact_id,
+        ref.byte_len,
+        ref.checksum,
+        0,
+        prefix_len,
+        cancellation,
+    ) catch |err| switch (err) {
         error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return false,
         else => return err,
     };
     defer alloc.free(prefix);

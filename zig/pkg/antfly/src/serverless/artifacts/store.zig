@@ -74,6 +74,7 @@ pub const ArtifactStore = struct {
         get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror![]u8 = null,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
+        get_verified_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         stat: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         verify_content: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken) anyerror!void = null,
@@ -231,6 +232,74 @@ pub const ArtifactStore = struct {
         else
             try self.vtable.get_range_alloc(self.ptr, result_alloc, artifact_id, offset, len);
         errdefer result_alloc.free(payload);
+        try cancellation.check();
+        return payload;
+    }
+
+    /// Loads a range from the exact object or file identity authenticated by
+    /// `expected_checksum`. Native backends pin the provider generation, ETag,
+    /// or open file identity across verification and reading. The fallback is
+    /// retained for test and custom stores, but production stores should
+    /// implement the vtable entry so replacement cannot race a range read.
+    pub fn getVerifiedRangeAllocWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
+            return error.ArtifactIntegrityMismatch;
+        const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch
+            return error.InvalidRange;
+        if (end > expected_byte_len) return error.InvalidRange;
+        if (len == 0) {
+            try self.verifyContentWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                cancellation,
+            );
+            const empty = try result_alloc.alloc(u8, 0);
+            errdefer result_alloc.free(empty);
+            try cancellation.check();
+            return empty;
+        }
+
+        const payload = if (self.vtable.get_verified_range_alloc_with_cancellation) |get_verified_range|
+            try get_verified_range(
+                self.ptr,
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else blk: {
+            try self.verifyContentWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                cancellation,
+            );
+            break :blk try self.getRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                offset,
+                len,
+                cancellation,
+            );
+        };
+        errdefer result_alloc.free(payload);
+        if (payload.len != len) return error.ArtifactIntegrityMismatch;
         try cancellation.check();
         return payload;
     }

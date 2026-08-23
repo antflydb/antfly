@@ -15,6 +15,10 @@
 //! Dependency-light manifest artifact references shared by manifest codecs and
 //! lake-native publication planning.
 
+/// First manifest version that old readers can safely consume when graph
+/// metric artifact references are present.
+pub const graph_metric_min_manifest_wire_version: u16 = 15;
+
 pub const ArtifactKind = enum(u8) {
     text_segment = 1,
     vector_segment = 2,
