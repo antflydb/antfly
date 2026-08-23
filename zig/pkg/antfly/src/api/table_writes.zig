@@ -6603,26 +6603,27 @@ pub const ProvisionedTableWriteSource = struct {
         var handoff_index: usize = 0;
         while (handoff_index < entry.publication_handoffs.items.len) {
             const handoff = entry.publication_handoffs.items[handoff_index];
-            if (handoff.requires_blocking and !blocking) {
-                handoff_index += 1;
-                continue;
-            }
             const current = for (status.stats.indexes) |item| {
                 if (std.mem.eql(u8, item.name, handoff.index_name)) break item;
             } else null;
-            const complete = if (current) |item|
-                // Absence or replacement settles the obsolete target. For the
-                // same incarnation, require this enqueue boundary to have run
-                // and the index's resulting replay lane to be fully visible.
-                item.coverage_generation != handoff.coverage_generation or
-                    item.coverage_config_hash != handoff.coverage_config_hash or
-                    (status.stats.enrichment.applied_sequence >= handoff.producer_target_sequence and
-                        item.replay_applied_sequence >= item.replay_target_sequence and
-                        !item.replay_catch_up_required and
-                        !item.catch_up_active and
-                        !item.backfill_active)
-            else
-                true;
+            const complete = if (current) |item| blk: {
+                // Absence or replacement settles the obsolete target on any
+                // authoritative publication: its old dense worker may already
+                // be gone and therefore cannot emit another blocking edge.
+                if (item.coverage_generation != handoff.coverage_generation or
+                    item.coverage_config_hash != handoff.coverage_config_hash)
+                {
+                    break :blk true;
+                }
+                // Only the same dense incarnation needs the stronger
+                // post-watermark publication boundary.
+                if (handoff.requires_blocking and !blocking) break :blk false;
+                break :blk status.stats.enrichment.applied_sequence >= handoff.producer_target_sequence and
+                    item.replay_applied_sequence >= item.replay_target_sequence and
+                    !item.replay_catch_up_required and
+                    !item.catch_up_active and
+                    !item.backfill_active;
+            } else true;
             if (!complete) {
                 handoff_index += 1;
                 continue;
@@ -34062,6 +34063,71 @@ test "managed create publication handoff releases on converged owner publication
         &db,
         .publish_blocking,
     );
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
+test "managed dense publication handoff releases when its incarnation is superseded" {
+    const alloc = std.testing.allocator;
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-superseded-publication-handoff", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+
+    for ([_]u64{ 7001, 7002, 7003 }) |group_id| {
+        source.reserveStructuralReconcileStatus("docs");
+        source.ensureStructuralPublicationHandoffStatus("docs", group_id, .{
+            .index_name = "semantic_idx",
+            .coverage_generation = 42,
+            .coverage_config_hash = 84,
+            .producer_target_sequence = 10,
+            .requires_blocking = true,
+        });
+        source.releaseStructuralReconcileStatus("docs");
+    }
+
+    // Group 7001 observes a completed drop, group 7002 observes a replacement,
+    // and group 7003 still observes the exact dense incarnation. Only that last
+    // handoff must retain the blocking publication requirement.
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .stats = .{},
+    });
+    const replacement_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 43,
+        .coverage_config_hash = 85,
+    }};
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7002,
+        .stats = .{
+            .index_count = replacement_indexes.len,
+            .indexes = @constCast(&replacement_indexes),
+        },
+    });
+    const exact_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .replay_applied_sequence = 10,
+        .replay_target_sequence = 10,
+    }};
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7003,
+        .stats = .{
+            .index_count = exact_indexes.len,
+            .indexes = @constCast(&exact_indexes),
+            .enrichment = .{ .applied_sequence = 10, .target_sequence = 10 },
+        },
+    });
+
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7001, false));
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7002, false));
+    try std.testing.expect(!source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7003, false));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7003, true));
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 }
 
