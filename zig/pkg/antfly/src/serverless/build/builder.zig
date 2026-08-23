@@ -3451,6 +3451,12 @@ fn buildGraphMetricArtifactRefsAlloc(
 
     const graph_metric_limits = lake_graph_metric.Limits{};
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
+    // Named graph indexes produced from materialized documents intentionally
+    // alias one content-addressed topology payload. Keep a single authenticated
+    // decode hot across those aliases; replacing it rather than accumulating a
+    // map preserves O(one graph) peak memory for external/mixed callers too.
+    var prepared_graph: ?lake_graph_metric.PreparedGraphArtifact = null;
+    defer if (prepared_graph) |*prepared| prepared.deinit(alloc);
     for (specs) |spec| {
         try cancellation.check();
         const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
@@ -3492,27 +3498,53 @@ fn buildGraphMetricArtifactRefsAlloc(
             continue;
         }
 
-        const built = lake_graph_metric.publishManyFromGraphArtifactWithBudgetAlloc(
-            alloc,
-            artifacts,
-            spec.index_name,
-            graph_ref,
-            spec.configs,
-            cancellation,
-            graph_metric_limits,
-            &graph_metric_budget,
-        ) catch |err| switch (err) {
-            error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+        const built = build: {
+            if (prepared_graph == null or !prepared_graph.?.identifies(graph_ref)) {
+                if (prepared_graph) |*prepared| prepared.deinit(alloc);
+                prepared_graph = null;
+                prepared_graph = lake_graph_metric.prepareGraphArtifactAlloc(
+                    alloc,
+                    artifacts,
+                    graph_ref,
+                    cancellation,
+                    graph_metric_limits,
+                ) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded => break :build try lake_graph_metric.publishRejectedManyAlloc(
+                        alloc,
+                        artifacts,
+                        spec.index_name,
+                        graph_ref,
+                        spec.configs,
+                        cancellation,
+                        .build_budget_exceeded,
+                        graph_metric_limits,
+                    ),
+                    else => return err,
+                };
+            }
+            break :build lake_graph_metric.publishManyFromPreparedGraphWithBudgetAlloc(
                 alloc,
                 artifacts,
                 spec.index_name,
                 graph_ref,
                 spec.configs,
                 cancellation,
-                .build_budget_exceeded,
                 graph_metric_limits,
-            ),
-            else => return err,
+                &graph_metric_budget,
+                &prepared_graph.?,
+            ) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+                    alloc,
+                    artifacts,
+                    spec.index_name,
+                    graph_ref,
+                    spec.configs,
+                    cancellation,
+                    .build_budget_exceeded,
+                    graph_metric_limits,
+                ),
+                else => return err,
+            };
         };
         var built_refs_moved = false;
         defer {
@@ -3557,8 +3589,13 @@ fn graphMetricArtifactReusable(
         error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
-    const max_header_bytes: u64 = 1024 * 1024;
-    const prefix_len: usize = @intCast(@min(ref.byte_len, max_header_bytes));
+    const prefix_len = try graph_metric_segment_mod.headerProbeLen(
+        ref.byte_len,
+        graph_index_name,
+        config.name,
+        graph_ref.artifact_id,
+        graph_ref.checksum,
+    );
     const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, cancellation) catch |err| switch (err) {
         error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
         else => return err,

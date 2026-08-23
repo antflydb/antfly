@@ -850,11 +850,18 @@ pub const HttpHandler = struct {
                     const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name);
                     if (graph_index != null and metric_index != null) {
                         const metric_ref = session.artifactRef(metric_index.?).?;
+                        const graph_ref = session.artifactRef(graph_index.?).?;
                         const verified = blk: {
                             session.verifyArtifact(metric_index.?) catch break :blk false;
                             break :blk true;
                         };
-                        const prefix_len: usize = @intCast(@min(metric_ref.byte_len, graph_metric_status_prefix_bytes));
+                        const prefix_len = try graph_metric_segment_mod.headerProbeLen(
+                            metric_ref.byte_len,
+                            spec.index_name,
+                            config.name,
+                            graph_ref.artifact_id,
+                            graph_ref.checksum,
+                        );
                         const prefix = if (verified)
                             // Use a dedicated integrity-seeded block cache key,
                             // never a legacy range entry that may have been
@@ -866,7 +873,6 @@ pub const HttpHandler = struct {
                         if (prefix) |payload| {
                             defer self.alloc.free(payload);
                             if (graph_metric_segment_mod.decodeHeader(payload)) |header| {
-                                const graph_ref = session.artifactRef(graph_index.?).?;
                                 status.materializer_fingerprint = header.materializer_fingerprint;
                                 const valid_identity = std.mem.eql(u8, header.graph_index_name, spec.index_name) and
                                     std.mem.eql(u8, header.metric_name, config.name) and
@@ -6376,10 +6382,6 @@ const GraphMetricMaterializationState = enum {
     stale,
     unavailable,
 };
-
-// Policy-bounded graph/metric names plus SHA-256 provenance fit comfortably
-// in this prefix; score vectors remain out of the control-plane status path.
-const graph_metric_status_prefix_bytes: u64 = 4096;
 
 const ServerlessGraphMetricStatus = struct {
     index_name: []u8,

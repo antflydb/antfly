@@ -50,13 +50,38 @@ pub const BuildResult = struct {
     }
 };
 
+/// One authenticated and decoded topology artifact. Publication orchestrators
+/// may reuse this across graph-index aliases that identify the same immutable
+/// payload, avoiding repeated object-store reads and decode allocations while
+/// retaining an exact provenance check at every use.
+pub const PreparedGraphArtifact = struct {
+    source_artifact_id: []u8,
+    source_checksum: []u8,
+    source_byte_len: u64,
+    graph: graph_segment.Segment,
+
+    pub fn deinit(self: *PreparedGraphArtifact, alloc: Allocator) void {
+        alloc.free(self.source_artifact_id);
+        alloc.free(self.source_checksum);
+        self.graph.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn identifies(self: PreparedGraphArtifact, source_graph: artifact_ref.ArtifactRef) bool {
+        return source_graph.kind == .graph_segment and
+            source_graph.byte_len == self.source_byte_len and
+            std.mem.eql(u8, source_graph.artifact_id, self.source_artifact_id) and
+            std.mem.eql(u8, source_graph.checksum, self.source_checksum);
+    }
+};
+
 pub fn artifactNameAlloc(alloc: Allocator, graph_index_name: []const u8, metric_name: []const u8) ![]u8 {
     return metric_segment.artifactNameAlloc(alloc, graph_index_name, metric_name) catch return error.InvalidGraphMetricBuildOptions;
 }
 
 pub fn buildFromGraphPayloadAlloc(alloc: Allocator, graph_payload: []const u8, options: BuildOptions) !BuildResult {
     try validateOptions(graph_payload, options);
-    var graph = graph_segment.decodeAlloc(alloc, graph_payload) catch |err| switch (err) {
+    var graph = graph_segment.decodeAllocWithCancellation(alloc, graph_payload, options.cancellation) catch |err| switch (err) {
         error.DecodedArtifactTooLarge => return error.GraphMetricBuildBudgetExceeded,
         else => return err,
     };
@@ -138,11 +163,33 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
     batch_budget: *graph_metric_policy.Budget,
 ) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
-    try graph_metric_policy.validateConfigs(configs, limits);
-    if (!std.meta.eql(batch_budget.limits, limits)) return error.InvalidGraphMetricBuildOptions;
-    if (graph_index_name.len == 0 or source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
+    try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
+    var prepared = try prepareGraphArtifactAlloc(alloc, artifacts, source_graph, cancellation, limits);
+    defer prepared.deinit(alloc);
+    return try publishManyFromPreparedGraphWithBudgetAlloc(
+        alloc,
+        artifacts,
+        graph_index_name,
+        source_graph,
+        configs,
+        cancellation,
+        limits,
+        batch_budget,
+        &prepared,
+    );
+}
+
+pub fn prepareGraphArtifactAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_graph: artifact_ref.ArtifactRef,
+    cancellation: CancellationToken,
+    limits: Limits,
+) !PreparedGraphArtifact {
+    try cancellation.check();
+    try graph_metric_policy.validateLimits(limits);
+    if (source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
     if (source_graph.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
-    try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs);
     const graph_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
         alloc,
         source_graph.artifact_id,
@@ -151,11 +198,38 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
         cancellation,
     );
     defer alloc.free(graph_payload);
-    var graph = graph_segment.decodeAlloc(alloc, graph_payload) catch |err| switch (err) {
+    var graph = graph_segment.decodeAllocWithCancellation(alloc, graph_payload, cancellation) catch |err| switch (err) {
         error.DecodedArtifactTooLarge => return error.GraphMetricBuildBudgetExceeded,
         else => return err,
     };
-    defer graph.deinit(alloc);
+    errdefer graph.deinit(alloc);
+    const source_artifact_id = try alloc.dupe(u8, source_graph.artifact_id);
+    errdefer alloc.free(source_artifact_id);
+    const source_checksum = try alloc.dupe(u8, source_graph.checksum);
+    return .{
+        .source_artifact_id = source_artifact_id,
+        .source_checksum = source_checksum,
+        .source_byte_len = source_graph.byte_len,
+        .graph = graph,
+    };
+}
+
+pub fn publishManyFromPreparedGraphWithBudgetAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    limits: Limits,
+    batch_budget: *graph_metric_policy.Budget,
+    prepared: *const PreparedGraphArtifact,
+) ![]artifact_ref.ArtifactRef {
+    if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
+    try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
+    if (!prepared.identifies(source_graph)) return error.ArtifactIntegrityMismatch;
+
+    const graph = prepared.graph;
 
     const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
     const initialized = try alloc.alloc(bool, configs.len);
@@ -222,6 +296,22 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
         processed[i] = true;
     }
     return refs;
+}
+
+fn validatePublicationOptions(
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    limits: Limits,
+    batch_budget: *graph_metric_policy.Budget,
+) !void {
+    try cancellation.check();
+    try graph_metric_policy.validateConfigs(configs, limits);
+    if (!std.meta.eql(batch_budget.limits, limits)) return error.InvalidGraphMetricBuildOptions;
+    if (graph_index_name.len == 0 or source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
+    if (source_graph.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs);
 }
 
 fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, built: *const BuildResult) !artifact_ref.ArtifactRef {
@@ -890,7 +980,13 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
 
     var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 303, .max_total_work_items = 303 } };
     const one_config = [_]graph_mod.GraphMetricConfig{.{ .name = "shared_rank", .kind = .pagerank }};
-    const first_index = try publishManyFromGraphArtifactWithBudgetAlloc(
+    var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
+    defer prepared.deinit(alloc);
+    try std.testing.expect(prepared.identifies(source));
+    var wrong_source = source;
+    wrong_source.byte_len += 1;
+    try std.testing.expect(!prepared.identifies(wrong_source));
+    const first_index = try publishManyFromPreparedGraphWithBudgetAlloc(
         alloc,
         &artifacts,
         "graph_a",
@@ -899,12 +995,13 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         .none,
         shared_budget.limits,
         &shared_budget,
+        &prepared,
     );
     defer {
         for (first_index) |ref| freeArtifactRef(alloc, ref);
         alloc.free(first_index);
     }
-    const second_index = try publishManyFromGraphArtifactWithBudgetAlloc(
+    const second_index = try publishManyFromPreparedGraphWithBudgetAlloc(
         alloc,
         &artifacts,
         "graph_b",
@@ -913,6 +1010,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         .none,
         shared_budget.limits,
         &shared_budget,
+        &prepared,
     );
     defer {
         for (second_index) |ref| freeArtifactRef(alloc, ref);

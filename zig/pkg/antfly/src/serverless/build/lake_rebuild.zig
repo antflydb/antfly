@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const artifact_store = @import("../artifacts/store.zig");
 const external_source = @import("../external_source/types.zig");
@@ -239,6 +240,7 @@ pub const RowSourceProvider = struct {
 
 pub const ExecutionOptions = struct {
     limits: lake_build_limits.Limits = .{},
+    cancellation: CancellationToken = .none,
 };
 
 pub const ExecutedOperation = struct {
@@ -510,6 +512,29 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     table: TableIndexDefinition,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
 ) !ReconciledManifest {
+    return try reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
+        alloc,
+        artifacts,
+        source_provider,
+        base_source,
+        inventory,
+        table,
+        published_declarations,
+        .none,
+    );
+}
+
+pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_provider: RowSourceProvider,
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    inventory: external_source.Inventory,
+    table: TableIndexDefinition,
+    published_declarations: []const sidecar_manifest.DeclaredArtifact,
+    cancellation: CancellationToken,
+) !ReconciledManifest {
+    try cancellation.check();
     var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, table);
     defer desired.deinit(alloc);
 
@@ -524,12 +549,14 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     var operation_plan = try planOperationsAlloc(alloc, desired.artifacts, published);
     defer operation_plan.deinit(alloc);
 
-    var executed = try executeOperationsAlloc(alloc, artifacts, source_provider, operation_plan);
+    var executed = try executeOperationsWithOptionsAlloc(alloc, artifacts, source_provider, operation_plan, .{
+        .cancellation = cancellation,
+    });
     defer executed.deinit(alloc);
 
     var reconciled = try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
     defer reconciled.deinit(alloc);
-    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations);
+    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations, cancellation);
 }
 
 fn appendExternalGraphMetricDeclarationsAlloc(
@@ -538,7 +565,9 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     indexes_json: []const u8,
     base_declarations: []const sidecar_manifest.DeclaredArtifact,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
+    cancellation: CancellationToken,
 ) !ReconciledManifest {
+    try cancellation.check();
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
     defer graph_metric_config.freeIndexSpecs(alloc, specs);
 
@@ -552,7 +581,10 @@ fn appendExternalGraphMetricDeclarationsAlloc(
 
     const graph_metric_limits = lake_graph_metric.Limits{};
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
+    var prepared_graph: ?lake_graph_metric.PreparedGraphArtifact = null;
+    defer if (prepared_graph) |*prepared| prepared.deinit(alloc);
     for (specs) |spec| {
+        try cancellation.check();
         const graph_declaration = findDeclaration(base_declarations, spec.index_name) orelse continue;
         if (graph_declaration.binding.sidecar_kind != .graph or graph_declaration.artifact.kind != .graph_segment) return error.SidecarArtifactKindMismatch;
 
@@ -573,7 +605,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             const expected_hash = try graphMetricBindingHashAlloc(alloc, config, graph_declaration.artifact.artifact_id);
             defer alloc.free(expected_hash);
             if (!std.mem.eql(u8, existing.binding.index_config_hash, expected_hash) or
-                !try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, spec.index_name, config, graph_declaration.artifact))
+                !try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, spec.index_name, config, graph_declaration.artifact, cancellation))
             {
                 reusable = false;
                 break;
@@ -591,27 +623,53 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             continue;
         }
 
-        const built = lake_graph_metric.publishManyFromGraphArtifactWithBudgetAlloc(
-            alloc,
-            artifacts,
-            spec.index_name,
-            graph_declaration.artifact,
-            spec.configs,
-            .none,
-            graph_metric_limits,
-            &graph_metric_budget,
-        ) catch |err| switch (err) {
-            error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+        const built = build: {
+            if (prepared_graph == null or !prepared_graph.?.identifies(graph_declaration.artifact)) {
+                if (prepared_graph) |*prepared| prepared.deinit(alloc);
+                prepared_graph = null;
+                prepared_graph = lake_graph_metric.prepareGraphArtifactAlloc(
+                    alloc,
+                    artifacts,
+                    graph_declaration.artifact,
+                    cancellation,
+                    graph_metric_limits,
+                ) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded => break :build try lake_graph_metric.publishRejectedManyAlloc(
+                        alloc,
+                        artifacts,
+                        spec.index_name,
+                        graph_declaration.artifact,
+                        spec.configs,
+                        cancellation,
+                        .build_budget_exceeded,
+                        graph_metric_limits,
+                    ),
+                    else => return err,
+                };
+            }
+            break :build lake_graph_metric.publishManyFromPreparedGraphWithBudgetAlloc(
                 alloc,
                 artifacts,
                 spec.index_name,
                 graph_declaration.artifact,
                 spec.configs,
-                .none,
-                .build_budget_exceeded,
+                cancellation,
                 graph_metric_limits,
-            ),
-            else => return err,
+                &graph_metric_budget,
+                &prepared_graph.?,
+            ) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+                    alloc,
+                    artifacts,
+                    spec.index_name,
+                    graph_declaration.artifact,
+                    spec.configs,
+                    cancellation,
+                    .build_budget_exceeded,
+                    graph_metric_limits,
+                ),
+                else => return err,
+            };
         };
         defer {
             for (built) |artifact| lake_graph_metric.freeArtifactRef(alloc, artifact);
@@ -732,6 +790,7 @@ pub fn executeOperationsWithOptionsAlloc(
     options: ExecutionOptions,
 ) !ExecutionResult {
     try options.limits.validate();
+    try options.cancellation.check();
     const executed = try alloc.alloc(ExecutedOperation, plan.operations.len);
     errdefer alloc.free(executed);
     const completed = try alloc.alloc(bool, plan.operations.len);
@@ -742,6 +801,7 @@ pub fn executeOperationsWithOptionsAlloc(
     }
 
     for (plan.operations, 0..) |operation, operation_idx| {
+        try options.cancellation.check();
         if (completed[operation_idx]) continue;
         switch (operation.action) {
             .reuse => {
@@ -773,6 +833,7 @@ pub fn executeOperationsWithOptionsAlloc(
                 defer replay.deinit(alloc);
 
                 for (plan.operations, 0..) |group_operation, group_idx| {
+                    try options.cancellation.check();
                     if (completed[group_idx] or group_operation.action != .rebuild or
                         !source_binding.sameSourceSnapshot(group_operation.binding, operation.binding)) continue;
                     var cursor = replay.cursor();
@@ -1295,14 +1356,20 @@ fn graphMetricArtifactReusable(
     graph_index_name: []const u8,
     config: @import("../../graph/graph.zig").GraphMetricConfig,
     graph_ref: manifest_artifact.ArtifactRef,
+    cancellation: CancellationToken,
 ) !bool {
-    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, .none) catch |err| switch (err) {
+    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, cancellation) catch |err| switch (err) {
         error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
-    const max_header_bytes: u64 = 1024 * 1024;
-    const prefix_len: usize = @intCast(@min(ref.byte_len, max_header_bytes));
-    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, .none) catch |err| switch (err) {
+    const prefix_len = try graph_metric_segment.headerProbeLen(
+        ref.byte_len,
+        graph_index_name,
+        config.name,
+        graph_ref.artifact_id,
+        graph_ref.checksum,
+    );
+    const prefix = artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, ref.artifact_id, 0, prefix_len, cancellation) catch |err| switch (err) {
         error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
         else => return err,
     };

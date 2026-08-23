@@ -111,6 +111,7 @@ pub const executeLakeRebuildOperationsWithOptionsAlloc = lake_rebuild.executeOpe
 pub const deleteDroppedLakeRebuildArtifactsAfterPublishAlloc = lake_rebuild.deleteDroppedArtifactsAfterPublishAlloc;
 pub const reconcileLakeRebuildExecutedOperationsAlloc = lake_rebuild.reconcileExecutedOperationsAlloc;
 pub const reconcileResolvedExternalLakeSidecarsAlloc = lake_rebuild.reconcileResolvedExternalSourceSidecarsAlloc;
+pub const reconcileResolvedExternalLakeSidecarsWithCancellationAlloc = lake_rebuild.reconcileResolvedExternalSourceSidecarsWithCancellationAlloc;
 pub const LakeAlgebraicGroupBySidecarBuildOptions = lake_sidecar_algebraic.AlgebraicGroupBySidecarBuildOptions;
 pub const LakeAlgebraicGroupBySidecarBuildResult = lake_sidecar_algebraic.AlgebraicGroupBySidecarBuildResult;
 pub const LakeAlgebraicGroupBySidecarPublishResult = lake_sidecar_algebraic.AlgebraicGroupBySidecarPublishResult;
@@ -261,6 +262,7 @@ test "serverless build module compiles" {
     _ = deleteDroppedLakeRebuildArtifactsAfterPublishAlloc;
     _ = reconcileLakeRebuildExecutedOperationsAlloc;
     _ = reconcileResolvedExternalLakeSidecarsAlloc;
+    _ = reconcileResolvedExternalLakeSidecarsWithCancellationAlloc;
     _ = LakeAlgebraicGroupBySidecarBuildOptions;
     _ = LakeAlgebraicGroupBySidecarBuildResult;
     _ = LakeAlgebraicGroupBySidecarPublishResult;

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const graph_types = @import("types.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 
@@ -86,20 +87,67 @@ test "lake graph segment codec rejects forged adjacency counts before allocation
     try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(std.testing.allocator, &payload));
 }
 
+test "lake graph segment decode observes cancellation inside adjacency scans" {
+    const alloc = std.testing.allocator;
+    const adjacency_count: u32 = 257;
+    const payload = try alloc.alloc(u8, header_len + adjacency_count * 12);
+    defer alloc.free(payload);
+    @memcpy(payload[0..4], wire_magic);
+    std.mem.writeInt(u16, payload[4..6], wire_version, .little);
+    std.mem.writeInt(u32, payload[6..10], adjacency_count, .little);
+    @memset(payload[header_len..], 0);
+
+    const State = struct {
+        calls: usize = 0,
+
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 3;
+        }
+    };
+    var state = State{};
+    const cancellation = CancellationToken{ .ptr = &state, .is_cancelled_fn = State.cancelled };
+    try std.testing.expectError(error.Canceled, decodeAllocWithCancellation(alloc, payload, cancellation));
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+}
+
 pub fn decodeAlloc(alloc: Allocator, data: []const u8) !graph_types.Segment {
-    return try decodeAllocWithLimits(alloc, data, .{});
+    return try decodeAllocWithLimitsAndCancellation(alloc, data, .{}, .none);
 }
 
 pub fn decodeAllocWithLimits(alloc: Allocator, data: []const u8, limits: DecodeLimits) !graph_types.Segment {
+    return try decodeAllocWithLimitsAndCancellation(alloc, data, limits, .none);
+}
+
+pub fn decodeAllocWithCancellation(alloc: Allocator, data: []const u8, cancellation: CancellationToken) !graph_types.Segment {
+    return try decodeAllocWithLimitsAndCancellation(alloc, data, .{}, cancellation);
+}
+
+pub fn decodeAllocWithLimitsAndCancellation(
+    alloc: Allocator,
+    data: []const u8,
+    limits: DecodeLimits,
+    cancellation: CancellationToken,
+) !graph_types.Segment {
+    try cancellation.check();
     var budget = try bounded_decode.Budget.init(data.len, limits);
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_allocation_bytes);
-    return decodeBoundedAlloc(limiter.allocator(), data, &budget) catch |err| {
+    var decoded = decodeBoundedAlloc(limiter.allocator(), data, &budget, cancellation) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
         return err;
     };
+    errdefer decoded.deinit(alloc);
+    try cancellation.check();
+    return decoded;
 }
 
-fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decode.Budget) !graph_types.Segment {
+fn decodeBoundedAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    budget: *bounded_decode.Budget,
+    cancellation: CancellationToken,
+) !graph_types.Segment {
     if (data.len < header_len) return error.InvalidGraphSegment;
     var pos: usize = 0;
     if (!std.mem.eql(u8, data[pos..][0..4], wire_magic)) return error.InvalidGraphSegment;
@@ -120,6 +168,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
     }
 
     for (0..adjacency_count) |idx| {
+        if (idx % 256 == 0) try cancellation.check();
         if (pos + 12 > data.len) return error.InvalidGraphSegment;
         const node_id_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
@@ -133,12 +182,12 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         pos += node_id_len;
         errdefer alloc.free(node_id);
 
-        const out_edges = try decodeEdgesAlloc(alloc, data, &pos, out_count, budget);
+        const out_edges = try decodeEdgesAlloc(alloc, data, &pos, out_count, budget, cancellation);
         errdefer {
             for (out_edges) |*edge| edge.deinit(alloc);
             alloc.free(out_edges);
         }
-        const in_edges = try decodeEdgesAlloc(alloc, data, &pos, in_count, budget);
+        const in_edges = try decodeEdgesAlloc(alloc, data, &pos, in_count, budget, cancellation);
         errdefer {
             for (in_edges) |*edge| edge.deinit(alloc);
             alloc.free(in_edges);
@@ -177,6 +226,7 @@ fn decodeEdgesAlloc(
     pos: *usize,
     edge_count: u32,
     budget: *bounded_decode.Budget,
+    cancellation: CancellationToken,
 ) ![]graph_types.Edge {
     if (pos.* > data.len or @as(usize, edge_count) > (data.len - pos.*) / 12) return error.InvalidGraphSegment;
     _ = try budget.admitCount(graph_types.Edge, edge_count, data.len - pos.*, 12);
@@ -188,6 +238,7 @@ fn decodeEdgesAlloc(
     }
 
     for (0..edge_count) |idx| {
+        if (idx % 4096 == 0) try cancellation.check();
         if (pos.* + 12 > data.len) return error.InvalidGraphSegment;
         const neighbor_id_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
         pos.* += 4;

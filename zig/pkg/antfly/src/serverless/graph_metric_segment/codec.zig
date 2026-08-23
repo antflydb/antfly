@@ -35,6 +35,25 @@ pub const Header = struct {
     source_graph_checksum: []const u8,
 };
 
+/// Exact bounded prefix needed to decode provenance from an artifact produced
+/// by this codec. Older wire versions have shorter fixed headers, so the small
+/// current-version surplus remains valid for backward-compatible status reads.
+pub fn headerProbeLen(
+    artifact_byte_len: u64,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    source_graph_artifact_id: []const u8,
+    source_graph_checksum: []const u8,
+) !usize {
+    var required: usize = fixed_header_len;
+    required = std.math.add(usize, required, graph_index_name.len) catch return error.GraphMetricSegmentTooLarge;
+    required = std.math.add(usize, required, metric_name.len) catch return error.GraphMetricSegmentTooLarge;
+    required = std.math.add(usize, required, source_graph_artifact_id.len) catch return error.GraphMetricSegmentTooLarge;
+    required = std.math.add(usize, required, source_graph_checksum.len) catch return error.GraphMetricSegmentTooLarge;
+    const required_u64 = std.math.cast(u64, required) orelse return error.GraphMetricSegmentTooLarge;
+    return @intCast(@min(artifact_byte_len, required_u64));
+}
+
 /// Decodes only provenance and lifecycle metadata from a bounded prefix. Score
 /// vectors and edge filters are deliberately not materialized.
 pub fn decodeHeader(data: []const u8) !Header {
@@ -302,6 +321,19 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     defer segment.deinit(alloc);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
+    const header_len = try headerProbeLen(
+        encoded.len,
+        segment.graph_index_name,
+        segment.metric_name,
+        segment.source_graph_artifact_id,
+        segment.source_graph_checksum,
+    );
+    try std.testing.expectEqual(
+        fixed_header_len + segment.graph_index_name.len + segment.metric_name.len + segment.source_graph_artifact_id.len + segment.source_graph_checksum.len,
+        header_len,
+    );
+    const header = try decodeHeader(encoded[0..header_len]);
+    try std.testing.expectEqualStrings(segment.metric_name, header.metric_name);
     var decoded = try decodeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, 0.75), decoded.score("b"));

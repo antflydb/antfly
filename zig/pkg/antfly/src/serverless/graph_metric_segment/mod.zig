@@ -26,6 +26,7 @@ pub const decodeAlloc = codec.decodeAlloc;
 pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
 pub const decodeHeader = codec.decodeHeader;
 pub const wire_version = codec.wire_version;
+pub const headerProbeLen = codec.headerProbeLen;
 
 test "serverless graph metric segment module compiles" {
     _ = types;

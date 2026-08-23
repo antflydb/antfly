@@ -392,6 +392,7 @@ pub const executeLakeRebuildOperationsWithOptionsAlloc = build.executeLakeRebuil
 pub const deleteDroppedLakeRebuildArtifactsAfterPublishAlloc = build.deleteDroppedLakeRebuildArtifactsAfterPublishAlloc;
 pub const reconcileLakeRebuildExecutedOperationsAlloc = build.reconcileLakeRebuildExecutedOperationsAlloc;
 pub const reconcileResolvedExternalLakeSidecarsAlloc = build.reconcileResolvedExternalLakeSidecarsAlloc;
+pub const reconcileResolvedExternalLakeSidecarsWithCancellationAlloc = build.reconcileResolvedExternalLakeSidecarsWithCancellationAlloc;
 pub const LakeRangeCacheLane = query.LakeRangeCacheLane;
 pub const LakeRangePurpose = query.LakeRangePurpose;
 pub const LakeRangeObjectVersion = query.LakeRangeObjectVersion;
@@ -835,6 +836,7 @@ test "serverless module compiles" {
     _ = deleteDroppedLakeRebuildArtifactsAfterPublishAlloc;
     _ = reconcileLakeRebuildExecutedOperationsAlloc;
     _ = reconcileResolvedExternalLakeSidecarsAlloc;
+    _ = reconcileResolvedExternalLakeSidecarsWithCancellationAlloc;
     _ = LakeRangeCacheLane;
     _ = LakeRangePurpose;
     _ = LakeRangeObjectVersion;
