@@ -889,6 +889,7 @@ const dense_catch_up_default_maintenance_steps: usize = 8;
 const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
 const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
 const artifact_repair_summary_dirty_marker = "dirty";
+const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
@@ -7341,6 +7342,13 @@ pub const DB = struct {
         if (!ctx.index_artifact_finalization_mutex.tryLock()) return .busy;
         defer ctx.index_artifact_finalization_mutex.unlock();
 
+        // Repair issues describe one concrete consumer generation. A
+        // same-name replacement has different artifact identities and cannot
+        // resolve diagnoses left by the retired generation. Keep the durable
+        // cleanup tombstone authoritative until every issue and its terminal
+        // failure history have drained in bounded, crash-idempotent pages.
+        if (try drainRetiredIndexArtifactRepairIssuesPageContext(ctx, index_name)) return .progressed;
+
         // The durable tombstone remains visible while finalization runs, so
         // namespace admission stays fenced. Release page arbitration before
         // checkpoint and filesystem I/O; other indexes can continue draining.
@@ -7382,6 +7390,239 @@ pub const DB = struct {
             ctx.index_manager.artifact_cleanup_state.store(0, .release);
             std.log.warn("generated-artifact cleanup was not scheduled err={s}", .{@errorName(err)});
         };
+    }
+
+    const retired_index_artifact_repair_cleanup_page_size: usize = 64;
+
+    const RetiredArtifactRepairIssueKeyParse = union(enum) {
+        valid: internal_keys.ArtifactRepairIssueKeyParts,
+        malformed: anyerror,
+    };
+
+    fn parseRetiredArtifactRepairIssueKeyAlloc(
+        alloc: Allocator,
+        key: []const u8,
+    ) !RetiredArtifactRepairIssueKeyParse {
+        const parts = internal_keys.artifactRepairIssueKeyPartsAlloc(alloc, key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidInternalUserKey => return .{ .malformed = err },
+        };
+        return .{ .valid = parts };
+    }
+
+    const RetiredArtifactRepairIssueValueDecode = union(enum) {
+        valid: types.ArtifactRepairIssue,
+        malformed: anyerror,
+    };
+
+    fn decodeRetiredArtifactRepairIssueAlloc(
+        alloc: Allocator,
+        raw: []const u8,
+    ) !RetiredArtifactRepairIssueValueDecode {
+        const issue = decodeArtifactRepairIssueValueAlloc(alloc, raw) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .malformed = err },
+        };
+        return .{ .valid = issue };
+    }
+
+    fn drainRetiredIndexArtifactRepairIssuesPageContext(
+        ctx: *AsyncContext,
+        index_name: []const u8,
+    ) !bool {
+        // Summary rebuilds own the apply lock, while issue publication and
+        // terminal-marker transitions own the repair mutex. This ordering is
+        // shared by derived apply paths and prevents a cleanup batch from
+        // racing either authority.
+        ctx.apply_mutex.lockExclusive();
+        defer ctx.apply_mutex.unlockExclusive();
+        lockAtomicWithBackoff(&ctx.artifact_repair_issue_mutex);
+        defer ctx.artifact_repair_issue_mutex.unlock();
+
+        const prefix = try internal_keys.artifactRepairIssueIndexPrefixAlloc(ctx.alloc, index_name);
+        defer ctx.alloc.free(prefix);
+        const rows = try ctx.store.scanPrefixPage(
+            ctx.alloc,
+            prefix,
+            null,
+            retired_index_artifact_repair_cleanup_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(ctx.alloc, rows);
+        if (rows.len == 0) {
+            // Primary records are authoritative. Sweep legacy orphaned
+            // kind-index rows in bounded pages before releasing admission.
+            for (std.meta.tags(types.ArtifactRepairKind)) |kind| {
+                const kind_prefix = try internal_keys.artifactRepairIssueKindIndexPrefixAlloc(
+                    ctx.alloc,
+                    @tagName(kind),
+                    index_name,
+                );
+                defer ctx.alloc.free(kind_prefix);
+                const secondary_rows = try ctx.store.scanPrefixPage(
+                    ctx.alloc,
+                    kind_prefix,
+                    null,
+                    retired_index_artifact_repair_cleanup_page_size,
+                );
+                defer docstore_mod.DocStore.freeResults(ctx.alloc, secondary_rows);
+                if (secondary_rows.len == 0) continue;
+                const secondary_deletes = try ctx.alloc.alloc([]const u8, secondary_rows.len);
+                defer ctx.alloc.free(secondary_deletes);
+                for (secondary_rows, 0..) |row, i| secondary_deletes[i] = row.key;
+                try ctx.store.putBatch(&.{}, secondary_deletes);
+                return true;
+            }
+            return false;
+        }
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (writes.items) |write| ctx.alloc.free(@constCast(write.value));
+            writes.deinit(ctx.alloc);
+        }
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(ctx.alloc);
+        var owned_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (owned_keys.items) |key| ctx.alloc.free(@constCast(key));
+            owned_keys.deinit(ctx.alloc);
+        }
+        const Batch = struct {
+            fn appendOwnedDelete(
+                alloc: Allocator,
+                out_deletes: *std.ArrayListUnmanaged([]const u8),
+                out_owned_keys: *std.ArrayListUnmanaged([]const u8),
+                key: []u8,
+            ) !void {
+                errdefer alloc.free(key);
+                const owned_len = out_owned_keys.items.len;
+                try out_owned_keys.append(alloc, key);
+                errdefer out_owned_keys.shrinkRetainingCapacity(owned_len);
+                try out_deletes.append(alloc, key);
+            }
+        };
+
+        var removed_issue_count: usize = 0;
+        for (rows) |row| {
+            // A coalesced issue can own arbitrarily many historical failure
+            // markers. Drain exactly one marker page and leave the primary
+            // issue present until a later pass observes the reverse namespace
+            // empty; this is the durable cursor across crashes and reopen.
+            const marker_count = try appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+                ctx.alloc,
+                ctx.store,
+                row.key,
+                &deletes,
+                &owned_keys,
+            );
+            if (marker_count != 0) {
+                if (removed_issue_count != 0) {
+                    try appendArtifactRepairSummaryDirtyMarkerForStore(ctx.alloc, &writes, &deletes, &owned_keys);
+                }
+                try ctx.store.putBatch(writes.items, deletes.items);
+                return true;
+            }
+
+            try deletes.append(ctx.alloc, row.key);
+            removed_issue_count += 1;
+
+            // The marker generation is keyed by the authoritative primary
+            // key, so it is safe to retire even when the value is malformed.
+            const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(ctx.alloc, row.key);
+            try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, generation_key);
+
+            var parts = switch (try parseRetiredArtifactRepairIssueKeyAlloc(ctx.alloc, row.key)) {
+                .valid => |value| value,
+                .malformed => |err| {
+                    std.log.warn("retired index cleanup removed malformed artifact repair key index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    continue;
+                },
+            };
+            defer parts.deinit(ctx.alloc);
+            if (!std.mem.eql(u8, parts.index_name, index_name)) return error.InvalidInternalUserKey;
+
+            const kind_key = try internal_keys.artifactRepairIssueKindKeyAlloc(
+                ctx.alloc,
+                parts.repair_artifact_kind,
+                parts.index_name,
+                parts.issue_id,
+            );
+            try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, kind_key);
+
+            var issue_valid = true;
+            var issue = switch (try decodeRetiredArtifactRepairIssueAlloc(ctx.alloc, row.value)) {
+                .valid => |value| value,
+                .malformed => |err| issue: {
+                    issue_valid = false;
+                    std.log.warn("retired index cleanup removed malformed artifact repair issue index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    break :issue types.ArtifactRepairIssue{};
+                },
+            };
+            defer if (issue_valid) issue.deinit(ctx.alloc);
+            if (issue_valid) {
+                const expected_issue_key = try artifactRepairIssueKeyForIssueAlloc(ctx.alloc, issue);
+                defer ctx.alloc.free(expected_issue_key);
+                issue_valid = std.mem.eql(u8, issue.index_name, index_name) and
+                    std.mem.eql(u8, expected_issue_key, row.key);
+                if (!issue_valid) {
+                    issue.deinit(ctx.alloc);
+                    std.log.warn("retired index cleanup removed mismatched artifact repair issue index={s}", .{index_name});
+                }
+            }
+
+            const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(
+                ctx.alloc,
+                parts.repair_artifact_kind,
+                parts.issue_id,
+            );
+            var completion_key_local = true;
+            defer if (completion_key_local) ctx.alloc.free(completion_key);
+            if (!issue_valid) {
+                // Completion fences are only a single-flight optimization. A
+                // corrupt consumer value cannot safely contribute to their
+                // shared count, so discard the fence rather than let stale
+                // completed state suppress future repair.
+                try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, completion_key);
+                completion_key_local = false;
+                continue;
+            }
+            if (issue.reason != .enrichment_failed) {
+                continue;
+            }
+
+            const completion = (try loadArtifactRepairCompletionStateFromStore(
+                ctx.alloc,
+                ctx.store,
+                completion_key,
+            )) orelse continue;
+            var updated_completion = completion;
+            updated_completion.pending_issues -|= 1;
+            if (updated_completion.pending_issues == 0) {
+                try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, completion_key);
+                completion_key_local = false;
+            } else {
+                const owned_len = owned_keys.items.len;
+                owned_keys.append(ctx.alloc, completion_key) catch |err| {
+                    return err;
+                };
+                errdefer owned_keys.shrinkRetainingCapacity(owned_len);
+                const encoded = try ctx.alloc.create([artifact_repair_completion_state_len]u8);
+                errdefer ctx.alloc.destroy(encoded);
+                encodeArtifactRepairCompletionState(encoded, updated_completion);
+                try writes.append(ctx.alloc, .{ .key = completion_key, .value = encoded });
+                completion_key_local = false;
+            }
+        }
+
+        try appendArtifactRepairSummaryDirtyMarkerForStore(ctx.alloc, &writes, &deletes, &owned_keys);
+        try ctx.store.putBatch(writes.items, deletes.items);
+        return true;
     }
 
     fn finalizeRetiredIndexCleanupContext(ctx: *AsyncContext, index_name: []const u8, cleanup_key: []const u8) !void {
@@ -8946,7 +9187,15 @@ pub const DB = struct {
         };
         defer if (raw_progress) |value| alloc.free(value);
 
-        if (raw_progress == null and (try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) {
+        const invalidation_pending = if (raw_progress) |progress|
+            std.mem.eql(u8, progress, artifact_repair_summary_dirty_marker)
+        else
+            false;
+        if (invalidation_pending and try self.drainArtifactRepairSummaryRebuildInvalidationPage(alloc)) {
+            return true;
+        }
+
+        if (!invalidation_pending and raw_progress == null and (try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) {
             const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
             defer alloc.free(ready_key);
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -8961,7 +9210,7 @@ pub const DB = struct {
             try self.core.store.putBatchWithReplayWithOptions(null, writes[0..], deletes.items, null, .{ .defer_commit_flush = true });
             return false;
         }
-        if (raw_progress == null) {
+        if (!invalidation_pending and raw_progress == null) {
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer deletes.deinit(alloc);
             var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -8981,6 +9230,7 @@ pub const DB = struct {
         defer if (upper) |buf| alloc.free(buf);
 
         const lower = lower: {
+            if (invalidation_pending) break :lower try alloc.dupe(u8, prefix);
             const progress = raw_progress orelse break :lower try alloc.dupe(u8, prefix);
             if (!std.mem.startsWith(u8, progress, prefix)) break :lower try alloc.dupe(u8, prefix);
             var lower = try alloc.alloc(u8, progress.len + 1);
@@ -9144,6 +9394,31 @@ pub const DB = struct {
         }
         try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .defer_commit_flush = true });
         return false;
+    }
+
+    fn drainArtifactRepairSummaryRebuildInvalidationPage(self: *DB, alloc: Allocator) !bool {
+        const prefix = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+        defer alloc.free(prefix);
+        const rows = try self.core.store.scanPrefixPage(
+            alloc,
+            prefix,
+            null,
+            artifact_repair_summary_invalidation_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        if (rows.len == 0) return false;
+
+        const deletes = try alloc.alloc([]const u8, rows.len);
+        defer alloc.free(deletes);
+        for (rows, 0..) |row, i| deletes[i] = row.key;
+        try self.core.store.putBatchWithReplayWithOptions(
+            null,
+            &.{},
+            deletes,
+            null,
+            .{ .defer_commit_flush = true },
+        );
+        return true;
     }
 
     fn artifactRepairKindIndexReady(self: *DB, alloc: Allocator) !bool {
@@ -36484,6 +36759,30 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
     owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
     retire_generation: bool,
 ) !void {
+    _ = try appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+        alloc,
+        store,
+        repair_issue_key,
+        deletes,
+        owned_delete_keys,
+    );
+    if (retire_generation) {
+        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+        errdefer alloc.free(generation_key);
+        const owned_len = owned_delete_keys.items.len;
+        try owned_delete_keys.append(alloc, generation_key);
+        errdefer owned_delete_keys.shrinkRetainingCapacity(owned_len);
+        try deletes.append(alloc, generation_key);
+    }
+}
+
+fn appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !usize {
     const prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, repair_issue_key);
     defer alloc.free(prefix);
     const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
@@ -36499,7 +36798,9 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
         fn appendOwned(self: *@This(), value: []const u8) !void {
             const owned = try self.alloc.dupe(u8, value);
             errdefer self.alloc.free(owned);
+            const owned_len = self.owned_delete_keys.items.len;
             try self.owned_delete_keys.append(self.alloc, owned);
+            errdefer self.owned_delete_keys.shrinkRetainingCapacity(owned_len);
             try self.deletes.append(self.alloc, owned);
         }
 
@@ -36537,12 +36838,7 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
         .owned_delete_keys = owned_delete_keys,
     };
     try store.scanWithContext(prefix, if (upper) |value| value else "", .{}, &state, ScanState.scanEntry);
-    if (retire_generation) {
-        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
-        errdefer alloc.free(generation_key);
-        try owned_delete_keys.append(alloc, generation_key);
-        try deletes.append(alloc, generation_key);
-    }
+    return state.entries_examined;
 }
 
 fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
@@ -37567,27 +37863,29 @@ fn decodeArtifactRepairIssueValueAlloc(alloc: Allocator, raw: []const u8) !types
     const kind = std.meta.stringToEnum(types.ArtifactRepairKind, Fields.string(obj, "artifact_kind")) orelse .embedding;
     const reason = std.meta.stringToEnum(types.ArtifactRepairReason, Fields.string(obj, "reason")) orelse .missing_artifact;
     const default_repairable = artifactRepairKindHasAutomatedReprocessor(kind);
-    return .{
+    var issue = types.ArtifactRepairIssue{
         .artifact_kind = kind,
-        .index_name = try alloc.dupe(u8, Fields.string(obj, "index_name")),
-        .doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key")),
-        .parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key")),
-        .unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id")),
-        .source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name")),
-        .artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name")),
-        .artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key")),
         .chunk_id = Fields.optionalU32(obj, "chunk_id"),
         .repairable = Fields.boolValue(obj, "repairable", default_repairable),
-        .unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason")),
         .sequence = Fields.u64Value(obj, "sequence"),
         .reason = reason,
         .generation_attempts = Fields.u64Value(obj, "generation_attempts"),
-        .generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error")),
         .attempts = Fields.u64Value(obj, "attempts"),
         .first_seen_ns = Fields.u64Value(obj, "first_seen_ns"),
         .last_seen_ns = Fields.u64Value(obj, "last_seen_ns"),
-        .last_error = try alloc.dupe(u8, Fields.string(obj, "last_error")),
     };
+    errdefer issue.deinit(alloc);
+    issue.index_name = try alloc.dupe(u8, Fields.string(obj, "index_name"));
+    issue.doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key"));
+    issue.parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key"));
+    issue.unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id"));
+    issue.source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name"));
+    issue.artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name"));
+    issue.artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key"));
+    issue.unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason"));
+    issue.generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error"));
+    issue.last_error = try alloc.dupe(u8, Fields.string(obj, "last_error"));
+    return issue;
 }
 
 fn loadArtifactRepairIssueFromStoreByKey(
@@ -37721,6 +38019,33 @@ fn appendArtifactRepairSummaryDirtyForStore(
     errdefer owned_delete_keys.shrinkRetainingCapacity(owned_len);
     try deletes.append(alloc, ready_key);
     try appendArtifactRepairSummaryRebuildInvalidationForStore(alloc, store, writes, deletes, owned_delete_keys);
+}
+
+/// Invalidate summary publication in constant space. Retired-index cleanup
+/// already owns the global apply lock, so a rebuild cannot commit over this
+/// marker; maintenance drains any shadow state in bounded pages before it
+/// starts a fresh summary pass.
+fn appendArtifactRepairSummaryDirtyMarkerForStore(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    errdefer alloc.free(ready_key);
+    const ready_owned_len = owned_keys.items.len;
+    try owned_keys.append(alloc, ready_key);
+    errdefer owned_keys.shrinkRetainingCapacity(ready_owned_len);
+    try deletes.append(alloc, ready_key);
+
+    const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+    errdefer alloc.free(progress_key);
+    const progress_owned_len = owned_keys.items.len;
+    try owned_keys.append(alloc, progress_key);
+    errdefer owned_keys.shrinkRetainingCapacity(progress_owned_len);
+    const dirty_value = try alloc.dupe(u8, artifact_repair_summary_dirty_marker);
+    errdefer alloc.free(dirty_value);
+    try writes.append(alloc, .{ .key = progress_key, .value = dirty_value });
 }
 
 const artifact_repair_completion_state_len = 24;
@@ -57227,6 +57552,77 @@ test "db artifact repair summary rebuild invalidates partial counters on mutatio
     }
 }
 
+test "db artifact repair dirty marker drains shadow summaries in bounded pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var encoded_count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_count, 1, .little);
+    for (0..artifact_repair_summary_invalidation_page_size + 1) |i| {
+        const index_name = try std.fmt.allocPrint(alloc, "index-{d:0>4}", .{i});
+        defer alloc.free(index_name);
+        const key = try internal_keys.artifactRepairSummaryRebuildIndexKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        try db.core.store.put(key, &encoded_count);
+    }
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| alloc.free(@constCast(write.value));
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(@constCast(key));
+        owned_keys.deinit(alloc);
+    }
+    try appendArtifactRepairSummaryDirtyMarkerForStore(alloc, &writes, &deletes, &owned_keys);
+    try db.core.store.putBatch(writes.items, deletes.items);
+
+    try std.testing.expect(try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    const rebuild_prefix = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+    defer alloc.free(rebuild_prefix);
+    {
+        const rows = try db.core.store.scanPrefixPage(
+            alloc,
+            rebuild_prefix,
+            null,
+            artifact_repair_summary_invalidation_page_size + 1,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+    }
+    const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+    defer alloc.free(progress_key);
+    {
+        const progress = try db.core.store.get(alloc, progress_key);
+        defer alloc.free(progress);
+        try std.testing.expectEqualStrings(artifact_repair_summary_dirty_marker, progress);
+    }
+
+    try std.testing.expect(try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    {
+        const rows = try db.core.store.scanPrefixPage(alloc, rebuild_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+    try std.testing.expect(!try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    try std.testing.expect(try db.artifactRepairSummaryReady(alloc));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, progress_key));
+}
+
 test "db artifact repair summary store writer invalidates partial rebuild" {
     const alloc = std.testing.allocator;
 
@@ -60261,12 +60657,53 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     }
     try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
+    // One coalesced issue may accumulate more terminal-failure history than a
+    // single retirement page during a prolonged provider outage. Admission
+    // must remain fenced until all of it is gone, rather than shifting cleanup
+    // and fail-closed retries onto the replacement generation's first writes.
+    const retired_issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = cfg.name,
+        .doc_key = "doc:retired",
+        .artifact_name = cfg.name,
+        .artifact_key = "retired-generation-artifact",
+        .reason = .enrichment_failed,
+    };
+    for (0..enrichment_terminal_failure_retirement_page_size + 7) |i| {
+        var sequenced = retired_issue;
+        sequenced.sequence = 10_000 + @as(u64, @intCast(i));
+        try db.recordArtifactRepairIssue(alloc, sequenced);
+    }
+    const retired_issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, retired_issue);
+    defer alloc.free(retired_issue_key);
+    const retired_marker_prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, retired_issue_key);
+    defer alloc.free(retired_marker_prefix);
+    {
+        const marker_rows = try db.core.store.scanPrefixPage(alloc, retired_marker_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, marker_rows);
+        try std.testing.expectEqual(@as(usize, 1), marker_rows.len);
+    }
+    const retired_generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, retired_issue_key);
+    defer alloc.free(retired_generation_key);
+    const retired_completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(alloc, retired_issue);
+    defer alloc.free(retired_completion_key);
+
     const delete_started_ns = monotonicTimeNs();
     try std.testing.expect(try db.deleteIndex("semantic_idx"));
     try std.testing.expect(monotonicTimeNs() - delete_started_ns < 2 * std.time.ns_per_s);
 
     gated.allowAll();
     db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    {
+        const issues = try db.listArtifactRepairIssues(alloc, .embedding, cfg.name, 0);
+        defer types.freeArtifactRepairIssues(alloc, issues);
+        try std.testing.expectEqual(@as(usize, 0), issues.len);
+        const marker_rows = try db.core.store.scanPrefixPage(alloc, retired_marker_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, marker_rows);
+        try std.testing.expectEqual(@as(usize, 0), marker_rows.len);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retired_generation_key));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retired_completion_key));
+    }
     try db.addIndex(cfg);
     try db.runUntilIdle();
 
@@ -60276,6 +60713,166 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     try std.testing.expect(!stats.enrichment.worker_failed);
     try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].doc_count);
     try std.testing.expect(stats.indexes[0].replay_applied_sequence >= stats.indexes[0].replay_target_sequence);
+    try std.testing.expect(stats.indexes[0].repair_summary_ready);
+    try std.testing.expect(!stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].repair_issue_count);
+}
+
+test "retired repair cleanup propagates allocation failures from durable metadata parsing" {
+    const alloc = std.testing.allocator;
+    const issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = "retired_index",
+        .doc_key = "doc:retired",
+        .artifact_name = "retired_index",
+        .artifact_key = "retired-physical-artifact",
+        .reason = .enrichment_failed,
+    };
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const encoded_issue = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+    defer alloc.free(encoded_issue);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, key: []const u8) !void {
+                var parsed = try DB.parseRetiredArtifactRepairIssueKeyAlloc(failing_alloc, key);
+                switch (parsed) {
+                    .valid => |*parts| parts.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueKey,
+                }
+            }
+        }.run,
+        .{issue_key},
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, raw: []const u8) !void {
+                var decoded = try DB.decodeRetiredArtifactRepairIssueAlloc(failing_alloc, raw);
+                switch (decoded) {
+                    .valid => |*value| value.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueValue,
+                }
+            }
+        }.run,
+        .{encoded_issue},
+    );
+
+    const malformed_key = try DB.parseRetiredArtifactRepairIssueKeyAlloc(alloc, "not-an-internal-key");
+    switch (malformed_key) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueKey;
+        },
+        .malformed => {},
+    }
+    const malformed_value = try DB.decodeRetiredArtifactRepairIssueAlloc(alloc, "{");
+    switch (malformed_value) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueValue;
+        },
+        .malformed => {},
+    }
+}
+
+test "retired repair cleanup resumes marker retirement and removes corrupt sidecars after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = "retired_index",
+        .doc_key = "doc:retired",
+        .artifact_name = "retired_index",
+        .artifact_key = "retired-physical-artifact",
+        .reason = .enrichment_failed,
+    };
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const marker_prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, issue_key);
+    defer alloc.free(marker_prefix);
+    const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, issue_key);
+    defer alloc.free(generation_key);
+    const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(
+        alloc,
+        @tagName(issue.artifact_kind),
+        issue.artifact_key,
+    );
+    defer alloc.free(completion_key);
+    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(kind_key);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        for (0..enrichment_terminal_failure_retirement_page_size + 7) |i| {
+            var sequenced = issue;
+            sequenced.sequence = 20_000 + @as(u64, @intCast(i));
+            try db.recordArtifactRepairIssue(alloc, sequenced);
+        }
+        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        // The primary key remains trustworthy even when the payload does not.
+        // Cleanup must use it to drain marker, generation, secondary, and
+        // single-flight sidecars without following corrupt value fields.
+        try db.core.store.put(issue_key, "malformed-repair-issue");
+
+        try std.testing.expect(try DB.drainRetiredIndexArtifactRepairIssuesPageContext(
+            db.async_context,
+            issue.index_name,
+        ));
+        const primary = try db.core.store.get(alloc, issue_key);
+        alloc.free(primary);
+        const remaining_markers = try db.core.store.scanPrefixPage(
+            alloc,
+            marker_prefix,
+            null,
+            enrichment_terminal_failure_retirement_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
+        try std.testing.expectEqual(@as(usize, 7), remaining_markers.len);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    var drained = false;
+    for (0..8) |_| {
+        if (!try DB.drainRetiredIndexArtifactRepairIssuesPageContext(
+            reopened.async_context,
+            issue.index_name,
+        )) {
+            drained = true;
+            break;
+        }
+    }
+    try std.testing.expect(drained);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, issue_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, kind_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, generation_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, completion_key));
+    const remaining_markers = try reopened.core.store.scanPrefixPage(alloc, marker_prefix, null, 1);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
+    try std.testing.expectEqual(@as(usize, 0), remaining_markers.len);
+
+    try reopened.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try std.testing.expect(try reopened.artifactRepairSummaryReady(alloc));
 }
 
 test "db dense checkpoint persistence serializes with index apply" {
