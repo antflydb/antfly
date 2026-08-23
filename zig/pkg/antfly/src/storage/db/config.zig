@@ -65,6 +65,12 @@ pub const PrimaryBackend = union(enum) {
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
+    // Public bulk transactions are already coalesced and sorted. Publish them
+    // directly at half the ordinary mutable flush size so status/catch-up
+    // readers do not repeatedly snapshot an accumulating vector-heavy epoch.
+    // This also replaces several split immutable flushes with one owned-state
+    // ingest while retaining a meaningful lower bound for small bulk calls.
+    .direct_bulk_ingest_min_bytes = 16 * 1024 * 1024,
     // Preserve throughput batching while bounding retained WAL for every
     // workload shape. Meaningful bursts checkpoint promptly; low-rate tables
     // accumulate instead of producing one run per write and checkpoint at the
@@ -575,6 +581,7 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
     try std.testing.expectEqual(@as(u64, 0), primary_opts.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);

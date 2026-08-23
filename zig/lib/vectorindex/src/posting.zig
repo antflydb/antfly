@@ -48,6 +48,11 @@ pub const PostingMaintenanceOptions = struct {
     max_layout_changes: usize = std.math.maxInt(usize),
     max_boundary_reassignments: usize = 0,
     boundary_reassignment_min_improvement: f32 = 0.0,
+    /// Optional cooperative cancellation for background repair. A stopped
+    /// transaction still commits every complete posting repaired so far and
+    /// reports `limit_reached`, allowing the next idle round to resume.
+    should_continue: ?*const fn (context: *anyopaque) bool = null,
+    continue_context: ?*anyopaque = null,
 };
 
 pub const PostingMaintenanceResult = struct {

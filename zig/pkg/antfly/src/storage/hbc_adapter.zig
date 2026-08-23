@@ -1416,6 +1416,30 @@ const ExperimentalPostingMaterializedValue = struct {
     owned: bool,
 };
 
+const experimental_posting_patch_cache_shards = 64;
+
+const ExperimentalPostingPatchCacheShard = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    values: std.AutoHashMapUnmanaged(u128, []u8) = .empty,
+
+    fn deinit(self: *ExperimentalPostingPatchCacheShard, alloc: Allocator) void {
+        var values = self.values.valueIterator();
+        while (values.next()) |value| alloc.free(value.*);
+        self.values.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const ExperimentalPostingResolvedValue = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: *ExperimentalPostingResolvedValue, alloc: Allocator) void {
+        if (self.owned) |bytes| alloc.free(bytes);
+        self.* = undefined;
+    }
+};
+
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
@@ -1430,11 +1454,17 @@ const ExperimentalPostingReadState = struct {
     wal_bytes: ?[]u8 = null,
     wal_committed_bytes: u64,
     materialized: std.AutoHashMapUnmanaged(u128, ExperimentalPostingMaterializedValue) = .empty,
+    // Immutable patch values are decoded only when a query or mutation first
+    // touches them. Sharding avoids serializing cold concurrent queries, and
+    // cached allocations remain stable for the lifetime of this leased root.
+    patch_cache: [experimental_posting_patch_cache_shards]ExperimentalPostingPatchCacheShard =
+        [_]ExperimentalPostingPatchCacheShard{.{}} ** experimental_posting_patch_cache_shards,
 
     fn deinit(self: *ExperimentalPostingReadState) void {
         var values = self.materialized.valueIterator();
         while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
+        for (&self.patch_cache) |*shard| shard.deinit(self.alloc);
         if (self.wal_bytes) |bytes| self.alloc.free(bytes);
         for (self.segments) |*segment| segment.deinit();
         self.alloc.free(self.segments);
@@ -1444,7 +1474,8 @@ const ExperimentalPostingReadState = struct {
     }
 
     fn value(self: *ExperimentalPostingReadState, posting_id: u64, kind: vectorindex_posting_wal.RecordKind) !?[]const u8 {
-        if (self.materialized.get(experimentalPostingValueKey(posting_id, kind))) |materialized| {
+        const key = experimentalPostingValueKey(posting_id, kind);
+        if (self.materialized.get(key)) |materialized| {
             return materialized.bytes orelse error.NotFound;
         }
         if (self.vector_directory) |directory| switch (kind) {
@@ -1464,16 +1495,79 @@ const ExperimentalPostingReadState = struct {
             },
             else => {},
         };
+        if (self.cachedPatchedValue(key)) |cached| return cached;
+        var resolved = (try self.resolveSegmentValueAlloc(self.alloc, self.segments.len, posting_id, kind)) orelse return null;
+        defer resolved.deinit(self.alloc);
+        if (resolved.owned) |owned| {
+            resolved.owned = null;
+            return try self.cachePatchedValue(key, owned);
+        }
+        return resolved.bytes;
+    }
+
+    fn patchCacheShard(key: u128) usize {
+        const folded: u64 = @truncate(key ^ (key >> 64));
+        return @intCast(folded & (experimental_posting_patch_cache_shards - 1));
+    }
+
+    fn cachedPatchedValue(self: *ExperimentalPostingReadState, key: u128) ?[]const u8 {
+        const shard = &self.patch_cache[patchCacheShard(key)];
+        platform.sync.lockYielding(&shard.mutex);
+        defer shard.mutex.unlock();
+        return shard.values.get(key);
+    }
+
+    fn cachePatchedValue(self: *ExperimentalPostingReadState, key: u128, owned: []u8) ![]const u8 {
+        errdefer self.alloc.free(owned);
+        const shard = &self.patch_cache[patchCacheShard(key)];
+        platform.sync.lockYielding(&shard.mutex);
+        defer shard.mutex.unlock();
+        const result = try shard.values.getOrPut(self.alloc, key);
+        if (result.found_existing) {
+            self.alloc.free(owned);
+            return result.value_ptr.*;
+        }
+        result.value_ptr.* = owned;
+        return owned;
+    }
+
+    /// Resolves one logical value from a prefix of the immutable chain. Patch
+    /// entries are relative to the preceding prefix, so a bounded recursive
+    /// walk reconstructs at most six generations. Callers own only the final
+    /// reconstructed allocation; borrowed full values remain mmap-backed.
+    fn resolveSegmentValueAlloc(
+        self: *ExperimentalPostingReadState,
+        alloc: Allocator,
+        segment_count: usize,
+        posting_id: u64,
+        kind: vectorindex_posting_wal.RecordKind,
+    ) !?ExperimentalPostingResolvedValue {
         const entry_kind = experimentalPostingSegmentKind(kind) orelse return null;
-        var index = self.segments.len;
+        var index = segment_count;
         while (index > 1) {
             index -= 1;
-            if (try self.segments[index].getValue(posting_id, entry_kind)) |value_bytes| return value_bytes;
+            if (try self.segments[index].getValue(posting_id, entry_kind)) |value_bytes| {
+                return .{ .bytes = value_bytes };
+            }
             if (experimentalPostingSegmentTombstoneKind(kind)) |tombstone_kind| {
                 if (try self.segments[index].getValue(posting_id, tombstone_kind)) |_| return error.NotFound;
             }
+            if (experimentalPostingSegmentPatchKind(kind)) |patch_kind| {
+                if (try self.segments[index].getValue(posting_id, patch_kind)) |patch_bytes| {
+                    var base = (try self.resolveSegmentValueAlloc(alloc, index, posting_id, kind)) orelse
+                        return error.PostingPatchBaseMismatch;
+                    defer base.deinit(alloc);
+                    const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, patch_bytes, base.bytes);
+                    if (decoded.target != kind) {
+                        alloc.free(decoded.replacement);
+                        return error.InvalidPostingPatchTarget;
+                    }
+                    return .{ .bytes = decoded.replacement, .owned = decoded.replacement };
+                }
+            }
         }
-        return try self.segments[0].getValue(posting_id, entry_kind);
+        const value_bytes = (try self.segments[0].getValue(posting_id, entry_kind)) orelse return null;
+        return .{ .bytes = value_bytes };
     }
 
     fn replaceMaterialized(
@@ -1577,25 +1671,36 @@ fn experimentalPostingSegmentTombstoneKind(kind: vectorindex_posting_wal.RecordK
     };
 }
 
+fn experimentalPostingSegmentPatchKind(kind: vectorindex_posting_wal.RecordKind) ?vectorindex_posting_segment.EntryKind {
+    return switch (kind) {
+        .base => .base_patch,
+        .quantized_checkpoint => .quantized_checkpoint_patch,
+        else => null,
+    };
+}
+
 fn experimentalPostingWalKindFromSegment(kind: vectorindex_posting_segment.EntryKind) ?struct {
     kind: vectorindex_posting_wal.RecordKind,
     tombstone: bool,
+    patch: bool,
 } {
     return switch (kind) {
-        .base => .{ .kind = .base, .tombstone = false },
-        .quantized_checkpoint => .{ .kind = .quantized_checkpoint, .tombstone = false },
-        .posting_state => .{ .kind = .posting_state, .tombstone = false },
-        .node_range => .{ .kind = .node_range, .tombstone = false },
-        .vector_leaf => .{ .kind = .vector_leaf, .tombstone = false },
-        .vector_metadata => .{ .kind = .vector_metadata, .tombstone = false },
-        .index_metadata => .{ .kind = .index_metadata, .tombstone = false },
-        .base_tombstone => .{ .kind = .base, .tombstone = true },
-        .quantized_checkpoint_tombstone => .{ .kind = .quantized_checkpoint, .tombstone = true },
-        .posting_state_tombstone => .{ .kind = .posting_state, .tombstone = true },
-        .node_range_tombstone => .{ .kind = .node_range, .tombstone = true },
-        .vector_leaf_tombstone => .{ .kind = .vector_leaf, .tombstone = true },
-        .vector_metadata_tombstone => .{ .kind = .vector_metadata, .tombstone = true },
-        .index_metadata_tombstone => .{ .kind = .index_metadata, .tombstone = true },
+        .base => .{ .kind = .base, .tombstone = false, .patch = false },
+        .quantized_checkpoint => .{ .kind = .quantized_checkpoint, .tombstone = false, .patch = false },
+        .posting_state => .{ .kind = .posting_state, .tombstone = false, .patch = false },
+        .node_range => .{ .kind = .node_range, .tombstone = false, .patch = false },
+        .vector_leaf => .{ .kind = .vector_leaf, .tombstone = false, .patch = false },
+        .vector_metadata => .{ .kind = .vector_metadata, .tombstone = false, .patch = false },
+        .index_metadata => .{ .kind = .index_metadata, .tombstone = false, .patch = false },
+        .base_tombstone => .{ .kind = .base, .tombstone = true, .patch = false },
+        .quantized_checkpoint_tombstone => .{ .kind = .quantized_checkpoint, .tombstone = true, .patch = false },
+        .posting_state_tombstone => .{ .kind = .posting_state, .tombstone = true, .patch = false },
+        .node_range_tombstone => .{ .kind = .node_range, .tombstone = true, .patch = false },
+        .vector_leaf_tombstone => .{ .kind = .vector_leaf, .tombstone = true, .patch = false },
+        .vector_metadata_tombstone => .{ .kind = .vector_metadata, .tombstone = true, .patch = false },
+        .index_metadata_tombstone => .{ .kind = .index_metadata, .tombstone = true, .patch = false },
+        .base_patch => .{ .kind = .base, .tombstone = false, .patch = true },
+        .quantized_checkpoint_patch => .{ .kind = .quantized_checkpoint, .tombstone = false, .patch = true },
         else => null,
     };
 }
@@ -1754,6 +1859,7 @@ fn collectExperimentalPostingCompactionValues(
     alloc: Allocator,
     generation: *ExperimentalPostingReadGeneration,
     latest: *ExperimentalPostingLatestValues,
+    reconstructed_values: *std.ArrayListUnmanaged([]u8),
 ) !void {
     try collectExperimentalPostingLatestValues(alloc, generation, latest);
     const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
@@ -1764,7 +1870,23 @@ fn collectExperimentalPostingCompactionValues(
         while (try entries.next()) |entry| {
             const decoded = experimentalPostingWalKindFromSegment(entry.kind) orelse continue;
             const result = try latest.getOrPut(alloc, experimentalPostingValueKey(entry.id, decoded.kind));
-            if (!result.found_existing) result.value_ptr.* = if (decoded.tombstone) null else entry.value;
+            if (!result.found_existing) {
+                result.value_ptr.* = if (decoded.tombstone)
+                    null
+                else if (decoded.patch) blk: {
+                    var resolved = (try root.resolveSegmentValueAlloc(
+                        alloc,
+                        root.segments.len,
+                        entry.id,
+                        decoded.kind,
+                    )) orelse return error.PostingPatchBaseMismatch;
+                    defer resolved.deinit(alloc);
+                    const owned = resolved.owned orelse return error.PostingPatchBaseMismatch;
+                    try reconstructed_values.append(alloc, owned);
+                    resolved.owned = null;
+                    break :blk owned;
+                } else entry.value;
+            }
         }
     }
 }
@@ -1848,6 +1970,9 @@ pub const PostingCheckpointStats = struct {
 const ExperimentalPostingCheckpointBuildResult = struct {
     segment_bytes: []u8,
     posting_count: u64,
+    patch_count: u64 = 0,
+    patched_value_bytes: u64 = 0,
+    encoded_patch_bytes: u64 = 0,
 };
 
 const ExperimentalPostingCheckpointKind = enum { full, delta };
@@ -1955,24 +2080,35 @@ pub const ExperimentalPostingWalAppendOptions = struct {
 const managedPostingOverlayCollapseBytes: u64 = 32 * 1024 * 1024;
 const managedPostingIdleCheckpointWalBytes: u64 = 64 * 1024 * 1024;
 const managedPostingDeltaCheckpointWalBytes: u64 = 128 * 1024 * 1024;
+const managedPostingFullCheckpointWalBytes: u64 = 192 * 1024 * 1024;
 const managedPostingCheckpointHardWalBytes: u64 = 256 * 1024 * 1024;
-const managedPostingMaxDeltaSegments: usize = 6;
+// Patched deltas are much smaller than full generations, but every cold value
+// lookup must replay its patch chain before the decoded node/quantized caches
+// can take over. Two deltas retain most of the write-amplification win without
+// turning restart or the first query sweep into a six-generation point-read.
+const managedPostingMaxDeltaSegments: usize = 2;
 
 fn shouldStartExperimentalPostingCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
     // A delta writes only changed tree state, while a max-chain checkpoint
-    // faults and rewrites the entire visible generation. Give that full merge
-    // twice the WAL budget so its cost is amortized without weakening the
-    // existing hard recovery bound.
+    // faults and rewrites the entire visible generation. Amortize that merge,
+    // but start it below the hard recovery ceiling: the immutable patch chain
+    // is also read amplification, not merely recovery debt.
     const threshold = if (delta_segment_count < managedPostingMaxDeltaSegments)
         managedPostingDeltaCheckpointWalBytes
     else
-        managedPostingCheckpointHardWalBytes;
+        managedPostingFullCheckpointWalBytes;
     return wal_bytes >= threshold;
 }
 
 fn shouldStartExperimentalPostingIdleCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
-    return wal_bytes >= managedPostingIdleCheckpointWalBytes and
-        delta_segment_count < managedPostingMaxDeltaSegments;
+    // At a real idle/readiness boundary, flatten a max-depth chain as well.
+    // The build runs against a retained generation and yields to foreground
+    // queries, so publication stays non-blocking while subsequent cold reads
+    // stop paying accumulated patch decoding. Generations written by an older
+    // policy may already exceed the current bound; migrate those even with a
+    // short WAL tail.
+    return delta_segment_count > managedPostingMaxDeltaSegments or
+        wal_bytes >= managedPostingIdleCheckpointWalBytes;
 }
 
 const ExperimentalPostingMaintenanceCapture = struct {
@@ -4069,13 +4205,16 @@ pub const HBCIndex = struct {
                 staged,
             ),
         }
-        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} kind={s} wal_tail_bytes={} chain_deltas={}", .{
+        std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} kind={s} wal_tail_bytes={} chain_deltas={} patches={} patched_value_bytes={} encoded_patch_bytes={}", .{
             build.segment_generation,
             build.covered_source_sequence,
             result.segment_bytes.len,
             @tagName(build.kind),
             posting_store.wal_committed_bytes,
             posting_store.deltaSegmentCount(),
+            result.patch_count,
+            result.patched_value_bytes,
+            result.encoded_patch_bytes,
         });
         self.discardExperimentalPostingDeltaBaseState();
         self.refreshExperimentalPostingReadGenerationBestEffort(posting_store.covered_source_sequence);
@@ -4677,13 +4816,14 @@ pub const HBCIndex = struct {
         covered_source_sequence: u64,
         foreground_manager: ?*resource_manager_mod.ResourceManager,
         force_progress: ?*const std.atomic.Value(bool),
+        reconstructed_values: *std.ArrayListUnmanaged([]u8),
     ) !?u64 {
         const root = experimentalPostingRootState(generation) orelse return null;
         const base_directory = root.vector_directory orelse return null;
 
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
-        try collectExperimentalPostingCompactionValues(alloc, generation, &latest);
+        try collectExperimentalPostingCompactionValues(alloc, generation, &latest, reconstructed_values);
 
         var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
@@ -4773,6 +4913,11 @@ pub const HBCIndex = struct {
     ) !ExperimentalPostingCheckpointBuildResult {
         var writer = vectorindex_posting_segment.Writer.init(alloc);
         defer writer.deinit();
+        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (reconstructed_values.items) |value| alloc.free(value);
+            reconstructed_values.deinit(alloc);
+        }
         const posting_count = (try appendExperimentalPostingCheckpointFromGeneration(
             alloc,
             &writer,
@@ -4781,6 +4926,7 @@ pub const HBCIndex = struct {
             covered_source_sequence,
             foreground_manager,
             force_progress,
+            &reconstructed_values,
         )) orelse return error.MissingPostingCheckpoint;
         return .{
             .segment_bytes = try writer.build(),
@@ -4788,10 +4934,12 @@ pub const HBCIndex = struct {
         };
     }
 
-    /// Encodes only complete replacement values changed since the immutable
-    /// root. WAL patches have already been materialized by the read generation,
-    /// so recovery never depends on an older WAL after CURRENT rotates. Exact
-    /// per-kind tombstones distinguish deletion from absence in this delta.
+    /// Encodes values changed since the immutable root. Large packed-node and
+    /// quantized values use AFPD replacement patches when smaller than the
+    /// complete value; the patch is relative to the preceding CURRENT chain,
+    /// not to a WAL that will be rotated away. Small families stay as direct
+    /// replacements and exact per-kind tombstones distinguish deletion from
+    /// absence.
     fn buildExperimentalPostingDeltaFromGeneration(
         alloc: Allocator,
         generation: *ExperimentalPostingReadGeneration,
@@ -4800,18 +4948,56 @@ pub const HBCIndex = struct {
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
         try collectExperimentalPostingLatestValues(alloc, generation, &latest);
+        const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
 
         var writer = vectorindex_posting_segment.Writer.init(alloc);
         defer writer.deinit();
         var posting_count: u64 = 0;
+        var patch_count: u64 = 0;
+        var patched_value_bytes: u64 = 0;
+        var encoded_patch_bytes: u64 = 0;
         var it = latest.iterator();
         while (it.next()) |entry| {
             const id = experimentalPostingValueKeyId(entry.key_ptr.*);
             const record_kind = try experimentalPostingValueKeyKind(entry.key_ptr.*);
             if (entry.value_ptr.*) |value_bytes| {
-                const segment_kind = experimentalPostingSegmentKind(record_kind) orelse
-                    return error.InvalidPostingPatchTarget;
-                try writer.appendValueBorrowedAt(id, segment_kind, covered_source_sequence, value_bytes);
+                var emitted_patch = false;
+                if (experimentalPostingSegmentPatchKind(record_kind)) |patch_kind| {
+                    var base_value = root.resolveSegmentValueAlloc(
+                        alloc,
+                        root.segments.len,
+                        id,
+                        record_kind,
+                    ) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (base_value) |*base| {
+                        defer base.deinit(alloc);
+                        const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(
+                            alloc,
+                            record_kind,
+                            base.bytes,
+                            value_bytes,
+                        );
+                        if (patch.len < value_bytes.len) {
+                            patch_count = std.math.add(u64, patch_count, 1) catch return error.PostingSegmentTooLarge;
+                            patched_value_bytes = std.math.add(u64, patched_value_bytes, value_bytes.len) catch
+                                return error.PostingSegmentTooLarge;
+                            encoded_patch_bytes = std.math.add(u64, encoded_patch_bytes, patch.len) catch
+                                return error.PostingSegmentTooLarge;
+                            try writer.appendValueOwnedAt(id, patch_kind, covered_source_sequence, patch);
+                            emitted_patch = true;
+                        } else {
+                            alloc.free(patch);
+                        }
+                    }
+                }
+                if (!emitted_patch) {
+                    const segment_kind = experimentalPostingSegmentKind(record_kind) orelse
+                        return error.InvalidPostingPatchTarget;
+                    try writer.appendValueBorrowedAt(id, segment_kind, covered_source_sequence, value_bytes);
+                }
                 if (record_kind == .base) posting_count += 1;
             } else {
                 const tombstone_kind = experimentalPostingSegmentTombstoneKind(record_kind) orelse
@@ -4822,6 +5008,9 @@ pub const HBCIndex = struct {
         return .{
             .segment_bytes = try writer.build(),
             .posting_count = posting_count,
+            .patch_count = patch_count,
+            .patched_value_bytes = patched_value_bytes,
+            .encoded_patch_bytes = encoded_patch_bytes,
         };
     }
 
@@ -4850,6 +5039,11 @@ pub const HBCIndex = struct {
             1;
         var writer = vectorindex_posting_segment.Writer.init(self.alloc);
         defer writer.deinit();
+        var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (reconstructed_values.items) |value| self.alloc.free(value);
+            reconstructed_values.deinit(self.alloc);
+        }
         var posting_count: u64 = 0;
 
         const flattened_generation = if (source_generation) |read_generation|
@@ -4861,6 +5055,7 @@ pub const HBCIndex = struct {
                 covered_source_sequence,
                 null,
                 null,
+                &reconstructed_values,
             )) |count| blk: {
                 posting_count = count;
                 break :blk true;
@@ -9115,6 +9310,25 @@ pub const HBCIndex = struct {
         return try self.repairDirtyPostingsWithOptions(.{});
     }
 
+    fn optionalPostingMaintenanceShouldContinue(context: *anyopaque) bool {
+        const self: *HBCIndex = @ptrCast(@alignCast(context));
+        const manager = self.resource_manager orelse return true;
+        return !manager.shouldDeferOptionalMaintenanceForForegroundQuery();
+    }
+
+    pub fn shouldDeferOptionalPostingMaintenance(self: *const HBCIndex) bool {
+        const manager = self.resource_manager orelse return false;
+        return manager.shouldDeferOptionalMaintenanceForForegroundQuery();
+    }
+
+    pub fn repairDirtyPostingsOptionalWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {
+        if (self.shouldDeferOptionalPostingMaintenance()) return .{ .limit_reached = true };
+        var cooperative = options;
+        cooperative.should_continue = optionalPostingMaintenanceShouldContinue;
+        cooperative.continue_context = self;
+        return try self.repairDirtyPostingsWithOptions(cooperative);
+    }
+
     pub fn repairDirtyPostingsWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {
         const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
         errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
@@ -10020,6 +10234,167 @@ test "insert and search" {
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
 }
 
+fn buildTestExperimentalPostingSegment(
+    alloc: Allocator,
+    id: u64,
+    kind: vectorindex_posting_segment.EntryKind,
+    sequence: u64,
+    value: []const u8,
+) ![]u8 {
+    var writer = vectorindex_posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendValueAt(id, kind, sequence, value);
+    return writer.build();
+}
+
+fn createTestExperimentalPostingReadState(
+    alloc: Allocator,
+    segment_bytes: []const []const u8,
+) !*ExperimentalPostingReadState {
+    if (segment_bytes.len == 0) return error.MissingPostingCheckpoint;
+    const state = try alloc.create(ExperimentalPostingReadState);
+    errdefer alloc.destroy(state);
+    const retained = try alloc.alloc(posting_segment_store_mod.RetainedSegment, segment_bytes.len);
+    errdefer alloc.free(retained);
+    const readers = try alloc.alloc(vectorindex_posting_segment.VerifiedReader, segment_bytes.len);
+    errdefer alloc.free(readers);
+    var initialized: usize = 0;
+    errdefer {
+        for (readers[0..initialized]) |*reader| reader.deinit();
+        for (retained[0..initialized]) |*segment| segment.deinit(alloc);
+    }
+    for (segment_bytes, 0..) |bytes, i| {
+        const owned = try alloc.dupe(u8, bytes);
+        errdefer alloc.free(owned);
+        readers[i] = try vectorindex_posting_segment.VerifiedReader.init(alloc, owned);
+        retained[i] = .{ .heap = owned };
+        initialized += 1;
+    }
+    state.* = .{
+        .alloc = alloc,
+        .covered_source_sequence = 1,
+        .retained_segments = retained,
+        .segments = readers,
+        .wal_committed_bytes = 0,
+    };
+    return state;
+}
+
+test "immutable posting replacement patches resolve bounded chains and compact logically" {
+    const alloc = std.testing.allocator;
+    const id: u64 = 41;
+    var base: [4096]u8 = undefined;
+    for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 193 +% i / 11);
+    var replacement_one: [4112]u8 = undefined;
+    @memcpy(replacement_one[0..2048], base[0..2048]);
+    @memset(replacement_one[2048..2064], 0x5a);
+    @memcpy(replacement_one[2064..], base[2048..]);
+    var replacement_two = replacement_one;
+    @memset(replacement_two[3000..3024], 0xa5);
+
+    const base_segment = try buildTestExperimentalPostingSegment(alloc, id, .base, 1, &base);
+    defer alloc.free(base_segment);
+    const patch_one = try vectorindex_posting_wal.encodeReplacementPatchAlloc(alloc, .base, &base, &replacement_one);
+    defer alloc.free(patch_one);
+    try std.testing.expect(patch_one.len < replacement_one.len / 8);
+    const delta_one = try buildTestExperimentalPostingSegment(alloc, id, .base_patch, 2, patch_one);
+    defer alloc.free(delta_one);
+    const patch_two = try vectorindex_posting_wal.encodeReplacementPatchAlloc(alloc, .base, &replacement_one, &replacement_two);
+    defer alloc.free(patch_two);
+    try std.testing.expect(patch_two.len < replacement_two.len / 8);
+    const delta_two = try buildTestExperimentalPostingSegment(alloc, id, .base_patch, 3, patch_two);
+    defer alloc.free(delta_two);
+
+    const state = try createTestExperimentalPostingReadState(alloc, &.{ base_segment, delta_one, delta_two });
+    const root = try ExperimentalPostingReadGeneration.createRoot(alloc, state);
+    defer root.release();
+
+    var compacted: ExperimentalPostingLatestValues = .empty;
+    defer compacted.deinit(alloc);
+    var reconstructed_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (reconstructed_values.items) |value| alloc.free(value);
+        reconstructed_values.deinit(alloc);
+    }
+    try collectExperimentalPostingCompactionValues(alloc, root, &compacted, &reconstructed_values);
+    try std.testing.expectEqualSlices(
+        u8,
+        &replacement_two,
+        compacted.get(experimentalPostingValueKey(id, .base)).?.?,
+    );
+    for (&state.patch_cache) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.values.count());
+
+    const first = (try root.value(id, .base)).?;
+    try std.testing.expectEqualSlices(u8, &replacement_two, first);
+    // A second lookup is the same leased cache allocation, not another full
+    // reconstruction of the chain.
+    try std.testing.expectEqual(first.ptr, (try root.value(id, .base)).?.ptr);
+
+    var replacement_three: [4128]u8 = undefined;
+    @memcpy(replacement_three[0..1024], replacement_two[0..1024]);
+    @memset(replacement_three[1024..1040], 0x3c);
+    @memcpy(replacement_three[1040..], replacement_two[1024..]);
+    const overlay = try ExperimentalPostingReadGeneration.createOverlay(alloc, root, 4);
+    defer overlay.release();
+    try overlay.set(id, .base, &replacement_three);
+    const built = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(alloc, overlay, 4);
+    defer alloc.free(built.segment_bytes);
+    var delta_reader = try vectorindex_posting_segment.VerifiedReader.init(alloc, built.segment_bytes);
+    defer delta_reader.deinit();
+    try std.testing.expect((try delta_reader.getValue(id, .base)) == null);
+    try std.testing.expect((try delta_reader.getValue(id, .base_patch)).?.len < replacement_three.len / 8);
+
+    const chained_state = try createTestExperimentalPostingReadState(
+        alloc,
+        &.{ base_segment, delta_one, delta_two, built.segment_bytes },
+    );
+    defer {
+        chained_state.deinit();
+        alloc.destroy(chained_state);
+    }
+    try std.testing.expectEqualSlices(u8, &replacement_three, (try chained_state.value(id, .base)).?);
+}
+
+test "immutable posting replacement patches reject wrong bases and targets" {
+    const alloc = std.testing.allocator;
+    const id: u64 = 17;
+    var base: [4096]u8 = undefined;
+    for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% i / 7);
+    var wrong_base = base;
+    wrong_base[0] +%= 1;
+    var replacement = wrong_base;
+    replacement[2048] +%= 1;
+
+    const base_segment = try buildTestExperimentalPostingSegment(alloc, id, .base, 1, &base);
+    defer alloc.free(base_segment);
+    const wrong_patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(alloc, .base, &wrong_base, &replacement);
+    defer alloc.free(wrong_patch);
+    const wrong_delta = try buildTestExperimentalPostingSegment(alloc, id, .base_patch, 2, wrong_patch);
+    defer alloc.free(wrong_delta);
+    const wrong_state = try createTestExperimentalPostingReadState(alloc, &.{ base_segment, wrong_delta });
+    defer {
+        wrong_state.deinit();
+        alloc.destroy(wrong_state);
+    }
+    try std.testing.expectError(error.PostingPatchBaseMismatch, wrong_state.value(id, .base));
+
+    const target_patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(
+        alloc,
+        .quantized_checkpoint,
+        &base,
+        &base,
+    );
+    defer alloc.free(target_patch);
+    const target_delta = try buildTestExperimentalPostingSegment(alloc, id, .base_patch, 2, target_patch);
+    defer alloc.free(target_delta);
+    const target_state = try createTestExperimentalPostingReadState(alloc, &.{ base_segment, target_delta });
+    defer {
+        target_state.deinit();
+        alloc.destroy(target_state);
+    }
+    try std.testing.expectError(error.InvalidPostingPatchTarget, target_state.value(id, .base));
+}
+
 test "experimental posting checkpoint reopens safely and publishes immutable generations" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -10240,7 +10615,7 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     try std.testing.expectEqual(@as(usize, 5), compacted_results.items.items.len);
 }
 
-test "idle posting checkpoint defers a max-chain full rewrite" {
+test "idle posting checkpoint flattens a max-depth patch chain" {
     try std.testing.expect(!shouldStartExperimentalPostingIdleCheckpoint(
         managedPostingIdleCheckpointWalBytes - 1,
         0,
@@ -10249,13 +10624,17 @@ test "idle posting checkpoint defers a max-chain full rewrite" {
         managedPostingIdleCheckpointWalBytes,
         managedPostingMaxDeltaSegments - 1,
     ));
-    try std.testing.expect(!shouldStartExperimentalPostingIdleCheckpoint(
+    try std.testing.expect(shouldStartExperimentalPostingIdleCheckpoint(
         managedPostingIdleCheckpointWalBytes,
         managedPostingMaxDeltaSegments,
     ));
+    try std.testing.expect(shouldStartExperimentalPostingIdleCheckpoint(
+        0,
+        managedPostingMaxDeltaSegments + 1,
+    ));
 }
 
-test "max-chain full checkpoint receives the hard WAL budget" {
+test "max-chain full checkpoint starts below the hard WAL budget" {
     try std.testing.expect(!shouldStartExperimentalPostingCheckpoint(
         managedPostingDeltaCheckpointWalBytes - 1,
         0,
@@ -10265,13 +10644,14 @@ test "max-chain full checkpoint receives the hard WAL budget" {
         managedPostingMaxDeltaSegments - 1,
     ));
     try std.testing.expect(!shouldStartExperimentalPostingCheckpoint(
-        managedPostingCheckpointHardWalBytes - 1,
+        managedPostingFullCheckpointWalBytes - 1,
         managedPostingMaxDeltaSegments,
     ));
     try std.testing.expect(shouldStartExperimentalPostingCheckpoint(
-        managedPostingCheckpointHardWalBytes,
+        managedPostingFullCheckpointWalBytes,
         managedPostingMaxDeltaSegments,
     ));
+    try std.testing.expect(managedPostingFullCheckpointWalBytes < managedPostingCheckpointHardWalBytes);
 }
 
 test "posting WAL mutations provide read your writes without derived LSM persistence" {
@@ -13321,6 +13701,16 @@ test "posting maintenance repairs dirty leaf centroid and state" {
         try idx.finishWriteTxn(&txn);
         idx.invalidateNodeCache(root.id);
     }
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    idx.attachResourceManager(&resource_manager);
+    resource_manager.beginForegroundQuery();
+    const deferred = try idx.repairDirtyPostingsOptionalWithOptions(.{});
+    resource_manager.finishForegroundQuery();
+    try std.testing.expect(deferred.limit_reached);
+    try std.testing.expectEqual(@as(u64, 0), deferred.repaired_postings);
+    try std.testing.expectEqual(@as(u64, 1), (try idx.postingBacklogStats()).dirty_postings);
 
     idx.resetWriteProfile();
     const result = try idx.repairDirtyPostings();

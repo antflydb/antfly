@@ -671,6 +671,13 @@ pub fn repairDirtyPostingsTxnWithOptions(
 
     var node_id: u64 = 1;
     while (node_id <= self.metadata.node_count) : (node_id += 1) {
+        if (options.should_continue) |should_continue| {
+            const context = options.continue_context orelse return error.MissingMaintenanceContinueContext;
+            if (!should_continue(context)) {
+                result.limit_reached = true;
+                break;
+            }
+        }
         var node = self.loadNode(txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 result.skipped_missing += 1;

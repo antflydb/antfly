@@ -28,7 +28,7 @@ const posting = @import("posting.zig");
 pub const PostingId = posting.PostingId;
 
 const magic: [4]u8 = "AFPS".*;
-const version: u16 = 3;
+const version: u16 = 4;
 const min_supported_version: u16 = 2;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8 + 4;
 const footer_size: usize = 8 + 8 + 4 + 2 + 2 + 4 + 4;
@@ -52,6 +52,10 @@ pub const EntryKind = enum(u8) {
     vector_leaf_tombstone = 16,
     vector_metadata_tombstone = 17,
     index_metadata_tombstone = 18,
+    /// Replacement patches use the posting-WAL AFPD codec and are relative to
+    /// the same logical value in the preceding immutable segment generation.
+    base_patch = 19,
+    quantized_checkpoint_patch = 20,
 };
 
 pub const DeltaValue = struct {
@@ -444,6 +448,8 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
             @intFromEnum(EntryKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
             @intFromEnum(EntryKind.index_metadata_tombstone) => .index_metadata_tombstone,
+            @intFromEnum(EntryKind.base_patch) => .base_patch,
+            @intFromEnum(EntryKind.quantized_checkpoint_patch) => .quantized_checkpoint_patch,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;

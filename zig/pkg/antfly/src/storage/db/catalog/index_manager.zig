@@ -4035,6 +4035,7 @@ pub const IndexManager = struct {
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             // Capture ownership is protected by the same per-index apply
             // mutex as replay. Without this fence, catch-up can observe an
             // active maintenance capture, decline to start its own capture,
@@ -4054,10 +4055,11 @@ pub const IndexManager = struct {
             if (try entry.index.requestExperimentalPostingCheckpointForIdle()) {
                 total_steps += 1;
             }
+            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             const backlog = try entry.index.postingBacklogStats();
             if (!backlog.needsRepair()) continue;
 
-            const result = try entry.index.repairDirtyPostingsWithOptions(.{
+            const result = try entry.index.repairDirtyPostingsOptionalWithOptions(.{
                 .max_postings = options.max_postings_per_index,
                 .rebalance_layout = true,
                 .max_layout_changes = options.max_layout_changes_per_index,
