@@ -26,9 +26,9 @@ const default_wait_poll_ms: u64 = 1000;
 // progress reporting for minutes.
 const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
-// Derived replay can publish a ready snapshot immediately before discovering
-// the final tail produced by an enrichment/index-create transition. Confirm
-// the edge once so `wait` cannot return a state that is already regressing.
+// Server status now fails closed while publication is non-authoritative. A
+// second live observation covers the remaining scheduler handoff where queued
+// derived work becomes active immediately after an otherwise-ready snapshot.
 const ready_confirmation_observations: u8 = 2;
 const max_ready_confirmation_delay_ms: u64 = 100;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;

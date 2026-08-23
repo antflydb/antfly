@@ -1476,6 +1476,41 @@ fn publicIndexRepairState(item: anytype) ?[]const u8 {
     return @tagName(status);
 }
 
+fn repairActiveGenerationServiceable(item: anytype) bool {
+    const T = @TypeOf(item);
+    if (@hasField(T, "index_repair_active_generation_serviceable")) {
+        return item.index_repair_active_generation_serviceable;
+    }
+    if (@hasField(T, "repair_active_generation_serviceable")) {
+        return item.repair_active_generation_serviceable;
+    }
+    return false;
+}
+
+fn publicIndexRuntimeView(item: anytype) @TypeOf(item) {
+    var view = item;
+    if (!repairActiveGenerationServiceable(item) or publicIndexRepairState(item) == null) return view;
+
+    // Candidate generation construction has its own replay session. The
+    // active generation remains the query authority until activation, so do
+    // not project candidate watermarks onto its public readiness. A durable
+    // clean checkpoint is the active generation's publication boundary; an
+    // aggregate has already folded each shard's boundary into replay_applied.
+    const active_applied = if (@hasField(@TypeOf(item), "projection_checkpoint_applied_sequence") and
+        item.projection_checkpoint_applied_sequence > 0)
+        item.projection_checkpoint_applied_sequence
+    else
+        item.replay_applied_sequence;
+    view.replay_applied_sequence = active_applied;
+    view.replay_target_sequence = active_applied;
+    view.replay_catch_up_required = false;
+    view.catch_up_active = false;
+    view.catch_up_phase = .idle;
+    view.catch_up_applied_sequence = active_applied;
+    view.catch_up_target_sequence = active_applied;
+    return view;
+}
+
 fn repairStateRank(state: []const u8) u8 {
     // Aggregate toward the least-progressing shard so a partially stalled
     // distributed index is not presented as uniformly rebuilding.
@@ -1694,23 +1729,24 @@ fn aggregateIndexStatusIndexed(
                 aggregate.repair_state = state;
             }
         }
+        const public_item = publicIndexRuntimeView(item);
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
-        aggregate.replay_applied_sequence += item.replay_applied_sequence;
-        aggregate.replay_target_sequence += item.replay_target_sequence;
-        if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
+        aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
+        aggregate.replay_target_sequence += public_item.replay_target_sequence;
+        if (public_item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
         if (item.enrichment_failed) aggregate.enrichment_failed = true;
         if (item.repair_degraded) aggregate.repair_degraded = true;
         aggregate.repair_issue_count += item.repair_issue_count;
         if (!item.repair_summary_ready) aggregate.repair_summary_ready = false;
         if (item.repair_issue_count_estimated) aggregate.repair_issue_count_estimated = true;
-        aggregate.catch_up_applied_sequence += item.catch_up_applied_sequence;
-        aggregate.catch_up_target_sequence += item.catch_up_target_sequence;
-        if (item.catch_up_active) aggregate.catch_up_active = true;
-        if (@intFromEnum(item.catch_up_phase) > @intFromEnum(aggregate.catch_up_phase)) aggregate.catch_up_phase = item.catch_up_phase;
+        aggregate.catch_up_applied_sequence += public_item.catch_up_applied_sequence;
+        aggregate.catch_up_target_sequence += public_item.catch_up_target_sequence;
+        if (public_item.catch_up_active) aggregate.catch_up_active = true;
+        if (@intFromEnum(public_item.catch_up_phase) > @intFromEnum(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
         aggregateTextMergeStats(&aggregate.text_merge, item.text_merge);
         aggregateHbcCacheStats(&aggregate.hbc_cache, item.hbc_cache);
         aggregateHbcPostingStats(&aggregate.hbc_posting, item.hbc_posting);
@@ -1756,10 +1792,10 @@ fn aggregateIndexStatusIndexed(
         aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
         aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
         aggregateResolverReplayDiagnostics(&aggregate.resolver_replay, runtime.stats.resolver_replay);
-        if (item.backfill_active) {
+        if (public_item.backfill_active) {
             aggregate.backfill_active = true;
             active_count += 1;
-            active_progress_sum += item.backfill_progress;
+            active_progress_sum += public_item.backfill_progress;
         }
     }
 
@@ -2377,7 +2413,14 @@ test "complete partial embeddings coverage is ready after active generation proo
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
         .replay_applied_sequence = 7,
-        .replay_target_sequence = 7,
+        .replay_target_sequence = 11,
+        .replay_catch_up_required = true,
+        .catch_up_active = true,
+        .catch_up_phase = .replay,
+        .catch_up_applied_sequence = 7,
+        .catch_up_target_sequence = 11,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
         .backfill_active = true,
         .backfill_progress = 1.0,
         .repair_degraded = true,
@@ -2397,7 +2440,12 @@ test "complete partial embeddings coverage is ready after active generation proo
         42,
         99,
         null,
-        .{},
+        .{ .dense_catch_up = .{
+            .active = true,
+            .phase = .replay,
+            .current_sequence = 7,
+            .current_target_sequence = 11,
+        } },
         .{
             .enabled = true,
             .target_sequence = 7,
@@ -2412,7 +2460,7 @@ test "complete partial embeddings coverage is ready after active generation proo
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0}}",
+        "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0},\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":7,\"replay_catch_up_required\":false}",
         encoded.items,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
@@ -3021,13 +3069,15 @@ fn appendSingleIndexRuntimeStatus(
     const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
     const embeddings_materialization_current = index_type != .embeddings or
         (coverage_runtime_present and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+    const public_item = publicIndexRuntimeView(item);
+    const active_generation_serviceable = repairActiveGenerationServiceable(item);
     const visible_doc_count = if (embeddings_materialization_current) item.doc_count else 0;
     const visible_term_count = if (embeddings_materialization_current) item.term_count else 0;
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
     const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
+        embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
     else
         null;
     const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
@@ -3039,9 +3089,9 @@ fn appendSingleIndexRuntimeStatus(
     // converged index watermark into synthetic replay debt. Older snapshots
     // that contain no index replay facts can still derive a compatibility
     // view from enrichment status.
-    const visible_item_replay_applied_sequence = if (embeddings_materialization_current) item.replay_applied_sequence else 0;
-    const visible_item_replay_target_sequence = if (embeddings_materialization_current) item.replay_target_sequence else 0;
-    const visible_item_replay_catch_up_required = if (embeddings_materialization_current) item.replay_catch_up_required else index_type == .embeddings;
+    const visible_item_replay_applied_sequence = if (embeddings_materialization_current) public_item.replay_applied_sequence else 0;
+    const visible_item_replay_target_sequence = if (embeddings_materialization_current) public_item.replay_target_sequence else 0;
+    const visible_item_replay_catch_up_required = if (embeddings_materialization_current) public_item.replay_catch_up_required else index_type == .embeddings;
     const index_replay_present = visible_item_replay_applied_sequence != 0 or
         visible_item_replay_target_sequence != 0 or visible_item_replay_catch_up_required;
     var replay_applied_sequence = if (index_replay_present or embeddings_view == null)
@@ -3057,12 +3107,12 @@ fn appendSingleIndexRuntimeStatus(
     else
         embeddings_view.?.replay_catch_up_required;
     const dense_catch_up = async_indexing.dense_catch_up;
-    var catch_up_active = if (embeddings_materialization_current) item.catch_up_active else false;
-    var catch_up_phase = if (embeddings_materialization_current) item.catch_up_phase else .idle;
-    var catch_up_applied_sequence = if (embeddings_materialization_current) item.catch_up_applied_sequence else 0;
-    var catch_up_target_sequence = if (embeddings_materialization_current) item.catch_up_target_sequence else 0;
+    var catch_up_active = if (embeddings_materialization_current) public_item.catch_up_active else false;
+    var catch_up_phase = if (embeddings_materialization_current) public_item.catch_up_phase else .idle;
+    var catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
+    var catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
     if (index_type == .embeddings) {
-        if (embeddings_materialization_current and dense_catch_up.active) {
+        if (embeddings_materialization_current and dense_catch_up.active and !active_generation_serviceable) {
             catch_up_active = true;
             catch_up_phase = dense_catch_up.phase;
             catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
@@ -3095,12 +3145,6 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    const active_generation_serviceable = if (@hasField(@TypeOf(item), "index_repair_active_generation_serviceable"))
-        item.index_repair_active_generation_serviceable
-    else if (@hasField(@TypeOf(item), "repair_active_generation_serviceable"))
-        item.repair_active_generation_serviceable
-    else
-        false;
     const repair_state = if (embeddings_materialization_current and !active_generation_serviceable)
         publicIndexRepairState(item)
     else
