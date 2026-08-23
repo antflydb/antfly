@@ -212,19 +212,23 @@ run_zig_build_steps_with_retry() {
     return 0
   fi
 
-  # Zig 0.16 can fail the first ARM64 musl ReleaseSmall compile in LLVM's
-  # allocation path even though the runner has ample available memory. A replay
-  # using the local cache populated by that failed compile has been observed to
-  # complete at the same peak RSS. Limit the retry to that known failure mode so
-  # unrelated compiler and source errors still fail immediately.
-  if [ "$target" != aarch64-linux-musl ] || \
-     [ "$optimize" != ReleaseSmall ] || \
-     ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"
-  then
+  # Zig 0.16 can fail a first ARM64 release compile in LLVM's allocation path
+  # even though the runner has ample available memory. This has occurred in the
+  # historical Linux ReleaseSmall build and in the current Linux and macOS
+  # ReleaseFast builds. A replay retains completed work in the local cache and
+  # starts LLVM in a fresh process. Limit the retry to those observed production
+  # combinations and allocation signatures so unrelated errors fail immediately.
+  case "$target:$optimize" in
+    aarch64-linux-musl:ReleaseSmall | \
+    aarch64-linux-musl:ReleaseFast | \
+    aarch64-macos:ReleaseFast) ;;
+    *) return "$status" ;;
+  esac
+  if ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"; then
     return "$status"
   fi
 
-  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $label once with the populated local cache"
+  echo "::warning::Zig ARM64 release build hit a compiler allocation failure; retrying $label once with the populated local cache"
   set +e
   run_zig_build_steps "$@" 2>&1 | tee "$retry_log"
   status=${PIPESTATUS[0]}

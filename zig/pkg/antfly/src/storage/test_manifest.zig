@@ -197,6 +197,10 @@ comptime {
     _ = @import("persistent_vopr.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
+    _ = @import("rowsource/external.zig");
+    _ = @import("rowsource/local.zig");
+    _ = @import("rowsource/mod.zig");
+    _ = @import("rowsource/types.zig");
     _ = @import("schema.zig");
     _ = @import("shard.zig");
     _ = @import("sim_runtime.zig");

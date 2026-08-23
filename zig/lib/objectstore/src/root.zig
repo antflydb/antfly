@@ -28,6 +28,8 @@ pub const ObjectChecksumScope = types.ObjectChecksumScope;
 pub const ObjectChecksumType = types.ObjectChecksumType;
 pub const PutOptions = types.PutOptions;
 pub const GetOptions = types.GetOptions;
+pub const StatOptions = types.StatOptions;
+pub const CancellationToken = types.CancellationToken;
 pub const DeleteOptions = types.DeleteOptions;
 pub const ListOptions = types.ListOptions;
 pub const ByteRange = types.ByteRange;
@@ -71,6 +73,8 @@ test "objectstore module compiles" {
     _ = ObjectMetadata;
     _ = PutOptions;
     _ = GetOptions;
+    _ = StatOptions;
+    _ = CancellationToken;
     _ = DeleteOptions;
     _ = ListOptions;
     _ = ByteRange;

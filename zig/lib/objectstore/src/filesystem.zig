@@ -151,6 +151,19 @@ pub const FilesystemClient = struct {
     }
 
     fn getFile(self: *FilesystemClient, alloc: Allocator, destination_io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
+        return try self.getFileWithOptions(alloc, destination_io, bucket, key, dest_path, .{});
+    }
+
+    fn getFileWithOptions(
+        self: *FilesystemClient,
+        alloc: Allocator,
+        destination_io: std.Io,
+        bucket: []const u8,
+        key: []const u8,
+        dest_path: []const u8,
+        opts: types.GetOptions,
+    ) !void {
+        if (opts.cancellation) |token| try token.check();
         const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
         defer alloc.free(object_path);
         const source = try openFilePath(self.io, object_path);
@@ -165,6 +178,7 @@ pub const FilesystemClient = struct {
             source,
             header,
             dest_path,
+            opts.cancellation,
         );
     }
 
@@ -204,6 +218,7 @@ pub const FilesystemClient = struct {
     }
 
     fn getObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
         var meta = try self.statObject(alloc, bucket, key);
@@ -230,7 +245,15 @@ pub const FilesystemClient = struct {
         if (opts.max_response_bytes) |limit| {
             if (requested.end - requested.start > limit) return error.ResponseTooLarge;
         }
-        const body = try readObjectRangeAlloc(self.io, alloc, object_path, requested.start, requested.end, meta.etag.?);
+        const body = try readObjectRangeAlloc(
+            self.io,
+            alloc,
+            object_path,
+            requested.start,
+            requested.end,
+            meta.etag.?,
+            opts.cancellation,
+        );
 
         meta.content_length = @intCast(body.len);
         return .{
@@ -406,6 +429,7 @@ pub const FilesystemClient = struct {
         .put_object = erasedPutObject,
         .put_file = erasedPutFile,
         .get_file = erasedGetFile,
+        .get_file_with_options = erasedGetFileWithOptions,
         .get_prefix = erasedGetPrefix,
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
@@ -442,6 +466,11 @@ pub const FilesystemClient = struct {
     fn erasedGetFile(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8) !void {
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return try self.getFile(alloc, io, bucket, key, dest_path);
+    }
+
+    fn erasedGetFileWithOptions(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
+        const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
+        return try self.getFileWithOptions(alloc, io, bucket, key, dest_path, opts);
     }
 
     fn erasedGetPrefix(ptr: *anyopaque, alloc: Allocator, io: std.Io, bucket: []const u8, prefix: []const u8, dest_path: []const u8) !usize {
@@ -794,7 +823,16 @@ fn resolveRange(total_len: u64, offset: u64, maybe_len: ?u64) !ObjectRange {
     return .{ .start = @intCast(offset), .end = @intCast(end_u64) };
 }
 
-fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: usize, end: usize, expected_etag: []const u8) ![]u8 {
+fn readObjectRangeAlloc(
+    io: std.Io,
+    alloc: Allocator,
+    path: []const u8,
+    start: usize,
+    end: usize,
+    expected_etag: []const u8,
+    cancellation: ?types.CancellationToken,
+) ![]u8 {
+    if (cancellation) |token| try token.check();
     if (end < start) return error.InvalidRange;
     const file = try openFilePath(io, path);
     defer file.close(io);
@@ -807,7 +845,16 @@ fn readObjectRangeAlloc(io: std.Io, alloc: Allocator, path: []const u8, start: u
     const body = try alloc.alloc(u8, end - start);
     errdefer alloc.free(body);
     const file_offset = std.math.add(u64, header.data_offset, start) catch return error.InvalidRange;
-    if (body.len > 0 and try file.readPositionalAll(io, body, file_offset) != body.len) return error.CorruptObject;
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < body.len) {
+        if (cancellation) |token| try token.check();
+        const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
+        const chunk = body[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, file_offset + copied) != chunk.len) return error.CorruptObject;
+        copied += chunk.len;
+    }
+    if (cancellation) |token| try token.check();
     return body;
 }
 
@@ -818,7 +865,9 @@ fn streamVerifiedObjectToFile(
     source: std.Io.File,
     header: ObjectHeader,
     dest_path: []const u8,
+    cancellation: ?types.CancellationToken,
 ) !void {
+    if (cancellation) |token| try token.check();
     try ensureParentDir(destination_io, dest_path);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-objectstore-download-{d}", .{ dest_path, uniqueNs() });
     defer alloc.free(tmp_path);
@@ -833,6 +882,7 @@ fn streamVerifiedObjectToFile(
     var read_buf: [256 * 1024]u8 = undefined;
     var offset: u64 = 0;
     while (offset < header.content_length) {
+        if (cancellation) |token| try token.check();
         const wanted: usize = @intCast(@min(header.content_length - offset, read_buf.len));
         const file_offset = std.math.add(u64, header.data_offset, offset) catch return error.CorruptObject;
         const n = try source.readPositionalAll(source_io, read_buf[0..wanted], file_offset);
@@ -847,7 +897,9 @@ fn streamVerifiedObjectToFile(
     var actual_etag: [64]u8 = undefined;
     digestHex(&actual_etag, &digest);
     if (!std.mem.eql(u8, &actual_etag, &header.etag)) return error.ChecksumMismatch;
+    if (cancellation) |token| try token.check();
     try output.sync(destination_io);
+    if (cancellation) |token| try token.check();
     output.close(destination_io);
     output_open = false;
     try renameFilePath(destination_io, tmp_path, dest_path);
@@ -1073,6 +1125,37 @@ test "filesystem client supports bucket/object lifecycle and file helpers" {
     const downloaded = try readFileAlloc(alloc, dst_path);
     defer alloc.free(downloaded);
     try std.testing.expectEqualStrings("beta", downloaded);
+}
+
+test "filesystem whole-file download honors cancellation before publication" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "download-cancellation");
+    defer cleanupTmp(path);
+
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    var put = try client.putObject("bucket", "backup/segment", "payload", .{});
+    put.deinit(alloc);
+
+    const State = struct {
+        checks: usize = 0,
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 4;
+        }
+    };
+    var state = State{};
+    const destination = try std.fs.path.join(alloc, &.{ std.mem.span(path), "restore", "segment" });
+    defer alloc.free(destination);
+    try std.testing.expectError(error.Canceled, client.getFile("bucket", "backup/segment", destination, .{
+        .cancellation = types.CancellationToken.fromCallback(&state, State.isCancelled),
+    }));
+    try std.testing.expect(state.checks >= 4);
+    try std.testing.expect(!fileExists(fs.io, destination));
 }
 
 test "filesystem client rejects paths that escape its root" {

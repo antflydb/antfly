@@ -2,6 +2,7 @@ self-hosted-runner:
   labels:
     - arc-antfly-standard
     - arc-antfly-heavy
+    - arc-antfly-l4-spot
     - arc-antfly-docker
     - arc-antfly-publish
     - arc-antfly-publish-arm64

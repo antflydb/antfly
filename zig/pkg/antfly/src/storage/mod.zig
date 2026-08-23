@@ -19,5 +19,6 @@ pub const vopr_durable_job_lane = @import("vopr_durable_job_lane.zig");
 pub const ha = @import("ha/mod.zig");
 pub const lsm_backend = @import("lsm_backend.zig");
 pub const resource_manager = @import("resource_manager.zig");
+pub const rowsource = @import("rowsource/mod.zig");
 pub const runtime_backend = @import("runtime_backend.zig");
 pub const sim_runtime = @import("sim_runtime.zig");
