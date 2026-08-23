@@ -134,62 +134,7 @@ pub const ManagedRuntime = struct {
                 else => return err,
             };
             defer status.deinit(self.alloc);
-            var effective_policy = policy;
-            effective_policy.enrichment_enabled = status.enrichment_enabled;
-            effective_policy.chunk_preview_enabled = status.chunk_preview_enabled;
-            effective_policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
-            effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
-
-            if (self.enricher) |*enricher| {
-                const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace.name) catch |err| switch (err) {
-                    error.FileNotFound => null,
-                    else => return err,
-                };
-                if (maybe_table_record) |table_record| {
-                    var table = table_record;
-                    defer table.deinit(self.alloc);
-
-                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
-                        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                        defer parsed.deinit();
-                        const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
-                        try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
-                    } else {
-                        enricher.clearSparseEmbedder();
-                    }
-
-                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
-                        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                        defer parsed.deinit();
-                        const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
-                        const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
-                        try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
-                    } else {
-                        enricher.clearChunkEmbedder();
-                    }
-                }
-
-                if (self.cfg.enrichment_enabled and status.enrichment_active_stage != null) {
-                    const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(status.enrichment_active_stage.?) orelse continue;
-                    const enrichment = enricher.runNamespaceWithConfig(namespace.name, .{
-                        .batch_size = policy.enrichment_batch_size,
-                        .pipeline_version = stage_spec.pipeline_version,
-                        .stage = status.enrichment_active_stage.?,
-                        .model_preference = stage_spec.model_preference,
-                        .failure_policy = policy.enrichment_failure_policy,
-                    }) catch |err| switch (err) {
-                        error.FileNotFound => continue,
-                        else => return err,
-                    };
-                    stats.enriched_namespaces += enrichment.enriched_namespaces;
-                    stats.enriched_documents += enrichment.enriched_documents;
-                    stats.enrichment_wal_appends += enrichment.wal_appends;
-                    stats.enrichment_model_documents += enrichment.model_documents;
-                    stats.enrichment_fallback_documents += enrichment.fallback_documents;
-                    stats.enrichment_failed_documents += enrichment.failed_documents;
-                    stats.enrichment_stage_failures += enrichment.stage_failures;
-                }
-            }
+            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, &stats)) continue;
 
             if (self.compactor) |*compactor| {
                 if (self.cfg.compaction_enabled) {
@@ -226,6 +171,40 @@ pub const ManagedRuntime = struct {
         return stats;
     }
 
+    /// Runs only the request-visible background materialization stage for one
+    /// namespace. It deliberately excludes publication, compaction, pruning,
+    /// and catalog-wide enumeration; those remain owned by the background
+    /// runtime and must not be amplified by synchronous HTTP requests.
+    pub fn runNamespaceMaterializationOnceWithCancellation(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+    ) !RuntimeRunStats {
+        if (!self.supportsSynchronousMaterialization()) return error.MaterializationUnavailable;
+        if (namespace.len == 0) return error.InvalidNamespace;
+        try cancellation.check();
+        try lockAtomicWithCancellation(&self.run_mu, cancellation);
+        defer self.run_mu.unlock();
+
+        const policy = try self.catalog.getPolicy(namespace);
+        var status = try self.catalog.buildStatus(namespace);
+        defer status.deinit(self.alloc);
+        var stats = RuntimeRunStats{};
+        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, &stats)) {
+            return error.MaterializationUnavailable;
+        }
+        try cancellation.check();
+        self.recordStats(stats);
+        return stats;
+    }
+
+    pub fn supportsSynchronousMaterialization(self: *const ManagedRuntime) bool {
+        return self.cfg.role != .query_only and
+            self.cfg.role != .api_only and
+            self.cfg.enrichment_enabled and
+            self.enricher != null;
+    }
+
     pub fn metricsSnapshot(self: *ManagedRuntime) RuntimeRunStats {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
@@ -238,6 +217,85 @@ pub const ManagedRuntime = struct {
 
     pub fn setEnricher(self: *ManagedRuntime, enricher: enrichment_mod.SparseEnricher) void {
         self.enricher = enricher;
+    }
+
+    /// Returns false when the namespace disappeared or its active stage is no
+    /// longer representable, matching the full-sweep behavior of skipping the
+    /// remainder of that namespace for this tick.
+    fn enrichNamespaceWithStatus(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        policy: catalog_mod.NamespacePolicy,
+        status: catalog_mod.BuildStatus,
+        cancellation: CancellationToken,
+        stats: *RuntimeRunStats,
+    ) !bool {
+        try cancellation.check();
+        if (!self.cfg.enrichment_enabled or status.enrichment_active_stage == null) return true;
+        const enricher = if (self.enricher) |*value| value else return true;
+
+        var effective_policy = policy;
+        effective_policy.enrichment_enabled = status.enrichment_enabled;
+        effective_policy.chunk_preview_enabled = status.chunk_preview_enabled;
+        effective_policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
+        effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
+        const stage = status.enrichment_active_stage.?;
+        const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
+
+        const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (maybe_table_record) |table_record| {
+            var table = table_record;
+            defer table.deinit(self.alloc);
+
+            if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                defer parsed.deinit();
+                const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
+                try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
+            } else {
+                enricher.clearSparseEmbedder();
+            }
+
+            if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                defer parsed.deinit();
+                const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
+                const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
+                try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
+            } else {
+                enricher.clearChunkEmbedder();
+            }
+        } else {
+            // Namespace-only records predate the table catalog. Preserve their
+            // fallback enrichment behavior without retaining a previous
+            // namespace's managed embedder configuration.
+            enricher.clearSparseEmbedder();
+            enricher.clearChunkEmbedder();
+        }
+
+        try cancellation.check();
+        const enrichment = enricher.runNamespaceWithConfig(namespace, .{
+            .batch_size = policy.enrichment_batch_size,
+            .pipeline_version = stage_spec.pipeline_version,
+            .stage = stage,
+            .model_preference = stage_spec.model_preference,
+            .failure_policy = policy.enrichment_failure_policy,
+            .cancellation = cancellation,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        stats.enriched_namespaces += enrichment.enriched_namespaces;
+        stats.enriched_documents += enrichment.enriched_documents;
+        stats.enrichment_wal_appends += enrichment.wal_appends;
+        stats.enrichment_model_documents += enrichment.model_documents;
+        stats.enrichment_fallback_documents += enrichment.fallback_documents;
+        stats.enrichment_failed_documents += enrichment.failed_documents;
+        stats.enrichment_stage_failures += enrichment.stage_failures;
+        return true;
     }
 
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
@@ -671,7 +729,7 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
     try std.testing.expectEqual(manifest_mod.ArtifactKind.text_segment, compacted.artifacts[1].kind);
 }
 
-test "managed runtime runs sparse enrichment for opted-in namespaces" {
+test "serverless managed runtime targets request-driven enrichment without global maintenance" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -710,10 +768,17 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
     var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
     defer catalog.deinit();
-    try std.testing.expect(try catalog.ensureNamespaceWithPolicy("docs", 100, .{
-        .enrichment_enabled = true,
-        .keep_latest_versions = 2,
-    }));
+    try std.testing.expect(try catalog.ensureTableWithDefinition(
+        "docs",
+        100,
+        .{
+            .enrichment_enabled = true,
+            .keep_latest_versions = 2,
+        },
+        "",
+        "",
+        "{}",
+    ));
 
     var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
     const batch = [_]@import("../api/types.zig").DocumentMutation{
@@ -721,14 +786,18 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     };
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
     defer ingest.deinit(alloc);
-    var build = try builder.publishNamespace("docs");
+    var build = try catalog.buildNamespace("docs");
     defer build.deinit(alloc);
 
     var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setEnricher(enrichment_mod.SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
-    const stats = try runtime.runOnce();
+    try std.testing.expect(runtime.supportsSynchronousMaterialization());
+    const stats = try runtime.runNamespaceMaterializationOnceWithCancellation("docs", .none);
+    try std.testing.expectEqual(@as(usize, 0), stats.published_namespaces);
+    try std.testing.expectEqual(@as(usize, 0), stats.compacted_namespaces);
+    try std.testing.expectEqual(@as(usize, 0), stats.pruned_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.enriched_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.enriched_documents);
     try std.testing.expectEqual(@as(usize, 1), stats.enrichment_wal_appends);
@@ -736,6 +805,7 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     const tail = try wal_store.readFromAlloc("docs", 2);
     defer @import("../wal/mod.zig").freeRecords(alloc, tail);
     try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

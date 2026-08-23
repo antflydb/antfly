@@ -56,6 +56,7 @@ from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConfli
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
+from .batch_committed_failure import BatchCommittedFailure
 from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
@@ -914,6 +915,7 @@ __all__ = (
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
+    "BatchCommittedFailure",
     "BatchRequest",
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",

@@ -45,6 +45,7 @@ pub const BackupListResponse = types.BackupListResponse;
 pub const BackupMetadataUnavailableError = types.BackupMetadataUnavailableError;
 pub const BackupOutcomeAmbiguousConflict = types.BackupOutcomeAmbiguousConflict;
 pub const BackupRequest = types.BackupRequest;
+pub const BatchCommittedFailure = types.BatchCommittedFailure;
 pub const BatchRequest = types.BatchRequest;
 pub const BatchResponse = types.BatchResponse;
 pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;

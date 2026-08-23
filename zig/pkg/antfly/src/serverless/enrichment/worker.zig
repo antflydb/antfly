@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
@@ -49,6 +50,7 @@ pub const SparseEnricherConfig = struct {
     stage: catalog_mod.EnrichmentStage = .lexical_sparse,
     model_preference: catalog_mod.EnrichmentModelPreference = .prefer_model,
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
+    cancellation: CancellationToken = .none,
 };
 
 const DerivedBodyResult = struct {
@@ -136,6 +138,7 @@ pub const SparseEnricher = struct {
     }
 
     pub fn runNamespaceWithConfig(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig) !EnrichmentRunStats {
+        try cfg.cancellation.check();
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => return .{ .idle_namespaces = 1 },
             else => return err,
@@ -149,6 +152,7 @@ pub const SparseEnricher = struct {
 
         const docs = try self.loadPublishedDocsAlloc(manifest);
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
+        try cfg.cancellation.check();
 
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
         if (stored_head != head) {
@@ -167,7 +171,12 @@ pub const SparseEnricher = struct {
 
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
+        var canceled = false;
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
+            if (cfg.cancellation.isCancelled()) {
+                canceled = true;
+                break;
+            }
             next_offset = doc_index + 1;
             const derived = buildDerivedBodyAlloc(self, cfg.stage, doc.body, cfg.pipeline_version, cfg.model_preference) catch |err| {
                 if (isRecoverableEnrichmentError(err)) {
@@ -189,6 +198,11 @@ pub const SparseEnricher = struct {
             };
             const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
             defer self.alloc.free(encoded);
+            if (cfg.cancellation.isCancelled()) {
+                canceled = true;
+                next_offset = doc_index;
+                break;
+            }
             _ = try self.wal.append(namespace, doc.last_timestamp_ns + 1, encoded);
             stats.enriched_documents += 1;
             stats.wal_appends += 1;
@@ -199,6 +213,7 @@ pub const SparseEnricher = struct {
 
         const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
         _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, @intCast(next_offset));
+        if (canceled) return error.Canceled;
         if (stats.enriched_documents == 0) {
             stats.idle_namespaces = 1;
         } else {

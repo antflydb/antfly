@@ -4908,8 +4908,9 @@ export interface components {
             /**
              * @description Durable commit outcome. `committed_pending` means requested visibility or
              *     participant propagation is still completing. `committed_repair_required`
-             *     means the primary write committed, but a terminal enrichment failure needs
-             *     operator repair and will not be retried indefinitely.
+             *     means the primary write committed, but a terminal background materialization
+             *     failure needs operator repair and will not be retried indefinitely. Inspect
+             *     `failure` when present; retrying the document write is unnecessary.
              * @enum {string}
              */
             status?: "committed" | "committed_pending" | "committed_repair_required";
@@ -4919,6 +4920,22 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+            failure?: components["schemas"]["BatchCommittedFailure"];
+        };
+        /**
+         * @description Additive details for a committed batch that needs operator action. The
+         *     open string code is forward-compatible with older SDKs; clients should
+         *     treat unknown codes as non-retryable when `retryable` is false.
+         */
+        BatchCommittedFailure: {
+            /** @description Stable machine-readable failure code, such as `graph_metric_materialization_rejected`. */
+            code: string;
+            /** @description Actionable operator guidance. */
+            message: string;
+            /** @description Optional stable reason within the failure category, such as `build_budget_exceeded`. */
+            reason?: string;
+            /** @description Whether replaying the document mutation is safe. Committed repair outcomes are false. */
+            retryable: boolean;
         };
         /** @description A dense-index rebuild is retaining replay history and the node has reached its hard safety budget. */
         DenseRepairBackpressureError: {

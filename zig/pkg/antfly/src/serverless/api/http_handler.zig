@@ -5004,7 +5004,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, request.cancellation) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, namespace, req.sync_level, result.end_lsn, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -5022,15 +5022,19 @@ pub const HttpHandler = struct {
         sync_level: db_types.SyncLevel,
         status: catalog_types.BuildStatus,
     ) public_table_http.TableApi.ExecuteBatchError!void {
-        const requires_background_materialization =
-            status.enrichment_enabled or
-            status.chunk_preview_enabled or
-            status.chunk_embeddings_enabled or
-            status.rerank_terms_enabled;
+        const requires_background_materialization = switch (sync_level) {
+            .propose, .write => false,
+            .full_text => status.chunk_preview_enabled,
+            .enrichments, .full_index => status.enrichment_enabled or
+                status.chunk_preview_enabled or
+                status.chunk_embeddings_enabled or
+                status.rerank_terms_enabled,
+        };
         switch (sync_level) {
-            .propose, .write, .full_text => {},
-            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
-                return error.UnsupportedSyncLevel;
+            .propose, .write => {},
+            .full_text, .enrichments, .full_index => if (requires_background_materialization) {
+                const runtime = self.runtime_metrics orelse return error.UnsupportedSyncLevel;
+                if (!runtime.supportsSynchronousMaterialization()) return error.UnsupportedSyncLevel;
             },
         }
         if (sync_level != .full_index) return;
@@ -5043,6 +5047,7 @@ pub const HttpHandler = struct {
     fn enforcePublicTableBatchSyncLevel(
         self: *HttpHandler,
         table_name: []const u8,
+        namespace: []const u8,
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
         cancellation: CancellationToken,
@@ -5075,16 +5080,6 @@ pub const HttpHandler = struct {
                 owned_build.deinit(self.alloc);
             }
 
-            if (self.runtime_metrics) |runtime| {
-                _ = runtime.runOnceWithCancellation(sync_cancellation) catch |err| switch (err) {
-                    error.Canceled => return error.CommittedPending,
-                    else => {
-                        std.log.err("serverless public table batch maintenance run failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                        return error.CommittedRepairRequired;
-                    },
-                };
-            }
-
             var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
                 error.NamespaceNotFound => return error.CommittedRepairRequired,
                 else => {
@@ -5096,6 +5091,17 @@ pub const HttpHandler = struct {
 
             if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.CommittedGraphMetricMaterializationRejected;
             if (tableSyncLevelSatisfied(sync_level, end_lsn, status)) return;
+
+            if (syncLevelNeedsBackgroundMaterialization(sync_level, status)) {
+                const runtime = self.runtime_metrics orelse return error.CommittedRepairRequired;
+                _ = runtime.runNamespaceMaterializationOnceWithCancellation(namespace, sync_cancellation) catch |err| switch (err) {
+                    error.Canceled => return error.CommittedPending,
+                    else => {
+                        std.log.err("serverless public table batch targeted materialization failed table={s} namespace={s} sync_level={} err={}", .{ table_name, namespace, sync_level, err });
+                        return error.CommittedRepairRequired;
+                    },
+                };
+            }
             if (cancellation.isCancelled()) return error.CommittedPending;
             if (platform_time.monotonicNs() >= deadline_ns) {
                 std.log.err(
@@ -5136,6 +5142,18 @@ pub const HttpHandler = struct {
             .full_text => fullTextSyncSatisfied(status),
             .enrichments => status.enrichment_complete,
             .full_index => fullIndexSyncSatisfied(status),
+        };
+    }
+
+    fn syncLevelNeedsBackgroundMaterialization(sync_level: db_types.SyncLevel, status: catalog_types.BuildStatus) bool {
+        return switch (sync_level) {
+            .propose, .write => false,
+            .full_text => status.chunk_preview_enabled and !status.chunk_preview_complete,
+            .enrichments => !status.enrichment_complete,
+            .full_index => (status.enrichment_enabled and !status.enrichment_complete) or
+                (status.chunk_preview_enabled and !status.chunk_preview_complete) or
+                (status.chunk_embeddings_enabled and !status.chunk_embeddings_complete) or
+                (status.rerank_terms_enabled and !status.rerank_terms_complete),
         };
     }
 
@@ -10392,6 +10410,15 @@ test "http handler honors public serverless sync levels on table batch writes" {
 test "serverless full_index sync waits for enrichment and index publication" {
     var status = readyServerlessBuildStatusForSyncTest();
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    try std.testing.expect(!HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_text, status));
+    try std.testing.expect(!HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_index, status));
+
+    status.chunk_preview_enabled = true;
+    status.chunk_preview_complete = false;
+    try std.testing.expect(HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_text, status));
+    try std.testing.expect(HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_index, status));
+    status.chunk_preview_enabled = false;
+    status.chunk_preview_complete = true;
 
     status.enrichment_complete = false;
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));

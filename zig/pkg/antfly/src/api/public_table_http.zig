@@ -1003,7 +1003,12 @@ pub fn handleTableBatch(
         },
         error.CommittedGraphMetricMaterializationRejected => return .{
             .status = 202,
-            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_graph_metric_materialization_rejected")),
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithFailure(.{
+                .code = "graph_metric_materialization_rejected",
+                .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
+                .reason = "build_budget_exceeded",
+                .retryable = false,
+            })),
             .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
@@ -2628,7 +2633,7 @@ test "serverless public table batch handler identifies committed graph metric re
     try std.testing.expect(resp.json);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"status\":\"committed_graph_metric_materialization_rejected\",\"inserted\":1,\"deleted\":0,\"transformed\":0}",
+        "{\"status\":\"committed_repair_required\",\"inserted\":1,\"deleted\":0,\"transformed\":0,\"failure\":{\"code\":\"graph_metric_materialization_rejected\",\"message\":\"graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild\",\"reason\":\"build_budget_exceeded\",\"retryable\":false}}",
         resp.body,
     );
 }

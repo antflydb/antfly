@@ -13,15 +13,27 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/mod.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 const public_limits = @import("public_limits.zig");
+
+pub const BatchFailure = struct {
+    code: []const u8,
+    message: []const u8,
+    reason: ?[]const u8 = null,
+    retryable: bool,
+};
 
 pub const BatchResult = struct {
     status: []const u8 = "committed",
     inserted: u32,
     deleted: u32,
     transformed: u32 = 0,
+    /// Additive details for a durable commit that needs operator action. Keep
+    /// the stable status vocabulary so older strict-enum SDKs can still parse
+    /// the committed response and safely avoid replaying the mutation.
+    failure: ?BatchFailure = null,
 };
 
 pub const OwnedBatchRequest = struct {
@@ -73,6 +85,12 @@ pub const OwnedBatchRequest = struct {
     pub fn resultWithStatus(self: OwnedBatchRequest, status: []const u8) BatchResult {
         var result_value = self.result();
         result_value.status = status;
+        return result_value;
+    }
+
+    pub fn resultWithFailure(self: OwnedBatchRequest, failure: BatchFailure) BatchResult {
+        var result_value = self.resultWithStatus("committed_repair_required");
+        result_value.failure = failure;
         return result_value;
     }
 };
@@ -422,12 +440,7 @@ fn parseBatchRequestWithOptions(
 }
 
 pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{{\"status\":{f},\"inserted\":{d},\"deleted\":{d},\"transformed\":{d}}}", .{
-        std.json.fmt(result.status, .{}),
-        result.inserted,
-        result.deleted,
-        result.transformed,
-    });
+    return try ant_json.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false });
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {

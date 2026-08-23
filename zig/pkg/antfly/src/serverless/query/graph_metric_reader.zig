@@ -128,6 +128,30 @@ pub const PointScoresResult = struct {
 };
 
 const BorrowedScore = struct { node_id: []const u8, value: f64 };
+const RankedScoreBoundaryValidator = struct {
+    previous_node_id: [metric_segment.codec.max_score_node_id_bytes]u8 = undefined,
+    previous_node_id_len: usize = 0,
+    previous_value: f64 = 0,
+    has_previous: bool = false,
+
+    fn observeBlock(self: *@This(), decoded: metric_segment.codec.DecodedScoreBlock) !void {
+        if (decoded.len == 0) return error.InvalidGraphMetricSegment;
+        const first = decoded.scores[0];
+        if (self.has_previous and scoreOrder(
+            .{ .node_id = self.previous_node_id[0..self.previous_node_id_len], .value = self.previous_value },
+            .{ .node_id = first.node_id, .value = first.value },
+        ) != .lt) {
+            return error.InvalidGraphMetricSegment;
+        }
+
+        const last = decoded.scores[decoded.len - 1];
+        if (last.node_id.len > self.previous_node_id.len) return error.InvalidGraphMetricSegment;
+        @memcpy(self.previous_node_id[0..last.node_id.len], last.node_id);
+        self.previous_node_id_len = last.node_id.len;
+        self.previous_value = last.value;
+        self.has_previous = true;
+    }
+};
 const TopQueue = std.PriorityQueue(BorrowedScore, void, compareWorstFirst);
 const OwnedTopQueue = std.PriorityQueue(Score, void, compareOwnedWorstFirst);
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
@@ -583,6 +607,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
             }
             var result_bytes = std.math.mul(usize, result_count, @sizeOf(Score)) catch return error.GraphMetricQueryBudgetExceeded;
             var block_cursor: usize = 0;
+            var boundary_validator = RankedScoreBoundaryValidator{};
             while (block_cursor < required_blocks) {
                 var range_end = block_cursor;
                 var range_bytes: usize = 0;
@@ -607,6 +632,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
                         expected_top_count - initialized,
                     );
                     if (decoded.len != expected_block_count) return error.InvalidGraphMetricSegment;
+                    try boundary_validator.observeBlock(decoded);
                     for (decoded.scores[0..@min(decoded.len, result_count - initialized)]) |score| {
                         result_bytes = std.math.add(usize, result_bytes, score.node_id.len) catch return error.GraphMetricQueryBudgetExceeded;
                         if (result_bytes > limits.max_result_bytes) return error.GraphMetricQueryBudgetExceeded;
@@ -1059,6 +1085,35 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
         .{ .max_scores_scanned = 0 },
     ));
     try std.testing.expectEqual(@as(usize, 0), state.verify_calls);
+}
+
+test "serverless graph metric ranked blocks reject cross-boundary inversions and duplicates" {
+    var validator = RankedScoreBoundaryValidator{};
+    var first = metric_segment.codec.DecodedScoreBlock{};
+    first.scores[0] = .{ .node_id = "a", .value = 10 };
+    first.scores[1] = .{ .node_id = "b", .value = 9 };
+    first.len = 2;
+    try validator.observeBlock(first);
+
+    var valid = metric_segment.codec.DecodedScoreBlock{};
+    valid.scores[0] = .{ .node_id = "c", .value = 9 };
+    valid.scores[1] = .{ .node_id = "d", .value = 8 };
+    valid.len = 2;
+    try validator.observeBlock(valid);
+
+    var inverted_validator = RankedScoreBoundaryValidator{};
+    try inverted_validator.observeBlock(first);
+    var inverted = metric_segment.codec.DecodedScoreBlock{};
+    inverted.scores[0] = .{ .node_id = "c", .value = 11 };
+    inverted.len = 1;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, inverted_validator.observeBlock(inverted));
+
+    var duplicate_validator = RankedScoreBoundaryValidator{};
+    try duplicate_validator.observeBlock(first);
+    var duplicate = metric_segment.codec.DecodedScoreBlock{};
+    duplicate.scores[0] = .{ .node_id = "b", .value = 9 };
+    duplicate.len = 1;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, duplicate_validator.observeBlock(duplicate));
 }
 
 fn scoreOrder(a: BorrowedScore, b: BorrowedScore) std.math.Order {

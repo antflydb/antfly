@@ -647,6 +647,18 @@ pub const BackupRequest = struct {
     format: ?[]const u8 = null,
 };
 
+/// Additive details for a committed batch that needs operator action. The open string code is forward-compatible with older SDKs; clients should treat unknown codes as non-retryable when `retryable` is false.
+pub const BatchCommittedFailure = struct {
+    /// Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+    code: []const u8,
+    /// Actionable operator guidance.
+    message: []const u8,
+    /// Optional stable reason within the failure category, such as `build_budget_exceeded`.
+    reason: ?[]const u8 = null,
+    /// Whether replaying the document mutation is safe. Committed repair outcomes are false.
+    retryable: bool,
+};
+
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
@@ -659,7 +671,7 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
-    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal enrichment failure needs operator repair and will not be retried indefinitely. `committed_graph_metric_materialization_rejected` means the primary write committed, but graph-metric materialization exceeded its configured build budget. Reduce the graph or raise the serverless graph-metric limits before retrying `full_index`; retrying the document write is unnecessary.
+    /// Durable commit outcome. `committed_pending` means requested visibility or participant propagation is still completing. `committed_repair_required` means the primary write committed, but a terminal background materialization failure needs operator repair and will not be retried indefinitely. Inspect `failure` when present; retrying the document write is unnecessary.
     status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
@@ -667,6 +679,7 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+    failure: ?BatchCommittedFailure = null,
 };
 
 pub const ByteRange = []const []const u8;
