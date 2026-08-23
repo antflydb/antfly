@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	inferenceclient "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"go.uber.org/zap"
@@ -53,10 +53,10 @@ func NewNERClient(inferenceURL, nerModel string, nerLabels []string, logger *zap
 	}, nil
 }
 
-// DefaultNERClient creates an NER client with default settings,
-// resolving the inference URL via go/pkg/antfly/lib/inference.ResolveURL.
+// DefaultNERClient creates an NER client with default settings, using
+// ANTFLY_INFERENCE_URL when configured.
 func DefaultNERClient(logger *zap.Logger) (*NERClient, error) {
-	url := libinference.ResolveURL("")
+	url := os.Getenv("ANTFLY_INFERENCE_URL")
 	if url == "" {
 		url = "http://localhost:11433"
 	}

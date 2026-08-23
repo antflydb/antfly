@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("../../api/backups.zig");
@@ -42,9 +43,11 @@ else
 const db_transform = @import("../../storage/db/transform.zig");
 const db_types = @import("../../storage/db/types.zig");
 const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
+const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
 const graph_paths = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const http_routes = @import("http_routes.zig");
@@ -77,6 +80,11 @@ const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
+const common_config = @import("../../common/config.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const api_operation = @import("../../api/operation.zig");
+const request_admission = @import("../../common/request_admission.zig");
+const RequestAdmission = request_admission.RequestAdmission;
 
 pub const HttpRequest = http_types.HttpRequest;
 pub const HttpResponse = http_types.HttpResponse;
@@ -175,6 +183,20 @@ const joinUsesForeignSource = query_execution.joinUsesForeignSource;
 const parseSupportedJoinRequest = query_execution.parseSupportedJoinRequest;
 const parseSupportedJoinClauseValue = query_execution.parseSupportedJoinClauseValue;
 
+fn normalizeServerlessCreateIndexConfig(
+    alloc: Allocator,
+    index_name: []const u8,
+    expanded_index_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    return try table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        alloc,
+        index_name,
+        expanded_index_json,
+        options,
+    );
+}
+
 pub const HttpHandler = struct {
     alloc: Allocator,
     api: *api_service.Service,
@@ -185,10 +207,13 @@ pub const HttpHandler = struct {
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
+    write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
     pub fn init(
         alloc: Allocator,
@@ -210,10 +235,29 @@ pub const HttpHandler = struct {
         };
     }
 
-    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
-        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn setIo(self: *HttpHandler, io: ?std.Io) void {
+        self.io = io;
+    }
 
-        return switch (route) {
+    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
+        try req.ensureActive();
+        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
+        const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
+            .none => null,
+            .query => &self.query_admission,
+            .write => &self.write_admission,
+        };
+        if (admission) |gate| {
+            if (!gate.tryAcquire()) {
+                var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
+                response.retry_after_seconds = 1;
+                return response;
+            }
+        }
+        defer if (admission) |gate| gate.release();
+        try req.ensureActive();
+
+        var response = switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
             .readyz => try self.handleReadyz(),
@@ -232,7 +276,7 @@ pub const HttpHandler = struct {
             },
             .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
             .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
-            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body),
+            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, req.cancellation),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -249,28 +293,36 @@ pub const HttpHandler = struct {
             },
             .head => |value| try self.handleHead(value.namespace),
             .publish_head => |value| try self.handlePublishHead(value.namespace, req.body),
-            .query => |value| try self.handleQuery(value.namespace),
-            .table_query => |value| try self.handleTableQuery(value.table_name),
-            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body),
-            .table_query_published => |value| try self.handleTableQueryPublished(value.table_name),
-            .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name),
-            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body),
-            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body),
-            .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body),
-            .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body),
-            .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body),
-            .query_graph_neighbors => |value| try self.handleQueryGraphNeighbors(value.namespace, req.body),
-            .query_graph_traverse => |value| try self.handleQueryGraphTraverse(value.namespace, req.body),
-            .query_graph_shortest_path => |value| try self.handleQueryGraphShortestPath(value.namespace, req.body),
-            .query_head => |value| try self.handleQueryHead(value.namespace),
-            .query_latest => |value| try self.handleQueryLatest(value.namespace),
-            .query_version => |value| try self.handleQueryVersion(value.namespace, value.version),
-            .query_version_graph_neighbors => |value| try self.handleQueryVersionGraphNeighbors(value.namespace, value.version, req.body),
-            .query_version_graph_traverse => |value| try self.handleQueryVersionGraphTraverse(value.namespace, value.version, req.body),
-            .query_version_graph_shortest_path => |value| try self.handleQueryVersionGraphShortestPath(value.namespace, value.version, req.body),
-            .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index),
-            .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index),
+            .query => |value| try self.handleQuery(value.namespace, req.cancellation),
+            .table_query => |value| try self.handleTableQuery(value.table_name, req.cancellation),
+            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, req.cancellation),
+            .table_query_published => |value| try self.handleTableQueryPublished(value.table_name, req.cancellation),
+            .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name, req.cancellation),
+            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, req.cancellation),
+            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, req.cancellation),
+            .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body, req.cancellation),
+            .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body, req.cancellation),
+            .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body, req.cancellation),
+            .query_graph_neighbors => |value| try self.handleQueryGraphNeighbors(value.namespace, req.body, req.cancellation),
+            .query_graph_traverse => |value| try self.handleQueryGraphTraverse(value.namespace, req.body, req.cancellation),
+            .query_graph_shortest_path => |value| try self.handleQueryGraphShortestPath(value.namespace, req.body, req.cancellation),
+            .query_head => |value| try self.handleQueryHead(value.namespace, req.cancellation),
+            .query_latest => |value| try self.handleQueryLatest(value.namespace, req.cancellation),
+            .query_version => |value| try self.handleQueryVersion(value.namespace, value.version, req.cancellation),
+            .query_version_graph_neighbors => |value| try self.handleQueryVersionGraphNeighbors(value.namespace, value.version, req.body, req.cancellation),
+            .query_version_graph_traverse => |value| try self.handleQueryVersionGraphTraverse(value.namespace, value.version, req.body, req.cancellation),
+            .query_version_graph_shortest_path => |value| try self.handleQueryVersionGraphShortestPath(value.namespace, value.version, req.body, req.cancellation),
+            .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index, req.cancellation),
+            .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
+        errdefer response.deinit(self.alloc);
+        try req.ensureActive();
+        return response;
+    }
+
+    pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
+        self.query_admission = RequestAdmission.init(query_capacity);
+        self.write_admission = RequestAdmission.init(write_capacity);
     }
 
     pub fn setRuntimeMetrics(self: *HttpHandler, runtime: *runtime_manager.ManagedRuntime) void {
@@ -494,11 +546,21 @@ pub const HttpHandler = struct {
             query_mod.QueryCacheStats{};
         const query_metrics = self.query.metricsSnapshot();
         const query_count_f32: f32 = if (query_metrics.total_queries == 0) 0 else @floatFromInt(query_metrics.total_queries);
+        const query_admission = self.query_admission.stats();
+        const write_admission = self.write_admission.stats();
 
         var result = api_types.MetricsResult{
             .live = true,
             .ready = self.runtime_status.validated,
             .validated = self.runtime_status.validated,
+            .query_capacity = query_admission.capacity,
+            .query_in_flight = query_admission.in_flight,
+            .query_peak_in_flight = query_admission.peak_in_flight,
+            .query_rejected_total = query_admission.rejected_total,
+            .write_capacity = write_admission.capacity,
+            .write_in_flight = write_admission.in_flight,
+            .write_peak_in_flight = write_admission.peak_in_flight,
+            .write_rejected_total = write_admission.rejected_total,
             .namespace_count = namespaces.len,
             .total_pending_records = total_pending_records,
             .total_retained_versions = total_retained_versions,
@@ -565,6 +627,8 @@ pub const HttpHandler = struct {
             .cache_exact_payload_block_misses = cache_stats.exact_payload_block_misses,
             .cache_exact_payload_block_writes = cache_stats.exact_payload_block_writes,
             .cache_evictions = cache_stats.evictions,
+            .cache_bypasses = cache_stats.bypasses,
+            .cache_integrity_failures = cache_stats.integrity_failures,
             .cache_current_bytes = cache_stats.current_bytes,
             .cache_pinned_bytes = cache_stats.pinned_bytes,
             .cache_payload_bytes = cache_stats.payload_bytes,
@@ -791,6 +855,10 @@ pub const HttpHandler = struct {
 
     fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -807,6 +875,11 @@ pub const HttpHandler = struct {
 
     fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.tableBuildStatus(table_name) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -835,8 +908,8 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, 202, table_result);
     }
 
-    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
+    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(cancellation));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => blk: {
@@ -850,7 +923,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableListIndexes(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi());
+        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonSliceResponse(self.alloc, 200, resp.body),
@@ -859,7 +932,7 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableGetIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi());
+        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonSliceResponse(self.alloc, 200, resp.body),
@@ -868,16 +941,16 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableCreateIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi());
+        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
+            201 => try typedJsonResponse(indexes_openapi.types.CreatedIndex, self.alloc, 201, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
 
     fn handlePublicTableDeleteIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
+        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi(.none));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201 => try typedJsonResponse(struct {}, self.alloc, 201, resp.body),
@@ -1020,45 +1093,49 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, if (published) 200 else 409, result);
     }
 
-    fn handleQuery(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQuery(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         const policy = self.catalog.getPolicy(namespace) catch return try textResponse(self.alloc, 404, "not found");
         return switch (policy.default_query_view) {
-            .published => try self.handleQueryHead(namespace),
-            .latest => try self.handleQueryLatest(namespace),
+            .published => try self.handleQueryHead(namespace, cancellation),
+            .latest => try self.handleQueryLatest(namespace, cancellation),
         };
     }
 
-    fn handleTableQuery(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .default_view);
+    fn handleTableQuery(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .default_view, cancellation);
     }
 
-    fn handleTableQueryPublished(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .published);
+    fn handleTableQueryPublished(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .published, cancellation);
     }
 
-    fn handleTableQueryLatest(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        return try self.handlePublicTableQueryView(table_name, .latest);
+    fn handleTableQueryLatest(self: *HttpHandler, table_name: []const u8, cancellation: CancellationToken) !HttpResponse {
+        return try self.handlePublicTableQueryView(table_name, .latest, cancellation);
     }
 
     fn handlePublicTableQueryView(
         self: *HttpHandler,
         table_name: []const u8,
         view: public_table_http.TableApi.TableQueryView,
+        cancellation: CancellationToken,
     ) !HttpResponse {
+        try cancellation.check();
         var resp = try public_table_http.handleTableQueryView(
             self.alloc,
             table_name,
             view,
-            self.tableApi(),
+            self.tableApi(cancellation),
         );
         defer resp.deinit(self.alloc);
+        try cancellation.check();
         return switch (resp.status) {
             200 => try typedJsonResponse(query_types.TableQueryResult, self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
 
-    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8) !SearchExecution {
+    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8, cancellation: CancellationToken) !SearchExecution {
+        try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
         var plan = try query_mod.parseSearchPlanAlloc(self.alloc, body, status.published_search_sources);
@@ -1069,7 +1146,7 @@ pub const HttpHandler = struct {
             plan.request.offset = 0;
             plan.request.limit = std.math.maxInt(usize);
         }
-        try self.resolveSemanticQueryRequest(table_name, &plan);
+        try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
         var profile_requested = false;
         var public_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -1086,7 +1163,7 @@ pub const HttpHandler = struct {
         profile_requested = public_request.value.profile orelse false;
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
-        try query_mod.warmIndexedSearchPlanPath(&session, plan);
+        session.setCancellation(cancellation);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
         const hits = try query_mod.searchIndexedPlanWithStatsAlloc(self.alloc, &session, plan, &execution_stats);
@@ -1105,8 +1182,9 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8) anyerror![]u8 {
-        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
+    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        try cancellation.check();
+        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         }) |json| {
@@ -1122,17 +1200,19 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
         }
 
-        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body);
+        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation);
     }
 
     fn executeForeignPublicTableQueryJsonAlloc(
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
+        cancellation: CancellationToken,
     ) anyerror!?[]u8 {
+        try cancellation.check();
         var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -1160,10 +1240,11 @@ pub const HttpHandler = struct {
                 foreign_source,
                 parsed_join.join,
                 parsed_join.foreign_sources,
+                cancellation,
             );
         }
 
-        return try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, request, foreign_source);
+        return try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, request, foreign_source, cancellation);
     }
 
     fn encodeForeignPublicTableQueryResponseJsonAlloc(
@@ -1171,7 +1252,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         request: metadata_openapi.QueryRequest,
         foreign_source: foreign_mod.PostgresConfig,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         const registry = self.foreign_registry orelse return error.UnsupportedQueryRequest;
         const started_ns = platform_time.monotonicNs();
         const limit = try foreignQueryLimit(request.limit);
@@ -1211,6 +1294,7 @@ pub const HttpHandler = struct {
             .order_by = foreign_order_by,
         });
         defer params.deinit(self.alloc);
+        params.cancellation = cancellation;
 
         const source_config = try foreign_source.toSourceConfig(self.alloc);
         var foreign_query_source = try registry.create(self.alloc, source_config);
@@ -1226,6 +1310,7 @@ pub const HttpHandler = struct {
                 filter_query_json,
             );
             defer aggregate_params.deinit(self.alloc);
+            aggregate_params.cancellation = cancellation;
             var aggregate_result = foreign_query_source.aggregate(self.alloc, aggregate_params) catch |err| switch (err) {
                 error.UnsupportedAggregate => return error.UnsupportedQueryRequest,
                 else => return err,
@@ -1269,7 +1354,9 @@ pub const HttpHandler = struct {
         foreign_source: foreign_mod.PostgresConfig,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -1286,7 +1373,7 @@ pub const HttpHandler = struct {
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer primary_request.deinit();
-        const primary_json = try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, primary_request.value, foreign_source);
+        const primary_json = try self.encodeForeignPublicTableQueryResponseJsonAlloc(table_name, primary_request.value, foreign_source, cancellation);
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -1295,7 +1382,7 @@ pub const HttpHandler = struct {
         if (hits_ptr.items.len == 0) return primary_json;
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, hits_ptr.items, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         var stats: JoinedQueryStats = .{
@@ -1470,7 +1557,8 @@ pub const HttpHandler = struct {
         return hits;
     }
 
-    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8) anyerror![]u8 {
+    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        try cancellation.check();
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             else => return error.InternalQueryFailure,
@@ -1480,7 +1568,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body)) |owned_response| {
+        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation)) |owned_response| {
             var response = owned_response;
             defer response.deinit(self.alloc);
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
@@ -1491,7 +1579,7 @@ pub const HttpHandler = struct {
             };
         }
 
-        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -1724,6 +1812,7 @@ pub const HttpHandler = struct {
             out_hits[idx] = .{
                 .id = try alloc.dupe(u8, hit.doc_id),
                 .score = @as(f32, @floatFromInt(hit.score)) / 1000.0,
+                .distance = hit.distance,
                 .stored_data = try normalizeServerlessAggregationStoredDataAlloc(alloc, body),
             };
             initialized_hits += 1;
@@ -2161,7 +2250,9 @@ pub const HttpHandler = struct {
         body: []const u8,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]u8 {
+        try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -2174,7 +2265,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body);
+        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation);
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -2183,7 +2274,7 @@ pub const HttpHandler = struct {
         if (hits_ptr.items.len == 0) return primary_json;
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, hits_ptr.items, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         var stats: JoinedQueryStats = .{
@@ -2269,9 +2360,11 @@ pub const HttpHandler = struct {
         left_hits: []const std.json.Value,
         plan: PlannedJoinExecution,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!RightJoinQueryResult {
+        try cancellation.check();
         if (foreign_sources.get(join.right_table)) |foreign_source| {
-            return try self.executeForeignRightJoinQuery(foreign_source, join, left_hits, foreign_sources);
+            return try self.executeForeignRightJoinQuery(foreign_source, join, left_hits, foreign_sources, cancellation);
         }
         const namespace = self.catalog.resolveTableNamespaceAlloc(join.right_table) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
@@ -2281,6 +2374,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         const docs = try self.allocPublishedDocumentsAlloc(&session);
         defer query_materializer.freeDocuments(self.alloc, docs);
@@ -2303,7 +2397,8 @@ pub const HttpHandler = struct {
             hits.deinit(self.alloc);
         }
 
-        for (docs) |doc| {
+        for (docs, 0..) |doc, doc_index| {
+            if (doc_index % 64 == 0) try cancellation.check();
             if (join.right_filters) |filters| {
                 if (filters.filter_prefix) |prefix| {
                     if (!std.mem.startsWith(u8, doc.doc_id, prefix)) continue;
@@ -2337,7 +2432,7 @@ pub const HttpHandler = struct {
         }
 
         if (join.nested_join) |nested_join| {
-            const nested_hits = try self.executeSupportedJoinedHitsAlloc(nested_join.*, hits.items, foreign_sources);
+            const nested_hits = try self.executeSupportedJoinedHitsAlloc(nested_join.*, hits.items, foreign_sources, cancellation);
             for (hits.items) |*item| deinitJsonValue(self.alloc, item);
             hits.deinit(self.alloc);
             return .{
@@ -2358,7 +2453,9 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         left_hits: []const std.json.Value,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!RightJoinQueryResult {
+        try cancellation.check();
         const registry = self.foreign_registry orelse return error.UnsupportedQueryRequest;
 
         const effective_fields = try buildForeignJoinFieldListAlloc(self.alloc, join);
@@ -2385,6 +2482,7 @@ pub const HttpHandler = struct {
             .limit = if (join.right_filters) |filters| filters.limit else null,
         });
         defer params.deinit(self.alloc);
+        params.cancellation = cancellation;
 
         const source_config = try foreign_source.toSourceConfig(self.alloc);
         var foreign_query_source = try registry.create(self.alloc, source_config);
@@ -2399,7 +2497,8 @@ pub const HttpHandler = struct {
             hits.deinit(self.alloc);
         }
 
-        for (result.rows) |row| {
+        for (result.rows, 0..) |row, row_index| {
+            if (row_index % 64 == 0) try cancellation.check();
             if (row != .object) return error.UnsupportedQueryRequest;
             const match_value = extractJsonPathValue(row, join.right_field) orelse continue;
             if (join.join_type != .right) {
@@ -2418,7 +2517,7 @@ pub const HttpHandler = struct {
 
         const owned_hits = try hits.toOwnedSlice(self.alloc);
         if (join.nested_join) |nested_join| {
-            try self.applyNestedJoinToRightHitsAlloc(join.right_table, owned_hits, nested_join, foreign_sources);
+            try self.applyNestedJoinToRightHitsAlloc(join.right_table, owned_hits, nested_join, foreign_sources, cancellation);
         }
 
         return .{
@@ -2432,11 +2531,13 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         left_hits: []const std.json.Value,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror![]std.json.Value {
+        try cancellation.check();
         if (left_hits.len == 0 and join.join_type != .right) return try self.alloc.alloc(std.json.Value, 0);
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, left_hits, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, left_hits, plan, foreign_sources);
+        var right_result = try self.executeSupportedRightJoinQuery(join, left_hits, plan, foreign_sources, cancellation);
         defer right_result.deinit(self.alloc);
 
         const requested_left_fields = if (join.join_type == .right)
@@ -2454,7 +2555,8 @@ pub const HttpHandler = struct {
             joined_hits.deinit(self.alloc);
         }
 
-        for (left_hits) |hit_value| {
+        for (left_hits, 0..) |hit_value, hit_index| {
+            if (hit_index % 64 == 0) try cancellation.check();
             var joined_hit = cloneJsonValue(self.alloc, hit_value) catch return error.InternalQueryFailure;
             errdefer deinitJsonValue(self.alloc, &joined_hit);
             const source_value = joined_hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
@@ -2507,15 +2609,17 @@ pub const HttpHandler = struct {
         right_hits: []std.json.Value,
         nested_join: *SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        cancellation: CancellationToken,
     ) anyerror!void {
         _ = parent_table_name;
         if (right_hits.len == 0) return;
 
         const plan = planSupportedJoinExecution(self, self.alloc, nested_join.*, right_hits, foreign_sources);
-        var nested_result = try self.executeSupportedRightJoinQuery(nested_join.*, right_hits, plan, foreign_sources);
+        var nested_result = try self.executeSupportedRightJoinQuery(nested_join.*, right_hits, plan, foreign_sources, cancellation);
         defer nested_result.deinit(self.alloc);
 
-        for (right_hits) |*hit| {
+        for (right_hits, 0..) |*hit, hit_index| {
+            if (hit_index % 64 == 0) try cancellation.check();
             const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
             const matched_right = findFirstMatchingRightHit(nested_join.*, left_value, nested_result.hits) orelse continue;
             const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
@@ -2528,7 +2632,9 @@ pub const HttpHandler = struct {
         self: *HttpHandler,
         table_name: []const u8,
         requested_view: public_table_http.TableApi.TableQueryView,
+        cancellation: CancellationToken,
     ) ![]u8 {
+        try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
@@ -2549,6 +2655,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         if (resolved_view == .latest) {
             const records = try self.api.wal.readFromAlloc(namespace, session.manifest.wal_end_lsn + 1);
@@ -2562,15 +2669,17 @@ pub const HttpHandler = struct {
         return try self.encodeTableQuerySessionResponseJsonAlloc(table_name, &session, .published, &.{});
     }
 
-    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+        try cancellation.check();
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
             body,
             null,
-            self.tableApi(),
+            self.tableApi(cancellation),
         );
         defer resp.deinit(self.alloc);
+        try cancellation.check();
         return switch (resp.status) {
             200 => try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
@@ -2582,7 +2691,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         namespace: []const u8,
         body: []const u8,
+        cancellation: CancellationToken,
     ) !?HttpResponse {
+        try cancellation.check();
         public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
         };
@@ -2622,6 +2733,7 @@ pub const HttpHandler = struct {
             .graph_queries = graph_queries,
             .limit = if (request.limit) |limit| std.math.cast(u32, limit) orelse 10 else 10,
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
+            .cancellation = cancellation,
         };
         var search_hits: []db_types.SearchHit = &.{};
         defer if (search_hits.len > 0) freeDbSearchHits(self.alloc, search_hits);
@@ -2639,7 +2751,7 @@ pub const HttpHandler = struct {
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body) catch |err| switch (err) {
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2693,6 +2805,7 @@ pub const HttpHandler = struct {
                 else => return err,
             };
             session_initialized = true;
+            session.setCancellation(cancellation);
         }
 
         const results = try self.executePublicGraphQueriesAlloc(&session, graph_queries, initial_sets.items);
@@ -2719,14 +2832,14 @@ pub const HttpHandler = struct {
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
     }
 
-    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -2810,7 +2923,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
@@ -2819,7 +2932,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.UnsupportedQueryRequest,
             error.EmbeddingIndexNotFound,
@@ -2886,7 +2999,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQueryGraphNeighbors(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphNeighbors(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2900,10 +3013,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphNeighborsResponse(&session, table_name, namespace, req);
     }
 
-    fn handleTableQueryGraphTraverse(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphTraverse(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -2917,10 +3031,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphTraverseResponse(&session, table_name, namespace, req);
     }
 
-    fn handleTableQueryGraphShortestPath(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleTableQueryGraphShortestPath(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -2934,10 +3049,12 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.tableQueryGraphShortestPathResponse(&session, table_name, namespace, req);
     }
 
-    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan) !void {
+    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken) !void {
+        try cancellation.check();
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
 
@@ -2952,26 +3069,27 @@ pub const HttpHandler = struct {
             defer table.deinit(self.alloc);
 
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+                .io = self.io,
                 .remote_content = self.remote_content,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
-                    try runtime.embedQueryWithTemplate(self.alloc, index_name, semantic_search, value)
+                    try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
                 else
-                    try runtime.embedQuery(self.alloc, index_name, semantic_search);
+                    try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
                 return;
             }
         }
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
         plan.request.vector = if (plan.request.embedding_template) |value|
-            try runtime.embedQueryWithTemplate(self.alloc, index_name, semantic_search, value)
+            try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
         else
-            try runtime.embedQuery(self.alloc, index_name, semantic_search);
+            try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
     }
 
-    fn handleQueryGraphNeighbors(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphNeighbors(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2982,10 +3100,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphNeighborsResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphNeighbors(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphNeighbors(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphNeighborsPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph query request");
         };
@@ -2996,6 +3115,7 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphNeighborsResponse(&session, namespace, req);
     }
 
@@ -3019,6 +3139,7 @@ pub const HttpHandler = struct {
             if (graph_queries.len > 0) self.alloc.free(results);
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
+            try session.checkCancellation();
             results[idx] = try self.executePublicGraphQueryAlloc(session, graph_queries[query_index], available_sets.items);
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
@@ -3265,13 +3386,22 @@ pub const HttpHandler = struct {
         defer freeOwnedKeySlice(self.alloc, start_keys);
         const start_key_refs = try castOwnedKeysToConst(self.alloc, start_keys);
         defer self.alloc.free(start_key_refs);
+        const target_keys = if (named_query.query.target_nodes) |selector|
+            try public_graph_query.resolveGraphSelectorAlloc(self.alloc, selector, available_sets)
+        else
+            try self.alloc.alloc([]u8, 0);
+        defer freeOwnedKeySlice(self.alloc, target_keys);
+        const target_key_refs = try castOwnedKeysToConst(self.alloc, target_keys);
+        defer self.alloc.free(target_key_refs);
+        const target_nodes = try self.alloc.alloc(graph_node_identity.Ref, target_key_refs.len);
+        defer self.alloc.free(target_nodes);
+        for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
         const need_docs = named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
         const docs: []const query_materializer.Document = if (need_docs) try self.allocPublishedDocumentsAlloc(session) else &.{};
         defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
 
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
-        try session.warmArtifact(graph_index);
         const payload = try session.fetchArtifactAlloc(graph_index);
         defer self.alloc.free(payload);
         var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
@@ -3285,15 +3415,18 @@ pub const HttpHandler = struct {
                 alloc: Allocator,
                 table: ?[]const u8,
                 key: []const u8,
+                edge_types: []const []const u8,
                 direction: graph_mod.EdgeDirection,
             ) ![]graph_mod.Edge {
                 // Serverless snapshots contain one table-local graph segment.
                 if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
                 const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
-                const edge_count: usize = switch (direction) {
-                    .out => adjacency.out_edges.len,
-                    .in => adjacency.in_edges.len,
-                    .both => adjacency.out_edges.len + adjacency.in_edges.len,
+                var edge_count: usize = 0;
+                if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
+                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
+                };
+                if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
+                    if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
                 };
                 const edges = try alloc.alloc(graph_mod.Edge, edge_count);
                 var initialized: usize = 0;
@@ -3304,10 +3437,17 @@ pub const HttpHandler = struct {
 
                 if (direction == .out or direction == .both) {
                     for (adjacency.out_edges) |edge| {
+                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+                        const source = try alloc.dupe(u8, adjacency.node_id);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, edge.neighbor_id);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, edge.edge_type);
+                        errdefer alloc.free(edge_type);
                         edges[initialized] = .{
-                            .source = try alloc.dupe(u8, adjacency.node_id),
-                            .target = try alloc.dupe(u8, edge.neighbor_id),
-                            .edge_type = try alloc.dupe(u8, edge.edge_type),
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
                             .weight = edge.weight,
                             .created_at = 0,
                             .updated_at = 0,
@@ -3318,10 +3458,17 @@ pub const HttpHandler = struct {
                 }
                 if (direction == .in or direction == .both) {
                     for (adjacency.in_edges) |edge| {
+                        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+                        const source = try alloc.dupe(u8, edge.neighbor_id);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, adjacency.node_id);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, edge.edge_type);
+                        errdefer alloc.free(edge_type);
                         edges[initialized] = .{
-                            .source = try alloc.dupe(u8, edge.neighbor_id),
-                            .target = try alloc.dupe(u8, adjacency.node_id),
-                            .edge_type = try alloc.dupe(u8, edge.edge_type),
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
                             .weight = edge.weight,
                             .created_at = 0,
                             .updated_at = 0,
@@ -3336,6 +3483,50 @@ pub const HttpHandler = struct {
             pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
                 for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
                 if (edges.len > 0) alloc.free(edges);
+            }
+
+            pub fn probeEdges(
+                reader: @This(),
+                alloc: Allocator,
+                table: ?[]const u8,
+                probes: []const graph_mod.EdgeProbe,
+            ) ![]?graph_mod.Edge {
+                const results = try alloc.alloc(?graph_mod.Edge, probes.len);
+                @memset(results, null);
+                errdefer {
+                    for (results) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+                    alloc.free(results);
+                }
+                if (table != null) return results;
+                for (probes, 0..) |probe, probe_index| {
+                    const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, probe.source) orelse continue;
+                    for (adjacency.out_edges) |edge| {
+                        if (!std.mem.eql(u8, edge.neighbor_id, probe.target) or
+                            !std.mem.eql(u8, edge.edge_type, probe.edge_type)) continue;
+                        const source = try alloc.dupe(u8, probe.source);
+                        errdefer alloc.free(source);
+                        const target = try alloc.dupe(u8, probe.target);
+                        errdefer alloc.free(target);
+                        const edge_type = try alloc.dupe(u8, probe.edge_type);
+                        errdefer alloc.free(edge_type);
+                        results[probe_index] = .{
+                            .source = source,
+                            .target = target,
+                            .edge_type = edge_type,
+                            .weight = edge.weight,
+                            .created_at = 0,
+                            .updated_at = 0,
+                            .metadata = &.{},
+                        };
+                        break;
+                    }
+                }
+                return results;
+            }
+
+            pub fn freeProbedEdges(_: @This(), alloc: Allocator, edges: []?graph_mod.Edge) void {
+                for (edges) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
+                alloc.free(edges);
             }
         };
 
@@ -3354,6 +3545,9 @@ pub const HttpHandler = struct {
             .{
                 .max_results = named_query.query.params.max_results,
                 .return_aliases = named_query.query.return_aliases,
+                .target_nodes = target_nodes,
+                .target_required = named_query.query.target_nodes != null,
+                .include_paths = named_query.query.params.include_paths,
                 .evaluator = if (need_docs) .{
                     .ctx = @ptrCast(&filter_ctx),
                     .func = publishedPatternNodeFilterEvaluator,
@@ -3508,19 +3702,21 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const neighbors = query_mod.graphNeighborsAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphNeighborQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph neighbor query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer query_mod.freeGraphNeighbors(self.alloc, neighbors);
 
         const out_neighbors = try self.alloc.alloc(query_types.GraphNeighbor, neighbors.len);
-        errdefer self.alloc.free(out_neighbors);
+        var initialized_neighbors: usize = 0;
+        errdefer {
+            for (out_neighbors[0..initialized_neighbors]) |neighbor| freeGraphNeighbor(self.alloc, neighbor);
+            self.alloc.free(out_neighbors);
+        }
         for (neighbors, 0..) |neighbor, idx| {
-            out_neighbors[idx] = .{
-                .doc_id = try self.alloc.dupe(u8, neighbor.doc_id),
-                .edge_type = try self.alloc.dupe(u8, neighbor.edge_type),
-                .weight = neighbor.weight,
-                .direction = neighbor.direction,
-            };
+            out_neighbors[idx] = try dupGraphNeighborAlloc(self.alloc, neighbor);
+            initialized_neighbors += 1;
         }
         defer freeGraphNeighbors(self.alloc, out_neighbors);
 
@@ -3554,7 +3750,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleQueryGraphTraverse(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphTraverse(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -3565,10 +3761,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphTraverseResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphTraverse(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphTraverse(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphTraversePlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph traverse request");
         };
@@ -3579,10 +3776,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphTraverseResponse(&session, namespace, req);
     }
 
-    fn handleQueryGraphShortestPath(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn handleQueryGraphShortestPath(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -3593,10 +3791,11 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphShortestPathResponse(&session, namespace, req);
     }
 
-    fn handleQueryVersionGraphShortestPath(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8) !HttpResponse {
+    fn handleQueryVersionGraphShortestPath(self: *HttpHandler, namespace: []const u8, version: u64, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         var req = query_mod.parseGraphShortestPathPlanAlloc(self.alloc, body) catch {
             return try textResponse(self.alloc, 400, "invalid graph shortest path request");
         };
@@ -3607,6 +3806,7 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryGraphShortestPathResponse(&session, namespace, req);
     }
 
@@ -3623,21 +3823,21 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const nodes = query_mod.graphTraverseAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph traversal query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer query_mod.freeGraphTraversalNodes(self.alloc, nodes);
 
         const out_nodes = try self.alloc.alloc(query_types.GraphTraversalNode, nodes.len);
-        errdefer self.alloc.free(out_nodes);
+        var initialized_nodes: usize = 0;
+        errdefer {
+            for (out_nodes[0..initialized_nodes]) |node| freeGraphTraversalNode(self.alloc, node);
+            self.alloc.free(out_nodes);
+        }
         for (nodes, 0..) |node, idx| {
-            out_nodes[idx] = .{
-                .doc_id = try self.alloc.dupe(u8, node.doc_id),
-                .depth = node.depth,
-                .parent_doc_id = if (node.parent_doc_id) |value| try self.alloc.dupe(u8, value) else null,
-                .via_edge_type = if (node.via_edge_type) |value| try self.alloc.dupe(u8, value) else null,
-                .path = if (node.path) |path| try dupGraphPathAlloc(self.alloc, path) else null,
-                .edge_path = if (node.edge_path) |path| try dupGraphEdgePathAlloc(self.alloc, path) else null,
-            };
+            out_nodes[idx] = try dupGraphTraversalNodeAlloc(self.alloc, node);
+            initialized_nodes += 1;
         }
         defer freeGraphTraversalNodes(self.alloc, out_nodes);
 
@@ -3686,6 +3886,8 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const maybe_path = query_mod.graphShortestPathAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph shortest-path query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
 
@@ -3764,21 +3966,23 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleQueryHead(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQueryHead(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.querySessionResponse(&session, .published, &.{});
     }
 
-    fn handleQueryLatest(self: *HttpHandler, namespace: []const u8) !HttpResponse {
+    fn handleQueryLatest(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
 
         const records = self.api.wal.readFromAlloc(namespace, session.manifest.wal_end_lsn + 1) catch return try textResponse(self.alloc, 500, "query failed");
         defer wal_mod.freeRecords(self.alloc, records);
@@ -3788,30 +3992,33 @@ pub const HttpHandler = struct {
         return try self.querySessionResponse(&session, .latest, tail);
     }
 
-    fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64) !HttpResponse {
+    fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.querySessionResponse(&session, .published, &.{});
     }
 
-    fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize) !HttpResponse {
+    fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryArtifactResponse(&session, artifact_index);
     }
 
-    fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize) !HttpResponse {
+    fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
         var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer session.deinit();
+        session.setCancellation(cancellation);
         return try self.queryArtifactResponse(&session, artifact_index);
     }
 
@@ -4036,8 +4243,6 @@ pub const HttpHandler = struct {
     }
 
     fn allocPublishedDocumentsAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Document {
-        try session.warmArtifactKind(.document_segment);
-        try session.warmArtifactKind(.mutation_segment);
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
             if (artifact_ref.kind != .document_segment) continue;
@@ -4206,9 +4411,10 @@ pub const HttpHandler = struct {
         return mutations;
     }
 
-    fn tableApi(self: *HttpHandler) public_table_http.TableApi {
+    fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
         return .{
             .ptr = self,
+            .request = .{ .cancellation = cancellation },
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -4228,10 +4434,20 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         req: db_types.BatchRequest,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
+
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return error.NotFound,
+            error.ExternalTableReadOnly => return error.MethodNotAllowed,
+            else => {
+                std.log.err("serverless public table batch write admission failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
 
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
@@ -4271,7 +4487,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -4290,6 +4506,7 @@ pub const HttpHandler = struct {
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
         status_before_write: catalog_types.BuildStatus,
+        cancellation: CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const requires_background_materialization =
             status_before_write.enrichment_enabled or
@@ -4308,6 +4525,7 @@ pub const HttpHandler = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
         while (true) {
+            cancellation.check() catch return error.Canceled;
             const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
                 error.NamespaceNotFound => return error.NotFound,
                 error.HeadChanged => null,
@@ -4424,11 +4642,12 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -4438,6 +4657,7 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4450,12 +4670,14 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         view: public_table_http.TableApi.TableQueryView,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryViewJsonAlloc(table_name, view) catch |err| switch (err) {
+        return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.Canceled => return error.Canceled,
             else => return error.InternalFailure,
         };
     }
@@ -4466,9 +4688,11 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: backups_api.BackupFormat,
+        _: ?backups_api.TableBackupFence,
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;
     }
@@ -4481,6 +4705,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         return error.MethodNotAllowed;
     }
@@ -4489,6 +4714,7 @@ pub const HttpHandler = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4504,6 +4730,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
@@ -4520,7 +4747,8 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
-    ) public_table_http.TableApi.ExecuteCreateIndexError!void {
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
@@ -4538,18 +4766,45 @@ pub const HttpHandler = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
-        table_writes.validateIndexConfig(alloc, index_name, expanded_index_json) catch |err| switch (err) {
+        const normalized_index_json = normalizeServerlessCreateIndexConfig(
+            alloc,
+            index_name,
+            expanded_index_json,
+            .{
+                .io = self.io,
+                .remote_content = self.remote_content,
+            },
+        ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
         };
-        const next_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json) catch |err| switch (err) {
+        defer alloc.free(normalized_index_json);
+        table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
+            .io = self.io,
+            .remote_content = self.remote_content,
+        }) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
+            else => return error.InternalFailure,
+        };
+        const next_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
         defer alloc.free(next_indexes_json);
+        const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
+        errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
+        };
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
         };
         const updated = self.catalog.setTableDefinition(
             table_name,
@@ -4558,6 +4813,7 @@ pub const HttpHandler = struct {
             next_indexes_json,
         ) catch return error.InternalFailure;
         if (!updated) return error.NotFound;
+        return response_body;
     }
 
     fn executePublicTableDeleteIndex(
@@ -4565,6 +4821,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
@@ -4576,6 +4833,11 @@ pub const HttpHandler = struct {
         };
         defer alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch return error.InternalFailure;
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => unreachable,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
@@ -4675,6 +4937,14 @@ fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep)
     return false;
 }
 
+fn patternEdgeTypeRequested(edge_type: []const u8, requested: []const []const u8) bool {
+    if (requested.len == 0) return true;
+    for (requested) |item| {
+        if (std.mem.eql(u8, edge_type, item)) return true;
+    }
+    return false;
+}
+
 fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_query_json == null) return true;
@@ -4715,25 +4985,58 @@ fn findNamespaceQueryMetrics(
 }
 
 fn freeGraphNeighbors(alloc: Allocator, neighbors: []query_types.GraphNeighbor) void {
-    for (neighbors) |neighbor| {
-        alloc.free(neighbor.doc_id);
-        alloc.free(neighbor.edge_type);
-    }
+    for (neighbors) |neighbor| freeGraphNeighbor(alloc, neighbor);
     alloc.free(neighbors);
 }
 
+fn freeGraphNeighbor(alloc: Allocator, neighbor: query_types.GraphNeighbor) void {
+    alloc.free(neighbor.doc_id);
+    alloc.free(neighbor.edge_type);
+}
+
+fn dupGraphNeighborAlloc(alloc: Allocator, neighbor: query_mod.GraphNeighbor) !query_types.GraphNeighbor {
+    const doc_id = try alloc.dupe(u8, neighbor.doc_id);
+    errdefer alloc.free(doc_id);
+    const edge_type = try alloc.dupe(u8, neighbor.edge_type);
+    return .{
+        .doc_id = doc_id,
+        .edge_type = edge_type,
+        .weight = neighbor.weight,
+        .direction = neighbor.direction,
+    };
+}
+
 fn freeGraphTraversalNodes(alloc: Allocator, nodes: []query_types.GraphTraversalNode) void {
-    for (nodes) |node| {
-        alloc.free(node.doc_id);
-        if (node.parent_doc_id) |value| alloc.free(value);
-        if (node.via_edge_type) |value| alloc.free(value);
-        if (node.path) |path| {
-            for (path) |segment| alloc.free(segment);
-            alloc.free(path);
-        }
-        if (node.edge_path) |path| freeGraphEdgePath(alloc, path);
-    }
+    for (nodes) |node| freeGraphTraversalNode(alloc, node);
     alloc.free(nodes);
+}
+
+fn freeGraphTraversalNode(alloc: Allocator, node: query_types.GraphTraversalNode) void {
+    alloc.free(node.doc_id);
+    if (node.parent_doc_id) |value| alloc.free(value);
+    if (node.via_edge_type) |value| alloc.free(value);
+    if (node.path) |path| freeGraphPath(alloc, path);
+    if (node.edge_path) |path| freeGraphEdgePath(alloc, path);
+}
+
+fn dupGraphTraversalNodeAlloc(alloc: Allocator, node: query_mod.GraphTraversalNode) !query_types.GraphTraversalNode {
+    const doc_id = try alloc.dupe(u8, node.doc_id);
+    errdefer alloc.free(doc_id);
+    const parent_doc_id = if (node.parent_doc_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (parent_doc_id) |value| alloc.free(value);
+    const via_edge_type = if (node.via_edge_type) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (via_edge_type) |value| alloc.free(value);
+    const path = if (node.path) |value| try dupGraphPathAlloc(alloc, value) else null;
+    errdefer if (path) |value| freeGraphPath(alloc, value);
+    const edge_path = if (node.edge_path) |value| try dupGraphEdgePathAlloc(alloc, value) else null;
+    return .{
+        .doc_id = doc_id,
+        .depth = node.depth,
+        .parent_doc_id = parent_doc_id,
+        .via_edge_type = via_edge_type,
+        .path = path,
+        .edge_path = edge_path,
+    };
 }
 
 fn graphTotalHits(results: []const db_types.GraphSearchResult) u32 {
@@ -4837,10 +5140,15 @@ fn allocSinglePathEdgeInfo(
 ) ![]const graph_query_mod.PathEdgeInfo {
     const out = try alloc.alloc(graph_query_mod.PathEdgeInfo, 1);
     errdefer alloc.free(out);
+    const source_copy = try alloc.dupe(u8, source);
+    errdefer alloc.free(source_copy);
+    const target_copy = try alloc.dupe(u8, target);
+    errdefer alloc.free(target_copy);
+    const edge_type_copy = try alloc.dupe(u8, edge_type);
     out[0] = .{
-        .source = try alloc.dupe(u8, source),
-        .target = try alloc.dupe(u8, target),
-        .edge_type = try alloc.dupe(u8, edge_type),
+        .source = source_copy,
+        .target = target_copy,
+        .edge_type = edge_type_copy,
         .weight = weight,
     };
     return out;
@@ -4861,10 +5169,15 @@ fn allocPathEdgeInfos(
         }
     }
     for (path, 0..) |hop, idx| {
+        const source = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         out[idx] = .{
-            .source = try alloc.dupe(u8, hop.from_doc_id),
-            .target = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
             .weight = hop.weight,
         };
         initialized += 1;
@@ -4943,10 +5256,15 @@ fn toDbGraphPath(alloc: Allocator, path: query_mod.GraphShortestPath) !db_types.
 
     var total_weight: f64 = 0;
     for (path.edge_path, 0..) |hop, idx| {
+        const source = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         edges[idx] = .{
-            .source = try alloc.dupe(u8, hop.from_doc_id),
-            .target = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
             .weight = hop.weight,
         };
         total_weight += hop.weight;
@@ -4975,7 +5293,7 @@ fn dupGraphPathAlloc(alloc: Allocator, path: [][]u8) ![][]u8 {
     return out;
 }
 
-fn freeGraphPath(alloc: Allocator, path: [][]u8) void {
+fn freeGraphPath(alloc: Allocator, path: []const []const u8) void {
     for (path) |segment| alloc.free(segment);
     alloc.free(path);
 }
@@ -4992,10 +5310,15 @@ fn dupGraphEdgePathAlloc(alloc: Allocator, path: []query_mod.GraphPathHop) ![]qu
         }
     }
     for (path, 0..) |hop, idx| {
+        const from_doc_id = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(from_doc_id);
+        const to_doc_id = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(to_doc_id);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         out[idx] = .{
-            .from_doc_id = try alloc.dupe(u8, hop.from_doc_id),
-            .to_doc_id = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .from_doc_id = from_doc_id,
+            .to_doc_id = to_doc_id,
+            .edge_type = edge_type,
             .weight = hop.weight,
             .direction = hop.direction,
         };
@@ -5744,6 +6067,10 @@ fn findNamedArtifactPublicationAction(
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
+    table_writes.validateGraphIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTableIndexMetadata,
+    };
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -5925,6 +6252,7 @@ fn allocDbSearchHitsAlloc(
         out_hits[idx] = .{
             .id = try alloc.dupe(u8, hit.doc_id),
             .score = @as(f32, @floatFromInt(hit.score)) / 1000.0,
+            .distance = hit.distance,
             .stored_data = try alloc.dupe(u8, hit.body),
         };
         initialized_hits += 1;
@@ -5962,6 +6290,7 @@ fn allocQueryHitsAlloc(
             else
                 try alloc.dupe(u8, hit.body),
             .score = hit.score,
+            .distance = hit.distance,
         };
         initialized_hits += 1;
     }
@@ -6312,7 +6641,7 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
     };
 }
 
-test "http handler serves internal namespace lifecycle and query head" {
+test "serverless http handler serves internal namespace lifecycle, admission, and query head" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -6435,6 +6764,8 @@ test "http handler serves internal namespace lifecycle and query head" {
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_pinned_block_count);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_approx_payload_block_hits);
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_max_payload_bytes);
+    try std.testing.expectEqual(@as(usize, common_config.default_query_max_concurrent_requests), parsed_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, common_config.default_write_max_concurrent_requests), parsed_metrics.value.write_capacity);
 
     var create = try handler.handle(.{
         .method = .put,
@@ -6450,6 +6781,43 @@ test "http handler serves internal namespace lifecycle and query head" {
     try std.testing.expectEqual(@as(u64, 123), parsed_create.value.created_at_ns);
     try std.testing.expectEqual(@as(u64, 4), parsed_create.value.policy.keep_latest_versions);
     try std.testing.expectEqual(shared_vector.DistanceMetric.inner_product, parsed_create.value.policy.vector_distance_metric);
+
+    handler.configureAdmission(1, 1);
+    try std.testing.expect(handler.query_admission.tryAcquire());
+    try std.testing.expect(handler.write_admission.tryAcquire());
+    var saturated_query = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/namespaces/docs/query/head",
+    });
+    defer saturated_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_query.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_query.retry_after_seconds);
+    var saturated_write = try handler.handle(.{
+        .method = .put,
+        .path = "/internal/v1/namespaces/docs/ingest-batch",
+        .body = "{}",
+    });
+    defer saturated_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), saturated_write.status);
+    try std.testing.expectEqual(@as(?u32, 1), saturated_write.retry_after_seconds);
+    handler.query_admission.release();
+    handler.write_admission.release();
+
+    var admission_metrics = try handler.handle(.{
+        .method = .get,
+        .path = "/metrics",
+    });
+    defer admission_metrics.deinit(alloc);
+    var parsed_admission_metrics = try parseJsonTestBody(api_types.MetricsResult, alloc, admission_metrics.body);
+    defer parsed_admission_metrics.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.query_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.query_rejected_total);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.write_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.write_rejected_total);
 
     var list = try handler.handle(.{
         .method = .get,
@@ -7215,7 +7583,7 @@ test "http handler executes foreign right join query through registry" {
     };
     defer foreign_config.deinit(alloc);
 
-    var right = try handler.executeForeignRightJoinQuery(foreign_config, join, parsed_hits.values, .{});
+    var right = try handler.executeForeignRightJoinQuery(foreign_config, join, parsed_hits.values, .{}, .none);
     defer right.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), right.hits.len);
@@ -7291,7 +7659,7 @@ test "http handler executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body)).?;
+    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body, .none)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -8101,7 +8469,77 @@ test "http handler create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"group_fields\"") != null);
 }
 
-test "serverless algebraic index catalog validation rejects malformed configs" {
+test "serverless create index normalization resolves and persists one probed embedding dimension" {
+    const FakeProvider = struct {
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+            };
+        }
+
+        fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            errdefer alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn embedSparse(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var provider = FakeProvider{};
+    const options = managed_embedder.InitOptions{ .antfly_provider = provider.provider() };
+    const normalized = try normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , options);
+    defer alloc.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try table_writes.validateIndexConfigWithOptions(alloc, "semantic_idx", normalized, options);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const dimension = parsed.value.object.get("dimension") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), dimension.integer);
+
+    const indexes_json = try indexes_api.addIndexToTableIndexesJson(
+        alloc,
+        tables_api.default_indexes_json,
+        "semantic_idx",
+        normalized,
+    );
+    defer alloc.free(indexes_json);
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed_indexes.deinit();
+    const stored = parsed_indexes.value.object.get("semantic_idx") orelse return error.TestUnexpectedResult;
+    const stored_dimension = stored.object.get("dimension") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), stored_dimension.integer);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(alloc, "semantic_idx", normalized);
+    defer alloc.free(response);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
+        response,
+    );
+}
+
+test "serverless index catalog validation rejects malformed configs" {
     const alloc = std.testing.allocator;
 
     try validateServerlessIndexCatalog(alloc,
@@ -8118,6 +8556,10 @@ test "serverless algebraic index catalog validation rejects malformed configs" {
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+    ));
+
+    try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
+        \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
 }
 
@@ -9317,6 +9759,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-c", parsed_neighbors.value.neighbors[1].doc_id);
     try std.testing.expectEqualStrings("related", parsed_neighbors.value.neighbors[1].edge_type);
 
+    var oversized_neighbors = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/neighbors",
+        .body = "{\"doc_id\":\"doc-a\",\"direction\":\"out\",\"limit\":100001}",
+    });
+    defer oversized_neighbors.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_neighbors.status);
+    try std.testing.expectEqualStrings("graph neighbor query exceeds configured limits", oversized_neighbors.body);
+
     var version_neighbors = try handler.handle(.{
         .method = .post,
         .path = "/internal/v1/namespaces/docs/query/versions/1/graph/neighbors",
@@ -9365,6 +9816,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-c", parsed_traverse.value.nodes[2].path.?[2]);
     try std.testing.expect(parsed_traverse.value.nodes[2].edge_path != null);
 
+    var oversized_traverse = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/traverse",
+        .body = "{\"start_doc_id\":\"doc-a\",\"direction\":\"out\",\"max_depth\":65,\"limit\":10}",
+    });
+    defer oversized_traverse.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_traverse.status);
+    try std.testing.expectEqualStrings("graph traversal query exceeds configured limits", oversized_traverse.body);
+
     var table_traverse = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query/graph/traverse",
@@ -9409,6 +9869,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-b", parsed_shortest.value.edge_path.?[0].to_doc_id);
     try std.testing.expectEqualStrings("doc-c", parsed_shortest.value.edge_path.?[1].to_doc_id);
     try std.testing.expectEqualStrings("cites", parsed_shortest.value.edge_path.?[0].edge_type);
+
+    var oversized_shortest = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/shortest-path",
+        .body = "{\"start_doc_id\":\"doc-a\",\"end_doc_id\":\"doc-c\",\"direction\":\"out\",\"max_depth\":65}",
+    });
+    defer oversized_shortest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_shortest.status);
+    try std.testing.expectEqualStrings("graph shortest-path query exceeds configured limits", oversized_shortest.body);
 
     var table_shortest = try handler.handle(.{
         .method = .post,
@@ -9477,7 +9946,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"include_documents":true,"fields":["title"]}},"limit":10}
+        \\{"graph_searches":{"two_hop":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"target_nodes":{"keys":["doc-c"]},"pattern":[{"alias":"a"},{"alias":"b","node_filter":{"filter_query":{"term":"beta","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","node_filter":{"filter_query":{"prefix":"ga","field":"title"}},"edge":{"types":["cites"],"direction":"out","min_hops":1,"max_hops":1}}],"params":{"include_paths":false},"include_documents":true,"fields":["title"]}},"limit":10}
         ,
     });
     defer pattern.deinit(alloc);
@@ -9488,6 +9957,7 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, two_hop.type);
     try std.testing.expectEqual(@as(i64, 1), two_hop.total);
     try std.testing.expectEqual(@as(usize, 1), two_hop.matches.?.len);
+    try std.testing.expect(two_hop.matches.?[0].path == null);
     const bindings = two_hop.matches.?[0].bindings.?;
     try std.testing.expect(bindings.map.get("a") != null);
     try std.testing.expect(bindings.map.get("b") != null);
@@ -9706,12 +10176,42 @@ test "serverless public graph query rejects exact sort controls" {
         "docs",
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+        .none,
     ));
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+        .none,
     ));
+}
+
+test "serverless graph HTTP result copies are allocation-failure safe" {
+    const alloc = std.testing.allocator;
+    var node_path = [_][]u8{ @constCast("doc-a"), @constCast("doc-b") };
+    var edge_path = [_]query_mod.GraphPathHop{.{
+        .from_doc_id = @constCast("doc-a"),
+        .to_doc_id = @constCast("doc-b"),
+        .edge_type = @constCast("cites"),
+        .weight = 1.0,
+        .direction = .out,
+    }};
+    const node = query_mod.GraphTraversalNode{
+        .doc_id = @constCast("doc-b"),
+        .depth = 1,
+        .parent_doc_id = @constCast("doc-a"),
+        .via_edge_type = @constCast("cites"),
+        .path = &node_path,
+        .edge_path = &edge_path,
+    };
+
+    const AllocationRunner = struct {
+        fn run(a: Allocator, source: query_mod.GraphTraversalNode) !void {
+            const copy = try dupGraphTraversalNodeAlloc(a, source);
+            defer freeGraphTraversalNode(a, copy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

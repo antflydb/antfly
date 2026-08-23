@@ -910,6 +910,7 @@ pub const ReadingPipeline = struct {
                 break :fallback null;
             };
             if (result) |decoded| {
+                logMetalStageTimingProfile(&cb);
                 logReadProfile("florence_resident_kv_decode", decode_start);
                 return decoded;
             }
@@ -1488,6 +1489,29 @@ fn logReadProfileStep(phase: []const u8, step: usize, seq_len: usize, elapsed_ns
     } else {
         std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
     }
+}
+
+fn logMetalStageTimingProfile(cb: *const ComputeBackend) void {
+    if (!readProfileEnabled()) return;
+    const stage = cb.debugTimingSnapshot().provider.metal_stage_timing;
+    if (stage.enabled == 0) return;
+    std.log.info(
+        "read-profile phase=metal_stage_timing supported={d} complete={d} decode_frames={d} decode_gpu_ms={d:.3} attention_ms={d:.3} ffn_ms={d:.3} ple_ms={d:.3} tail_ms={d:.3} embedding_ms={d:.3} other_ms={d:.3} samples={d} dropped={d}",
+        .{
+            stage.supported,
+            stage.complete,
+            stage.decode.sampled_frames,
+            nsToMs(stage.decode.whole_frame_gpu_nanos),
+            nsToMs(stage.decode.attention_nanos),
+            nsToMs(stage.decode.ffn_nanos),
+            nsToMs(stage.decode.ple_nanos),
+            nsToMs(stage.decode.tail_nanos),
+            nsToMs(stage.decode.embedding_nanos),
+            nsToMs(stage.decode.other_nanos),
+            stage.barrier_sample_count,
+            stage.dropped_frames,
+        },
+    );
 }
 
 fn logReadBatchMode(mode: []const u8, image_datas: []const []const u8, fallback_reason: ?[]const u8) void {

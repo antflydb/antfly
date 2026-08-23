@@ -16,30 +16,18 @@
 //! code-generated inference runtime. These are intermediate link boundaries,
 //! not a public or stable C API.
 
-const failure_abi = @import("runtime_failure_abi");
+const error_abi = @import("../runtime_error_abi.zig");
+const http_abi = @import("../runtime_http_abi.zig");
+const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version = failure_abi.abi_version;
+pub const abi_version: u32 = 16;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
-pub const Status = failure_abi.Status;
-pub const FailureIdentity = failure_abi.FailureIdentity;
-
-/// Append-only stage identity for inference lifecycle failures.
-pub const Operation = enum(u32) {
-    create = 1,
-    configure = 2,
-    register_routes = 3,
-    embed_dense_texts = 4,
-    embed_sparse_texts = 5,
-    rerank_texts = 6,
-    list_models_json = 7,
-    generate_text = 8,
-    generate_messages = 9,
-    embed_dense_parts = 10,
-    read_images = 11,
-    transcribe_audio = 12,
-    extract = 13,
-};
+pub const Status = error_abi.Status;
+pub const statusFromError = error_abi.statusFromError;
+pub const statusFromErrorWithFallback = error_abi.statusFromErrorWithFallback;
+pub const errorHasStableDetail = error_abi.errorHasStableDetail;
+pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const String = extern struct {
     ptr: [*]const u8,
@@ -77,9 +65,18 @@ pub const WarmModel = extern struct {
     quantization: OptionalString = .{},
 };
 
+pub const ProcessMemoryLimitProvenance = enum(u8) {
+    automatic = 0,
+    explicit = 1,
+    cgroup_v2 = 2,
+    cgroup_v1 = 3,
+    host = 4,
+    unavailable = 5,
+};
+
 pub const CreateContext = extern struct {
-    init: *const anyopaque,
-    loaded_config: ?*const anyopaque,
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
     data_dir_ptr: [*]const u8,
     data_dir_len: usize,
     models_dir: OptionalString,
@@ -89,217 +86,203 @@ pub const CreateContext = extern struct {
     combined_limit_bytes: usize,
     kv_limit_bytes: usize,
     scratch_limit_bytes: usize,
-    runtime_config_json: String,
+    process_memory_limit_bytes: usize,
+    process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     preload_ptr: ?[*]const WarmModel,
     preload_len: usize,
+    keep_alive: OptionalString,
+    max_loaded_models: i64,
+    has_max_loaded_models: u8,
+    content_security_json: OptionalString,
+    s3_credentials_json: OptionalString,
+    runtime_config_json: String,
+    /// Host-owned inference executor retained until destroy returns.
+    executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
-    out_failure: *FailureIdentity,
 };
 
 pub const ConfigureContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
-    resource_manager: *anyopaque,
-    io: ?*const anyopaque,
-    out_failure: *FailureIdentity,
+    resource_budget: *const ResourceBudget,
 };
 
-pub const CancellationProbeFn = *const fn (?*const anyopaque) callconv(.c) u8;
-
-/// One coarse dense-embedding batch. All strings are borrowed for the
-/// synchronous call. Cancellation is queried through a consumer-local C ABI
-/// callback rather than passing a Zig atomic or `std.Io` across the boundary.
-pub const DenseEmbeddingRequest = extern struct {
-    version: u32 = abi_version,
-    has_deadline: u8 = 0,
-    _reserved0: [3]u8 = @splat(0),
-    handle: ?*anyopaque = null,
-    model: String,
-    texts: ?[*]const String = null,
-    text_count: usize = 0,
-    deadline_ns: u64 = 0,
-    cancellation_ctx: ?*const anyopaque = null,
-    cancellation_probe: ?CancellationProbeFn = null,
+pub const AdmissionAmounts = extern struct {
+    host_weight_bytes: usize,
+    backend_weight_bytes: usize,
+    host_kv_bytes: usize,
+    backend_kv_bytes: usize,
+    host_scratch_bytes: usize,
+    backend_scratch_bytes: usize,
 };
 
-pub const DenseVector = extern struct {
-    values: ?[*]const f32 = null,
-    value_count: usize = 0,
-
-    pub fn slice(self: DenseVector) []const f32 {
-        const ptr = self.values orelse return &.{};
-        return ptr[0..self.value_count];
-    }
+pub const ResourceBudget = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    /// Retain/release the host-owned context across inference component
+    /// lifetimes. Configure fails when the owner is already shutting down.
+    retain_context: *const fn (*anyopaque) callconv(.c) u8,
+    release_context: *const fn (*anyopaque) callconv(.c) void,
+    reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts, *usize) callconv(.c) Status,
+    retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
+    release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
+    observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
+    observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
 };
 
-/// Provider-owned descriptors and vectors. The consumer copies the result
-/// into its own allocator and always calls the matching destroy function.
-pub const DenseEmbeddingResult = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    owner: ?*anyopaque = null,
-    vectors: ?[*]const DenseVector = null,
-    vector_count: usize = 0,
+/// Stable operation identifiers for the embedded inference service. Requests
+/// and responses are UTF-8 JSON owned by the caller and inference unit,
+/// respectively. This keeps Zig allocators, error unions, tagged unions, and
+/// function signatures out of the archive boundary.
+pub const ProviderOperation = enum(c_int) {
+    embed_dense_texts = 1,
+    embed_dense_texts_with_context = 2,
+    embed_sparse_texts = 3,
+    embed_dense_parts = 4,
+    embed_dense_parts_with_context = 5,
+    rerank_texts = 6,
+    generate_text = 7,
+    generate_messages = 8,
+    read_images = 9,
+    transcribe_audio = 10,
+    extract = 11,
+    list_models_json = 12,
 };
 
-pub const SparseVector = extern struct {
-    indices: ?[*]const u32 = null,
-    values: ?[*]const f32 = null,
-    value_count: usize = 0,
-};
-
-pub const SparseEmbeddingResult = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    owner: ?*anyopaque = null,
-    vectors: ?[*]const SparseVector = null,
-    vector_count: usize = 0,
-};
-
-pub const RerankRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    handle: ?*anyopaque = null,
-    model: String,
-    query: String,
-    documents: ?[*]const String = null,
-    document_count: usize = 0,
-};
-
-pub const FloatResult = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    owner: ?*anyopaque = null,
-    values: ?[*]const f32 = null,
-    value_count: usize = 0,
-};
-
-pub const HandleRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    handle: ?*anyopaque = null,
-};
-
-pub const BytesResult = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    owner: ?*anyopaque = null,
-    bytes: ?[*]const u8 = null,
-    byte_count: usize = 0,
-};
-
-pub const GenerateTextRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    handle: ?*anyopaque = null,
-    model: String,
-    roles: ?[*]const String = null,
-    contents: ?[*]const String = null,
-    message_count: usize = 0,
-};
-
-pub const JsonOperationRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    handle: ?*anyopaque = null,
-    model: String,
-    payload_json: String,
-};
-
-pub const ContentPartTag = enum(u32) {
-    text = 1,
-    media_url = 2,
-    binary = 3,
-};
-
-pub const ContentPart = extern struct {
-    tag: ContentPartTag,
-    _reserved0: u32 = 0,
-    value: String,
-    mime_type: String,
-};
-
-pub const DensePartsRequest = extern struct {
-    version: u32 = abi_version,
-    has_deadline: u8 = 0,
-    _reserved0: [3]u8 = @splat(0),
-    handle: ?*anyopaque = null,
-    model: String,
-    parts: ?[*]const ContentPart = null,
-    part_count: usize = 0,
-    deadline_ns: u64 = 0,
-    cancellation_ctx: ?*const anyopaque = null,
-    cancellation_probe: ?CancellationProbeFn = null,
-};
-
-pub const RoutesContext = extern struct {
+pub const ProviderInvokeContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
-    server: *anyopaque,
-    out_failure: *FailureIdentity,
+    operation: c_int,
+    request_json: String,
+    deadline_ns: u64,
+    has_deadline: u8,
+    out_response_handle: *?*anyopaque,
+    out_response_json: *String,
 };
 
-pub extern fn antfly_standalone_inference_create(context: *const CreateContext) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_configure(context: *const ConfigureContext) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_embed_dense(
-    request: *const DenseEmbeddingRequest,
-    out_result: *DenseEmbeddingResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_dense_result_destroy(
-    result: *DenseEmbeddingResult,
-) callconv(.c) void;
-pub extern fn antfly_standalone_inference_embed_sparse(
-    request: *const DenseEmbeddingRequest,
-    out_result: *SparseEmbeddingResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_sparse_result_destroy(
-    result: *SparseEmbeddingResult,
-) callconv(.c) void;
-pub extern fn antfly_standalone_inference_rerank(
-    request: *const RerankRequest,
-    out_result: *FloatResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_float_result_destroy(
-    result: *FloatResult,
-) callconv(.c) void;
-pub extern fn antfly_standalone_inference_list_models(
-    request: *const HandleRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_bytes_result_destroy(
-    result: *BytesResult,
-) callconv(.c) void;
-pub extern fn antfly_standalone_inference_generate_text(
-    request: *const GenerateTextRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_generate_messages(
-    request: *const JsonOperationRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_embed_dense_parts(
-    request: *const DensePartsRequest,
-    out_result: *DenseEmbeddingResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_read_images(
-    request: *const JsonOperationRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_transcribe_audio(
-    request: *const JsonOperationRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_extract(
-    request: *const JsonOperationRequest,
-    out_result: *BytesResult,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_register_routes(context: *const RoutesContext) callconv(.c) Status;
-pub extern fn antfly_standalone_inference_destroy(handle: *anyopaque) callconv(.c) void;
+pub const RouteManifestEntry = extern struct {
+    route_handle: *anyopaque,
+    method: http_abi.HttpMethod,
+    path: http_abi.Bytes,
+    request_body: http_abi.RequestBodyMode,
+    streaming_response: u8,
+};
+
+pub const RouteManifestContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    handle: *anyopaque,
+    out_entries: *?[*]const RouteManifestEntry,
+    out_len: *usize,
+};
+
+pub const HttpHandleContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    route_handle: *anyopaque,
+    request: *const http_abi.HttpRequestView,
+    cancellation: http_abi.CancellationView = .{},
+    body_source: http_abi.RequestBodySource = .{},
+    stream: http_abi.StreamSink = .{},
+    out_response_handle: *?*anyopaque,
+    out_response: *http_abi.HttpResponseView,
+};
+
+pub const Capability = struct {
+    pub const provider: u64 = 1 << 0;
+    pub const route_manifest: u64 = 1 << 1;
+    pub const resource_budget: u64 = 1 << 2;
+    pub const request_admission: u64 = 1 << 3;
+};
+
+pub const RequestAdmissionStats = extern struct {
+    capacity: usize,
+    in_flight: usize,
+    peak_in_flight: usize,
+    rejected_total: u64,
+};
+
+/// Append-only function table returned by the linked inference archive. A
+/// caller validates this fixed prefix before creating any cross-archive object.
+pub const FunctionTable = extern struct {
+    abi_version: u32,
+    struct_size: u32,
+    capabilities: u64,
+
+    create: *const fn (*const CreateContext) callconv(.c) Status,
+    configure: *const fn (*const ConfigureContext) callconv(.c) Status,
+    invoke_provider: *const fn (*const ProviderInvokeContext) callconv(.c) Status,
+    destroy_provider_response: *const fn (*anyopaque) callconv(.c) void,
+    route_manifest: *const fn (*const RouteManifestContext) callconv(.c) Status,
+    handle_http: *const fn (*const HttpHandleContext) callconv(.c) Status,
+    destroy_http_response: *const fn (*anyopaque) callconv(.c) void,
+    destroy: *const fn (*anyopaque) callconv(.c) void,
+    try_acquire_request: *const fn (*anyopaque) callconv(.c) u8,
+    release_request: *const fn (*anyopaque) callconv(.c) void,
+    request_admission_stats: *const fn (*anyopaque, *RequestAdmissionStats) callconv(.c) void,
+};
+
+pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
+    return version == abi_version and struct_size == @sizeOf(T);
+}
+
+pub fn validFunctionTable(table: *const FunctionTable, required_capabilities: u64) bool {
+    const required_size = requiredFunctionTableSize(required_capabilities) orelse return false;
+    return table.abi_version == abi_version and
+        table.struct_size >= required_size and
+        table.capabilities & required_capabilities == required_capabilities;
+}
+
+fn functionTableFieldEnd(comptime field_name: []const u8) u32 {
+    return @intCast(@offsetOf(FunctionTable, field_name) + @sizeOf(@FieldType(FunctionTable, field_name)));
+}
+
+pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
+    const known = Capability.provider |
+        Capability.route_manifest |
+        Capability.resource_budget |
+        Capability.request_admission;
+    if (required_capabilities & ~known != 0) return null;
+    var required = functionTableFieldEnd("capabilities");
+    // Provider lifetime includes destruction even though the invoke operations
+    // precede route support in the append-only table.
+    if (required_capabilities & Capability.provider != 0)
+        required = @max(required, functionTableFieldEnd("destroy"));
+    if (required_capabilities & Capability.route_manifest != 0)
+        required = @max(required, functionTableFieldEnd("destroy_http_response"));
+    if (required_capabilities & Capability.resource_budget != 0)
+        required = @max(required, functionTableFieldEnd("configure"));
+    if (required_capabilities & Capability.request_admission != 0)
+        required = @max(required, functionTableFieldEnd("request_admission_stats"));
+    return required;
+}
+
+pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
+
+test "linked inference ABI rejects mismatched context and function-table prefixes" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProcessMemoryLimitProvenance.automatic));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProcessMemoryLimitProvenance.explicit));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v2));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v1));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(ProcessMemoryLimitProvenance.host));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(ProcessMemoryLimitProvenance.unavailable));
+    try std.testing.expect(validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext)));
+    try std.testing.expect(!validContext(RouteManifestContext, abi_version - 1, @sizeOf(RouteManifestContext)));
+    try std.testing.expect(!validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext) - 1));
+
+    var table: FunctionTable = undefined;
+    table.abi_version = abi_version;
+    table.struct_size = @sizeOf(FunctionTable);
+    table.capabilities = Capability.provider;
+    try std.testing.expect(validFunctionTable(&table, Capability.provider));
+    try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
+    table.struct_size = requiredFunctionTableSize(Capability.provider).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.provider));
+    table.struct_size = requiredFunctionTableSize(Capability.provider).?;
+    try std.testing.expect(validFunctionTable(&table, Capability.provider));
+    try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+}

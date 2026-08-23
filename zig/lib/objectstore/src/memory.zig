@@ -33,9 +33,25 @@ const StoredObject = struct {
 pub const MemoryClient = struct {
     alloc: Allocator,
     buckets: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(StoredObject)) = .empty,
+    operation_count: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: Allocator) MemoryClient {
         return .{ .alloc = alloc };
+    }
+
+    /// Test-visible transport operation count. Counting at the client boundary
+    /// includes failed conditional requests and makes cleanup budget assertions
+    /// verify actual backend work rather than only local arithmetic.
+    pub fn operationCount(self: *const MemoryClient) u64 {
+        return self.operation_count.load(.monotonic);
+    }
+
+    pub fn resetOperationCount(self: *MemoryClient) void {
+        self.operation_count.store(0, .monotonic);
+    }
+
+    fn recordOperation(self: *MemoryClient) void {
+        _ = self.operation_count.fetchAdd(1, .monotonic);
     }
 
     pub fn deinit(self: *MemoryClient) void {
@@ -63,10 +79,12 @@ pub const MemoryClient = struct {
     }
 
     fn bucketExists(self: *MemoryClient, bucket: []const u8) bool {
+        self.recordOperation();
         return self.buckets.contains(bucket);
     }
 
     fn makeBucket(self: *MemoryClient, bucket: []const u8) !void {
+        self.recordOperation();
         _ = try self.ensureBucket(bucket);
     }
 
@@ -79,6 +97,7 @@ pub const MemoryClient = struct {
     }
 
     fn putObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        self.recordOperation();
         var object_map = try self.ensureBucket(bucket);
 
         const existing = object_map.getPtr(key);
@@ -121,6 +140,8 @@ pub const MemoryClient = struct {
     }
 
     fn getObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        if (opts.cancellation) |token| try token.check();
+        self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
@@ -140,21 +161,47 @@ pub const MemoryClient = struct {
         if (opts.max_response_bytes) |limit| {
             if (selected.len > limit) return error.ResponseTooLarge;
         }
-        const body = try alloc.dupe(u8, selected);
+        const body = try alloc.alloc(u8, selected.len);
+        errdefer alloc.free(body);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var copied: usize = 0;
+        while (copied < selected.len) {
+            if (opts.cancellation) |token| try token.check();
+            const chunk_len = @min(cancellation_chunk_bytes, selected.len - copied);
+            @memcpy(body[copied..][0..chunk_len], selected[copied..][0..chunk_len]);
+            copied += chunk_len;
+        }
+        if (opts.cancellation) |token| try token.check();
+
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const owned_etag = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(owned_etag);
+        const owned_checksum = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(owned_checksum);
+        const owned_content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_content_type) |value| alloc.free(value);
 
         return .{
             .body = body,
             .metadata = .{
-                .bucket = try alloc.dupe(u8, bucket),
-                .key = try alloc.dupe(u8, key),
-                .etag = try alloc.dupe(u8, object.etag),
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .etag = owned_etag,
+                .checksum = .{
+                    .algorithm = .sha256_hex,
+                    .value = owned_checksum,
+                },
                 .content_length = @intCast(object.body.len),
-                .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
+                .content_type = owned_content_type,
             },
         };
     }
 
     fn getObjectAttributes(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectAttributes {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
         const parts = try alloc.alloc(types.ObjectPart, 1);
@@ -173,18 +220,24 @@ pub const MemoryClient = struct {
     }
 
     fn statObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
         return .{
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = try alloc.dupe(u8, object.etag),
+            .checksum = .{
+                .algorithm = .sha256_hex,
+                .value = try alloc.dupe(u8, object.etag),
+            },
             .content_length = @intCast(object.body.len),
             .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
         };
     }
 
     fn deleteObject(self: *MemoryClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
@@ -197,6 +250,7 @@ pub const MemoryClient = struct {
     }
 
     fn listObjects(self: *MemoryClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse {
             return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
@@ -373,6 +427,8 @@ test "memory client supports put get stat list and delete" {
     var got = try client.getObject("bucket", "a/one", .{});
     defer got.deinit(alloc);
     try std.testing.expectEqualStrings("alpha", got.body);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, got.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, got.metadata.checksum.?.value);
     try std.testing.expectError(
         error.ResponseTooLarge,
         client.getObject("bucket", "a/one", .{ .max_response_bytes = 4 }),
@@ -387,6 +443,8 @@ test "memory client supports put get stat list and delete" {
     var meta = try client.statObject("bucket", "a/one");
     defer meta.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), meta.content_length);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.sha256_hex, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings(put.etag.?, meta.checksum.?.value);
 
     var listed = try client.listObjects("bucket", .{ .prefix = "a/" });
     defer listed.deinit(alloc);
@@ -398,6 +456,22 @@ test "memory client supports put get stat list and delete" {
 
     try client.deleteObject("bucket", "a/one", .{});
     try std.testing.expectError(error.FileNotFound, client.getObject("bucket", "a/one", .{}));
+}
+
+test "memory get result construction cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var memory = MemoryClient.init(alloc);
+            var client = memory.client();
+            defer client.deinit();
+            try client.makeBucket("bucket");
+            var put = try client.putObject("bucket", "object", "payload", .{ .content_type = "application/octet-stream" });
+            defer put.deinit(alloc);
+            var result = try client.getObject("bucket", "object", .{});
+            defer result.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "memory client supports non-recursive listing with common prefixes" {

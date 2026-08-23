@@ -16,6 +16,11 @@
 
 pub const storage = @import("storage/mod.zig");
 pub const api = @import("api.zig");
+pub const admin_read_operations = @import("admin_read_operations.zig");
+pub const admin_mutation_operations = @import("admin_mutation_operations.zig");
+pub const extension_operations = @import("extension_operations.zig");
+pub const node_operations = @import("node_operations.zig");
+pub const table_operations = @import("table_operations.zig");
 pub const authority = @import("authority.zig");
 pub const incarnation = @import("incarnation.zig");
 pub const admin = @import("admin.zig");
@@ -74,6 +79,7 @@ pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusR
 pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;
 pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
+pub const IndexRepairStatus = table_manager.IndexRepairStatus;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
 pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;

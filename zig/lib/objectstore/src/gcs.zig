@@ -129,7 +129,7 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize, ?types.CancellationToken) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
@@ -179,6 +179,7 @@ const HttpxTransport = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
@@ -189,22 +190,46 @@ const HttpxTransport = struct {
             try request_headers.append(alloc, .{ "Content-Type", value });
         }
 
-        var response = try self.client.request(method.toHttpx(), url, .{
+        var response = self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
             .max_response_size = max_response_size,
-        });
+            .cancellation = if (cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
         defer response.deinit();
 
-        return .{
-            .status = response.status.code,
-            .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
-            .etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null,
-            .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
-            .location = if (response.headers.get("Location")) |value| try alloc.dupe(u8, value) else null,
-        };
+        return try transportResponseAlloc(
+            alloc,
+            response.status.code,
+            response.body orelse "",
+            response.headers.get("ETag"),
+            response.headers.get("Content-Type"),
+            response.headers.get("Location"),
+        );
     }
 };
+
+fn transportResponseAlloc(
+    alloc: Allocator,
+    status: u16,
+    body: []const u8,
+    etag: ?[]const u8,
+    content_type: ?[]const u8,
+    location: ?[]const u8,
+) !TransportResponse {
+    var result = TransportResponse{
+        .status = status,
+        .body = try alloc.dupe(u8, body),
+    };
+    errdefer result.deinit(alloc);
+    if (etag) |value| result.etag = try alloc.dupe(u8, value);
+    if (content_type) |value| result.content_type = try alloc.dupe(u8, value);
+    if (location) |value| result.location = try alloc.dupe(u8, value);
+    return result;
+}
 
 test "gcs http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
@@ -454,15 +479,27 @@ pub const JsonApiClient = struct {
                 .key = owned_key,
                 .content_length = 0,
             };
-        } else try self.statObject(alloc, bucket, key);
+        } else try self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
         errdefer meta.deinit(alloc);
 
-        const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, opts.version_id);
+        const effective_generation: ?[]const u8 = if (opts.version_id) |value|
+            value
+        else if (!opts.skip_metadata_probe)
+            meta.version_id
+        else
+            null;
+        const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, effective_generation);
         defer alloc.free(url);
 
         var headers = std.ArrayListUnmanaged(HeaderPair).empty;
         defer headers.deinit(alloc);
-        try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, false);
+        const effective_if_match: ?[]const u8 = if (opts.if_match_etag) |value|
+            value
+        else if (!opts.skip_metadata_probe and effective_generation == null)
+            meta.etag
+        else
+            null;
+        try appendConditionalHeaders(alloc, &headers, effective_if_match, false);
         if (opts.range) |range| {
             const value = try byteRangeHeaderAlloc(alloc, range);
             errdefer alloc.free(value);
@@ -474,13 +511,14 @@ pub const JsonApiClient = struct {
             }
         }
 
-        var response = try self.performWithResponseLimit(
+        var response = try self.performWithResponseLimitAndCancellation(
             .GET,
             url,
             headers.items,
             null,
             null,
             opts.max_response_bytes,
+            opts.cancellation,
         );
         errdefer response.deinit(alloc);
 
@@ -533,10 +571,25 @@ pub const JsonApiClient = struct {
     }
 
     fn statObject(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
-        const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, null);
+        return self.statObjectVersion(alloc, bucket, key, null, null);
+    }
+
+    fn statObjectWithOptions(self: *JsonApiClient, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+    }
+
+    fn statObjectVersion(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        generation: ?[]const u8,
+        cancellation: ?types.CancellationToken,
+    ) !types.ObjectMetadata {
+        const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
         defer alloc.free(url);
 
-        var response = try self.perform(.GET, url, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, null, cancellation);
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -614,6 +667,20 @@ pub const JsonApiClient = struct {
         content_type: ?[]const u8,
         max_response_size: ?usize,
     ) !TransportResponse {
+        return try self.performWithResponseLimitAndCancellation(method, url, headers, body, content_type, max_response_size, null);
+    }
+
+    fn performWithResponseLimitAndCancellation(
+        self: *JsonApiClient,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
+    ) !TransportResponse {
+        if (cancellation) |token| try token.check();
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
         defer merged.deinit(self.alloc);
         try merged.appendSlice(self.alloc, headers);
@@ -631,6 +698,7 @@ pub const JsonApiClient = struct {
             body,
             content_type,
             max_response_size,
+            cancellation,
         );
     }
 
@@ -643,6 +711,7 @@ pub const JsonApiClient = struct {
         .get_object = erasedGetObject,
         .get_object_attributes = erasedGetObjectAttributes,
         .stat_object = erasedStatObject,
+        .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
     };
@@ -685,6 +754,11 @@ pub const JsonApiClient = struct {
     fn erasedStatObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectMetadata {
         const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
         return try self.statObject(alloc, bucket, key);
+    }
+
+    fn erasedStatObjectWithOptions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        const self: *JsonApiClient = @ptrCast(@alignCast(ptr));
+        return try self.statObjectWithOptions(alloc, bucket, key, opts);
     }
 
     fn erasedDeleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
@@ -1043,6 +1117,8 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
         generation: ?[]const u8 = null,
         size: ?[]const u8 = null,
         contentType: ?[]const u8 = null,
+        md5Hash: ?[]const u8 = null,
+        crc32c: ?[]const u8 = null,
     };
 
     var parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .ignore_unknown_fields = true });
@@ -1058,11 +1134,21 @@ fn parseObjectMetadataResponse(alloc: Allocator, bucket: []const u8, body: []con
     const version_id = if (parsed.value.generation) |value| try alloc.dupe(u8, value) else null;
     errdefer if (version_id) |value| alloc.free(value);
     const content_type = if (parsed.value.contentType) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (content_type) |value| alloc.free(value);
+    var checksum: ?types.ObjectChecksum = if (parsed.value.md5Hash) |value| .{
+        .algorithm = .md5_base64,
+        .value = try alloc.dupe(u8, value),
+    } else if (parsed.value.crc32c) |value| .{
+        .algorithm = .crc32c_base64,
+        .value = try alloc.dupe(u8, value),
+    } else null;
+    errdefer if (checksum) |*value| value.deinit(alloc);
     return .{
         .bucket = owned_bucket,
         .key = key,
         .etag = etag,
         .version_id = version_id,
+        .checksum = checksum,
         .content_length = content_length,
         .content_type = content_type,
         .last_modified_unix_ms = null,
@@ -1257,6 +1343,23 @@ test "gcs response parsers clean up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "gcs transport response construction cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var response = try transportResponseAlloc(
+                alloc,
+                200,
+                "payload",
+                "etag",
+                "application/octet-stream",
+                "https://storage.googleapis.com/session",
+            );
+            defer response.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -1273,7 +1376,7 @@ test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -1319,7 +1422,7 @@ test "gcs local grpc reference path can be discovered when present" {
     }
 }
 
-test "json api client get object uses metadata then media with auth and range" {
+test "json api client pins media reads to the generation returned by metadata" {
     const alloc = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
@@ -1333,6 +1436,7 @@ test "json api client get object uses metadata then media with auth and range" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             max_response_size: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             _ = body;
             _ = content_type;
@@ -1347,7 +1451,7 @@ test "json api client get object uses metadata then media with auth and range" {
                     try expectHeader(headers, "Authorization", "Bearer token-123");
                     return .{
                         .status = 200,
-                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-1\",\"generation\":\"42\",\"size\":\"11\",\"contentType\":\"text/plain\"}"),
+                        .body = try request_alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"folder/doc.txt\",\"etag\":\"etag-1\",\"generation\":\"42\",\"size\":\"11\",\"contentType\":\"text/plain\",\"md5Hash\":\"md5-body\"}"),
                     };
                 },
                 1 => {
@@ -1355,7 +1459,6 @@ test "json api client get object uses metadata then media with auth and range" {
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
-                    try expectHeader(headers, "If-Match", "etag-1");
                     try expectHeader(headers, "Range", "bytes=2-5");
                     return .{
                         .status = 206,
@@ -1390,9 +1493,7 @@ test "json api client get object uses metadata then media with auth and range" {
     defer client.deinit();
 
     var result = try client.getObject("bucket", "folder/doc.txt", .{
-        .version_id = "42",
         .range = .{ .offset = 2, .length = 4 },
-        .if_match_etag = "etag-1",
     });
     defer result.deinit(alloc);
 
@@ -1401,6 +1502,9 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqualStrings("folder/doc.txt", result.metadata.key);
     try std.testing.expectEqualStrings("etag-1", result.metadata.etag.?);
     try std.testing.expectEqualStrings("42", result.metadata.version_id.?);
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.md5_base64, result.metadata.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("md5-body", result.metadata.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, result.metadata.checksum.?.checksum_type);
     try std.testing.expectEqualStrings("text/plain", result.metadata.content_type.?);
 
     var direct = try client.getObject("bucket", "folder/doc.txt", .{
@@ -1419,6 +1523,74 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
+test "json api metadata falls back to the always-available crc32c checksum" {
+    const alloc = std.testing.allocator;
+    var meta = try parseObjectMetadataResponse(
+        alloc,
+        "bucket",
+        "{\"name\":\"composite\",\"generation\":\"9\",\"size\":\"4\",\"crc32c\":\"crc-body\"}",
+    );
+    defer meta.deinit(alloc);
+
+    try std.testing.expectEqual(types.ObjectChecksumAlgorithm.crc32c_base64, meta.checksum.?.algorithm);
+    try std.testing.expectEqualStrings("crc-body", meta.checksum.?.value);
+    try std.testing.expectEqual(types.ObjectChecksumType.full_object, meta.checksum.?.checksum_type);
+}
+
+test "gcs read cancellation reaches active media and metadata requests" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        signal: *std.atomic.Value(bool),
+        calls: usize = 0,
+
+        fn request(
+            ptr: ?*anyopaque,
+            _: Allocator,
+            method: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            cancellation: ?types.CancellationToken,
+        ) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            self.signal.store(true, .release);
+            try cancellation.?.check();
+            return error.TestExpectedCancellation;
+        }
+    };
+
+    var signal = std.atomic.Value(bool).init(false);
+    var state = State{ .signal = &signal };
+    const cfg = try jsonApiClientConfigAlloc(alloc);
+    var json_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    var client = json_client.client();
+    defer client.deinit();
+
+    try std.testing.expectError(
+        error.Canceled,
+        client.getObject("bucket", "object", .{
+            .range = .{ .offset = 0, .length = 1 },
+            .skip_metadata_probe = true,
+            .max_response_bytes = 1,
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+    signal.store(false, .release);
+    try std.testing.expectError(
+        error.Canceled,
+        client.statObjectWithOptions("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
 test "json api client put object encodes upload url and returns etag" {
     const alloc = std.testing.allocator;
     const State = struct {
@@ -1431,6 +1603,7 @@ test "json api client put object encodes upload url and returns etag" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=media&name=folder%2Fdoc.txt&ifGenerationMatch=0", url);
@@ -1471,6 +1644,7 @@ test "json api client lists objects and prefixes" {
             body: ?[]const u8,
             content_type: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             _ = headers;
             _ = body;
@@ -1520,6 +1694,7 @@ test "json api client make bucket requires project id" {
             _: ?[]const u8,
             _: ?[]const u8,
             _: ?usize,
+            _: ?types.CancellationToken,
         ) !TransportResponse {
             return error.Unreachable;
         }

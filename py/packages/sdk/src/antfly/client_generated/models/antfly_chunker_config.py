@@ -37,27 +37,26 @@ class AntflyChunkerConfig:
                 {'target_tokens': 500, 'overlap_tokens': 50, 'separator': '\n\n'}}
 
         Attributes:
-            model (str): The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from
-                models/chunkers/{name}/. Default: 'fixed'. Example: fixed.
             max_chunks (int | Unset): Maximum number of chunks to generate per document.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
             text (TextChunkOptions | Unset): Options specific to text chunking.
             audio (AudioChunkOptions | Unset): Options specific to audio chunking.
             api_url (str | Unset): The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set
                 via ANTFLY_INFERENCE_URL environment variable. Example: http://localhost:8080.
+            model (str | Unset): The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other
+                values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+                Default: 'fixed'. Example: fixed.
     """
 
-    model: str = "fixed"
     max_chunks: int | Unset = UNSET
     threshold: float | Unset = UNSET
     text: TextChunkOptions | Unset = UNSET
     audio: AudioChunkOptions | Unset = UNSET
     api_url: str | Unset = UNSET
+    model: str | Unset = "fixed"
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        model = self.model
-
         max_chunks = self.max_chunks
 
         threshold = self.threshold
@@ -72,13 +71,11 @@ class AntflyChunkerConfig:
 
         api_url = self.api_url
 
+        model = self.model
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "model": model,
-            }
-        )
+        field_dict.update({})
         if max_chunks is not UNSET:
             field_dict["max_chunks"] = max_chunks
         if threshold is not UNSET:
@@ -89,6 +86,8 @@ class AntflyChunkerConfig:
             field_dict["audio"] = audio
         if api_url is not UNSET:
             field_dict["api_url"] = api_url
+        if model is not UNSET:
+            field_dict["model"] = model
 
         return field_dict
 
@@ -98,8 +97,6 @@ class AntflyChunkerConfig:
         from ..models.text_chunk_options import TextChunkOptions
 
         d = dict(src_dict)
-        model = d.pop("model")
-
         max_chunks = d.pop("max_chunks", UNSET)
 
         threshold = d.pop("threshold", UNSET)
@@ -120,13 +117,15 @@ class AntflyChunkerConfig:
 
         api_url = d.pop("api_url", UNSET)
 
+        model = d.pop("model", UNSET)
+
         antfly_chunker_config = cls(
-            model=model,
             max_chunks=max_chunks,
             threshold=threshold,
             text=text,
             audio=audio,
             api_url=api_url,
+            model=model,
         )
 
         antfly_chunker_config.additional_properties = d

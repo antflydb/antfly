@@ -713,7 +713,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     ));
 
     var cancellation = std.atomic.Value(bool).init(true);
-    edges_req.cancellation = &cancellation;
+    edges_req.cancellation = db_mod.types.CancellationToken.fromAtomic(&cancellation);
     try std.testing.expectError(
         error.Cancelled,
         read_source.source().graphEdgesGroupLocal(alloc, 7001, "articles", edges_req, .read_index),

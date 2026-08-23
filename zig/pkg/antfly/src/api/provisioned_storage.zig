@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const builtin = @import("builtin");
+const process_memory = @import("antfly_platform").process_memory;
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -36,6 +36,7 @@ const ProvisionedReadCache = if (storage_kernel_experiment) void else table_read
 const ProvisionedWriteCache = if (storage_kernel_experiment) void else table_writes.ProvisionedTableWriteCache;
 
 const MiB: u64 = 1024 * 1024;
+const GiB: u64 = 1024 * MiB;
 const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
 // Decoded primary-run indexes are important for latency, but letting this
 // cache consume a full GiB leaves too little headroom for full-text mappings,
@@ -80,31 +81,49 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-fn readMemoryLimitFile(path: []const u8) ?u64 {
-    if (builtin.os.tag == .freestanding) return null;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
+pub const MemoryLimitSource = enum {
+    explicit,
+    cgroup_v2,
+    cgroup_v1,
+    host,
+    unavailable,
+};
 
-    var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
-    defer file.close(io_impl.io());
+const DetectedMemoryLimit = struct {
+    bytes: u64,
+    source: MemoryLimitSource,
+};
 
-    var reader_buf: [128]u8 = undefined;
-    var reader = file.reader(io_impl.io(), &reader_buf);
-    var value_buf: [128]u8 = undefined;
-    const n = reader.interface.readSliceShort(&value_buf) catch return null;
-    const raw = std.mem.trim(u8, value_buf[0..n], " \t\r\n");
-    if (raw.len == 0 or std.mem.eql(u8, raw, "max")) return null;
-    const value = std.fmt.parseUnsigned(u64, raw, 10) catch return null;
-    if (value == 0 or value > (1 << 60)) return null;
-    return value;
+fn resolveEffectiveMemoryLimit(
+    explicit_bytes: ?u64,
+    detected: ?DetectedMemoryLimit,
+) ?DetectedMemoryLimit {
+    if (detected) |detected_limit| {
+        if (explicit_bytes) |explicit_limit| {
+            if (explicit_limit <= detected_limit.bytes) {
+                return .{ .bytes = explicit_limit, .source = .explicit };
+            }
+        }
+        return detected_limit;
+    }
+    if (explicit_bytes) |explicit_limit| {
+        return .{ .bytes = explicit_limit, .source = .explicit };
+    }
+    return null;
 }
 
-fn detectedMemoryLimitBytes() ?u64 {
-    if (builtin.os.tag == .linux) {
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory.max")) |limit| return limit;
-        if (readMemoryLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |limit| return limit;
-    }
-    return std.process.totalSystemMemory() catch null;
+fn detectedMemoryLimit() ?DetectedMemoryLimit {
+    const envelope = process_memory.systemEnvelope();
+    if (envelope.limit_bytes == 0) return null;
+    return .{
+        .bytes = envelope.limit_bytes,
+        .source = switch (envelope.source) {
+            .cgroup_v2 => .cgroup_v2,
+            .cgroup_v1 => .cgroup_v1,
+            .host => .host,
+            .unavailable => .unavailable,
+        },
+    };
 }
 
 fn adaptiveSliceHardLimit(total: u64, divisor: u64, min_bytes: u64, max_bytes: u64) u64 {
@@ -130,11 +149,14 @@ fn resourceBudget(soft_numerator: u64, hard_limit_bytes: u64) resource_manager_m
 const SmartResourceBudgets = struct {
     options: resource_manager_mod.Options,
     lsm_cache_budget_bytes: usize,
+    effective_memory_limit_bytes: u64 = 0,
+    memory_limit_source: MemoryLimitSource = .unavailable,
 };
 
-fn smartResourceBudgets() SmartResourceBudgets {
+fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
-    const total = detectedMemoryLimitBytes() orelse {
+    const explicit: ?u64 = if (process_memory_limit_bytes == 0) null else @intCast(process_memory_limit_bytes);
+    const effective = resolveEffectiveMemoryLimit(explicit, detectedMemoryLimit()) orelse {
         const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
         options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
         return .{
@@ -143,11 +165,41 @@ fn smartResourceBudgets() SmartResourceBudgets {
         };
     };
 
-    return smartResourceBudgetsForTotal(total);
+    var budgets = smartResourceBudgetsForTotal(effective.bytes);
+    budgets.effective_memory_limit_bytes = effective.bytes;
+    budgets.memory_limit_source = effective.source;
+    return budgets;
+}
+
+fn smartResourceBudgetsResolved(
+    process_memory_limit_bytes: usize,
+    source: MemoryLimitSource,
+) SmartResourceBudgets {
+    if (process_memory_limit_bytes == 0) {
+        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
+        var options = resource_manager_mod.Options{};
+        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+        return .{
+            .options = options,
+            .lsm_cache_budget_bytes = lsm_cache_budget,
+            .memory_limit_source = source,
+        };
+    }
+    var budgets = smartResourceBudgetsForTotal(@intCast(process_memory_limit_bytes));
+    budgets.effective_memory_limit_bytes = @intCast(process_memory_limit_bytes);
+    budgets.memory_limit_source = source;
+    return budgets;
+}
+
+fn safeManagedHostMemory(total: u64) u64 {
+    const preferred_headroom = std.math.clamp(@max(total / 4, 6 * GiB), 4 * GiB, 24 * GiB);
+    const headroom = @min(preferred_headroom, total / 2);
+    return total - headroom;
 }
 
 fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
+    options.memory_budget = resourceBudget(3, safeManagedHostMemory(total));
 
     const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
@@ -185,6 +237,9 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    // Inference slices are logical host-plus-accelerator metrics. Their host
+    // component is enforced by the aggregate budget above; ModelManager and
+    // BackendRuntime retain device-aware backend admission.
 
     return .{
         .options = options,
@@ -203,7 +258,7 @@ pub const PhysicalStorageResources = struct {
     hbc_cache: hbc_mod.Cache,
 
     pub fn init(alloc: std.mem.Allocator) PhysicalStorageResources {
-        const budgets = smartResourceBudgets();
+        const budgets = smartResourceBudgets(0);
         return .{
             .alloc = alloc,
             .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
@@ -245,12 +300,36 @@ pub const ProvisionedGroupStorage = struct {
     write_cache: ProvisionedWriteCache,
     startup_write_cache: ProvisionedWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    effective_memory_limit_bytes: u64 = 0,
+    memory_limit_source: MemoryLimitSource = .unavailable,
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
-        const budgets = smartResourceBudgets();
+        return initWithProcessMemoryLimit(alloc, 0);
+    }
+
+    pub fn initWithProcessMemoryLimit(
+        alloc: std.mem.Allocator,
+        process_memory_limit_bytes: usize,
+    ) ProvisionedGroupStorage {
+        return initWithProcessMemoryPolicy(alloc, process_memory_limit_bytes, null);
+    }
+
+    pub fn initWithProcessMemoryPolicy(
+        alloc: std.mem.Allocator,
+        process_memory_limit_bytes: usize,
+        resolved_source: ?MemoryLimitSource,
+    ) ProvisionedGroupStorage {
+        const budgets = if (resolved_source) |source|
+            smartResourceBudgetsResolved(process_memory_limit_bytes, source)
+        else
+            smartResourceBudgets(process_memory_limit_bytes);
+        var manager_options = budgets.options;
+        manager_options.identity_allocator = alloc;
         return .{
             .alloc = alloc,
-            .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
+            .resource_manager = resource_manager_mod.ResourceManager.init(manager_options),
+            .effective_memory_limit_bytes = budgets.effective_memory_limit_bytes,
+            .memory_limit_source = budgets.memory_limit_source,
             .lsm_cache = if (storage_kernel_experiment) {} else lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
             .hbc_cache = if (storage_kernel_experiment) {} else hbc_mod.Cache.init(alloc),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
@@ -519,11 +598,41 @@ test "provisioned lsm cache budget scales with node memory and remains capped" {
     try std.testing.expect(small.lsm_cache_budget_bytes < medium.lsm_cache_budget_bytes);
     try std.testing.expectEqual(medium.lsm_cache_budget_bytes, large.lsm_cache_budget_bytes);
 
-    inline for (.{ small, medium, large }) |budgets| {
+    inline for (.{
+        .{ .budgets = small, .total = 2 * 1024 * MiB },
+        .{ .budgets = medium, .total = 8 * 1024 * MiB },
+        .{ .budgets = large, .total = 64 * 1024 * MiB },
+    }) |fixture| {
+        const budgets = fixture.budgets;
         const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
         try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
         try std.testing.expectEqual(configured.hard_limit_bytes * 3 / 4, configured.soft_limit_bytes);
+        try std.testing.expectEqual(
+            safeManagedHostMemory(fixture.total),
+            budgets.options.memory_budget.hard_limit_bytes,
+        );
     }
+}
+
+test "effective process memory limit preserves source and clamps explicit requests" {
+    const detected = DetectedMemoryLimit{ .bytes = 8 * GiB, .source = .cgroup_v2 };
+
+    const automatic = resolveEffectiveMemoryLimit(null, detected).?;
+    try std.testing.expectEqual(@as(u64, 8 * GiB), automatic.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, automatic.source);
+
+    const explicit = resolveEffectiveMemoryLimit(4 * GiB, detected).?;
+    try std.testing.expectEqual(@as(u64, 4 * GiB), explicit.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit.source);
+
+    const clamped = resolveEffectiveMemoryLimit(16 * GiB, detected).?;
+    try std.testing.expectEqual(@as(u64, 8 * GiB), clamped.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, clamped.source);
+
+    const explicit_without_detection = resolveEffectiveMemoryLimit(2 * GiB, null).?;
+    try std.testing.expectEqual(@as(u64, 2 * GiB), explicit_without_detection.bytes);
+    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit_without_detection.source);
+    try std.testing.expectEqual(@as(?DetectedMemoryLimit, null), resolveEffectiveMemoryLimit(null, null));
 }
 
 test "provisioned group storage wires remote content to writer caches" {
@@ -593,6 +702,16 @@ test "provisioned group storage derives all resource budgets" {
         try std.testing.expect(stats.soft_limit_bytes > 0);
         try std.testing.expect(stats.soft_limit_bytes <= stats.hard_limit_bytes);
     }
+
+    inline for (.{
+        resource_manager_mod.Slice.inference_model_residency,
+        resource_manager_mod.Slice.inference_kv_working_set,
+        resource_manager_mod.Slice.inference_scratch_working_set,
+    }) |slice| {
+        const stats = storage.resource_manager.sliceStats(slice);
+        try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_bytes);
+    }
+    try std.testing.expect(storage.resource_manager.snapshot().memory.hard_limit_bytes > 0);
 
     const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
     try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);

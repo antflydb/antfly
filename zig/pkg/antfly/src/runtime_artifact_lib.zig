@@ -18,16 +18,15 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const httpx = @import("httpx");
 const platform = @import("antfly_platform");
+pub const platform_sync = platform.sync;
 const bridge = @import("runtime_bridge.zig");
-const api_kernel_abi = @import("api/kernel_abi.zig");
+const private_error_diagnostics = @import("runtime_private_error_diagnostics.zig");
 const unit_options = @import("runtime_library_options");
 const owns_storage_kernel = unit_options.unit == .storage_kernel or unit_options.unit == .data_pic_probe or
     unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe or
     (unit_options.unit == .distributed and !unit_options.storage_kernel_experiment);
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
-const boundary_error_identity = @import("runtime_failure_identity");
 const restore_staging_exports = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
     unit_options.unit == .storage_kernel or unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
@@ -39,10 +38,7 @@ const api_kernel_exports = if (unit_options.unit == .api_kernel or unit_options.
     @import("api/kernel_exports.zig")
 else
     struct {};
-pub const kernel_wal_owner = if (owns_storage_kernel)
-    @import("storage/kernel_wal_owner.zig")
-else
-    struct {};
+pub const kernel_wal_owner = if (owns_storage_kernel) @import("storage/kernel_wal_owner.zig") else struct {};
 const storage_kernel_exports = if (owns_storage_kernel)
     @import("capi/db.zig")
 else
@@ -57,49 +53,35 @@ else
     struct {};
 
 const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .serverless or unit_options.unit == .control_probe or
-    unit_options.unit == .cli_pic_probe)
-    @import("cli_runtime.zig")
-else
-    struct {};
+    unit_options.unit == .cli_pic_probe) @import("cli_runtime.zig") else struct {};
+// Local HA administration owns storage handles and seed lifecycle artifacts.
+// Keep it with the distributed/storage unit so the small remote-client CLI
+// archive does not code-generate a second copy of the HA storage closure.
 const ha_runtime = if (unit_options.unit == .distributed or unit_options.unit == .application_pic_probe or
-    unit_options.unit == .control_api_probe)
-    @import("cmd/ha.zig")
-else
-    struct {};
+    unit_options.unit == .control_api_probe) @import("cmd/ha.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed or unit_options.unit == .data_pic_probe or
     unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe or
-    unit_options.unit == .control_api_probe)
-    @import("data/runtime.zig")
-else
-    struct {};
+    unit_options.unit == .control_api_probe) @import("data/runtime.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe or
     unit_options.unit == .application_pic_probe or unit_options.unit == .control_api_probe)
     @import("metadata/runtime.zig")
 else
     struct {};
-// Serverless executes over immutable published artifacts. Its aggregation
-// fold crosses the coarse storage-owner ABI, so its product composition stays
-// outside the physical DB owner.
 const serverless_runtime = if (unit_options.unit == .serverless or unit_options.unit == .application_pic_probe)
     @import("cmd/serverless.zig")
 else
     struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
-// Standalone adds little when co-generated with the server roles but costs a
-// large independent ARM64 Linux unit. It is product composition, so keep it
-// with distributed control while storage and inference remain linked islands.
-const standalone_runtime = if (unit_options.unit == .distributed or
-    unit_options.unit == .storage_runtime_pic_probe or
-    unit_options.unit == .application_pic_probe)
-    @import("standalone/runtime.zig")
-else
-    struct {};
-// Lite administration opens and rewrites the physical container directly, so
-// it belongs beside the DB/local-query implementation. `lite serve` remains a
-// separate linked entry point in the same final executable.
+// Standalone adds about 35 seconds when co-generated with the server roles but
+// costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
+// until the shared storage kernel removes that duplicated LLVM work.
+const standalone_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .application_pic_probe) @import("standalone/runtime.zig") else struct {};
+// Lite's non-server commands share storage types with standalone, while
+// `lite serve` directly enters that runtime. Co-locating Lite and the server
+// roles gives them one storage type identity and one LLVM unit.
 const lite_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
-    unit_options.unit == .storage_kernel or
-    unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .storage_kernel or unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
     @import("cmd/lite.zig")
 else
@@ -133,7 +115,6 @@ pub const metadata_table_manager = @import("metadata/table_manager.zig");
 pub const metadata_table_provisioner = @import("metadata/table_provisioner.zig");
 pub const paths = @import("graph/paths.zig");
 pub const platform_clock = @import("antfly_platform").clock;
-pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const restore_state_contract = @import("storage/restore_state_contract.zig");
@@ -152,24 +133,125 @@ fn runtimeEntry(
     comptime role_name: []const u8,
     comptime run: fn (std.process.Init, []const u8, *std.process.Args.Iterator) anyerror!void,
 ) c_int {
-    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
-    const args: *std.process.Args.Iterator = @ptrCast(@alignCast(context.args));
-    const command = context.command_ptr[0..context.command_len];
+    if (!context.valid()) {
+        std.debug.print("antfly {s}: invalid runtime process ABI context\n", .{role_name});
+        return 1;
+    }
+    var process = RuntimeProcess.init(context) catch |err| {
+        std.debug.print("antfly {s}: failed to initialize runtime process context (error.{s})\n", .{ role_name, @errorName(err) });
+        return 1;
+    };
+    defer process.deinit();
+    var args = std.process.Args.Iterator.initAllocator(process.processArgs(), process.alloc) catch |err| {
+        std.debug.print("antfly {s}: failed to initialize runtime arguments (error.{s})\n", .{ role_name, @errorName(err) });
+        return 1;
+    };
+    defer args.deinit();
+    _ = args.next(); // synthetic argv[0], owned by this runtime unit
+    const command = context.command.slice();
 
-    run(runtimeInit(init.*), command, args) catch |err| {
+    run(process.processInit(), command, &args) catch |err| {
+        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
             error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
             else => "startup failed; see the preceding diagnostic for details",
         };
-        // The process-level ABI intentionally returns only success/failure,
-        // but diagnostics must retain the exact originating Zig error name.
-        std.debug.print("antfly {s}: {s} err={s}\n", .{ role_name, message, @errorName(err) });
+        std.debug.print("antfly {s}: {s} (error.{s})\n", .{ role_name, message, @errorName(err) });
         return 1;
     };
     return 0;
 }
+
+const RuntimeProcess = struct {
+    alloc: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    io_impl: std.Io.Threaded,
+    process_environ: std.process.Environ,
+    environ_map: std.process.Environ.Map,
+    argument_storage: [][:0]u8,
+    argument_ptrs: [][*:0]const u8,
+    preopens: std.process.Preopens,
+
+    fn init(context: *const bridge.Context) !RuntimeProcess {
+        const alloc = runtimeAllocator();
+        const input_arguments = context.arguments() orelse return error.InvalidArgument;
+        const argument_storage = try alloc.alloc([:0]u8, input_arguments.len + 1);
+        errdefer alloc.free(argument_storage);
+        var initialized_arguments: usize = 0;
+        errdefer for (argument_storage[0..initialized_arguments]) |argument| alloc.free(argument);
+        argument_storage[0] = try alloc.dupeZ(u8, "antfly-runtime");
+        initialized_arguments = 1;
+        for (input_arguments, 1..) |argument, index| {
+            argument_storage[index] = try alloc.dupeZ(u8, argument.slice());
+            initialized_arguments += 1;
+        }
+        const argument_ptrs = try alloc.alloc([*:0]const u8, argument_storage.len);
+        errdefer alloc.free(argument_ptrs);
+        for (argument_storage, argument_ptrs) |argument, *pointer| pointer.* = argument.ptr;
+
+        var environ_map = std.process.Environ.Map.init(alloc);
+        errdefer environ_map.deinit();
+        for (context.environment() orelse return error.InvalidArgument) |entry| {
+            if (!std.process.Environ.Map.validateKeyForPut(entry.name.slice()) or
+                std.mem.indexOfScalar(u8, entry.value.slice(), 0) != null)
+                return error.InvalidArgument;
+            try environ_map.put(entry.name.slice(), entry.value.slice());
+        }
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const preopens = try std.process.Preopens.init(arena.allocator());
+        const process_environ: std.process.Environ = switch (builtin.os.tag) {
+            .windows, .wasi => @compileError("partitioned Antfly runtime process ABI currently requires a POSIX host"),
+            else => .{ .block = try environ_map.createPosixBlock(alloc, .{}) },
+        };
+        errdefer process_environ.block.deinit(alloc);
+        const io_impl = std.Io.Threaded.init(alloc, .{ .environ = process_environ });
+
+        return .{
+            .alloc = alloc,
+            .arena = arena,
+            .io_impl = io_impl,
+            .process_environ = process_environ,
+            .environ_map = environ_map,
+            .argument_storage = argument_storage,
+            .argument_ptrs = argument_ptrs,
+            .preopens = preopens,
+        };
+    }
+
+    fn deinit(self: *RuntimeProcess) void {
+        self.io_impl.deinit();
+        self.process_environ.block.deinit(self.alloc);
+        self.environ_map.deinit();
+        self.arena.deinit();
+        for (self.argument_storage) |argument| self.alloc.free(argument);
+        self.alloc.free(self.argument_storage);
+        self.alloc.free(self.argument_ptrs);
+        self.* = undefined;
+    }
+
+    fn processArgs(self: *const RuntimeProcess) std.process.Args {
+        switch (builtin.os.tag) {
+            .windows => @compileError("partitioned Antfly runtime process ABI does not yet support Windows"),
+            .wasi => @compileError("partitioned Antfly runtime process ABI does not support WASI"),
+            else => return .{ .vector = self.argument_ptrs },
+        }
+    }
+
+    fn processInit(self: *RuntimeProcess) std.process.Init {
+        return .{
+            .minimal = .{ .args = self.processArgs(), .environ = self.process_environ },
+            .arena = &self.arena,
+            .gpa = self.alloc,
+            .io = self.io_impl.io(),
+            .environ_map = &self.environ_map,
+            .preopens = self.preopens,
+        };
+    }
+};
 
 fn runCli(
     init: std.process.Init,
@@ -179,16 +261,12 @@ fn runCli(
     return cli_runtime.runFromIterator(init, command, args);
 }
 
-fn runHa(
-    init: std.process.Init,
-    _: []const u8,
-    args: *std.process.Args.Iterator,
-) !void {
-    return ha_runtime.runFromIterator(init, "antfly", args);
-}
-
 fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return data_runtime.runFromIterator(init, "antfly", args);
+}
+
+fn runHa(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return ha_runtime.runFromIterator(init, "antfly", args);
 }
 
 fn runMetadata(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
@@ -203,7 +281,9 @@ fn runInference(init: std.process.Init, _: []const u8, args: *std.process.Args.I
     return inference_runtime.runFromIterator(init, "antfly", args);
 }
 
-fn runStandalone(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+fn runStandalone(init: std.process.Init, command: []const u8, args: *std.process.Args.Iterator) !void {
+    if (std.mem.eql(u8, command, "lite") and !unit_options.storage_kernel_experiment)
+        return lite_runtime.runFromIterator(init, "antfly", args);
     return standalone_runtime.runFromIterator(init, "antfly", args);
 }
 
@@ -215,12 +295,12 @@ fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "cli", runCli);
 }
 
-fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
-    return runtimeEntry(context, "ha", runHa);
-}
-
 fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "data", runData);
+}
+
+fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "ha", runHa);
 }
 
 fn metadataEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -252,7 +332,7 @@ fn standaloneLiteEntry(context: *const bridge.LiteServeContext) callconv(.c) c_i
         for (encoded, 0..) |arg, i| extra_args[i] = arg.slice();
     }
     standalone_runtime.runLite(
-        runtimeInit(init.*),
+        init.*,
         context.path.slice(),
         context.host.slice(),
         context.port,
@@ -269,122 +349,10 @@ fn exportInternal(comptime function: anytype, comptime name: []const u8) void {
     @export(function, .{ .name = name, .visibility = .hidden });
 }
 
-fn exportApiKernel() void {
-    exportInternal(&api_kernel_exports.create, "antfly_api_kernel_create");
-    exportInternal(&api_kernel_exports.destroy, "antfly_api_kernel_destroy");
-    exportInternal(&api_kernel_exports.requestStats, "antfly_api_kernel_request_stats");
-    exportInternal(&api_kernel_exports.setProvider, "antfly_api_kernel_set_provider");
-    exportInternal(&api_kernel_exports.setHAExecutor, "antfly_api_kernel_set_ha_executor");
-    exportInternal(&api_kernel_exports.executor, "antfly_api_kernel_executor");
-    exportInternal(&api_kernel_exports.streamingExecutor, "antfly_api_kernel_streaming_executor");
-    exportInternal(&api_kernel_exports.attachRuntimeRestoreStore, "antfly_api_kernel_attach_runtime_restore_store");
-    exportInternal(&api_kernel_exports.attachReplicatedRestoreStore, "antfly_api_kernel_attach_replicated_restore_store");
-    exportInternal(&api_kernel_exports.resumeRestoreJobs, "antfly_api_kernel_resume_restore_jobs");
-    exportInternal(&api_kernel_exports.pollRestoreJobs, "antfly_api_kernel_poll_restore_jobs");
-    exportInternal(&api_kernel_exports.prepareRestoreLeadership, "antfly_api_kernel_prepare_restore_leadership");
-    exportInternal(&api_kernel_exports.scheduleSessionMaintenance, "antfly_api_kernel_schedule_session_maintenance");
-    exportInternal(&api_kernel_exports.storageMaintenanceActive, "antfly_api_kernel_storage_maintenance_active");
-    exportInternal(&api_kernel_exports.handle, "antfly_api_kernel_handle");
-    exportInternal(&api_kernel_exports.handleInternal, "antfly_api_kernel_handle_internal");
-    exportInternal(&api_kernel_exports.handlerCreate, "antfly_api_kernel_handler_create");
-    exportInternal(&api_kernel_exports.handlerInit, "antfly_api_kernel_handler_init");
-    exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
-    exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
-    exportInternal(&api_kernel_exports.handlerHandleHttp, "antfly_api_kernel_handler_handle_http");
-    exportInternal(&api_kernel_exports.handlerDestroyHttpResponse, "antfly_api_kernel_handler_destroy_http_response");
-    exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
-}
-
-extern fn antfly_api_kernel_handler_handle_http(context: *const api_kernel_abi.HttpHandleContext) callconv(.c) api_kernel_abi.Status;
-extern fn antfly_api_kernel_handler_destroy_http_response(handle: *anyopaque) callconv(.c) void;
-
-fn distributedHttpxRegister(context: *const api_kernel_abi.RouteContext) callconv(.c) api_kernel_abi.Status {
-    if (context.abi_version != api_kernel_abi.abi_version or context._reserved != 0)
-        return api_kernel_abi.statusFromError(error.UnsupportedVersion);
-    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
-    const path = context.path_ptr[0..context.path_len];
-    const method: httpx.Method = switch (context.method) {
-        .get => .GET,
-        .post => .POST,
-        .put => .PUT,
-        .delete => .DELETE,
-    };
-    const result = server.routeWithData(method, path, distributedApiHttpHandler, context.route_handle);
-    result catch |err| return api_kernel_abi.statusFromError(err);
-    return .ok;
-}
-
-fn distributedApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
-    const route_handle = context.route_data orelse return error.ApiKernelUnavailable;
-    const source_headers = context.request.headers.iterator();
-    const headers = try context.allocator.alloc(api_kernel_abi.HeaderView, source_headers.len);
-    defer context.allocator.free(headers);
-    for (source_headers, 0..) |header, i| {
-        headers[i] = .{
-            .name = api_kernel_abi.Bytes.init(header.name),
-            .value = api_kernel_abi.Bytes.init(header.value),
-        };
-    }
-    const params = try context.allocator.alloc(api_kernel_abi.RouteParamView, context.params.len);
-    defer context.allocator.free(params);
-    for (context.params, 0..) |param, i| {
-        params[i] = .{
-            .name = api_kernel_abi.Bytes.init(param.name),
-            .value = api_kernel_abi.Bytes.init(param.value),
-        };
-    }
-
-    var response_handle: ?*anyopaque = null;
-    var response_view: api_kernel_abi.HttpResponseView = undefined;
-    const request_view: api_kernel_abi.HttpRequestView = .{
-        .method = switch (context.request.method) {
-            .GET => .get,
-            .POST => .post,
-            .PUT => .put,
-            .DELETE => .delete,
-            else => return error.MethodNotAllowed,
-        },
-        .path = api_kernel_abi.Bytes.init(context.request.uri.path),
-        .query = api_kernel_abi.OptionalBytes.init(context.request.uri.query),
-        .headers_ptr = if (headers.len == 0) null else headers.ptr,
-        .headers_len = headers.len,
-        .params_ptr = if (params.len == 0) null else params.ptr,
-        .params_len = params.len,
-        .body = api_kernel_abi.Bytes.init(context.request.body orelse ""),
-        .authorization = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
-        .content_type = api_kernel_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
-    };
-    const status = antfly_api_kernel_handler_handle_http(&.{
-        .abi_version = api_kernel_abi.abi_version,
-        .route_handle = route_handle,
-        .request = &request_view,
-        .out_response_handle = &response_handle,
-        .out_response = &response_view,
-    });
-    if (!status.isOk()) return api_kernel_abi.errorFromStatus(status);
-    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
-    defer antfly_api_kernel_handler_destroy_http_response(owned_response_handle);
-
-    var response = httpx.Response.init(context.allocator, response_view.status);
-    errdefer response.deinit();
-    if (response_view.content_type.slice()) |content_type|
-        try response.headers.set("Content-Type", content_type);
-    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
-    for (response_headers) |header| {
-        if (response_view.content_type.slice() != null and
-            std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
-        try response.headers.append(header.name.slice(), header.value.slice());
-    }
-    const body = try context.allocator.dupe(u8, response_view.body.slice());
-    response.body = body;
-    response.body_owned = true;
-    return response;
-}
-
 comptime {
     switch (unit_options.unit) {
         .api_kernel => {
-            exportApiKernel();
+            exportInternal(&api_kernel_exports.getFunctionTable, "antfly_api_kernel_get_function_table");
         },
         .distributed => {
             // Importing the C ABI implementation makes its `pub export`
@@ -394,35 +362,23 @@ comptime {
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
-            if (unit_options.storage_kernel_experiment) {
-                exportInternal(&distributedHttpxRegister, "antfly_distributed_httpx_register");
-            }
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
-            if (unit_options.storage_kernel_experiment)
+            if (unit_options.storage_kernel_experiment) {
+                exportInternal(&api_kernel_exports.getFunctionTable, "antfly_api_kernel_get_function_table");
                 exportInternal(&standaloneLiteEntry, "antfly_runtime_standalone_lite");
-            if (!unit_options.storage_kernel_experiment) {
+            } else {
                 exportInternal(&liteEntry, "antfly_runtime_lite");
                 exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
                 exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
-                // The legacy compile-once archive owns both sides of the
-                // owner contract. Shared runtime cleanup still enters through
-                // these ABI symbols, so provide them from the owning archive
-                // even though its physical operation paths remain direct.
                 exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
                 exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
             }
         },
         .data_pic_probe => {
-            // Measurement-only mirror of the production archive: retain the
-            // data entry point and the same CAPI roots, but none of the CLI,
-            // metadata, standalone, Lite, or restore-staging entry points.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
         },
         .storage_runtime_pic_probe => {
-            // Candidate storage-owning unit: keep the runtime paths that must
-            // share the physical storage implementation, while excluding the
-            // remote/control-only CLI and metadata roots.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
@@ -430,9 +386,6 @@ comptime {
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
         },
         .application_pic_probe => {
-            // Candidate application/storage unit after removing only CLI.
-            // Metadata is intentionally co-generated because prior data plus
-            // metadata measurements showed near-zero marginal LLVM cost.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
@@ -446,17 +399,25 @@ comptime {
             exportInternal(&cliEntry, "antfly_runtime_cli");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
         },
-        .cli_pic_probe => {
-            exportInternal(&cliEntry, "antfly_runtime_cli");
-        },
+        .cli_pic_probe => exportInternal(&cliEntry, "antfly_runtime_cli"),
         .control_api_probe => {
-            exportApiKernel();
+            exportInternal(&api_kernel_exports.getFunctionTable, "antfly_api_kernel_get_function_table");
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
         },
-        .cli => {
+        .serverless => {
             exportInternal(&cliEntry, "antfly_runtime_cli");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
+        },
+        .enrichment_compute => {
+            exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
+            exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
+            exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
+        },
+        .local_query => {
+            exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
+            exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
         },
         .storage_kernel => {
             // The kernel owns physical DB and local-query compilation plus
@@ -516,6 +477,7 @@ comptime {
             exportInternal(&storage_kernel_exports.dataApplyPreparedSnapshotDestroy, "antfly_data_apply_prepared_snapshot_destroy");
             exportInternal(&storage_kernel_exports.dataApplyStoreLatest, "antfly_data_apply_store_latest");
             exportInternal(&storage_kernel_exports.dataApplyStoreLatestForTransition, "antfly_data_apply_store_latest_for_transition");
+            exportInternal(&storage_kernel_exports.dataApplyStoreRaftBatchProtocolVersion, "antfly_data_apply_store_raft_batch_protocol_version");
             exportInternal(&storage_kernel_exports.dataApplyStoreProjection, "antfly_data_apply_store_projection");
             exportInternal(&storage_kernel_exports.dataApplyStoreReconcileOwner, "antfly_data_apply_store_reconcile_owner");
             exportInternal(&storage_kernel_exports.dataApplyStoreRetainGroups, "antfly_data_apply_store_retain_groups");
@@ -583,253 +545,202 @@ comptime {
             exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
             exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
         },
-        .serverless => {
-            exportInternal(&cliEntry, "antfly_runtime_cli");
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
-        },
-        .enrichment_compute => {
-            exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
-            exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
-            exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
-        },
-        .local_query => {
-            exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
-            exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
-        },
         .inference => {
+            exportInternal(&standaloneInferenceGetFunctionTable, "antfly_standalone_inference_get_function_table");
             exportInternal(&inferenceEntry, "antfly_runtime_inference");
-            exportInternal(&standaloneInferenceCreate, "antfly_standalone_inference_create");
-            exportInternal(&standaloneInferenceConfigure, "antfly_standalone_inference_configure");
-            exportInternal(&standaloneInferenceEmbedDense, "antfly_standalone_inference_embed_dense");
-            exportInternal(&standaloneInferenceDenseResultDestroy, "antfly_standalone_inference_dense_result_destroy");
-            exportInternal(&standaloneInferenceEmbedSparse, "antfly_standalone_inference_embed_sparse");
-            exportInternal(&standaloneInferenceSparseResultDestroy, "antfly_standalone_inference_sparse_result_destroy");
-            exportInternal(&standaloneInferenceRerank, "antfly_standalone_inference_rerank");
-            exportInternal(&standaloneInferenceFloatResultDestroy, "antfly_standalone_inference_float_result_destroy");
-            exportInternal(&standaloneInferenceListModels, "antfly_standalone_inference_list_models");
-            exportInternal(&standaloneInferenceBytesResultDestroy, "antfly_standalone_inference_bytes_result_destroy");
-            exportInternal(&standaloneInferenceGenerateText, "antfly_standalone_inference_generate_text");
-            exportInternal(&standaloneInferenceGenerateMessages, "antfly_standalone_inference_generate_messages");
-            exportInternal(&standaloneInferenceEmbedDenseParts, "antfly_standalone_inference_embed_dense_parts");
-            exportInternal(&standaloneInferenceReadImages, "antfly_standalone_inference_read_images");
-            exportInternal(&standaloneInferenceTranscribeAudio, "antfly_standalone_inference_transcribe_audio");
-            exportInternal(&standaloneInferenceExtract, "antfly_standalone_inference_extract");
-            exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
-            exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
+        },
+        .cli => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
         },
     }
 }
 
 fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) standalone_inference_bridge.Status {
-    context.out_handle.* = null;
-    context.out_failure.* = .{};
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.CreateContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     context.out_handle.* = standalone_inference_host.linkedInferenceCreate(context) catch |err| {
-        return reportStandaloneInferenceFailure(context.out_failure, .create, err);
+        return reportStandaloneInferenceFailure("create", err);
     };
     return .ok;
 }
 
 fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) standalone_inference_bridge.Status {
-    context.out_failure.* = .{};
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.ConfigureContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceConfigure(context) catch |err| {
-        return reportStandaloneInferenceFailure(context.out_failure, .configure, err);
+        return reportStandaloneInferenceFailure("configure", err);
     };
     return .ok;
 }
 
-fn standaloneInferenceEmbedDense(
-    request: *const standalone_inference_bridge.DenseEmbeddingRequest,
-    out_result: *standalone_inference_bridge.DenseEmbeddingResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceEmbedDense(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .embed_dense_texts, err);
+const inference_provider_operation_slots = 13;
+var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
+
+// Private inference errors are normalized at this archive boundary, so this is
+// the only place their original identity is available. Keep a fixed-size set
+// of per-operation/error/model counters: one noisy model must not consume the
+// first diagnostic for a different model, while model names supplied by a
+// client must never grow process memory or produce unbounded first-error logs.
+var inference_private_failure_diagnostics = [_]private_error_diagnostics.Diagnostic{.{}} ** private_error_diagnostics.slots_count;
+
+fn shouldLogInferencePrivateFailure(count: u64) bool {
+    // Keep the first few failures for diagnosis, then retain logarithmic
+    // visibility without allowing a bad model to amplify logs per request.
+    return count <= 4 or std.math.isPowerOfTwo(count);
+}
+
+fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge.ProviderInvokeContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.ProviderInvokeContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
+    standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
+        // Stable errors retain their exact identity at the caller, which owns
+        // the request correlation and can log them once with table context.
+        // Only private inference-unit errors need an owner-side diagnostic
+        // before they are normalized to the stable provider failure.
+        if (standalone_inference_bridge.errorHasStableDetail(err))
+            return standalone_inference_bridge.statusFromError(err);
+        const provider_operation = std.enums.fromInt(
+            standalone_inference_bridge.ProviderOperation,
+            context.operation,
+        );
+        const operation_slot: usize = if (context.operation > 0 and context.operation < inference_provider_operation_slots)
+            @intCast(context.operation)
+        else
+            0;
+        const diagnostic_fingerprint = private_error_diagnostics.fingerprint(
+            context.operation,
+            err,
+            context.request_json.slice(),
+        );
+        if (private_error_diagnostics.note(
+            &inference_private_failure_diagnostics,
+            diagnostic_fingerprint,
+        )) |failure_count| {
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_fingerprint={x} observed_diagnostic_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    diagnostic_fingerprint,
+                    failure_count,
+                    err,
+                });
+            }
+        } else {
+            // Once the bounded fingerprint table is full, retain logarithmic
+            // aggregate visibility without allocating or logging once per new
+            // client-controlled model name.
+            const failure_count = inference_private_failure_counts[operation_slot].fetchAdd(1, .monotonic) +% 1;
+            if (shouldLogInferencePrivateFailure(failure_count)) {
+                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_table_saturated=true observed_overflow_failures={d} err={}", .{
+                    if (provider_operation) |value| @tagName(value) else "unknown",
+                    context.request_json.len,
+                    context.has_deadline != 0,
+                    failure_count,
+                    err,
+                });
+            }
+        }
+        return standalone_inference_bridge.statusFromErrorWithFallback(err, error.InferenceProviderFailure);
     };
     return .ok;
 }
 
-fn standaloneInferenceDenseResultDestroy(
-    result: *standalone_inference_bridge.DenseEmbeddingResult,
+fn standaloneInferenceDestroyProviderResponse(handle: *anyopaque) callconv(.c) void {
+    standalone_inference_host.linkedInferenceDestroyProviderResponse(handle);
+}
+
+fn standaloneInferenceRouteManifest(context: *const standalone_inference_bridge.RouteManifestContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.RouteManifestContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
+    standalone_inference_host.linkedInferenceRouteManifest(context) catch |err| {
+        return reportStandaloneInferenceFailure("route_manifest", err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceHandleHttp(context: *const standalone_inference_bridge.HttpHandleContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.HttpHandleContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
+    standalone_inference_host.linkedInferenceHandleHttp(context) catch |err| {
+        return reportStandaloneInferenceFailure("handle_http", err);
+    };
+    return .ok;
+}
+
+fn standaloneInferenceDestroyHttpResponse(handle: *anyopaque) callconv(.c) void {
+    standalone_inference_host.linkedInferenceDestroyHttpResponse(handle);
+}
+
+fn standaloneInferenceTryAcquireRequest(handle: *anyopaque) callconv(.c) u8 {
+    return @intFromBool(standalone_inference_host.linkedInferenceTryAcquireRequest(handle));
+}
+
+fn standaloneInferenceReleaseRequest(handle: *anyopaque) callconv(.c) void {
+    standalone_inference_host.linkedInferenceReleaseRequest(handle);
+}
+
+fn standaloneInferenceRequestAdmissionStats(
+    handle: *anyopaque,
+    out: *standalone_inference_bridge.RequestAdmissionStats,
 ) callconv(.c) void {
-    standalone_inference_host.linkedInferenceDenseResultDestroy(result);
-}
-
-fn standaloneInferenceEmbedSparse(
-    request: *const standalone_inference_bridge.DenseEmbeddingRequest,
-    out_result: *standalone_inference_bridge.SparseEmbeddingResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceEmbedSparse(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .embed_sparse_texts, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceSparseResultDestroy(
-    result: *standalone_inference_bridge.SparseEmbeddingResult,
-) callconv(.c) void {
-    standalone_inference_host.linkedInferenceSparseResultDestroy(result);
-}
-
-fn standaloneInferenceRerank(
-    request: *const standalone_inference_bridge.RerankRequest,
-    out_result: *standalone_inference_bridge.FloatResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceRerank(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .rerank_texts, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceFloatResultDestroy(
-    result: *standalone_inference_bridge.FloatResult,
-) callconv(.c) void {
-    standalone_inference_host.linkedInferenceFloatResultDestroy(result);
-}
-
-fn standaloneInferenceListModels(
-    request: *const standalone_inference_bridge.HandleRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceListModels(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .list_models_json, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceBytesResultDestroy(
-    result: *standalone_inference_bridge.BytesResult,
-) callconv(.c) void {
-    standalone_inference_host.linkedInferenceBytesResultDestroy(result);
-}
-
-fn standaloneInferenceGenerateText(
-    request: *const standalone_inference_bridge.GenerateTextRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceGenerateText(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .generate_text, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceGenerateMessages(
-    request: *const standalone_inference_bridge.JsonOperationRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceGenerateMessages(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .generate_messages, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceEmbedDenseParts(
-    request: *const standalone_inference_bridge.DensePartsRequest,
-    out_result: *standalone_inference_bridge.DenseEmbeddingResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceEmbedDenseParts(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .embed_dense_parts, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceReadImages(
-    request: *const standalone_inference_bridge.JsonOperationRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceReadImages(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .read_images, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceTranscribeAudio(
-    request: *const standalone_inference_bridge.JsonOperationRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceTranscribeAudio(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .transcribe_audio, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceExtract(
-    request: *const standalone_inference_bridge.JsonOperationRequest,
-    out_result: *standalone_inference_bridge.BytesResult,
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-) callconv(.c) standalone_inference_bridge.Status {
-    out_result.* = .{};
-    out_failure.* = .{};
-    standalone_inference_host.linkedInferenceExtract(request, out_result) catch |err| {
-        return reportStandaloneInferenceFailure(out_failure, .extract, err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) standalone_inference_bridge.Status {
-    context.out_failure.* = .{};
-    standalone_inference_host.linkedInferenceRegisterRoutes(context) catch |err| {
-        return reportStandaloneInferenceFailure(context.out_failure, .register_routes, err);
-    };
-    return .ok;
+    out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
 }
 
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
 
-fn reportStandaloneInferenceFailure(
-    out_failure: *standalone_inference_bridge.FailureIdentity,
-    operation: standalone_inference_bridge.Operation,
-    err: anyerror,
-) standalone_inference_bridge.Status {
-    out_failure.* = boundary_error_identity.failureFromError(
-        err,
-        .inference_runtime,
-        standalone_inference_bridge.abi_version,
-        @intFromEnum(operation),
-    );
-    std.log.err("standalone inference bridge failed operation={s} err={}", .{ @tagName(operation), err });
-    return out_failure.status;
+const standalone_inference_function_table: standalone_inference_bridge.FunctionTable = .{
+    .abi_version = standalone_inference_bridge.abi_version,
+    .struct_size = @sizeOf(standalone_inference_bridge.FunctionTable),
+    .capabilities = standalone_inference_bridge.Capability.provider |
+        standalone_inference_bridge.Capability.route_manifest |
+        standalone_inference_bridge.Capability.resource_budget |
+        standalone_inference_bridge.Capability.request_admission,
+    .create = &standaloneInferenceCreate,
+    .configure = &standaloneInferenceConfigure,
+    .invoke_provider = &standaloneInferenceInvokeProvider,
+    .destroy_provider_response = &standaloneInferenceDestroyProviderResponse,
+    .route_manifest = &standaloneInferenceRouteManifest,
+    .handle_http = &standaloneInferenceHandleHttp,
+    .destroy_http_response = &standaloneInferenceDestroyHttpResponse,
+    .try_acquire_request = &standaloneInferenceTryAcquireRequest,
+    .release_request = &standaloneInferenceReleaseRequest,
+    .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
+    .destroy = &standaloneInferenceDestroy,
+};
+
+fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {
+    return &standalone_inference_function_table;
 }
 
-fn runtimeInit(init: std.process.Init) std.process.Init {
-    return .{
-        .minimal = init.minimal,
-        .arena = init.arena,
-        .gpa = runtimeAllocator(init),
-        .io = init.io,
-        .environ_map = init.environ_map,
-        .preopens = init.preopens,
-    };
+fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerror) standalone_inference_bridge.Status {
+    std.log.err("standalone inference bridge failed operation={s} err={}", .{ operation, err });
+    return standalone_inference_bridge.statusFromError(err);
 }
 
-fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
-    const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else init.gpa;
+fn runtimeAllocator() std.mem.Allocator {
+    const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else std.heap.page_allocator;
     return platform.allocator.processAllocator(fallback);
 }

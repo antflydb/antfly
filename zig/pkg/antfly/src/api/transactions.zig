@@ -262,11 +262,44 @@ pub const TerminalCommitStatus = enum {
     }
 };
 
+/// Repair debt is terminal and independently persisted. Only live propagation
+/// or retryable visibility debt keeps coordinator recovery active.
+pub fn terminalCommitStatusForOutcome(
+    propagation_pending: bool,
+    visibility_pending: bool,
+    visibility_retry_pending: bool,
+    visibility_repair_required: bool,
+) TerminalCommitStatus {
+    if (propagation_pending) return .committed_recovery_pending;
+    // `visibility_pending` predates the retry/repair split and remains the
+    // compatibility contract for private adapters and mixed-version callers.
+    // Treat a parent-only outcome as live retryable debt rather than silently
+    // upgrading it to committed. A classified repair-only result remains
+    // terminal and is rendered by terminalCommitResponseStatus below.
+    const unclassified_visibility_pending = visibility_pending and
+        !visibility_retry_pending and
+        !visibility_repair_required;
+    if (visibility_retry_pending or unclassified_visibility_pending)
+        return .committed_visibility_pending;
+    return .committed;
+}
+
+/// Wire status precedence mirrors operational urgency: unresolved participant
+/// recovery, then retryable visibility, then terminal repair debt.
+pub fn terminalCommitResponseStatus(status: TerminalCommitStatus, repair_required: bool) []const u8 {
+    if (status != .committed) return status.text();
+    if (repair_required) return "committed_repair_required";
+    return status.text();
+}
+
 /// A durable API-level terminal result. The coordinator location is retained
 /// with the result because current routing may change after the topology fence
 /// is released. `coordinator_table_name` is owned by this value.
 pub const TerminalCommit = struct {
     status: TerminalCommitStatus,
+    /// Stored independently from status so rollback binaries continue to read
+    /// the established status enum and simply ignore this additive JSON field.
+    repair_required: bool = false,
     coordinator_group_id: ?u64 = null,
     coordinator_table_name: ?[]u8 = null,
     coordinator_acknowledged: bool = false,
@@ -279,6 +312,7 @@ pub const TerminalCommit = struct {
     pub fn clone(self: TerminalCommit, alloc: std.mem.Allocator) !TerminalCommit {
         return .{
             .status = self.status,
+            .repair_required = self.repair_required,
             .coordinator_group_id = self.coordinator_group_id,
             .coordinator_table_name = if (self.coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null,
             .coordinator_acknowledged = self.coordinator_acknowledged,
@@ -314,6 +348,13 @@ pub const PendingSessionRecovery = union(enum) {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         sync_level: db_mod.types.SyncLevel,
+        /// A prior visibility attempt reached durable repair debt. Recovery
+        /// should finish participant propagation at write durability without
+        /// polling the failed provider again.
+        repair_required: bool = false,
+        /// The source returned only a terminal error, so coordinator metadata
+        /// must be recovered without re-entering the failed visibility barrier.
+        repair_handoff_needs_coordinator: bool = false,
         request: OwnedTransactionCommitRequest,
     },
     acknowledge: PendingTerminalAcknowledgement,
@@ -1546,6 +1587,25 @@ pub const SessionRegistry = struct {
         coordinator_group_id: ?u64,
         coordinator_table_name: ?[]const u8,
     ) !?void {
+        return try self.recordTerminalCommitWithRepair(
+            alloc,
+            txn_id,
+            status,
+            false,
+            coordinator_group_id,
+            coordinator_table_name,
+        );
+    }
+
+    pub fn recordTerminalCommitWithRepair(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        status: TerminalCommitStatus,
+        repair_required: bool,
+        coordinator_group_id: ?u64,
+        coordinator_table_name: ?[]const u8,
+    ) !?void {
         if ((coordinator_group_id == null) != (coordinator_table_name == null)) return error.InvalidTransactionSessionRecord;
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -1554,18 +1614,26 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
-            if (terminal.coordinator_group_id != coordinator_group_id or
-                !optionalStringsEqual(terminal.coordinator_table_name, coordinator_table_name))
+            const fills_provisional_repair_handoff = terminal.status == .committed and
+                terminal.repair_required and
+                terminal.coordinator_group_id == null and
+                status == .committed and
+                repair_required and
+                coordinator_group_id != null;
+            if (!fills_provisional_repair_handoff and
+                (terminal.coordinator_group_id != coordinator_group_id or
+                    !optionalStringsEqual(terminal.coordinator_table_name, coordinator_table_name)))
             {
                 return error.TransactionCoordinatorMismatch;
             }
-            break :blk terminal.coordinator_acknowledged;
+            break :blk if (fills_provisional_repair_handoff) false else terminal.coordinator_acknowledged;
         } else false;
         if (candidate.terminal_commit) |*terminal| terminal.deinit(alloc);
         candidate.terminal_commit = null;
         const owned_coordinator_table_name = if (coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null;
         candidate.terminal_commit = .{
             .status = status,
+            .repair_required = repair_required,
             .coordinator_group_id = coordinator_group_id,
             .coordinator_table_name = owned_coordinator_table_name,
             .coordinator_acknowledged = coordinator_acknowledged,
@@ -1773,16 +1841,30 @@ pub const SessionRegistry = struct {
             // completed. In particular, do this before consulting the legacy
             // acknowledgement bit so records written by an older binary can
             // self-heal instead of remaining pending forever.
-            if (terminal.status != .committed) {
+            const repair_handoff_needs_coordinator = terminal.status == .committed and
+                terminal.repair_required and terminal.coordinator_group_id == null;
+            if (terminal.status != .committed or repair_handoff_needs_coordinator) {
                 if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
                     return error.InvalidTransactionSessionRecord;
                 const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
-                return .{ .commit = .{
-                    .txn_id = txn_id,
-                    .begin_timestamp = candidate.begin_timestamp,
-                    .sync_level = candidate.sync_level,
-                    .request = try request.clone(alloc),
-                } };
+                return .{
+                    .commit = .{
+                        .txn_id = txn_id,
+                        .begin_timestamp = candidate.begin_timestamp,
+                        // Repair debt for one participant does not weaken another
+                        // participant's still-live visibility contract. Exact
+                        // failure markers keep the repaired request from invoking
+                        // its provider again while recovery retains the caller's
+                        // original barrier for every remaining participant. A
+                        // source that returned only a thrown terminal error may
+                        // use write durability once to recover missing coordinator
+                        // metadata; maintenance selects that fallback explicitly.
+                        .sync_level = candidate.sync_level,
+                        .repair_required = terminal.repair_required,
+                        .repair_handoff_needs_coordinator = repair_handoff_needs_coordinator,
+                        .request = try request.clone(alloc),
+                    },
+                };
             }
             if (terminal.coordinator_acknowledged) return null;
             const group_id = terminal.coordinator_group_id orelse return null;
@@ -1800,6 +1882,8 @@ pub const SessionRegistry = struct {
             .txn_id = txn_id,
             .begin_timestamp = candidate.begin_timestamp,
             .sync_level = candidate.sync_level,
+            .repair_required = false,
+            .repair_handoff_needs_coordinator = false,
             .request = try request.clone(alloc),
         } };
     }
@@ -3834,6 +3918,7 @@ fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) 
 fn sessionNeedsRecovery(session: Session) bool {
     if (session.terminal_commit) |terminal| {
         return terminal.status != .committed or
+            (terminal.repair_required and terminal.coordinator_group_id == null) or
             (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
     }
     return session.commit_body_digest != null and session.commit_execution_started;
@@ -3917,6 +4002,8 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         }
         try out.appendSlice(alloc, ",\"coordinator_acknowledged\":");
         try out.appendSlice(alloc, if (terminal.coordinator_acknowledged) "true" else "false");
+        try out.appendSlice(alloc, ",\"repair_required\":");
+        try out.appendSlice(alloc, if (terminal.repair_required) "true" else "false");
         try out.append(alloc, '}');
     } else {
         try out.appendSlice(alloc, "null");
@@ -4045,9 +4132,14 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
                 .bool => |acknowledged| acknowledged,
                 else => return error.InvalidTransactionSessionRecord,
             } else false;
+            const repair_required = if (terminal_obj.get("repair_required")) |value| switch (value) {
+                .bool => |required| required,
+                else => return error.InvalidTransactionSessionRecord,
+            } else false;
             const coordinator_table_name = if (coordinator_table_name_text) |value| try alloc.dupe(u8, value) else null;
             session.terminal_commit = .{
                 .status = status,
+                .repair_required = repair_required,
                 .coordinator_group_id = coordinator_group_id,
                 .coordinator_table_name = coordinator_table_name,
                 .coordinator_acknowledged = coordinator_acknowledged,
@@ -4337,10 +4429,11 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
         defer writer.deinit(std.testing.allocator);
         const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 7);
         txn_id = session.txn_id;
-        try std.testing.expect((try writer.recordTerminalCommit(
+        try std.testing.expect((try writer.recordTerminalCommitWithRepair(
             std.testing.allocator,
             txn_id,
             .committed_visibility_pending,
+            true,
             7001,
             "docs",
         )) != null);
@@ -4351,6 +4444,7 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
     var terminal = (try reader.getTerminalCommit(std.testing.allocator, txn_id)).?;
     defer terminal.deinit(std.testing.allocator);
     try std.testing.expectEqual(TerminalCommitStatus.committed_visibility_pending, terminal.status);
+    try std.testing.expect(terminal.repair_required);
     try std.testing.expectEqual(@as(?u64, 7001), terminal.coordinator_group_id);
     try std.testing.expectEqualStrings("docs", terminal.coordinator_table_name.?);
     try std.testing.expect(!terminal.coordinator_acknowledged);
@@ -4367,6 +4461,131 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
     defer acknowledged.deinit(std.testing.allocator);
     try std.testing.expect(acknowledged.coordinator_acknowledged);
     try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(std.testing.allocator, std.math.maxInt(u64)));
+}
+
+test "repair-required transaction sessions replay propagation once then release coordination" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .full_index }, 9);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)) orelse return error.TestExpectedEqual;
+    sealed.deinit(alloc);
+    _ = (try registry.markCommitExecutionStarted(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed_visibility_pending,
+        true,
+        7001,
+        "docs",
+    )) orelse return error.TestExpectedEqual;
+
+    var replay = (try registry.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())) orelse return error.TestExpectedEqual;
+    defer replay.deinit(alloc);
+    try std.testing.expect(replay == .commit);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, replay.commit.sync_level);
+    try std.testing.expect(replay.commit.repair_required);
+
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        terminalCommitStatusForOutcome(false, false, false, false),
+        true,
+        7001,
+        "docs",
+    )) orelse return error.TestExpectedEqual;
+    var acknowledgement = (try registry.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())) orelse return error.TestExpectedEqual;
+    defer acknowledgement.deinit(alloc);
+    try std.testing.expect(acknowledgement == .acknowledge);
+    _ = (try registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
+    const pending = try registry.listPendingRecoveryIds(alloc, 8);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "committed repair session without coordinator replays a write handoff" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .full_index }, 9);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)) orelse return error.TestExpectedEqual;
+    sealed.deinit(alloc);
+    _ = (try registry.markCommitExecutionStarted(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
+
+    // This is the crash-safe provisional state written when storage committed
+    // but the source surfaced only a terminal enrichment error, before it
+    // returned coordinator metadata to the session handler.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed,
+        true,
+        null,
+        null,
+    )) orelse return error.TestExpectedEqual;
+
+    var replay = (try registry.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())) orelse return error.TestExpectedEqual;
+    defer replay.deinit(alloc);
+    try std.testing.expect(replay == .commit);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, replay.commit.sync_level);
+    try std.testing.expect(replay.commit.repair_required);
+    try std.testing.expect(replay.commit.repair_handoff_needs_coordinator);
+
+    // The provisional record may be promoted exactly once when the write-only
+    // recovery call returns the missing coordinator identity.
+    _ = (try registry.recordTerminalCommitWithRepair(
+        alloc,
+        session.txn_id,
+        .committed,
+        true,
+        7001,
+        "docs",
+    )) orelse return error.TestExpectedEqual;
+    var acknowledgement = (try registry.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())) orelse return error.TestExpectedEqual;
+    defer acknowledgement.deinit(alloc);
+    try std.testing.expect(acknowledgement == .acknowledge);
+}
+
+test "terminal commit response preserves live debt ahead of repair" {
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed_recovery_pending,
+        terminalCommitStatusForOutcome(true, true, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "committed_recovery_pending",
+        terminalCommitResponseStatus(.committed_recovery_pending, true),
+    );
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed_visibility_pending,
+        terminalCommitStatusForOutcome(false, true, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "committed_visibility_pending",
+        terminalCommitResponseStatus(.committed_visibility_pending, true),
+    );
+    try std.testing.expectEqualStrings(
+        "committed_repair_required",
+        terminalCommitResponseStatus(.committed, true),
+    );
+    // Legacy/private adapters may only populate the established parent bit.
+    // Preserve their unmet visibility contract conservatively.
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed_visibility_pending,
+        terminalCommitStatusForOutcome(false, true, false, false),
+    );
+    // A classified terminal repair is not live retry work.
+    try std.testing.expectEqual(
+        TerminalCommitStatus.committed,
+        terminalCommitStatusForOutcome(false, true, false, true),
+    );
 }
 
 test "durable session limits bound count and encoded record size" {

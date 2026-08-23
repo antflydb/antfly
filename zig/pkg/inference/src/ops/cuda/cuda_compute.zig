@@ -3124,6 +3124,19 @@ const CudaKvDeviceStorage = struct {
         }
     }
 
+    fn truncateSequence(
+        ctx: *anyopaque,
+        sequence_id: kv_storage_runtime.SequenceId,
+        retained_token_count: usize,
+    ) void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        var it = self.layers.iterator();
+        while (it.next()) |entry| {
+            if (@as(u32, @intCast(entry.key_ptr.* >> 32)) != sequence_id) continue;
+            entry.value_ptr.token_count = @min(entry.value_ptr.token_count, retained_token_count);
+        }
+    }
+
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
         self.deinit();
@@ -3134,6 +3147,7 @@ const CudaKvDeviceStorage = struct {
         .writeLayerKvSuffix = writeLayerKvSuffix,
         .gatherLayerKvDevice = gatherLayerKvDevice,
         .pagedLayerKvDevice = pagedLayerKvDevice,
+        .truncateSequence = truncateSequence,
         .releaseSequence = releaseSequence,
         .deinit = hookDeinit,
     };
@@ -16470,7 +16484,7 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, .attention, token_count);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, true);
+    try self.kernels.launchTokenMajorAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode);
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }

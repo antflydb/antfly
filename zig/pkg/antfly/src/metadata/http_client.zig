@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -27,6 +28,21 @@ const routes = @import("http_routes.zig");
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
+// The server's read-index barrier is bounded at five seconds. A full catalog
+// snapshot can still require meaningful clone/serialization time, so keep the
+// transport ceiling larger while the caller's shared budget remains the hard
+// end-to-end bound.
+const linearizable_snapshot_request_timeout_ms: u32 = 10_000;
+const default_mutation_authority_retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
+const max_mutation_authority_retry_delay_ns: u64 = std.time.ns_per_s;
+const mutation_authority_retry_cancellation_slice_ns: u64 = 10 * std.time.ns_per_ms;
+
+const RetryPolicy = enum {
+    /// Preserve the metadata client's existing retry behavior.
+    replay_safe,
+    /// Retry only failures that prove the server did not admit the mutation.
+    at_most_once,
+};
 
 /// One monotonic budget shared by every transport and not-leader retry in a
 /// logical metadata operation. The cancellation pointer is borrowed only by
@@ -78,6 +94,14 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonValue(metadata_api.MetadataStatus, base_uri, routes.Routes.status);
     }
 
+    pub fn fetchStatusWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: RequestBudget,
+    ) !metadata_api.MetadataStatus {
+        return try self.getJsonValueWithBudget(metadata_api.MetadataStatus, base_uri, routes.Routes.status, budget);
+    }
+
     pub fn fetchHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
         return try self.fetchHeadWithBudget(base_uri, null);
     }
@@ -88,6 +112,44 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
     ) !metadata_api.MetadataHead {
         return try self.getJsonValueWithBudget(metadata_api.MetadataHead, base_uri, routes.Routes.head, budget);
+    }
+
+    pub fn fetchLinearizableHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
+        var parsed = try self.requestJsonWithBody(
+            metadata_api.MetadataHead,
+            base_uri,
+            .POST,
+            routes.Routes.internal_linearizable_head,
+            "{}",
+            null,
+            null,
+            null,
+        );
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn fetchLinearizableSnapshot(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_linearizable_snapshot);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = "{}",
+            .content_type = "application/json",
+            .timeout_ms = linearizable_snapshot_request_timeout_ms,
+        }, budget);
+        defer resp.deinit(self.alloc);
+        // Unknown internal routes are the capability signal during a rolling
+        // upgrade. Treat both common server spellings as unsupported.
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        try mapStatus(resp.status, null, null, null);
+        return try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
@@ -170,8 +232,29 @@ pub const MetadataHttpClient = struct {
         return try self.getJson(ActiveTransitionsResponse, base_uri, routes.Routes.active_transitions);
     }
 
+    /// Returns `error.ReallocationOutcomeUnknown` when transport fails after
+    /// admission may have occurred. Callers must observe metadata state before
+    /// deciding whether to submit a new reallocation generation.
     pub fn triggerReallocate(self: *MetadataHttpClient, base_uri: []const u8) !void {
-        try self.postNoContent(base_uri, routes.Routes.internal_reallocate, "");
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_reallocate);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetryPolicy(.{
+            .method = .POST,
+            .uri = uri,
+            .body = "",
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 503) {
+            // A broad authority hint without the stronger non-admission proof
+            // is not safe to replay and is not an upgrade verdict. Preserve
+            // the ambiguity so callers converge through observation.
+            if (isMetadataNotLeaderResponse(resp)) return error.ReallocationOutcomeUnknown;
+            return error.ReallocationProtocolUpgradeRequired;
+        }
+        try mapStatus(resp.status, null, null, null);
     }
 
     pub fn upsertNode(
@@ -538,10 +621,6 @@ pub const MetadataHttpClient = struct {
         return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
     }
 
-    fn postNoContent(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, body: []const u8) !void {
-        try self.requestWithBody(base_uri, .POST, path, body, null, null, null);
-    }
-
     fn requestWithBody(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -622,44 +701,140 @@ pub const MetadataHttpClient = struct {
         req: http_common.HttpRequest,
         budget: ?RequestBudget,
     ) !http_common.HttpResponse {
+        return try self.executeWithRetryPolicy(req, budget, .replay_safe);
+    }
+
+    fn executeWithRetryPolicy(
+        self: *MetadataHttpClient,
+        req: http_common.HttpRequest,
+        budget: ?RequestBudget,
+        retry_policy: RetryPolicy,
+    ) !http_common.HttpResponse {
         var transport_attempt: usize = 0;
         var not_leader_attempt: usize = 0;
         while (true) {
             const controlled_req = try applyRequestBudget(req, budget);
             var resp = self.executor.execute(self.alloc, controlled_req) catch |err| switch (err) {
-                error.HttpConnectionClosing,
-                error.ConnectionResetByPeer,
-                error.ConnectionRefused,
-                error.BrokenPipe,
-                error.EndOfStream,
-                error.Timeout,
-                => {
+                // The operating system rejected the connection before an HTTP
+                // request could reach the metadata service, so retrying cannot
+                // create a second reallocation generation.
+                error.ConnectionRefused => {
                     if (transport_attempt >= max_transport_retries) return err;
                     transport_attempt += 1;
                     continue;
                 },
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.Timeout,
+                => {
+                    // These failures can arrive after the server admitted the
+                    // POST. Although active requests coalesce, a replay can
+                    // arrive after the first generation clears and create a
+                    // second pass. Preserve ambiguity for observation instead.
+                    if (retry_policy == .at_most_once) return error.ReallocationOutcomeUnknown;
+                    if (transport_attempt >= max_transport_retries) return err;
+                    transport_attempt += 1;
+                    continue;
+                },
+                // Preserve the established behavior for other metadata calls,
+                // while treating this response-less failure as ambiguous for
+                // the at-most-once reallocation mutation.
+                error.ConnectionTimedOut => if (retry_policy == .at_most_once)
+                    return error.ReallocationOutcomeUnknown
+                else
+                    return err,
                 else => return err,
             };
-            if (!isMetadataNotLeaderResponse(resp)) return resp;
+            const retryable_authority_response = switch (retry_policy) {
+                .replay_safe => isMetadataNotLeaderResponse(resp),
+                .at_most_once => isMetadataMutationNotAdmittedResponse(resp),
+            };
+            if (!retryable_authority_response) return resp;
             if (not_leader_attempt >= max_metadata_not_leader_retries) {
                 resp.deinit(self.alloc);
                 return error.NotLeader;
             }
             not_leader_attempt += 1;
+            const retry_delay_ns = if (retry_policy == .at_most_once)
+                metadataAuthorityRetryDelayNs(resp)
+            else
+                0;
             resp.deinit(self.alloc);
+            if (retry_delay_ns != 0) try waitBeforeMetadataMutationRetry(
+                retry_delay_ns,
+                budget,
+                controlled_req.cancellation,
+            );
         }
     }
 
     fn isMetadataNotLeaderResponse(resp: http_common.HttpResponse) bool {
+        return responseHasHeaderValue(
+            resp,
+            http_common.metadata_not_leader_header,
+            http_common.metadata_not_leader_value,
+        );
+    }
+
+    fn isMetadataMutationNotAdmittedResponse(resp: http_common.HttpResponse) bool {
+        return responseHasHeaderValue(
+            resp,
+            http_common.metadata_mutation_not_admitted_header,
+            http_common.metadata_mutation_not_admitted_value,
+        );
+    }
+
+    fn responseHasHeaderValue(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
         if (resp.status != 503) return false;
         for (resp.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
-                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), http_common.metadata_not_leader_value))
+            if (std.ascii.eqlIgnoreCase(header.name, name) and
+                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), value))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    fn metadataAuthorityRetryDelayNs(resp: http_common.HttpResponse) u64 {
+        for (resp.headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "Retry-After")) continue;
+            const seconds = std.fmt.parseUnsigned(
+                u64,
+                std.mem.trim(u8, header.value, " \t\r\n"),
+                10,
+            ) catch break;
+            return @min(
+                seconds *| std.time.ns_per_s,
+                max_mutation_authority_retry_delay_ns,
+            );
+        }
+        return default_mutation_authority_retry_delay_ns;
+    }
+
+    fn waitBeforeMetadataMutationRetry(
+        requested_delay_ns: u64,
+        budget: ?RequestBudget,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !void {
+        const started_ns = platform_time.monotonicNs();
+        var delay_ns = requested_delay_ns;
+        if (budget) |value| {
+            if (started_ns >= value.deadline_ns) return error.Timeout;
+            delay_ns = @min(delay_ns, value.deadline_ns - started_ns);
+        }
+
+        var remaining_ns = delay_ns;
+        while (remaining_ns != 0) {
+            if (cancellation) |signal| {
+                if (signal.isCancelled()) return error.Cancelled;
+            }
+            const slice_ns = @min(remaining_ns, mutation_authority_retry_cancellation_slice_ns);
+            platform_time.sleepNs(slice_ns);
+            remaining_ns -= slice_ns;
+        }
     }
 
     fn mapStatus(status: u16, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
@@ -711,6 +886,291 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
         parsed.value.store_id,
         routes.Routes.internal_node_status_suffix,
     });
+}
+
+test "metadata http client uses the reallocation route and maps upgrade gating" {
+    const UpgradeRequiredExecutor = struct {
+        fn executor(_: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate));
+            return .{
+                .status = 503,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "metadata voter upgrade required"),
+            };
+        }
+    };
+
+    var executor = UpgradeRequiredExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.ReallocationProtocolUpgradeRequired,
+        client.triggerReallocate("http://127.0.0.1:9000"),
+    );
+}
+
+test "metadata http client does not replay reallocation after ambiguous transport failures" {
+    const AmbiguousExecutor = struct {
+        failure: anyerror,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            return self.failure;
+        }
+    };
+
+    const failures = [_]anyerror{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.ConnectionTimedOut,
+        error.Timeout,
+    };
+    for (failures) |failure| {
+        var executor = AmbiguousExecutor{ .failure = failure };
+        var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+        try std.testing.expectError(
+            error.ReallocationOutcomeUnknown,
+            client.triggerReallocate("http://127.0.0.1:9000"),
+        );
+        try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+    }
+}
+
+test "metadata http client retries reallocation only before connection admission" {
+    const PreAdmissionExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.ConnectionRefused;
+            return .{ .status = 202 };
+        }
+    };
+
+    var executor = PreAdmissionExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try client.triggerReallocate("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+}
+
+test "metadata http client bounds mutation authority retry-after delay" {
+    var one_second = [_]http_common.Header{.{
+        .name = @constCast("Retry-After"),
+        .value = @constCast(" 1 "),
+    }};
+    try std.testing.expectEqual(
+        @as(u64, std.time.ns_per_s),
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = one_second[0..] }),
+    );
+
+    var excessive = [_]http_common.Header{.{
+        .name = @constCast("retry-after"),
+        .value = @constCast("999999999999"),
+    }};
+    try std.testing.expectEqual(
+        max_mutation_authority_retry_delay_ns,
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = excessive[0..] }),
+    );
+
+    var invalid = [_]http_common.Header{.{
+        .name = @constCast("Retry-After"),
+        .value = @constCast("tomorrow"),
+    }};
+    try std.testing.expectEqual(
+        default_mutation_authority_retry_delay_ns,
+        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = invalid[0..] }),
+    );
+}
+
+test "metadata http client replays reallocation only with explicit mutation non-admission proof" {
+    const ProofKind = enum { mutation_not_admitted, broad_authority_hint };
+    const ProofExecutor = struct {
+        proof: ProofKind,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn rejectionResponse(
+            alloc: std.mem.Allocator,
+            header_name: []const u8,
+            header_value: []const u8,
+        ) !http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, header_name),
+                .value = &.{},
+            };
+            errdefer headers[0].deinit(alloc);
+            headers[0].value = try alloc.dupe(u8, header_value);
+            const body = try alloc.dupe(u8, "metadata authority unavailable");
+            errdefer alloc.free(body);
+            return .{ .status = 503, .headers = headers, .body = body };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.attempts += 1;
+            if (self.attempts > 1) return .{ .status = 202 };
+            return switch (self.proof) {
+                .mutation_not_admitted => try rejectionResponse(
+                    alloc,
+                    http_common.metadata_mutation_not_admitted_header,
+                    http_common.metadata_mutation_not_admitted_value,
+                ),
+                .broad_authority_hint => try rejectionResponse(
+                    alloc,
+                    http_common.metadata_not_leader_header,
+                    http_common.metadata_not_leader_value,
+                ),
+            };
+        }
+    };
+
+    var proved = ProofExecutor{ .proof = .mutation_not_admitted };
+    var proved_client = MetadataHttpClient.init(std.testing.allocator, proved.executor());
+    try proved_client.triggerReallocate("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(usize, 2), proved.attempts);
+
+    var ambiguous = ProofExecutor{ .proof = .broad_authority_hint };
+    var ambiguous_client = MetadataHttpClient.init(std.testing.allocator, ambiguous.executor());
+    try std.testing.expectError(
+        error.ReallocationOutcomeUnknown,
+        ambiguous_client.triggerReallocate("http://127.0.0.1:9000"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ambiguous.attempts);
+}
+
+test "metadata http client requests a non-cacheable linearizable head fence" {
+    const FenceExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings(
+                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-head",
+                req.uri,
+            );
+            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
+                ),
+            };
+        }
+    };
+
+    var executor = FenceExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    const head = try client.fetchLinearizableHead("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "metadata http client fetches one bounded linearizable snapshot" {
+    const FenceExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings(
+                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-snapshot",
+                req.uri,
+            );
+            try std.testing.expectEqual(@as(?u32, linearizable_snapshot_request_timeout_ms), req.timeout_ms);
+            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                ),
+            };
+        }
+    };
+
+    var executor = FenceExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var snapshot = try client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "metadata http client treats missing linearizable snapshot route as unsupported" {
+    const LegacyExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "not found"),
+            };
+        }
+    };
+
+    var executor = LegacyExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null),
+    );
 }
 
 test "metadata http client retries transient connection close on fetch status" {
@@ -780,6 +1240,8 @@ test "metadata http client retries bounded timeout on fetch status" {
     var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(u16, 0), status.reallocation_barrier_protocol_version);
+    try std.testing.expectEqual(@as(u16, 0), status.runtime_status_record_version);
     try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
 }
 
@@ -982,9 +1444,9 @@ test "metadata http client percent-encodes artifact enrichment path components" 
 }
 
 test "metadata http client round-trips server endpoints" {
+    const httpx = @import("httpx");
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 
     const FakeSource = struct {
         reallocate_count: usize = 0,
@@ -1222,11 +1684,27 @@ test "metadata http client round-trips server endpoints" {
 
     var source = FakeSource{};
     var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer server_io.deinit();
+    var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
     defer listener.deinit();
-    try listener.start();
+    try server.registerRoutes(&listener);
+    try listener.bind();
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn listen(http_server: *httpx.Server) void {
+            http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
+        }
+    }.listen, .{&listener});
+    defer {
+        listener.stop();
+        listener_thread.join();
+    }
 
-    const base_uri = try listener.baseUri(std.heap.page_allocator);
+    const address = listener.boundAddress() orelse return error.AddressNotAvailable;
+    const base_uri = try std.fmt.allocPrint(std.heap.page_allocator, "http://127.0.0.1:{d}", .{address.ip4.port});
     defer std.heap.page_allocator.free(base_uri);
 
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
@@ -1258,6 +1736,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
 
     try client.triggerReallocate(base_uri);
+    try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
+    try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
     try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");

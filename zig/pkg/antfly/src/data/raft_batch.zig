@@ -16,6 +16,11 @@ const std = @import("std");
 const batch_api = @import("../api/batch.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
+const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
+
+pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
+pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 
 pub const OwnedStorageOwnerDescriptor = struct {
     descriptor: descriptor_contract.Descriptor,
@@ -35,6 +40,7 @@ pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
     batch: batch_api.OwnedBatchRequest,
     storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
+    protocol_barrier_version: ?u16 = null,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -43,6 +49,24 @@ pub const OwnedReplicatedBatch = struct {
         self.* = undefined;
     }
 };
+
+/// Encodes an irreversible Raft log-format activation point. `batch` is
+/// intentionally null: binaries that predate protocol barriers reject the
+/// entry and stop applying instead of silently continuing past a format they
+/// cannot interpret. Binaries that understand the barrier handle it before
+/// parsing the batch payload.
+pub fn encodeProtocolBarrier(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    version: u16,
+) ![]u8 {
+    if (version == 0 or version > timestamp_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"table\":{f},\"protocol_barrier\":{d},\"batch\":null}}",
+        .{ std.json.fmt(table_name, .{}), version },
+    );
+}
 
 pub fn encode(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) ![]u8 {
     return try encodeWithStorageOwnerDescriptor(alloc, table_name, req, null);
@@ -102,6 +126,21 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
 
     const table_name = try alloc.dupe(u8, table_value.string);
     errdefer alloc.free(table_name);
+    if (root.get("protocol_barrier")) |barrier_value| {
+        if (barrier_value != .integer or barrier_value.integer <= 0 or
+            barrier_value.integer > std.math.maxInt(u16))
+        {
+            return error.InvalidReplicatedBatch;
+        }
+        const version: u16 = @intCast(barrier_value.integer);
+        if (version > timestamp_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+        if (batch_value != .null) return error.InvalidReplicatedBatch;
+        return .{
+            .table_name = table_name,
+            .batch = .{},
+            .protocol_barrier_version = version,
+        };
+    }
     const batch_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
     defer alloc.free(batch_json);
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
@@ -127,6 +166,40 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     };
 }
 
+test "raft protocol barrier is fail closed for legacy batch parsers" {
+    try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
+    const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const batch_value = parsed.value.object.get("batch") orelse return error.TestExpectedEqual;
+    const batch_json = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(batch_value, .{})});
+    defer std.testing.allocator.free(batch_json);
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        batch_api.parseInternalBatchRequest(std.testing.allocator, batch_json),
+    );
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+}
+
+test "raft protocol barrier rejects unsupported future versions" {
+    const encoded = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
+        .{timestamp_protocol_version + 1},
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(
+        error.UnsupportedRaftBatchProtocolVersion,
+        decode(std.testing.allocator, encoded),
+    );
+}
+
 test "raft batch envelope detector tolerates whitespace and object field order" {
     try std.testing.expect(looksLikeEnvelope(" \n {\"batch\":{},\"table\":\"docs\"}"));
     try std.testing.expect(looksLikeEnvelope("{\"table\":\"docs\",\"batch\":{}}"));
@@ -138,6 +211,7 @@ test "raft batch round trips table batch payload" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
         .deletes = &.{"doc:b"},
+        .timestamp_ns = 123,
         .sync_level = .write,
     });
     defer std.testing.allocator.free(encoded);
@@ -150,6 +224,7 @@ test "raft batch round trips table batch payload" {
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.batch.req.writes[0].value);
     try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.deletes.len);
     try std.testing.expectEqualStrings("doc:b", decoded.batch.req.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 123), decoded.batch.req.timestamp_ns);
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, decoded.batch.req.sync_level);
 }
 

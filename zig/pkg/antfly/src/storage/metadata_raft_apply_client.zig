@@ -24,6 +24,7 @@ const metadata = @import("../metadata/domain.zig");
 const metadata_incarnation = @import("../metadata/incarnation.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const metadata_reconciler = @import("../metadata/reconciler.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 
@@ -240,6 +241,22 @@ pub const RaftApplyStore = struct {
 
     pub fn getMetadataIncarnation(self: *RaftApplyStore, group_id: u64) !?metadata_incarnation.MetadataClusterIncarnation {
         return try self.projection(?metadata_incarnation.MetadataClusterIncarnation, .{ .kind = .metadata_incarnation, .group_id = group_id });
+    }
+
+    pub fn getRuntimeStatusProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
+        return try self.projection(u16, .{ .kind = .runtime_status_protocol_activation_version, .group_id = group_id });
+    }
+
+    pub fn listPlacementVersionFences(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        return try self.projectionWithAllocator(
+            []metadata_reconciler.PlacementVersionFence,
+            alloc,
+            .{ .kind = .placement_version_fences, .group_id = group_id },
+        );
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {

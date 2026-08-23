@@ -82,7 +82,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Invoke an Antfly-compatible inference connection */
+        /**
+         * Invoke an Antfly-compatible inference connection
+         * @description Invokes an inference operation through the selected connection.
+         *     Requires `inference/*` write permission. Generation requests with
+         *     `stream: true` return the provider's Server-Sent Events stream; all
+         *     other responses are returned as buffered JSON.
+         */
         post: operations["invokeInferenceConnection"];
         delete?: never;
         options?: never;
@@ -2076,12 +2082,12 @@ export interface paths {
          *
          *     Downloaded and inline encoded media is limited cumulatively across the request
          *     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-         *     `max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
+         *     `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero configured
          *     download limit disables nonempty media. Remote URL byte potential is reserved before
          *     fetch; inline sources reserve their actual encoded size without adding it to the
          *     existing request-body reservation. Accepted image headers are then validated and
          *     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-         *     the lower of 512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero
+         *     the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero
          *     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
          *     limits each source edge. Malformed images return 400, while dimension or aggregate
          *     excess returns 413 before model loading. Initial capacity admission occurs before
@@ -2223,11 +2229,11 @@ export interface paths {
          *     weighted capacity unit and at least one unit per two declared images. The effective
          *     ceiling is the minimum of the configured per-image limit times image count, the
          *     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-         *     `max_concurrent_requests`. Admission happens before model resolution or download.
+         *     `admission.inference.max_concurrent_requests`. Admission happens before model resolution or download.
          *
          *     After download, image headers are validated before model loading. Decoded source
          *     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-         *     512 MiB or 16 MiB times a positive `max_concurrent_requests`; a zero concurrency
+         *     512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
          *     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
          *     from downloaded-byte admission before inference. `max_image_dimension` limits
          *     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -2652,8 +2658,134 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         Error: {
-            /** @example An error message */
+            /** @description Optional stable machine-readable error code for programmatic handling. */
+            code?: string;
+            /**
+             * @description Legacy human-readable error text.
+             * @example An error message
+             */
             error: string;
+            /** @description Human-readable error description when supplied by the endpoint. */
+            message?: string;
+            /** @description Whether retrying the operation may succeed without changing the request. */
+            retryable?: boolean;
+            /**
+             * Format: int32
+             * @description Suggested minimum retry delay in milliseconds.
+             */
+            retry_after_ms?: number;
+        };
+        /** @description The metadata service does not yet provide the consistency capability required by backup. */
+        MetadataCapabilityUnavailableError: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "metadata_capability_unavailable";
+            /**
+             * @description Legacy human-readable error text. Use `code` for branching.
+             * @enum {string}
+             */
+            error: "metadata capability unavailable";
+            message: string;
+            /** @enum {string} */
+            required_capability: "linearizable_snapshot";
+            /** @enum {boolean} */
+            retryable: true;
+            /** Format: int32 */
+            retry_after_ms: number;
+        };
+        /** @description The request could not establish authority with the current metadata leader. */
+        MetadataLeaderUnavailableError: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "metadata_leader_unavailable";
+            /**
+             * @description Legacy human-readable error text. Use `code` for branching.
+             * @enum {string}
+             */
+            error: "metadata leader unavailable";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            /** Format: int32 */
+            retry_after_ms: number;
+        };
+        /** @description A retryable metadata-availability failure reported before backup side effects begin. */
+        BackupMetadataUnavailableError: components["schemas"]["MetadataCapabilityUnavailableError"] | components["schemas"]["MetadataLeaderUnavailableError"];
+        /** @description A non-retryable table-backup conflict. Ambiguous outcomes include the logical backup ID and, when available, the opaque artifact generation retained for reconciliation. */
+        TableBackupConflictError: components["schemas"]["BackupAlreadyExistsConflict"] | components["schemas"]["TableCatalogChangedConflict"] | components["schemas"]["BackupOutcomeAmbiguousConflict"];
+        BackupAlreadyExistsConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "backup_already_exists";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        TableCatalogChangedConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "table_catalog_changed";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        BackupOutcomeAmbiguousConflict: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            code: "backup_outcome_ambiguous";
+            /** @description Legacy human-readable error text. Use `code` for branching. */
+            error: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Logical backup ID whose outcome must be inspected before retrying. */
+            backup_id: string;
+            /** @description Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID. */
+            artifact_backup_id?: string;
+        };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceCapacityError: {
+            /** @description Stable machine-readable error code. */
+            error: string;
+            /** @description Human-readable error description. */
+            message: string;
+            /**
+             * @description Machine-readable capacity source.
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "inference_admission";
+            /**
+             * @description Always true for a transient-capacity response.
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds. */
+            retry_after_ms: number;
+        };
+        /** @description Actionable retry contract for temporary storage descriptor exhaustion. */
+        StorageResourceExhaustedError: {
+            /** @enum {string} */
+            code: "storage_resource_exhausted";
+            /** @enum {string} */
+            error: "storage_resource_exhausted";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+            retry_after_ms: number;
         };
         /** @description A non-retryable table-storage integrity or format failure. */
         TableStorageUnreadableError: {
@@ -2668,6 +2800,51 @@ export interface components {
             message: string;
             /**
              * @description Always false; recovery requires repair, restore, or table replacement.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A transient query dependency or read-availability failure that is safe to retry. */
+        QueryTemporarilyUnavailableError: {
+            /**
+             * @description Stable machine-readable retry classification.
+             * @enum {string}
+             */
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
+            /** @description Human-readable error summary. */
+            message: string;
+            /**
+             * @description Always true; retry after the response's Retry-After delay.
+             * @enum {boolean}
+             */
+            retryable: true;
+        };
+        /** @description A hierarchy traversal cursor bound to an older source-artifact revision. */
+        HierarchyCursorStaleError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 409;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "hierarchy_cursor_stale";
+            /** @description Human-readable explanation of why traversal cannot continue. */
+            message: string;
+            /**
+             * @description Stable client action for recovering from the conflict.
+             * @enum {string}
+             */
+            action: "restart_hierarchy_traversal";
+            /**
+             * @description Request field to omit when restarting at the first unit.
+             * @enum {string}
+             */
+            restart_without: "search_after";
+            /**
+             * @description Retrying the same cursor cannot succeed; restart traversal instead.
              * @enum {boolean}
              */
             retryable: false;
@@ -3834,7 +4011,9 @@ export interface components {
              */
             description?: string;
             /**
-             * @description Map of index name to index configuration. Indexes enable different query capabilities:
+             * @description Map of index name to create-index configuration. The map key owns the
+             *     index name; do not repeat `name` inside the configuration. Indexes enable
+             *     different query capabilities:
              *     - Full-text indexes for BM25 search
              *     - Vector indexes for semantic similarity
              *     - Multimodal indexes for images/audio/video
@@ -3855,7 +4034,7 @@ export interface components {
              *     }
              */
             indexes?: {
-                [key: string]: components["schemas"]["IndexConfig"];
+                [key: string]: components["schemas"]["CreateIndexRequest"];
             };
             /**
              * @description Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -3914,8 +4093,8 @@ export interface components {
             query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
             /**
              * @description Whether this concrete field is declared sortable in the effective
-             *     capability model. Public exact order_by accepts it only when
-             *     sort_lifecycle_state is queryable or accelerated.
+             *     capability model. A cold declared field is validated on first
+             *     exact order_by use; clients do not need to poll lifecycle status.
              */
             sortable: boolean;
             /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
@@ -3923,7 +4102,7 @@ export interface components {
             /** @description Current missing/null handling policy for this field. */
             missing_null_policy: string;
             /**
-             * @description Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+             * @description Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
              * @enum {string}
              */
             sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
@@ -3983,6 +4162,15 @@ export interface components {
          * @enum {string}
          */
         AggregationType: "sum" | "avg" | "min" | "max" | "count" | "sumsquares" | "stats" | "cardinality" | "terms" | "range" | "date_range" | "histogram" | "date_histogram" | "geohash_grid" | "geo_distance" | "significant_terms";
+        /**
+         * @description Exact-vs-approximate selection for a cardinality aggregation:
+         *     - auto: use a materialized HyperLogLog sketch when one applies and is
+         *       current, else an exact distinct scan (default).
+         *     - exact: always compute an exact distinct count.
+         *     - approximate: require a matching sketch; error if none applies.
+         * @enum {string}
+         */
+        CardinalityMode: "auto" | "exact" | "approximate";
         AggregationRange: {
             /** @description Name of the range bucket */
             name: string;
@@ -4060,6 +4248,8 @@ export interface components {
             type: components["schemas"]["AggregationType"];
             /** @description Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation. */
             field?: string;
+            /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
+            mode?: components["schemas"]["CardinalityMode"];
             /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
             fields?: string[];
             /**
@@ -4144,6 +4334,13 @@ export interface components {
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
+            /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
+            approximate?: boolean;
+            /**
+             * Format: float
+             * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
+             */
+            relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
@@ -4671,10 +4868,13 @@ export interface components {
         };
         BatchResponse: {
             /**
-             * @description Durable commit and visibility/participant recovery state.
+             * @description Durable commit outcome. `committed_pending` means requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary write committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_pending";
+            status?: "committed" | "committed_pending" | "committed_repair_required";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
@@ -4736,10 +4936,13 @@ export interface components {
         /** @description Response for a cross-table batch operation. Contains per-table results. */
         MultiBatchResponse: {
             /**
-             * @description Durable commit and visibility/propagation state.
+             * @description Durable commit outcome. Pending states mean requested visibility or
+             *     participant propagation is still completing. `committed_repair_required`
+             *     means the primary writes committed, but a terminal enrichment failure needs
+             *     operator repair and will not be retried indefinitely.
              * @enum {string}
              */
-            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending";
+            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required";
             /** @description Per-table batch results */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
@@ -4838,10 +5041,12 @@ export interface components {
             /**
              * @description Durable transaction outcome. Pending committed states mean the
              *     commit decision is durable while its requested visibility barrier
-             *     or participant recovery is still completing.
+             *     or participant recovery is still completing. `committed_repair_required`
+             *     means the commit decision is durable and coordination may be released, but
+             *     a terminal enrichment failure requires operator repair.
              * @enum {string}
              */
-            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "aborted";
+            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "committed_repair_required" | "aborted";
             /** @description Details about the conflict that caused an abort (only present when status is "aborted") */
             conflict?: components["schemas"]["TransactionConflict"];
             /** @description Per-table batch results (present for every committed status) */
@@ -5058,8 +5263,17 @@ export interface components {
              * @example completed
              * @enum {string}
              */
-            status: "completed" | "partial" | "failed";
+            status: "completed" | "successful" | "partial" | "failed" | "ambiguous";
         };
+        /**
+         * @description Outcome for one table in a cluster backup. `successful` is the legacy
+         *     spelling emitted by pre-Zig coordinators; new coordinators emit `completed`.
+         *
+         *     An `ambiguous` outcome includes `error`, `code`, `retryable: false`,
+         *     `backup_id`, and `artifact_backup_id` so callers can reconcile the retained
+         *     generation without retrying blindly. Failed and skipped outcomes may include
+         *     `error`; other fields are omitted when they do not apply.
+         */
         TableBackupStatus: {
             /**
              * @description Table name
@@ -5067,13 +5281,23 @@ export interface components {
              */
             name: string;
             /**
-             * @description Backup status for this table
              * @example completed
              * @enum {string}
              */
-            status: "completed" | "failed" | "skipped";
-            /** @description Error message if backup failed */
+            status: "completed" | "successful" | "failed" | "skipped" | "ambiguous";
+            /** @description Human-readable failure, skip reason, or reconciliation guidance. */
             error?: string;
+            /**
+             * @description Stable machine-readable code for an ambiguous outcome.
+             * @enum {string}
+             */
+            code?: "backup_outcome_ambiguous";
+            /** @description False for an ambiguous outcome; inspect the retained attempt before retrying. */
+            retryable?: boolean;
+            /** @description Logical per-table backup ID retained by an ambiguous cluster attempt. */
+            backup_id?: string;
+            /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
+            artifact_backup_id?: string;
         };
         ClusterRestoreRequest: {
             /**
@@ -5980,6 +6204,102 @@ export interface components {
         };
         /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
         RawQuery: components["schemas"]["Query"];
+        HierarchyProjection: {
+            /**
+             * @description Fields to include from the hydrated hierarchy document. This projection is
+             *     required whenever the ancestor is requested so hierarchy hydration cannot
+             *     accidentally return an unbounded document. Use an empty array to return
+             *     hierarchy identity without stored document fields.
+             */
+            fields: string[];
+        };
+        HierarchyMatches: {
+            /**
+             * Format: uint32
+             * @description Maximum matching descendant hits attached to each group, independent of
+             *     the top-level query limit. Matches follow the effective query order, and
+             *     the group score is the score of its best matching descendant. The maximum
+             *     bounds nested response growth. Group selection uses an adaptive candidate
+             *     window, then each returned group is expanded with a separately bounded query,
+             *     so a group with fewer matches never forces a global exhaustive scan. To bound
+             *     execution as well as response growth, grouped queries accept at most 100
+             *     top-level groups and 1,000 requested matches across the complete result page.
+             * @default 3
+             */
+            limit?: number;
+            /**
+             * @description Fields to include in each nested match. This projection is required because
+             *     grouped and matching records commonly have different schemas. Use an empty
+             *     array to return match identity and hierarchy metadata without stored fields.
+             */
+            fields: string[];
+        };
+        HierarchyGroupBy: {
+            /**
+             * @description Hierarchy level used to group the records matched by the targeted index.
+             *     Unit groups are relevance-ranked and do not accept `order_by`, `search_after`,
+             *     or `search_before`; use `hierarchy.children` for sequential, cursor-paginated
+             *     unit traversal.
+             * @enum {string}
+             */
+            level: "source" | "unit";
+            matches?: components["schemas"]["HierarchyMatches"];
+        };
+        HierarchyChildParent: {
+            /** @enum {string} */
+            level: "source";
+            id: string;
+        };
+        HierarchyChildren: {
+            parent: components["schemas"]["HierarchyChildParent"];
+            /**
+             * @description Child level to enumerate. Unit traversal reads the versioned extraction
+             *     hierarchy rather than a relevance index, so empty and failed units are included.
+             * @enum {string}
+             */
+            level: "unit";
+        };
+        /**
+         * @description The required public order for sequential hierarchy traversal. Specify
+         *     `_hierarchy.position` ascending; Antfly appends `_id` ascending as the
+         *     deterministic tie-breaker and returns both values in each hit's `_sort`.
+         */
+        HierarchyChildrenOrderBy: {
+            /** @enum {string} */
+            field: "_hierarchy.position";
+            /**
+             * @default false
+             * @enum {boolean}
+             */
+            desc?: false;
+        }[];
+        /** @description Opaque position and unit-id tuple returned in the preceding hit's `_sort`. */
+        HierarchyChildrenSearchAfter: string[];
+        HierarchyAncestors: {
+            source?: components["schemas"]["HierarchyProjection"];
+            unit?: components["schemas"]["HierarchyProjection"];
+        };
+        /**
+         * @description Returns direct index matches with optional projected ancestor context, or groups
+         *     those matches at a hierarchy level through `group_by`. A group's nested `matches`
+         *     projection is independently bounded and defaults to three hits while the top-level
+         *     `limit` continues to control the number of groups.
+         *
+         *     `children` is a separate sequential-browsing operation. It enumerates every unit
+         *     in the selected source revision, including units with no searchable chunk, and uses
+         *     the top-level `_sort`/`search_after` cursor contract.
+         *
+         *     Ancestor and nested-match field projections are always explicit to keep response
+         *     size predictable. The presence of this object selects the canonical contract:
+         *     without `group_by` or `children`, including when the object is empty, direct index
+         *     matches are returned. `ancestors` only controls projected context and never changes result
+         *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+         */
+        QueryHierarchy: {
+            group_by?: components["schemas"]["HierarchyGroupBy"];
+            ancestors?: components["schemas"]["HierarchyAncestors"];
+            children?: components["schemas"]["HierarchyChildren"];
+        } & (unknown & unknown & unknown);
         QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
@@ -6141,6 +6461,10 @@ export interface components {
              * @description Aggregation requests for computing metrics and bucketing results.
              *     Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
              *
+             *     When `hierarchy.group_by` is present, aggregations operate on the complete
+             *     set of top-level grouped source or unit records. Nested `group_by.matches` are
+             *     bounded evidence projections and are not counted as aggregation rows.
+             *
              *     Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
              *     bucketing aggregations (terms, range, date_range, histogram, date_histogram),
              *     geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).
@@ -6193,7 +6517,10 @@ export interface components {
             search_effort?: number;
             /**
              * @description List of fields to include in the results. If not specified, all fields are returned.
-             *     Use to reduce response size and improve performance.
+             *     Use to reduce response size and improve performance. This field is required when
+             *     hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+             *     entire grouped document. Use an empty array for identity-only groups.
+             *     This projection is also required for hierarchy.children traversal.
              * @example [
              *       "title",
              *       "url",
@@ -6202,9 +6529,13 @@ export interface components {
              *     ]
              */
             fields?: string[];
+            hierarchy?: components["schemas"]["QueryHierarchy"];
             /**
-             * @description Maximum number of results to return. For semantic_search, this is the topk parameter.
-             *     Default varies by query type (typically 10).
+             * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
+             *     This does not limit nested matches attached through hierarchy.group_by.matches;
+             *     use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+             *     Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+             *     and a groups-times-matches execution budget of 1,000.
              * @example 20
              */
             limit?: number;
@@ -6227,11 +6558,15 @@ export interface components {
             /**
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+             *     Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque,
+             *     sortable value is bound to the complete source hierarchy revision.
              *     Supported for exact text-backed, match_all, and filter-only requests
              *     when each non-`_id` field is a mapped exact scalar field with sortable
              *     native doc-value coverage. Sortable mapping types are keyword,
              *     numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-             *     link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+             *     link. Declare the field with `x-antfly-field` and `sortable: true`;
+             *     `x-antfly-types` shorthand declarations alone are not sortable.
+             *     Analyzed `text` fields and `search_as_you_type`, geo, embedding,
              *     blob, html, object, and array fields are not directly sortable; sort
              *     on an exact scalar mapping such as `title.keyword` instead. Requests
              *     that cannot be executed through an exact native sort path return 422
@@ -6261,6 +6596,9 @@ export interface components {
              *     order and the cursor tuple must contain exactly one `_id` string.
              *     Supported for exact text-backed, match_all, and filter-only requests;
              *     not supported for semantic_search or count-only requests.
+             *     For hierarchy child traversal, a cursor whose source-artifact revision
+             *     changed returns `409 hierarchy_cursor_stale`; restart the same traversal
+             *     without `search_after` rather than retrying the stale tuple.
              */
             search_after?: unknown[];
             /**
@@ -6915,15 +7253,122 @@ export interface components {
             pca?: number[];
             tsne?: number[];
         };
+        HierarchyArtifactSource: {
+            name: string;
+            /** @enum {string} */
+            kind: "chunk" | "asset" | "embedding";
+            /** Format: uint32 */
+            chunk_id?: number;
+            unit_id?: string;
+        };
+        HierarchyArtifact: {
+            name: string;
+            /** @enum {string} */
+            kind: "chunk" | "asset" | "embedding";
+            /** Format: uint32 */
+            chunk_id?: number;
+            unit_id?: string;
+            source?: components["schemas"]["HierarchyArtifactSource"];
+        };
+        HierarchyAncestor: {
+            id?: string;
+            document?: {
+                [key: string]: unknown;
+            };
+            key?: string;
+            artifact_name?: string;
+            source_field?: string;
+            provenance?: unknown;
+        } & {
+            [key: string]: unknown;
+        };
+        QueryHitHierarchyAncestors: {
+            source: components["schemas"]["HierarchyAncestor"];
+            unit?: components["schemas"]["HierarchyAncestor"];
+        };
+        /** @enum {string} */
+        QueryHitHierarchyLevel: "source" | "unit" | "chunk" | "mention" | "artifact" | "embedding";
+        HierarchyMatchContext: {
+            level?: components["schemas"]["QueryHitHierarchyLevel"];
+            parent_doc_key?: string;
+            parent_unit_id?: string;
+            artifact?: components["schemas"]["HierarchyArtifact"];
+            ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
+        };
+        HierarchyEvidence: {
+            local_id?: string;
+            decision?: string;
+            /** Format: float */
+            confidence?: number;
+            source_artifact?: string;
+            source_artifact_key?: string;
+            resolution_artifact?: string;
+            resolution_artifact_key?: string;
+            resolver?: string;
+            resolver_table?: string;
+            mention?: {
+                [key: string]: unknown;
+            };
+            canonical?: {
+                [key: string]: unknown;
+            };
+        };
+        HierarchyMatchHit: {
+            _id: string;
+            /**
+             * Format: float
+             * @description Relevance score, normalized so higher values always rank first.
+             */
+            _score: number;
+            /**
+             * Format: float
+             * @description Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
+             */
+            _distance?: number;
+            _source?: {
+                [key: string]: unknown;
+            };
+            hierarchy?: components["schemas"]["HierarchyMatchContext"];
+        };
+        QueryHitHierarchy: {
+            /** @description Hierarchy level represented by this hit. */
+            level?: components["schemas"]["QueryHitHierarchyLevel"];
+            /** @description Source document key that owns this derived hit. */
+            parent_doc_key?: string;
+            /** @description Unit identifier when the hit is attached to a document unit. */
+            parent_unit_id?: string;
+            artifact?: components["schemas"]["HierarchyArtifact"];
+            ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
+            evidence?: components["schemas"]["HierarchyEvidence"];
+            /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
+            matches?: components["schemas"]["HierarchyMatchHit"][];
+            /** @description Opaque format-neutral position used for sequential hierarchy traversal. */
+            position?: string;
+            /** @description Composite source hierarchy revision to which the position and cursor are bound. */
+            revision?: string;
+            /**
+             * @deprecated
+             * @description Legacy child chunk hits included for source-level rollups.
+             */
+            chunks?: components["schemas"]["HierarchyMatchHit"][];
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
             _id: string;
             /**
              * Format: float
-             * @description Relevance score of the hit.
+             * @description Relevance score of the hit, normalized so higher values always rank first.
              */
             _score: number;
+            /**
+             * Format: float
+             * @description Raw vector distance for direct dense-vector hits; lower values are better.
+             *     For a source group ranked by dense descendants, this is the distance of
+             *     the best matching descendant that supplied the group score. Omitted for
+             *     non-dense and fused results.
+             */
+            _distance?: number;
             /** @description Scores partitioned by index when using RRF search. */
             _index_scores?: {
                 [key: string]: unknown;
@@ -6934,35 +7379,12 @@ export interface components {
             /**
              * @description Stable ancestry envelope for derived document hierarchy hits. Present when
              *     the hit is a derived unit/chunk/embedding artifact or when a source-level
-             *     rollup includes child chunks. Standard fields include `level`,
-             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+             *     group includes nested matches. Standard fields include `level`,
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
+             *     Legacy rollup requests continue to use `chunks` instead of `matches`.
              */
-            hierarchy?: {
-                /**
-                 * @description Hierarchy level represented by this hit.
-                 * @enum {string}
-                 */
-                level?: "source" | "unit" | "chunk" | "artifact" | "embedding";
-                /** @description Source document key that owns this derived hit. */
-                parent_doc_key?: string;
-                /** @description Unit identifier when the hit is attached to a document unit. */
-                parent_unit_id?: string;
-                /** @description Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`. */
-                artifact?: {
-                    [key: string]: unknown;
-                };
-                /** @description Ancestor context. Includes `source.id` for derived hits, `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct unit hits or requested unit hydration when the unit payload is present. */
-                ancestors?: {
-                    [key: string]: unknown;
-                };
-                /** @description Child chunk hits included for source-level rollups. */
-                chunks?: {
-                    [key: string]: unknown;
-                }[];
-            } & {
-                [key: string]: unknown;
-            };
+            hierarchy?: components["schemas"]["QueryHitHierarchy"];
             /**
              * @description Sort key values for this hit. Pass as search_after or search_before
              *     to paginate to the next/previous page. Values preserve their JSON
@@ -6978,7 +7400,7 @@ export interface components {
             hits?: components["schemas"]["QueryHit"][];
             /**
              * Format: float
-             * @description Maximum score of the results.
+             * @description Best relevance score among the returned results. Scores are always higher-is-better.
              */
             max_score?: number;
         };
@@ -7788,14 +8210,41 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Serialized asset producer configuration. */
+            /** @description Write-only serialized asset producer configuration. It may contain provider credentials and is never returned. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
+        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
+        CreateIndexCommon: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
+            /** @description Document field indexed as text. Omit for the table's default full-document text index. */
+            field?: string;
+            /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
+            artifact_name?: string;
+        };
+        /** @description Create a full-text index. */
+        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
         };
         /**
          * @description How generation-scoped source outcomes determine derived-index completeness.
@@ -8663,11 +9112,11 @@ export interface components {
              */
             api_url?: string;
             /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
              * @default fixed
              * @example fixed
              */
-            model: string;
+            model?: string;
         };
         /**
          * @description The chunking provider to use.
@@ -8700,6 +9149,23 @@ export interface components {
             full_text_index?: {
                 [key: string]: unknown;
             };
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+            max_chunks?: number;
+            /** Format: float */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
         };
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
@@ -8763,6 +9229,17 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
+        /** @description Create a dense or sparse embeddings index. */
+        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             /** @description Edge type name (e.g., 'cites', 'similar_to') */
@@ -8801,6 +9278,106 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
+        /** @description Artifact stream materialized into graph edges. */
+        GraphArtifactSourceConfig: {
+            /** @enum {string} */
+            kind: "artifact";
+            artifact: string;
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+        };
+        /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
+        GraphArtifactProducerSourceConfig: {
+            /** @enum {string} */
+            type: "field" | "template";
+            value: string;
+        };
+        /** @description Asset producer used by an artifact-backed graph index. */
+        GraphArtifactProducerConfig: {
+            name: string;
+            /** @enum {string} */
+            kind: "asset";
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            producer_json?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            source?: components["schemas"]["GraphTemplateValue"];
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Algebraic law used to combine bounded graph traversal provenance. */
+        GraphBoundedTraversalConfig: {
+            /** @enum {string} */
+            law: "provenance_semiring";
+        };
+        /** @description Optional algebraic planning features for graph traversal. */
+        GraphAlgebraicPlanningConfig: {
+            bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
+        };
+        /** @description Versioned entity resolver attached to an artifact-backed graph index. */
+        GraphResolverConfig: {
+            name: string;
+            table: string;
+            source_artifact: string;
+            /**
+             * @default asset
+             * @enum {string}
+             */
+            source_artifact_kind?: "asset" | "chunk" | "any";
+            resolution_artifact: string;
+            key_template: string;
+            /** @default true */
+            type_must_match?: boolean;
+            scorer_json?: string;
+            /** @enum {string} */
+            candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            candidate_ann_index?: string;
+            /** Format: uint */
+            candidate_limit?: number;
+            name_embedding?: string;
+            /** Format: uint */
+            name_embedding_dims?: number;
+            /** @enum {string} */
+            fusion_combine?: "" | "noisy_or" | "max" | "mean";
+            /** Format: double */
+            fusion_trust?: number;
+            /** Format: double */
+            fusion_prior?: number;
+            /** Format: double */
+            fusion_prior_weight?: number;
+            /** Format: uint64 */
+            config_generation?: number;
+        };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
@@ -8817,50 +9394,120 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             /** @description Maximum number of edges per document (0 = unlimited) */
             max_edges_per_document?: number;
+            source?: components["schemas"]["GraphArtifactSourceConfig"];
+            artifact?: components["schemas"]["GraphArtifactProducerConfig"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Create a graph index. */
+        CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
         };
         /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
         AlgebraicIndexConfig: {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
+        /** @description Create a schema-derived algebraic index. */
+        CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
         /**
-         * @description The type of the index.
+         * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
+         *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
+         *     corresponding runtime type: number/integer to numeric, bool to boolean,
+         *     date/timestamp to datetime, geo_point to geopoint, and geo_shape to
+         *     geoshape.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
-        /** @description Configuration for an index */
-        IndexConfig: {
-            /** @description Name of the index */
-            name: string;
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            type: components["schemas"]["IndexType"];
+        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        /** @description Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property. */
+        DocumentSubfieldMapping: {
+            type?: components["schemas"]["FieldMappingType"];
+            /** @description Analyzer name for text-oriented mappings. */
+            analyzer?: string;
+            /** @description Whether to index the field. Omit to use the server default of true. */
+            index?: boolean;
             /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
+             * @description Whether to store the field value (default false)
+             * @default false
              */
-            version?: number;
+            store?: boolean;
             /**
-             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
-             * @example [
-             *       {
-             *         "name": "document_chunks_v1",
-             *         "kind": "chunk",
-             *         "field": "text",
-             *         "source_artifact_name": "document_units_v1",
-             *         "chunk_size": 512
-             *       },
-             *       {
-             *         "name": "document_chunk_dense_v1",
-             *         "kind": "embedding",
-             *         "field": "text",
-             *         "source_artifact_name": "document_chunks_v1",
-             *         "expected_dims": 768
-             *       }
-             *     ]
+             * @description Whether to include in the _all field for cross-field search
+             * @default false
              */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+            include_in_all?: boolean;
+            /**
+             * @description Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
+             * @default false
+             */
+            sortable?: boolean;
+            /**
+             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @default missing_rejected
+             * @enum {string}
+             */
+            missing_null_policy?: "missing_rejected";
+        };
+        /** @description Executable physical mapping used by a document property's `x-antfly-field` annotation. The mapping must accept the JSON Schema value type. Declarations for the same dotted path across document types must normalize to an identical physical mapping, and present values that cannot be encoded are rejected at write admission. Mappings contributed by `anyOf` or `oneOf` must normalize to the same mapping in every alternative; conditional and dynamically named mappings are rejected. */
+        DocumentFieldMapping: {
+            type?: components["schemas"]["FieldMappingType"];
+            /** @description Analyzer name for text-oriented mappings. */
+            analyzer?: string;
+            /** @description Whether to index the field. Omit to use the server default of true. */
+            index?: boolean;
+            /**
+             * @description Whether to store the field value (default false)
+             * @default false
+             */
+            store?: boolean;
+            /**
+             * @description Whether to include in the _all field for cross-field search
+             * @default false
+             */
+            include_in_all?: boolean;
+            /**
+             * @description Whether this exact scalar field can be used in order_by. Supported
+             *     sortable mapping types are keyword, numeric/number/integer,
+             *     boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+             *     search_as_you_type, geo, embedding, blob, html, object, and array
+             *     fields are not directly sortable; use an exact scalar subfield such
+             *     as title.keyword for sorted string pagination. Antfly derives the
+             *     required typed doc values when enabled.
+             * @default false
+             */
+            sortable?: boolean;
+            /**
+             * @description Missing/null sort policy. The current production policy rejects missing or null native sort values.
+             * @default missing_rejected
+             * @enum {string}
+             */
+            missing_null_policy?: "missing_rejected";
+            /** @description Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield. */
+            fields?: {
+                [key: string]: components["schemas"]["DocumentSubfieldMapping"];
+            };
+        };
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -8873,23 +9520,15 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /**
-         * @description Field type annotations for schema fields
-         * @enum {string}
-         */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
-        /** @description Field mapping to apply when a dynamic template matches */
+        /** @description Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required. */
         TemplateFieldMapping: {
-            type?: components["schemas"]["AntflyType-2"];
+            type?: components["schemas"]["FieldMappingType"];
             /**
              * @description Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer").
              *     Used for text fields to control tokenization and normalization.
              */
             analyzer?: string;
-            /**
-             * @description Whether to index the field (default true)
-             * @default true
-             */
+            /** @description Whether to index the field. Omit to use the server default of true. */
             index?: boolean;
             /**
              * @description Whether to store the field value (default false)
@@ -8988,6 +9627,44 @@ export interface components {
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
+        /**
+         * @description The type of the index.
+         * @enum {string}
+         */
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /** @description Configuration for an index */
+        IndexConfig: {
+            /** @description Name of the index */
+            name: string;
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            type: components["schemas"]["IndexType"];
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /**
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+             * @example [
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
+             *     ]
+             */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
             /**
@@ -10133,7 +10810,7 @@ export interface components {
         /**
          * @description Configuration for URL content fetching.
          *
-         *     Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
+         *     Uses Antfly's content fetcher for downloading and processing. Supports:
          *     - HTTP/HTTPS URLs with security validation
          *     - HTML pages (extracts readable text via go-readability)
          *     - PDF files (extracts text)
@@ -10141,7 +10818,7 @@ export interface components {
          *     - Plain text files
          *     - S3 URLs (requires s3_credentials)
          *
-         *     Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
+         *     Security features include:
          *     - Allowed host whitelist
          *     - Private IP blocking (SSRF prevention)
          *     - Download size limits
@@ -11074,7 +11751,7 @@ export interface components {
             index_name: string;
             /** @description Starting node(s) for the query */
             start_nodes?: components["schemas"]["GraphNodeSelector"];
-            /** @description Target nodes (for pathfinding only) */
+            /** @description Exact target nodes for pathfinding or the final binding of a pattern query. When a pattern endpoint is known, prefer this selector over an exact node_filter.filter_prefix so Antfly can use an exact edge-probe plan. */
             target_nodes?: components["schemas"]["GraphNodeSelector"];
             /** @description Traversal/pathfinding parameters */
             params?: components["schemas"]["GraphQueryParams"];
@@ -11213,6 +11890,165 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
+        /** @description Credential-free normalized enrichment configuration returned after index creation. */
+        CreatedEnrichmentConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            template?: string;
+            source_artifact_name?: string;
+            expected_dims?: number;
+            chunk_size?: number;
+            chunk_overlap?: number;
+            chunker_json?: string;
+            /** @default false */
+            full_text_index?: boolean;
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
+        CreatedIndexCommon: {
+            /** @description Name of the created index */
+            name: string;
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Normalized inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
+        };
+        /** @description Normalized effective full-text index configuration returned after creation. */
+        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
+        };
+        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
+        CreatedProviderConfig: {
+            /** @description Configured provider discriminator. */
+            provider: string;
+            /** @description Configured provider model when applicable. */
+            model?: string;
+            models?: string[];
+            project_id?: string;
+            location?: string;
+            region?: string;
+            /** Format: uri */
+            url?: string;
+            /** Format: uri */
+            api_url?: string;
+            dimension?: number;
+            dimensions?: number;
+            input_type?: string;
+            truncate?: string;
+            strip_new_lines?: boolean;
+            batch_size?: number;
+            /** Format: float */
+            temperature?: number;
+            max_tokens?: number;
+            /** Format: float */
+            top_p?: number;
+            top_k?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+            timeout?: number;
+        };
+        /** @description Credential-free normalized embeddings configuration returned after creation. */
+        CreatedEmbeddingsIndexConfig: {
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @default false */
+            external?: boolean;
+            /** @default false */
+            sparse?: boolean;
+            dimension?: number;
+            field?: string;
+            embedding_name?: string;
+            source_artifact_name?: string;
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            mem_only?: boolean;
+            embedder?: components["schemas"]["CreatedProviderConfig"];
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @default 10 */
+            top_k?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_weight?: number;
+            /** @default 1024 */
+            chunk_size?: number;
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
+        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
+        /** @description Credential-free graph artifact producer configuration returned after creation. */
+        CreatedGraphArtifactProducerConfig: {
+            name: string;
+            /** @enum {string} */
+            kind: "asset";
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Credential-free normalized graph configuration returned after creation. */
+        CreatedGraphIndexConfig: {
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            template?: string;
+            edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            max_edges_per_document?: number;
+            source?: components["schemas"]["GraphArtifactSourceConfig"];
+            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Normalized effective graph index configuration returned after creation. */
+        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
+        };
+        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
+        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Discriminated normalized configuration returned after an index is created. */
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -11222,7 +12058,7 @@ export interface components {
              * @description Machine-readable capacity source when the failure is retryable
              * @enum {string}
              */
-            reason?: "inference_capacity" | "request_queue";
+            reason?: "inference_capacity" | "inference_admission";
             /** @description Whether retrying the request may succeed */
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
@@ -11238,7 +12074,7 @@ export interface components {
              * @description Machine-readable capacity source
              * @enum {string}
              */
-            reason: "inference_capacity" | "request_queue";
+            reason: "inference_capacity" | "inference_admission";
             /**
              * @description Always true for a transient-capacity response
              * @enum {boolean}
@@ -12250,7 +13086,45 @@ export interface components {
              */
             ttl_ms?: number;
         };
-        InferenceConfig: {
+        /** @description Process-local foreground request admission settings. */
+        InferenceAdmissionConfig: {
+            inference?: components["schemas"]["InferenceRequestAdmissionConfig"];
+        };
+        InferenceRequestAdmissionConfig: {
+            /**
+             * @description Maximum concurrent inference requests in this process. The same
+             *     value also sizes the weighted work budget shared by every executing
+             *     inference endpoint: each request consumes one request slot and at
+             *     least one unit, while request body size, generation workload, and
+             *     image byte/count reservations can consume more than one unit. The
+             *     request count can therefore never exceed this value, while expensive
+             *     requests may exhaust weighted capacity sooner. Read and
+             *     image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB
+             *     per unit and at least one unit per two images. A positive capacity also
+             *     clamps each such request's downloaded-image ceiling to 16 MiB times
+             *     this value. When either ceiling is exhausted, new HTTP requests are
+             *     rejected immediately with 503 Service Unavailable and Retry-After: 1;
+             *     they are not retained
+             *     in an in-process queue. Set to 0 to disable both ceilings, admission
+             *     unit accounting, and the capacity-derived clamp. The default is 32.
+             * @default 32
+             * @example 32
+             */
+            max_concurrent_requests?: number;
+        };
+        InferenceConfig: components["schemas"]["InferenceRuntimeConfig"] & {
+            admission?: components["schemas"]["InferenceAdmissionConfig"];
+        };
+        InferenceRuntimeConfig: {
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for
+             *     `admission.inference.max_concurrent_requests`. New configurations
+             *     should use the process-level admission setting. If both spellings
+             *     are supplied, they must have the same value.
+             * @example 32
+             */
+            max_concurrent_requests?: number;
             /**
              * Format: uri
              * @description URL of the Antfly inference embedding/chunking service
@@ -12279,7 +13153,7 @@ export interface components {
              * @example ~/.antfly/inference/ml
              */
             ml_dir?: string;
-            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
+            /** @description Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
@@ -12317,23 +13191,6 @@ export interface components {
              *     configuring this list has no effect.
              */
             backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
-            /**
-             * @description Maximum concurrent weighted inference admission units in the Zig runtime.
-             *     Request body size, generation workload, and image byte/count reservations
-             *     can consume more than one unit. Read and image-extraction admission reserves the
-             *     effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per
-             *     two images. A positive capacity also clamps each such request's downloaded-image
-             *     ceiling to 16 MiB times this value. Set to 0 disables both admission accounting
-             *     and that capacity-derived clamp.
-             *     When a positive limit is exhausted, new requests are rejected immediately
-             *     with 503 Service Unavailable and Retry-After: 1; they are not retained in
-             *     an in-process queue. Set to 0 only as an operational escape hatch for
-             *     trusted testing environments; unlimited admission is not recommended for
-             *     production native generation. Use a positive production limit. The default is 32.
-             * @default 32
-             * @example 32
-             */
-            max_concurrent_requests?: number;
             /**
              * @deprecated
              * @description Legacy Go-runtime queue setting. The current Zig runtime does not retain
@@ -12761,8 +13618,25 @@ export interface components {
         ExtractionClassificationSchema: {
             name: string;
             labels: string[];
-            /** @default false */
+            /**
+             * @description When false, return the highest-ranked labels up to `top_k` (one by
+             *     default). When true, return every label meeting `options.threshold`.
+             * @default false
+             */
             multi_label?: boolean;
+            /**
+             * @description NLI hypothesis template for this named taxonomy. Use `{}` as the
+             *     candidate-label placeholder. Non-NLI extractors ignore this field.
+             * @default This example is {}.
+             */
+            hypothesis_template?: string;
+            /**
+             * @description Maximum labels returned for single-label classification. Ignored
+             *     when `multi_label` is true, where `options.threshold` controls the
+             *     returned set.
+             * @default 1
+             */
+            top_k?: number;
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
@@ -12991,6 +13865,49 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Backup could not establish the required metadata authority before starting side effects. */
+        BackupMetadataUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                /** @description Present with value `true` only when retrying against the current metadata leader may succeed. */
+                "X-Antfly-Metadata-Not-Leader"?: "true";
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["BackupMetadataUnavailableError"];
+            };
+        };
+        /** @description Backup ID collision, catalog-incarnation change, or an outcome requiring reconciliation before retry. */
+        TableBackupConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TableBackupConflictError"];
+            };
+        };
+        /** @description Storage descriptors are temporarily exhausted */
+        StorageResourceExhausted: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["StorageResourceExhaustedError"];
+            };
+        };
+        /** @description Inference capacity is temporarily unavailable */
+        InferenceTransientCapacity: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["InferenceCapacityError"];
+            };
+        };
         /**
          * @description Internal transaction failure. If the response says that the outcome is
          *     unknown, the request may already have committed and the stateless
@@ -13033,6 +13950,26 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["ExactSortError"];
+            };
+        };
+        /** @description The hierarchy changed after the traversal cursor was issued */
+        HierarchyCursorStale: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["HierarchyCursorStaleError"];
+            };
+        };
+        /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
+        QueryTemporarilyUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryTemporarilyUnavailableError"];
             };
         };
         /** @description Internal server error */
@@ -13216,6 +14153,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
+                    "text/event-stream": string;
                     "application/json": {
                         [key: string]: unknown;
                     };
@@ -13235,7 +14173,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description The connection does not declare the capability required by this operation */
+            /** @description Inference write permission is missing, or the connection does not declare the required capability */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -13249,6 +14187,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["InferenceTransientCapacity"];
         };
     };
     listSecrets: {
@@ -13856,6 +14795,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["BackupMetadataUnavailable"];
         };
     };
     restore: {
@@ -14036,8 +14976,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            409: components["responses"]["HierarchyCursorStale"];
             422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["QueryInternalServerError"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
         };
     };
     evaluate: {
@@ -14312,8 +15254,10 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["HierarchyCursorStale"];
             422: components["responses"]["UnsupportedExactSort"];
             500: components["responses"]["QueryInternalServerError"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
         };
     };
     batchWrite: {
@@ -14441,8 +15385,9 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            409: components["responses"]["TableBackupConflict"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["BackupMetadataUnavailable"];
         };
     };
     restoreTable: {
@@ -15240,7 +16185,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["IndexConfig"];
+                "application/json": components["schemas"]["CreateIndexRequest"];
             };
         };
         responses: {
@@ -15249,10 +16194,17 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CreatedIndex"];
+                };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     dropIndex: {

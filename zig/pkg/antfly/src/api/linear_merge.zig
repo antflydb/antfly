@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const api_operation = @import("operation.zig");
 const db_mod = @import("../storage/db/selected_root.zig").db;
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_read_source.zig");
@@ -112,7 +113,7 @@ pub fn execute(
     table_name: []const u8,
     req: OwnedLinearMergeRequest,
 ) ![]u8 {
-    const response = try executeResponse(alloc, reads, writes, table_name, req);
+    const response = try executeResponse(alloc, reads, writes, table_name, req, .{});
     return try encodeResponse(alloc, response);
 }
 
@@ -137,16 +138,22 @@ pub fn executeResponse(
     writes: table_writes.TableWriteSource,
     table_name: []const u8,
     req: OwnedLinearMergeRequest,
+    request: api_operation.RequestContext,
 ) !Response {
+    try request.ensureActive();
     var request_keys = std.StringHashMapUnmanaged(void){};
     defer request_keys.deinit(alloc);
-    for (req.writes) |write| try request_keys.put(alloc, write.key, {});
+    for (req.writes, 0..) |write, index| {
+        if (index % 64 == 0) try request.ensureActive();
+        try request_keys.put(alloc, write.key, {});
+    }
 
     var changed_writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer changed_writes.deinit(alloc);
 
     var skipped: usize = 0;
-    for (req.writes) |write| {
+    for (req.writes, 0..) |write, index| {
+        if (index % 64 == 0) try request.ensureActive();
         var existing = try reads.lookup(alloc, table_name, write.key, .{}, .read_index);
         if (existing) |*lookup| {
             defer lookup.deinit(alloc);
@@ -160,6 +167,7 @@ pub fn executeResponse(
         }
     }
 
+    try request.ensureActive();
     const next_cursor = if (req.writes.len > 0) req.writes[req.writes.len - 1].key else req.last_merged_id;
     var scanned = (try reads.scan(
         alloc,
@@ -184,6 +192,7 @@ pub fn executeResponse(
     var lines = std.mem.splitScalar(u8, scanned.ndjson, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        if (keys_scanned % 64 == 0) try request.ensureActive();
         keys_scanned += 1;
         const key = try parseScanLineKey(alloc, line);
         defer alloc.free(key);
@@ -192,6 +201,9 @@ pub fn executeResponse(
     }
 
     if (!req.dry_run and (changed_writes.items.len > 0 or deleted_ids.items.len > 0)) {
+        // The batch call is the irreversible write boundary. Never report
+        // cancellation after it begins because the outcome may be durable.
+        try request.ensureActive();
         _ = (try writes.batch(alloc, table_name, .{
             .writes = changed_writes.items,
             .deletes = deleted_ids.items,
@@ -403,11 +415,15 @@ test "linear merge scan line key uses reserved document identity" {
 
 test "storage.ha linear merge delegates every mutation to the HA-mirrored batch source" {
     const FakeReads = struct {
+        cancel_after_lookup: ?*std.atomic.Value(bool) = null,
+
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
         }
 
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.cancel_after_lookup) |signal| signal.store(true, .release);
             return null;
         }
 
@@ -445,11 +461,23 @@ test "storage.ha linear merge delegates every mutation to the HA-mirrored batch 
     defer request.deinit(std.testing.allocator);
     var reads = FakeReads{};
     var writes = RecordingWrites{};
-    const response = try executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request);
+    const response = try executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request, .{});
 
     try std.testing.expectEqual(@as(usize, 1), writes.calls);
     try std.testing.expectEqual(@as(usize, 1), writes.writes);
     try std.testing.expectEqual(@as(usize, 0), writes.deletes);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, writes.sync_level.?);
     try std.testing.expectEqual(@as(usize, 1), response.upserted);
+
+    var cancellation = std.atomic.Value(bool).init(false);
+    reads.cancel_after_lookup = &cancellation;
+    try std.testing.expectError(error.Canceled, executeResponse(
+        std.testing.allocator,
+        reads.source(),
+        writes.source(),
+        "docs",
+        request,
+        .{ .cancellation = api_operation.CancellationToken.fromAtomic(&cancellation) },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), writes.calls);
 }

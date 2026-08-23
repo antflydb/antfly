@@ -25,7 +25,9 @@ import pytest
 import requests
 
 from conftest import ready_index_status
-from helpers import json_doc, upsert, wait_until
+from helpers import assert_created_index, json_doc, upsert, wait_until
+
+pytestmark = pytest.mark.reuse_antfly_process
 
 
 def _table_name(created: dict) -> str:
@@ -159,7 +161,9 @@ def _pack_f32_le(values: list[float]) -> str:
     return base64.b64encode(struct.pack(f"<{len(values)}f", *values)).decode("ascii")
 
 
-def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
+def _ready_index(
+    stateful_api, table_name: str, index_name: str, *, expected_docs: int
+) -> dict | None:
     try:
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
@@ -171,6 +175,32 @@ def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_doc
     if total_indexed < expected_docs:
         return None
     return stats
+
+
+def _ready_algebraic_index(
+    stateful_api, table_name: str, index_name: str
+) -> dict | None:
+    try:
+        index_info = stateful_api.get_index(table_name, index_name)
+    except Exception:
+        return None
+    return ready_index_status(index_info, require_query_fresh=True)
+
+
+def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "limit": 1,
+            "aggregations": {
+                "amount_sum": {"type": "sum", "field": "amount"},
+                "category_terms": {"type": "terms", "field": "category", "size": 10},
+            },
+        },
+    )
+    responses = result.get("responses", [result])
+    assert responses
+    return responses[0].get("aggregations", {})
 
 
 def test_ready_index_status_requires_current_coverage_observation():
@@ -209,7 +239,9 @@ def test_ready_index_status_requires_current_coverage_observation():
         assert ready_index_status(terminal) is None
 
 
-def _retrying_partial_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
+def _retrying_partial_index(
+    stateful_api, table_name: str, index_name: str, *, expected_docs: int
+) -> dict | None:
     try:
         stats = _index_stats(stateful_api.get_index(table_name, index_name))
     except Exception:
@@ -261,7 +293,7 @@ def test_table_index_lifecycle(table_api):
             "dimension": 384,
         },
     )
-    assert created_index == {}
+    assert_created_index(created_index, index_name, "embeddings")
 
     assert (
         wait_until(
@@ -303,7 +335,7 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "search_idx",
@@ -311,8 +343,9 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
                 "name": "search_idx",
                 "type": "full_text",
             },
-        )
-        == {}
+        ),
+        "search_idx",
+        "full_text",
     )
 
     detail = stateful_api.get_index(table_name, "search_idx")
@@ -320,7 +353,100 @@ def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
     assert detail["config"]["type"] == "full_text"
 
 
-def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
+@pytest.mark.fresh_antfly_process
+def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(
+    stateful_api,
+):
+    table_name = f"managed_algebraic_generation_{time.time_ns()}"
+    index_name = "analytics_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+    stateful_api.update_schema(
+        table_name,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "keyword"},
+                            "amount": {"type": "number"},
+                        },
+                    }
+                }
+            },
+        },
+    )
+    initial = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {"category": "tools", "amount": 3},
+            "doc:b": {"category": "books", "amount": 5},
+        },
+        sync_level="write",
+    )
+    assert initial["inserted"] == 2
+
+    assert_created_index(
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "algebraic",
+                "derive_from_schema": True,
+            },
+        ),
+        index_name,
+        "algebraic",
+    )
+    # This write lands after admission while the snapshot generation may still
+    # be building. Durable replay must carry it into the activated generation.
+    concurrent = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:c": {"category": "tools", "amount": 7}},
+        sync_level="write",
+    )
+    assert concurrent["inserted"] == 1
+
+    ready = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert aggregations["amount_sum"]["value"] == 15
+    assert {
+        bucket["key"]: bucket["doc_count"]
+        for bucket in aggregations["category_terms"]["buckets"]
+    } == {"books": 1, "tools": 2}
+
+    assert stateful_api.supports_restart
+    stateful_api.restart_server()
+    reopened = wait_until(
+        lambda: _ready_algebraic_index(stateful_api, table_name, index_name),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert reopened is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name),
+        indent=2,
+        sort_keys=True,
+    )
+    reopened_aggregations = _algebraic_aggregations(stateful_api, table_name)
+    assert reopened_aggregations == aggregations
+
+
+def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(
+    stateful_api,
+):
     table_name = f"artifact_enrichment_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
@@ -357,7 +483,9 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
                 "kind": "asset",
                 "field": "url",
                 "content_type": "application/json",
-                "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+                "producer_json": json.dumps(
+                    {"type": "document_extraction", "config": {}}
+                ),
             },
         )
         == {}
@@ -407,7 +535,9 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert '"chunk_overlap": 25' in replaced_detail
 
     with pytest.raises(requests.HTTPError) as exc_info:
-        stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment")
+        stateful_api.delete(
+            f"/tables/{table_name}/artifacts/document_units_v1/enrichment"
+        )
     assert exc_info.value.response.status_code == 400
 
     decoded_name = "document chunks v2"
@@ -429,18 +559,35 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
     assert decoded_name in decoded_detail
     assert quote(decoded_name, safe="") not in decoded_detail
 
-    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment") == {}
-    assert stateful_api.delete(f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment") == {}
-    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
+    assert (
+        stateful_api.delete(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment"
+        )
+        == {}
+    )
+    assert (
+        stateful_api.delete(
+            f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment"
+        )
+        == {}
+    )
+    assert (
+        stateful_api.delete(
+            f"/tables/{table_name}/artifacts/document_units_v1/enrichment"
+        )
+        == {}
+    )
 
 
-def test_stateful_table_accepts_document_full_text_create_index_with_inline_enrichments(stateful_api):
+def test_stateful_table_cleans_document_full_text_inline_enrichments_on_index_delete(
+    stateful_api,
+):
     table_name = f"document_full_text_inline_{time.time_ns()}"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "document_text",
@@ -454,7 +601,9 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
                         "kind": "asset",
                         "field": "url",
                         "content_type": "application/json",
-                        "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+                        "producer_json": json.dumps(
+                            {"type": "document_extraction", "config": {}}
+                        ),
                     },
                     {
                         "name": "document_chunks_v1",
@@ -466,8 +615,9 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
                     },
                 ],
             },
-        )
-        == {}
+        ),
+        "document_text",
+        "full_text",
     )
 
     index = stateful_api.get_index(table_name, "document_text")
@@ -475,15 +625,35 @@ def test_stateful_table_accepts_document_full_text_create_index_with_inline_enri
     assert "document_units_v1" in detail
     assert "document_chunks_v1" in detail
 
+    assert stateful_api.delete_index(table_name, "document_text") == {}
+    table = stateful_api.get_table(table_name)
+    enrichment_names = {
+        enrichment["name"] for enrichment in table.get("artifact_enrichments", [])
+    }
+    assert "document_units_v1" not in enrichment_names
+    assert "document_chunks_v1" not in enrichment_names
 
-def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
+    # Exercise the first post-delete write through the same resident writer.
+    # A dangling generated-enrichment target must not retain full-index debt.
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={"doc:after-delete": {"body": "index and inline producers are gone"}},
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
+
+
+def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(
+    stateful_api,
+):
     table_name = f"stateful_external_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -493,14 +663,18 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        index_name,
+        "embeddings",
     )
 
     detail = wait_until(
         lambda: (
             current
-            if (current := stateful_api.get_index(table_name, index_name)).get("config", {}).get("name") == index_name
+            if (current := stateful_api.get_index(table_name, index_name))
+            .get("config", {})
+            .get("name")
+            == index_name
             else None
         ),
         timeout_s=30.0,
@@ -540,22 +714,26 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
         timeout_s=30.0,
         interval_s=0.5,
     )
-    assert ready is not None, json.dumps(stateful_api.get_index(table_name, index_name), indent=2, sort_keys=True)
+    assert ready is not None, json.dumps(
+        stateful_api.get_index(table_name, index_name), indent=2, sort_keys=True
+    )
 
     result = wait_until(
         lambda: (
             current
             if (
-                (current := stateful_api.query_table(
-                    table_name,
-                    {
-                        "embeddings": {
-                            index_name: _pack_f32_le([1.0, 0.0, 0.0]),
+                (
+                    current := stateful_api.query_table(
+                        table_name,
+                        {
+                            "embeddings": {
+                                index_name: _pack_f32_le([1.0, 0.0, 0.0]),
+                            },
+                            "indexes": [index_name],
+                            "limit": 3,
                         },
-                        "indexes": [index_name],
-                        "limit": 3,
-                    },
-                ))
+                    )
+                )
                 .get("responses", [{}])[0]
                 .get("hits", {})
                 .get("hits")
@@ -571,6 +749,76 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     assert hits[0]["_id"] == "doc:a"
 
 
+def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(
+    stateful_api,
+):
+    table_name = f"stateful_external_embeddings_online_admission_{time.time_ns()}"
+    index_names = ("vectors_one", "vectors_two")
+    vector = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+
+    for index_name in index_names:
+        # Do not wait for runtime readiness between creates. The regression
+        # requires each short write-capability admission to complete while the
+        # prior index can still have background lifecycle work queued.
+        assert_created_index(
+            stateful_api.post(
+                f"/tables/{table_name}/indexes/{index_name}",
+                {
+                    "type": "embeddings",
+                    "external": True,
+                    "dimension": len(vector),
+                    "distance_metric": "cosine",
+                },
+            ),
+            index_name,
+            "embeddings",
+        )
+
+    batch = stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc:a": {
+                "content": "one document, two vectors",
+                "_embeddings": {index_name: vector for index_name in index_names},
+            }
+        },
+        sync_level="full_index",
+    )
+    assert batch["status"] == "committed"
+    assert batch["inserted"] == 1
+
+    for index_name in index_names:
+        ready = wait_until(
+            lambda index_name=index_name: _ready_index(
+                stateful_api,
+                table_name,
+                index_name,
+                expected_docs=1,
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        assert ready is not None, json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        assert int(ready.get("total_indexed", ready.get("doc_count", 0))) == 1
+
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        assert _response_hit_ids(result) == ["doc:a"]
+
+
 def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     stateful_api,
     openai_embedder,
@@ -582,7 +830,7 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -597,11 +845,12 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        "embeddings",
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=10.0,
         interval_s=0.1,
     )
@@ -623,7 +872,9 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     # The test intentionally issues no later write or explicit catch-up request.
     plain_batch = stateful_api.batch_write(
         table_name,
-        inserts={f"plain:{i}": {"content": f"plain trailing document {i}"} for i in range(3)},
+        inserts={
+            f"plain:{i}": {"content": f"plain trailing document {i}"} for i in range(3)
+        },
         sync_level="write",
     )
     assert plain_batch["inserted"] == 3
@@ -635,7 +886,9 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         latest_status = _index_stats(stateful_api.get_index(table_name, index_name))
         applied = int(latest_status.get("replay_applied_sequence", 0))
         target = int(latest_status.get("replay_target_sequence", 0))
-        indexed = int(latest_status.get("total_indexed", latest_status.get("doc_count", 0)))
+        indexed = int(
+            latest_status.get("total_indexed", latest_status.get("doc_count", 0))
+        )
         if (
             indexed < 6
             or applied < target
@@ -692,9 +945,17 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -722,7 +983,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     partial = wait_until(
         lambda: (
             stats
-            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"] > 0
+            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"]
+            > 0
             and stats["successful_requests"] >= 1
             else None
         ),
@@ -743,7 +1005,11 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         is not None
     )
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
 
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
@@ -806,10 +1072,14 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
             assert created["name"] == table_name
         rate_limited_openai_embedder.allow_all_requests()
         for table_name in hot_tables:
-            assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+            assert_created_index(
+                stateful_api.create_index(table_name, index_name, index_payload),
+                index_name,
+                "embeddings",
+            )
             assert wait_until(
-                lambda table_name=table_name: ready_index_status(
-                    stateful_api.get_index(table_name, index_name)
+                lambda table_name=table_name: _ready_index(
+                    stateful_api, table_name, index_name, expected_docs=0
                 ),
                 timeout_s=30.0,
                 interval_s=0.1,
@@ -841,7 +1111,9 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
                 except requests.RequestException:
                     continue
                 pending_statuses[table_name] = detail
-            if stats["rate_limited_requests"] == 0 or len(pending_statuses) != len(hot_tables):
+            if stats["rate_limited_requests"] == 0 or len(pending_statuses) != len(
+                hot_tables
+            ):
                 return None
             if not all(
                 int(detail.get("status", {}).get("coverage", {}).get("pending", 0)) > 0
@@ -920,9 +1192,17 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        # A metadata snapshot can expose the index config before the table's
+        # shard topology and runtime observation arrive. Do not begin the
+        # rate-limit scenario from that config-only response: it has an empty
+        # shard_status and cannot prove that the managed worker is running.
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -950,7 +1230,8 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     partial = wait_until(
         lambda: (
             stats
-            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"] > 0
+            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"]
+            > 0
             and stats["successful_requests"] >= 1
             else None
         ),
@@ -994,6 +1275,7 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     assert _response_hit_ids(alpha_query)[0] == "doc:a"
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     single_item_enrichment_batches,
     stateful_api,
@@ -1004,7 +1286,7 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1019,11 +1301,12 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
                     "url": rate_limited_openai_embedder.url,
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        "embeddings",
     )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.25,
     )
@@ -1031,7 +1314,9 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     documents = {
         f"doc:{i:03d}": {
             "title": f"restart document {i}",
-            "body": "alpha concept overview" if i == 0 else f"managed restart payload {i}",
+            "body": (
+                "alpha concept overview" if i == 0 else f"managed restart payload {i}"
+            ),
         }
         for i in range(24)
     }
@@ -1040,7 +1325,8 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     assert wait_until(
         lambda: (
             stats
-            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"] > 0
+            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"]
+            > 0
             and stats["successful_requests"] >= 1
             else None
         ),
@@ -1049,16 +1335,21 @@ def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
     )
 
     stateful_api.pause_server()
-    rate_limited_before_restart = rate_limited_openai_embedder.stats()["rate_limited_requests"]
+    rate_limited_before_restart = rate_limited_openai_embedder.stats()[
+        "rate_limited_requests"
+    ]
     stateful_api.resume_server()
     rate_limited_during_restart = (
-        rate_limited_openai_embedder.stats()["rate_limited_requests"] - rate_limited_before_restart
+        rate_limited_openai_embedder.stats()["rate_limited_requests"]
+        - rate_limited_before_restart
     )
     assert rate_limited_during_restart <= 12
     rate_limited_openai_embedder.allow_all_requests()
 
     recovered = wait_until(
-        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=len(documents)),
+        lambda: _ready_index(
+            stateful_api, table_name, index_name, expected_docs=len(documents)
+        ),
         timeout_s=90.0,
         interval_s=0.25,
     )
@@ -1105,9 +1396,13 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1140,7 +1435,9 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
         if stats["rate_limited_requests"] == 0 or stats["successful_requests"] < 1:
             return None
         latest_status = _index_stats(stateful_api.get_index(table_name, index_name))
-        return _retrying_partial_index(stateful_api, table_name, index_name, expected_docs=3)
+        return _retrying_partial_index(
+            stateful_api, table_name, index_name, expected_docs=3
+        )
 
     partial = wait_until(
         current_partial_status,
@@ -1205,9 +1502,13 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1268,7 +1569,11 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                 "burst": 1,
             },
         }
-        assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+        assert_created_index(
+            stateful_api.create_index(table_name, index_name, index_payload),
+            index_name,
+            "embeddings",
+        )
         assert wait_until(
             lambda table_name=table_name: ready_index_status(
                 stateful_api.get_index(table_name, index_name),
@@ -1307,6 +1612,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         timeout_s=60.0,
         interval_s=0.5,
     )
+
     def shared_pacing_debug() -> dict:
         status_keys = (
             "backfill_active",
@@ -1329,9 +1635,13 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
             aggregate = info.get("status", {})
             shards = info.get("shard_status", {})
             return {
-                "status": {key: aggregate.get(key) for key in status_keys if key in aggregate},
+                "status": {
+                    key: aggregate.get(key) for key in status_keys if key in aggregate
+                },
                 "shards": {
-                    group_id: {key: shard.get(key) for key in status_keys if key in shard}
+                    group_id: {
+                        key: shard.get(key) for key in status_keys if key in shard
+                    }
                     for group_id, shard in shards.items()
                 },
             }
@@ -1348,7 +1658,9 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                         "limit": 3,
                     },
                 )
-                hits = response.get("responses", [{}])[0].get("hits", {}).get("hits", [])
+                hits = (
+                    response.get("responses", [{}])[0].get("hits", {}).get("hits", [])
+                )
                 return {"ids": [hit.get("_id") for hit in hits]}
             except Exception as exc:  # pragma: no cover - failure diagnostics only
                 return {"error": repr(exc)}
@@ -1382,6 +1694,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
     assert stats["rate_limited_requests"] <= 1
 
 
+@pytest.mark.fresh_antfly_process
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_artifact(
     stateful_api,
     openai_embedder,
@@ -1404,9 +1717,13 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         },
     }
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
     assert wait_until(
-        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
     )
@@ -1456,7 +1773,11 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         is not None
     )
 
-    assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+    assert_created_index(
+        stateful_api.create_index(table_name, index_name, index_payload),
+        index_name,
+        "embeddings",
+    )
 
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
@@ -1566,7 +1887,9 @@ def test_table_create_table_ignores_user_full_text_index_entries(table_api):
     assert "embed_idx" in created["indexes"]
 
 
-def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_embedder):
+def test_table_chunker_full_text_index_routes_template_chunks(
+    table_api, openai_embedder
+):
     def query_ids(table_name: str) -> list[str]:
         return _response_hit_ids(
             table_api.query_table(
@@ -1598,7 +1921,7 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
         if full_text_enabled:
             chunker["full_text_index"] = {}
 
-        assert (
+        assert_created_index(
             table_api.create_index(
                 table_name,
                 index_name,
@@ -1614,8 +1937,9 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
                     },
                     "chunker": chunker,
                 },
-            )
-            == {}
+            ),
+            index_name,
+            "embeddings",
         )
 
         batch = table_api.batch_write(
@@ -1632,14 +1956,18 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
         if table_api.backend == "serverless":
             assert table_api.publish_table(table_name) is not None
 
-        hits = wait_until(
-            lambda: (
-                current
-                if ((current := query_ids(table_name)) and full_text_enabled)
-                else None
-            ),
-            timeout_s=30.0,
-            interval_s=0.5,
+        # `full_index` is the positive completion barrier for stateful tables;
+        # serverless tables additionally complete publication above. Do not
+        # poll for an absent hit when full text is disabled: that predicate can
+        # never succeed and previously consumed the entire 30-second timeout.
+        hits = (
+            wait_until(
+                lambda: current if (current := query_ids(table_name)) else None,
+                timeout_s=30.0,
+                interval_s=0.5,
+            )
+            if full_text_enabled
+            else None
         )
         return table_name, {"hits": hits or []}
 
@@ -1652,14 +1980,16 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
     assert query_ids(with_full_text_name)[0] == "doc:a"
 
 
-def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(stateful_api, openai_embedder):
+def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(
+    stateful_api, openai_embedder
+):
     table_name = f"chunk_storage_disabled_{time.time_ns()}"
     index_name = "semantic_chunked_idx"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1684,8 +2014,9 @@ def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(s
                     },
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        "embeddings",
     )
 
     batch = stateful_api.batch_write(
@@ -1704,15 +2035,17 @@ def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(s
         lambda: (
             rows
             if (
-                (rows := stateful_api.scan_keys(
-                    table_name,
-                    {
-                        "from": "doc:a",
-                        "to": "doc:a;",
-                        "inclusive_from": True,
-                        "fields": ["title", "_chunks"],
-                    },
-                ))
+                (
+                    rows := stateful_api.scan_keys(
+                        table_name,
+                        {
+                            "from": "doc:a",
+                            "to": "doc:a;",
+                            "inclusive_from": True,
+                            "fields": ["title", "_chunks"],
+                        },
+                    )
+                )
                 and rows[0].get("title") == "Alpha without stored chunks"
             )
             else None
@@ -1725,14 +2058,16 @@ def test_mutable_table_chunker_without_full_text_index_does_not_persist_chunks(s
     assert f"{index_name}_chunks" not in chunks
 
 
-def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, openai_embedder):
+def test_mutable_table_chunker_full_text_index_persists_chunks(
+    stateful_api, openai_embedder
+):
     table_name = f"chunk_storage_full_text_{time.time_ns()}"
     index_name = "semantic_chunked_idx"
 
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             index_name,
@@ -1758,8 +2093,9 @@ def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, ope
                     },
                 },
             },
-        )
-        == {}
+        ),
+        index_name,
+        "embeddings",
     )
 
     batch = stateful_api.batch_write(
@@ -1778,15 +2114,17 @@ def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, ope
         lambda: (
             rows
             if (
-                (rows := stateful_api.scan_keys(
-                    table_name,
-                    {
-                        "from": "doc:a",
-                        "to": "doc:a;",
-                        "inclusive_from": True,
-                        "fields": ["title", "_chunks"],
-                    },
-                ))
+                (
+                    rows := stateful_api.scan_keys(
+                        table_name,
+                        {
+                            "from": "doc:a",
+                            "to": "doc:a;",
+                            "inclusive_from": True,
+                            "fields": ["title", "_chunks"],
+                        },
+                    )
+                )
                 and rows[0].get("_chunks", {}).get(f"{index_name}_chunks")
             )
             else None
@@ -1801,7 +2139,9 @@ def test_mutable_table_chunker_full_text_index_persists_chunks(stateful_api, ope
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
 
 
-def test_serverless_chunker_full_text_index_reports_publication_status(serverless_api, openai_embedder):
+def test_serverless_chunker_full_text_index_reports_publication_status(
+    serverless_api, openai_embedder
+):
     def publish_with_chunker(full_text_enabled: bool) -> tuple[str, dict]:
         table_name = f"serverless_chunk_full_text_{time.time_ns()}_{'on' if full_text_enabled else 'off'}"
         index_name = "semantic_chunked_idx"
@@ -1822,7 +2162,7 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
         if full_text_enabled:
             chunker["full_text_index"] = {}
 
-        assert (
+        assert_created_index(
             serverless_api.create_index(
                 table_name,
                 index_name,
@@ -1839,8 +2179,9 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
                     },
                     "chunker": chunker,
                 },
-            )
-            == {}
+            ),
+            index_name,
+            "embeddings",
         )
 
         serverless_api.ingest_table(
@@ -1862,7 +2203,10 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
             lambda: (
                 current
                 if (
-                    (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+                    (current := serverless_api.table_build_status(table_name)).get(
+                        "head_version", 0
+                    )
+                    >= 1
                     and current.get("published_wal_end_lsn", 0) >= 1
                 )
                 else None
@@ -1886,7 +2230,9 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
     assert with_entry["source_mode"] == "document_plus_artifact"
     assert with_entry["chunked_source_count"] == 1
 
-    without_detail = serverless_api.get_index(without_full_text_name, "full_text_index_v0")
+    without_detail = serverless_api.get_index(
+        without_full_text_name, "full_text_index_v0"
+    )
     assert without_detail["status"]["full_text_source_mode"] == "document"
     assert without_detail["status"]["chunked_source_count"] == 0
     assert without_detail["status"]["chunked_full_text"] is False
@@ -1897,7 +2243,9 @@ def test_serverless_chunker_full_text_index_reports_publication_status(serverles
     assert with_detail["status"]["chunked_full_text"] is True
 
 
-def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverless_api):
+def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(
+    serverless_api,
+):
     table_name = f"serverless_chunk_embeddings_blocker_{time.time_ns()}"
     index_name = "semantic_chunked_idx"
 
@@ -1916,27 +2264,26 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
         )
         == {}
     )
-    assert (
-        serverless_api.create_index(
-            table_name,
-            index_name,
-            {
-                "name": index_name,
-                "type": "embeddings",
-                "field": "body",
-                "dimension": 3,
-                "chunker": {
-                    "provider": "antfly",
-                    "store_chunks": False,
-                    "text": {
-                        "target_tokens": 4,
-                        "separator": " ",
-                    },
+    created_index = serverless_api.create_index(
+        table_name,
+        index_name,
+        {
+            "name": index_name,
+            "type": "embeddings",
+            "field": "body",
+            "dimension": 3,
+            "chunker": {
+                "provider": "antfly",
+                "store_chunks": False,
+                "text": {
+                    "target_tokens": 4,
+                    "separator": " ",
                 },
             },
-        )
-        == {}
+        },
     )
+    assert_created_index(created_index, index_name, "embeddings")
+    assert created_index["chunker"]["model"] == "fixed"
 
     serverless_api.ingest_table(
         table_name,
@@ -1947,7 +2294,9 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
                 json_doc(
                     body="alpha bravo",
                     chunk_preview=["alpha bravo"],
-                    chunk_embeddings=[{"chunk": "alpha bravo", "embedding": [1.0, 0.0, 0.0]}],
+                    chunk_embeddings=[
+                        {"chunk": "alpha bravo", "embedding": [1.0, 0.0, 0.0]}
+                    ],
                     _enrichment={
                         "chunk_preview": True,
                         "chunk_preview_version": 1,
@@ -1965,7 +2314,10 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
         wait_until(
             lambda: (
                 current
-                if (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+                if (current := serverless_api.table_build_status(table_name)).get(
+                    "head_version", 0
+                )
+                >= 1
                 else None
             ),
             timeout_s=30.0,
@@ -1996,9 +2348,9 @@ def test_serverless_chunked_dense_index_reports_chunk_embeddings_blocker(serverl
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get(
-                    "pending_materialization_families", {}
-                ).get("chunk_embeddings")
+                (current := serverless_api.table_build_status(table_name))
+                .get("pending_materialization_families", {})
+                .get("chunk_embeddings")
                 is True
             )
             else None
@@ -2019,7 +2371,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_a",
@@ -2029,10 +2381,11 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_a",
+        "embeddings",
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_a",
@@ -2042,8 +2395,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_a",
+        "embeddings",
     )
 
     serverless_api.ingest_table(
@@ -2070,7 +2424,10 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+                (current := serverless_api.table_build_status(table_name)).get(
+                    "head_version", 0
+                )
+                >= 1
                 and current.get("published_wal_end_lsn", 0) >= 1
             )
             else None
@@ -2080,7 +2437,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     )
     assert status is not None
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_b",
@@ -2090,10 +2447,11 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_b",
+        "embeddings",
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_b",
@@ -2103,26 +2461,23 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_b",
+        "embeddings",
     )
     assert serverless_api.delete_index(table_name, "semantic_a") == {}
 
-    planned = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_republish_recommended") is True
-                and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_b") == "rebuild"
-            )
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    if planned is not None:
+    # The pre-build plan is a transient diagnostic snapshot: the test's
+    # required contract is the post-build action set below. Inspect it when it
+    # is already observable, but do not spend 30 seconds waiting for an
+    # optional intermediate state.
+    planned = serverless_api.table_build_status(table_name)
+    if (
+        planned.get("head_republish_recommended") is True
+        and _named_action(planned, "vector_index_actions", "semantic_b") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_a") == "reuse"
+        and _named_action(planned, "sparse_index_actions", "sparse_b") == "rebuild"
+    ):
         assert _named_action(planned, "vector_index_actions", "semantic_a") == "drop"
         assert planned["artifact_actions"]["dense_vector"] == "reuse"
         assert planned["artifact_actions"]["sparse_vector"] == "rebuild"
@@ -2156,7 +2511,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_idx",
@@ -2166,8 +2521,9 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_idx",
+        "embeddings",
     )
 
     serverless_api.ingest_table(
@@ -2192,7 +2548,10 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+                (current := serverless_api.table_build_status(table_name)).get(
+                    "head_version", 0
+                )
+                >= 1
                 and current.get("published_wal_end_lsn", 0) >= 1
             )
             else None
@@ -2226,9 +2585,13 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get("head_republish_recommended") is True
+                (current := serverless_api.table_build_status(table_name)).get(
+                    "head_republish_recommended"
+                )
+                is True
                 and current.get("next_publish_reason") == "head_republish"
-                and _named_action(current, "vector_index_actions", "semantic_idx") == "rebuild"
+                and _named_action(current, "vector_index_actions", "semantic_idx")
+                == "rebuild"
             )
             else None
         ),
@@ -2246,7 +2609,11 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         published_wal_end_lsn=first_published_wal_end,
     )
     assert rebuilt is not None
-    target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
+    target_head_version = (
+        rebuilt.get("version")
+        or rebuilt.get("head_version")
+        or (first_head_version + 1)
+    )
     _wait_for_serverless_build_status(
         serverless_api,
         table_name,
@@ -2254,7 +2621,8 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
             current.get("head_version", 0) >= target_head_version
             and current.get("published_wal_end_lsn") == first_published_wal_end
             and current.get("publish_recommended") is False
-            and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
+            and _named_action(current, "head_vector_index_actions", "semantic_idx")
+            == "rebuild"
         ),
         timeout_s=60.0,
         reason=f"serverless dense-index republish did not reach head version {target_head_version}",
@@ -2265,13 +2633,15 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     assert ready_index_status(detail) is not None
 
 
-def test_serverless_build_status_reports_head_actions_for_text_only_updates(serverless_api):
+def test_serverless_build_status_reports_head_actions_for_text_only_updates(
+    serverless_api,
+):
     table_name = f"serverless_head_actions_{time.time_ns()}"
 
     created = serverless_api.ensure_table(table_name, created_at_ns=100)
     assert created["table_name"] == table_name
 
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "semantic_a",
@@ -2281,10 +2651,11 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
                 "external": True,
                 "dimension": 3,
             },
-        )
-        == {}
+        ),
+        "semantic_a",
+        "embeddings",
     )
-    assert (
+    assert_created_index(
         serverless_api.create_index(
             table_name,
             "sparse_a",
@@ -2294,8 +2665,9 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
                 "external": True,
                 "sparse": True,
             },
-        )
-        == {}
+        ),
+        "sparse_a",
+        "embeddings",
     )
 
     serverless_api.ingest_table(
@@ -2319,7 +2691,10 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     first_ready = wait_until(
         lambda: (
             current
-            if (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+            if (current := serverless_api.table_build_status(table_name)).get(
+                "head_version", 0
+            )
+            >= 1
             else None
         ),
         timeout_s=30.0,
@@ -2345,7 +2720,9 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     )
     second_build = _maybe_serverless_build(serverless_api, table_name)
     assert second_build is not None
-    target_head_version = second_build.get("version") or second_build.get("head_version") or 2
+    target_head_version = (
+        second_build.get("version") or second_build.get("head_version") or 2
+    )
 
     status = _wait_for_serverless_build_status(
         serverless_api,
@@ -2357,12 +2734,17 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     assert status["head_artifact_actions"]["full_text"] == "rebuild"
     assert status["head_artifact_actions"]["dense_vector"] == "reuse"
     assert status["head_artifact_actions"]["sparse_vector"] == "reuse"
-    assert _full_text_action(status, "head_full_text_index_actions", "full_text_index_v0") == "rebuild"
+    assert (
+        _full_text_action(status, "head_full_text_index_actions", "full_text_index_v0")
+        == "rebuild"
+    )
     assert _named_action(status, "head_vector_index_actions", "semantic_a") == "reuse"
     assert _named_action(status, "head_sparse_index_actions", "sparse_a") == "reuse"
 
 
-def test_serverless_schema_migration_republishes_versioned_full_text_indexes(serverless_api):
+def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
+    serverless_api,
+):
     table_name = f"serverless_full_text_version_transition_{time.time_ns()}"
     initial_schema = {
         "version": 1,
@@ -2420,7 +2802,10 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) >= 1
+                (current := serverless_api.table_build_status(table_name)).get(
+                    "head_version", 0
+                )
+                >= 1
                 and current.get("published_wal_end_lsn", 0) >= 1
             )
             else None
@@ -2451,10 +2836,19 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
         lambda: (
             current
             if (
-                (current := serverless_api.table_build_status(table_name)).get("head_republish_recommended") is True
+                (current := serverless_api.table_build_status(table_name)).get(
+                    "head_republish_recommended"
+                )
+                is True
                 and current.get("next_publish_reason") == "head_republish"
-                and _full_text_action(current, "full_text_index_actions", "full_text_index_v0") == "reuse"
-                and _full_text_action(current, "full_text_index_actions", "full_text_index_v1") == "rebuild"
+                and _full_text_action(
+                    current, "full_text_index_actions", "full_text_index_v0"
+                )
+                == "reuse"
+                and _full_text_action(
+                    current, "full_text_index_actions", "full_text_index_v1"
+                )
+                == "rebuild"
             )
             else None
         ),
@@ -2467,15 +2861,25 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
 
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
-    target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
+    target_head_version = (
+        rebuilt.get("version")
+        or rebuilt.get("head_version")
+        or (first_head_version + 1)
+    )
     _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (
             current.get("head_version", 0) >= target_head_version
             and current.get("published_wal_end_lsn") == first_published_wal_end
-            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v0") == "reuse"
-            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v1") == "rebuild"
+            and _full_text_action(
+                current, "head_full_text_index_actions", "full_text_index_v0"
+            )
+            == "reuse"
+            and _full_text_action(
+                current, "head_full_text_index_actions", "full_text_index_v1"
+            )
+            == "rebuild"
         ),
         reason=f"serverless full-text republish did not reach head version {target_head_version}",
     )

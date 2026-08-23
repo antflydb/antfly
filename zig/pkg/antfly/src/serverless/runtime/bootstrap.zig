@@ -15,11 +15,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
+const common_secrets = @import("../../common/secrets.zig");
 const artifacts_object_store = @import("../artifacts/object_store.zig");
 const manifest_object_store = @import("../manifest/object_store.zig");
 const wal_object_store = @import("../wal/object_store.zig");
 const catalog_object_store = @import("../catalog/object_store.zig");
 const progress_object_store = @import("../catalog/object_progress_store.zig");
+const configured_object_store_support = @import("../configured_object_store_support.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
 const remote_uri = @import("../remote_uri.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
@@ -37,6 +40,7 @@ const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
@@ -63,9 +67,48 @@ pub const BootstrapConfig = struct {
     enrichment_enabled: bool = true,
     foreign_registry: ?*const foreign_mod.Registry = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    node_config: ?*const common_config.Config = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
+
+const ConfiguredExternalSourceObjectStoreResolver = struct {
+    node_config: ?*const common_config.Config = null,
+    secret_store: ?*common_secrets.FileStore = null,
+
+    fn configure(
+        self: *@This(),
+        node_config: ?*const common_config.Config,
+        secret_store: ?*common_secrets.FileStore,
+    ) void {
+        self.node_config = node_config;
+        self.secret_store = secret_store;
+    }
+
+    fn resolver(self: *@This()) build_mod.ExternalSourceOpenedObjectStoreResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .open = open },
+        };
+    }
+
+    fn open(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        binding: external_binding.Binding,
+        options: build_mod.ExternalSourceOpenedObjectStoreResolver.OpenOptions,
+    ) !object_store_support.OpenedObjectStore {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try configured_object_store_support.openBindingObjectStoreAlloc(alloc, binding, .{
+            .file_bucket = options.file_bucket,
+            .node_config = self.node_config,
+            .secret_store = self.secret_store,
+        });
+    }
+};
 
 const S3ClientPool = struct {
     const AwsCredentialContext = struct {
@@ -290,6 +333,8 @@ pub const OwnedStack = struct {
     catalog_store: catalog_mod.CatalogStore,
     builder: build_mod.Builder,
     catalog: catalog_mod.CatalogService,
+    external_source_object_store_resolver: ConfiguredExternalSourceObjectStoreResolver = .{},
+    external_source_plan_resolver: build_mod.ExternalSourcePublicationPlanResolver = undefined,
     api: api_mod.Service,
     query_cache: ?query_mod.QueryCache = null,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
@@ -301,7 +346,7 @@ pub const OwnedStack = struct {
     status: RuntimeStatus,
     handler: api_mod.HttpHandler,
 
-    pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig) !void {
+    pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
         self.s3_client_pool = try S3ClientPool.init(alloc);
@@ -362,6 +407,14 @@ pub const OwnedStack = struct {
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
+        self.external_source_object_store_resolver = .{};
+        self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
+        self.external_source_plan_resolver = build_mod.ExternalSourcePublicationPlanResolver.init(
+            &self.artifacts,
+            self.external_source_object_store_resolver.resolver(),
+            .{},
+        );
+        self.catalog.setExternalSourcePlanResolver(self.external_source_plan_resolver.planResolver());
         self.api = api_mod.Service.init(alloc, &self.wal, &self.builder);
         if (cfg.query_cache_dir) |query_cache_dir| {
             self.query_cache = try query_mod.QueryCache.initWithConfig(alloc, query_cache_dir, .{
@@ -386,7 +439,10 @@ pub const OwnedStack = struct {
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         if (cfg.embedding_indexes_json) |indexes_json| {
-            const embedder_options = managed_embedder.InitOptions{ .remote_content = cfg.remote_content };
+            const embedder_options = managed_embedder.InitOptions{
+                .io = io,
+                .remote_content = cfg.remote_content,
+            };
             var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
             errdefer query_embedder.deinit();
             if (query_embedder.hasDenseEntries()) {
@@ -410,6 +466,8 @@ pub const OwnedStack = struct {
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        self.handler.setIo(io);
+        self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -615,7 +673,7 @@ test "runtime bootstrap assembles serverless stack from uri config" {
         .tick_interval_ms = 1,
         .role = .combined,
         .combined_mode = true,
-    });
+    }, std.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(stack.status.combined_mode);
@@ -723,7 +781,7 @@ test "runtime bootstrap wires foreign registry into public join handler" {
         .role = .combined,
         .combined_mode = true,
         .foreign_registry = &foreign_registry,
-    });
+    }, std.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(try stack.catalog.ensureTable("orders", 100));
@@ -880,7 +938,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
         .query_cache_dir = null,
         .tick_interval_ms = 1,
         .role = .combined,
-    });
+    }, std.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(try stack.catalog.ensureTableWithDefinition(

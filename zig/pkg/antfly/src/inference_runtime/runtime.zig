@@ -16,7 +16,10 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
+const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
+const httpx = @import("httpx");
 
 pub const ServerBudgetOverrides = inference.server.BudgetOverrides;
 
@@ -58,17 +61,30 @@ pub fn defaultMlDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []con
 
 pub const SpawnedServer = struct {
     base_uri: []u8,
-    thread: std.Thread,
+    listener_task: httpx.ListenerTask,
     node: *inference.server.Node,
+    server: *httpx.Server,
     host: []u8,
 
+    pub fn shutdown(self: *SpawnedServer, timeout_ms: u64) void {
+        self.listener_task.shutdown(timeout_ms);
+    }
+
+    pub fn join(self: *SpawnedServer) !void {
+        return try self.listener_task.join();
+    }
+
     pub fn deinit(self: *SpawnedServer, alloc: std.mem.Allocator, _: std.Io) void {
-        // The serve loop runs until the process exits; detach so we don't
-        // block shutdown waiting for it.
-        self.thread.detach();
+        self.shutdown(30_000);
+        self.join() catch |err| {
+            std.log.err("embedded inference listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+        self.server.deinit();
+        alloc.destroy(self.server);
+        self.node.deinit();
+        alloc.destroy(self.node);
         alloc.free(self.base_uri);
-        // The embedded server thread owns the running node for the rest of the
-        // process lifetime. Freeing it here would race the detached serve loop.
+        alloc.free(self.host);
         self.* = undefined;
     }
 };
@@ -81,9 +97,23 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
+    process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: inference.runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     preload: []const inference.server.WarmModel = &.{},
     allow_insecure_public_bind: bool = false,
 };
+
+fn inferenceProcessMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference.runtime.tier.memory.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
 
 const BudgetOverridesMb = struct {
     host_budget_mb: usize = 0,
@@ -225,6 +255,8 @@ pub fn runFromIterator(
         return try inference.compare_generate.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "finetune")) {
         return try inference.finetune_cli.main(init, try collectArgs(alloc, args));
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        return try inference.cuda_info.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try inference.native_smoke.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "list")) {
@@ -250,6 +282,13 @@ fn runHelpRequested(args: *std.process.Args.Iterator) bool {
     return false;
 }
 
+fn resolveRunMaxConcurrentRequests(cli: ?u32, cfg: ?*const common_config.Config) usize {
+    return @intCast(cli orelse if (cfg) |config|
+        config.admission.inference.max_concurrent_requests
+    else
+        common_config.default_inference_max_concurrent_requests);
+}
+
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     // Help is side-effect free and wins over every run option, even if it
     // follows an otherwise invalid value. Probe a copy so normal parsing can
@@ -271,6 +310,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var max_loaded_models: usize = 10;
+    var config_path: ?[]const u8 = null;
+    var max_concurrent_requests_override: ?u32 = null;
+    var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mb = BudgetOverridesMb{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var kernel_jit_cache_dir_override: ?[]const u8 = null;
@@ -299,6 +341,18 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
                 args.next() orelse return error.InvalidArguments,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-concurrent-requests")) {
+            max_concurrent_requests_override = try std.fmt.parseInt(
+                u32,
+                args.next() orelse return error.InvalidArguments,
+                10,
+            );
+        } else if (std.mem.eql(u8, arg, "--process-memory-budget-mb") or
+            std.mem.eql(u8, arg, "--inference-process-memory-budget-mb"))
+        {
+            process_memory_budget_mb_override = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -336,6 +390,21 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         }
     }
 
+    var loaded_config: ?common_config.Config = if (config_path) |path|
+        try common_config.loadFromPath(alloc, path)
+    else
+        null;
+    defer if (loaded_config) |*config| config.deinit();
+    const max_concurrent_requests = resolveRunMaxConcurrentRequests(
+        max_concurrent_requests_override,
+        if (loaded_config) |*config| config else null,
+    );
+    const process_memory_resolution = try process_memory_budget.resolveSystemDetailed(
+        process_memory_budget_mb_override,
+        platform.env.getenv(process_memory_budget.canonical_env),
+        platform.env.getenv(process_memory_budget.inference_compat_env),
+    );
+
     const kernel_jit = try resolveKernelJitConfig(
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
         kernel_jit_mode_override,
@@ -352,12 +421,26 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         kernel_jit.max_cache_bytes_mb,
         kernel_jit.preload_budget_ms,
     });
+    std.log.info(
+        "process memory policy input_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            process_memory_resolution.limit_bytes,
+        },
+    );
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = max_loaded_models,
+        .max_concurrent_requests = max_concurrent_requests,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_provenance = inferenceProcessMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload = preload_models.items,
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
@@ -370,13 +453,50 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
-    std.debug.print("listening on {s}:{d}\n", .{ host, port });
-    try node.serve(alloc, io, host, port);
+    node.startReadinessInventory(io);
+
+    node.validateHttpBind(host) catch |err| {
+        std.log.err(
+            "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",
+            .{ host, port },
+        );
+        return err;
+    };
+    var server = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host, port));
+    defer server.deinit();
+    try node.registerHttpRoutes(&server);
+
+    var termination_signals = runtime_lifecycle.ProcessSignalScope.install();
+    defer termination_signals.deinit();
+    var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
+    defer supervisor.markStopped();
+
+    var listener_task = httpx.ListenerTask.init(&server);
+    try listener_task.start();
+    defer {
+        listener_task.shutdown(supervisor.deadline().remainingMilliseconds());
+        listener_task.join() catch |err| {
+            std.log.err("inference listener failed during shutdown err={s}", .{@errorName(err)});
+        };
+    }
+
+    if (server.boundAddress()) |address|
+        std.debug.print("listening on http://{f}\n", .{address})
+    else
+        return error.MissingInferenceListener;
+    try supervisor.publishReady();
+    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (listener_task.runtimeFailure()) |err|
+            return supervisor.fail("inference", "public-http", err);
+        io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {
+            error.Canceled => supervisor.requestShutdown(),
+        };
+    }
 }
 
 pub fn spawnServerProcess(
     alloc: std.mem.Allocator,
-    _: std.Io,
+    io: std.Io,
     _: []const u8,
     base_uri: []const u8,
     config: EmbeddedServerConfig,
@@ -387,6 +507,8 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
+        .process_memory_limit_bytes = config.process_memory_limit_bytes,
+        .process_memory_limit_provenance = config.process_memory_limit_provenance,
         .preload = config.preload,
         .allow_insecure_public_bind = config.allow_insecure_public_bind,
         .allow_unknown_models = config.allow_unknown_models,
@@ -402,26 +524,31 @@ pub fn spawnServerProcess(
     const host_dup = try alloc.dupe(u8, parsed.host);
     errdefer alloc.free(host_dup);
 
-    const thread = try std.Thread.spawn(.{}, serveThread, .{ node, alloc, host_dup, parsed.port });
+    try node.validateHttpBind(host_dup);
+    node.attachIo(io);
+    try node.warmConfiguredGenerators(alloc);
+    node.startReadinessInventory(io);
+
+    const server = try alloc.create(httpx.Server);
+    errdefer alloc.destroy(server);
+    server.* = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host_dup, parsed.port));
+    errdefer server.deinit();
+    try node.registerHttpRoutes(server);
+    const base_uri_owned = try alloc.dupe(u8, base_uri);
+    errdefer alloc.free(base_uri_owned);
+    var listener_task = httpx.ListenerTask.init(server);
+    try listener_task.start();
+    errdefer {
+        listener_task.requestStop();
+        listener_task.join() catch {};
+    }
 
     return .{
-        .base_uri = try alloc.dupe(u8, base_uri),
-        .thread = thread,
+        .base_uri = base_uri_owned,
+        .listener_task = listener_task,
         .node = node,
+        .server = server,
         .host = host_dup,
-    };
-}
-
-fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    node.attachIo(io_impl.io());
-    node.warmConfiguredGenerators(alloc) catch |err| {
-        std.debug.print("inference warmup error: {}\n", .{err});
-        return;
-    };
-    node.serve(alloc, io_impl.io(), host, port) catch |err| {
-        std.debug.print("inference server error: {}\n", .{err});
     };
 }
 
@@ -705,6 +832,7 @@ fn printUsage() void {
         \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
+        \\  cuda-info   Inspect the compiled CUDA artifact or validate a CUDA device
         \\  smoke       Run a model smoke test
         \\  list        List available models
         \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
@@ -717,6 +845,10 @@ fn printUsage() void {
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
+        \\  --config <path>     Load admission settings from an Antfly config file
+        \\  --max-concurrent-requests <n> Override admission.inference.max_concurrent_requests; 0 disables it
+        \\  --process-memory-budget-mb <n> Whole-process host-memory envelope; 0 selects cgroup/host detection
+        \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
@@ -747,6 +879,25 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference runtime preserves effective process envelope provenance" {
+    const Case = struct {
+        source: process_memory_budget.EffectiveSource,
+        expected: inference.runtime.tier.memory.ProcessMemoryLimitProvenance,
+    };
+    inline for ([_]Case{
+        .{ .source = .explicit, .expected = .explicit },
+        .{ .source = .cgroup_v2, .expected = .cgroup_v2 },
+        .{ .source = .cgroup_v1, .expected = .cgroup_v1 },
+        .{ .source = .host, .expected = .host },
+        .{ .source = .unavailable, .expected = .unavailable },
+    }) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            inferenceProcessMemoryLimitProvenance(case.source),
+        );
+    }
 }
 
 test "inference run detects trailing help without consuming arguments" {
@@ -824,5 +975,18 @@ test "inference run rejects unknown flags instead of silently disabling policy" 
     try std.testing.expectError(
         error.InvalidArguments,
         runServer(std.heap.page_allocator, std.testing.io, &iter),
+    );
+}
+
+test "inference run admission uses config with CLI precedence" {
+    var cfg = try common_config.Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"inference":{"max_concurrent_requests":11}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 11), resolveRunMaxConcurrentRequests(null, &cfg));
+    try std.testing.expectEqual(@as(usize, 3), resolveRunMaxConcurrentRequests(3, &cfg));
+    try std.testing.expectEqual(
+        @as(usize, common_config.default_inference_max_concurrent_requests),
+        resolveRunMaxConcurrentRequests(null, null),
     );
 }

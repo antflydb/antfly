@@ -20,7 +20,9 @@ const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../domain.zig");
+const metadata_reconciler = @import("../reconciler.zig");
 const metadata_incarnation = @import("../incarnation.zig");
+const runtime_status_protocol = @import("../runtime_status_protocol.zig");
 const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
@@ -78,10 +80,16 @@ pub const TransitionCommand = union(enum) {
     remove_store: struct {
         store_id: u64,
     },
-    upsert_replica_intent: raft_reconciler.PlacementIntent,
+    upsert_replica_intent: struct {
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+        replacement: raft_reconciler.PlacementIntent,
+    },
     remove_replica_intent: struct {
         group_id: u64,
         local_node_id: u64,
+        expected_metadata_version: u64,
     },
     upsert_table: metadata.TableRecord,
     compare_and_replace_table: struct {
@@ -178,10 +186,10 @@ pub const TransitionCommand = union(enum) {
             .upsert_store, .register_store => |*record| {
                 metadata_table_manager.freeStore(alloc, record.*);
             },
-            .upsert_replica_intent => |*intent| {
-                var record = intent.record;
+            .upsert_replica_intent => |*replacement| {
+                var record = replacement.replacement.record;
                 record.deinit(alloc);
-                if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+                if (replacement.replacement.peer_node_ids.len > 0) alloc.free(replacement.replacement.peer_node_ids);
             },
             .upsert_table => |*record| {
                 metadata_table_manager.freeTable(alloc, record.*);
@@ -265,6 +273,12 @@ pub const TransitionCommand = union(enum) {
 
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
+        .upsert_store, .register_store => |record| {
+            if (!metadata_table_manager.reporterFenceValid(
+                record.reporter_incarnation,
+                record.status_generation,
+            )) return error.InvalidStoreReporterFence;
+        },
         .compare_and_replace_table => |replacement| {
             if (replacement.expected.table_id == 0 or
                 replacement.replacement.table_id != replacement.expected.table_id or
@@ -331,7 +345,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 record.retired_publication_name.len == 0)
                 return error.InvalidReplicationCutoverIntent;
         },
-        .upsert_replica_intent => |intent| try group_ids.requireDataGroupId(intent.record.group_id),
+        .upsert_replica_intent => |replacement| try group_ids.requireDataGroupId(replacement.replacement.record.group_id),
         .remove_replica_intent => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
@@ -478,8 +492,13 @@ fn testTransitionRangeRecord(
 test "transition command validation rejects metadata group ids in data group fields" {
     const metadata_group_id = group_ids.main_metadata_group_id;
     const commands = [_]TransitionCommand{
-        .{ .upsert_replica_intent = .{ .record = .{ .group_id = metadata_group_id, .replica_id = 1, .local_node_id = 1 } } },
-        .{ .remove_replica_intent = .{ .group_id = metadata_group_id, .local_node_id = 1 } },
+        .{ .upsert_replica_intent = .{
+            .expected_metadata_version = null,
+            .expected_version_fence = 0,
+            .expected_target_drain_requested = false,
+            .replacement = .{ .record = .{ .group_id = metadata_group_id, .replica_id = 1, .local_node_id = 1 } },
+        } },
+        .{ .remove_replica_intent = .{ .group_id = metadata_group_id, .local_node_id = 1, .expected_metadata_version = 0 } },
         .{ .upsert_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id, .backup_id = "backup" } },
         .{ .remove_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id } },
         .{ .upsert_range = .{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" } },
@@ -655,6 +674,56 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
     try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(@as(u16, 0), try source.getRuntimeStatusProtocolActivationVersion(group_id));
+
+    var repair_indexes = [_]metadata.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .repair_status = .rebuilding,
+        .repair_active_generation_serviceable = true,
+    }};
+    var runtime_statuses = [_]metadata.RuntimeGroupStatusReport{.{
+        .table_id = 11,
+        .table_name = "products",
+        .group_id = 12,
+        .store_id = 13,
+        .node_id = 1,
+        .indexes = repair_indexes[0..],
+    }};
+    const activate = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_store = .{
+        .store_id = 13,
+        .node_id = 1,
+        .runtime_statuses = runtime_statuses[0..],
+    } });
+    defer std.testing.allocator.free(activate);
+    const activate_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = activate },
+    });
+    defer std.testing.allocator.free(activate_entries);
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = activate_entries });
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try source.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
+    const activate_reporter_fence = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_store = .{
+        .store_id = 13,
+        .node_id = 1,
+        .reporter_incarnation = 0x1234,
+    } });
+    defer std.testing.allocator.free(activate_reporter_fence);
+    const reporter_fence_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 4, .entry_type = .normal, .data = activate_reporter_fence },
+    });
+    defer std.testing.allocator.free(reporter_fence_entries);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 4,
+        .entries_bytes = reporter_fence_entries,
+    });
+    try std.testing.expectEqual(
+        runtime_status_protocol.current_record_version,
+        try source.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(snapshot);
     source.deinit();
@@ -662,11 +731,102 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     defer reopened.deinit();
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(
+        runtime_status_protocol.current_record_version,
+        try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
 
     var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
     defer target.deinit();
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 4, snapshot));
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(
+        runtime_status_protocol.current_record_version,
+        try target.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
+}
+
+test "metadata raft apply store snapshots and promotes the latest pending reallocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-target", .{tmp.sub_path});
+    defer std.testing.allocator.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const incarnation: metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const fingerprint = metadata.reallocation_request.membershipFingerprint(&.{1});
+    const active: metadata.ReallocationRequestRecord = .{
+        .request_id = 17,
+        .requested_at_ms = 17_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+    const superseded_pending: metadata.ReallocationRequestRecord = .{
+        .request_id = 18,
+        .requested_at_ms = 18_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+    const latest_pending: metadata.ReallocationRequestRecord = .{
+        .request_id = 19,
+        .requested_at_ms = 19_000,
+        .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+        .metadata_incarnation = incarnation,
+        .protected_metadata_member_count = 1,
+        .protected_metadata_membership_fingerprint = fingerprint,
+    };
+
+    const active_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = active });
+    defer std.testing.allocator.free(active_command);
+    const superseded_pending_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = superseded_pending });
+    defer std.testing.allocator.free(superseded_pending_command);
+    const latest_pending_command = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_reallocation_request = latest_pending });
+    defer std.testing.allocator.free(latest_pending_command);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = active_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = superseded_pending_command },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = latest_pending_command },
+    });
+    defer std.testing.allocator.free(entries);
+
+    var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer source.deinit();
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = entries });
+    try std.testing.expectEqual(active, (try source.getReallocationRequest(group_id)).?);
+    const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
+    defer std.testing.allocator.free(snapshot);
+
+    var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 3, snapshot));
+    try std.testing.expectEqual(active, (try target.getReallocationRequest(group_id)).?);
+
+    const clear_active = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{ .expected_request_id = active.request_id },
+    });
+    defer std.testing.allocator.free(clear_active);
+    const clear_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = clear_active },
+    });
+    defer std.testing.allocator.free(clear_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 4, .entries_bytes = clear_entries });
+    try std.testing.expectEqual(latest_pending, (try target.getReallocationRequest(group_id)).?);
+
+    const clear_promoted = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{ .expected_request_id = latest_pending.request_id },
+    });
+    defer std.testing.allocator.free(clear_promoted);
+    const final_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = clear_promoted },
+    });
+    defer std.testing.allocator.free(final_entries);
+    try target.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 5, .entries_bytes = final_entries });
+    try std.testing.expect((try target.getReallocationRequest(group_id)) == null);
 }
 
 test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
@@ -1066,13 +1226,24 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         defer self.alloc.free(encoded);
-        if (encoded.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
-            return error.InvalidMetadataIncarnation;
-        }
-        var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
-        @memcpy(&incarnation, encoded);
-        if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
-        return incarnation;
+        return (try decodeMetadataIncarnationRecord(encoded)).incarnation;
+    }
+
+    /// Returns the highest runtime-status record version durably activated by
+    /// this metadata group. Activation is stored with the cluster incarnation,
+    /// so it survives leader changes, process restarts, and Raft snapshots.
+    pub fn getRuntimeStatusProtocolActivationVersion(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !u16 {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return (try decodeMetadataIncarnationRecord(encoded)).runtime_status_record_version;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -1128,6 +1299,48 @@ pub const RaftApplyStore = struct {
             if (entry.metadata_group_id != group_id) continue;
             out[initialized] = try clonePlacementIntent(alloc, entry.intent);
             initialized += 1;
+        }
+        return out;
+    }
+
+    pub fn listPlacementVersionFences(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = try placementVersionPrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+
+        const out = try alloc.alloc(metadata_reconciler.PlacementVersionFence, kvs.len);
+        errdefer alloc.free(out);
+        for (kvs, 0..) |kv, i| {
+            if (kv.key.len <= prefix.len or kv.value.len != @sizeOf(u64))
+                return error.InvalidPlacementVersionFence;
+            var parts = std.mem.splitScalar(u8, kv.key[prefix.len..], ':');
+            const range_group_id = try std.fmt.parseInt(
+                u64,
+                parts.next() orelse return error.InvalidPlacementVersionFence,
+                10,
+            );
+            const local_node_id = try std.fmt.parseInt(
+                u64,
+                parts.next() orelse return error.InvalidPlacementVersionFence,
+                10,
+            );
+            if (parts.next() != null) return error.InvalidPlacementVersionFence;
+            out[i] = .{
+                .group_id = range_group_id,
+                .local_node_id = local_node_id,
+                .version = std.mem.readInt(u64, kv.value[0..@sizeOf(u64)], .little),
+            };
         }
         return out;
     }
@@ -1730,6 +1943,7 @@ pub const RaftApplyStore = struct {
         split_transition,
         merge_transition,
         placement,
+        placement_version,
         node,
         store,
         table,
@@ -1746,6 +1960,7 @@ pub const RaftApplyStore = struct {
         range,
         reconcile_lease,
         reallocation_request,
+        reallocation_request_pending,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -1760,6 +1975,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
         .{ .projection = .placement, .key = .{ .prefix = placementPrefixForGroup } },
+        .{ .projection = .placement_version, .key = .{ .prefix = placementVersionPrefixForGroup } },
         .{ .projection = .node, .key = .{ .prefix = nodePrefixForGroup } },
         .{ .projection = .store, .key = .{ .prefix = storePrefixForGroup } },
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
@@ -1776,6 +1992,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
         .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
+        .{ .projection = .reallocation_request_pending, .key = .{ .point = pendingReallocationRequestKeyForGroup } },
     };
 
     fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
@@ -1791,7 +2008,8 @@ pub const RaftApplyStore = struct {
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
-            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement),
+            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
+                metadataSnapshotProjectionBit(.placement_version),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
@@ -1807,7 +2025,8 @@ pub const RaftApplyStore = struct {
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
             .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
-            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request),
+            .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
+                metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
@@ -2146,12 +2365,7 @@ pub const RaftApplyStore = struct {
                     },
                     else => return err,
                 };
-                if (existing.len != @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) {
-                    return error.InvalidMetadataIncarnation;
-                }
-                var committed: metadata_incarnation.MetadataClusterIncarnation = undefined;
-                @memcpy(&committed, existing);
-                if (!metadata_incarnation.isValid(committed)) return error.InvalidMetadataIncarnation;
+                _ = try decodeMetadataIncarnationRecord(existing);
                 // Initialization is first-writer-wins. A proposal accepted by a
                 // superseded leader may race a later term, but it must never
                 // replace the cluster identity selected by the committed log.
@@ -2197,6 +2411,9 @@ pub const RaftApplyStore = struct {
                 defer metadata_table_manager.freeStore(self.alloc, applied);
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
+                if (storeRuntimeStatusRecordVersion(applied)) |version| {
+                    try activateRuntimeStatusProtocolTxn(txn, group_id, version);
+                }
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -2205,6 +2422,7 @@ pub const RaftApplyStore = struct {
                     .store_id = record.store_id,
                     .node_id = applied.node_id,
                 });
+                try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, applied.node_id);
             },
             .register_store => |record| {
                 var key_buf: [160]u8 = undefined;
@@ -2212,6 +2430,9 @@ pub const RaftApplyStore = struct {
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
+                if (storeRuntimeStatusRecordVersion(applied)) |version| {
+                    try activateRuntimeStatusProtocolTxn(txn, group_id, version);
+                }
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -2220,10 +2441,13 @@ pub const RaftApplyStore = struct {
                     .store_id = record.store_id,
                     .node_id = record.node_id,
                 });
+                try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.node_id);
             },
             .remove_store => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
+                const existing = try self.loadStoreRecordTxn(txn, group_id, record.store_id);
+                defer if (existing) |store| metadata_table_manager.freeStore(self.alloc, store);
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -2234,37 +2458,27 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                     .store_id = record.store_id,
                 });
+                if (existing) |store| try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, store.node_id);
             },
-            .upsert_replica_intent => |intent| {
-                var key_buf: [192]u8 = undefined;
-                const key = try placementKeyForGroup(&key_buf, group_id, intent.record.group_id, intent.record.local_node_id);
-                const value = try encodePlacementIntent(self.alloc, intent);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                try self.upsertProjectedPlacementIntent(group_id, intent);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .placement_intent,
-                    .metadata_group_id = group_id,
-                    .group_id = intent.record.group_id,
-                    .node_id = intent.record.local_node_id,
-                });
+            .upsert_replica_intent => |replacement| {
+                try self.applyPlacementCompareAndUpsertTxn(
+                    txn,
+                    group_id,
+                    replacement.expected_metadata_version,
+                    replacement.expected_version_fence,
+                    replacement.expected_target_drain_requested,
+                    replacement.replacement,
+                );
             },
             .remove_replica_intent => |record| {
-                var key_buf: [192]u8 = undefined;
-                const key = try placementKeyForGroup(&key_buf, group_id, record.group_id, record.local_node_id);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.removeProjectedPlacementIntent(group_id, record.group_id, record.local_node_id);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .placement_intent,
-                    .metadata_group_id = group_id,
-                    .group_id = record.group_id,
-                    .node_id = record.local_node_id,
-                });
+                try self.applyPlacementRemoveIfVersionTxn(
+                    txn,
+                    group_id,
+                    record.group_id,
+                    record.local_node_id,
+                    record.expected_metadata_version,
+                );
+                try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.local_node_id);
             },
             .upsert_table => |record| {
                 try self.applyTableUpsertTxn(txn, group_id, record);
@@ -2572,18 +2786,50 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
-            .upsert_reallocation_request => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
+            .upsert_reallocation_request => |record| admit: {
+                var active_key_buf: [160]u8 = undefined;
+                const active_key = try reallocationRequestKeyForGroup(&active_key_buf, group_id);
+                const active: ?[]const u8 = txn.get(active_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (active) |encoded| {
+                    var pos: usize = 0;
+                    const current = try readReallocationRequestRecord(encoded, &pos);
+                    if (pos != encoded.len) return error.InvalidMetadataRecord;
+                    // Reapplying the active command is idempotent and must not
+                    // manufacture a successor generation.
+                    if (current.request_id == record.request_id) break :admit;
+
+                    // Keep the published generation stable while stores
+                    // acknowledge it, but retain one durable rerun latch. A
+                    // newer trigger may safely replace this private pending
+                    // value because no store can observe it until promotion.
+                    var pending_key_buf: [168]u8 = undefined;
+                    const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                    const value = try encodeReallocationRequestRecord(self.alloc, record);
+                    defer self.alloc.free(value);
+                    try txn.put(pending_key, value);
+                    break :admit;
+                }
+
                 const value = try encodeReallocationRequestRecord(self.alloc, record);
                 defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                try txn.put(active_key, value);
+                // This key should only coexist with an active request. Remove
+                // any orphan defensively when establishing a new generation.
+                var pending_key_buf: [168]u8 = undefined;
+                const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                txn.delete(pending_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = active_key });
             },
             .remove_reallocation_request => |expected| remove: {
-                var key_buf: [160]u8 = undefined;
-                const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
-                const encoded = txn.get(key) catch |err| switch (err) {
+                var active_key_buf: [160]u8 = undefined;
+                const active_key = try reallocationRequestKeyForGroup(&active_key_buf, group_id);
+                const encoded = txn.get(active_key) catch |err| switch (err) {
                     error.NotFound => break :remove,
                     else => return err,
                 };
@@ -2591,11 +2837,28 @@ pub const RaftApplyStore = struct {
                 const current = try readReallocationRequestRecord(encoded, &pos);
                 if (pos != encoded.len) return error.InvalidMetadataRecord;
                 if (current.request_id != expected.expected_request_id) break :remove;
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
+
+                var pending_key_buf: [168]u8 = undefined;
+                const pending_key = try pendingReallocationRequestKeyForGroup(&pending_key_buf, group_id);
+                const pending_encoded: ?[]const u8 = txn.get(pending_key) catch |err| switch (err) {
+                    error.NotFound => null,
                     else => return err,
                 };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                if (pending_encoded) |pending_value| {
+                    var pending_pos: usize = 0;
+                    const pending = try readReallocationRequestRecord(pending_value, &pending_pos);
+                    if (pending_pos != pending_value.len) return error.InvalidMetadataRecord;
+                    const promoted_value = try encodeReallocationRequestRecord(self.alloc, pending);
+                    defer self.alloc.free(promoted_value);
+                    try txn.put(active_key, promoted_value);
+                    try txn.delete(pending_key);
+                } else {
+                    txn.delete(active_key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = active_key });
             },
             .upsert_extension_package => |record| {
                 var key_buf: [256]u8 = undefined;
@@ -3379,7 +3642,15 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyNodeShutdownRequestTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, node_id: u64) !void {
-        try self.setNodeLifecycleTxn(txn, group_id, node_id, metadata_table_manager.node_lifecycle_draining, true);
+        const existing = try self.loadNodeRecordTxn(txn, group_id, node_id);
+        defer if (existing) |record| metadata_table_manager.freeNode(self.alloc, record);
+        // A retried request is idempotent across every accepted shutdown
+        // phase. Only cancellation may move finalizing back to active; keeping
+        // this state monotonic preserves the one-shot finalize intent while
+        // placement or store observations drain.
+        if (existing == null or !metadata_table_manager.nodeLifecycleFinalizing(existing.?.lifecycle)) {
+            try self.setNodeLifecycleTxn(txn, group_id, node_id, metadata_table_manager.node_lifecycle_draining, true);
+        }
         try self.setNodeStoresDrainRequestedTxn(txn, group_id, node_id, true);
     }
 
@@ -3396,9 +3667,17 @@ pub const RaftApplyStore = struct {
         defer if (existing_node) |record| metadata_table_manager.freeNode(self.alloc, record);
         var draining_node = false;
         if (existing_node) |record| {
-            if (metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return error.ActiveNodeFinalizeRejected;
+            // Explicit cancellation wins if it commits before finalization.
+            // Other debt races retain a durable finalizing lifecycle below so
+            // the accepted one-shot request is not silently lost.
+            if (metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return;
             draining_node = true;
         }
+
+        // Placement ownership is the durable deletion fence. Observational
+        // store debt below may lag, but finalization must never remove the
+        // node/store records while a placement still targets this node.
+        var has_termination_debt = try self.nodeHasPlacementIntentTxn(txn, group_id, node_id);
 
         const StoreRef = struct {
             store_id: u64,
@@ -3418,10 +3697,26 @@ pub const RaftApplyStore = struct {
                 const store = try decodeStoreRecord(self.alloc, kv.value);
                 defer metadata_table_manager.freeStore(self.alloc, store);
                 if (store.node_id == node_id) {
-                    if (!draining_node and !store.drain_requested) return error.ActiveNodeFinalizeRejected;
+                    if (!draining_node and !store.drain_requested) return;
+                    has_termination_debt = has_termination_debt or metadata_table_manager.storeHasTerminationDebt(store);
                     try stores_to_delete.append(self.alloc, .{ .store_id = store.store_id, .node_id = store.node_id });
                 }
             }
+        }
+
+        if (has_termination_debt) {
+            // Persist the accepted finalization request in the same record
+            // whose draining lifecycle already fences new placement. Store
+            // status and placement-removal commands retry only this node when
+            // they clear debt, avoiding a metadata-wide polling scan.
+            try self.setNodeLifecycleTxn(
+                txn,
+                group_id,
+                node_id,
+                metadata_table_manager.node_lifecycle_finalizing,
+                true,
+            );
+            return;
         }
 
         txn.delete(node_key) catch |err| switch (err) {
@@ -3445,6 +3740,38 @@ pub const RaftApplyStore = struct {
                 .node_id = store.node_id,
             });
         }
+    }
+
+    fn retryPendingNodeShutdownFinalizeTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        node_id: u64,
+    ) !void {
+        const node = (try self.loadNodeRecordTxn(txn, group_id, node_id)) orelse return;
+        defer metadata_table_manager.freeNode(self.alloc, node);
+        if (!metadata_table_manager.nodeLifecycleFinalizing(node.lifecycle)) return;
+        try self.applyNodeShutdownFinalizeTxn(txn, group_id, node_id);
+    }
+
+    fn nodeHasPlacementIntentTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        node_id: u64,
+    ) !bool {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try placementPrefixForGroup(&prefix_buf, metadata_group_id);
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var entry = try cur.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const intent = try decodePlacementIntent(self.alloc, kv.value);
+            defer raft_reconciler.freeIntentOwned(self.alloc, intent);
+            if (intent.record.local_node_id == node_id) return true;
+        }
+        return false;
     }
 
     fn setNodeLifecycleTxn(
@@ -3585,6 +3912,189 @@ pub const RaftApplyStore = struct {
         return !metadata_table_manager.nodeLifecycleActive(node.lifecycle);
     }
 
+    fn loadPlacementIntentTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        placement_key: []const u8,
+    ) !?raft_reconciler.PlacementIntent {
+        const encoded = txn.get(placement_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try decodePlacementIntent(self.alloc, encoded);
+    }
+
+    fn loadPlacementVersionFenceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range_group_id: u64,
+        local_node_id: u64,
+    ) !u64 {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        const key = try placementVersionKeyForGroup(&key_buf, metadata_group_id, range_group_id, local_node_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        if (encoded.len != @sizeOf(u64)) return error.InvalidPlacementVersionFence;
+        return std.mem.readInt(u64, encoded[0..@sizeOf(u64)], .little);
+    }
+
+    fn writePlacementVersionFenceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range_group_id: u64,
+        local_node_id: u64,
+        version: u64,
+    ) !void {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        const key = try placementVersionKeyForGroup(&key_buf, metadata_group_id, range_group_id, local_node_id);
+        var encoded: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, version, .little);
+        try txn.put(key, &encoded);
+    }
+
+    fn advancePlacementVersionFenceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range_group_id: u64,
+        local_node_id: u64,
+        observed_version: u64,
+    ) !u64 {
+        const current = try self.loadPlacementVersionFenceTxn(txn, metadata_group_id, range_group_id, local_node_id);
+        const basis = @max(current, observed_version);
+        if (basis == std.math.maxInt(u64)) return error.PlacementVersionExhausted;
+        const next = basis + 1;
+        try self.writePlacementVersionFenceTxn(txn, metadata_group_id, range_group_id, local_node_id, next);
+        return next;
+    }
+
+    fn placementTargetDrainRequestedTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        intent: raft_reconciler.PlacementIntent,
+    ) !?bool {
+        const node = (try self.loadNodeRecordTxn(txn, metadata_group_id, intent.record.local_node_id)) orelse return null;
+        defer metadata_table_manager.freeNode(self.alloc, node);
+        var drain_requested = !metadata_table_manager.nodeLifecycleActive(node.lifecycle);
+        if (intent.store_id != 0) {
+            const store = (try self.loadStoreRecordTxn(txn, metadata_group_id, intent.store_id)) orelse return null;
+            defer metadata_table_manager.freeStore(self.alloc, store);
+            if (store.node_id != intent.record.local_node_id) return null;
+            drain_requested = drain_requested or store.drain_requested;
+        }
+        return drain_requested;
+    }
+
+    fn applyPlacementCompareAndUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+        replacement: raft_reconciler.PlacementIntent,
+    ) !void {
+        const target_drain_requested = (try self.placementTargetDrainRequestedTxn(
+            txn,
+            metadata_group_id,
+            replacement,
+        )) orelse return;
+        if (target_drain_requested != expected_target_drain_requested) return;
+        if (target_drain_requested and
+            replacement.serving_state != .draining and
+            replacement.serving_state != .retiring)
+        {
+            return;
+        }
+
+        var key_buf: [192]u8 = undefined;
+        const key = try placementKeyForGroup(
+            &key_buf,
+            metadata_group_id,
+            replacement.record.group_id,
+            replacement.record.local_node_id,
+        );
+        const existing = try self.loadPlacementIntentTxn(txn, key);
+        defer if (existing) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
+        const current_version_fence = try self.loadPlacementVersionFenceTxn(
+            txn,
+            metadata_group_id,
+            replacement.record.group_id,
+            replacement.record.local_node_id,
+        );
+        if (current_version_fence != expected_version_fence) return;
+        if (expected_metadata_version) |expected| {
+            if (existing == null or
+                existing.?.record.metadata_version != expected or
+                replacement.record.metadata_version != expected or
+                expected != expected_version_fence)
+            {
+                return;
+            }
+        } else if (existing != null or replacement.record.metadata_version != 0) {
+            return;
+        }
+
+        const next_version = try self.advancePlacementVersionFenceTxn(
+            txn,
+            metadata_group_id,
+            replacement.record.group_id,
+            replacement.record.local_node_id,
+            if (existing) |intent| intent.record.metadata_version else 0,
+        );
+        var applied = replacement;
+        applied.record.metadata_version = next_version;
+        const value = try encodePlacementIntent(self.alloc, applied);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        try self.upsertProjectedPlacementIntent(metadata_group_id, applied);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .placement_intent,
+            .metadata_group_id = metadata_group_id,
+            .group_id = applied.record.group_id,
+            .node_id = applied.record.local_node_id,
+        });
+    }
+
+    fn applyPlacementRemoveIfVersionTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range_group_id: u64,
+        local_node_id: u64,
+        expected_metadata_version: u64,
+    ) !void {
+        var key_buf: [192]u8 = undefined;
+        const key = try placementKeyForGroup(&key_buf, metadata_group_id, range_group_id, local_node_id);
+        const existing = (try self.loadPlacementIntentTxn(txn, key)) orelse return;
+        defer raft_reconciler.freeIntentOwned(self.alloc, existing);
+        if (existing.record.metadata_version != expected_metadata_version) return;
+        _ = try self.advancePlacementVersionFenceTxn(
+            txn,
+            metadata_group_id,
+            range_group_id,
+            local_node_id,
+            existing.record.metadata_version,
+        );
+        try txn.delete(key);
+        self.removeProjectedPlacementIntent(metadata_group_id, range_group_id, local_node_id);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .placement_intent,
+            .metadata_group_id = metadata_group_id,
+            .group_id = range_group_id,
+            .node_id = local_node_id,
+        });
+    }
+
     fn loadStoreRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64) !?metadata.StoreRecord {
         var key_buf: [160]u8 = undefined;
         const key = try storeKeyForGroup(&key_buf, group_id, store_id);
@@ -3698,8 +4208,106 @@ fn replicationCutoverRetirementCleared(
 }
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 12;
 const group_status_record_version: u16 = 4;
+const metadata_incarnation_extension_magic = "afmi1";
+const metadata_incarnation_extension_version: u16 = 1;
+// Store records predate framing and are read by mixed-version metadata
+// replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
+// self-identifying for current readers, but legacy readers do not ignore them;
+// embedded record-version upgrades therefore require capability negotiation.
+const store_record_extension_magic = "afsx1";
+const store_record_extension_legacy_version: u16 = 1;
+const store_record_extension_version: u16 = 2;
+const reallocation_request_extension_magic = "afrr1";
+const reallocation_request_extension_version: u16 = 1;
+
+const MetadataIncarnationRecord = struct {
+    incarnation: metadata_incarnation.MetadataClusterIncarnation,
+    runtime_status_record_version: u16 = 0,
+};
+
+fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationRecord {
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    if (encoded.len < incarnation_len) return error.InvalidMetadataIncarnation;
+
+    var incarnation: metadata_incarnation.MetadataClusterIncarnation = undefined;
+    @memcpy(&incarnation, encoded[0..incarnation_len]);
+    if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+    if (encoded.len == incarnation_len) return .{ .incarnation = incarnation };
+
+    const extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    if (encoded.len != incarnation_len + extension_len or
+        !std.mem.eql(
+            u8,
+            encoded[incarnation_len..][0..metadata_incarnation_extension_magic.len],
+            metadata_incarnation_extension_magic,
+        ))
+    {
+        return error.InvalidMetadataIncarnation;
+    }
+    var pos: usize = incarnation_len + metadata_incarnation_extension_magic.len;
+    const extension_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
+    pos += @sizeOf(u16);
+    if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
+    if (runtime_status_record_version < runtime_status_protocol.repair_status_record_version or
+        runtime_status_record_version > runtime_status_protocol.current_record_version)
+    {
+        return error.InvalidMetadataIncarnation;
+    }
+    return .{
+        .incarnation = incarnation,
+        .runtime_status_record_version = runtime_status_record_version,
+    };
+}
+
+fn activateRuntimeStatusProtocolTxn(
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    target_version: u16,
+) !void {
+    var key_buf: [160]u8 = undefined;
+    const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+    const existing = txn.get(key) catch |err| switch (err) {
+        // Production admission requires an incarnation before v13 can be
+        // proposed. Preserve the historical state-machine behavior for direct
+        // test/embedding callers that apply a store before initialization.
+        error.NotFound => return,
+        else => return err,
+    };
+    const decoded = try decodeMetadataIncarnationRecord(existing);
+    if (target_version < runtime_status_protocol.repair_status_record_version or
+        target_version > runtime_status_protocol.current_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (decoded.runtime_status_record_version >= target_version) return;
+
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    var encoded: [encoded_len]u8 = undefined;
+    @memcpy(encoded[0..incarnation_len], &decoded.incarnation);
+    var pos: usize = incarnation_len;
+    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
+    pos += metadata_incarnation_extension_magic.len;
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], target_version, .little);
+    try txn.put(key, &encoded);
+}
+
+fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.repair_status != null) return true;
+        }
+    }
+    return false;
+}
+
+fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
+    if (record.reporter_incarnation != 0 or record.status_generation != 0)
+        return runtime_status_protocol.current_record_version;
+    if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
+    return null;
+}
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,
@@ -3798,14 +4406,19 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.remove_store));
             try appendInt(alloc, &out, u64, record.store_id);
         },
-        .upsert_replica_intent => |intent| {
+        .upsert_replica_intent => |replacement| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_replica_intent));
-            try appendPlacementIntent(alloc, &out, intent);
+            try out.append(alloc, @intFromBool(replacement.expected_metadata_version != null));
+            if (replacement.expected_metadata_version) |version| try appendInt(alloc, &out, u64, version);
+            try appendInt(alloc, &out, u64, replacement.expected_version_fence);
+            try out.append(alloc, @intFromBool(replacement.expected_target_drain_requested));
+            try appendPlacementIntent(alloc, &out, replacement.replacement);
         },
         .remove_replica_intent => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_replica_intent));
             try appendInt(alloc, &out, u64, record.group_id);
             try appendInt(alloc, &out, u64, record.local_node_id);
+            try appendInt(alloc, &out, u64, record.expected_metadata_version);
         },
         .upsert_table => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_table));
@@ -4024,13 +4637,28 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .remove_store => .{
             .remove_store = .{ .store_id = try readInt(encoded, &pos, u64) },
         },
-        .upsert_replica_intent => .{
-            .upsert_replica_intent = try readPlacementIntent(alloc, encoded, &pos),
+        .upsert_replica_intent => blk: {
+            const has_expected = try readInt(encoded, &pos, u8);
+            if (has_expected > 1) return error.InvalidMetadataTransitionEncoding;
+            const expected_metadata_version = if (has_expected == 1)
+                try readInt(encoded, &pos, u64)
+            else
+                null;
+            const expected_version_fence = try readInt(encoded, &pos, u64);
+            const expected_target_drain_requested = try readInt(encoded, &pos, u8);
+            if (expected_target_drain_requested > 1) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .upsert_replica_intent = .{
+                .expected_metadata_version = expected_metadata_version,
+                .expected_version_fence = expected_version_fence,
+                .expected_target_drain_requested = expected_target_drain_requested == 1,
+                .replacement = try readPlacementIntent(alloc, encoded, &pos),
+            } };
         },
         .remove_replica_intent => .{
             .remove_replica_intent = .{
                 .group_id = try readInt(encoded, &pos, u64),
                 .local_node_id = try readInt(encoded, &pos, u64),
+                .expected_metadata_version = try readInt(encoded, &pos, u64),
             },
         },
         .upsert_table => .{
@@ -4459,6 +5087,45 @@ fn appendStoreRecord(
     try appendInt(alloc, out, u32, @intCast(record.runtime_statuses.len));
     for (record.runtime_statuses) |runtime_status| try appendRuntimeGroupStatusRecord(alloc, out, runtime_status);
     try out.append(alloc, if (record.drain_requested) 1 else 0);
+    try appendStoreRecordExtensions(alloc, out, record);
+}
+
+fn appendStoreRecordExtensions(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.StoreRecord,
+) !void {
+    if (!metadata_table_manager.reporterFenceValid(
+        record.reporter_incarnation,
+        record.status_generation,
+    )) return error.InvalidStoreReporterFence;
+    var observation_count: u32 = 0;
+    for (record.group_statuses) |status| {
+        if (status.observed_reallocation_request_id != 0) observation_count += 1;
+    }
+    const has_reporter_fence = record.reporter_incarnation != 0 or record.status_generation != 0;
+    if (observation_count == 0 and !has_reporter_fence) return;
+
+    try out.appendSlice(alloc, store_record_extension_magic);
+    const version: u16 = if (has_reporter_fence)
+        store_record_extension_version
+    else
+        store_record_extension_legacy_version;
+    try appendInt(alloc, out, u16, version);
+    if (version >= store_record_extension_version) {
+        try appendInt(alloc, out, u64, record.reporter_incarnation);
+        try appendInt(alloc, out, u64, record.status_generation);
+    }
+    try appendInt(alloc, out, u32, observation_count);
+    for (record.group_statuses, 0..) |status, status_index| {
+        if (status.observed_reallocation_request_id == 0) continue;
+        // Group reports are intentionally permitted to contain duplicate group
+        // IDs so reconciliation can treat the report as ambiguous and fail
+        // closed. Address the extension by position so that ambiguity remains
+        // representable in the committed command instead of making apply fail.
+        try appendInt(alloc, out, u32, @intCast(status_index));
+        try appendInt(alloc, out, u128, status.observed_reallocation_request_id);
+    }
 }
 
 fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !metadata.StoreRecord {
@@ -4524,9 +5191,12 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         pos.* += 1;
         break :blk value;
     } else false;
+    const extensions = try readStoreRecordExtensions(encoded, pos, group_statuses);
     return .{
         .store_id = store_id,
         .node_id = node_id,
+        .reporter_incarnation = extensions.reporter_incarnation,
+        .status_generation = extensions.status_generation,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -4546,12 +5216,59 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
     };
 }
 
+fn readStoreRecordExtensions(
+    encoded: []const u8,
+    pos: *usize,
+    group_statuses: []metadata.GroupStatusReport,
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0 } {
+    if (pos.* == encoded.len) return .{};
+    if (pos.* + store_record_extension_magic.len > encoded.len or
+        !std.mem.eql(
+            u8,
+            encoded[pos.* .. pos.* + store_record_extension_magic.len],
+            store_record_extension_magic,
+        ))
+    {
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    pos.* += store_record_extension_magic.len;
+
+    const version = try readInt(encoded, pos, u16);
+    if (version != store_record_extension_legacy_version and
+        version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
+    const reporter_incarnation = if (version >= store_record_extension_version)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const status_generation = if (version >= store_record_extension_version)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    if (reporter_incarnation == 0 and status_generation != 0) return error.InvalidMetadataTransitionEncoding;
+    const observation_count = try readInt(encoded, pos, u32);
+    var observation_index: u32 = 0;
+    while (observation_index < observation_count) : (observation_index += 1) {
+        const status_index = try readInt(encoded, pos, u32);
+        const request_id = try readInt(encoded, pos, u128);
+        if (request_id == 0 or status_index >= group_statuses.len) return error.InvalidMetadataTransitionEncoding;
+        const status = &group_statuses[status_index];
+        if (status.observed_reallocation_request_id != 0) return error.InvalidMetadataTransitionEncoding;
+        status.observed_reallocation_request_id = request_id;
+    }
+    if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
+    return .{
+        .reporter_incarnation = reporter_incarnation,
+        .status_generation = status_generation,
+    };
+}
+
 fn appendRuntimeGroupStatusRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.RuntimeGroupStatusReport,
 ) !void {
-    try appendInt(alloc, out, u16, runtime_status_record_version);
+    const version = runtimeGroupStatusRecordVersion(record);
+    try appendInt(alloc, out, u16, version);
     try appendInt(alloc, out, u64, record.table_id);
     try appendRequiredString(alloc, out, record.table_name);
     try appendInt(alloc, out, u64, record.group_id);
@@ -4576,7 +5293,14 @@ fn appendRuntimeGroupStatusRecord(
     try appendRuntimeDocIdentityStatusRecord(alloc, out, record.doc_identity);
     try appendRuntimeDocSetPlanningStatusRecord(alloc, out, record.doc_set_planning);
     try appendInt(alloc, out, u32, @intCast(record.indexes.len));
-    for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index);
+    for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index, version);
+}
+
+fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
+    for (record.indexes) |index| {
+        if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
+    }
+    return runtime_status_protocol.legacy_record_version;
 }
 
 fn appendRuntimeEnrichmentStatusRecord(
@@ -4725,8 +5449,22 @@ fn readRuntimeGroupStatusRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
+    return try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded,
+        pos,
+        runtime_status_protocol.current_record_version,
+    );
+}
+
+fn readRuntimeGroupStatusRecordWithMaxVersion(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    max_supported_version: u16,
+) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version == 0 or version > runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version == 0 or version > max_supported_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -4962,6 +5700,7 @@ fn appendRuntimeIndexStatusRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.RuntimeIndexStatusReport,
+    version: u16,
 ) !void {
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.kind);
@@ -4983,6 +5722,13 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
+    if (version >= runtime_status_protocol.repair_status_record_version) {
+        try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
+        try out.append(
+            alloc,
+            if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
+        );
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5028,6 +5774,26 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = if (version >= 11) try readOptionalString(alloc, encoded, pos) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const repair_status: ?metadata.IndexRepairStatus = if (version >= 13) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const tag = encoded[pos.*];
+        pos.* += 1;
+        break :blk switch (tag) {
+            0 => null,
+            @intFromEnum(metadata.IndexRepairStatus.rebuilding) => .rebuilding,
+            @intFromEnum(metadata.IndexRepairStatus.waiting) => .waiting,
+            @intFromEnum(metadata.IndexRepairStatus.paused) => .paused,
+            @intFromEnum(metadata.IndexRepairStatus.failed) => .failed,
+            else => return error.InvalidMetadataTransitionEncoding,
+        };
+    } else null;
+    const repair_active_generation_serviceable = if (version >= 13) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
+        break :blk value == 1;
+    } else false;
     return .{
         .name = name,
         .kind = kind,
@@ -5049,6 +5815,8 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .repair_status = repair_status,
+        .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
 }
 
@@ -5521,6 +6289,13 @@ fn appendReallocationRequestRecord(
     if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
     try appendInt(alloc, out, u128, record.request_id);
     try appendInt(alloc, out, u64, record.requested_at_ms);
+    if (record.barrier_protocol_version == 0) return;
+    try out.appendSlice(alloc, reallocation_request_extension_magic);
+    try appendInt(alloc, out, u16, reallocation_request_extension_version);
+    try appendInt(alloc, out, u16, record.barrier_protocol_version);
+    try out.appendSlice(alloc, &record.metadata_incarnation.?);
+    try appendInt(alloc, out, u32, record.protected_metadata_member_count);
+    try out.appendSlice(alloc, &record.protected_metadata_membership_fingerprint);
 }
 
 fn readTableRecord(
@@ -6349,10 +7124,37 @@ fn readReallocationRequestRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.ReallocationRequestRecord {
-    const record: metadata.ReallocationRequestRecord = .{
+    var record: metadata.ReallocationRequestRecord = .{
         .request_id = try readInt(encoded, pos, u128),
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+    if (pos.* < encoded.len) {
+        if (pos.* + reallocation_request_extension_magic.len > encoded.len or
+            !std.mem.eql(
+                u8,
+                encoded[pos.* .. pos.* + reallocation_request_extension_magic.len],
+                reallocation_request_extension_magic,
+            ))
+        {
+            return error.InvalidMetadataRecord;
+        }
+        pos.* += reallocation_request_extension_magic.len;
+        const version = try readInt(encoded, pos, u16);
+        if (version != reallocation_request_extension_version) return error.InvalidMetadataRecord;
+        record.barrier_protocol_version = try readInt(encoded, pos, u16);
+        if (pos.* + @sizeOf(metadata.MetadataClusterIncarnation) > encoded.len) return error.InvalidMetadataRecord;
+        var incarnation: metadata.MetadataClusterIncarnation = undefined;
+        @memcpy(&incarnation, encoded[pos.*..][0..incarnation.len]);
+        pos.* += incarnation.len;
+        record.metadata_incarnation = incarnation;
+        record.protected_metadata_member_count = try readInt(encoded, pos, u32);
+        if (pos.* + record.protected_metadata_membership_fingerprint.len > encoded.len) return error.InvalidMetadataRecord;
+        @memcpy(
+            &record.protected_metadata_membership_fingerprint,
+            encoded[pos.*..][0..record.protected_metadata_membership_fingerprint.len],
+        );
+        pos.* += record.protected_metadata_membership_fingerprint.len;
+    }
     if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
     return record;
 }
@@ -6547,6 +7349,10 @@ pub fn placementPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement:{d}:", .{group_id});
 }
 
+pub fn placementVersionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement_version:{d}:", .{group_id});
+}
+
 pub fn nodePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_node:{d}:", .{group_id});
 }
@@ -6627,6 +7433,10 @@ pub fn reallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request:{d}", .{group_id});
 }
 
+fn pendingReallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request_pending:{d}", .{group_id});
+}
+
 pub fn shuffleJoinLeaseKeyForGroup(buf: []u8, group_id: u64, job_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_shuffle_join_lease:{d}:{d}", .{ group_id, job_id });
 }
@@ -6681,6 +7491,10 @@ fn rangeKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64) ![]const u8 {
 
 fn placementKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64, local_node_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement:{d}:{d}:{d}", .{ group_id, range_group_id, local_node_id });
+}
+
+fn placementVersionKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64, local_node_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_placement_version:{d}:{d}:{d}", .{ group_id, range_group_id, local_node_id });
 }
 
 fn nodeKeyForGroup(buf: []u8, group_id: u64, node_id: u64) ![]const u8 {
@@ -7873,6 +8687,199 @@ test "metadata raft apply store ignores stale drained first store registration a
     try std.testing.expect(!stores[0].drain_requested);
 }
 
+test "metadata raft apply store fences stale placement plans across drain cancellation and finalization" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_root);
+    const restored_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence-restored", .{tmp.sub_path});
+    defer std.testing.allocator.free(restored_root);
+
+    const register_node = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
+        .node_id = 12,
+        .role = "data",
+        .lifecycle = metadata_table_manager.node_lifecycle_active,
+    } });
+    defer std.testing.allocator.free(register_node);
+    const register_store = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 12,
+        .node_id = 12,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    } });
+    defer std.testing.allocator.free(register_store);
+    const create_serving = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+        },
+    } });
+    defer std.testing.allocator.free(create_serving);
+    const recreate_serving_v3 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 3,
+        .expected_target_drain_requested = false,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+        },
+    } });
+    defer std.testing.allocator.free(recreate_serving_v3);
+    const request_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(request_shutdown);
+    const cancel_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .cancel_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(cancel_shutdown);
+    const finalize_shutdown = try encodeTransitionCommand(std.testing.allocator, .{ .finalize_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(finalize_shutdown);
+    const stale_serving_v1 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = 1,
+        .expected_version_fence = 1,
+        .expected_target_drain_requested = false,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 1 },
+            .store_id = 12,
+            .peer_node_ids = &.{ 12, 14 },
+        },
+    } });
+    defer std.testing.allocator.free(stale_serving_v1);
+    const draining_v1 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = 1,
+        .expected_version_fence = 1,
+        .expected_target_drain_requested = true,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 1 },
+            .store_id = 12,
+            .peer_node_ids = &.{ 12, 13 },
+            .serving_state = .draining,
+        },
+    } });
+    defer std.testing.allocator.free(draining_v1);
+    const remove_v2 = try encodeTransitionCommand(std.testing.allocator, .{ .remove_replica_intent = .{
+        .group_id = 1201,
+        .local_node_id = 12,
+        .expected_metadata_version = 2,
+    } });
+    defer std.testing.allocator.free(remove_v2);
+    const draining_v4 = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = 4,
+        .expected_version_fence = 4,
+        .expected_target_drain_requested = true,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12, .metadata_version = 4 },
+            .store_id = 12,
+            .peer_node_ids = &.{ 12, 13 },
+            .serving_state = .draining,
+        },
+    } });
+    defer std.testing.allocator.free(draining_v4);
+    const remove_v5 = try encodeTransitionCommand(std.testing.allocator, .{ .remove_replica_intent = .{
+        .group_id = 1201,
+        .local_node_id = 12,
+        .expected_metadata_version = 5,
+    } });
+    defer std.testing.allocator.free(remove_v5);
+
+    const drain_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = register_node },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = register_store },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = create_serving },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = request_shutdown },
+        // A pre-shutdown serving plan cannot overwrite the drain request.
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = stale_serving_v1 },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = draining_v1 },
+        // The same plan cannot overwrite the version it just advanced.
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = draining_v1 },
+    });
+    defer std.testing.allocator.free(drain_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 7,
+        .entries_bytes = drain_entries,
+    });
+    {
+        const intents = try store.listPlacementIntents(std.testing.allocator, 21);
+        defer store.freePlacementIntents(std.testing.allocator, intents);
+        try std.testing.expectEqual(@as(usize, 1), intents.len);
+        try std.testing.expectEqual(@as(u64, 2), intents[0].record.metadata_version);
+        try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, intents[0].serving_state);
+        try std.testing.expectEqualSlices(u64, &.{ 12, 13 }, intents[0].peer_node_ids);
+    }
+
+    const pre_snapshot_cancel_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 8, .entry_type = .normal, .data = remove_v2 },
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = cancel_shutdown },
+        // The cancelled drain rejects its old expected drain state.
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = draining_v1 },
+    });
+    defer std.testing.allocator.free(pre_snapshot_cancel_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 10,
+        .entries_bytes = pre_snapshot_cancel_entries,
+    });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(std.testing.allocator, 21);
+    defer std.testing.allocator.free(snapshot);
+
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = restored_root });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(std.testing.allocator, 21, 10, snapshot));
+    const post_snapshot_cancel_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        // A stale absence plan is fenced after the intervening create/remove.
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = create_serving },
+        // A freshly observed absence can create the next incarnation.
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = recreate_serving_v3 },
+        // An old removal cannot delete the new placement incarnation.
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = remove_v2 },
+    });
+    defer std.testing.allocator.free(post_snapshot_cancel_entries);
+    try restored.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 13,
+        .entries_bytes = post_snapshot_cancel_entries,
+    });
+    {
+        const intents = try restored.listPlacementIntents(std.testing.allocator, 21);
+        defer restored.freePlacementIntents(std.testing.allocator, intents);
+        try std.testing.expectEqual(@as(usize, 1), intents.len);
+        try std.testing.expectEqual(@as(u64, 4), intents[0].record.metadata_version);
+        try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, intents[0].serving_state);
+        const fences = try restored.listPlacementVersionFences(std.testing.allocator, 21);
+        defer std.testing.allocator.free(fences);
+        try std.testing.expectEqual(@as(usize, 1), fences.len);
+        try std.testing.expectEqual(@as(u64, 1201), fences[0].group_id);
+        try std.testing.expectEqual(@as(u64, 12), fences[0].local_node_id);
+        try std.testing.expectEqual(@as(u64, 4), fences[0].version);
+    }
+
+    const finalize_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 3, .index = 14, .entry_type = .normal, .data = request_shutdown },
+        .{ .term = 3, .index = 15, .entry_type = .normal, .data = draining_v4 },
+        .{ .term = 3, .index = 16, .entry_type = .normal, .data = remove_v5 },
+        .{ .term = 3, .index = 17, .entry_type = .normal, .data = finalize_shutdown },
+        // Missing finalized ownership rejects even an absence-matching create.
+        .{ .term = 3, .index = 18, .entry_type = .normal, .data = create_serving },
+    });
+    defer std.testing.allocator.free(finalize_entries);
+    try restored.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 18,
+        .entries_bytes = finalize_entries,
+    });
+    const final_intents = try restored.listPlacementIntents(std.testing.allocator, 21);
+    defer restored.freePlacementIntents(std.testing.allocator, final_intents);
+    try std.testing.expectEqual(@as(usize, 0), final_intents.len);
+}
+
 test "metadata raft apply store ignores stale draining node registration after cancellation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7911,7 +8918,7 @@ test "metadata raft apply store ignores stale draining node registration after c
     try std.testing.expect(metadata_table_manager.nodeLifecycleActive(nodes[0].lifecycle));
 }
 
-test "metadata raft apply store finalizes node shutdown by deleting node and stores" {
+test "metadata raft apply store waits for termination debt before finalizing node shutdown" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7923,6 +8930,11 @@ test "metadata raft apply store finalizes node shutdown by deleting node and sto
         .updated_at_millis = 10,
         .local_voter = true,
         .voter_count = 1,
+    }};
+    const foreign_runtime_statuses = [_]metadata.RuntimeGroupStatusReport{.{
+        .group_id = 99,
+        .node_id = 12,
+        .store_id = 99,
     }};
     const target_node_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_node = .{ .node_id = 12, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_draining },
@@ -7948,24 +8960,102 @@ test "metadata raft apply store finalizes node shutdown by deleting node and sto
         .upsert_store = .{ .store_id = 13, .node_id = 13, .role = "data", .health_class = "healthy", .live = true },
     });
     defer std.testing.allocator.free(other_store_cmd);
+    const placement_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = true,
+        .replacement = .{
+            .record = .{ .group_id = 41, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+            .serving_state = .draining,
+        },
+    } });
+    defer std.testing.allocator.free(placement_cmd);
+    const remove_placement_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .remove_replica_intent = .{
+        .group_id = 41,
+        .local_node_id = 12,
+        .expected_metadata_version = 1,
+    } });
+    defer std.testing.allocator.free(remove_placement_cmd);
+    const clear_target_store_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 12,
+            .node_id = 12,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .drain_requested = true,
+            .runtime_statuses = @constCast(foreign_runtime_statuses[0..]),
+        },
+    });
+    defer std.testing.allocator.free(clear_target_store_cmd);
     const finalize_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .finalize_node_shutdown = .{ .node_id = 12 } });
     defer std.testing.allocator.free(finalize_cmd);
+    const retry_shutdown_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .request_node_shutdown = .{ .node_id = 12 } });
+    defer std.testing.allocator.free(retry_shutdown_cmd);
 
-    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+    const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = target_node_cmd },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = other_node_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = target_store_cmd },
         .{ .term = 1, .index = 4, .entry_type = .normal, .data = other_store_cmd },
-        .{ .term = 2, .index = 5, .entry_type = .normal, .data = finalize_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = placement_cmd },
+        .{ .term = 2, .index = 6, .entry_type = .normal, .data = finalize_cmd },
+        // Retrying the original request after finalization was accepted must
+        // not erase the durable completion intent.
+        .{ .term = 2, .index = 7, .entry_type = .normal, .data = retry_shutdown_cmd },
     });
-    defer std.testing.allocator.free(encoded_entries);
+    defer std.testing.allocator.free(initial_entries);
 
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 24,
-        .commit_index = 5,
-        .entries_bytes = encoded_entries,
+        .commit_index = 7,
+        .entries_bytes = initial_entries,
+    });
+    {
+        const nodes = try store.listNodes(std.testing.allocator, 24);
+        defer store.freeNodes(std.testing.allocator, nodes);
+        const stores = try store.listStores(std.testing.allocator, 24);
+        defer store.freeStores(std.testing.allocator, stores);
+        try std.testing.expectEqual(@as(usize, 2), nodes.len);
+        try std.testing.expectEqual(@as(usize, 2), stores.len);
+        const target = if (nodes[0].node_id == 12) nodes[0] else nodes[1];
+        try std.testing.expect(metadata_table_manager.nodeLifecycleFinalizing(target.lifecycle));
+    }
+
+    // Removing the durable placement still leaves the store's last observed
+    // runtime/membership debt. The original accepted finalization intent stays
+    // durable; no second finalize command is needed.
+    const placement_removed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 8, .entry_type = .normal, .data = remove_placement_cmd },
+    });
+    defer std.testing.allocator.free(placement_removed_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 24,
+        .commit_index = 8,
+        .entries_bytes = placement_removed_entries,
+    });
+    {
+        const nodes = try store.listNodes(std.testing.allocator, 24);
+        defer store.freeNodes(std.testing.allocator, nodes);
+        try std.testing.expectEqual(@as(usize, 2), nodes.len);
+        const target = if (nodes[0].node_id == 12) nodes[0] else nodes[1];
+        try std.testing.expect(metadata_table_manager.nodeLifecycleFinalizing(target.lifecycle));
+    }
+
+    // Clearing the final store observation transactionally completes the
+    // pending finalization without mutation retries or a polling scan.
+    const drained_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 9, .entry_type = .normal, .data = clear_target_store_cmd },
+    });
+    defer std.testing.allocator.free(drained_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 24,
+        .commit_index = 9,
+        .entries_bytes = drained_entries,
     });
 
     const nodes = try store.listNodes(std.testing.allocator, 24);
@@ -7979,7 +9069,7 @@ test "metadata raft apply store finalizes node shutdown by deleting node and sto
     try std.testing.expectEqual(@as(u64, 13), stores[0].store_id);
 }
 
-test "metadata raft apply store rejects finalizing active node shutdown" {
+test "metadata raft apply store commits active node finalization as a no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8015,11 +9105,11 @@ test "metadata raft apply store rejects finalizing active node shutdown" {
         .entries_bytes = initial_entries,
     });
 
-    try std.testing.expectError(error.ActiveNodeFinalizeRejected, store.snapshotBuilder().applyBatch(.{
+    try store.snapshotBuilder().applyBatch(.{
         .group_id = 25,
         .commit_index = 3,
         .entries_bytes = finalize_entries,
-    }));
+    });
 
     const nodes = try store.listNodes(std.testing.allocator, 25);
     defer store.freeNodes(std.testing.allocator, nodes);
@@ -8032,7 +9122,7 @@ test "metadata raft apply store rejects finalizing active node shutdown" {
     try std.testing.expectEqual(@as(u64, 14), stores[0].store_id);
 }
 
-test "metadata raft apply store rejects finalizing active store-only node" {
+test "metadata raft apply store commits active store-only finalization as a no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8063,11 +9153,11 @@ test "metadata raft apply store rejects finalizing active store-only node" {
         .entries_bytes = initial_entries,
     });
 
-    try std.testing.expectError(error.ActiveNodeFinalizeRejected, store.snapshotBuilder().applyBatch(.{
+    try store.snapshotBuilder().applyBatch(.{
         .group_id = 26,
         .commit_index = 2,
         .entries_bytes = finalize_entries,
-    }));
+    });
 
     const stores = try store.listStores(std.testing.allocator, 26);
     defer store.freeStores(std.testing.allocator, stores);
@@ -8734,10 +9824,16 @@ test "metadata schema progress transition command round-trips" {
 }
 
 test "metadata reallocation request transition command round-trips" {
+    const protected_members = [_]u64{ 1, 2, 3 };
+    const fingerprint = metadata.reallocation_request.membershipFingerprint(&protected_members);
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_reallocation_request = .{
             .request_id = 17,
             .requested_at_ms = 42_000,
+            .barrier_protocol_version = metadata.reallocation_request.barrier_protocol_version,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .protected_metadata_member_count = protected_members.len,
+            .protected_metadata_membership_fingerprint = fingerprint,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -8749,6 +9845,10 @@ test "metadata reallocation request transition command round-trips" {
         .upsert_reallocation_request => |record| {
             try std.testing.expectEqual(@as(u128, 17), record.request_id);
             try std.testing.expectEqual(@as(u64, 42_000), record.requested_at_ms);
+            try std.testing.expectEqual(metadata.reallocation_request.barrier_protocol_version, record.barrier_protocol_version);
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &record.metadata_incarnation.?);
+            try std.testing.expectEqual(@as(u32, 3), record.protected_metadata_member_count);
+            try std.testing.expectEqualSlices(u8, &fingerprint, &record.protected_metadata_membership_fingerprint);
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
@@ -8769,6 +9869,18 @@ test "metadata reallocation request transition command round-trips" {
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
+}
+
+test "metadata reallocation request decoder accepts the legacy unfenced record" {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendInt(std.testing.allocator, &encoded, u128, 17);
+    try appendInt(std.testing.allocator, &encoded, u64, 42_000);
+    var pos: usize = 0;
+    const record = try readReallocationRequestRecord(encoded.items, &pos);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(u16, 0), record.barrier_protocol_version);
+    try std.testing.expect(record.metadata_incarnation == null);
 }
 
 test "metadata extension lifecycle transition command round-trips" {
@@ -9552,6 +10664,7 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
         .raft_membership_index = 87,
         .disk_bytes = 4096,
         .disk_bytes_known = true,
+        .observed_reallocation_request_id = 0x123456789abcdef00123456789abcdef,
         .local_leader = true,
         .local_voter = true,
         .voter_count = 3,
@@ -9580,8 +10693,78 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     try std.testing.expectEqual(@as(u64, 91), statuses[0].raft_applied_index);
     try std.testing.expectEqual(@as(u64, 12), statuses[0].raft_term);
     try std.testing.expectEqual(@as(u64, 87), statuses[0].raft_membership_index);
+    try std.testing.expectEqual(
+        @as(u128, 0x123456789abcdef00123456789abcdef),
+        statuses[0].observed_reallocation_request_id,
+    );
     try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
     try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
+}
+
+test "metadata raft apply store transition codec preserves duplicate group observations by position" {
+    var group_statuses = [_]metadata.GroupStatusReport{
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x1111,
+        },
+        .{
+            .group_id = 5101,
+            .observed_reallocation_request_id = 0x2222,
+        },
+    };
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_store = .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .group_statuses = group_statuses[0..],
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    const statuses = decoded.upsert_store.group_statuses;
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 5101), statuses[1].group_id);
+    try std.testing.expectEqual(@as(u128, 0x1111), statuses[0].observed_reallocation_request_id);
+    try std.testing.expectEqual(@as(u128, 0x2222), statuses[1].observed_reallocation_request_id);
+}
+
+test "metadata raft apply store transition codec preserves reporter fencing" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .register_store = .{
+            .store_id = 101,
+            .node_id = 201,
+            .reporter_incarnation = 0x1234_5678_90ab_cdef,
+            .status_generation = 42,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(u64, 0x1234_5678_90ab_cdef),
+        decoded.register_store.reporter_incarnation,
+    );
+    try std.testing.expectEqual(@as(u64, 42), decoded.register_store.status_generation);
+}
+
+test "metadata raft apply store transition codec rejects generation without incarnation" {
+    try std.testing.expectError(
+        error.InvalidStoreReporterFence,
+        encodeTransitionCommand(std.testing.allocator, .{
+            .register_store = .{
+                .store_id = 101,
+                .node_id = 201,
+                .status_generation = 42,
+            },
+        }),
+    );
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {
@@ -9591,29 +10774,49 @@ test "metadata raft apply store projects placement intents from committed entrie
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const node_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
+        .node_id = 7,
+        .role = "data",
+        .lifecycle = metadata_table_manager.node_lifecycle_active,
+    } });
+    defer std.testing.allocator.free(node_cmd);
+    const store_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 44,
+        .node_id = 7,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    } });
+    defer std.testing.allocator.free(store_cmd);
     const intent_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_replica_intent = .{
-            .record = .{
-                .group_id = 5101,
-                .replica_id = 2,
-                .local_node_id = 7,
-                .bootstrap_mode = .fetch_snapshot,
-                .metadata_version = 3,
-                .snapshot_bootstrap = .{
-                    .from_node_id = 3,
-                    .term = 8,
-                    .snapshot_id = "snap-5101",
-                    .uri = "http://127.0.0.1:7777/raft/v1/snapshot/fetch/snap-5101",
+            .expected_metadata_version = null,
+            .expected_version_fence = 0,
+            .expected_target_drain_requested = false,
+            .replacement = .{
+                .record = .{
+                    .group_id = 5101,
+                    .replica_id = 2,
+                    .local_node_id = 7,
+                    .bootstrap_mode = .fetch_snapshot,
+                    .snapshot_bootstrap = .{
+                        .from_node_id = 3,
+                        .term = 8,
+                        .snapshot_id = "snap-5101",
+                        .uri = "http://127.0.0.1:7777/raft/v1/snapshot/fetch/snap-5101",
+                    },
                 },
+                .store_id = 44,
+                .peer_node_ids = &.{ 7, 8, 9 },
+                .serving_state = .retiring,
             },
-            .store_id = 44,
-            .peer_node_ids = &.{ 7, 8, 9 },
-            .serving_state = .retiring,
         },
     });
     defer std.testing.allocator.free(intent_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = node_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = store_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = intent_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
@@ -9654,31 +10857,51 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-backup-source-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const node_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
+        .node_id = 7,
+        .role = "data",
+        .lifecycle = metadata_table_manager.node_lifecycle_active,
+    } });
+    defer std.testing.allocator.free(node_cmd);
+    const store_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 45,
+        .node_id = 7,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    } });
+    defer std.testing.allocator.free(store_cmd);
     const intent_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_replica_intent = .{
-            .record = .{
-                .group_id = 5201,
-                .replica_id = 2,
-                .local_node_id = 7,
-                .bootstrap_mode = .fetch_snapshot,
-                .metadata_version = 4,
-                .backup_restore_bootstrap = .{
-                    .backup_id = "snap-5201",
-                    .artifact_backup_id = "snap-5201",
-                    .location = "file:///tmp/backups",
-                    .snapshot_path = "snap-5201/groups/5201",
-                    .connection = "backup-store",
-                    .artifact_size_bytes = 4096,
-                    .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .expected_metadata_version = null,
+            .expected_version_fence = 0,
+            .expected_target_drain_requested = false,
+            .replacement = .{
+                .record = .{
+                    .group_id = 5201,
+                    .replica_id = 2,
+                    .local_node_id = 7,
+                    .bootstrap_mode = .fetch_snapshot,
+                    .backup_restore_bootstrap = .{
+                        .backup_id = "snap-5201",
+                        .artifact_backup_id = "snap-5201",
+                        .location = "file:///tmp/backups",
+                        .snapshot_path = "snap-5201/groups/5201",
+                        .connection = "backup-store",
+                        .artifact_size_bytes = 4096,
+                        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    },
                 },
+                .store_id = 45,
+                .peer_node_ids = &.{ 7, 8, 9 },
             },
-            .store_id = 45,
-            .peer_node_ids = &.{ 7, 8, 9 },
         },
     });
     defer std.testing.allocator.free(intent_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = node_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = store_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = intent_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
@@ -9864,6 +11087,8 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_config_hash = 0x1234,
             .coverage_identity_ready = true,
             .coverage_summary_ready = true,
+            .repair_status = .rebuilding,
+            .repair_active_generation_serviceable = true,
         }})[0..]),
     }};
 
@@ -9911,6 +11136,8 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
+    try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
 }
 
 test "metadata runtime index status decoder accepts version ten records" {
@@ -9925,12 +11152,12 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    });
+    }, runtime_status_protocol.current_record_version);
 
-    // Version 10 ended immediately after replay_catch_up_required. The final
-    // absent optional-string tag is the only field appended by version 11.
-    try std.testing.expectEqual(@as(u8, 0), encoded.items[encoded.items.len - 1]);
-    encoded.items.len -= 1;
+    // Version 10 ended immediately after replay_catch_up_required. Remove the
+    // version-11 optional load-error tag and the two version-13 repair bytes.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, encoded.items[encoded.items.len - 3 ..]);
+    encoded.items.len -= 3;
 
     var pos: usize = 0;
     const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);
@@ -9943,6 +11170,65 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expectEqual(@as(u64, 11), decoded.replay_target_sequence);
     try std.testing.expect(decoded.replay_catch_up_required);
     try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
+    try std.testing.expect(decoded.repair_status == null);
+    try std.testing.expect(!decoded.repair_active_generation_serviceable);
+}
+
+test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    var indexes = [_]metadata.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+    }};
+    const status = metadata.RuntimeGroupStatusReport{
+        .table_id = 1,
+        .table_name = "products",
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .source = "runtime",
+        .freshness = "fresh",
+        .indexes = indexes[0..],
+    };
+
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    var version_pos: usize = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.legacy_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    var legacy_pos: usize = 0;
+    const legacy_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &legacy_pos,
+        runtime_status_protocol.legacy_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, legacy_decoded);
+    try std.testing.expectEqual(encoded.items.len, legacy_pos);
+
+    encoded.clearRetainingCapacity();
+    indexes[0].repair_status = .rebuilding;
+    indexes[0].repair_active_generation_serviceable = true;
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    legacy_pos = 0;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        readRuntimeGroupStatusRecordWithMaxVersion(
+            alloc,
+            encoded.items,
+            &legacy_pos,
+            runtime_status_protocol.legacy_record_version,
+        ),
+    );
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

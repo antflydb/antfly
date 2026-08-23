@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Antfly is a distributed key-value store and vector search engine built on etcd's Raft consensus library. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
+Antfly is a distributed key-value store and vector search engine with a Zig server runtime. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-Multiple independent Go modules exist under `go/` (`go/pkg/antfly/`, `go/e2e/`, `go/pkg/sdk/`, `go/pkg/operator/`, `go/pkg/libaf/`, etc.) — each must be built from within its own directory. CLI subcommands (query, table, load, inference, etc.) are registered directly on the root command.
+The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/`, and each must be built from within its own directory. The Antfly and inference servers live under `zig/`.
 
 ## Go Version
 
@@ -32,11 +32,11 @@ See `docs/architecture.mdx` for full details.
 **Multi-Raft Design**: Separate consensus groups for metadata (cluster topology, schemas) and storage (one per shard).
 
 **Key Components**:
-- `go/pkg/antfly/src/metadata/`: Metadata server coordinating cluster operations
-- `go/pkg/antfly/src/store/`: Storage nodes handling data shards, queries, and indexes
-- `go/pkg/antfly/src/raft/`: Raft consensus wrapping etcd/raft
-- `go/pkg/antfly/src/tablemgr/`: Table and shard management
-- `go/pkg/antfly/lib/multirafthttp/`: HTTP transport for multi-raft communication
+- `zig/pkg/antfly/src/metadata/`: Metadata server coordinating cluster operations
+- `zig/pkg/antfly/src/data/`: Storage nodes handling data shards and queries
+- `zig/pkg/antfly/src/raft/`: Raft consensus and transport
+- `zig/pkg/antfly/src/storage/`: Storage engines, indexes, and transactions
+- `zig/pkg/inference/`: Local inference runtime
 - `docs/`: Hand-written documentation (synced into colony/frontend/apps/www-antfly at build time)
 
 **Data Organization**:
@@ -44,9 +44,7 @@ See `docs/architecture.mdx` for full details.
 - **Tables**: Multiple shards with configurable replication
 - **Indexes**: `bleve` (full-text BM25), `embeddingindex` (vector), `remote` (proxy), enrichers (embeddings/summaries)
 
-**Index System**: Registry pattern in `go/pkg/antfly/src/store/indexes/indexes.go`. All indexes implement `Index` interface; enrichable indexes implement `EnrichableIndex` for async embedding generation.
-
-**Storage**: Pebble (RocksDB successor) + Raft consensus. Each shard has its own Pebble instance.
+**Storage**: LSM storage + Raft consensus, with separate runtime paths for provisioned, serverless, and embedded Lite deployments.
 
 ## Commands
 
@@ -57,27 +55,27 @@ make generate           # After OpenAPI/proto changes (SDKs, docs, protobufs)
 
 ## Testing
 
-**E2E tests** with ONNX+XLA (downloads deps and models on first run):
+**Zig tests and E2E suites**:
 
 ```bash
-make e2e                            # Run all E2E tests
-make e2e E2E_TEST=TestName          # Run specific test
-make e2e E2E_TIMEOUT=30m            # Custom timeout (default: 30m)
+make zig-test
+cd zig && make unit-test
+uv run --project zig/e2e/antfly pytest -q
 ```
 
 **Long-running tests** (E2E, evals, `-race`) should write output to a file:
 
 ```bash
-make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
-RUN_ML_TESTS=true make e2e E2E_TIMEOUT=45m > /tmp/test.log 2>&1
-cd go/e2e && RUN_PG_TESTS=true go test -v ./... -timeout 10m > /tmp/test.log 2>&1
-go test -race -v ./... > /tmp/test.log 2>&1
+cd zig && make test > /tmp/test.log 2>&1
+uv run --project zig/e2e/antfly pytest -q > /tmp/test.log 2>&1
+cd go/pkg/sdk && go test -race -v ./... > /tmp/test.log 2>&1
 ```
 
 ## Running Antfly
 
 ```bash
-cd go/pkg/antfly && go run ./cmd standalone        # Single-node dev
+make build
+./antfly standalone
 ```
 
 **Antfly inference**: ML service for embeddings/chunking/reranking, enabled by default in standalone mode. Models auto-discovered from `~/.antfly/inference/models/`.
@@ -97,9 +95,9 @@ cd go/pkg/antfly && go run ./cmd standalone        # Single-node dev
 
 ## Release Tags
 
-Tags follow Go module conventions and trigger CI:
+Release tags:
 
-- `go/pkg/antfly/v*` — Antfly module release + container build
+- `v*` — Zig runtime archives, CLI packages, and container images
 - `go/pkg/operator/v*` — integrated Antfly operator container build
 ## Secrets Management
 
@@ -109,4 +107,4 @@ Never store credentials in config. Use `${secret:...}` keystore or env vars. See
 
 **Schema Extensions** (`x-antfly-*`): Custom OpenAPI annotations for indexing (`x-antfly-types`, `x-antfly-index`, `x-antfly-include-in-all`).
 
-**Leader-Only Work**: Use `LeaderFactory` pattern with `atomic.Bool` flag. Only Raft leader runs background jobs. See `go/pkg/antfly/src/store/db.go`.
+**Leader-Only Work**: Only the active Raft leader may run reconciliation and background mutation work; keep ownership transitions explicit and test them through the Zig simulation harnesses.

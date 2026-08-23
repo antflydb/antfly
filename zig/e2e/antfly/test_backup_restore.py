@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -34,17 +35,24 @@ from conftest import (
     REPO_ROOT,
     _read_log_tail,
     antfly_public_api_url,
-    find_free_port,
     maybe_preserve_tempdir,
     resolve_binary_path,
     wait_for_server,
 )
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
+from port_reservations import LoopbackPortReservations
 
 BACKUP_CONNECTION = "e2e-backups"
 
 
-def _wait_for_terminal_restore_job(backup_api, response: requests.Response, *, timeout_s: float = 30.0) -> dict:
+def _file_location(path: str | Path) -> str:
+    """Return a canonical file URI accepted by no-symlink backup traversal."""
+    return Path(path).resolve().as_uri()
+
+
+def _wait_for_terminal_restore_job(
+    backup_api, response: requests.Response, *, timeout_s: float = 30.0
+) -> dict:
     assert response.status_code == 202
     accepted = response.json()
     job_id = accepted["job_id"]
@@ -65,9 +73,13 @@ def _lookup_doc(stateful_api, table_name: str, key: str) -> dict | None:
         return None
 
 
-def _lookup_doc_from_url(session: requests.Session, api_url: str, table_name: str, key: str) -> dict | None:
+def _lookup_doc_from_url(
+    session: requests.Session, api_url: str, table_name: str, key: str
+) -> dict | None:
     try:
-        response = session.get(f"{api_url}/tables/{table_name}/documents/{key}", timeout=10)
+        response = session.get(
+            f"{api_url}/tables/{table_name}/documents/{key}", timeout=10
+        )
         if response.status_code >= 400:
             return None
         payload = response.json()
@@ -76,7 +88,9 @@ def _lookup_doc_from_url(session: requests.Session, api_url: str, table_name: st
         return None
 
 
-def _lookup_docs(stateful_api, table_names: tuple[str, ...], key: str) -> dict[str, dict] | None:
+def _lookup_docs(
+    stateful_api, table_names: tuple[str, ...], key: str
+) -> dict[str, dict] | None:
     docs: dict[str, dict] = {}
     for table_name in table_names:
         doc = _lookup_doc(stateful_api, table_name, key)
@@ -86,7 +100,9 @@ def _lookup_docs(stateful_api, table_names: tuple[str, ...], key: str) -> dict[s
     return docs
 
 
-def _wait_until_absent(stateful_api, table_name: str, key: str, *, timeout_s: float, interval_s: float) -> None:
+def _wait_until_absent(
+    stateful_api, table_name: str, key: str, *, timeout_s: float, interval_s: float
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _lookup_doc(stateful_api, table_name, key) is None:
@@ -102,7 +118,9 @@ def _lookup_table(stateful_api, table_name: str) -> dict | None:
         return None
 
 
-def _wait_until_table_absent(stateful_api, table_name: str, *, timeout_s: float, interval_s: float) -> None:
+def _wait_until_table_absent(
+    stateful_api, table_name: str, *, timeout_s: float, interval_s: float
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _lookup_table(stateful_api, table_name) is None:
@@ -111,7 +129,9 @@ def _wait_until_table_absent(stateful_api, table_name: str, *, timeout_s: float,
     raise AssertionError(f"{table_name} remained visible after delete")
 
 
-def _top_hit(stateful_api, table_name: str, query: str, expected_id: str) -> dict | None:
+def _top_hit(
+    stateful_api, table_name: str, query: str, expected_id: str
+) -> dict | None:
     try:
         result = stateful_api.query_table(
             table_name,
@@ -140,7 +160,9 @@ def _top_hit(stateful_api, table_name: str, query: str, expected_id: str) -> dic
     return None
 
 
-def _semantic_top_hit(stateful_api, table_name: str, query: str, index_name: str, expected_id: str) -> dict | None:
+def _semantic_top_hit(
+    stateful_api, table_name: str, query: str, index_name: str, expected_id: str
+) -> dict | None:
     try:
         result = stateful_api.query_table(
             table_name,
@@ -165,7 +187,9 @@ def _semantic_top_hit(stateful_api, table_name: str, query: str, index_name: str
     return None
 
 
-def _chunked_doc(stateful_api, table_name: str, key: str, chunk_field: str) -> list[dict] | None:
+def _chunked_doc(
+    stateful_api, table_name: str, key: str, chunk_field: str
+) -> list[dict] | None:
     scan = stateful_api.scan_keys(
         table_name,
         {
@@ -181,7 +205,9 @@ def _chunked_doc(stateful_api, table_name: str, key: str, chunk_field: str) -> l
     return scan if chunks else None
 
 
-def _write_single_doc(stateful_api, table_name: str, key: str, *, title: str, content: str) -> None:
+def _write_single_doc(
+    stateful_api, table_name: str, key: str, *, title: str, content: str
+) -> None:
     batch = stateful_api.batch_write(
         table_name,
         inserts={
@@ -227,7 +253,9 @@ def _check_response(response: requests.Response) -> dict:
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        raise AssertionError(f"{response.request.method} {response.url} failed: {response.text}") from exc
+        raise AssertionError(
+            f"{response.request.method} {response.url} failed: {response.text}"
+        ) from exc
     payload = response.json()
     assert isinstance(payload, dict)
     return payload
@@ -241,30 +269,43 @@ class MultiMetadataBackupCluster:
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
-        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-metadata-backup-e2e-")
-        self.root = Path(self.tempdir.name)
+        with ExitStack() as setup:
+            self.tempdir = tempfile.TemporaryDirectory(
+                prefix="antfly-zig-metadata-backup-e2e-"
+            )
+            setup.callback(self.tempdir.cleanup)
+            self.root = Path(self.tempdir.name)
+            self.port_reservations = LoopbackPortReservations(self.host)
+            setup.callback(self.port_reservations.close)
 
-        self.metadata_raft_ports = [find_free_port() for _ in range(3)]
-        self.metadata_admin_ports = [find_free_port() for _ in range(3)]
-        self.metadata_admin_urls = [f"http://{self.host}:{port}" for port in self.metadata_admin_ports]
-        self.metadata_public_urls = [
-            antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT) for url in self.metadata_admin_urls
-        ]
-        self.data_port = find_free_port()
-        self.data_raft_port = find_free_port()
-        self.data_url = f"http://{self.host}:{self.data_port}"
-        self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+            self.metadata_raft_ports = list(self.port_reservations.reserve_many(3))
+            self.metadata_admin_ports = list(self.port_reservations.reserve_many(3))
+            self.metadata_admin_urls = [
+                f"http://{self.host}:{port}" for port in self.metadata_admin_ports
+            ]
+            self.metadata_public_urls = [
+                antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT)
+                for url in self.metadata_admin_urls
+            ]
+            self.data_port, self.data_raft_port = self.port_reservations.reserve_many(2)
+            self.data_url = f"http://{self.host}:{self.data_port}"
+            self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
 
-        self.config_path = self.root / "antfly-metadata-cluster.json"
-        self._write_config()
+            self.config_path = self.root / "antfly-metadata-cluster.json"
+            self._write_config()
 
-        self.metadata_log_paths = [self.root / f"metadata-{node_id}.log" for node_id in range(1, 4)]
-        self.metadata_log_files = [path.open("w") for path in self.metadata_log_paths]
-        self.data_log_path = self.root / "data.log"
-        self.data_log_file = self.data_log_path.open("w")
+            self.metadata_log_paths = [
+                self.root / f"metadata-{node_id}.log" for node_id in range(1, 4)
+            ]
+            self.metadata_log_files = [
+                setup.enter_context(path.open("w")) for path in self.metadata_log_paths
+            ]
+            self.data_log_path = self.root / "data.log"
+            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
 
-        self.metadata_procs: list[subprocess.Popen[str]] = []
-        self.data_proc: subprocess.Popen[str] | None = None
+            self.metadata_procs: list[subprocess.Popen[str]] = []
+            self.data_proc: subprocess.Popen[str] | None = None
+            setup.pop_all()
 
         try:
             self._start()
@@ -275,10 +316,13 @@ class MultiMetadataBackupCluster:
     def _write_config(self) -> None:
         metadata = {
             "orchestration_urls": {
-                str(node_id): self.metadata_admin_urls[node_id - 1] for node_id in range(1, 4)
+                str(node_id): self.metadata_admin_urls[node_id - 1]
+                for node_id in range(1, 4)
             },
             "raft_urls": {
-                str(node_id): f"http://{self.host}:{self.metadata_raft_ports[node_id - 1]}"
+                str(
+                    node_id
+                ): f"http://{self.host}:{self.metadata_raft_ports[node_id - 1]}"
                 for node_id in range(1, 4)
             },
         }
@@ -374,29 +418,43 @@ class MultiMetadataBackupCluster:
 
     def _start(self) -> None:
         for i in range(3):
-            proc = subprocess.Popen(
-                self._metadata_command(i + 1),
-                stdout=self.metadata_log_files[i],
-                stderr=subprocess.STDOUT,
-                cwd=REPO_ROOT,
+            command = self._metadata_command(i + 1)
+            proc = self.port_reservations.handoff_to(
+                (self.metadata_raft_ports[i], self.metadata_admin_ports[i]),
+                lambda: subprocess.Popen(
+                    command,
+                    stdout=self.metadata_log_files[i],
+                    stderr=subprocess.STDOUT,
+                    cwd=REPO_ROOT,
+                ),
             )
             self.metadata_procs.append(proc)
 
         for url in self.metadata_admin_urls:
             if not wait_for_server(url, path="/metadata/v1/status", timeout=30.0):
-                raise RuntimeError(f"metadata server failed to start at {url}\n{self.debug_logs()}")
+                raise RuntimeError(
+                    f"metadata server failed to start at {url}\n{self.debug_logs()}"
+                )
 
         if self.metadata_stable_leader_index(timeout_s=30.0) is None:
-            raise RuntimeError(f"metadata cluster did not elect a leader\n{self.debug_logs()}")
+            raise RuntimeError(
+                f"metadata cluster did not elect a leader\n{self.debug_logs()}"
+            )
 
-        self.data_proc = subprocess.Popen(
-            self._data_command(),
-            stdout=self.data_log_file,
-            stderr=subprocess.STDOUT,
-            cwd=REPO_ROOT,
+        data_command = self._data_command()
+        self.data_proc = self.port_reservations.handoff_to(
+            (self.data_port, self.data_raft_port),
+            lambda: subprocess.Popen(
+                data_command,
+                stdout=self.data_log_file,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
         )
         if not wait_for_server(self.data_api_url, timeout=30.0):
-            raise RuntimeError(f"data server failed to start at {self.data_api_url}\n{self.debug_logs()}")
+            raise RuntimeError(
+                f"data server failed to start at {self.data_api_url}\n{self.debug_logs()}"
+            )
 
     def debug_logs(self) -> str:
         for handle in self.metadata_log_files:
@@ -480,7 +538,9 @@ class MultiMetadataBackupCluster:
                 observed = 1
             return leader_index if observed >= stable_observations else None
 
-        return wait_until(current_stable_leader, timeout_s=timeout_s, interval_s=interval_s)
+        return wait_until(
+            current_stable_leader, timeout_s=timeout_s, interval_s=interval_s
+        )
 
     def metadata_leader_public_url(self, *, timeout_s: float = 30.0) -> str:
         leader_index = self.metadata_stable_leader_index(timeout_s=timeout_s)
@@ -489,6 +549,7 @@ class MultiMetadataBackupCluster:
         return self.metadata_public_urls[leader_index]
 
     def stop(self) -> None:
+        self.port_reservations.close()
         if self.data_proc is not None and self.data_proc.poll() is None:
             self.data_proc.send_signal(signal.SIGTERM)
             try:
@@ -535,7 +596,9 @@ def test_table_backup_restore_round_trip(backup_api):
     table_name = f"backup_restore_{time.time_ns()}"
     backup_id = f"backup-{time.time_ns()}"
 
-    created = backup_api.create_table(table_name, num_shards=1, description="backup restore docs")
+    created = backup_api.create_table(
+        table_name, num_shards=1, description="backup restore docs"
+    )
     assert created["name"] == table_name
     assert "full_text_index_v0" in created["indexes"]
 
@@ -562,18 +625,24 @@ def test_table_backup_restore_round_trip(backup_api):
     )
 
     with tempfile.TemporaryDirectory(prefix="antfly-backup-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
 
-        backup = backup_api.backup_table(table_name, backup_id=backup_id, location=location)
+        backup = backup_api.backup_table(
+            table_name, backup_id=backup_id, location=location
+        )
         assert backup["backup"] == "successful"
 
         deleted = backup_api.delete_table(table_name)
         assert deleted == {}
 
         _wait_until_table_absent(backup_api, table_name, timeout_s=10.0, interval_s=0.5)
-        _wait_until_absent(backup_api, table_name, "doc:db", timeout_s=10.0, interval_s=0.5)
+        _wait_until_absent(
+            backup_api, table_name, "doc:db", timeout_s=10.0, interval_s=0.5
+        )
 
-        restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
+        restore = backup_api.restore_table(
+            table_name, backup_id=backup_id, location=location
+        )
         assert restore == {"restore": "triggered"}
 
         restored_doc = wait_until(
@@ -591,14 +660,18 @@ def test_table_backup_restore_round_trip(backup_api):
         )
 
 
-def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, slow_openai_embedder):
+def test_table_backup_restore_round_trip_managed_chunked_semantic(
+    backup_api, slow_openai_embedder
+):
     table_name = f"backup_chunked_semantic_{time.time_ns()}"
     backup_id = f"backup-chunked-semantic-{time.time_ns()}"
 
-    created = backup_api.create_table(table_name, num_shards=1, description="chunked semantic backup docs")
+    created = backup_api.create_table(
+        table_name, num_shards=1, description="chunked semantic backup docs"
+    )
     assert created["name"] == table_name
 
-    assert (
+    assert_created_index(
         backup_api.create_index(
             table_name,
             "semantic_chunked_idx",
@@ -623,11 +696,14 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
                     },
                 },
             },
-        )
-        == {}
+        ),
+        "semantic_chunked_idx",
+        "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+    )
 
     batch = backup_api.batch_write(
         table_name,
@@ -646,14 +722,18 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
     assert batch["inserted"] == 2
 
     before_scan = wait_until(
-        lambda: _chunked_doc(backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"),
+        lambda: _chunked_doc(
+            backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"
+        ),
         timeout_s=60.0,
         interval_s=1.0,
     )
     assert before_scan is not None
 
     assert wait_until(
-        lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),
+        lambda: _semantic_top_hit(
+            backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"
+        ),
         timeout_s=120.0,
         interval_s=1.0,
     )
@@ -661,19 +741,27 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
     before_chunks = before_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
     assert len(before_chunks) >= 2
 
-    with tempfile.TemporaryDirectory(prefix="antfly-backup-chunked-semantic-") as backup_dir:
-        location = f"file://{backup_dir}"
+    with tempfile.TemporaryDirectory(
+        prefix="antfly-backup-chunked-semantic-"
+    ) as backup_dir:
+        location = _file_location(backup_dir)
 
-        backup = backup_api.backup_table(table_name, backup_id=backup_id, location=location)
+        backup = backup_api.backup_table(
+            table_name, backup_id=backup_id, location=location
+        )
         assert backup["backup"] == "successful"
 
         deleted = backup_api.delete_table(table_name)
         assert deleted == {}
 
         _wait_until_table_absent(backup_api, table_name, timeout_s=10.0, interval_s=0.5)
-        _wait_until_absent(backup_api, table_name, "doc:a", timeout_s=10.0, interval_s=0.5)
+        _wait_until_absent(
+            backup_api, table_name, "doc:a", timeout_s=10.0, interval_s=0.5
+        )
 
-        restore = backup_api.restore_table(table_name, backup_id=backup_id, location=location)
+        restore = backup_api.restore_table(
+            table_name, backup_id=backup_id, location=location
+        )
         assert restore == {"restore": "triggered"}
 
         restored_doc = wait_until(
@@ -693,7 +781,9 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
         )
 
         semantic_after = wait_until(
-            lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),
+            lambda: _semantic_top_hit(
+                backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"
+            ),
             timeout_s=120.0,
             interval_s=1.0,
         )
@@ -725,7 +815,9 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
         assert semantic_after
 
         after_scan = wait_until(
-            lambda: _chunked_doc(backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"),
+            lambda: _chunked_doc(
+                backup_api, table_name, "doc:a", "semantic_chunked_idx_chunks"
+            ),
             timeout_s=60.0,
             interval_s=1.0,
         )
@@ -733,7 +825,6 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, sl
         assert after_scan[0]["title"] == "Alpha backup"
         after_chunks = after_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
         assert len(after_chunks) >= 2
-
 
 
 def test_cluster_backup_restore_round_trip(backup_api):
@@ -745,7 +836,9 @@ def test_cluster_backup_restore_round_trip(backup_api):
         (table_a, "Cluster Backup Alpha"),
         (table_b, "Cluster Backup Beta"),
     ):
-        created = backup_api.create_table(table_name, num_shards=1, description=f"{table_name} docs")
+        created = backup_api.create_table(
+            table_name, num_shards=1, description=f"{table_name} docs"
+        )
         assert created["name"] == table_name
         batch = backup_api.batch_write(
             table_name,
@@ -759,13 +852,15 @@ def test_cluster_backup_restore_round_trip(backup_api):
         )
         assert batch["inserted"] == 1
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(backup_api, tn, q, doc_id),
+            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
+                backup_api, tn, q, doc_id
+            ),
             timeout_s=60.0,
             interval_s=1.0,
         )
 
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-backup-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
 
         backup = backup_api.cluster_backup(backup_id=backup_id, location=location)
         assert backup["backup_id"] == backup_id
@@ -844,12 +939,16 @@ def test_cluster_backup_through_metadata_leader_public_api(
     )
     assert batch["inserted"] == 1
     assert wait_until(
-        lambda: _lookup_doc_from_url(session, cluster.data_api_url, table_name, "doc:1"),
+        lambda: _lookup_doc_from_url(
+            session, cluster.data_api_url, table_name, "doc:1"
+        ),
         timeout_s=30.0,
         interval_s=0.5,
     ), cluster.debug_logs()
 
-    with tempfile.TemporaryDirectory(prefix="antfly-metadata-leader-cluster-backup-") as backup_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="antfly-metadata-leader-cluster-backup-"
+    ) as backup_dir:
         backup = None
         last_response: requests.Response | None = None
         for _ in range(3):
@@ -858,7 +957,7 @@ def test_cluster_backup_through_metadata_leader_public_api(
                 f"{leader_public_url}/backup",
                 json={
                     "backup_id": backup_id,
-                    "location": f"file://{backup_dir}",
+                    "location": _file_location(backup_dir),
                     "connection": BACKUP_CONNECTION,
                     "table_names": [table_name],
                 },
@@ -875,7 +974,9 @@ def test_cluster_backup_through_metadata_leader_public_api(
         )
 
         assert backup["backup_id"] == backup_id
-        assert backup["status"] == "completed", f"backup={backup}\n{cluster.debug_logs()}"
+        assert backup["status"] == "completed", (
+            f"backup={backup}\n{cluster.debug_logs()}"
+        )
         assert [table["name"] for table in backup["tables"]] == [table_name]
 
 
@@ -891,7 +992,9 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         (table_a, f"{backend.upper()} Backup Alpha"),
         (table_b, f"{backend.upper()} Backup Beta"),
     ):
-        created = backup_api.create_table(table_name, num_shards=1, description=f"{table_name} docs")
+        created = backup_api.create_table(
+            table_name, num_shards=1, description=f"{table_name} docs"
+        )
         assert created["name"] == table_name
         batch = backup_api.batch_write(
             table_name,
@@ -905,7 +1008,9 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         )
         assert batch["inserted"] == 1
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(backup_api, tn, q, doc_id),
+            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
+                backup_api, tn, q, doc_id
+            ),
             timeout_s=60.0,
             interval_s=1.0,
         )
@@ -960,17 +1065,27 @@ def test_cluster_restore_modes(backup_api):
         (table_a, "Original Alpha"),
         (table_b, "Original Beta"),
     ):
-        created = backup_api.create_table(table_name, num_shards=1, description=f"{table_name} docs")
+        created = backup_api.create_table(
+            table_name, num_shards=1, description=f"{table_name} docs"
+        )
         assert created["name"] == table_name
-        _write_single_doc(backup_api, table_name, "doc:1", title=title, content=f"{title} backup source")
+        _write_single_doc(
+            backup_api,
+            table_name,
+            "doc:1",
+            title=title,
+            content=f"{title} backup source",
+        )
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(backup_api, tn, q, doc_id),
+            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
+                backup_api, tn, q, doc_id
+            ),
             timeout_s=60.0,
             interval_s=1.0,
         )
 
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-modes-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
 
         backup = backup_api.cluster_backup(backup_id=backup_id, location=location)
         assert backup["status"] == "completed"
@@ -989,8 +1104,12 @@ def test_cluster_restore_modes(backup_api):
         assert failed_job["phase"] == "failed"
         assert failed_job["error"] == "TableAlreadyExists"
 
-        _write_single_doc(backup_api, table_a, "doc:1", title="Mutated Alpha", content="mutated alpha")
-        _write_single_doc(backup_api, table_b, "doc:1", title="Mutated Beta", content="mutated beta")
+        _write_single_doc(
+            backup_api, table_a, "doc:1", title="Mutated Alpha", content="mutated alpha"
+        )
+        _write_single_doc(
+            backup_api, table_b, "doc:1", title="Mutated Beta", content="mutated beta"
+        )
         mutated_a = wait_until(
             lambda: _lookup_doc(backup_api, table_a, "doc:1"),
             timeout_s=30.0,
@@ -1046,9 +1165,17 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     missing_table = f"cluster_partial_missing_{time.time_ns()}"
     backup_id = f"cluster-partial-{time.time_ns()}"
 
-    created = backup_api.create_table(table_name, num_shards=1, description="partial backup docs")
+    created = backup_api.create_table(
+        table_name, num_shards=1, description="partial backup docs"
+    )
     assert created["name"] == table_name
-    _write_single_doc(backup_api, table_name, "doc:1", title="Partial Table", content="table survives partial backup")
+    _write_single_doc(
+        backup_api,
+        table_name,
+        "doc:1",
+        title="Partial Table",
+        content="table survives partial backup",
+    )
     assert wait_until(
         lambda: _top_hit(backup_api, table_name, "partial table", "doc:1"),
         timeout_s=60.0,
@@ -1056,7 +1183,7 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     )
 
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-partial-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
 
         backup = backup_api.cluster_backup(
             backup_id=backup_id,
@@ -1076,7 +1203,9 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
         matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
         assert matched == []
 
-        created = backup_api.create_table(missing_table, num_shards=1, description="retry backup docs")
+        created = backup_api.create_table(
+            missing_table, num_shards=1, description="retry backup docs"
+        )
         assert created["name"] == missing_table
         _write_single_doc(
             backup_api,
@@ -1086,7 +1215,9 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
             content="Recovered Missing Table retry publishes a complete aggregate",
         )
         assert wait_until(
-            lambda: _top_hit(backup_api, missing_table, "recovered missing table", "doc:2"),
+            lambda: _top_hit(
+                backup_api, missing_table, "recovered missing table", "doc:2"
+            ),
             timeout_s=60.0,
             interval_s=1.0,
         )
@@ -1097,7 +1228,10 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
             table_names=[table_name, missing_table],
         )
         assert retried["status"] == "completed"
-        assert {table["name"] for table in retried["tables"]} == {table_name, missing_table}
+        assert {table["name"] for table in retried["tables"]} == {
+            table_name,
+            missing_table,
+        }
 
         listed = backup_api.list_backups(location=location)
         matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
@@ -1107,8 +1241,12 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
         backup_api.delete_table(table_name)
         backup_api.delete_table(missing_table)
         for deleted_table, doc_id in ((table_name, "doc:1"), (missing_table, "doc:2")):
-            _wait_until_table_absent(backup_api, deleted_table, timeout_s=10.0, interval_s=0.5)
-            _wait_until_absent(backup_api, deleted_table, doc_id, timeout_s=10.0, interval_s=0.5)
+            _wait_until_table_absent(
+                backup_api, deleted_table, timeout_s=10.0, interval_s=0.5
+            )
+            _wait_until_absent(
+                backup_api, deleted_table, doc_id, timeout_s=10.0, interval_s=0.5
+            )
 
         restore = backup_api.cluster_restore(
             backup_id=backup_id,
@@ -1139,7 +1277,7 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
 
 def test_backup_restore_request_validation(backup_api):
     with tempfile.TemporaryDirectory(prefix="antfly-backup-validate-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
         table_name = f"validate_backup_case_{time.time_ns()}"
 
         created = backup_api.create_table(table_name, num_shards=1)
@@ -1153,31 +1291,52 @@ def test_backup_restore_request_validation(backup_api):
             (
                 "POST",
                 f"/tables/{table_name}/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
+                {
+                    "backup_id": "snap",
+                    "location": "ftp://bucket/path",
+                    "connection": BACKUP_CONNECTION,
+                },
                 "unsupported backup location",
             ),
             (
                 "POST",
                 f"/tables/{table_name}/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
+                {
+                    "backup_id": "snap",
+                    "location": "ftp://bucket/path",
+                    "connection": BACKUP_CONNECTION,
+                },
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/backup",
-                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
+                {
+                    "backup_id": "snap",
+                    "location": "ftp://bucket/path",
+                    "connection": BACKUP_CONNECTION,
+                },
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": "ftp://bucket/path", "connection": BACKUP_CONNECTION},
+                {
+                    "backup_id": "snap",
+                    "location": "ftp://bucket/path",
+                    "connection": BACKUP_CONNECTION,
+                },
                 "unsupported backup location",
             ),
             (
                 "POST",
                 "/restore",
-                {"backup_id": "snap", "location": location, "connection": BACKUP_CONNECTION, "restore_mode": "bogus"},
+                {
+                    "backup_id": "snap",
+                    "location": location,
+                    "connection": BACKUP_CONNECTION,
+                    "restore_mode": "bogus",
+                },
                 "invalid restore mode",
             ),
         )
@@ -1212,7 +1371,7 @@ def test_backup_restore_request_validation(backup_api):
 
 def test_list_backups_empty_location(backup_api):
     with tempfile.TemporaryDirectory(prefix="antfly-empty-backups-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
         listed = backup_api.list_backups(location=location)
         assert listed == {"backups": []}
 
@@ -1225,7 +1384,7 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
     assert created["name"] == table_name
 
     with tempfile.TemporaryDirectory(prefix="antfly-missing-restore-") as backup_dir:
-        location = f"file://{backup_dir}"
+        location = _file_location(backup_dir)
 
         table_restore = backup_api._request(
             "POST",

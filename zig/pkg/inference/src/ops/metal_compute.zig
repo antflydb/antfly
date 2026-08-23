@@ -362,6 +362,10 @@ fn enableContiguousSliceDeviceView() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_CONTIGUOUS_SLICE_DEVICE_VIEW");
 }
 
+fn decoderRuntimeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
+    return layer.rope_theta;
+}
+
 pub const MetalCompute = if (build_options.enable_metal) struct {
     const mlx_quant = struct {
         pub const Provider = void;
@@ -665,6 +669,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     attention_mask_values_cache: []i64 = &.{},
     attention_mask_batch: usize = 0,
     attention_mask_seq_len: usize = 0,
+    deberta_relative_index_device_cache: ?MetalTensor = null,
+    deberta_relative_index_values_cache: []i64 = &.{},
+    deberta_relative_index_unique_count: usize = 0,
     deberta_embedding_weight_device_cache: ?MetalTensor = null,
     deberta_embedding_ln_weight_device_cache: ?MetalTensor = null,
     deberta_embedding_ln_bias_device_cache: ?MetalTensor = null,
@@ -3632,12 +3639,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn deinit(self: *MetalCompute) void {
+        self.finishPendingDebertaRelativeProjections(false);
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
         self.cyclic_page_table_cache.deinit(self.allocator);
         if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
         if (self.attention_mask_values_cache.len != 0) self.allocator.free(self.attention_mask_values_cache);
+        if (self.deberta_relative_index_device_cache) |*tensor| tensor.deinit();
+        if (self.deberta_relative_index_values_cache.len != 0) self.allocator.free(self.deberta_relative_index_values_cache);
         var v4_it = self.deepseek_v4_device_cache.iterator();
         while (v4_it.next()) |entry| entry.value_ptr.deinit();
         self.deepseek_v4_device_cache.deinit(self.allocator);
@@ -9269,6 +9279,272 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.attention_mask_device_cache.?.retainedCopy();
     }
 
+    fn debertaRelativeIndexDeviceTensor(
+        self: *MetalCompute,
+        relative_index: []const i64,
+        unique_count: usize,
+    ) !MetalTensor {
+        // The runtime ABI carries indices in an f32 device buffer. Keep the
+        // conversion exact instead of silently rounding an oversized index.
+        if (unique_count > 1 << 24) return error.InvalidTensorShape;
+        if (self.deberta_relative_index_device_cache) |*cached| {
+            if (self.deberta_relative_index_unique_count == unique_count and
+                std.mem.eql(i64, self.deberta_relative_index_values_cache, relative_index))
+            {
+                return cached.retainedCopy();
+            }
+        }
+
+        const values = try self.allocator.alloc(f32, relative_index.len);
+        defer self.allocator.free(values);
+        for (relative_index, 0..) |index, i| {
+            if (index < 0 or @as(usize, @intCast(index)) >= unique_count) return error.InvalidTensorShape;
+            values[i] = @floatFromInt(index);
+        }
+        const shape = [_]i32{@intCast(relative_index.len)};
+        var replacement = try self.deviceTensorFromF32Slice(values, &shape);
+        errdefer replacement.deinit();
+        const cached_values = try self.allocator.dupe(i64, relative_index);
+        errdefer self.allocator.free(cached_values);
+
+        if (self.deberta_relative_index_device_cache) |*cached| cached.deinit();
+        if (self.deberta_relative_index_values_cache.len != 0) self.allocator.free(self.deberta_relative_index_values_cache);
+        self.deberta_relative_index_device_cache = replacement;
+        self.deberta_relative_index_values_cache = cached_values;
+        self.deberta_relative_index_unique_count = unique_count;
+        return self.deberta_relative_index_device_cache.?.retainedCopy();
+    }
+
+    fn cachedDebertaRelativeProjection(
+        self: *MetalCompute,
+        q_slot: usize,
+        k_slot: usize,
+        seq_len: usize,
+        relative_count: usize,
+        hidden_size: usize,
+    ) !?ops.LinearNoBiasPairResult {
+        if (q_slot >= self.provider_impl.deberta_relative_projection_cache.len) return null;
+        self.lockDebertaRelativeProjectionCache();
+        defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+        const entry = &self.provider_impl.deberta_relative_projection_cache[q_slot];
+        if (!entry.valid or
+            entry.k_slot != k_slot or
+            entry.seq_len != seq_len or
+            entry.relative_count != relative_count or
+            entry.hidden_size != hidden_size)
+        {
+            return null;
+        }
+        var q = try (entry.q orelse return null).retainedCopy();
+        errdefer q.deinit();
+        var k = try (entry.k orelse return null).retainedCopy();
+        errdefer k.deinit();
+        const q_ct = try self.ctFromOwnedMetalTensor(q);
+        errdefer freeOp(self, q_ct);
+        const k_ct = try self.ctFromOwnedMetalTensor(k);
+        return .{ .first = q_ct, .second = k_ct };
+    }
+
+    fn debertaRelativeEmbeddingsOp(
+        ctx: *anyopaque,
+        request: *const ops.DebertaRelativeEmbeddingRequest,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.bucket_ids.len == 0 or request.hidden_size == 0) return null;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.sliceAsBytes(request.bucket_ids));
+        const bucket_ids_hash = hasher.final();
+        const norm_eps_bits: u32 = @bitCast(request.norm_eps);
+
+        self.lockDebertaRelativeProjectionCache();
+        const cache = &self.provider_impl.deberta_relative_embedding_cache;
+        if (cache.valid and
+            cache.bucket_ids_hash == bucket_ids_hash and
+            cache.bucket_count == request.bucket_ids.len and
+            cache.hidden_size == request.hidden_size and
+            cache.norm_eps_bits == norm_eps_bits)
+        {
+            const cached_tensor = cache.tensor orelse {
+                self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+                return null;
+            };
+            var tensor = cached_tensor.retainedCopy() catch |err| {
+                self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+                return err;
+            };
+            self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+            errdefer tensor.deinit();
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+
+        const normed = layerNormOp(
+            ctx,
+            request.weight,
+            request.layer_norm_weight,
+            request.layer_norm_bias,
+            request.hidden_size,
+            request.norm_eps,
+        ) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        defer freeOp(ctx, normed);
+        const gathered = try embeddingLookupOp(
+            ctx,
+            normed,
+            request.bucket_ids,
+            request.bucket_ids.len,
+            request.hidden_size,
+        );
+
+        self.stageDebertaRelativeEmbeddings(
+            gathered,
+            bucket_ids_hash,
+            request.bucket_ids.len,
+            request.hidden_size,
+            norm_eps_bits,
+        ) catch {};
+        return gathered;
+    }
+
+    fn stageDebertaRelativeEmbeddings(
+        self: *MetalCompute,
+        gathered: CT,
+        bucket_ids_hash: u64,
+        bucket_count: usize,
+        hidden_size: usize,
+        norm_eps_bits: u32,
+    ) !void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        var tensor = try self.ownedDeviceMetalTensorFromCt(gathered);
+        errdefer tensor.deinit();
+        const frame_active = metal_runtime.hasActiveFrame(runtime);
+
+        self.lockDebertaRelativeProjectionCache();
+        defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+        const cache = &self.provider_impl.deberta_relative_embedding_cache;
+        const owner_token = @intFromPtr(self);
+        if (!cache.valid and cache.owner_token != 0 and cache.owner_token != owner_token) {
+            // Another active frame owns this pending entry. Never release its
+            // device buffer; this request can use its local gathered tensor
+            // without populating the shared cache.
+            tensor.deinit();
+            return;
+        }
+        if (cache.valid and
+            cache.bucket_ids_hash == bucket_ids_hash and
+            cache.bucket_count == bucket_count and
+            cache.hidden_size == hidden_size and
+            cache.norm_eps_bits == norm_eps_bits)
+        {
+            tensor.deinit();
+            return;
+        }
+        cache.deinit();
+        cache.* = .{
+            .tensor = tensor,
+            .bucket_ids_hash = bucket_ids_hash,
+            .bucket_count = bucket_count,
+            .hidden_size = hidden_size,
+            .norm_eps_bits = norm_eps_bits,
+            .owner_token = if (frame_active) @intFromPtr(self) else 0,
+            .valid = !frame_active,
+        };
+    }
+
+    fn stageDebertaRelativeProjection(
+        self: *MetalCompute,
+        q_slot: usize,
+        k_slot: usize,
+        seq_len: usize,
+        relative_count: usize,
+        hidden_size: usize,
+        q_ct: CT,
+        k_ct: CT,
+    ) !void {
+        if (q_slot >= self.provider_impl.deberta_relative_projection_cache.len) return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        if (!metal_runtime.hasActiveFrame(runtime)) return;
+
+        var q_src = try self.ownedDeviceMetalTensorFromCt(q_ct);
+        defer q_src.deinit();
+        var k_src = try self.ownedDeviceMetalTensorFromCt(k_ct);
+        defer k_src.deinit();
+        const shape = [_]i32{ @intCast(relative_count), @intCast(hidden_size) };
+        const elements = try std.math.mul(usize, relative_count, hidden_size);
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        var q_cached = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), bytes, .private, &shape);
+        errdefer q_cached.deinit();
+        var k_cached = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), bytes, .private, &shape);
+        errdefer k_cached.deinit();
+        try q_src.copyInto(&q_cached);
+        try k_src.copyInto(&k_cached);
+
+        self.lockDebertaRelativeProjectionCache();
+        defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+        const entry = &self.provider_impl.deberta_relative_projection_cache[q_slot];
+        const owner_token = @intFromPtr(self);
+        if (!entry.valid and entry.owner_token != 0 and entry.owner_token != owner_token) {
+            // A concurrent frame may still reference this pending entry.
+            // Preserve it and let this request proceed without caching.
+            q_cached.deinit();
+            k_cached.deinit();
+            return;
+        }
+        if (entry.valid and
+            entry.k_slot == k_slot and
+            entry.seq_len == seq_len and
+            entry.relative_count == relative_count and
+            entry.hidden_size == hidden_size)
+        {
+            q_cached.deinit();
+            k_cached.deinit();
+            return;
+        }
+        entry.deinit();
+        entry.* = .{
+            .q = q_cached,
+            .k = k_cached,
+            .k_slot = k_slot,
+            .seq_len = seq_len,
+            .relative_count = relative_count,
+            .hidden_size = hidden_size,
+            .owner_token = owner_token,
+            .valid = false,
+        };
+    }
+
+    fn finishPendingDebertaRelativeProjections(self: *MetalCompute, success: bool) void {
+        self.lockDebertaRelativeProjectionCache();
+        defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+        const owner_token = @intFromPtr(self);
+        for (&self.provider_impl.deberta_relative_projection_cache) |*entry| {
+            if (entry.owner_token != owner_token or entry.valid) continue;
+            if (success) {
+                entry.valid = true;
+                entry.owner_token = 0;
+            } else {
+                entry.deinit();
+            }
+        }
+        const embedding = &self.provider_impl.deberta_relative_embedding_cache;
+        if (!embedding.valid and embedding.owner_token == owner_token) {
+            if (success) {
+                embedding.valid = true;
+                embedding.owner_token = 0;
+            } else {
+                embedding.deinit();
+            }
+        }
+    }
+
+    fn lockDebertaRelativeProjectionCache(self: *MetalCompute) void {
+        while (!self.provider_impl.deberta_relative_projection_cache_mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
     fn tryScaledDotProductAttentionResident(
         self: *MetalCompute,
         q_ct: CT,
@@ -9664,21 +9940,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.exportCtFromHostNative(&native_ctx, n_out, &out_shape);
     }
 
-    fn disentangledRelativeAttentionOp(
-        ctx: *anyopaque,
+    fn tryDisentangledRelativeAttentionResident(
+        self: *MetalCompute,
         q_ct: CT,
         k_ct: CT,
         v_ct: CT,
         q_r_ct: CT,
         k_r_ct: CT,
+        relative_index: ?[]const i64,
+        relative_count: usize,
         mask: []const i64,
         batch: usize,
         seq_len: usize,
         num_heads: usize,
         head_dim: usize,
-    ) anyerror!CT {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+    ) anyerror!?CT {
+        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0 and relative_count != 0) resident_path: {
             const q_buf = toBuf(q_ct);
             const k_buf = toBuf(k_ct);
             const v_buf = toBuf(v_ct);
@@ -9690,8 +9967,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (seq_len > std.math.maxInt(usize) / 2) break :resident_path;
             const hidden = num_heads * head_dim;
             const total = batch * seq_len * hidden;
-            const rel_total = (seq_len * 2 - 1) * hidden;
+            const rel_total = relative_count * hidden;
             if (total == 0 or rel_total == 0) break :resident_path;
+            if (relative_index) |indices| {
+                if (indices.len != seq_len * 2 - 1) break :resident_path;
+            } else if (relative_count != seq_len * 2 - 1) break :resident_path;
 
             var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
             defer q_mt.deinit();
@@ -9707,6 +9987,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
             if (q_r_mt.elemCount() < rel_total or k_r_mt.elemCount() < rel_total) break :resident_path;
 
+            var relative_index_mt: ?MetalTensor = null;
+            defer if (relative_index_mt) |*tensor| tensor.deinit();
+            if (relative_index) |indices| {
+                relative_index_mt = try self.debertaRelativeIndexDeviceTensor(indices, relative_count);
+            }
+
             var mask_mt: ?MetalTensor = null;
             defer if (mask_mt) |*tensor| tensor.deinit();
             if (mask.len > 0) {
@@ -9720,6 +10006,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .v = v_mt,
                 .q_r = q_r_mt,
                 .k_r = k_r_mt,
+                .relative_index = relative_index_mt,
+                .relative_count = relative_count,
                 .mask = mask_mt,
                 .batch = batch,
                 .seq_len = seq_len,
@@ -9729,6 +10017,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return self.ctFromOwnedMetalTensor(tensor);
             }
         }
+        return null;
+    }
+
+    fn disentangledRelativeAttentionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        q_r_ct: CT,
+        k_r_ct: CT,
+        mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDisentangledRelativeAttentionResident(
+            q_ct,
+            k_ct,
+            v_ct,
+            q_r_ct,
+            k_r_ct,
+            null,
+            seq_len * 2 - 1,
+            mask,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        )) |output| return output;
         return self.hostFallbackDisentangledRelativeAttention(
             q_ct,
             k_ct,
@@ -12504,7 +12823,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace_gather) std.debug.print("kv-gather-null: no device_write_hook layer={d}\n", .{attention.layer_index});
             return null;
         };
-        const gather = runtime_root.kv.storage_runtime.KvLayerGather{
+        const gather = runtime_root.kv.storage_runtime.DeviceKvLayerGather{
             .sequence_id = kv.sequence_id,
             .layer_index = attention.layer_index,
             .token_count = attention.kv_sequence_len,
@@ -12523,7 +12842,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer storage.allocator.free(k_rows);
                 const v_rows = try storage.allocator.alloc(f32, elem_count);
                 defer storage.allocator.free(v_rows);
-                hook.gatherLayerKv(gather, k_rows, v_rows) catch |host_err| switch (host_err) {
+                hook.gatherLayerKv(.{
+                    .sequence_id = gather.sequence_id,
+                    .layer_index = gather.layer_index,
+                    .token_count = gather.token_count,
+                    .num_kv_heads = gather.num_kv_heads,
+                    .head_dim = gather.head_dim,
+                }, k_rows, v_rows) catch |host_err| switch (host_err) {
                     error.DeviceReadUnsupported, error.DeviceReadFallback => return null,
                     else => return host_err,
                 };
@@ -12561,6 +12886,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_kv_heads: usize,
         head_dim: usize,
     ) !?runtime_root.kv.storage_runtime.DevicePagedKvLayer {
+        return pagedKvLayerFromDeviceHookWithPendingSuffix(attention, num_kv_heads, head_dim, 0);
+    }
+
+    fn pagedKvLayerFromDeviceHookWithPendingSuffix(
+        attention: ops.AttentionContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pending_suffix_token_count: usize,
+    ) !?runtime_root.kv.storage_runtime.DevicePagedKvLayer {
         const kv = attention.kv_cache orelse return null;
         const storage = attention.kv_storage orelse return null;
         const hook = storage.device_write_hook orelse return null;
@@ -12570,6 +12904,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .token_count = attention.kv_sequence_len,
             .num_kv_heads = @intCast(num_kv_heads),
             .head_dim = @intCast(head_dim),
+            .pending_suffix_token_count = pending_suffix_token_count,
         }) catch |err| switch (err) {
             error.DeviceReadUnsupported, error.DeviceReadFallback => {
                 if (traceQuantBlockRequested()) std.debug.print(
@@ -12595,6 +12930,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
         return layer;
+    }
+
+    fn commitPagedKvLayerDeviceWrite(attention: ops.AttentionContext) !void {
+        if (attention.skip_kv_write) return;
+        const kv = attention.kv_cache orelse return error.DeviceWriteUnsupported;
+        const storage = attention.kv_storage orelse return error.DeviceWriteUnsupported;
+        try storage.commitLayerKvDeviceWrite(
+            kv.sequence_id,
+            attention.layer_index,
+            attention.kv_sequence_len,
+            attention.kv_position_offset,
+        );
     }
 
     fn pagedSlotAttentionSupported(paged_layer: runtime_root.kv.storage_runtime.DevicePagedKvLayer) bool {
@@ -15503,7 +15850,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     else => return err,
                 };
             }
-            const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+            const paged_layer = (try pagedKvLayerFromDeviceHookWithPendingSuffix(
+                attention,
+                request.num_kv_heads,
+                request.head_dim,
+                if (attention.skip_kv_write) 0 else attention.query_sequence_len,
+            )) orelse {
                 if (trace_quant) std.debug.print(
                     "metal-prefill-frame-layer-direct-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
                     .{ attention.layer_index, rows, attention.skip_kv_write },
@@ -15611,6 +15963,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 self.timing_stats.prefill_frame_executor_layer_block_nanos += direct_finished_at - direct_started_at;
             }
             if (direct_tensor) |tensor| {
+                try commitPagedKvLayerDeviceWrite(attention);
                 layer_runtime_success = true;
                 self.timing_stats.prefill_frame_executor_layer_runtime_successes += 1;
                 return tensor;
@@ -16670,7 +17023,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .ple_hidden_size = request.ple_hidden_size,
             };
             if (use_active_paged_block and metal_runtime.supportsDirectPagedGatedDecoderBlockDevice(self.provider_impl, direct_paged_request)) {
-                const paged_layer = (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) orelse {
+                const paged_layer = (try pagedKvLayerFromDeviceHookWithPendingSuffix(
+                    attention,
+                    request.num_kv_heads,
+                    request.head_dim,
+                    if (attention.skip_kv_write) 0 else attention.query_sequence_len,
+                )) orelse {
                     if (traceQuantBlockRequested()) std.debug.print(
                         "metal-prefill-planned-quant-null layer={d} rows={d} reason=no-paged-layer shares_kv={}\n",
                         .{ attention.layer_index, attention.query_sequence_len, attention.skip_kv_write },
@@ -16768,6 +17126,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         out,
                         &self.timing_stats,
                     )) {
+                        try commitPagedKvLayerDeviceWrite(attention);
                         try self.comparePagedDirectBlockWithStagedMt(
                             request,
                             attention,
@@ -16831,6 +17190,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     block_offsets,
                     &self.timing_stats,
                 )) |tensor| {
+                    try commitPagedKvLayerDeviceWrite(attention);
                     try self.comparePagedDirectBlockWithStagedMt(
                         request,
                         attention,
@@ -19581,7 +19941,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             attention.query_sequence_len,
             layer.head_dim,
             layer.rope_active_dim,
-            layer.rope_theta,
+            decoderRuntimeLayerRopeTheta(layer),
             request.rope_freq_scale,
             position_offset,
             request.rope_consecutive_pairs,
@@ -21734,7 +22094,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const layer_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
         defer self.endActivePlannedComputeScope(layer_scope);
 
-        const qkv = (try decoderRuntimeApplyLinearQkvOp(ctx, &.{
+        const qkv_request: ops.DecoderRuntimeApplyLinearQkvRequest = .{
             .q_slot = request.layer.q_linear_slot,
             .k_slot = request.layer.k_linear_slot,
             .v_slot = request.layer.v_linear_slot,
@@ -21742,20 +22102,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.hidden_size,
             .q_out_dim = request.hidden_size,
             .kv_out_dim = request.hidden_size,
-        })) orelse return null;
+        };
+        const qkv = (try decoderRuntimeApplyLinearQkvOp(ctx, &qkv_request)) orelse return null;
         defer freeOp(ctx, qkv.first);
         defer freeOp(ctx, qkv.second);
         defer freeOp(ctx, qkv.third);
 
-        const rel_qk = (try decoderRuntimeApplyLinearPairOp(ctx, &.{
-            .slot_a = request.layer.q_linear_slot,
-            .slot_b = request.layer.k_linear_slot,
-            .input = request.relative_embeddings,
-            .in_dim = request.hidden_size,
-            .out_dim = request.hidden_size,
-        })) orelse {
-            self.timing_stats.metal_runtime_deberta_relative_qk_pair_fallbacks += 1;
-            return null;
+        const rel_qk = if (try self.cachedDebertaRelativeProjection(
+            request.layer.q_linear_slot,
+            request.layer.k_linear_slot,
+            request.seq_len,
+            request.relative_unique_count,
+            request.hidden_size,
+        )) |cached| cached else blk: {
+            const projected = (try decoderRuntimeApplyLinearPairOp(ctx, &.{
+                .slot_a = request.layer.q_linear_slot,
+                .slot_b = request.layer.k_linear_slot,
+                .input = request.relative_embeddings,
+                .in_dim = request.hidden_size,
+                .out_dim = request.hidden_size,
+            })) orelse {
+                self.timing_stats.metal_runtime_deberta_relative_qk_pair_fallbacks += 1;
+                return null;
+            };
+            self.stageDebertaRelativeProjection(
+                request.layer.q_linear_slot,
+                request.layer.k_linear_slot,
+                request.seq_len,
+                request.relative_unique_count,
+                request.hidden_size,
+                projected.first,
+                projected.second,
+            ) catch {};
+            break :blk projected;
         };
         self.timing_stats.metal_runtime_deberta_relative_qk_pair_calls += 1;
         var q_r = rel_qk.first;
@@ -21764,6 +22143,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(ctx, k_r);
 
         if (request.relative_full_to_unique) |ids| {
+            if (try self.tryDisentangledRelativeAttentionResident(
+                qkv.first,
+                qkv.second,
+                qkv.third,
+                q_r,
+                k_r,
+                ids,
+                request.relative_unique_count,
+                request.attention_mask,
+                request.batch,
+                request.seq_len,
+                request.num_attention_heads,
+                request.head_dim,
+            )) |compact_attn_out| {
+                defer freeOp(ctx, compact_attn_out);
+                return try self.finishDebertaEncoderLayer(request, rows, compact_attn_out);
+            }
+
+            // The compact route is optional. Preserve the validated expanded
+            // path as the atomic fallback for unsupported devices/shapes.
             const q_expanded = try embeddingLookupOp(ctx, q_r, ids, request.relative_full_count, request.hidden_size);
             errdefer freeOp(ctx, q_expanded);
             const k_expanded = try embeddingLookupOp(ctx, k_r, ids, request.relative_full_count, request.hidden_size);
@@ -21788,6 +22187,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
         defer freeOp(ctx, attn_out);
 
+        return try self.finishDebertaEncoderLayer(request, rows, attn_out);
+    }
+
+    fn finishDebertaEncoderLayer(
+        self: *MetalCompute,
+        request: *const ops.DebertaEncoderLayerRequest,
+        rows: usize,
+        attn_out: CT,
+    ) !?CT {
         var attn_out_mt = try self.ownedDeviceMetalTensorFromCt(attn_out);
         defer attn_out_mt.deinit();
         var hidden_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
@@ -21816,7 +22224,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const attn_normed = try self.ctFromOwnedMetalTensor(attn_normed_output_mt);
         // `defer` alone covers every exit; a redundant errdefer would double-free
         // attn_normed on an error return (both would run).
-        defer freeOp(ctx, attn_normed);
+        defer freeOp(self, attn_normed);
 
         var attn_normed_mt = try self.ownedDeviceMetalTensorFromCt(attn_normed);
         defer attn_normed_mt.deinit();
@@ -22346,6 +22754,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn beginDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime) !bool {
         const rt = runtime orelse return false;
         if (metal_runtime.hasActiveFrame(rt)) return false;
+        self.finishPendingDebertaRelativeProjections(false);
         self.clearPendingPrefillKvDeviceSeeds();
         try metal_runtime.beginFrame(rt);
         self.timing_stats.decoder_runtime_frame_begins += 1;
@@ -22355,6 +22764,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn beginPreparedDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime) !bool {
         const rt = runtime orelse return false;
         if (metal_runtime.hasActiveFrame(rt)) return false;
+        self.finishPendingDebertaRelativeProjections(false);
         self.clearPendingPrefillKvDeviceSeeds();
         try metal_runtime.beginPreparedFrame(rt);
         self.timing_stats.decoder_runtime_frame_begins += 1;
@@ -22366,11 +22776,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer self.cancelDecoderRuntimeFrame(runtime, active);
         const rt = runtime orelse {
             active.* = false;
+            self.finishPendingDebertaRelativeProjections(false);
             return;
         };
         if (!metal_runtime.activeFrameHasWork(rt)) {
             metal_runtime.cancelFrame(rt) catch {};
             active.* = false;
+            self.finishPendingDebertaRelativeProjections(false);
             try self.flushPendingPrefillKvDeviceSeeds();
             return;
         }
@@ -22383,6 +22795,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.decoder_runtime_frame_wait_nanos += @intCast(finished_at - started_at);
         }
         self.timing_stats.decoder_runtime_frame_gpu_nanos += metal_runtime.lastFrameGpuNanos(rt);
+        self.finishPendingDebertaRelativeProjections(true);
         try self.flushPendingPrefillKvDeviceSeeds();
         active.* = false;
     }
@@ -22398,6 +22811,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.decoder_runtime_frame_wait_nanos += @intCast(finished_at - started_at);
         }
         self.timing_stats.decoder_runtime_frame_gpu_nanos += metal_runtime.lastFrameGpuNanos(rt);
+        self.finishPendingDebertaRelativeProjections(true);
         try self.flushPendingPrefillKvDeviceSeeds();
         return try metal_runtime.decoderRuntimeReadTokenId(self.provider_impl);
     }
@@ -22406,11 +22820,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!active.*) return;
         const rt = runtime orelse {
             active.* = false;
+            self.finishPendingDebertaRelativeProjections(false);
             self.clearPendingPrefillKvDeviceSeeds();
             return;
         };
         metal_runtime.cancelFrame(rt) catch {};
         active.* = false;
+        self.finishPendingDebertaRelativeProjections(false);
         self.clearPendingPrefillKvDeviceSeeds();
     }
 
@@ -22676,9 +23092,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .other_nanos = raw_stage_timing.decode.bucket_nanos[5],
             },
         };
-        stats.metal_runtime_buffer_count = runtime_stats.buffer_count;
-        stats.metal_runtime_total_bytes = runtime_stats.total_bytes;
-        stats.metal_runtime_private_bytes = runtime_stats.private_bytes;
+        var relative_cache_bytes: u64 = 0;
+        var relative_cache_buffers: u64 = 0;
+        {
+            while (!self.provider_impl.deberta_relative_projection_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
+            const embedding_cache = &self.provider_impl.deberta_relative_embedding_cache;
+            if (embedding_cache.valid) {
+                if (embedding_cache.tensor) |*tensor| {
+                    relative_cache_bytes +|= std.math.cast(u64, tensor.deviceByteLen()) orelse std.math.maxInt(u64);
+                    relative_cache_buffers +|= 1;
+                }
+            }
+            for (&self.provider_impl.deberta_relative_projection_cache) |*entry| {
+                if (!entry.valid) continue;
+                if (entry.q) |*tensor| {
+                    relative_cache_bytes +|= std.math.cast(u64, tensor.deviceByteLen()) orelse std.math.maxInt(u64);
+                    relative_cache_buffers +|= 1;
+                }
+                if (entry.k) |*tensor| {
+                    relative_cache_bytes +|= std.math.cast(u64, tensor.deviceByteLen()) orelse std.math.maxInt(u64);
+                    relative_cache_buffers +|= 1;
+                }
+            }
+        }
+        stats.metal_runtime_buffer_count = runtime_stats.buffer_count +| relative_cache_buffers;
+        stats.metal_runtime_total_bytes = runtime_stats.total_bytes +| relative_cache_bytes;
+        stats.metal_runtime_private_bytes = runtime_stats.private_bytes +| relative_cache_bytes;
+        stats.metal_runtime_deberta_relative_cache_bytes = relative_cache_bytes;
         stats.metal_runtime_shared_bytes = runtime_stats.shared_bytes;
         stats.metal_runtime_managed_bytes = runtime_stats.managed_bytes;
         stats.metal_runtime_embedding_logical_bytes = runtime_stats.embedding_logical_bytes;
@@ -22736,6 +23177,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_decode_gqa_split_calls = runtime_stats.decode_gqa_split_calls;
+        if (metal_runtime.decodeGqaSplitScheduleSnapshot(self.provider_impl.raw_decode_runtime)) |schedule_stats| {
+            stats.metal_runtime_decode_gqa_split_fallback_calls = schedule_stats.fallback_calls;
+        } else |_| {}
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
         stats.metal_runtime_generated_attention_flash_prefill_hd512_calls = runtime_stats.generated_attention_flash_prefill_hd512_calls;
@@ -24479,6 +24923,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeDecode = decoderRuntimeDecodeOp;
         vt.decoderRuntimePlanPrefillFrame = decoderRuntimePlanPrefillFrameOp;
         vt.decoderRuntimeExecuteGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
+        vt.debertaRelativeEmbeddings = debertaRelativeEmbeddingsOp;
         vt.debertaEncoderPlanFrame = debertaEncoderPlanFrameOp;
         vt.debertaEncoderLayer = debertaEncoderLayerOp;
         vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
@@ -29479,6 +29924,120 @@ test "metal_compute: disentangled relative attention forward matches native at m
     try expectStableDebertaForward(std.testing.allocator);
 }
 
+test "metal_compute: compact DeBERTa relative rows match expanded native attention" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const batch: usize = 1;
+    // Keep this at the production MPS-attention threshold so compact relative
+    // indexing is checked through the batched-MPS score path, not only Flash4.
+    const seq_len: usize = 128;
+    const num_heads: usize = 2;
+    const head_dim: usize = 8;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const rel_rows = 2 * seq_len - 1;
+    const unique_rows: usize = 5;
+
+    const q_data = try allocator.alloc(f32, total);
+    defer allocator.free(q_data);
+    const k_data = try allocator.alloc(f32, total);
+    defer allocator.free(k_data);
+    const v_data = try allocator.alloc(f32, total);
+    defer allocator.free(v_data);
+    const compact_q_r = try allocator.alloc(f32, unique_rows * hidden);
+    defer allocator.free(compact_q_r);
+    const compact_k_r = try allocator.alloc(f32, unique_rows * hidden);
+    defer allocator.free(compact_k_r);
+    fillSignedUnit(q_data, 8101);
+    fillSignedUnit(k_data, 8102);
+    fillSignedUnit(v_data, 8103);
+    fillSignedUnit(compact_q_r, 8104);
+    fillSignedUnit(compact_k_r, 8105);
+
+    const relative_index = try allocator.alloc(i64, rel_rows);
+    defer allocator.free(relative_index);
+    const expanded_q_r = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(expanded_q_r);
+    const expanded_k_r = try allocator.alloc(f32, rel_rows * hidden);
+    defer allocator.free(expanded_k_r);
+    for (relative_index, 0..) |*index, row| {
+        const unique_row = row % unique_rows;
+        index.* = @intCast(unique_row);
+        @memcpy(expanded_q_r[row * hidden .. (row + 1) * hidden], compact_q_r[unique_row * hidden .. (unique_row + 1) * hidden]);
+        @memcpy(expanded_k_r[row * hidden .. (row + 1) * hidden], compact_k_r[unique_row * hidden .. (unique_row + 1) * hidden]);
+    }
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+
+    const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    const expanded_rel_shape = [_]i32{ @intCast(rel_rows), @intCast(hidden) };
+    const compact_rel_shape = [_]i32{ @intCast(unique_rows), @intCast(hidden) };
+
+    var native_ws = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .empty,
+        .lazy_weights = .empty,
+    };
+    defer native_ws.resident_weights.deinit(allocator);
+    defer native_ws.lazy_weights.deinit(allocator);
+    var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    var native_cb = native_compute.computeBackend();
+    const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
+    defer native_cb.free(native_q);
+    const native_k = try native_cb.fromFloat32Shape(k_data, &token_shape);
+    defer native_cb.free(native_k);
+    const native_v = try native_cb.fromFloat32Shape(v_data, &token_shape);
+    defer native_cb.free(native_v);
+    const native_q_r = try native_cb.fromFloat32Shape(expanded_q_r, &expanded_rel_shape);
+    defer native_cb.free(native_q_r);
+    const native_k_r = try native_cb.fromFloat32Shape(expanded_k_r, &expanded_rel_shape);
+    defer native_cb.free(native_k_r);
+    const native_out = try native_cb.disentangledRelativeAttention(native_q, native_k, native_v, native_q_r, native_k_r, mask, batch, seq_len, num_heads, head_dim);
+    defer native_cb.free(native_out);
+    const expected = try native_cb.toFloat32(native_out, allocator);
+    defer allocator.free(expected);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &token_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(k_data, &token_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(v_data, &token_shape);
+    defer metal_cb.free(metal_v);
+    const metal_q_r = try metal_cb.fromFloat32Shape(compact_q_r, &compact_rel_shape);
+    defer metal_cb.free(metal_q_r);
+    const metal_k_r = try metal_cb.fromFloat32Shape(compact_k_r, &compact_rel_shape);
+    defer metal_cb.free(metal_k_r);
+    const metal_out = (try metal_compute.tryDisentangledRelativeAttentionResident(
+        metal_q,
+        metal_k,
+        metal_v,
+        metal_q_r,
+        metal_k_r,
+        relative_index,
+        unique_rows,
+        mask,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    )) orelse return error.MissingCompactMetalAttentionOutput;
+    defer metal_cb.free(metal_out);
+    var baseline: ?[]f32 = null;
+    defer if (baseline) |first| allocator.free(first);
+    try expectMetalRepeatsStable(allocator, &metal_cb, expected, 1e-4, &baseline, metal_out);
+    const timing = metal_cb.debugTimingSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), timing.provider.metal_runtime_deberta_attention_gemm_calls);
+    try std.testing.expectEqual(@as(u64, 0), timing.provider.metal_runtime_deberta_attention_flash_calls);
+}
+
 test "metal_compute: legacy threadgroup disentangled relative attention matches native at multi-simdgroup threadgroup width" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -30927,4 +31486,12 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
         try std.testing.expect(std.math.isFinite(actual_value));
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-5);
     }
+}
+
+test "metal decoder runtime consumes effective RoPE theta once" {
+    var layer = std.mem.zeroes(ops.DecoderRuntimeLayerSpec);
+    layer.rope_dim = 512;
+    layer.rope_active_dim = 128;
+    layer.rope_theta = std.math.pow(f32, 1_000_000.0, 0.25);
+    try std.testing.expectApproxEqAbs(layer.rope_theta, decoderRuntimeLayerRopeTheta(&layer), 1e-6);
 }

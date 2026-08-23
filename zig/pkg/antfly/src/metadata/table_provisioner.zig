@@ -293,6 +293,109 @@ pub fn reconcileDbIndexesWithOptions(
     };
 }
 
+/// Reconcile one catalog index without applying sibling index, resolver, or
+/// table-schema changes carried by the same metadata snapshot.
+/// This is the storage boundary used by online index DDL after its foreground
+/// write-capability barrier has completed (or partially completed).
+pub fn reconcileDbIndexTarget(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !ProvisionSummary {
+    if (!dbIndexReconciliationCanMutate(db)) return .{};
+    if (index_name.len == 0 or
+        std.mem.eql(u8, index_name, "resolvers") or
+        std.mem.eql(u8, index_name, "enrichments")) return error.InvalidTableIndexMetadata;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+
+    var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
+        desired_enrichments.deinit(alloc);
+    }
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
+    dedupeDesiredEnrichments(alloc, &desired_enrichments);
+    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+
+    var target_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (target_enrichments.items) |*cfg| cfg.deinit(alloc);
+        target_enrichments.deinit(alloc);
+    }
+
+    const current = try db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, current);
+    var target_summary: IndexEnsureSummary = .{};
+    var target_value: ?std.json.Value = null;
+    var target_array_form = false;
+
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            const name = try indexDefinitionName(item);
+            if (!std.mem.eql(u8, name, index_name)) continue;
+            if (target_value != null) return error.InvalidTableIndexMetadata;
+            target_value = item;
+            target_array_form = true;
+        }
+    } else {
+        if (object.get(index_name)) |config_value| {
+            target_value = config_value;
+        }
+    }
+
+    if (target_value) |value| {
+        try indexes_api.collectArtifactEnrichmentsFromValue(alloc, value, &target_enrichments);
+        dedupeDesiredEnrichments(alloc, &target_enrichments);
+        indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
+    }
+    const enrichment_summary = try ensureEnrichments(db, target_enrichments.items);
+
+    if (target_value) |value| {
+        try ensureIndexDefinition(
+            alloc,
+            db,
+            current,
+            &target_summary,
+            index_name,
+            try parseIndexKind(value),
+            if (target_array_form) indexDefinitionConfigValue(value) else value,
+            target_array_form,
+        );
+    } else {
+        if (try db.deleteIndex(index_name)) target_summary.removed += 1;
+    }
+    // Removing every persisted enrichment absent from the current catalog is
+    // target-safe: it never applies a sibling addition or update, while also
+    // making deletion retryable after a crash between index and enrichment
+    // retirement. Definitions still referenced by another index or by the
+    // table-level enrichment catalog remain in desired_enrichments.
+    const enrichments_removed = try removeAbsentEnrichments(alloc, db, desired_enrichments.items);
+    if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0) {
+        const pending = db.pendingWorkStats();
+        if (pending.enrichment.error_count == 0) try db.core.index_manager.syncAll(false);
+    }
+    return .{
+        .indexes_added = target_summary.added,
+        .indexes_removed = target_summary.removed,
+        .indexes_pending = target_summary.pending,
+        .enrichments_added = enrichment_summary.added,
+        .enrichments_updated = enrichment_summary.updated,
+        .enrichments_removed = enrichments_removed,
+    };
+}
+
 pub fn collectLocalSchemaProgress(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -1006,7 +1109,7 @@ fn ensureIndexDefinition(
     }
     if (existing) |existing_cfg| {
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
-            if (desired.kind == .full_text) {
+            if (db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
                 if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
                     summary.pending += 1;
                 }
@@ -1030,24 +1133,14 @@ fn ensureIndexDefinition(
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
     };
-    if (desired.kind == .full_text) {
-        const repair_id = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
-            error.IndexArtifactCleanupPending => {
-                summary.pending += 1;
-                return;
-            },
-            else => return err,
-        };
-        if (repair_id != null) summary.pending += 1;
-    } else {
-        db.addIndex(admitted) catch |err| switch (err) {
-            error.IndexArtifactCleanupPending => {
-                summary.pending += 1;
-                return;
-            },
-            else => return err,
-        };
-    }
+    const repair_id = db.admitManagedIndex(admitted) catch |err| switch (err) {
+        error.IndexArtifactCleanupPending => {
+            summary.pending += 1;
+            return;
+        },
+        else => return err,
+    };
+    if (repair_id != null) summary.pending += 1;
     summary.added += 1;
 }
 
@@ -1231,6 +1324,30 @@ fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: [
         if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
             if (enrichmentConfigsEqual(cfg, desired_cfg)) continue;
         }
+        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
+            if (deleted) removed += 1;
+        } else |err| switch (err) {
+            error.EnrichmentInUse => continue,
+            else => return err,
+        }
+    }
+    return removed;
+}
+
+fn removeAbsentEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
+    const existing = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
+
+    var removed: usize = 0;
+    var i = existing.len;
+    while (i > 0) {
+        i -= 1;
+        const cfg = existing[i];
+        // Target reconciliation may observe a newer sibling definition. Its
+        // named operation must not delete the old sibling config merely because
+        // that config still needs a whole-table update; only catalog absence is
+        // globally safe cleanup.
+        if (findEnrichmentByName(desired, cfg.name) != null) continue;
         if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
             if (deleted) removed += 1;
         } else |err| switch (err) {
@@ -1802,6 +1919,94 @@ test "table provisioner materializes array-form metadata indexes" {
     try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
 }
 
+test "target index reconciliation never mutates sibling indexes" {
+    const path = "/tmp/antfly-metadata-table-provisioner-target-index";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    _ = try reconcileDbIndexes(std.testing.allocator, &db,
+        \\{"keep_idx":{"type":"full_text"}}
+    );
+    const desired =
+        \\{"target_idx":{"type":"full_text"},"unrelated_new":{"type":"full_text"}}
+    ;
+    const admitted = try reconcileDbIndexTarget(std.testing.allocator, &db, desired, "target_idx");
+    try std.testing.expectEqual(@as(usize, 1), admitted.indexes_added);
+
+    var configs = try db.listIndexes(std.testing.allocator);
+    try std.testing.expect(findIndexConfig(configs, "keep_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "target_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
+    db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+
+    const removed = try reconcileDbIndexTarget(std.testing.allocator, &db, desired, "keep_idx");
+    try std.testing.expectEqual(@as(usize, 1), removed.indexes_removed);
+    configs = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+    try std.testing.expect(findIndexConfig(configs, "keep_idx") == null);
+    try std.testing.expect(findIndexConfig(configs, "target_idx") != null);
+    try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
+}
+
+test "target index reconciliation retires orphaned inline enrichments after deletion retry" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-target-enrichment-delete";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const initial =
+        \\{
+        \\  "target_idx":{"type":"full_text","artifact_name":"target_chunks","enrichments":[
+        \\    {"name":"target_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"target_chunks","kind":"chunk","source_artifact_name":"target_units","field":"text","chunk_size":128}
+        \\  ]},
+        \\  "keep_idx":{"type":"full_text","artifact_name":"keep_chunks","enrichments":[
+        \\    {"name":"keep_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"keep_chunks","kind":"chunk","source_artifact_name":"keep_units","field":"text","chunk_size":128}
+        \\  ]}
+        \\}
+    ;
+    _ = try reconcileDbIndexes(alloc, &db, initial);
+    try std.testing.expect(try db.deleteIndex("target_idx"));
+
+    // Simulate a crash after the index catalog commit but before its inline
+    // enrichments were retired. The retry has no old index config to inspect,
+    // so cleanup must be derived from complete current catalog ownership.
+    const desired =
+        \\{"keep_idx":{"type":"full_text","artifact_name":"keep_chunks","enrichments":[
+        \\  {"name":"keep_units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\  {"name":"keep_chunks","kind":"chunk","source_artifact_name":"keep_units","field":"text","chunk_size":128}
+        \\]}}
+    ;
+    const summary = try reconcileDbIndexTarget(alloc, &db, desired, "target_idx");
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 2), summary.enrichments_removed);
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "keep_units") != null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "keep_chunks") != null);
+    try std.testing.expect(findEnrichment(enrichments, .asset, "target_units") == null);
+    try std.testing.expect(findEnrichment(enrichments, .chunk, "target_chunks") == null);
+}
+
 test "table provisioner durably enqueues existing corpus full text backfill" {
     const path = "/tmp/antfly-metadata-table-provisioner-full-text-backfill";
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1996,6 +2201,38 @@ test "table provisioner reconciles stored algebraic metadata without public type
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
 }
 
+test "table provisioner admits algebraic index on a non-empty table through generation repair" {
+    const path = "/tmp/antfly-metadata-table-provisioner-algebraic-non-empty";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2002);
+    defer std.testing.allocator.free(db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), db_path);
+
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"product\":\"hammer\"}" }},
+        .sync_level = .write,
+    });
+
+    const indexes_json =
+        \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_pending);
+    try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
+    try std.testing.expect(db.core.index_manager.repairUnavailable("alg"));
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
+}
+
 test "table provisioner extracts public algebraic metadata as internal config" {
     const alloc = std.testing.allocator;
     const index_json =
@@ -2084,7 +2321,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
@@ -2141,7 +2378,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
@@ -2187,7 +2424,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[]
         \\}
     ;
@@ -2242,7 +2479,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}}
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
         \\}
     ;
     _ = try reconcileDbIndexesWithOptions(alloc, &db, graph_only, .{});
@@ -2261,7 +2498,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\{
         \\  "relations_graph":{"type":"graph",
         \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
         \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}

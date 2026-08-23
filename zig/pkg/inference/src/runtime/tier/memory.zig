@@ -20,6 +20,11 @@ const kv_pool = @import("../kv/pool.zig");
 const storage_runtime = @import("../kv/storage_runtime.zig");
 const gpt_mod = @import("../../models/gpt.zig");
 
+pub const generation_kv_page_size_tokens: u16 = 16;
+pub const generation_default_prefill_chunk_tokens: usize = 256;
+pub const generation_max_speculative_k: u32 = 16;
+pub const generation_max_speculative_rows: usize = @as(usize, generation_max_speculative_k) + 1;
+
 const macos = if (builtin.os.tag == .macos) struct {
     pub const kern_return_t = c_int;
     pub const integer_t = c_int;
@@ -95,6 +100,29 @@ pub const Limits = struct {
     scratch_limit_bytes: usize = 0,
 };
 
+/// Apply selective operator overrides while preserving a coherent physical
+/// memory envelope. Host and backend limits are the two components of the
+/// combined limit, so changing either component without also changing the
+/// aggregate must derive a new aggregate from the effective component limits.
+/// An explicit combined override remains authoritative and may intentionally
+/// impose a tighter shared cap.
+pub fn applyLimitOverrides(defaults: Limits, overrides: Limits) Limits {
+    var limits = defaults;
+    const physical_component_overridden =
+        overrides.host_limit_bytes != 0 or overrides.backend_limit_bytes != 0;
+
+    if (overrides.host_limit_bytes != 0) limits.host_limit_bytes = overrides.host_limit_bytes;
+    if (overrides.backend_limit_bytes != 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
+    if (overrides.combined_limit_bytes != 0) {
+        limits.combined_limit_bytes = overrides.combined_limit_bytes;
+    } else if (physical_component_overridden) {
+        limits.combined_limit_bytes = limits.host_limit_bytes +| limits.backend_limit_bytes;
+    }
+    if (overrides.kv_limit_bytes != 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
+    if (overrides.scratch_limit_bytes != 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+    return limits;
+}
+
 pub const bytes_per_mib: usize = 1024 * 1024;
 
 /// CLI-facing memory limit overrides expressed in whole mebibytes. Zero means
@@ -123,14 +151,7 @@ pub const BudgetOverridesMib = struct {
     /// Apply explicit overrides after backend defaults and model-specific
     /// widening have been resolved.
     pub fn apply(self: @This(), defaults: Limits) !Limits {
-        const overrides = try self.toByteLimits();
-        var limits = defaults;
-        if (overrides.host_limit_bytes != 0) limits.host_limit_bytes = overrides.host_limit_bytes;
-        if (overrides.backend_limit_bytes != 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
-        if (overrides.combined_limit_bytes != 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
-        if (overrides.kv_limit_bytes != 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
-        if (overrides.scratch_limit_bytes != 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
-        return limits;
+        return applyLimitOverrides(defaults, try self.toByteLimits());
     }
 };
 
@@ -153,7 +174,7 @@ test "budget MiB overrides convert every memory domain exactly" {
     try std.testing.expectEqual(@as(usize, 6 * bytes_per_mib), overrides.scratch_limit_bytes);
 }
 
-test "budget MiB overrides apply selectively and zero remains omitted" {
+test "budget MiB overrides apply selectively and keep physical limits coherent" {
     const defaults = Limits{
         .host_limit_bytes = 10,
         .backend_limit_bytes = 20,
@@ -167,10 +188,33 @@ test "budget MiB overrides apply selectively and zero remains omitted" {
     }).apply(defaults);
     try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib), applied.host_limit_bytes);
     try std.testing.expectEqual(@as(usize, 20), applied.backend_limit_bytes);
-    try std.testing.expectEqual(@as(usize, 30), applied.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib + 20), applied.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 3 * bytes_per_mib), applied.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 50), applied.scratch_limit_bytes);
     try std.testing.expectEqual(defaults, try (BudgetOverridesMib{}).apply(defaults));
+}
+
+test "explicit combined budget remains authoritative over component overrides" {
+    const applied = applyLimitOverrides(.{
+        .host_limit_bytes = 100,
+        .backend_limit_bytes = 200,
+        .combined_limit_bytes = 300,
+    }, .{
+        .host_limit_bytes = 400,
+        .combined_limit_bytes = 250,
+    });
+    try std.testing.expectEqual(@as(usize, 400), applied.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 200), applied.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 250), applied.combined_limit_bytes);
+}
+
+test "derived combined budget saturates instead of wrapping" {
+    const applied = applyLimitOverrides(.{
+        .host_limit_bytes = 1,
+        .backend_limit_bytes = std.math.maxInt(usize),
+        .combined_limit_bytes = 1,
+    }, .{ .host_limit_bytes = 2 });
+    try std.testing.expectEqual(std.math.maxInt(usize), applied.combined_limit_bytes);
 }
 
 test "budget MiB overrides accept the representable boundary and reject overflow" {
@@ -215,12 +259,36 @@ pub const SystemMemoryInfo = struct {
     /// large portion of RAM and can reject every positive admission while
     /// macOS still reports normal memory pressure.
     availability_basis: AvailabilityBasis = .mem_available,
+    /// When an operator-owned process envelope is the tighter live constraint,
+    /// it already bounds the complete cgroup or process working set.
+    /// Preserve only the emergency reserve inside that bounded view instead
+    /// of applying dynamic host headroom a second time.
+    live_admission_policy: LiveAdmissionPolicy = .dynamic_pressure,
 };
 
 pub const AvailabilityBasis = enum {
     mem_available,
     macos_memory_pressure,
     macos_reclaimable_pages,
+};
+
+pub const LiveAdmissionPolicy = enum {
+    dynamic_pressure,
+    explicit_process_envelope,
+};
+
+/// Provenance is policy, not telemetry: only an operator-owned envelope may
+/// replace the dynamic pressure reserve with the fixed emergency reserve.
+/// Automatically detected host/cgroup limits remain dynamic even when their
+/// resolved byte value is forwarded by a composing runtime. Preserve their
+/// exact source for diagnostics and future source-specific policy.
+pub const ProcessMemoryLimitProvenance = enum {
+    automatic,
+    explicit,
+    cgroup_v2,
+    cgroup_v1,
+    host,
+    unavailable,
 };
 
 pub const ReservationKind = enum {
@@ -590,8 +658,26 @@ pub const AdmissionResourceError = error{
 
 pub const AdmissionResourceBudget = struct {
     context: *anyopaque,
-    try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!void,
-    release: *const fn (*anyopaque, AdmissionAmounts) void,
+    /// Optional capability-context lifetime. Shared owners must provide both
+    /// hooks so an admission controller can safely outlive its publisher.
+    retain_context: ?*const fn (*anyopaque) bool = null,
+    release_context: ?*const fn (*anyopaque) void = null,
+    try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!usize,
+    retain: *const fn (*anyopaque, usize, AdmissionAmounts) AdmissionResourceError!void,
+    release: *const fn (*anyopaque, usize) void,
+
+    pub fn hasValidLifetimeHooks(self: @This()) bool {
+        return (self.retain_context == null) == (self.release_context == null);
+    }
+
+    pub fn retainContext(self: @This()) bool {
+        if (!self.hasValidLifetimeHooks()) return false;
+        return if (self.retain_context) |retain| retain(self.context) else true;
+    }
+
+    pub fn releaseContext(self: @This()) void {
+        if (self.release_context) |release| release(self.context);
+    }
 };
 
 pub const AdmissionRequest = struct {
@@ -631,6 +717,9 @@ pub const AdmissionLease = struct {
     amounts: AdmissionAmounts,
     amounts_by_backend: [backend_class_count]AdmissionAmounts,
     retain_backend_class: ?BackendClass,
+    /// Opaque exactly-once ownership token returned by the external process
+    /// manager. Byte totals are never reconstructed for release.
+    external_lease: ?usize = null,
     /// Bytes committed against the current live-memory pressure epoch. This is
     /// deliberately separate from policy accounting: the kernel/cgroup probe
     /// reflects physical pressure, while AdmissionAmounts tracks ownership.
@@ -647,6 +736,7 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const retained_live_bytes = liveHostBytes(retained) catch
             return error.InvalidAdmissionLeaseReduction;
+        try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
         controller.settleLiveReservation(
             self.live_reserved_bytes,
@@ -660,11 +750,12 @@ pub const AdmissionLease = struct {
     pub fn release(self: *AdmissionLease) void {
         const controller = self.controller orelse return;
         controller.releaseLiveReservation(self.live_reserved_bytes);
-        controller.release(self.amounts_by_backend, self.amounts);
+        controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
         self.controller = null;
         self.amounts = .{};
         self.amounts_by_backend = emptyAdmissionAmountsByBackend();
         self.retain_backend_class = null;
+        self.external_lease = null;
         self.live_reserved_bytes = 0;
     }
 };
@@ -688,10 +779,20 @@ pub const AdmissionController = struct {
     admitted_by_backend: [backend_class_count]AdmissionAmounts =
         emptyAdmissionAmountsByBackend(),
     shared_limits: SharedAdmissionLimits = .{},
+    /// Optional hard envelope for the whole process/container. Unlike the
+    /// inference-owned ledgers, the live check charges current container usage,
+    /// including sibling processes and allocations outside inference.
+    process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     resource_budget: ?AdmissionResourceBudget = null,
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
+
+    pub fn deinit(self: *AdmissionController) void {
+        self.configureResourceBudget(null) catch
+            @panic("admission controller deinitialized with active resource leases");
+    }
 
     pub fn configureForcedRunDenialsForTesting(
         self: *AdmissionController,
@@ -725,14 +826,52 @@ pub const AdmissionController = struct {
         self.shared_limits = shared_limits;
     }
 
-    pub fn configureResourceBudget(
+    pub fn configureProcessMemoryLimit(
         self: *AdmissionController,
-        resource_budget: ?AdmissionResourceBudget,
+        limit_bytes: usize,
+        provenance: ProcessMemoryLimitProvenance,
     ) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
         std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        self.process_memory_limit_bytes = limit_bytes;
+        self.process_memory_limit_provenance = provenance;
+    }
+
+    /// Re-sample the authoritative live-memory signal without acquiring a new
+    /// logical reservation. Long-running mmap-backed inference can grow the
+    /// cgroup working set through page faults after its last allocator-visible
+    /// admission point; backends use this probe to shed clean pages before the
+    /// kubelet's eviction threshold is reached.
+    pub fn isLiveHostUnderPressure(self: *AdmissionController) bool {
+        const info = currentSystemMemoryInfoForLimit(
+            self.process_memory_limit_bytes,
+            self.process_memory_limit_provenance,
+        ) orelse return false;
+        checkLiveHostMemoryWithInfo(info, 1) catch return true;
+        return false;
+    }
+
+    pub fn configureResourceBudget(
+        self: *AdmissionController,
+        resource_budget: ?AdmissionResourceBudget,
+    ) !void {
+        if (resource_budget) |budget| {
+            if (!budget.hasValidLifetimeHooks())
+                return error.InvalidResourceBudgetLifetime;
+            if (!budget.retainContext())
+                return error.ResourceOwnerShuttingDown;
+        }
+        errdefer if (resource_budget) |budget| budget.releaseContext();
+        spinLockAdmission(&self.mutex);
+        if (!std.meta.eql(self.admitted, AdmissionAmounts{})) {
+            self.mutex.unlock();
+            return error.ResourceBudgetInUse;
+        }
+        const previous = self.resource_budget;
         self.resource_budget = resource_budget;
+        self.mutex.unlock();
+        if (previous) |budget| budget.releaseContext();
     }
 
     pub fn tryAcquire(
@@ -933,13 +1072,19 @@ pub const AdmissionController = struct {
             self.admitted_by_backend = next_by_backend;
         }
 
+        var external_lease: ?usize = null;
         if (self.resource_budget) |resource_budget| {
-            resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
+            const token = resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
                     pressure.* = .external_budget;
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
+            if (token == 0) {
+                self.releaseLocal(amounts_by_backend, amounts);
+                return error.ResourceLimitExceeded;
+            }
+            external_lease = token;
         }
 
         var live_reserved_bytes: usize = 0;
@@ -949,13 +1094,13 @@ pub const AdmissionController = struct {
             // Linux MemAvailable, or a valid device-resident model is rejected merely
             // because its VRAM footprint exceeds free host RAM.
             const live_host_incremental = liveHostBytes(amounts) catch {
-                self.release(amounts_by_backend, amounts);
+                self.release(amounts_by_backend, amounts, external_lease);
                 return error.ResourceLimitExceeded;
             };
             live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
                     pressure.* = .live_host;
-                self.release(amounts_by_backend, amounts);
+                self.release(amounts_by_backend, amounts, external_lease);
                 return err;
             };
         }
@@ -973,6 +1118,7 @@ pub const AdmissionController = struct {
             .amounts = amounts,
             .amounts_by_backend = amounts_by_backend,
             .retain_backend_class = retain_backend_class,
+            .external_lease = external_lease,
             .live_reserved_bytes = live_reserved_bytes,
         };
     }
@@ -999,17 +1145,37 @@ pub const AdmissionController = struct {
     ) void {
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         amounts_by_backend[backendClassIndex(backend_class)] = amounts;
-        self.release(amounts_by_backend, amounts);
+        self.releaseLocal(amounts_by_backend, amounts);
     }
 
     fn release(
         self: *AdmissionController,
         amounts_by_backend: [backend_class_count]AdmissionAmounts,
         amounts: AdmissionAmounts,
+        external_lease: ?usize,
     ) void {
+        if (external_lease) |token| {
+            // Keep the local reservation published until the external owner has
+            // consumed its exactly-once token. configureResourceBudget() uses
+            // that reservation as its exclusion condition, so releasing local
+            // accounting first would let a concurrent reconfiguration detach
+            // the old context and route this token to a different capability.
+            const resource_budget = self.resource_budget orelse
+                @panic("external admission lease lost its resource budget");
+            resource_budget.release(resource_budget.context, token);
+        }
         self.releaseLocal(amounts_by_backend, amounts);
-        if (self.resource_budget) |resource_budget|
-            resource_budget.release(resource_budget.context, amounts);
+    }
+
+    fn retainExternalLease(
+        self: *AdmissionController,
+        external_lease: ?usize,
+        retained: AdmissionAmounts,
+    ) AdmissionResourceError!void {
+        const token = external_lease orelse return;
+        const resource_budget = self.resource_budget orelse
+            return error.ResourceLimitExceeded;
+        try resource_budget.retain(resource_budget.context, token, retained);
     }
 
     fn releaseLocal(
@@ -1036,7 +1202,10 @@ pub const AdmissionController = struct {
         defer self.live_mutex.unlock();
 
         const info = if (self.live_pending_bytes == 0)
-            currentSystemMemoryInfo()
+            currentSystemMemoryInfoForLimit(
+                self.process_memory_limit_bytes,
+                self.process_memory_limit_provenance,
+            )
         else
             null;
         const starts_new_epoch = self.live_pending_bytes == 0;
@@ -1045,8 +1214,9 @@ pub const AdmissionController = struct {
                 if (info) |memory_info| {
                     const available = memory_info.available_bytes orelse 0;
                     const reserve = liveHostAdmissionReserve(memory_info);
+                    const process_memory = platform.process_memory.pressureSnapshot();
                     std.log.warn(
-                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s}",
+                        "inference live-memory admission denied requested_bytes={d} pending_bytes={d} available_bytes={d} reserve_bytes={d} capacity_bytes={d} basis={s} policy={s} process_rss_bytes={d} process_anonymous_bytes={d} process_private_dirty_bytes={d}",
                         .{
                             incremental_bytes,
                             self.live_pending_bytes,
@@ -1054,6 +1224,10 @@ pub const AdmissionController = struct {
                             reserve,
                             available -| reserve,
                             @tagName(memory_info.availability_basis),
+                            @tagName(memory_info.live_admission_policy),
+                            process_memory.resident_bytes,
+                            process_memory.anonymous_bytes,
+                            process_memory.private_dirty_bytes,
                         },
                     );
                 } else {
@@ -1266,17 +1440,26 @@ fn macosLiveAdmissionGrace(total_bytes: usize) usize {
 
 /// Determine how much of the current availability sample must remain unused.
 ///
-/// Linux MemAvailable is designed as an allocation-availability estimate, so
-/// retain the complete node headroom there. macOS supplies a system pressure
-/// percentage, with raw Mach page queues as a conservative fallback. The stable
-/// shared admission limit already retains full node headroom against Antfly
-/// residency. For this second, live-pressure gate keep a bounded emergency
-/// reserve instead of subtracting the node reserve twice.
+/// Linux MemAvailable is an allocation-availability estimate. With automatic
+/// host/cgroup sizing, preserve half of current availability, with a 512 MiB
+/// emergency floor and the stable node headroom as a ceiling. An explicit
+/// process envelope already charges the complete cgroup/process usage and
+/// expresses the operator's process headroom; inside that envelope preserve a
+/// fixed 512 MiB emergency reserve rather than dynamically reserving the
+/// bounded remainder a second time. macOS supplies a system pressure
+/// percentage, with raw Mach page queues as a conservative fallback, and uses
+/// a smaller bounded grace window because its availability sample omits some
+/// reclaimable memory.
 fn liveHostAdmissionReserve(info: SystemMemoryInfo) usize {
     const available = info.available_bytes orelse return 0;
+    if (info.live_admission_policy == .explicit_process_envelope)
+        return @min(available, mib(512));
     const node_headroom = liveHostMemoryHeadroom(info.total_bytes);
     return switch (info.availability_basis) {
-        .mem_available => @min(available, node_headroom),
+        .mem_available => @min(
+            node_headroom,
+            @min(available, @max(mib(512), available / 2)),
+        ),
         .macos_memory_pressure, .macos_reclaimable_pages => blk: {
             const normal_capacity = available -| node_headroom;
             const emergency_reserve = @min(
@@ -1302,7 +1485,14 @@ fn checkLiveHostMemoryWithInfo(info: SystemMemoryInfo, incremental_bytes: usize)
 }
 
 pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
-    if (currentSystemMemoryInfo()) |info| {
+    return defaultLimitsForBackendWithProcessLimit(backend, 0);
+}
+
+pub fn defaultLimitsForBackendWithProcessLimit(
+    backend: BackendClass,
+    process_memory_limit_bytes: usize,
+) Limits {
+    if (stableSystemMemoryInfoForLimit(process_memory_limit_bytes)) |info| {
         // Admission policy is stable for the lifetime of a machine configuration.
         // Current pressure is checked separately immediately before allocation.
         return deriveLimitsForBackend(backend, .{
@@ -1318,7 +1508,13 @@ pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
 /// cap represents all memory available after the node's safety headroom and
 /// therefore also accommodates explicitly widened large-model floors.
 pub fn defaultSharedAdmissionLimits() SharedAdmissionLimits {
-    const defaults = if (currentSystemMemoryInfo()) |info| blk: {
+    return defaultSharedAdmissionLimitsWithProcessLimit(0);
+}
+
+pub fn defaultSharedAdmissionLimitsWithProcessLimit(
+    process_memory_limit_bytes: usize,
+) SharedAdmissionLimits {
+    const defaults = if (stableSystemMemoryInfoForLimit(process_memory_limit_bytes)) |info| blk: {
         const safe_pool = info.total_bytes -|
             @min(info.total_bytes, liveHostMemoryHeadroom(info.total_bytes));
         break :blk SharedAdmissionLimits{
@@ -1342,7 +1538,14 @@ pub fn defaultSharedAdmissionLimits() SharedAdmissionLimits {
 /// Node overrides are global policy for shared physical domains, while the
 /// remaining fields continue to constrain each CPU/GPU workload bucket.
 pub fn sharedAdmissionLimitsWithOverrides(overrides: Limits) SharedAdmissionLimits {
-    var limits = defaultSharedAdmissionLimits();
+    return sharedAdmissionLimitsWithOverridesAndProcessLimit(overrides, 0);
+}
+
+pub fn sharedAdmissionLimitsWithOverridesAndProcessLimit(
+    overrides: Limits,
+    process_memory_limit_bytes: usize,
+) SharedAdmissionLimits {
+    var limits = defaultSharedAdmissionLimitsWithProcessLimit(process_memory_limit_bytes);
     if (overrides.host_limit_bytes > 0)
         limits.host_limit_bytes = overrides.host_limit_bytes;
     if (builtin.os.tag == .macos and overrides.combined_limit_bytes > 0)
@@ -1372,8 +1575,139 @@ fn staticLimitsForBackend(backend: BackendClass) Limits {
 pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     return switch (builtin.os.tag) {
         .macos => probeSystemMemoryInfoMacos(),
-        .linux => probeSystemMemoryInfoLinux(),
+        .linux => probeSystemMemoryInfoLinuxSample().info,
         else => null,
+    };
+}
+
+/// Apply a resolved process/container envelope to the live memory view. Linux
+/// charges the limit against leaf-cgroup working set, matching the kubelet's
+/// pod-eviction usage signal while excluding reclaimable inactive file pages.
+pub fn currentSystemMemoryInfoForLimit(
+    limit_bytes: usize,
+    provenance: ProcessMemoryLimitProvenance,
+) ?SystemMemoryInfo {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            const sample = probeSystemMemoryInfoLinuxSample();
+            break :blk applyOptionalProcessMemoryLimit(
+                sample.info,
+                limit_bytes,
+                sample.cgroup.leaf_working_set_bytes,
+                provenance,
+            );
+        },
+        .macos => blk: {
+            const detected = probeSystemMemoryInfoMacos();
+            if (limit_bytes == 0) break :blk detected;
+            break :blk applyOptionalProcessMemoryLimitWithProcessSnapshot(
+                detected,
+                limit_bytes,
+                provenance,
+                platform.process_memory.pressureSnapshot(),
+            );
+        },
+        else => applyOptionalProcessMemoryLimit(null, limit_bytes, null, provenance),
+    };
+}
+
+fn processWorkingSetBytesFromSnapshot(stats: platform.process_memory.Stats) ?usize {
+    if (!stats.available) return null;
+    const working_set = platform.process_memory.pressureWorkingSetBytes(stats);
+    // A wider platform counter must fail closed rather than wrap into apparent
+    // free capacity on a narrower target.
+    return std.math.cast(usize, working_set) orelse std.math.maxInt(usize);
+}
+
+fn applyOptionalProcessMemoryLimitWithProcessSnapshot(
+    detected: ?SystemMemoryInfo,
+    limit_bytes: usize,
+    provenance: ProcessMemoryLimitProvenance,
+    process_snapshot: platform.process_memory.Stats,
+) ?SystemMemoryInfo {
+    return applyOptionalProcessMemoryLimit(
+        detected,
+        limit_bytes,
+        processWorkingSetBytesFromSnapshot(process_snapshot),
+        provenance,
+    );
+}
+
+fn applyOptionalProcessMemoryLimit(
+    detected: ?SystemMemoryInfo,
+    limit_bytes: usize,
+    leaf_usage_bytes: ?usize,
+    provenance: ProcessMemoryLimitProvenance,
+) ?SystemMemoryInfo {
+    if (limit_bytes == 0) return detected;
+    return applyProcessMemoryLimit(detected orelse .{
+        .total_bytes = limit_bytes,
+        .available_bytes = limit_bytes,
+        .availability_basis = .mem_available,
+    }, limit_bytes, leaf_usage_bytes, provenance);
+}
+
+fn applyProcessMemoryLimit(
+    detected: SystemMemoryInfo,
+    limit_bytes: usize,
+    leaf_usage_bytes: ?usize,
+    provenance: ProcessMemoryLimitProvenance,
+) SystemMemoryInfo {
+    const effective_limit = @min(detected.total_bytes, limit_bytes);
+    const explicit_envelope_applies =
+        provenance == .explicit and
+        limit_bytes <= detected.total_bytes;
+    const detected_available = detected.available_bytes orelse detected.total_bytes;
+    var available = @min(detected_available, effective_limit);
+    var live_admission_policy = LiveAdmissionPolicy.dynamic_pressure;
+    if (leaf_usage_bytes) |current| {
+        const envelope_available = effective_limit -| @min(current, effective_limit);
+        available = @min(available, envelope_available);
+        // An explicit envelope changes only the reserve applied to capacity it
+        // actually constrains. If node or finite-cgroup availability is lower,
+        // retain dynamic pressure protection rather than letting operator
+        // configuration weaken a tighter physical signal.
+        if (explicit_envelope_applies and envelope_available <= detected_available)
+            live_admission_policy = .explicit_process_envelope;
+    } else if (explicit_envelope_applies) {
+        // An explicit process envelope is a hard bound on total live usage,
+        // not a pool of independently free bytes. If its usage signal is
+        // unavailable, admitting against `effective_limit` would fail open and
+        // could allocate the whole envelope again. Report zero transient
+        // capacity until the next probe succeeds. Callers classify this as
+        // retryable pressure, preserving both the hard bound and service
+        // recovery after a transient procfs/cgroup/platform failure.
+        available = 0;
+        live_admission_policy = .explicit_process_envelope;
+    }
+    return .{
+        .total_bytes = effective_limit,
+        .available_bytes = available,
+        .availability_basis = detected.availability_basis,
+        .live_admission_policy = live_admission_policy,
+    };
+}
+
+fn stableSystemMemoryInfoForLimit(limit_bytes: usize) ?SystemMemoryInfo {
+    return stableMemoryInfoForLimit(currentSystemMemoryInfo(), limit_bytes);
+}
+
+fn stableMemoryInfoForLimit(detected: ?SystemMemoryInfo, limit_bytes: usize) ?SystemMemoryInfo {
+    if (limit_bytes == 0) return detected;
+    const baseline = detected orelse SystemMemoryInfo{
+        .total_bytes = limit_bytes,
+        .available_bytes = limit_bytes,
+        .availability_basis = .mem_available,
+    };
+    const effective_limit = @min(baseline.total_bytes, limit_bytes);
+    return .{
+        .total_bytes = effective_limit,
+        .available_bytes = effective_limit,
+        .availability_basis = baseline.availability_basis,
+        // Stable limits describe sizing capacity, not the source of a live
+        // process envelope. Live admission receives provenance explicitly and
+        // must never reconstruct operator intent from numeric equality.
+        .live_admission_policy = .dynamic_pressure,
     };
 }
 
@@ -1514,6 +1848,18 @@ const CgroupMemoryInfo = struct {
     limit_bytes: ?usize = null,
     current_bytes: ?usize = null,
     available_bytes: ?usize = null,
+    /// Raw current usage at the process leaf, retained for diagnostics and
+    /// hierarchy tests even when memory.max is unlimited.
+    leaf_current_bytes: ?usize = null,
+    /// Leaf working set (`current - inactive_file`), retained even when
+    /// memory.max is unlimited so an explicit process envelope can be enforced
+    /// against the same usage signal the kubelet uses to rank pod eviction.
+    leaf_working_set_bytes: ?usize = null,
+};
+
+const LinuxSystemMemorySample = struct {
+    info: ?SystemMemoryInfo = null,
+    cgroup: CgroupMemoryInfo = .{},
 };
 
 const CgroupVersion = enum {
@@ -1712,6 +2058,10 @@ fn readCgroupInactiveFileBytes(
     return parseCgroupInactiveFileBytes(bytes, version);
 }
 
+fn cgroupWorkingSetBytes(current_bytes: usize, inactive_file_bytes: ?usize) usize {
+    return current_bytes - @min(inactive_file_bytes orelse 0, current_bytes);
+}
+
 fn decodeMountInfoPath(destination: []u8, encoded: []const u8) ?usize {
     if (encoded.len == 0 or encoded[0] != '/') return null;
     var source_index: usize = 0;
@@ -1781,6 +2131,13 @@ fn mergeCgroupMemoryInfo(
     result: *CgroupMemoryInfo,
     candidate: CgroupMemoryInfo,
 ) void {
+    if (candidate.leaf_current_bytes) |current| {
+        result.leaf_current_bytes = current;
+        // Keep the raw and reclaimability-adjusted views from the same
+        // authoritative mount candidate. A candidate with an unreadable stat
+        // file must not inherit a stale working set from a different mount.
+        result.leaf_working_set_bytes = candidate.leaf_working_set_bytes;
+    }
     if (candidate.limit_bytes) |limit| {
         if (result.limit_bytes == null or limit < result.limit_bytes.?) {
             result.limit_bytes = limit;
@@ -2009,6 +2366,12 @@ fn readCgroupHierarchy(
         );
         if (directory.len == leaf_directory_len) {
             result.leaf_present = limit != null or current != null;
+            result.info.leaf_current_bytes = current;
+            if (current) |usage|
+                result.info.leaf_working_set_bytes = cgroupWorkingSetBytes(
+                    usage,
+                    inactive_file_bytes,
+                );
         }
         accumulateCgroupLevel(
             &result.info,
@@ -2090,15 +2453,22 @@ fn applyCgroupMemoryInfo(
     return .{
         .total_bytes = limit,
         .available_bytes = if (available) |value| @min(value, limit) else null,
+        .availability_basis = host.availability_basis,
+        .live_admission_policy = host.live_admission_policy,
     };
 }
 
-fn probeSystemMemoryInfoLinux() ?SystemMemoryInfo {
-    if (builtin.os.tag != .linux) return null;
+fn probeSystemMemoryInfoLinuxSample() LinuxSystemMemorySample {
+    if (builtin.os.tag != .linux) return .{};
+    const cgroup = probeCgroupMemoryInfoLinux();
     var meminfo_buffer: [8192]u8 = undefined;
-    const bytes = readSmallLinuxFile("/proc/meminfo", &meminfo_buffer) orelse return null;
-    const host = parseLinuxMemInfo(bytes) orelse return null;
-    return applyCgroupMemoryInfo(host, probeCgroupMemoryInfoLinux());
+    const bytes = readSmallLinuxFile("/proc/meminfo", &meminfo_buffer) orelse
+        return .{ .cgroup = cgroup };
+    const host = parseLinuxMemInfo(bytes) orelse return .{ .cgroup = cgroup };
+    return .{
+        .info = applyCgroupMemoryInfo(host, cgroup),
+        .cgroup = cgroup,
+    };
 }
 
 fn mib(value: usize) usize {
@@ -2145,6 +2515,11 @@ fn generationMaxInflightTokens(prefill_chunk_size: usize) usize {
     return @max(@max(prefill_chunk_size, 1), 17);
 }
 
+pub const GenerationKvCapacityPolicy = enum {
+    full_history,
+    split_swa_ring,
+};
+
 pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
@@ -2152,6 +2527,26 @@ pub fn estimateGptGeneration(
     prompt_tokens: usize,
     max_tokens: usize,
     prefill_chunk_size: usize,
+) EstimateError!Estimate {
+    return estimateGptGenerationForKvPolicy(
+        backend,
+        kv_dtype,
+        config,
+        prompt_tokens,
+        max_tokens,
+        prefill_chunk_size,
+        .full_history,
+    );
+}
+
+pub fn estimateGptGenerationForKvPolicy(
+    backend: kv_pool.BackendKind,
+    kv_dtype: kv_pool.KvDType,
+    config: gpt_mod.Config,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    prefill_chunk_size: usize,
+    kv_capacity_policy: GenerationKvCapacityPolicy,
 ) EstimateError!Estimate {
     if (config.num_hidden_layers == 0 or
         config.hidden_size == 0 or
@@ -2170,32 +2565,32 @@ pub fn estimateGptGeneration(
         return error.ResourceLimitExceeded;
     const metal_capacity_tokens = geometricTokenCapacityChecked(total_tokens) catch
         return error.ResourceLimitExceeded;
-    const split_gemma_kv = backend == .metal and
-        config.usesGemmaSlidingAttention() and
-        config.hasGlobalAttentionLayers();
+    const split_gemma_kv = kv_capacity_policy == .split_swa_ring and
+        backend == .metal and
+        config.supportsSplitSwaGlobalKvRing();
+    // KvPoolConfig has one row geometry for every packed layer. Budget that
+    // exact model-wide geometry even when individual layers expose narrower
+    // local-attention heads.
+    const pool_kv_heads = config.maxKvHeads();
+    const pool_head_dim = try estimateMaxHeadDim(config);
+    if (pool_kv_heads == 0 or pool_head_dim == 0) return error.InvalidModelConfig;
+    const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(pool_kv_heads, pool_head_dim) catch
+        return error.ResourceLimitExceeded;
     var kv_bytes: usize = 0;
     for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
         if (config.layerSharesKv(layer)) continue;
         var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
         if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
             const ring_pages = storage_runtime.swaRingPageCount(
-                16,
+                generation_kv_page_size_tokens,
                 config.sliding_window,
                 generationMaxInflightTokens(prefill_chunk_size),
                 true,
             ) catch return error.ResourceLimitExceeded;
-            const ring_tokens = std.math.mul(usize, ring_pages, 16) catch
+            const ring_tokens = std.math.mul(usize, ring_pages, generation_kv_page_size_tokens) catch
                 return error.ResourceLimitExceeded;
-            layer_capacity_tokens = @max(layer_capacity_tokens, ring_tokens);
+            layer_capacity_tokens = ring_tokens;
         }
-        const kv_heads = config.effectiveKVHeadsForLayer(layer);
-        const head_dim = if (config.family == .deepseek_v4)
-            try estimateMaxHeadDim(config)
-        else
-            config.effectiveHeadDimForLayer(layer);
-        if (kv_heads == 0 or head_dim == 0) return error.InvalidModelConfig;
-        const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(kv_heads, head_dim) catch
-            return error.ResourceLimitExceeded;
         const layer_bytes = std.math.mul(usize, layer_capacity_tokens, kv_pair_bytes) catch
             return error.ResourceLimitExceeded;
         kv_bytes = std.math.add(usize, kv_bytes, layer_bytes) catch
@@ -2269,6 +2664,7 @@ pub const GptGenerationBudgetComponent = struct {
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
     config: gpt_mod.Config,
+    kv_capacity_policy: GenerationKvCapacityPolicy = .full_history,
 };
 
 pub const GptGenerationPrefillAdmission = struct {
@@ -2312,13 +2708,14 @@ pub fn reserveGptGenerationPrefill(
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            trial.reserveEstimate(try estimateGptGeneration(
+            trial.reserveEstimate(try estimateGptGenerationForKvPolicy(
                 component.backend,
                 component.kv_dtype,
                 component.config,
                 prompt_tokens,
                 max_tokens,
                 chunk,
+                component.kv_capacity_policy,
             )) catch |err| {
                 if (err != error.MemoryBudgetExceeded) return err;
                 failed = true;
@@ -2595,12 +2992,268 @@ test "live memory headroom scales down for constrained containers" {
         .{ .total_bytes = gib(2), .available_bytes = gib(2) },
         mib(128),
     );
+    try checkLiveHostMemoryWithInfo(
+        .{ .total_bytes = gib(2), .available_bytes = gib(1) },
+        mib(128),
+    );
+}
+
+test "explicit process envelope charges leaf cgroup working set" {
+    const info = applyProcessMemoryLimit(
+        .{
+            .total_bytes = gib(64),
+            .available_bytes = gib(40),
+            .availability_basis = .mem_available,
+        },
+        gib(14),
+        gib(3),
+        .explicit,
+    );
+    try std.testing.expectEqual(gib(14), info.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), info.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        info.live_admission_policy,
+    );
+
+    const saturated = applyProcessMemoryLimit(info, gib(14), gib(20), .explicit);
+    try std.testing.expectEqual(@as(?usize, 0), saturated.available_bytes);
+
+    const clamped = applyProcessMemoryLimit(
+        .{ .total_bytes = gib(8), .available_bytes = gib(6) },
+        gib(14),
+        gib(2),
+        .explicit,
+    );
+    try std.testing.expectEqual(gib(8), clamped.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(6)), clamped.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        clamped.live_admission_policy,
+    );
+
+    const host_pressure = applyProcessMemoryLimit(
+        .{
+            .total_bytes = gib(64),
+            .available_bytes = gib(2),
+            .availability_basis = .mem_available,
+        },
+        gib(14),
+        gib(3),
+        .explicit,
+    );
+    try std.testing.expectEqual(@as(?usize, gib(2)), host_pressure.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        host_pressure.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(1), liveHostAdmissionReserve(host_pressure));
+}
+
+test "process snapshot charges explicit envelope without cgroup usage" {
+    const detected = SystemMemoryInfo{
+        .total_bytes = gib(64),
+        .available_bytes = gib(40),
+        .availability_basis = .macos_memory_pressure,
+    };
+    // Keep every platform's preferred pressure field equal so this test covers
+    // the snapshot-to-envelope wiring independent of the test host OS.
+    const snapshot = platform.process_memory.Stats{
+        .available = true,
+        .resident_bytes = gib(3),
+        .anonymous_bytes = gib(3),
+        .private_dirty_bytes = gib(3),
+        .footprint_bytes = gib(3),
+    };
+    const live = applyOptionalProcessMemoryLimitWithProcessSnapshot(
+        detected,
+        gib(14),
+        .explicit,
+        snapshot,
+    ).?;
+    try std.testing.expectEqual(gib(14), live.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        live.live_admission_policy,
+    );
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(live));
+
+    const unavailable = applyOptionalProcessMemoryLimitWithProcessSnapshot(
+        detected,
+        gib(14),
+        .explicit,
+        .{},
+    ).?;
+    try std.testing.expectEqual(@as(?usize, 0), unavailable.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        unavailable.live_admission_policy,
+    );
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        checkLiveHostMemoryWithInfo(
-            .{ .total_bytes = gib(2), .available_bytes = gib(1) },
-            mib(128),
-        ),
+        checkLiveHostMemoryWithInfo(unavailable, 1),
+    );
+}
+
+test "process envelope provenance preserves automatic cgroup pressure policy" {
+    const detected = SystemMemoryInfo{
+        .total_bytes = gib(8),
+        .available_bytes = gib(4),
+        .availability_basis = .mem_available,
+    };
+
+    const automatic_cgroup = applyProcessMemoryLimit(detected, gib(8), gib(4), .cgroup_v2);
+    try std.testing.expectEqual(gib(4), automatic_cgroup.available_bytes.?);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        automatic_cgroup.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(automatic_cgroup));
+
+    const explicit = applyProcessMemoryLimit(detected, gib(8), gib(4), .explicit);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        explicit.live_admission_policy,
+    );
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(explicit));
+
+    // The outer resolver carries the cgroup source and its concrete effective
+    // limit when a larger explicit value was clamped by memory.max.
+    const clamped = applyProcessMemoryLimit(detected, gib(8), gib(4), .cgroup_v2);
+    try std.testing.expectEqual(gib(8), clamped.total_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.dynamic_pressure,
+        clamped.live_admission_policy,
+    );
+    try std.testing.expectEqual(gib(2), liveHostAdmissionReserve(clamped));
+}
+
+test "explicit Linux envelope does not double reserve bounded availability" {
+    // Reproduce the full-E2E runner after earlier models were evicted. The
+    // 13,000 MiB process envelope has 4,253 MiB left after charging the leaf
+    // working set. Gemma's measured 3,387 MiB construction peak fits
+    // while retaining the 512 MiB emergency reserve; reserving half of the
+    // already-bounded availability incorrectly rejected it.
+    const info = applyProcessMemoryLimit(
+        .{
+            .total_bytes = 67_428_634_624,
+            .available_bytes = 17_917_997_056,
+            .availability_basis = .mem_available,
+        },
+        mib(13_000),
+        9_171_787_776,
+        .explicit,
+    );
+    try std.testing.expectEqual(@as(?usize, 4_459_700_224), info.available_bytes);
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(info));
+    try checkLiveHostMemoryWithInfo(info, 3_551_851_480);
+    var controller = AdmissionController{};
+    const load_reservation = try controller.tryReserveLiveCapacityWithInfo(3_551_851_480, info);
+    try std.testing.expectEqual(@as(usize, 4_459_700_224 - mib(512)), controller.live_capacity_bytes);
+    controller.releaseLiveReservation(load_reservation);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(info, 4_459_700_224 - mib(512) + 1),
+    );
+
+    // The same run later observed 399 MiB free inside its old 13,000 MiB
+    // envelope after Gemma became resident, causing a 9 MiB run allocation to
+    // fail closed. The calibrated 14,000 MiB process envelope leaves 1,399 MiB
+    // at that exact working set, so request-local scratch fits without
+    // weakening the emergency reserve.
+    const post_load = applyProcessMemoryLimit(
+        .{
+            .total_bytes = 67_428_634_624,
+            .available_bytes = 17_917_997_056,
+            .availability_basis = .mem_available,
+        },
+        mib(14_000),
+        13_212_901_376,
+        .explicit,
+    );
+    try std.testing.expectEqual(@as(?usize, 1_467_162_624), post_load.available_bytes);
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(post_load));
+    try checkLiveHostMemoryWithInfo(post_load, 9_699_328);
+    const run_reservation = try controller.tryReserveLiveCapacityWithInfo(9_699_328, post_load);
+    controller.releaseLiveReservation(run_reservation);
+}
+
+test "cgroup working set excludes only bounded inactive file pages" {
+    try std.testing.expectEqual(gib(7), cgroupWorkingSetBytes(gib(12), gib(5)));
+    try std.testing.expectEqual(@as(usize, 0), cgroupWorkingSetBytes(gib(2), gib(3)));
+    try std.testing.expectEqual(gib(2), cgroupWorkingSetBytes(gib(2), null));
+}
+
+test "cgroup probe merge keeps raw and working-set samples coherent" {
+    var merged = CgroupMemoryInfo{
+        .leaf_current_bytes = gib(12),
+        .leaf_working_set_bytes = gib(7),
+    };
+    mergeCgroupMemoryInfo(&merged, .{ .leaf_current_bytes = gib(9) });
+    try std.testing.expectEqual(@as(?usize, gib(9)), merged.leaf_current_bytes);
+    try std.testing.expectEqual(@as(?usize, null), merged.leaf_working_set_bytes);
+}
+
+test "explicit process envelope remains authoritative without a host probe" {
+    const live = applyOptionalProcessMemoryLimit(null, gib(14), gib(3), .explicit).?;
+    try std.testing.expectEqual(gib(14), live.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(11)), live.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        live.live_admission_policy,
+    );
+
+    const unmeasured = applyOptionalProcessMemoryLimit(null, gib(14), null, .explicit).?;
+    try std.testing.expectEqual(@as(?usize, 0), unmeasured.available_bytes);
+    try std.testing.expectEqual(
+        LiveAdmissionPolicy.explicit_process_envelope,
+        unmeasured.live_admission_policy,
+    );
+
+    const stable = stableMemoryInfoForLimit(null, gib(14)).?;
+    try std.testing.expectEqual(gib(14), stable.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(14)), stable.available_bytes);
+    try std.testing.expect(stableMemoryInfoForLimit(null, 0) == null);
+}
+
+test "Linux live admission admits the CI model under shared-host pressure" {
+    // Reproduce the failing runner sample exactly: the old live gate retained
+    // the full 15.7 GiB node headroom a second time, leaving only 1.0 GiB for a
+    // 3.96 GiB model despite 16.7 GiB being available.
+    const info = SystemMemoryInfo{
+        .total_bytes = 67_428_634_624,
+        .available_bytes = 17_917_997_056,
+        .availability_basis = .mem_available,
+    };
+
+    try std.testing.expectEqual(@as(usize, 8_958_998_528), liveHostAdmissionReserve(info));
+    try checkLiveHostMemoryWithInfo(info, 4_248_561_560);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(info, 8_958_998_529),
+    );
+
+    const later_request = SystemMemoryInfo{
+        .total_bytes = info.total_bytes,
+        // Reproduce the same runner after the model is resident. The prior
+        // policy reserved this entire sample and rejected even 3.4 MiB of
+        // request scratch despite 5.4 GiB remaining available.
+        .available_bytes = 5_775_224_832,
+        .availability_basis = .mem_available,
+    };
+    try std.testing.expectEqual(@as(usize, 2_887_612_416), liveHostAdmissionReserve(later_request));
+    try checkLiveHostMemoryWithInfo(later_request, 3_358_720);
+
+    const emergency_pressure = SystemMemoryInfo{
+        .total_bytes = info.total_bytes,
+        .available_bytes = mib(512),
+        .availability_basis = .mem_available,
+    };
+    try std.testing.expectEqual(mib(512), liveHostAdmissionReserve(emergency_pressure));
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(emergency_pressure, 1),
     );
 }
 
@@ -2891,15 +3544,15 @@ test "live memory admissions share one sampled capacity epoch" {
         .available_bytes = gib(20),
     };
 
-    _ = try controller.tryReserveLiveCapacityWithInfo(gib(3), info);
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(7), info);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+        controller.tryReserveLiveCapacityWithInfo(gib(4), info),
     );
-    try std.testing.expectEqual(gib(3), controller.live_pending_bytes);
-    try std.testing.expectEqual(gib(4), controller.live_capacity_bytes);
+    try std.testing.expectEqual(gib(7), controller.live_pending_bytes);
+    try std.testing.expectEqual(gib(10), controller.live_capacity_bytes);
 
-    controller.releaseLiveReservation(gib(3));
+    controller.releaseLiveReservation(gib(7));
     _ = try controller.tryReserveLiveCapacityWithInfo(gib(2), info);
     controller.releaseLiveReservation(gib(2));
     try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
@@ -2918,10 +3571,10 @@ test "settled live residency remains committed during pressure epoch" {
     controller.settleLiveReservation(gib(3), gib(2));
 
     try std.testing.expectEqual(gib(1), controller.live_pending_bytes);
-    try std.testing.expectEqual(gib(2), controller.live_capacity_bytes);
+    try std.testing.expectEqual(gib(8), controller.live_capacity_bytes);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+        controller.tryReserveLiveCapacityWithInfo(gib(8), info),
     );
 
     controller.releaseLiveReservation(gib(1));
@@ -3022,36 +3675,82 @@ test "admission lease releases transient construction bytes while retaining resi
 test "admission resource budget mirrors acquire retain and release" {
     const Recorder = struct {
         current: AdmissionAmounts = .{},
+        references: usize = 1,
+        controller: ?*AdmissionController = null,
+        reconfiguration_blocked_during_release: bool = false,
 
-        fn reserve(context: *anyopaque, amounts: AdmissionAmounts) !void {
+        fn retainContext(context: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
-            self.current = try self.current.merge(amounts);
+            self.references += 1;
+            return true;
         }
 
-        fn release(context: *anyopaque, amounts: AdmissionAmounts) void {
+        fn releaseContext(context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            self.current = subtractAdmissionAmounts(self.current, amounts) orelse unreachable;
+            std.debug.assert(self.references > 1);
+            self.references -= 1;
+        }
+
+        fn reserve(context: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.current = try self.current.merge(amounts);
+            return 1;
+        }
+
+        fn retain(context: *anyopaque, lease: usize, retained: AdmissionAmounts) AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (lease != 1) return error.ResourceLimitExceeded;
+            self.current = retained;
+        }
+
+        fn release(context: *anyopaque, lease: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(lease == 1);
+            if (self.controller) |controller| {
+                controller.configureResourceBudget(null) catch |err| {
+                    self.reconfiguration_blocked_during_release =
+                        err == error.ResourceBudgetInUse;
+                    self.current = .{};
+                    return;
+                };
+                self.reconfiguration_blocked_during_release = false;
+            }
+            self.current = .{};
         }
     };
 
     var recorder = Recorder{};
     var controller = AdmissionController{};
-    controller.configureResourceBudget(.{
+    recorder.controller = &controller;
+    try controller.configureResourceBudget(.{
         .context = &recorder,
+        .retain_context = Recorder.retainContext,
+        .release_context = Recorder.releaseContext,
         .try_reserve = Recorder.reserve,
+        .retain = Recorder.retain,
         .release = Recorder.release,
     });
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
     var lease = try controller.tryAcquire(.cpu, .{}, .{
         .host_weight_bytes = 64,
         .host_scratch_bytes = 32,
     }, false);
     try std.testing.expectEqual(@as(usize, 64), recorder.current.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 32), recorder.current.host_scratch_bytes);
+    try std.testing.expectError(
+        error.ResourceBudgetInUse,
+        controller.configureResourceBudget(null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
 
     try lease.retain(.{ .host_weight_bytes = 64 });
     try std.testing.expectEqual(@as(usize, 0), recorder.current.host_scratch_bytes);
     lease.release();
+    try std.testing.expect(recorder.reconfiguration_blocked_during_release);
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
     try std.testing.expectEqual(AdmissionAmounts{}, recorder.current);
+    controller.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recorder.references);
 }
 
 test "estimate reservations can be rolled back transactionally" {
@@ -3208,15 +3907,44 @@ test "gpt generation estimate keeps mixed Gemma global history" {
         .sliding_window = 512,
         .sliding_window_pattern = 6,
         .num_kv_shared_layers = 18,
+        .ple_hidden_size = 2560,
         .position_encoding = .rope,
     };
 
     const estimate = try estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
     try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
-    // All 24 donor layers budget the 3168-token Metal growth capacity. The
-    // 18 shared tail layers do not own KV storage.
-    try std.testing.expectEqual(@as(usize, 181_665_792), estimate.kv_bytes);
+    // The packed pool uses the maximum 2 x 512 row geometry for all 24 donor
+    // layers and budgets geometric Metal growth. Shared tail layers do not
+    // own KV storage.
+    try std.testing.expectEqual(@as(usize, 311_427_072), estimate.kv_bytes);
     try std.testing.expectEqual(@as(usize, 76_546_048), estimate.scratch_bytes);
+
+    const ring_estimate = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        2000,
+        100,
+        512,
+        .split_swa_ring,
+    );
+    // Four global donor layers retain geometric full history. The other 20
+    // donor layers use the 1,040-token ring actually allocated at runtime.
+    try std.testing.expectEqual(@as(usize, 137_101_312), ring_estimate.kv_bytes);
+    try std.testing.expect(ring_estimate.kv_bytes < estimate.kv_bytes);
+
+    const long_full = try estimateGptGeneration(.metal, .f16, cfg, 65_536, 300, 256);
+    const long_ring = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        65_536,
+        300,
+        256,
+        .split_swa_ring,
+    );
+    try std.testing.expect(long_full.kv_bytes > gib(3));
+    try std.testing.expect(long_ring.kv_bytes < gib(3));
 }
 
 test "gpt generation estimate covers a sliding ring larger than global growth" {
@@ -3231,12 +3959,22 @@ test "gpt generation estimate covers a sliding ring larger than global growth" {
         .vocab_size = 1,
         .sliding_window = 512,
         .sliding_window_pattern = 2,
+        .ple_hidden_size = 2560,
         .position_encoding = .rope,
     };
 
-    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 16, 1, 16);
-    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens.
-    try std.testing.expectEqual(@as(usize, 1_310_720), estimate.kv_bytes);
+    const estimate = try estimateGptGenerationForKvPolicy(
+        .metal,
+        .f16,
+        cfg,
+        16,
+        1,
+        16,
+        .split_swa_ring,
+    );
+    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens. Both
+    // layers use the packed pool's maximum 2 x 512 row geometry.
+    try std.testing.expectEqual(@as(usize, 2_424_832), estimate.kv_bytes);
 }
 
 test "generation budget downshifts target and draft together" {

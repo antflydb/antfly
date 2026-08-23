@@ -169,6 +169,113 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
+func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
+	var gotPath string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"name":"thumbnail image","type":"embeddings","dimension":512}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	created, err := client.CreateIndex(context.Background(), "wiki/media", "thumbnail image", *request)
+	if err != nil {
+		t.Fatalf("CreateIndex: %v", err)
+	}
+	createdEmbedding, err := created.AsCreatedEmbeddingsIndex()
+	if err != nil {
+		t.Fatalf("created.AsCreatedEmbeddingsIndex: %v", err)
+	}
+	if createdEmbedding.Name != "thumbnail image" || createdEmbedding.Type != CreatedEmbeddingsIndexTypeEmbeddings {
+		t.Fatalf("created = %#v", createdEmbedding)
+	}
+	if kind, err := created.Kind(); err != nil || kind != IndexTypeEmbeddings {
+		t.Fatalf("created.Kind() = %q, %v", kind, err)
+	}
+	if _, err := created.AsCreatedGraphIndex(); err == nil {
+		t.Fatal("created.AsCreatedGraphIndex unexpectedly accepted embeddings response")
+	}
+	if gotPath != "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if strings.Contains(gotBody, `"name"`) {
+		t.Fatalf("request duplicated path identity: %s", gotBody)
+	}
+}
+
+func TestCreateIndexRejectsInvalidDiscriminatedResponse(t *testing.T) {
+	for _, body := range []string{
+		`{"name":"vectors","type":"future_index"}`,
+		`{"name":"vectors"}`,
+		`{"type":"embeddings","dimension":512}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+			if err != nil {
+				t.Fatalf("NewAntflyClientWithOptions: %v", err)
+			}
+			request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+			if err != nil {
+				t.Fatalf("NewCreateIndexRequest: %v", err)
+			}
+			if _, err := client.CreateIndex(context.Background(), "docs", "vectors", *request); err == nil {
+				t.Fatalf("CreateIndex accepted invalid response %s", body)
+			}
+		})
+	}
+}
+
+func TestCreateIndexPreservesStorageAdmissionRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"storage_resource_exhausted","error":"storage_resource_exhausted","message":"storage capacity is temporarily exhausted","retryable":true,"retry_after_ms":1250}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	_, err = client.CreateIndex(context.Background(), "docs", "vectors", *request)
+	var exhausted *StorageResourceExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("CreateIndex error = %T %[1]v, want StorageResourceExhaustedError", err)
+	}
+	if exhausted.StatusCode != http.StatusTooManyRequests || exhausted.Code != "storage_resource_exhausted" ||
+		!exhausted.Retryable || exhausted.RetryAfterMS != 1250 || exhausted.RetryAfterSeconds != 2 {
+		t.Fatalf("StorageResourceExhaustedError = %#v", exhausted)
+	}
+}
+
 func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string
@@ -442,6 +549,68 @@ func TestReadErrorResponseCapsBody(t *testing.T) {
 	}
 	if len(apiErr.Message) > int(maxErrorResponseBytes)+128 {
 		t.Fatalf("APIError.Message length = %d, want capped message", len(apiErr.Message))
+	}
+}
+
+func TestQueryPreservesHierarchyCursorRestartGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":409,"error":"hierarchy_cursor_stale","message":"the source artifact changed during traversal","action":"restart_hierarchy_traversal","restart_without":"search_after","retryable":false}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want HierarchyCursorStaleError")
+	}
+	var stale *HierarchyCursorStaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("error = %T %[1]v, want HierarchyCursorStaleError", err)
+	}
+	if stale.StatusCode != http.StatusConflict ||
+		stale.Code != "hierarchy_cursor_stale" ||
+		stale.Action != "restart_hierarchy_traversal" ||
+		stale.RestartWithout != "search_after" ||
+		stale.Retryable {
+		t.Fatalf("stale cursor error = %#v, want restart-without-search-after guidance", stale)
+	}
+}
+
+func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"code":"storage_read_temporarily_unavailable","message":"storage read temporarily unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want QueryTemporarilyUnavailableError")
+	}
+	var unavailable *QueryTemporarilyUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %T %[1]v, want QueryTemporarilyUnavailableError", err)
+	}
+	if unavailable.StatusCode != http.StatusServiceUnavailable ||
+		unavailable.Code != "storage_read_temporarily_unavailable" ||
+		!unavailable.Retryable ||
+		unavailable.RetryAfterSeconds != 3 {
+		t.Fatalf("temporary availability error = %#v, want retryable 3-second guidance", unavailable)
 	}
 }
 

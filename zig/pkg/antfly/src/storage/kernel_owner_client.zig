@@ -567,11 +567,12 @@ pub const Owner = struct {
         table_name: []const u8,
         request_json: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation_flag: ?*const anyopaque,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
+        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
         const status = abi.antfly_storage_owner_graph_expand_json(
             self.handle,
             &request,
@@ -587,11 +588,12 @@ pub const Owner = struct {
         table_name: []const u8,
         request_json: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation_flag: ?*const anyopaque,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
+        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
         const status = abi.antfly_storage_owner_graph_hydrate_json(
             self.handle,
             &request,
@@ -607,11 +609,12 @@ pub const Owner = struct {
         table_name: []const u8,
         request_json: []const u8,
         execution_deadline_ns: ?u64,
-        cancellation_flag: ?*const anyopaque,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
+        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
         const status = abi.antfly_storage_owner_graph_edges_json(
             self.handle,
             &request,
@@ -820,14 +823,16 @@ fn controlledRequest(
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
-    cancellation_flag: ?*const anyopaque,
+    cancellation_ctx: ?*anyopaque,
+    cancellation_fn: ?abi.CancellationCheckFn,
 ) abi.ControlledJsonOperationRequest {
     return .{
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_deadline_ns = execution_deadline_ns orelse 0,
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
-        .cancellation_flag = cancellation_flag,
+        .cancellation_ctx = cancellation_ctx,
+        .cancellation_fn = cancellation_fn,
     };
 }
 

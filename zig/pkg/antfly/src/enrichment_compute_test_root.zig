@@ -104,10 +104,19 @@ test "enrichment compute boundary preserves PDF units regions and rendered bytes
     try std.testing.expectEqual(@as(?u32, 1), result.units[0].page_number);
     try std.testing.expect(result.units[0].text_regions.len > 0);
 
-    const png = try client.renderPdfPagePngAlloc(alloc, pdf_fixture, 1);
-    defer alloc.free(png);
-    try std.testing.expect(png.len > 8);
-    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    var rendered = try client.renderPdfPagePngAdaptiveAlloc(
+        alloc,
+        pdf_fixture,
+        1,
+        150,
+        40_000_000,
+        4096,
+        64 * 1024 * 1024,
+        96 * 1024 * 1024,
+    );
+    defer alloc.free(rendered.png);
+    try std.testing.expect(rendered.png.len > 8);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, rendered.png[0..8]);
 }
 
 test "enrichment compute boundary preserves semantic provider error identity" {

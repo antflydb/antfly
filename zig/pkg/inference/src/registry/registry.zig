@@ -127,7 +127,7 @@ pub const ModelRef = struct {
             const name = name_part[slash + 1 ..];
             if (!hubRepoComponentIsSafe(owner) or
                 !hubRepoComponentIsSafe(name) or
-                variant.len == 0)
+                !modelVariantIsSafe(variant))
             {
                 return error.InvalidModelRef;
             }
@@ -144,6 +144,27 @@ fn hubRepoComponentIsSafe(component: []const u8) bool {
         std.mem.eql(u8, component, "..")) return false;
     for (component) |char| {
         if (!std.ascii.isAlphanumeric(char) and char != '-' and char != '_' and char != '.') return false;
+    }
+    return true;
+}
+
+pub fn modelVariantIsSafe(variant: []const u8) bool {
+    if (variant.len == 0 or variant.len > 256 or
+        std.mem.indexOfAny(u8, variant, "/\\") != null)
+    {
+        return false;
+    }
+    var components = std.mem.splitScalar(u8, variant, ':');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return false;
+        }
+        for (component) |byte| {
+            if (byte < 0x20 or byte == 0x7f) return false;
+        }
     }
     return true;
 }
@@ -167,6 +188,39 @@ pub fn modelInstallDirAlloc(
         allocator,
         "{s}/{s}/{s}--antfly-{s}",
         .{ models_dir, ref.owner, ref.name, variant_hex[0..16] },
+    );
+}
+
+/// Return the stable Hub request name recorded by a validated managed-model
+/// receipt. Install-directory leaves include a variant hash and are an internal
+/// cache detail; callers should publish `owner/name` for automatic selection or
+/// `owner/name:variant` for an explicit variant so every advertised value is
+/// stable, unique, and accepted by model-resolution endpoints.
+pub fn managedModelRequestNameAlloc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    model_dir: []const u8,
+) !?[]u8 {
+    var maybe_receipt = try managed_receipt.loadValidated(allocator, io, model_dir);
+    if (maybe_receipt == null) return null;
+    defer maybe_receipt.?.deinit();
+
+    const receipt = &maybe_receipt.?;
+    if (receipt.parsed.value.version != 2) return null;
+    const source = receipt.parsed.value.source orelse return null;
+    if (!hubRepoComponentIsSafe(source.owner) or
+        !hubRepoComponentIsSafe(source.name) or
+        !modelVariantIsSafe(source.variant))
+    {
+        return null;
+    }
+    if (std.mem.eql(u8, source.variant, "auto")) {
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
+    }
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}:{s}",
+        .{ source.owner, source.name, source.variant },
     );
 }
 pub const ModelRegistry = struct {
@@ -387,7 +441,7 @@ pub const ModelRegistry = struct {
 
     fn appendDiscoveredModel(
         self: *ModelRegistry,
-        _: Io,
+        io: Io,
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
         model_path: []const u8,
@@ -412,7 +466,10 @@ pub const ModelRegistry = struct {
             .path => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
-        const owned_name = try self.allocator.dupe(u8, display_name);
+        const owned_name = managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        } orelse try self.allocator.dupe(u8, display_name);
         errdefer self.allocator.free(owned_name);
         const owned_path = try self.allocator.dupe(u8, model_path);
         errdefer self.allocator.free(owned_path);
@@ -1292,6 +1349,72 @@ test "managed discovery recognizes receipted nested payloads" {
     try std.testing.expect(isModelDir(io, model_dir));
 }
 
+test "managed discovery preserves distinct receipt request names for coexisting variants" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-0123456789abcdef/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q4_K_M"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-fedcba9876543210");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-fedcba9876543210/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model--antfly-fedcba9876543210/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"gguf:Q8_0"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+    try tmp.dir.createDirPath(io, "models/owner/auto-model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/auto-model/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/auto-model/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"auto-model","variant":"auto"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    var registry = ModelRegistry.init(allocator, models_dir);
+    const models = try registry.discoverShallow(io);
+    defer {
+        for (models) |model| {
+            allocator.free(model.name);
+            allocator.free(model.path);
+        }
+        allocator.free(models);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    var saw_q4 = false;
+    var saw_q8 = false;
+    var saw_auto = false;
+    for (models) |model| {
+        saw_q4 = saw_q4 or std.mem.eql(u8, model.name, "owner/model:gguf:Q4_K_M");
+        saw_q8 = saw_q8 or std.mem.eql(u8, model.name, "owner/model:gguf:Q8_0");
+        saw_auto = saw_auto or std.mem.eql(u8, model.name, "owner/auto-model");
+    }
+    try std.testing.expect(saw_q4);
+    try std.testing.expect(saw_q8);
+    try std.testing.expect(saw_auto);
+}
+
 test "synthesized pulled manifest marks splade embedders as sparse" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1553,6 +1676,20 @@ test "parse invalid ref" {
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/../model"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model/extra"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner\\escape/model"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model:gguf/escape"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model:q4::extra"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model:.."));
+}
+
+test "model variants use the public request identifier grammar" {
+    try std.testing.expect(modelVariantIsSafe("auto"));
+    try std.testing.expect(modelVariantIsSafe("gguf:Q4_K_M"));
+    try std.testing.expect(!modelVariantIsSafe(""));
+    try std.testing.expect(!modelVariantIsSafe("gguf/escape"));
+    try std.testing.expect(!modelVariantIsSafe("gguf\\escape"));
+    try std.testing.expect(!modelVariantIsSafe("q4::extra"));
+    try std.testing.expect(!modelVariantIsSafe(".."));
+    try std.testing.expect(!modelVariantIsSafe("q4\n"));
 }
 
 test "explicit model variants use distinct stable install directories" {

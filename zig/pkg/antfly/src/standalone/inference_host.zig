@@ -20,12 +20,73 @@ const httpx = @import("httpx");
 const antfly = @import("inference_host_root.zig");
 const inference = @import("inference_server");
 const inference_bridge = @import("inference_bridge.zig");
+const http_abi = @import("../runtime_http_abi.zig");
+const platform_sync = @import("antfly_platform").sync;
+const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const inference_api = @import("inference_api");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
+    /// Host-owned interface protected by standalone's inference-lane lease.
+    io: std.Io,
     node: inference.server.Node,
     warm_models: ResolvedWarmModels,
+    content_security: ?std.json.Parsed(antfly.common.config.Config.ContentSecurityConfig),
+    s3_credentials: ?std.json.Parsed(antfly.common.config.Config.S3CredentialsConfig),
     runtime_config: std.json.Parsed(InferenceRuntimeConfig),
+    owned_models_dir: ?[]u8,
+    owned_ml_dir: ?[]u8,
+    resource_budget_context: ?*LinkedResourceBudgetContext = null,
+    routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+    route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
+    route_validator: httpx.Router,
+    route_manifest_mutex: std.atomic.Mutex = .unlocked,
+    route_manifest_ready: bool = false,
+};
+
+/// Stable, ref-counted copy of the standalone resource-owner capability. The
+/// inference Node and any tokenizer resource domain may outlive the configure
+/// call and LinkedInferenceState fields, but never this context.
+const LinkedResourceBudgetContext = struct {
+    alloc: std.mem.Allocator,
+    budget: inference_bridge.ResourceBudget,
+    references: std.atomic.Value(usize) = .init(1),
+
+    fn create(
+        alloc: std.mem.Allocator,
+        budget: inference_bridge.ResourceBudget,
+    ) !*@This() {
+        if (budget.retain_context(budget.context) == 0)
+            return error.ResourceOwnerShuttingDown;
+        errdefer budget.release_context(budget.context);
+        const self = try alloc.create(@This());
+        self.* = .{ .alloc = alloc, .budget = budget };
+        return self;
+    }
+
+    fn retain(self: *@This()) bool {
+        var current = self.references.load(.acquire);
+        while (current != 0 and current != std.math.maxInt(usize)) {
+            if (self.references.cmpxchgWeak(
+                current,
+                current + 1,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                current = observed;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn release(self: *@This()) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            self.budget.release_context(self.budget.context);
+            self.alloc.destroy(self);
+        }
+    }
 };
 
 const InferenceRuntimeConfig = struct {
@@ -34,50 +95,86 @@ const InferenceRuntimeConfig = struct {
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
 
-const DenseEmbeddingOwner = struct {
-    vectors: [][]f32,
-    descriptors: []inference_bridge.DenseVector,
-
-    fn deinit(self: *DenseEmbeddingOwner) void {
-        const alloc = std.heap.c_allocator;
-        for (self.vectors) |vector| alloc.free(vector);
-        alloc.free(self.vectors);
-        alloc.free(self.descriptors);
-        alloc.destroy(self);
-    }
+const RouteState = struct {
+    owner: *LinkedInferenceState,
+    handler: httpx.Handler,
 };
 
-const SparseEmbeddingOwner = struct {
-    vectors: []inference.server.Node.DirectSparseEmbedding,
-    descriptors: []inference_bridge.SparseVector,
-
-    fn deinit(self: *SparseEmbeddingOwner) void {
-        const alloc = std.heap.c_allocator;
-        for (self.vectors) |*vector| vector.deinit(alloc);
-        alloc.free(self.vectors);
-        alloc.free(self.descriptors);
-        alloc.destroy(self);
-    }
+const HttpResponseState = struct {
+    alloc: std.mem.Allocator,
+    response: httpx.Response,
+    header_views: []http_abi.HeaderView,
 };
 
-const FloatOwner = struct {
-    values: []f32,
-
-    fn deinit(self: *FloatOwner) void {
-        const alloc = std.heap.c_allocator;
-        alloc.free(self.values);
-        alloc.destroy(self);
-    }
+const ProviderResponseState = struct {
+    alloc: std.mem.Allocator,
+    json: []u8,
 };
 
-const BytesOwner = struct {
-    bytes: []u8,
+test "standalone linked inference ABI validates the supported function-table prefix" {
+    try std.testing.expect(inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
+    try std.testing.expect(!inference_bridge.validContext(
+        inference_bridge.RouteManifestContext,
+        inference_bridge.abi_version - 1,
+        @sizeOf(inference_bridge.RouteManifestContext),
+    ));
 
-    fn deinit(self: *BytesOwner) void {
-        const alloc = std.heap.c_allocator;
-        alloc.free(self.bytes);
-        alloc.destroy(self);
-    }
+    var table: inference_bridge.FunctionTable = undefined;
+    table.abi_version = inference_bridge.abi_version;
+    table.struct_size = @sizeOf(inference_bridge.FunctionTable);
+    table.capabilities = inference_bridge.Capability.provider;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.route_manifest));
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).? - 1;
+    try std.testing.expect(!inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+    table.struct_size = inference_bridge.requiredFunctionTableSize(inference_bridge.Capability.provider).?;
+    try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
+}
+
+const ModelTextsRequest = struct {
+    model: []const u8,
+    texts: []const []const u8,
+};
+
+const ModelPartsRequest = struct {
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+};
+
+const RerankTextsRequest = struct {
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+};
+
+const GenerateTextRequest = struct {
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+};
+
+const GenerateMessagesRequest = struct {
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+};
+
+const ReadImagesRequest = struct {
+    model: []const u8,
+    request: antfly.readers.Request,
+};
+
+const TranscribeAudioRequest = struct {
+    model: []const u8,
+    request: antfly.transcribing.Request,
+};
+
+const ExtractRequest = struct {
+    model: []const u8,
+    request: antfly.extracting.Request,
 };
 
 const ResolvedWarmModels = struct {
@@ -99,7 +196,6 @@ fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
 fn convertWarmModels(
     alloc: std.mem.Allocator,
     context: *const inference_bridge.CreateContext,
-    loaded_config: ?*const antfly.common.config.Config,
 ) !ResolvedWarmModels {
     if (context.preload_ptr) |preload_ptr| {
         const specs = preload_ptr[0..context.preload_len];
@@ -120,21 +216,7 @@ fn convertWarmModels(
         }
     }
 
-    const loaded = loaded_config orelse return .{ .items = &.{} };
-    if (loaded.inference.preload.len == 0) return .{ .items = &.{} };
-    const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.preload.len);
-    errdefer alloc.free(out);
-    for (loaded.inference.preload, 0..) |model, i| {
-        out[i] = .{
-            .kind = parseWarmModelKind(model.kind) orelse return error.InvalidConfig,
-            .name = model.name,
-            .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch
-                return error.InvalidConfig,
-            .format = model.format,
-            .quantization = model.quantization,
-        };
-    }
-    return .{ .items = out };
+    return .{ .items = &.{} };
 }
 
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {
@@ -183,14 +265,20 @@ test "standalone inference keep alive parses compound durations and zero" {
 /// Creates the standalone inference implementation inside its focused codegen
 /// unit. The caller passes only ABI-safe launch settings, never CliConfig.
 pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
-    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
-    const loaded_config: ?*const antfly.common.config.Config = if (context.loaded_config) |cfg|
-        @ptrCast(@alignCast(cfg))
+    const data_dir = context.data_dir_ptr[0..context.data_dir_len];
+    const alloc = std.heap.c_allocator;
+    const io = try context.executor.get();
+
+    var content_security = if (context.content_security_json.slice()) |json|
+        try std.json.parseFromSlice(antfly.common.config.Config.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
     else
         null;
-    const data_dir = context.data_dir_ptr[0..context.data_dir_len];
-    const alloc = init.gpa;
-
+    errdefer if (content_security) |*parsed| parsed.deinit();
+    var s3_credentials = if (context.s3_credentials_json.slice()) |json|
+        try std.json.parseFromSlice(antfly.common.config.Config.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true })
+    else
+        null;
+    errdefer if (s3_credentials) |*parsed| parsed.deinit();
     var runtime_config = try std.json.parseFromSlice(
         InferenceRuntimeConfig,
         alloc,
@@ -203,16 +291,22 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
 
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
-    var warm_models = try convertWarmModels(alloc, context, loaded_config);
+    var warm_models = try convertWarmModels(alloc, context);
     errdefer warm_models.deinit(alloc);
+    const owned_models_dir = if (context.models_dir.slice() == null)
+        try antfly.inference_runtime.defaultModelsDirForDataDirAlloc(alloc, data_dir)
+    else
+        null;
+    errdefer if (owned_models_dir) |path| alloc.free(path);
+    const owned_ml_dir = if (context.ml_dir.slice() == null)
+        try antfly.inference_runtime.defaultMlDirForDataDirAlloc(alloc, data_dir)
+    else
+        null;
+    errdefer if (owned_ml_dir) |path| alloc.free(path);
 
     var node_config = inference.server.NodeConfig{
-        .models_dir = context.models_dir.slice() orelse
-            if (loaded_config) |cfg| cfg.inference.models_dir orelse
-                antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir) else antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
-        .ml_dir = context.ml_dir.slice() orelse
-            if (loaded_config) |cfg| cfg.inference.ml_dir orelse
-                antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir) else antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
+        .models_dir = context.models_dir.slice() orelse owned_models_dir.?,
+        .ml_dir = context.ml_dir.slice() orelse owned_ml_dir.?,
         .generation_budget_overrides = .{
             .host_limit_bytes = context.host_limit_bytes,
             .backend_limit_bytes = context.backend_limit_bytes,
@@ -221,455 +315,445 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
             .scratch_limit_bytes = context.scratch_limit_bytes,
         },
         .preload = warm_models.items,
+        .process_memory_limit_bytes = context.process_memory_limit_bytes,
+        .process_memory_limit_provenance = switch (context.process_memory_limit_provenance) {
+            .automatic => .automatic,
+            .explicit => .explicit,
+            .cgroup_v2 => .cgroup_v2,
+            .cgroup_v1 => .cgroup_v1,
+            .host => .host,
+            .unavailable => .unavailable,
+        },
+        .resource_ownership = .external_required,
+        .tokenizer_cache = .{
+            .bulk_slots_per_shard = 16 * 1024,
+        },
         .kernel_jit = runtime_config.value.kernel_jit,
         .prompt_cache = runtime_config.value.prompt_cache,
     };
+    if (content_security) |*parsed| node_config.content_security = parsed.value;
+    if (s3_credentials) |*parsed| node_config.s3_credentials = parsed.value;
+    if (context.keep_alive.slice()) |value| node_config.keep_alive_ms = try parseKeepAliveMs(value);
+    if (context.has_max_loaded_models != 0)
+        node_config.max_loaded_models = std.math.cast(usize, context.max_loaded_models) orelse
+            return error.InvalidInferenceModelCacheConfig;
     if (runtime_config.value.max_concurrent_requests) |limit|
         node_config.max_concurrent_requests = limit;
-    if (loaded_config) |cfg| {
-        if (cfg.effectiveAntflyContentSecurity()) |security| node_config.content_security = security.*;
-        if (cfg.inference.s3_credentials) |creds| node_config.s3_credentials = creds;
-        if (cfg.inference.keep_alive) |value|
-            node_config.keep_alive_ms = try parseKeepAliveMs(value);
-        if (cfg.inference.max_loaded_models) |value|
-            node_config.max_loaded_models =
-                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
-    }
 
     state.* = .{
         .alloc = alloc,
-        .node = try inference.server.Node.init(alloc, node_config),
+        .io = io,
+        .node = undefined,
         .warm_models = warm_models,
+        .content_security = content_security,
+        .s3_credentials = s3_credentials,
         .runtime_config = runtime_config,
+        .owned_models_dir = owned_models_dir,
+        .owned_ml_dir = owned_ml_dir,
+        .route_validator = httpx.Router.init(alloc),
     };
+    errdefer state.route_validator.deinit();
+    state.node = try inference.server.Node.init(alloc, node_config);
+    state.node.attachIo(state.io);
     return state;
 }
 
 pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContext) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context.resource_manager));
-    state.node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(manager));
-    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(manager);
-    try state.node.configureTokenizerCaches(.{
-        .bulk_slots_per_shard = 16 * 1024,
-        .resource_budget = tokenizerCacheResourceBudget(manager),
-    });
-    if (context.io) |io_ptr| {
-        const io: *const std.Io = @ptrCast(@alignCast(io_ptr));
-        state.node.attachIo(io.*);
-    }
-    state.node.warmConfiguredModels(state.alloc) catch |err| {
+    if (!inference_bridge.validContext(
+        inference_bridge.ResourceBudget,
+        context.resource_budget.abi_version,
+        context.resource_budget.struct_size,
+    ))
+        return error.UnsupportedVersion;
+    if (state.resource_budget_context != null)
+        return error.ExternalResourceBudgetsAlreadyConfigured;
+    const resource_context = try LinkedResourceBudgetContext.create(
+        state.alloc,
+        context.resource_budget.*,
+    );
+    state.resource_budget_context = resource_context;
+    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(state);
+    state.node.configureExternalResourceBudgets(
+        inferenceAdmissionResourceBudget(resource_context),
+        tokenizerCacheResourceBudget(resource_context),
+    ) catch |err| {
+        state.resource_budget_context = null;
+        resource_context.release();
+        return err;
+    };
+    state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
     };
 }
 
-/// Execute one complete dense-embedding batch using only the dependency-neutral
-/// bridge contract. Provider allocations stay provider-owned until the caller
-/// invokes `linkedInferenceDenseResultDestroy`.
-pub fn linkedInferenceEmbedDense(
-    request: *const inference_bridge.DenseEmbeddingRequest,
-    out_result: *inference_bridge.DenseEmbeddingResult,
-) !void {
-    try validateDenseEmbeddingRequest(request);
-    const handle = request.handle.?;
-    const input_strings = if (request.text_count == 0)
-        &.{}
-    else
-        request.texts.?[0..request.text_count];
-    if (isDenseRequestCancelled(request)) return error.Cancelled;
-
-    const alloc = std.heap.c_allocator;
-    const texts = try alloc.alloc([]const u8, input_strings.len);
-    defer alloc.free(texts);
-    for (input_strings, 0..) |input, i| texts[i] = input.slice();
-
-    const node = linkedInferenceNode(handle);
-    const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
-    const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
-    const vectors = try node.embedDenseTextsDirectWithContext(
-        alloc,
-        io,
-        deadline_ns,
-        request.model.slice(),
-        texts,
-    );
-    errdefer freeDenseVectors(vectors);
-    if (isDenseRequestCancelled(request)) return error.Cancelled;
-    try publishDenseResult(vectors, out_result);
-}
-
-fn publishDenseResult(vectors: [][]f32, out_result: *inference_bridge.DenseEmbeddingResult) !void {
-    const alloc = std.heap.c_allocator;
-    const descriptors = try alloc.alloc(inference_bridge.DenseVector, vectors.len);
-    errdefer alloc.free(descriptors);
-    for (vectors, 0..) |vector, i| {
-        descriptors[i] = .{
-            .values = if (vector.len == 0) null else vector.ptr,
-            .value_count = vector.len,
-        };
-    }
-    const owner = try alloc.create(DenseEmbeddingOwner);
-    owner.* = .{ .vectors = vectors, .descriptors = descriptors };
-    out_result.* = .{
-        .owner = owner,
-        .vectors = if (descriptors.len == 0) null else descriptors.ptr,
-        .vector_count = descriptors.len,
-    };
-}
-
-fn freeDenseVectors(vectors: [][]f32) void {
-    const alloc = std.heap.c_allocator;
-    for (vectors) |vector| alloc.free(vector);
-    alloc.free(vectors);
-}
-
-pub fn linkedInferenceEmbedDenseParts(
-    request: *const inference_bridge.DensePartsRequest,
-    out_result: *inference_bridge.DenseEmbeddingResult,
-) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request.handle == null or request.has_deadline > 1 or
-        !std.mem.eql(u8, &request._reserved0, &@as([3]u8, @splat(0))) or
-        request.part_count > 1_000_000 or
-        (request.part_count == 0 and request.parts != null) or
-        (request.part_count != 0 and request.parts == null) or
-        (request.cancellation_ctx == null) != (request.cancellation_probe == null))
-    {
-        return error.InvalidArgument;
-    }
-    if (isCancelled(request.cancellation_probe, request.cancellation_ctx)) return error.Cancelled;
-    const alloc = std.heap.c_allocator;
-    const wire_parts = if (request.part_count == 0) &.{} else request.parts.?[0..request.part_count];
-    const parts = try alloc.alloc(antfly.template.ContentPart, wire_parts.len);
-    defer alloc.free(parts);
-    for (wire_parts, 0..) |part, i| {
-        if (part._reserved0 != 0) return error.InvalidArgument;
-        parts[i] = switch (part.tag) {
-            .text => .{ .text = part.value.slice() },
-            .media_url => .{ .media_url = part.value.slice() },
-            .binary => .{ .binary = .{
-                .data = part.value.slice(),
-                .mime_type = part.mime_type.slice(),
-            } },
-        };
-    }
-    const node = linkedInferenceNode(request.handle.?);
-    const io = node.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
-    const deadline_ns: ?u64 = if (request.has_deadline != 0) request.deadline_ns else null;
-    const vectors = try localAntflyEmbedDensePartsWithExecutionContext(
-        node,
-        alloc,
-        request.model.slice(),
-        parts,
-        io,
-        deadline_ns,
-    );
-    errdefer freeDenseVectors(vectors);
-    if (isCancelled(request.cancellation_probe, request.cancellation_ctx)) return error.Cancelled;
-    try publishDenseResult(vectors, out_result);
-}
-
-fn validateDenseEmbeddingRequest(request: *const inference_bridge.DenseEmbeddingRequest) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request.handle == null or
-        request.has_deadline > 1 or
-        !std.mem.eql(u8, &request._reserved0, &@as([3]u8, @splat(0))) or
-        request.text_count > 1_000_000 or
-        (request.text_count == 0 and request.texts != null) or
-        (request.text_count != 0 and request.texts == null) or
-        (request.cancellation_ctx == null) != (request.cancellation_probe == null))
-    {
-        return error.InvalidArgument;
-    }
-}
-
-fn isDenseRequestCancelled(request: *const inference_bridge.DenseEmbeddingRequest) bool {
-    return isCancelled(request.cancellation_probe, request.cancellation_ctx);
-}
-
-fn isCancelled(probe_optional: ?inference_bridge.CancellationProbeFn, context: ?*const anyopaque) bool {
-    const probe = probe_optional orelse return false;
-    return probe(context) != 0;
-}
-
-test "dense inference request validation preserves protocol error identity" {
-    var handle: u8 = 0;
-    const valid = inference_bridge.DenseEmbeddingRequest{
-        .handle = &handle,
-        .model = .init("model"),
-    };
-    try validateDenseEmbeddingRequest(&valid);
-
-    var wrong_version = valid;
-    wrong_version.version += 1;
-    try std.testing.expectError(
-        error.InvalidAbiVersion,
-        validateDenseEmbeddingRequest(&wrong_version),
-    );
-
-    var malformed = valid;
-    malformed.has_deadline = 2;
-    try std.testing.expectError(error.InvalidArgument, validateDenseEmbeddingRequest(&malformed));
-
-    malformed = valid;
-    malformed.cancellation_ctx = &handle;
-    try std.testing.expectError(error.InvalidArgument, validateDenseEmbeddingRequest(&malformed));
-}
-
-pub fn linkedInferenceDenseResultDestroy(result: *inference_bridge.DenseEmbeddingResult) void {
-    if (result.owner) |opaque_owner| {
-        const owner: *DenseEmbeddingOwner = @ptrCast(@alignCast(opaque_owner));
-        owner.deinit();
-    }
-    result.* = .{};
-}
-
-pub fn linkedInferenceEmbedSparse(
-    request: *const inference_bridge.DenseEmbeddingRequest,
-    out_result: *inference_bridge.SparseEmbeddingResult,
-) !void {
-    try validateDenseEmbeddingRequest(request);
-    const alloc = std.heap.c_allocator;
-    const input_strings = if (request.text_count == 0) &.{} else request.texts.?[0..request.text_count];
-    const texts = try alloc.alloc([]const u8, input_strings.len);
-    defer alloc.free(texts);
-    for (input_strings, 0..) |input, i| texts[i] = input.slice();
-
-    const node = linkedInferenceNode(request.handle.?);
-    const vectors = try node.embedSparseTextsDirect(alloc, request.model.slice(), texts);
-    errdefer {
-        for (vectors) |*vector| vector.deinit(alloc);
-        alloc.free(vectors);
-    }
-    const descriptors = try alloc.alloc(inference_bridge.SparseVector, vectors.len);
-    errdefer alloc.free(descriptors);
-    for (vectors, 0..) |vector, i| {
-        if (vector.indices.len != vector.values.len) return error.InvalidBoundaryQueryResponse;
-        descriptors[i] = .{
-            .indices = if (vector.indices.len == 0) null else vector.indices.ptr,
-            .values = if (vector.values.len == 0) null else vector.values.ptr,
-            .value_count = vector.values.len,
-        };
-    }
-    const owner = try alloc.create(SparseEmbeddingOwner);
-    owner.* = .{ .vectors = vectors, .descriptors = descriptors };
-    out_result.* = .{
-        .owner = owner,
-        .vectors = if (descriptors.len == 0) null else descriptors.ptr,
-        .vector_count = descriptors.len,
-    };
-}
-
-pub fn linkedInferenceSparseResultDestroy(result: *inference_bridge.SparseEmbeddingResult) void {
-    if (result.owner) |raw| {
-        const owner: *SparseEmbeddingOwner = @ptrCast(@alignCast(raw));
-        owner.deinit();
-    }
-    result.* = .{};
-}
-
-pub fn linkedInferenceRerank(
-    request: *const inference_bridge.RerankRequest,
-    out_result: *inference_bridge.FloatResult,
-) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request._reserved0 != 0 or request.handle == null or
-        request.document_count > 1_000_000 or
-        (request.document_count == 0 and request.documents != null) or
-        (request.document_count != 0 and request.documents == null))
-    {
-        return error.InvalidArgument;
-    }
-    const alloc = std.heap.c_allocator;
-    const input = if (request.document_count == 0) &.{} else request.documents.?[0..request.document_count];
-    const documents = try alloc.alloc([]const u8, input.len);
-    defer alloc.free(documents);
-    for (input, 0..) |document, i| documents[i] = document.slice();
-    const node = linkedInferenceNode(request.handle.?);
-    const values = try node.rerankTextsDirect(
-        alloc,
-        request.model.slice(),
-        request.query.slice(),
-        documents,
-    );
-    errdefer alloc.free(values);
-    const owner = try alloc.create(FloatOwner);
-    owner.* = .{ .values = values };
-    out_result.* = .{
-        .owner = owner,
-        .values = if (values.len == 0) null else values.ptr,
-        .value_count = values.len,
-    };
-}
-
-pub fn linkedInferenceFloatResultDestroy(result: *inference_bridge.FloatResult) void {
-    if (result.owner) |raw| {
-        const owner: *FloatOwner = @ptrCast(@alignCast(raw));
-        owner.deinit();
-    }
-    result.* = .{};
-}
-
-pub fn linkedInferenceListModels(
-    request: *const inference_bridge.HandleRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request._reserved0 != 0 or request.handle == null) return error.InvalidArgument;
-    const alloc = std.heap.c_allocator;
-    const node = linkedInferenceNode(request.handle.?);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const bytes = try node.listModelsJsonAlloc(alloc, io_impl.io());
-    try publishBytesResult(bytes, out_result);
-}
-
-pub fn linkedInferenceGenerateText(
-    request: *const inference_bridge.GenerateTextRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request._reserved0 != 0 or request.handle == null or
-        request.message_count > 1_000_000 or
-        (request.message_count == 0 and (request.roles != null or request.contents != null)) or
-        (request.message_count != 0 and (request.roles == null or request.contents == null)))
-    {
-        return error.InvalidArgument;
-    }
-    const alloc = std.heap.c_allocator;
-    const role_wire = if (request.message_count == 0) &.{} else request.roles.?[0..request.message_count];
-    const content_wire = if (request.message_count == 0) &.{} else request.contents.?[0..request.message_count];
-    const roles = try alloc.alloc([]const u8, request.message_count);
-    defer alloc.free(roles);
-    const contents = try alloc.alloc([]const u8, request.message_count);
-    defer alloc.free(contents);
-    for (role_wire, 0..) |role, i| roles[i] = role.slice();
-    for (content_wire, 0..) |content, i| contents[i] = content.slice();
-    const node = linkedInferenceNode(request.handle.?);
-    const bytes = try node.generateTextDirect(alloc, request.model.slice(), roles, contents);
-    try publishBytesResult(bytes, out_result);
-}
-
-pub fn linkedInferenceGenerateMessages(
-    request: *const inference_bridge.JsonOperationRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request._reserved0 != 0 or request.handle == null or
-        request.payload_json.len > 256 * 1024 * 1024)
-    {
-        return error.InvalidArgument;
-    }
-    const alloc = std.heap.c_allocator;
-    const parsed = try std.json.parseFromSlice(
-        []antfly.inference.ChatMessage,
-        alloc,
-        request.payload_json.slice(),
-        .{},
-    );
-    defer parsed.deinit();
-    const bytes = try localAntflyGenerateMessages(
-        request.handle.?,
-        alloc,
-        request.model.slice(),
-        parsed.value,
-    );
-    try publishBytesResult(bytes, out_result);
-}
-
-pub fn linkedInferenceReadImages(
-    request: *const inference_bridge.JsonOperationRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    try validateJsonOperationRequest(request);
-    const alloc = std.heap.c_allocator;
-    const parsed = try std.json.parseFromSlice(antfly.readers.Request, alloc, request.payload_json.slice(), .{});
-    defer parsed.deinit();
-    const node = linkedInferenceNode(request.handle.?);
-    const results = try node.readImagesDirect(alloc, request.model.slice(), parsed.value);
-    defer {
-        for (results) |*result| antfly.readers.deinitResult(alloc, result);
-        alloc.free(results);
-    }
-    const bytes = try std.json.Stringify.valueAlloc(alloc, results, .{});
-    try publishBytesResult(bytes, out_result);
-}
-
-pub fn linkedInferenceTranscribeAudio(
-    request: *const inference_bridge.JsonOperationRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    try validateJsonOperationRequest(request);
-    const alloc = std.heap.c_allocator;
-    const parsed = try std.json.parseFromSlice(antfly.transcribing.Request, alloc, request.payload_json.slice(), .{});
-    defer parsed.deinit();
-    const node = linkedInferenceNode(request.handle.?);
-    var response = try node.transcribeAudioDirect(alloc, request.model.slice(), parsed.value);
-    defer antfly.transcribing.deinitResponse(alloc, &response);
-    const bytes = try std.json.Stringify.valueAlloc(alloc, response, .{});
-    try publishBytesResult(bytes, out_result);
-}
-
-pub fn linkedInferenceExtract(
-    request: *const inference_bridge.JsonOperationRequest,
-    out_result: *inference_bridge.BytesResult,
-) !void {
-    try validateJsonOperationRequest(request);
-    const alloc = std.heap.c_allocator;
-    const parsed = try std.json.parseFromSlice(antfly.extracting.Request, alloc, request.payload_json.slice(), .{});
-    defer parsed.deinit();
-    const node = linkedInferenceNode(request.handle.?);
-    var response = try node.extractDirect(alloc, request.model.slice(), parsed.value);
-    defer response.deinit();
-    try publishBytesResult(try alloc.dupe(u8, response.json), out_result);
-}
-
-fn validateJsonOperationRequest(request: *const inference_bridge.JsonOperationRequest) !void {
-    if (request.version != inference_bridge.abi_version) return error.InvalidAbiVersion;
-    if (request._reserved0 != 0 or request.handle == null or
-        request.payload_json.len > 256 * 1024 * 1024)
-    {
-        return error.InvalidArgument;
-    }
-}
-
-fn publishBytesResult(bytes: []u8, out_result: *inference_bridge.BytesResult) !void {
-    const alloc = std.heap.c_allocator;
-    errdefer alloc.free(bytes);
-    const owner = try alloc.create(BytesOwner);
-    owner.* = .{ .bytes = bytes };
-    out_result.* = .{
-        .owner = owner,
-        .bytes = if (bytes.len == 0) null else bytes.ptr,
-        .byte_count = bytes.len,
-    };
-}
-
-pub fn linkedInferenceBytesResultDestroy(result: *inference_bridge.BytesResult) void {
-    if (result.owner) |raw| {
-        const owner: *BytesOwner = @ptrCast(@alignCast(raw));
-        owner.deinit();
-    }
-    result.* = .{};
-}
-
-fn linkedInferenceNode(handle: *anyopaque) *inference.server.Node {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
-    return &state.node;
-}
-
-/// Direct Zig table used only when inference is compiled into the same unit.
-/// Linked production composition uses consumer-local ABI shims instead.
-pub fn inlineInferenceProvider(handle: *anyopaque) antfly.inference.managed_embedder.AntflyProvider {
-    return localAntflyProvider(linkedInferenceNode(handle));
-}
-
-pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesContext) !void {
+pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
-    try state.node.registerRoutesOn(inference.server.public_api_prefix, server);
-    try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, server);
+    const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
+        return error.UnsupportedOperation;
+    const request_json = context.request_json.slice();
+    const deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
+    const alloc = state.alloc;
+
+    const response_json = switch (operation) {
+        .embed_dense_texts, .embed_dense_texts_with_context => blk: {
+            var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = if (operation == .embed_dense_texts_with_context)
+                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io, deadline_ns, parsed.value.model, parsed.value.texts)
+            else
+                try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
+            defer {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .embed_sparse_texts => blk: {
+            var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try localAntflyEmbedSparseTexts(&state.node, alloc, parsed.value.model, parsed.value.texts);
+            defer {
+                for (result) |*item| item.deinit(alloc);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .embed_dense_parts, .embed_dense_parts_with_context => blk: {
+            var parsed = try std.json.parseFromSlice(ModelPartsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try localAntflyEmbedDensePartsWithExecutionContext(
+                &state.node,
+                alloc,
+                parsed.value.model,
+                parsed.value.parts,
+                state.io,
+                if (operation == .embed_dense_parts_with_context) deadline_ns else null,
+            );
+            defer {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .rerank_texts => blk: {
+            var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
+            defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .generate_text => blk: {
+            var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try state.node.generateTextDirect(alloc, parsed.value.model, parsed.value.roles, parsed.value.contents);
+            defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .generate_messages => blk: {
+            var parsed = try std.json.parseFromSlice(GenerateMessagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try localAntflyGenerateMessages(
+                &state.node,
+                alloc,
+                parsed.value.model,
+                parsed.value.messages,
+            );
+            defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .read_images => blk: {
+            var parsed = try std.json.parseFromSlice(ReadImagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try state.node.readImagesDirect(alloc, parsed.value.model, parsed.value.request);
+            defer {
+                for (result) |*item| antfly.readers.deinitResult(alloc, item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .transcribe_audio => blk: {
+            var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var result = try state.node.transcribeAudioDirect(alloc, parsed.value.model, parsed.value.request);
+            defer antfly.transcribing.deinitResponse(alloc, &result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .extract => blk: {
+            var parsed = try std.json.parseFromSlice(ExtractRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var result = try state.node.extractDirect(alloc, parsed.value.model, parsed.value.request);
+            defer result.deinit();
+            break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
+        },
+        .list_models_json => blk: {
+            const result = try state.node.listModelsJsonAlloc(alloc, state.io);
+            defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+    };
+    errdefer alloc.free(response_json);
+    const response = try alloc.create(ProviderResponseState);
+    response.* = .{ .alloc = alloc, .json = response_json };
+    context.out_response_handle.* = response;
+    context.out_response_json.* = inference_bridge.String.init(response_json);
+}
+
+pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
+    const response: *ProviderResponseState = @ptrCast(@alignCast(handle));
+    const alloc = response.alloc;
+    alloc.free(response.json);
+    alloc.destroy(response);
+}
+
+pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var registrar = DirectServer{ .owner = state, .server = server };
+    try state.node.registerRoutesOn(inference.server.public_api_prefix, &registrar);
+    try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &registrar);
+}
+
+pub fn linkedInferenceRouteManifest(context: *const inference_bridge.RouteManifestContext) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    platform_sync.lockYielding(&state.route_manifest_mutex);
+    defer state.route_manifest_mutex.unlock();
+    if (!state.route_manifest_ready) {
+        const routes_start = state.routes.items.len;
+        const manifest_start = state.route_manifest.items.len;
+        var manifest = ManifestServer{ .owner = state };
+        state.node.registerRoutesOn(inference.server.public_api_prefix, &manifest) catch |err| {
+            rollbackRouteManifest(state, routes_start, manifest_start);
+            return err;
+        };
+        state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &manifest) catch |err| {
+            rollbackRouteManifest(state, routes_start, manifest_start);
+            return err;
+        };
+        state.route_manifest_ready = true;
+    }
+    context.out_entries.* = if (state.route_manifest.items.len == 0) null else state.route_manifest.items.ptr;
+    context.out_len.* = state.route_manifest.items.len;
+}
+
+fn rollbackRouteManifest(state: *LinkedInferenceState, routes_start: usize, manifest_start: usize) void {
+    for (state.routes.items[routes_start..]) |route| state.alloc.destroy(route);
+    state.routes.shrinkRetainingCapacity(routes_start);
+    state.route_manifest.shrinkRetainingCapacity(manifest_start);
+    state.route_validator.deinit();
+    state.route_validator = httpx.Router.init(state.alloc);
+}
+
+const ManifestServer = struct {
+    owner: *LinkedInferenceState,
+
+    fn register(self: *const ManifestServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        const metadata = routeMetadata(method, path);
+        self.owner.route_validator.add(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+        }, path, handler) catch |err| {
+            std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
+                @tagName(method),
+                path,
+                err,
+            });
+            return err;
+        };
+        const route = try self.owner.alloc.create(RouteState);
+        errdefer self.owner.alloc.destroy(route);
+        route.* = .{ .owner = self.owner, .handler = handler };
+        try self.owner.routes.append(self.owner.alloc, route);
+        errdefer _ = self.owner.routes.pop();
+        try self.owner.route_manifest.append(self.owner.alloc, .{
+            .route_handle = route,
+            .method = method,
+            .path = http_abi.Bytes.init(path),
+            .request_body = metadata.request_body,
+            .streaming_response = @intFromBool(metadata.streaming_response),
+        });
+    }
+
+    pub fn get(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.get, path, handler);
+    }
+
+    pub fn post(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.post, path, handler);
+    }
+
+    pub fn put(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.put, path, handler);
+    }
+
+    pub fn delete(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.delete, path, handler);
+    }
+};
+
+const RouteMetadata = struct {
+    request_body: http_abi.RequestBodyMode,
+    streaming_response: bool,
+};
+
+fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    const method_name = switch (method) {
+        .get => "GET",
+        .post => "POST",
+        .put => "PUT",
+        .delete => "DELETE",
+    };
+    const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
+        path[inference.server.public_api_prefix.len..]
+    else if (std.mem.startsWith(u8, path, inference.server.ai_api_prefix))
+        path[inference.server.ai_api_prefix.len..]
+    else
+        path;
+    for (inference_api.server.routes) |route| {
+        if (std.mem.eql(u8, route.method, method_name) and std.mem.eql(u8, route.path, relative_path)) {
+            return .{
+                .request_body = switch (route.request_body) {
+                    .none => .none,
+                    .buffered => .buffered,
+                },
+                .streaming_response = route.streaming_response,
+            };
+        }
+    }
+    return .{
+        .request_body = if (method == .get) .none else .buffered,
+        .streaming_response = false,
+    };
+}
+
+const DirectServer = struct {
+    owner: *LinkedInferenceState,
+    server: *httpx.Server,
+
+    fn register(self: *const DirectServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        const route = try self.owner.alloc.create(RouteState);
+        errdefer self.owner.alloc.destroy(route);
+        route.* = .{ .owner = self.owner, .handler = handler };
+        try self.owner.routes.append(self.owner.alloc, route);
+        errdefer _ = self.owner.routes.pop();
+        try self.server.routeWithData(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+        }, path, localInferenceHttpHandler, route);
+    }
+
+    pub fn get(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.get, path, handler);
+    }
+
+    pub fn post(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.post, path, handler);
+    }
+
+    pub fn put(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.put, path, handler);
+    }
+
+    pub fn delete(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.delete, path, handler);
+    }
+};
+
+fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+    const route: *RouteState = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRouteUnavailable));
+    return route.handler.invoke(context);
+}
+
+pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleContext) !void {
+    const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
+    const state = route.owner;
+    const alloc = state.alloc;
+    const request = context.request;
+    const query = request.query.slice();
+    const target = if (query) |value|
+        try std.fmt.allocPrint(alloc, "{s}?{s}", .{ request.path.slice(), value })
+    else
+        try alloc.dupe(u8, request.path.slice());
+    defer alloc.free(target);
+
+    var http_request = try httpx.Request.init(alloc, switch (request.method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+    }, target);
+    defer http_request.deinit();
+    const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
+    for (input_headers) |header| try http_request.headers.append(header.name.slice(), header.value.slice());
+    http_request.body = request.body.slice();
+
+    const input_params = if (request.params_ptr) |ptr| ptr[0..request.params_len] else &.{};
+    const params = try alloc.alloc(httpx.RouteParam, input_params.len);
+    defer alloc.free(params);
+    for (input_params, 0..) |param, i| {
+        params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
+    }
+
+    var http_context = httpx.Context.init(alloc, state.io, &http_request);
+    defer http_context.deinit();
+    http_context.params = params;
+    runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
+    var response = try route.handler.invoke(&http_context);
+    errdefer response.deinit();
+
+    const response_state = try alloc.create(HttpResponseState);
+    errdefer alloc.destroy(response_state);
+    const response_headers = response.headers.iterator();
+    const header_views = try alloc.alloc(http_abi.HeaderView, response_headers.len);
+    errdefer alloc.free(header_views);
+    for (response_headers, 0..) |header, i| {
+        header_views[i] = .{
+            .name = http_abi.Bytes.init(header.name),
+            .value = http_abi.Bytes.init(header.value),
+        };
+    }
+    response_state.* = .{ .alloc = alloc, .response = response, .header_views = header_views };
+    context.out_response_handle.* = response_state;
+    context.out_response.* = .{
+        .status = response.status.code,
+        .content_type = http_abi.OptionalBytes.init(response.contentType()),
+        .headers_ptr = if (header_views.len == 0) null else header_views.ptr,
+        .headers_len = header_views.len,
+        .body = http_abi.Bytes.init(response.body orelse ""),
+    };
+}
+
+pub fn linkedInferenceDestroyHttpResponse(handle: *anyopaque) void {
+    const state: *HttpResponseState = @ptrCast(@alignCast(handle));
+    const alloc = state.alloc;
+    state.response.deinit();
+    alloc.free(state.header_views);
+    alloc.destroy(state);
+}
+
+pub fn linkedInferenceTryAcquireRequest(handle: *anyopaque) bool {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    return state.node.tryAcquireRequestSlot();
+}
+
+pub fn linkedInferenceReleaseRequest(handle: *anyopaque) void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    state.node.releaseRequestSlot();
+}
+
+pub fn linkedInferenceRequestAdmissionStats(handle: *anyopaque) inference_bridge.RequestAdmissionStats {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const stats = state.node.inference_admission.stats();
+    return .{
+        .capacity = stats.capacity_requests,
+        .in_flight = stats.in_flight_requests,
+        .peak_in_flight = stats.peak_in_flight_requests,
+        .rejected_total = stats.rejected_requests_total,
+    };
 }
 
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
@@ -677,139 +761,117 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const alloc = state.alloc;
     state.node.detachPromptCacheResourceUsageObserver();
     state.node.deinit();
+    if (state.resource_budget_context) |context| context.release();
+    state.resource_budget_context = null;
+    for (state.routes.items) |route| alloc.destroy(route);
+    state.routes.deinit(alloc);
+    state.route_manifest.deinit(alloc);
+    state.route_validator.deinit();
     state.warm_models.deinit(alloc);
+    if (state.content_security) |*parsed| parsed.deinit();
+    if (state.s3_credentials) |*parsed| parsed.deinit();
     state.runtime_config.deinit();
+    if (state.owned_models_dir) |path| alloc.free(path);
+    if (state.owned_ml_dir) |path| alloc.free(path);
     alloc.destroy(state);
 }
 
-fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
+fn promptCacheResourceUsageObserver(state: *LinkedInferenceState) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
     return .{
-        .ptr = node,
-        .embed_dense_texts = localAntflyEmbedDenseTexts,
-        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
-        .embed_sparse_texts = localAntflyEmbedSparseTexts,
-        .embed_dense_parts = localAntflyEmbedDenseParts,
-        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
-        .rerank_texts = localAntflyRerankTexts,
-        .generate_text = localAntflyGenerateText,
-        .generate_messages = localAntflyGenerateMessages,
-        .read_images = localAntflyReadImages,
-        .transcribe_audio = localAntflyTranscribeAudio,
-        .extract = localAntflyExtract,
-        .list_models_json = localAntflyListModelsJson,
-    };
-}
-
-fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceManager) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
-    return .{
-        .context = manager,
+        .context = state,
         .update = observePromptCacheResourceUsage,
     };
 }
 
 fn inferenceAdmissionResourceBudget(
-    manager: *antfly.resource_manager.ResourceManager,
+    context: *LinkedResourceBudgetContext,
 ) inference.runtime.tier.memory.AdmissionResourceBudget {
     return .{
-        .context = manager,
+        .context = context,
+        .retain_context = retainLinkedResourceBudgetContext,
+        .release_context = releaseLinkedResourceBudgetContext,
         .try_reserve = reserveInferenceAdmissionResources,
+        .retain = retainInferenceAdmissionResources,
         .release = releaseInferenceAdmissionResources,
     };
 }
 
-fn inferenceAdmissionSliceAmounts(
+fn retainLinkedResourceBudgetContext(context: *anyopaque) bool {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    return resource_context.retain();
+}
+
+fn releaseLinkedResourceBudgetContext(context: *anyopaque) void {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    resource_context.release();
+}
+
+fn bridgeAdmissionAmounts(
     amounts: inference.runtime.tier.memory.AdmissionAmounts,
-) ![3]antfly.resource_manager.SliceAmount {
-    const model_residency = try std.math.add(
-        usize,
-        amounts.host_weight_bytes,
-        amounts.backend_weight_bytes,
-    );
-    const kv_working_set = try std.math.add(
-        usize,
-        amounts.host_kv_bytes,
-        amounts.backend_kv_bytes,
-    );
-    const scratch_working_set = try std.math.add(
-        usize,
-        amounts.host_scratch_bytes,
-        amounts.backend_scratch_bytes,
-    );
+) inference_bridge.AdmissionAmounts {
     return .{
-        .{ .slice = .inference_model_residency, .bytes = @intCast(model_residency) },
-        .{ .slice = .inference_kv_working_set, .bytes = @intCast(kv_working_set) },
-        .{ .slice = .inference_scratch_working_set, .bytes = @intCast(scratch_working_set) },
+        .host_weight_bytes = amounts.host_weight_bytes,
+        .backend_weight_bytes = amounts.backend_weight_bytes,
+        .host_kv_bytes = amounts.host_kv_bytes,
+        .backend_kv_bytes = amounts.backend_kv_bytes,
+        .host_scratch_bytes = amounts.host_scratch_bytes,
+        .backend_scratch_bytes = amounts.backend_scratch_bytes,
     };
 }
 
 fn reserveInferenceAdmissionResources(
     context: *anyopaque,
     amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!usize {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
+    const bridged = bridgeAdmissionAmounts(amounts);
+    var lease: usize = 0;
+    const status = budget.reserve_admission(budget.context, &bridged, &lease);
+    if (status.isOk()) {
+        if (lease == 0) return error.ResourceLimitExceeded;
+        return lease;
+    }
+    const err = inference_bridge.errorFromStatus(status);
+    if (err == error.ResourceTemporarilyUnavailable) return error.ResourceTemporarilyUnavailable;
+    return error.ResourceLimitExceeded;
+}
+
+fn retainInferenceAdmissionResources(
+    context: *anyopaque,
+    lease: usize,
+    retained: inference.runtime.tier.memory.AdmissionAmounts,
 ) inference.runtime.tier.memory.AdmissionResourceError!void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceAdmissionSliceAmounts(amounts) catch
-        return error.ResourceLimitExceeded;
-    manager.reserveBatchClassified(&slices) catch |err| switch (err) {
-        error.ResourceRequestTooLarge => return error.ResourceLimitExceeded,
-        error.ResourceTemporarilyUnavailable => return error.ResourceTemporarilyUnavailable,
-        // Duplicate slices are impossible in the fixed bridge plan.
-        error.DuplicateResourceSlice => unreachable,
-    };
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
+    const bridged = bridgeAdmissionAmounts(retained);
+    const status = budget.retain_admission(budget.context, lease, &bridged);
+    if (status.isOk()) return;
+    const err = inference_bridge.errorFromStatus(status);
+    if (err == error.ResourceTemporarilyUnavailable) return error.ResourceTemporarilyUnavailable;
+    return error.ResourceLimitExceeded;
 }
 
 fn releaseInferenceAdmissionResources(
     context: *anyopaque,
-    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+    lease: usize,
 ) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceAdmissionSliceAmounts(amounts) catch unreachable;
-    manager.releaseBatch(&slices);
-}
-
-test "inference admission bridge charges combined native residency to resource manager" {
-    var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
-        .{ .hard_limit_bytes = 100 };
-    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
-    const budget = inferenceAdmissionResourceBudget(&manager);
-
-    try std.testing.expectError(
-        error.ResourceLimitExceeded,
-        budget.try_reserve(budget.context, .{
-            .host_weight_bytes = 80,
-            .backend_weight_bytes = 30,
-        }),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
-
-    const admitted = inference.runtime.tier.memory.AdmissionAmounts{
-        .host_weight_bytes = 60,
-        .backend_weight_bytes = 30,
-    };
-    try budget.try_reserve(budget.context, admitted);
-    try std.testing.expectEqual(
-        @as(u64, 90),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
-    try std.testing.expectError(
-        error.ResourceTemporarilyUnavailable,
-        budget.try_reserve(budget.context, .{
-            .host_weight_bytes = 11,
-        }),
-    );
-    budget.release(budget.context, admitted);
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
+    budget.release_admission(budget.context, lease);
 }
 
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    manager.observeUsage(.inference_prompt_cache, current, next);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context));
+    const resource_context = state.resource_budget_context orelse return;
+    const budget = &resource_context.budget;
+    if (budget.observe_prompt_cache(
+        budget.context,
+        @intFromPtr(current),
+        current.*,
+        next,
+    ) != 0)
+        current.* = next;
 }
 
 test "standalone prompt cache detaches resource observer before owner teardown" {
@@ -855,45 +917,30 @@ test "standalone prompt cache detaches resource observer before owner teardown" 
 }
 
 fn tokenizerCacheResourceBudget(
-    manager: *antfly.resource_manager.ResourceManager,
+    context: *LinkedResourceBudgetContext,
 ) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
     return .{
-        .context = manager,
-        .try_reserve = reserveTokenizerCacheBytes,
-        .release = releaseTokenizerCacheBytes,
+        .context = context,
+        .retain_context = retainLinkedResourceBudgetContext,
+        .release_context = releaseLinkedResourceBudgetContext,
+        .observe = observeTokenizerCacheBytes,
     };
 }
 
-fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
-    const manager: *antfly.resource_manager.ResourceManager =
-        @ptrCast(@alignCast(context));
-    // Cache growth is optional: honor the slice's shrink policy at the soft
-    // boundary by declining new entries/workspace retention. reserve() below
-    // remains the atomic hard guard if another producer wins the race.
-    if (manager.admissionDecision(
-        .inference_tokenizer_cache,
-        @intCast(bytes),
-    ).action == .shrink_cache) return false;
-    var reservation = manager.reserve(
-        .inference_tokenizer_cache,
-        @intCast(bytes),
-    ) catch return false;
-    // The tokenizer owns the reservation until its entry/cache is released.
-    reservation.released = true;
-    return true;
-}
-
-fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
-    const manager: *antfly.resource_manager.ResourceManager =
-        @ptrCast(@alignCast(context));
-    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
-}
-
-fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try node.listModelsJsonAlloc(alloc, io_impl.io());
+fn observeTokenizerCacheBytes(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: usize,
+    next: usize,
+) bool {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
+    return budget.observe_tokenizer_cache(
+        budget.context,
+        observer_id,
+        @intCast(previous),
+        @intCast(next),
+    ) != 0;
 }
 
 fn localAntflyEmbedDenseTexts(
@@ -915,17 +962,6 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
-}
-
-fn localAntflyEmbedDenseParts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(

@@ -2291,11 +2291,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
+        var cancellation = req.cancellation;
         var response = try lease.owner().graphExpandJson(
             table_name,
             request_json,
             controlled.execution_deadline_ns,
-            if (req.cancellation) |flag| @ptrCast(flag) else null,
+            if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            if (cancellation != null) cancellationTokenRequested else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphExpandResponse(alloc, response.bytes());
@@ -2319,11 +2321,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
+        var cancellation = req.cancellation;
         var response = try lease.owner().graphHydrateJson(
             table_name,
             request_json,
             controlled.execution_deadline_ns,
-            if (req.cancellation) |flag| @ptrCast(flag) else null,
+            if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            if (cancellation != null) cancellationTokenRequested else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphHydrateResponse(alloc, response.bytes());
@@ -2347,14 +2351,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
+        var cancellation = req.cancellation;
         var response = try lease.owner().graphEdgesJson(
             table_name,
             request_json,
             controlled.execution_deadline_ns,
-            if (req.cancellation) |flag| @ptrCast(flag) else null,
+            if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            if (cancellation != null) cancellationTokenRequested else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphEdgesResponse(alloc, response.bytes());
+    }
+
+    fn cancellationTokenRequested(ctx: ?*anyopaque) callconv(.c) u8 {
+        const token: *const db_types.CancellationToken = @ptrCast(@alignCast(ctx orelse return 0));
+        return @intFromBool(token.isCancelled());
     }
 
     fn queryGroupLocal(

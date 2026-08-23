@@ -231,6 +231,12 @@ pub fn lawPreservesDerivedJoinFold(law_id: law.Id) bool {
         .max_timestamp,
         .provenance_semiring,
         .avg,
+        // HLL sketches union register-wise (an associative, distributive
+        // lattice join), so a cardinality-over-join folds exactly like the
+        // other lattice laws: a singleton sketch per matched pair, merged per
+        // group. Derived folds read current facts each query, so the law's
+        // non-invertibility (no incremental delete) doesn't apply here.
+        .hll,
         => true,
     };
 }

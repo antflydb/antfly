@@ -17,6 +17,7 @@ const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_http_client = @import("http_client.zig");
 const metadata_http_server = @import("http_server.zig");
+const metadata_http_test_runtime = @import("http_test_runtime.zig");
 const metadata_mod = @import("mod.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -26,8 +27,10 @@ const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
+const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
@@ -51,7 +54,6 @@ const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -66,10 +68,6 @@ const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 // Public API simulations can open DBs and hosted indexes from the listener
 // request thread; keep enough stack for that Linux CI path.
 const lean_sim_thread_stack_size = 4 * 1024 * 1024;
-const lean_sim_http_listener_cfg = std_http_listener.StdHttpListenerConfig{
-    .thread_stack_size = lean_sim_thread_stack_size,
-};
-
 fn leanSimHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
@@ -2639,6 +2637,14 @@ pub const MetadataHttpNodeSimulation = struct {
         return try store.listPlacementIntents(alloc, self.cluster.metadata_group_id);
     }
 
+    pub fn listProjectedPlacementVersionFences(
+        self: MetadataHttpNodeSimulation,
+        alloc: std.mem.Allocator,
+    ) ![]metadata_reconciler.PlacementVersionFence {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listPlacementVersionFences(alloc, self.cluster.metadata_group_id);
+    }
+
     pub fn listProjectedNodes(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listNodes(alloc, self.cluster.metadata_group_id);
@@ -2718,8 +2724,19 @@ pub const MetadataHttpNodeSimulation = struct {
         return try self.proposeTransitionCommands(&.{command});
     }
 
-    pub fn upsertReplicaIntent(self: MetadataHttpNodeSimulation, intent: raft_reconciler.PlacementIntent) !void {
-        try self.proposeTransitionCommand(.{ .upsert_replica_intent = intent });
+    pub fn upsertReplicaIntent(
+        self: MetadataHttpNodeSimulation,
+        intent: raft_reconciler.PlacementIntent,
+        expected_metadata_version: ?u64,
+        expected_version_fence: u64,
+        expected_target_drain_requested: bool,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = expected_metadata_version,
+            .expected_version_fence = expected_version_fence,
+            .expected_target_drain_requested = expected_target_drain_requested,
+            .replacement = intent,
+        } });
     }
 
     pub fn upsertNode(self: MetadataHttpNodeSimulation, record: metadata_table_manager.NodeRecord) !void {
@@ -2779,10 +2796,11 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .remove_store = .{ .store_id = store_id } });
     }
 
-    pub fn removeReplicaIntent(self: MetadataHttpNodeSimulation, group_id: u64, local_node_id: u64) !void {
+    pub fn removeReplicaIntent(self: MetadataHttpNodeSimulation, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
+            .expected_metadata_version = expected_metadata_version,
         } });
     }
 
@@ -2858,9 +2876,15 @@ pub const MetadataHttpNodeSimulation = struct {
         var commands = std.ArrayListUnmanaged(metadata_storage.TransitionCommand).empty;
         defer commands.deinit(self.cluster.alloc);
 
-        for (plan.placement_upserts) |intent| {
+        std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+        for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
             if (containsProjectedPlacementIntent(projected_intents, intent)) continue;
-            try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = intent });
+            try commands.append(self.cluster.alloc, .{ .upsert_replica_intent = .{
+                .expected_metadata_version = precondition.expected_metadata_version,
+                .expected_version_fence = precondition.expected_version_fence,
+                .expected_target_drain_requested = precondition.expected_target_drain_requested,
+                .replacement = intent,
+            } });
         }
         for (plan.table_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_table = record });
         for (plan.split_admissions) |admission| try commands.append(self.cluster.alloc, .{ .admit_split_transition = .{
@@ -2872,10 +2896,10 @@ pub const MetadataHttpNodeSimulation = struct {
         for (plan.merge_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_merge_transition = record });
         for (plan.placement_removals) |record| {
             if (!containsProjectedPlacementIntentGroup(projected_intents, record.group_id)) continue;
-            _ = record.local_node_id;
             try commands.append(self.cluster.alloc, .{ .remove_replica_intent = .{
                 .group_id = record.group_id,
                 .local_node_id = record.local_node_id,
+                .expected_metadata_version = record.expected_metadata_version,
             } });
         }
         for (plan.table_removals) |table_id| {
@@ -4614,7 +4638,7 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
-                .ensure_linearizable_read = ensureLinearizableRead,
+                .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
@@ -4639,9 +4663,13 @@ const PublicApiStatusSource = struct {
         return try adminSnapshot(ptr);
     }
 
-    fn ensureLinearizableRead(ptr: *anyopaque) !void {
+    fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+        try request.ensureActive();
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (self.linearizable_read_driver) |driver| return try driver.ensure();
+        if (self.linearizable_read_driver) |driver| {
+            try driver.ensure();
+            return try self.metadataNode().adminSnapshot();
+        }
         const target = self.metadataNode();
         const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
             return error.MetadataLinearizableReadTimeout;
@@ -4650,6 +4678,7 @@ const PublicApiStatusSource = struct {
         const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
             return error.MetadataLinearizableReadTimeout;
         if (raft_status.soft.role != .leader) return error.NotLeader;
+        return try target.adminSnapshot();
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -4945,7 +4974,7 @@ fn startPublicApiServers(
     roots: *const [N][]const u8,
     metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
     forward_executor: *std_http_executor.StdHttpExecutor,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -4993,8 +5022,7 @@ fn startPublicApiServers(
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, shared_io, &servers[i]);
         started += 1;
     }
 
@@ -5028,7 +5056,7 @@ fn deinitPublicApiServers(comptime N: usize, servers: *[N]api_http_server.ApiHtt
 
 fn deinitPublicApiStack(
     comptime N: usize,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
 ) void {
@@ -5041,7 +5069,7 @@ fn PublicApiTestRig(comptime N: usize) type {
     return struct {
         alloc: std.mem.Allocator,
         http_io: std.Io.Threaded,
-        listeners: [N]std_http_listener.StdHttpListener = undefined,
+        listeners: [N]api_http_test_runtime.Runtime = undefined,
         servers: [N]api_http_server.ApiHttpServer = undefined,
         status_sources: [N]PublicApiStatusSource = undefined,
         catalog_sources: [N]PublicApiCatalogSource = undefined,
@@ -5794,7 +5822,7 @@ fn startMetadataAdminServers(
     alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
     shared_io: *std.Io.Threaded,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
@@ -5809,8 +5837,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(alloc, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
-        try listeners[i].start();
+        listeners[i] = try metadata_http_test_runtime.Runtime.startShared(http_alloc, shared_io.io(), &servers[i]);
         started += 1;
     }
 
@@ -5834,17 +5861,14 @@ fn requestNodeShutdownViaSimAdmin(
     var source = MetadataAdminSimSource{ .node = cluster.node(source_index) };
     var server = metadata_http_server.MetadataHttpServer.init(cluster.alloc, .{}, source.iface());
     defer server.deinit();
-
-    const path = try std.fmt.allocPrint(cluster.alloc, "/internal/v1/nodes/{d}/shutdown", .{node_id});
-    defer cluster.alloc.free(path);
-
-    var response = try server.handle(.{
-        .method = .PUT,
-        .uri = path,
-        .body = "{\"type\":\"remove\",\"reason\":\"sim\"}",
-    });
-    defer response.deinit(cluster.alloc);
-    try std.testing.expectEqual(@as(u16, 202), response.status);
+    var runtime = try metadata_http_test_runtime.Runtime.startOwned(cluster.alloc, &server);
+    defer runtime.deinit();
+    const base_uri = try runtime.baseUri(cluster.alloc);
+    defer cluster.alloc.free(base_uri);
+    var executor = std_http_executor.StdHttpExecutor.init(cluster.alloc, .{});
+    defer executor.deinit();
+    var client = metadata_http_client.MetadataHttpClient.init(cluster.alloc, executor.executor());
+    try client.requestNodeShutdown(base_uri, node_id, "{\"type\":\"remove\",\"reason\":\"sim\"}");
 }
 
 test "metadata http cluster simulation drives table placement convergence" {
@@ -6160,7 +6184,11 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
     defer std.heap.page_allocator.free(admin_auth);
 
     for (public_api.api_base_uris) |base_uri| {
-        const status_uri = try raft_transport.Routes.join(std.heap.page_allocator, base_uri, api_http_routes.Routes.status);
+        const status_uri = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "{s}/db/v1{s}",
+            .{ base_uri, api_http_routes.Routes.status },
+        );
         defer std.heap.page_allocator.free(status_uri);
 
         var unauthorized = try public_api.client_executor.executor().execute(std.heap.page_allocator, .{
@@ -6246,7 +6274,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6264,7 +6292,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
     defer for (metadata_apis) |uri| sim_alloc.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6446,7 +6474,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6464,7 +6492,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
     defer for (metadata_apis) |uri| sim_alloc.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -9850,7 +9878,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -9892,8 +9920,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -10135,7 +10162,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -10169,8 +10196,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -10419,7 +10445,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
     var status_sources: [3]TestStatusSource = undefined;
     var catalog_sources: [3]TestCatalogSource = undefined;
@@ -10453,8 +10479,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
-        try listeners[i].start();
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -11513,7 +11538,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     defer http_io.deinit();
     var status_sources: [3]PublicApiStatusSource = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
-    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var listeners: [3]api_http_test_runtime.Runtime = undefined;
     var started: usize = 0;
     defer {
         for (listeners[0..started]) |*listener| listener.deinit();
@@ -11532,13 +11557,11 @@ test "metadata http cluster simulation load balanced backup retries a real elect
             null,
             writes[index].source(),
         );
-        listeners[index] = std_http_listener.StdHttpListener.initShared(
+        listeners[index] = try api_http_test_runtime.Runtime.startShared(
             leanSimHttpAllocator(),
-            lean_sim_http_listener_cfg,
-            servers[index].executor(),
             &http_io,
+            &servers[index],
         );
-        try listeners[index].start();
         started += 1;
     }
     var api_base_uris: [3][]u8 = undefined;

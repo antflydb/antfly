@@ -19,6 +19,7 @@ const raft_engine = @import("raft_engine");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
+const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
@@ -33,6 +34,7 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const api_http_client = @import("http_client.zig");
 const api_routes = @import("http_routes.zig");
 const api_http_server = @import("http_server.zig");
+const api_http_test_runtime = @import("http_test_runtime.zig");
 const api_table_catalog = @import("table_catalog.zig");
 const api_table_reads = @import("table_reads.zig");
 const api_table_router = @import("table_router.zig");
@@ -561,23 +563,12 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
-fn publicApiTestListenerConfig() std_http_listener.StdHttpListenerConfig {
-    // Public API handlers synchronously fan out to other data nodes. Exercise
-    // them with the same concurrent-listener contract used by production so a
-    // forwarded request can re-enter an ingress node without serial-listener
-    // deadlock. Keep the test bound lower than production's 64 threads.
-    return .{
-        .serve_in_connection_threads = true,
-        .max_connection_threads = 16,
-    };
-}
-
 fn startPublicApiServers(
     comptime N: usize,
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
     roots: *const [N][]const u8,
     forward_executor: *std_http_executor.StdHttpExecutor,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -609,7 +600,7 @@ fn startPublicApiServersWithExecutor(
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -642,7 +633,7 @@ fn startPublicApiServersWithDurableSessions(
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
     session_stores: *const [N]?*transactions_api.DurableSessionStore,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -675,7 +666,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
     roots: *const [N][]const u8,
     forward_executor: *std_http_executor.StdHttpExecutor,
     session_store_path: []const u8,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -730,13 +721,8 @@ fn startPublicApiServersWithSharedSessionStorePath(
             write_sources[i].source(),
         );
         initialized_servers += 1;
-        listeners[i] = std_http_listener.StdHttpListener.init(
-            std.testing.allocator,
-            publicApiTestListenerConfig(),
-            servers[i].executor(),
-        );
+        listeners[i] = try api_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[i]);
         initialized_listeners += 1;
-        try listeners[i].start();
     }
     for (0..N) |i| {
         api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -751,7 +737,7 @@ fn startPublicApiServersWithOptionalSessions(
     forward_executor: http_common.RequestExecutor,
     forward_io_impl: ?*std.Io.Threaded,
     session_stores: ?*const [N]?*transactions_api.DurableSessionStore,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
@@ -801,13 +787,8 @@ fn startPublicApiServersWithOptionalSessions(
             write_sources[i].source(),
         );
         initialized_servers += 1;
-        listeners[i] = std_http_listener.StdHttpListener.init(
-            std.testing.allocator,
-            publicApiTestListenerConfig(),
-            servers[i].executor(),
-        );
+        listeners[i] = try api_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[i]);
         initialized_listeners += 1;
-        try listeners[i].start();
     }
     for (0..N) |i| {
         api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -1357,7 +1338,7 @@ const MetadataAdminSimSource = struct {
 fn startMetadataAdminServers(
     comptime N: usize,
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
-    listeners: *[N]std_http_listener.StdHttpListener,
+    listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
@@ -1365,8 +1346,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, servers[i].executor());
-        try listeners[i].start();
+        listeners[i] = try metadata_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[i]);
     }
     for (0..N) |i| base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
 }
@@ -1430,7 +1410,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -1668,7 +1648,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -1676,7 +1656,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -1869,7 +1849,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -1877,7 +1857,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -2124,7 +2104,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -2458,7 +2438,7 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -2694,7 +2674,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -2879,12 +2859,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
         read_sources[begin_index].source(),
         write_sources[begin_index].source(),
     );
-    listeners[begin_index] = std_http_listener.StdHttpListener.init(
-        std.testing.allocator,
-        publicApiTestListenerConfig(),
-        servers[begin_index].executor(),
-    );
-    try listeners[begin_index].start();
+    listeners[begin_index] = try api_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[begin_index]);
     api_base_uris[begin_index] = try listeners[begin_index].baseUri(std.testing.allocator);
 
     var session_info_after_restart = try client.fetchTransactionSessionInfo(followup_base, txn_id_hex);
@@ -2968,7 +2943,7 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -3121,11 +3096,7 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
 
     listeners[begin_index].deinit();
     // Leave a valid stopped value for the common deferred cleanup.
-    listeners[begin_index] = std_http_listener.StdHttpListener.init(
-        std.testing.allocator,
-        publicApiTestListenerConfig(),
-        servers[begin_index].executor(),
-    );
+    listeners[begin_index] = api_http_test_runtime.Runtime.initStopped(std.testing.allocator);
     std.testing.allocator.free(api_base_uris[begin_index]);
     api_base_uris[begin_index] = try std.testing.allocator.dupe(u8, "http://127.0.0.1:1");
     // Advance the lease clock explicitly instead of racing a deliberate 1 ms
@@ -3171,7 +3142,9 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
 
     var session_info = try client.fetchTransactionSessionInfo(followup_base, txn_id_hex);
     defer session_info.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 404), session_info.status);
+    // The durable terminal record remains queryable until TTL cleanup so a
+    // retry can replay the committed result under the same transaction ID.
+    try std.testing.expectEqual(@as(u16, 200), session_info.status);
 
     var updated_user = try client.fetchLookup(followup_base, "users", "user:1", null);
     defer updated_user.deinit(std.heap.page_allocator);
@@ -3240,7 +3213,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -3386,12 +3359,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
         read_sources[begin_index].source(),
         write_sources[begin_index].source(),
     );
-    listeners[begin_index] = std_http_listener.StdHttpListener.init(
-        std.testing.allocator,
-        publicApiTestListenerConfig(),
-        servers[begin_index].executor(),
-    );
-    try listeners[begin_index].start();
+    listeners[begin_index] = try api_http_test_runtime.Runtime.startOwned(std.testing.allocator, &servers[begin_index]);
     api_base_uris[begin_index] = try listeners[begin_index].baseUri(std.testing.allocator);
 
     var session_info_after_restart = try client.fetchTransactionSessionInfo(followup_base, txn_id_hex);
@@ -3472,7 +3440,7 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -3606,7 +3574,7 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
 
     var session_info = try client.fetchTransactionSessionInfo(followup_base, txn_id_hex);
     defer session_info.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 404), session_info.status);
+    try std.testing.expectEqual(@as(u16, 200), session_info.status);
 
     var updated = try client.fetchLookup(followup_base, "docs", "doc:a", null);
     defer updated.deinit(std.heap.page_allocator);
@@ -3674,7 +3642,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -3682,7 +3650,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -3799,7 +3767,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
         .metadata_apis = &metadata_apis,
         .mode = .merge_once,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -3919,7 +3887,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -3927,7 +3895,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4044,7 +4012,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
         .metadata_apis = &metadata_apis,
         .mode = .merge_then_split,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4155,7 +4123,7 @@ test "public api multi-node e2e retries transaction session commit once after to
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4163,7 +4131,7 @@ test "public api multi-node e2e retries transaction session commit once after to
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4280,7 +4248,7 @@ test "public api multi-node e2e retries transaction session commit once after to
         .metadata_apis = &metadata_apis,
         .mode = .merge_once,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4368,7 +4336,7 @@ test "public api multi-node e2e retries transaction session commit once after to
 
     var session_info_after_commit = try client.fetchTransactionSessionInfo(client_base, txn_id_hex);
     defer session_info_after_commit.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 404), session_info_after_commit.status);
+    try std.testing.expectEqual(@as(u16, 200), session_info_after_commit.status);
 
     var updated_left = try client.fetchLookup(client_base, "docs", "doc:a", null);
     defer updated_left.deinit(std.heap.page_allocator);
@@ -4441,7 +4409,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4449,7 +4417,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4588,7 +4556,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
         .metadata_apis = &metadata_apis,
         .mode = .merge_once,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4698,7 +4666,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
 
     var session_info_after_commit = try client.fetchTransactionSessionInfo(client_base, txn_id_hex);
     defer session_info_after_commit.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 404), session_info_after_commit.status);
+    try std.testing.expectEqual(@as(u16, 200), session_info_after_commit.status);
 
     var updated_left = try client.fetchLookup(client_base, "docs", "doc:a", null);
     defer updated_left.deinit(std.heap.page_allocator);
@@ -4776,7 +4744,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -4784,7 +4752,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -4901,7 +4869,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
         .metadata_apis = &metadata_apis,
         .mode = .merge_then_split,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -5066,7 +5034,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
     try cluster.publishClusterNodes(metadata_leader_index);
     try cluster.publishClusterStores(metadata_leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5074,7 +5042,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -5325,7 +5293,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5333,7 +5301,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -5705,7 +5673,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5720,7 +5688,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -5901,7 +5869,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -5916,7 +5884,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6340,7 +6308,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6355,7 +6323,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6653,7 +6621,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6670,7 +6638,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "api distributed graph retry docs");
     defer std.heap.page_allocator.free(create_body);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6786,7 +6754,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         .metadata_apis = &metadata_apis,
         .mode = .merge_once,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -6891,7 +6859,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -6908,7 +6876,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "api distributed graph retry fail docs");
     defer std.heap.page_allocator.free(create_body);
 
-    var bootstrap_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var bootstrap_listeners: [4]api_http_test_runtime.Runtime = undefined;
     var bootstrap_servers: [4]api_http_server.ApiHttpServer = undefined;
     var bootstrap_status_sources: [4]PublicApiStatusSource = undefined;
     var bootstrap_catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -7023,7 +6991,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         .metadata_apis = &metadata_apis,
         .mode = .merge_then_split,
     };
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -7122,7 +7090,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -7130,7 +7098,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
@@ -7469,7 +7437,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
@@ -7477,7 +7445,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer for (metadata_apis) |uri| std.testing.allocator.free(uri);
 
-    var listeners: [4]std_http_listener.StdHttpListener = undefined;
+    var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;

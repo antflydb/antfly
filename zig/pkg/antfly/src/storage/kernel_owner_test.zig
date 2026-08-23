@@ -543,13 +543,27 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         error.InvalidArgument,
         owner.configure("articles", "", "{}"),
     );
-    try owner.configure(
-        "docs",
-        "",
+    const replacement_indexes_json =
         \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
         \\ "full_text_index_v0":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}}
-        ,
-    );
+    ;
+    try owner.configure("docs", "", replacement_indexes_json);
+    var dense_reconciled = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile(
+            "docs",
+            "",
+            replacement_indexes_json,
+            "dense_idx",
+            true,
+        );
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            dense_reconciled = true;
+            break;
+        }
+    }
+    try std.testing.expect(dense_reconciled);
     var indexed_batch = try owner.batchJson(
         "docs",
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",

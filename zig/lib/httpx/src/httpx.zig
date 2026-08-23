@@ -95,6 +95,7 @@ pub const client_mod = @import("client/client.zig");
 pub const pool = @import("client/pool.zig");
 
 pub const server_mod = @import("server/server.zig");
+pub const http_runtime = @import("server/http_runtime.zig");
 pub const router = @import("server/router.zig");
 pub const middleware = @import("server/middleware.zig");
 
@@ -197,6 +198,7 @@ pub const negotiateVersion = http.negotiateVersion;
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const CancellationToken = client_mod.CancellationToken;
 pub const WriterProgress = client_mod.WriterProgress;
 pub const WriterProgressCallback = client_mod.WriterProgressCallback;
 pub const Interceptor = client_mod.Interceptor;
@@ -210,7 +212,10 @@ pub const Connection = pool.Connection;
 pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
+pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
+pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
+pub const HttpRuntime = http_runtime.HttpRuntime;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
 pub const RouteParam = router.RouteParam;

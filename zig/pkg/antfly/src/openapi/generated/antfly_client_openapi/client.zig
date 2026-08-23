@@ -737,7 +737,7 @@ pub const Client = struct {
 
     /// Invoke an Antfly-compatible inference connection
     /// POST /db/v1/connections/{connection_id}/inference/{operation}
-    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.Value) !ApiResponse(std.json.Value) {
+    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.Value) !RawResponse {
         const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
         defer self.allocator.free(encoded_connection_id);
         const encoded_operation = try httpx.PercentEncoding.encode(self.allocator, operation);
@@ -747,7 +747,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Standalone evaluation endpoint
@@ -1269,7 +1270,7 @@ pub const Client = struct {
 
     /// Add an index to a table
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}
-    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
+    pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.CreateIndexRequest) !ApiResponse(types.CreatedIndex) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
@@ -1279,7 +1280,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CreatedIndex).fromResponse(self.allocator, &resp);
     }
 
     /// Drop an index from a table

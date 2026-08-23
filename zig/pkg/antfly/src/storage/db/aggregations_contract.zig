@@ -38,10 +38,16 @@ pub const DistanceRangeRequest = struct {
     to: ?f64 = null,
 };
 
+pub const CardinalityMode = enum { auto, exact, approximate };
+
 pub const SearchAggregationRequest = struct {
     name: []const u8,
     type: []const u8,
     field: []const u8,
+    // Exact-vs-approximate selection for cardinality aggregations; ignored for
+    // other types. `auto` keeps the existing behavior (sketch when it applies,
+    // else exact).
+    cardinality_mode: CardinalityMode = .auto,
     fields: []const []const u8 = &.{},
     size: i64 = 0,
     interval: f64 = 0,

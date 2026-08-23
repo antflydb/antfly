@@ -57,8 +57,10 @@ type InferencePoolSpec struct {
 
 	// Config is the Inference configuration as a JSON string.
 	// This is merged with auto-generated configuration and passed to inference via --config.
-	// Supports all inference config options including logging, GPU settings, keep_alive, etc.
-	// Example: {"log": {"level": "debug", "style": "json"}, "gpu": "auto"}
+	// Supports Zig runtime options such as admission, prompt_cache, kernel_jit,
+	// keep_alive_ms, and max_loaded_models. Accelerator backends are selected
+	// automatically from spec.hardware.
+	// Example: {"admission": {"inference": {"max_concurrent_requests": 8}}}
 	// +optional
 	Config string `json:"config,omitempty"`
 

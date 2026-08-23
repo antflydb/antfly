@@ -22,6 +22,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const platform_sync = @import("antfly_platform").sync;
 const http_common = @import("../../common/http/http_common.zig");
+const http_operation = @import("http_operation.zig");
 const internal_api = @import("../../internal/mod.zig");
 const primary_mod = @import("primary.zig");
 const replication_api = @import("replication_api.zig");
@@ -60,26 +61,47 @@ pub const Server = struct {
         };
     }
 
+    pub fn operationExecutor(self: *Server) http_operation.Executor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = executeTyped },
+        };
+    }
+
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         return try self.handleWithAllocator(self.alloc, req);
     }
 
     fn handleWithAllocator(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        var response = try self.executeOperationWithAllocator(response_alloc, requestFromLegacy(req));
+        defer response.deinit();
+        return .{
+            .status = response.status,
+            .content_type = try response_alloc.dupe(u8, response.content_type),
+            .body = try response_alloc.dupe(u8, response.body),
+        };
+    }
+
+    pub fn executeOperation(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+        return try self.executeOperationWithAllocator(self.alloc, req);
+    }
+
+    fn executeOperationWithAllocator(self: *Server, response_alloc: Allocator, req: http_operation.Request) !http_operation.OwnedResponse {
         const state_mutex = self.state_mutex;
         if (state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
         }
         defer if (state_mutex) |mutex| mutex.unlock();
-        const path = requestPath(req.uri);
+        const path = requestPath(req.target);
         switch (req.method) {
-            .GET => {
+            .get => {
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_identify)) {
                     return try self.handleIdentify(response_alloc);
                 }
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
-            .POST => {
+            .post => {
                 if (std.mem.eql(u8, path, internal_api.routes.ha_replication_slots)) {
                     return try self.handleCreateReplicationSlot(response_alloc, req);
                 }
@@ -92,19 +114,19 @@ pub const Server = struct {
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
-            .PUT, .DELETE => {
+            .put, .delete => {
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
         }
     }
 
-    fn handleIdentify(self: *Server, response_alloc: Allocator) !http_common.HttpResponse {
+    fn handleIdentify(self: *Server, response_alloc: Allocator) !http_operation.OwnedResponse {
         const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
         return try jsonResponse(response_alloc, replication_api.identifySystem(primary));
     }
 
-    fn handleCreateReplicationSlot(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleCreateReplicationSlot(self: *Server, response_alloc: Allocator, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
         if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA replication slot request");
         var parsed = internal_api.openapi.server.parseCreateHAReplicationStreamingSlotBody(
@@ -125,7 +147,7 @@ pub const Server = struct {
         return try jsonResponse(response_alloc, response);
     }
 
-    fn handleStartReplication(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleStartReplication(self: *Server, response_alloc: Allocator, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
         if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA start replication request");
         var parsed = internal_api.openapi.server.parseStartHAReplicationBody(
@@ -158,7 +180,7 @@ pub const Server = struct {
         return try jsonResponse(response_alloc, document);
     }
 
-    fn handleStandbyStatusUpdate(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn handleStandbyStatusUpdate(self: *Server, response_alloc: Allocator, req: http_operation.Request) !http_operation.OwnedResponse {
         const primary = self.primary orelse return try textResponse(response_alloc, 409, "primary unavailable");
         if (req.body.len == 0) return try textResponse(response_alloc, 400, "empty HA standby status update request");
         var parsed = internal_api.openapi.server.parseUpdateHAStandbyStatusBody(
@@ -192,7 +214,27 @@ pub const Server = struct {
         const self: *Server = @ptrCast(@alignCast(ptr));
         return self.handleWithAllocator(alloc, req);
     }
+
+    fn executeTyped(ptr: *anyopaque, req: http_operation.Request) !http_operation.OwnedResponse {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        return self.executeOperation(req);
+    }
 };
+
+fn requestFromLegacy(req: http_common.HttpRequest) http_operation.Request {
+    return .{
+        .method = switch (req.method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+        },
+        .target = req.uri,
+        .authorization = req.authorization orelse req.header("authorization"),
+        .content_type = req.content_type,
+        .body = req.body,
+    };
+}
 
 const StartReplicationDocument = struct {
     slot_name: []const u8,
@@ -324,15 +366,16 @@ fn base64Alloc(alloc: Allocator, raw: []const u8) ![]u8 {
     return out;
 }
 
-fn jsonResponse(alloc: Allocator, value: anytype) !http_common.HttpResponse {
+fn jsonResponse(alloc: Allocator, value: anytype) !http_operation.OwnedResponse {
     return .{
+        .owner_allocator = alloc,
         .status = 200,
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
 }
 
-fn commandErrorResponse(alloc: Allocator, err: anyerror) !http_common.HttpResponse {
+fn commandErrorResponse(alloc: Allocator, err: anyerror) !http_operation.OwnedResponse {
     return try textResponse(alloc, commandErrorStatus(err), @errorName(err));
 }
 
@@ -359,8 +402,9 @@ fn commandErrorStatus(err: anyerror) u16 {
     };
 }
 
-fn textResponse(alloc: Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
+fn textResponse(alloc: Allocator, status: u16, body: []const u8) !http_operation.OwnedResponse {
     return .{
+        .owner_allocator = alloc,
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
@@ -415,6 +459,17 @@ fn testIdentity() standby_mod.Identity {
 
 fn expectContains(body: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
+}
+
+test "storage.ha internal typed operation bypasses legacy request dispatch" {
+    var server = Server.init(std.testing.allocator, null);
+    var response = try server.operationExecutor().execute(.{
+        .method = .get,
+        .target = internal_api.routes.ha_replication_identify,
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try std.testing.expectEqualStrings("primary unavailable", response.body);
 }
 
 test "storage.ha internal http adapter handles every generated HA replication route method" {

@@ -699,20 +699,8 @@ fn runLocalChat(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     };
     defer cb.deinit();
 
-    // Mixed-attention models (iSWA-style, e.g. Gemma) need the full KV
-    // history for their global layers; see the matching rule in
-    // native_generate.zig for the trade-off and the env escape hatch.
     const sliding_trim_forced = platform.env.getenvBool("ANTFLY_INFERENCE_KV_SLIDING_TRIM");
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !sliding_trim_forced)
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(sliding_trim_forced);
     const pool_config: runtime.kv.pool.KvPoolConfig = .{
         .backend = backend_kind,
         .dtype = kv_dtype,
@@ -873,7 +861,7 @@ const ServerChatSession = struct {
             .json = body,
             .headers = &headers,
             .timeout_ms = 300_000,
-            .cancellation = &chat_interrupt,
+            .cancellation = .fromAtomic(&chat_interrupt),
         }, writer, null, null) catch |err| {
             if (err == error.Cancelled and chat_interrupt.load(.acquire)) return error.ChatInterrupted;
             return err;

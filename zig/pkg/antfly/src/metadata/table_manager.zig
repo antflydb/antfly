@@ -15,7 +15,10 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 const transition_state = @import("transition_state.zig");
+
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 
 pub const PlacementClass = enum {
     data,
@@ -266,9 +269,14 @@ pub fn restoreIntentTopologyCompatible(
 
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
+pub const node_lifecycle_finalizing = "finalizing";
 
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
+}
+
+pub fn nodeLifecycleFinalizing(lifecycle: []const u8) bool {
+    return std.mem.eql(u8, lifecycle, node_lifecycle_finalizing);
 }
 
 pub const NodeRecord = struct {
@@ -280,6 +288,11 @@ pub const NodeRecord = struct {
 pub const StoreRecord = struct {
     store_id: u64,
     node_id: u64,
+    /// Random non-zero process incarnation established by store registration.
+    /// Status generations are comparable only within this incarnation.
+    reporter_incarnation: u64 = 0,
+    /// Highest status snapshot generation accepted for `reporter_incarnation`.
+    status_generation: u64 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -320,6 +333,10 @@ pub const GroupStatusReport = struct {
     empty: bool = true,
     created_at_millis: u64 = 0,
     updated_at_millis: u64 = 0,
+    /// Durable reallocation request observed before this status was collected.
+    /// This is a causal barrier; timestamps remain only a rolling-upgrade
+    /// fallback for reporters that predate this field.
+    observed_reallocation_request_id: u128 = 0,
     local_leader: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
@@ -621,6 +638,11 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Must match the incarnation established by store registration. Zero is
+    /// reserved for rolling-upgrade compatibility with legacy reporters.
+    reporter_incarnation: u64 = 0,
+    /// Monotonic snapshot generation within `reporter_incarnation`.
+    status_generation: u64 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -633,6 +655,12 @@ pub const StoreStatusReport = struct {
     group_statuses: []GroupStatusReport = &.{},
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
+
+/// Generation zero is valid before the first snapshot, but a generation can
+/// never exist without the process incarnation that gives it meaning.
+pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
+    return reporter_incarnation != 0 or status_generation == 0;
+}
 
 pub const RuntimeEnrichmentStatusReport = struct {
     enabled: bool = false,
@@ -711,6 +739,31 @@ pub const RuntimeGroupStatusReport = struct {
     indexes: []RuntimeIndexStatusReport = &.{},
 };
 
+/// Runtime observations can be retained or overlaid across store refreshes.
+/// Only an observation whose explicit identity belongs to the containing
+/// store is termination debt; zero is the unknown wildcard used by reports
+/// that inherit their identity from the StoreRecord envelope.
+pub fn runtimeStatusBelongsToStore(
+    status: RuntimeGroupStatusReport,
+    node_id: u64,
+    store_id: u64,
+) bool {
+    if (status.node_id != 0 and status.node_id != node_id) return false;
+    if (status.store_id != 0 and status.store_id != store_id) return false;
+    return true;
+}
+
+/// Shared by shutdown status, mutation preflight, and Raft apply so the
+/// operator-visible `safe_to_terminate` contract is exactly the deletion
+/// fence enforced by the state machine.
+pub fn storeHasTerminationDebt(store: StoreRecord) bool {
+    if (store.group_statuses.len != 0) return true;
+    for (store.runtime_statuses) |status| {
+        if (runtimeStatusBelongsToStore(status, store.node_id, store.store_id)) return true;
+    }
+    return false;
+}
+
 pub const RuntimeDocIdentityStatusReport = struct {
     namespace_table_id: u64 = 0,
     namespace_shard_id: u64 = 0,
@@ -774,6 +827,10 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    repair_status: ?IndexRepairStatus = null,
+    /// This proof is meaningful only while repair_status is non-null. Missing
+    /// proof is deliberately false so mixed-version reports fail closed.
+    repair_active_generation_serviceable: bool = false,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -1898,6 +1955,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
     return .{
         .store_id = record.store_id,
         .node_id = record.node_id,
+        .reporter_incarnation = record.reporter_incarnation,
+        .status_generation = record.status_generation,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -1941,6 +2000,7 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
         .empty = record.empty,
         .created_at_millis = record.created_at_millis,
         .updated_at_millis = record.updated_at_millis,
+        .observed_reallocation_request_id = record.observed_reallocation_request_id,
         .local_leader = record.local_leader,
         .local_voter = record.local_voter,
         .voter_count = record.voter_count,
@@ -2088,6 +2148,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .repair_status = record.repair_status,
+        .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };
 }
 

@@ -87,9 +87,10 @@ pub const Tracker = struct {
         self.observe(self.accounted_bytes -| released);
     }
 
-    /// Returns the oldest target that drains debt below both the sequence and
-    /// byte low-water marks. Producers wait for this bounded target rather
-    /// than draining through the newest write, preserving useful pipelining.
+    /// Returns the oldest bounded target that reduces admission debt. Sequence
+    /// pressure is drained in latency-sized windows; byte pressure may request
+    /// a larger target to restore its low-water mark. Producers never drain
+    /// through the newest write merely because the sequence count is high.
     pub fn throttleTargetSequence(self: *Tracker) ?u64 {
         const manager = self.resource_manager orelse return null;
         // Without per-sequence allocation we cannot safely calculate a partial
@@ -101,7 +102,11 @@ pub const Tracker = struct {
         var release_count: usize = 0;
         const limits = manager.derivedBacklogLimits();
         if (limits.high_sequences > 0 and self.entries.items.len > limits.high_sequences) {
-            release_count = self.entries.items.len - @min(limits.resume_sequences, self.entries.items.len);
+            const to_resume = self.entries.items.len - @min(limits.resume_sequences, self.entries.items.len);
+            release_count = if (limits.throttle_window_sequences == 0)
+                to_resume
+            else
+                @min(to_resume, limits.throttle_window_sequences);
         }
 
         const stats = manager.sliceStats(.derived_backlog);
@@ -226,6 +231,21 @@ test "derived backlog tracker applies sequence high and low water marks" {
     for (1..6) |sequence| try tracker.track(std.testing.allocator, sequence, 1);
     try std.testing.expectEqual(@as(?u64, 3), tracker.throttleTargetSequence());
     tracker.releaseThrough(3);
+    try std.testing.expectEqual(@as(?u64, null), tracker.throttleTargetSequence());
+}
+
+test "derived backlog tracker bounds sequence-only admission drain window" {
+    var manager = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 8,
+        .derived_backlog_resume_sequences = 4,
+        .derived_backlog_throttle_window_sequences = 2,
+    });
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(std.testing.allocator);
+
+    for (1..11) |sequence| try tracker.track(std.testing.allocator, sequence, 1);
+    try std.testing.expectEqual(@as(?u64, 2), tracker.throttleTargetSequence());
+    tracker.releaseThrough(2);
     try std.testing.expectEqual(@as(?u64, null), tracker.throttleTargetSequence());
 }
 

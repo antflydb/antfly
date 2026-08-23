@@ -55,6 +55,14 @@ const RunConfig = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    const InferenceAdmissionConfig = struct {
+        max_concurrent_requests: ?u32 = null,
+    };
+
+    const AdmissionConfig = struct {
+        inference: ?InferenceAdmissionConfig = null,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -62,12 +70,31 @@ const RunConfig = struct {
     preload: []const WarmModelConfig = &.{},
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
-    max_concurrent_requests: ?usize = null,
+    /// Deprecated compatibility alias for admission.inference.max_concurrent_requests.
+    max_concurrent_requests: ?u32 = null,
+    admission: ?AdmissionConfig = null,
     pool_size: ?usize = null,
     generation_batching: ?inference.server.GenerationBatchingConfig = null,
     kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
+    process_memory_budget_mb: ?usize = null,
 };
+
+fn resolvedMaxConcurrentRequests(cfg: RunConfig) !?u32 {
+    const canonical = if (cfg.admission) |admission|
+        if (admission.inference) |inference_admission|
+            inference_admission.max_concurrent_requests
+        else
+            null
+    else
+        null;
+    if (canonical != null and cfg.max_concurrent_requests != null and
+        canonical.? != cfg.max_concurrent_requests.?)
+    {
+        return error.InvalidInferenceConfig;
+    }
+    return canonical orelse cfg.max_concurrent_requests;
+}
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(RunConfig) {
     const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
@@ -76,6 +103,28 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parse
 }
 
 fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(RunConfig) {
+    var raw_tree = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer raw_tree.deinit();
+    const root = switch (raw_tree.value) {
+        .object => |object| object,
+        else => return error.InvalidInferenceConfig,
+    };
+    if (root.get("admission")) |admission_value| {
+        const admission = switch (admission_value) {
+            .object => |object| object,
+            else => return error.InvalidInferenceConfig,
+        };
+        if (admission.count() != @intFromBool(admission.get("inference") != null))
+            return error.InvalidInferenceConfig;
+        if (admission.get("inference")) |inference_value| {
+            const inference_admission = switch (inference_value) {
+                .object => |object| object,
+                else => return error.InvalidInferenceConfig,
+            };
+            if (inference_admission.count() != @intFromBool(inference_admission.get("max_concurrent_requests") != null))
+                return error.InvalidInferenceConfig;
+        }
+    }
     const parsed = try std.json.parseFromSlice(RunConfig, allocator, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -91,6 +140,7 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
         }).validate();
     }
     if (parsed.value.kernel_jit) |value| try value.validate();
+    _ = try resolvedMaxConcurrentRequests(parsed.value);
     return parsed;
 }
 
@@ -292,11 +342,44 @@ fn printRunUsage(usage_name: []const u8) void {
         \\  --config <path>                     JSON run configuration
         \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
         \\  --max-concurrent-requests <count>    Request concurrency limit
+        \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
         \\  --preload-model <spec>               Warm a model at startup; repeatable
         \\  --allow-unknown-models               Allow models absent from the registry
         \\  -h, --help                           Show this help and exit
         \\
     , .{usage_name});
+}
+
+const ProcessMemoryBudgetSource = enum {
+    cli,
+    canonical_environment,
+    compatibility_environment,
+    config,
+    automatic,
+};
+
+const ProcessMemoryBudgetResolution = struct {
+    value_mib: ?usize,
+    source: ProcessMemoryBudgetSource,
+};
+
+fn resolveProcessMemoryBudgetMib(
+    cli_override: ?usize,
+    canonical_env_value: ?[]const u8,
+    compatibility_env_value: ?[]const u8,
+    config_value: ?usize,
+) !ProcessMemoryBudgetResolution {
+    if (cli_override) |value| return .{ .value_mib = value, .source = .cli };
+    if (canonical_env_value) |raw| return .{
+        .value_mib = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments,
+        .source = .canonical_environment,
+    };
+    if (compatibility_env_value) |raw| return .{
+        .value_mib = std.fmt.parseUnsigned(usize, raw, 10) catch return error.InvalidArguments,
+        .source = .compatibility_environment,
+    };
+    if (config_value) |value| return .{ .value_mib = value, .source = .config };
+    return .{ .value_mib = null, .source = .automatic };
 }
 
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -309,6 +392,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_path: ?[]const u8 = null;
     const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
+    var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
@@ -339,6 +423,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--process-memory-budget-mb") and i + 1 < args.len) {
+            process_memory_budget_mb_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host-budget-mb") and i + 1 < args.len) {
             budget_overrides_mib.host = try std.fmt.parseInt(usize, args[i + 1], 10);
@@ -402,6 +489,20 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
     const budget_override_limits = try budget_overrides_mib.toByteLimits();
+    const process_memory_resolution = try resolveProcessMemoryBudgetMib(
+        process_memory_budget_mb_override,
+        platform.env.getenv("ANTFLY_PROCESS_MEMORY_BUDGET_MB"),
+        platform.env.getenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB"),
+        if (loaded_cfg) |parsed| parsed.value.process_memory_budget_mb else null,
+    );
+    const process_memory_limit_bytes = if (process_memory_resolution.value_mib) |value|
+        (try (inference.runtime.tier.memory.BudgetOverridesMib{ .host = value }).toByteLimits()).host_limit_bytes
+    else
+        0;
+    std.log.info(
+        "process memory policy operator_source={s} configured_limit_bytes={d}",
+        .{ @tagName(process_memory_resolution.source), process_memory_limit_bytes },
+    );
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
@@ -413,6 +514,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .scratch_limit_bytes = budget_override_limits.scratch_limit_bytes,
         },
         .preload = preload_models.items,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_provenance = if (process_memory_resolution.value_mib != null)
+            .explicit
+        else
+            .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
     };
@@ -426,7 +532,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         }
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
-        if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
+        if (try resolvedMaxConcurrentRequests(cfg)) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
         if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
@@ -661,6 +767,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
+        \\  "admission": { "inference": { "max_concurrent_requests": 12 } },
         \\  "pool_size": 4,
         \\  "generation_batching": {
         \\    "mode": "on",
@@ -677,6 +784,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
+    try std.testing.expectEqual(@as(?u32, 12), parsed.value.admission.?.inference.?.max_concurrent_requests);
     try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
@@ -703,6 +811,32 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
     try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
+}
+
+test "run config accepts canonical and legacy inference admission spellings" {
+    const disabled = try parseRunConfig(std.testing.allocator,
+        \\{"admission":{"inference":{"max_concurrent_requests":0}}}
+    );
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), disabled.value.admission.?.inference.?.max_concurrent_requests);
+
+    const legacy = try parseRunConfig(std.testing.allocator, "{\"max_concurrent_requests\":1}");
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(?u32, 1), try resolvedMaxConcurrentRequests(legacy.value));
+
+    const matching = try parseRunConfig(std.testing.allocator,
+        \\{"max_concurrent_requests":1,"admission":{"inference":{"max_concurrent_requests":1}}}
+    );
+    defer matching.deinit();
+    try std.testing.expectEqual(@as(?u32, 1), try resolvedMaxConcurrentRequests(matching.value));
+
+    try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator,
+        \\{"max_concurrent_requests":1,"admission":{"inference":{"max_concurrent_requests":2}}}
+    ));
+    try std.testing.expectError(
+        error.InvalidInferenceConfig,
+        parseRunConfig(std.testing.allocator, "{\"admission\":{\"infer\":{\"max_concurrent_requests\":1}}}"),
+    );
 }
 
 test "run config rejects unrepresentable prompt cache values" {
@@ -765,6 +899,37 @@ test "kernel JIT mode precedence is CLI then environment then config" {
     const defaults = try resolveKernelJitConfig(null, null, null);
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, defaults.mode);
     try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig(null, "invalid", null));
+}
+
+test "process memory budget precedence ignores shadowed invalid sources" {
+    try std.testing.expectEqual(
+        ProcessMemoryBudgetSource.cli,
+        (try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512)).source,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        (try resolveProcessMemoryBudgetMib(0, "invalid", "also-invalid", 512)).value_mib,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 256),
+        (try resolveProcessMemoryBudgetMib(null, "256", "invalid", 512)).value_mib,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 384),
+        (try resolveProcessMemoryBudgetMib(null, null, "384", 512)).value_mib,
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 512),
+        (try resolveProcessMemoryBudgetMib(null, null, null, 512)).value_mib,
+    );
+    try std.testing.expectEqual(
+        ProcessMemoryBudgetSource.config,
+        (try resolveProcessMemoryBudgetMib(null, null, null, 512)).source,
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        resolveProcessMemoryBudgetMib(null, "invalid", null, 512),
+    );
 }
 
 test "inference run rejects unknown flags instead of silently disabling policy" {

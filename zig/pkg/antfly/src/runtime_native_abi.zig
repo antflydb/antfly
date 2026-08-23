@@ -45,6 +45,25 @@ pub const TypeContract = extern struct {
     }
 };
 
+/// Versioned, same-toolchain borrow of a host-owned executor. The receiver may
+/// copy the std.Io interface but must not retain it beyond the host's declared
+/// lease lifetime and must never deinitialize it.
+pub const IoBorrow = extern struct {
+    pointer: *const anyopaque,
+    contract: TypeContract,
+
+    pub fn init(io: *const std.Io) IoBorrow {
+        return .{ .pointer = io, .contract = .of(std.Io) };
+    }
+
+    pub fn get(self: IoBorrow) !std.Io {
+        if (!self.contract.matches(.of(std.Io))) return error.InvalidArgument;
+        if (@intFromPtr(self.pointer) % @alignOf(std.Io) != 0) return error.InvalidArgument;
+        const io: *const std.Io = @ptrCast(@alignCast(self.pointer));
+        return io.*;
+    }
+};
+
 pub const CallContract = extern struct {
     version: u32 = abi_version,
     _reserved: u32 = 0,
@@ -175,7 +194,7 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 }
 
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(1_000_000);
     const fields = std.meta.fields(VTable);
     inline for (fields, 0..) |left, left_index| {
         inline for (fields[left_index + 1 ..]) |right| {
@@ -210,4 +229,18 @@ test "native shallow layout fingerprints include field order" {
 test "native method identifiers are deterministic" {
     try std.testing.expectEqual(stableId("lookup"), stableId("lookup"));
     try std.testing.expect(stableId("lookup") != stableId("scan"));
+}
+
+test "native executor borrows validate before reconstructing std.Io" {
+    const io = std.testing.io;
+    const borrow = IoBorrow.init(&io);
+    _ = try borrow.get();
+
+    var incompatible = borrow;
+    incompatible.contract.version += 1;
+    try std.testing.expectError(error.InvalidArgument, incompatible.get());
+
+    var misaligned = borrow;
+    misaligned.pointer = @ptrFromInt(1);
+    try std.testing.expectError(error.InvalidArgument, misaligned.get());
 }

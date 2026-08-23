@@ -5,6 +5,7 @@ class QueryHitHierarchyLevel(str, Enum):
     ARTIFACT = "artifact"
     CHUNK = "chunk"
     EMBEDDING = "embedding"
+    MENTION = "mention"
     SOURCE = "source"
     UNIT = "unit"
 

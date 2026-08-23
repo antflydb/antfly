@@ -26,6 +26,22 @@ require() {
     fi
 }
 
+download_archive() {
+    case "${ANTFLY_DOWNLOAD_CLASS:-}" in
+        employee|ci)
+            curl -A "antfly-installer/1" -H "X-Antfly-Audience: ${ANTFLY_DOWNLOAD_CLASS}" \
+                --max-redirs 0 "$@"
+            ;;
+        ""|external)
+            curl -A "antfly-installer/1" "$@"
+            ;;
+        *)
+            warning "Ignoring invalid ANTFLY_DOWNLOAD_CLASS; expected external, employee, or ci"
+            curl -A "antfly-installer/1" "$@"
+            ;;
+    esac
+}
+
 # Detect OS and architecture
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -82,20 +98,13 @@ EOF
         *)  TAG="v$VERSION"; VERSION_NUM="$VERSION" ;;
     esac
 
-    status "Installing Antfly $EDITION version $TAG..."
+    status "Installing Antfly $TAG..."
 
-    # Construct download URL
-    # Default:     antfly_VERSION_OS_ARCH.tar.gz
-    # Go fallback: antfly-go_VERSION_OS_ARCH.tar.gz
-    if [ "$EDITION" = "go" ]; then
-        ARCHIVE_NAME="antfly-go_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
-    else
-        ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
-    fi
+    ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
 
     status "Downloading from $DOWNLOAD_URL..."
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
+    if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
         error "Failed to download Antfly. Please check your internet connection and the version number."
     fi
 
@@ -116,17 +125,13 @@ EOF
 
     status "Installing binaries to $INSTALL_DIR..."
 
-    # Install antfly or antfly-go
+    # Install the Zig runtime.
     if [ -f "$TEMP_DIR/antfly" ]; then
         install_binary "$TEMP_DIR/antfly" "$INSTALL_DIR/antfly"
     fi
-    if [ -f "$TEMP_DIR/antfly-go" ]; then
-        install_binary "$TEMP_DIR/antfly-go" "$INSTALL_DIR/antfly-go"
-    fi
-
-    # Install bundled libraries (Go fallback edition)
+    # Install bundled C ABI libraries.
     if [ -d "$TEMP_DIR/lib" ]; then
-        status "Installing bundled Go runtime libraries to $LIB_DIR..."
+        status "Installing bundled runtime libraries to $LIB_DIR..."
         if [ -w "$(dirname "$LIB_DIR")" ] || [ "$(id -u)" -eq 0 ]; then
             mkdir -p "$LIB_DIR"
             cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
@@ -134,7 +139,7 @@ EOF
             sudo mkdir -p "$LIB_DIR"
             sudo cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
         fi
-        status "Installed Go runtime libraries to $LIB_DIR"
+        status "Installed runtime libraries to $LIB_DIR"
     fi
 
     # Install shell completions if available
@@ -143,45 +148,29 @@ EOF
 
         # Bash completions
         if [ -f "$TEMP_DIR/completions/antfly.bash" ]; then
-            COMPLETION_NAME="antfly"
-            [ "$EDITION" = "go" ] && COMPLETION_NAME="antfly-go"
             BASH_COMPLETION_DIR="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
             mkdir -p "$BASH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.bash" "$BASH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.bash" "$BASH_COMPLETION_DIR/antfly" 2>/dev/null || true
         fi
 
         # Zsh completions
         if [ -f "$TEMP_DIR/completions/antfly.zsh" ]; then
-            COMPLETION_NAME="_antfly"
-            [ "$EDITION" = "go" ] && COMPLETION_NAME="_antfly-go"
             ZSH_COMPLETION_DIR="${ZSH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions}"
             mkdir -p "$ZSH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.zsh" "$ZSH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.zsh" "$ZSH_COMPLETION_DIR/_antfly" 2>/dev/null || true
         fi
 
         # Fish completions
         if [ -f "$TEMP_DIR/completions/antfly.fish" ]; then
-            COMPLETION_NAME="antfly.fish"
-            [ "$EDITION" = "go" ] && COMPLETION_NAME="antfly-go.fish"
             FISH_COMPLETION_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
             mkdir -p "$FISH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.fish" "$FISH_COMPLETION_DIR/$COMPLETION_NAME" 2>/dev/null || true
+            cp "$TEMP_DIR/completions/antfly.fish" "$FISH_COMPLETION_DIR/antfly.fish" 2>/dev/null || true
         fi
     fi
 
     status "Antfly installation complete!"
     status ""
-    if [ "$EDITION" = "go" ]; then
-        status "Run 'antfly-go --help' to get started"
-    else
-        status "Run 'antfly --help' to get started"
-    fi
-
-    if [ "$EDITION" = "go" ]; then
-        status ""
-        status "Go fallback edition includes the previous Go/omni runtime."
-        status "Libraries installed to $LIB_DIR"
-    fi
+    status "Run 'antfly --help' to get started"
 
     # Check if install dir is in PATH
     case ":$PATH:" in
@@ -211,7 +200,6 @@ install_binary() {
 
 # Main execution
 main() {
-    EDITION="default"
     VERSION=""
 
     while [ $# -gt 0 ]; do
@@ -222,19 +210,24 @@ Antfly Installer
 
 Usage:
   curl -fsSL https://antfly.io/install.sh | sh
-  curl -fsSL https://antfly.io/install.sh | sh -s -- --go
-  curl -fsSL https://antfly.io/install.sh | sh -s -- --go v0.0.0-dev50
+  curl -fsSL https://antfly.io/install.sh | sh -s -- v0.2.0
 
 Options:
   -h, --help    Show this help message
-  --go          Install the previous Go/omni runtime as antfly-go
-  --omni        Alias for --go
-  [version]     Install a specific version (e.g., v0.0.0-dev50)
+  [version]     Install a specific version (e.g., v0.2.0)
                 If not specified, installs the latest version.
 
 Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
+
+  ANTFLY_DOWNLOAD_CLASS supplies a best-effort analytics label for archive
+  requests. Set it to employee for staff downloads or ci for automated jobs;
+  unset, external, and invalid values are measured as external traffic. Values
+  are caller-asserted and can be omitted or forged. They are not authentication
+  credentials and must not be treated as proof of employee or CI identity.
+  Labeled requests reject redirects so their metric headers stay on the
+  versioned releases.antfly.io request.
 
   By default, it installs to:
     - /usr/local/bin (if running as root)
@@ -244,10 +237,6 @@ For more information, visit: https://docs.antfly.io
 EOF
                 exit 0
                 ;;
-            --go|--omni)
-                EDITION="go"
-                shift
-                ;;
             *)
                 VERSION="$1"
                 shift
@@ -255,7 +244,6 @@ EOF
         esac
     done
 
-    export EDITION
     install_antfly "${VERSION:-latest}"
 }
 

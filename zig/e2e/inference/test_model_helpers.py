@@ -16,7 +16,16 @@ import pytest
 import requests
 
 from . import models
-from .conftest import InferenceServer, capacity_retry_delay, retry_transient_capacity
+from .conftest import (
+    InferenceServer,
+    _backend_selection_diagnostic,
+    _managed_model_id,
+    _parse_backend_exceptions,
+    _positive_timeout,
+    _server_budget_args,
+    capacity_retry_delay,
+    retry_transient_capacity,
+)
 from .models import (
     DEFAULT_EXTRACTOR_MODEL,
     DEFAULT_EXTRACTOR_VARIANT,
@@ -29,6 +38,74 @@ from .models import (
     bootstrap_models_for_listing,
     find_local_model_path,
 )
+from .test_generate import (
+    test_configured_generation_smoke as run_configured_generation_smoke,
+)
+
+
+def test_server_budget_args_validate_and_preserve_values(monkeypatch):
+    for env_name in (
+        "ANTFLY_INFERENCE_BACKEND_BUDGET_MB",
+        "ANTFLY_INFERENCE_COMBINED_BUDGET_MB",
+        "ANTFLY_INFERENCE_KV_BUDGET_MB",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", "7000")
+    monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "0")
+
+    assert _server_budget_args() == [
+        "--host-budget-mb",
+        "7000",
+        "--scratch-budget-mb",
+        "0",
+    ]
+
+
+def test_configured_generation_smoke_uses_exact_model_and_first_use_timeout(
+    monkeypatch,
+):
+    model = "owner/model:gguf:Q4_0"
+    monkeypatch.setenv("ANTFLY_INFERENCE_SMOKE_GENERATOR_MODEL", model)
+
+    class Api:
+        request = None
+
+        def generate(self, messages, **kwargs):
+            self.request = (messages, kwargs)
+            return {
+                "id": "chatcmpl-smoke",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Hello"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+
+    api = Api()
+    run_configured_generation_smoke(api)
+
+    assert api.request is not None
+    _, kwargs = api.request
+    assert kwargs["model"] == model
+    assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert kwargs["request_timeout"] > 0
+
+
+@pytest.mark.parametrize("value", ["-1", "invalid", "1.5"])
+def test_server_budget_args_reject_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", value)
+    with pytest.raises(pytest.UsageError, match="non-negative integer"):
+        _server_budget_args()
 
 
 def test_partial_model_directory_is_not_available(tmp_path):
@@ -307,6 +384,17 @@ def test_generator_environment_override_preserves_curated_variant(monkeypatch):
     assert qwen.pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
 
 
+def test_draft_generator_environment_override_is_bootstrapped(monkeypatch):
+    for env_name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_DRAFT_MODEL", "unsloth/Qwen3-1.7B-GGUF")
+
+    specs = _env_model_specs()
+
+    assert [spec.repo for spec in specs] == ["unsloth/Qwen3-1.7B-GGUF"]
+    assert specs[0].pull_ref == "hf:unsloth/Qwen3-1.7B-GGUF:gguf:Q4_K_M"
+
+
 def test_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_TOOL_GENERATOR_MODEL
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL
@@ -356,6 +444,38 @@ def test_multimodal_model_selection_uses_shared_gemma_default(monkeypatch, tmp_p
         models.find_multimodal_generator_model_name({DEFAULT_GENERATOR_MODEL})
         == DEFAULT_GENERATOR_MODEL
     )
+
+
+def test_model_selection_returns_advertised_managed_variant(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_TOOL_MODEL", raising=False)
+    monkeypatch.delenv("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL", raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))
+
+    spec = models.spec_for_name(DEFAULT_GENERATOR_MODEL, "generators")
+    assert spec is not None
+    model_dir = models._model_path(spec)
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "vision_config": {},
+            }
+        )
+    )
+    (model_dir / "genai_config.json").write_text(
+        json.dumps({"tool_call_format": "functiongemma"})
+    )
+    advertised = {spec.listing_name}
+
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
+    assert models.default_generator_model_name(advertised) == spec.listing_name
+    assert models.find_tool_model_name(advertised) == spec.listing_name
+    assert models.find_multimodal_generator_model_name(advertised) == spec.listing_name
 
 
 def test_explicit_large_generator_is_bootstrapped(monkeypatch):
@@ -679,6 +799,21 @@ def test_capacity_retry_bounds_attempts_under_zero_delay():
     assert len(sends) == 2
 
 
+def test_positive_timeout_uses_default_and_explicit_value(monkeypatch):
+    monkeypatch.delenv("ANTFLY_TEST_TIMEOUT", raising=False)
+    assert _positive_timeout("ANTFLY_TEST_TIMEOUT", 30.0) == 30.0
+
+    monkeypatch.setenv("ANTFLY_TEST_TIMEOUT", "12.5")
+    assert _positive_timeout("ANTFLY_TEST_TIMEOUT", 30.0) == 12.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "invalid"])
+def test_positive_timeout_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("ANTFLY_TEST_TIMEOUT", value)
+    with pytest.raises(ValueError, match="ANTFLY_TEST_TIMEOUT"):
+        _positive_timeout("ANTFLY_TEST_TIMEOUT", 30.0)
+
+
 def test_live_server_tail_read_does_not_move_shared_output_offset():
     server = InferenceServer.__new__(InferenceServer)
     server.output = tempfile.TemporaryFile(mode="w+b")
@@ -691,6 +826,81 @@ def test_live_server_tail_read_does_not_move_shared_output_offset():
         assert server.output.tell() == position
     finally:
         server.output.close()
+
+
+def test_server_output_backend_scan_searches_full_capture_without_moving_offset(
+    tmp_path,
+):
+    server = InferenceServer.__new__(InferenceServer)
+    server.output = tempfile.TemporaryFile(mode="w+b")
+    server.proc = SimpleNamespace(poll=lambda: 0)
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
+    try:
+        server.output.write(f"selected backend cuda for {cuda_model}\n".encode())
+        server.output.write(b"x" * (70 * 1024))
+        server.output.write(f"selected backend native for {native_model}\n".encode())
+        server.output.seek(7)
+        position = server.output.tell()
+
+        assert server.output_contains(f"selected backend cuda for {cuda_model}")
+        assert not server.output_contains("selected backend metal for model")
+        selections = server.backend_selections({"cuda", "metal", "native"})
+        assert selections == {
+            ("cuda", str(cuda_model)),
+            ("native", str(native_model)),
+        }
+        assert (
+            _managed_model_id(str(native_model), str(models_path)) == "owner/cpu-model"
+        )
+        assert (
+            _backend_selection_diagnostic(
+                selections,
+                "cuda",
+                {("owner/cpu-model", "native")},
+                str(models_path),
+            )
+            is None
+        )
+        assert server.output.tell() == position
+    finally:
+        server.output.close()
+
+
+def test_backend_selection_policy_rejects_unexpected_and_stale_exceptions(tmp_path):
+    models_path = tmp_path / "models"
+    cuda_model = models_path / "owner" / "cuda-model--antfly-12345678"
+    native_model = models_path / "owner" / "cpu-model--antfly-abcdef12"
+    selections = {("cuda", str(cuda_model)), ("native", str(native_model))}
+
+    assert "disallowed selections" in _backend_selection_diagnostic(
+        selections, "cuda", set(), str(models_path)
+    )
+    assert "unused exceptions" in _backend_selection_diagnostic(
+        {("cuda", str(cuda_model))},
+        "cuda",
+        {("owner/cpu-model", "native")},
+        str(models_path),
+    )
+
+
+def test_backend_exception_parser_is_exact_and_validated():
+    supported = {"cuda", "native"}
+    assert _parse_backend_exceptions(
+        "owner/whisper=native, owner/sparse=native", supported
+    ) == {("owner/whisper", "native"), ("owner/sparse", "native")}
+
+    with pytest.raises(pytest.UsageError, match="owner/model=backend"):
+        _parse_backend_exceptions("owner/whisper", supported)
+    with pytest.raises(pytest.UsageError, match="must use owner/model"):
+        _parse_backend_exceptions("whisper=native", supported)
+    with pytest.raises(pytest.UsageError, match="must be one of"):
+        _parse_backend_exceptions("owner/whisper=metal", supported)
+    with pytest.raises(pytest.UsageError, match="duplicate"):
+        _parse_backend_exceptions(
+            "owner/whisper=native,owner/whisper=native", supported
+        )
 
 
 def test_live_server_http_diagnostic_is_reported_once(capsys):
@@ -706,5 +916,24 @@ def test_live_server_http_diagnostic_is_reported_once(capsys):
         captured = capsys.readouterr()
         assert captured.err.count("backend failed to load tensor") == 1
         assert "still running" in captured.err
+    finally:
+        server.output.close()
+
+
+def test_live_server_request_failure_includes_endpoint_and_output_tail():
+    server = InferenceServer.__new__(InferenceServer)
+    server.output = tempfile.TemporaryFile(mode="w+b")
+    server.output.write(b"model initialization still running\n")
+    server.proc = SimpleNamespace(poll=lambda: None)
+    try:
+        diagnostic = server.request_failure_diagnostic(
+            "post",
+            "/ai/v1/generate",
+            requests.ReadTimeout("read timed out after 300 seconds"),
+        )
+        assert "POST /ai/v1/generate" in diagnostic
+        assert "read timed out after 300 seconds" in diagnostic
+        assert "still running" in diagnostic
+        assert "model initialization still running" in diagnostic
     finally:
         server.output.close()

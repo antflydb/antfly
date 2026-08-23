@@ -9,7 +9,7 @@ spec:
   ports:
     - protocol: TCP
       port: 80 # The port the service exposes internally
-      targetPort: 12277 # The port your app listens on inside the container
+      targetPort: 12377 # Zig metadata API port
       nodePort: 30002 # The external port Minikube will use (e.g., 30002)
   type: NodePort
 ---
@@ -27,8 +27,6 @@ spec:
       port: 12377
     - name: raft
       port: 9017
-    - name: public
-      port: 12277
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -56,6 +54,9 @@ spec:
         app: antfly
         role: metadata
     spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       volumes:
         - name: config
           configMap:
@@ -76,10 +77,12 @@ spec:
               ORDINAL=${HOSTNAME##*-}
               ID=$((ORDINAL + 1))
               exec /antfly metadata --id $ID --config /config/config.json \
-                --api http://0.0.0.0:12377 \
-                --raft http://0.0.0.0:9017 \
-                --public-api http://0.0.0.0:12277 \
-                --cluster '{ "1": "http://antfly-metadata-0.antfly-metadata-svc.default.svc.cluster.local:9017", "2": "http://antfly-metadata-1.antfly-metadata-svc.default.svc.cluster.local:9017", "3": "http://antfly-metadata-2.antfly-metadata-svc.default.svc.cluster.local:9017" }'
+                --api-host 0.0.0.0 \
+                --api-port 12377 \
+                --raft-host 0.0.0.0 \
+                --raft-port 9017 \
+                --health-port 4200 \
+                --cluster '{ "1": {"raft_url":"http://antfly-metadata-0.antfly-metadata-svc.default.svc.cluster.local:9017","orchestration_url":"http://antfly-metadata-0.antfly-metadata-svc.default.svc.cluster.local:12377"}, "2": {"raft_url":"http://antfly-metadata-1.antfly-metadata-svc.default.svc.cluster.local:9017","orchestration_url":"http://antfly-metadata-1.antfly-metadata-svc.default.svc.cluster.local:12377"}, "3": {"raft_url":"http://antfly-metadata-2.antfly-metadata-svc.default.svc.cluster.local:9017","orchestration_url":"http://antfly-metadata-2.antfly-metadata-svc.default.svc.cluster.local:12377"} }'
           livenessProbe:
             httpGet:
               path: /healthz

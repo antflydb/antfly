@@ -24,6 +24,7 @@
 //! delta path for incremental writes.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
@@ -161,12 +162,12 @@ pub const SearchConstraints = struct {
     exclude_doc_ids: []const []const u8 = &.{},
     filter_doc_nums: []const u32 = &.{},
     exclude_doc_nums: []const u32 = &.{},
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
 };
 
-fn checkSearchCancellation(cancellation: ?*const std.atomic.Value(bool)) !void {
+fn checkSearchCancellation(cancellation: ?CancellationToken) !void {
     if (cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
+        if (value.isCancelled()) return error.Cancelled;
     }
 }
 
@@ -3207,7 +3208,7 @@ pub const SparseIndex = struct {
             direct_exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             profile: ?*SearchProfile,
             source: ScoreSource,
-            cancellation: ?*const std.atomic.Value(bool),
+            cancellation: ?CancellationToken,
 
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;

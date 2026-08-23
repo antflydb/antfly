@@ -172,11 +172,15 @@ pub const ServerGenerator = struct {
 
     fn generateRouteTable(self: *ServerGenerator, ops: []const OperationInfo) !void {
         try self.w.docComment("Route metadata for all operations.");
+        try self.w.line("pub const RequestBodyMode = enum {{ none, buffered }};", .{});
+        try self.w.blank();
         try self.w.line("pub const Route = struct {{", .{});
         self.w.indent();
         try self.w.line("method: []const u8,", .{});
         try self.w.line("path: []const u8,", .{});
         try self.w.line("operation_id: []const u8,", .{});
+        try self.w.line("request_body: RequestBodyMode,", .{});
+        try self.w.line("streaming_response: bool,", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
         try self.w.blank();
@@ -184,7 +188,13 @@ pub const ServerGenerator = struct {
         try self.w.line("pub const routes = [_]Route{{", .{});
         self.w.indent();
         for (ops) |op| {
-            try self.w.line(".{{ .method = \"{s}\", .path = \"{s}\", .operation_id = \"{s}\" }},", .{ op.http_method_upper, op.path, op.op_id });
+            try self.w.line(".{{ .method = \"{s}\", .path = \"{s}\", .operation_id = \"{s}\", .request_body = .{s}, .streaming_response = {} }},", .{
+                op.http_method_upper,
+                op.path,
+                op.op_id,
+                if (op.request_body_type != null) "buffered" else "none",
+                op.is_streaming,
+            });
         }
         self.w.dedent();
         try self.w.line("}};", .{});
@@ -219,13 +229,6 @@ pub const ServerGenerator = struct {
         try self.w.line("return struct {{", .{});
         self.w.indent();
 
-        // Global storage for the impl pointer, set during register().
-        // This allows bare function-pointer handlers (httpx.Handler = *const fn)
-        // to access the impl. Works across fibers/threads since register()
-        // completes before any handler is invoked.
-        try self.w.line("var active_impl: ?*Impl = null;", .{});
-        try self.w.blank();
-
         try self.w.line("impl: *Impl,", .{});
         try self.w.blank();
 
@@ -237,14 +240,13 @@ pub const ServerGenerator = struct {
         try self.w.blank();
 
         // register method
-        try self.w.docComment("Register all routes on the server and activate the impl.");
+        try self.w.docComment("Register all routes on the server with explicit instance context.");
         try self.w.line("pub fn register(self: *const @This(), server: anytype) !void {{", .{});
         self.w.indent();
-        try self.w.line("active_impl = self.impl;", .{});
 
         for (ops) |op| {
             const httpx_path = try self.openApiPathToHttpx(op.path);
-            try self.w.line("try server.{s}(\"{s}\", {s});", .{
+            try self.w.line("try server.{s}(\"{s}\", httpx.Handler.bind(self.impl, {s}));", .{
                 op.http_method,
                 httpx_path,
                 op.method_name,
@@ -292,9 +294,8 @@ pub const ServerGenerator = struct {
         if (op.summary) |summary| try self.w.docComment(summary);
         try self.w.docComment(try std.fmt.allocPrint(self.arena, "{s} {s}", .{ op.http_method_upper, op.path }));
 
-        try self.w.line("fn {s}(ctx: *httpx.Context) anyerror!httpx.Response {{", .{op.method_name});
+        try self.w.line("fn {s}(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {{", .{op.method_name});
         self.w.indent();
-        try self.w.line("const impl = active_impl orelse return ctx.status(503).json(.{{ .@\"error\" = \"not_initialized\", .message = \"server not initialized\" }});", .{});
 
         // Extract path parameters
         for (op.path_params) |p| {
@@ -347,8 +348,6 @@ pub const ServerGenerator = struct {
         self.w.dedent();
         try self.w.line("}}", .{});
     }
-
-    // Wrap helper removed: handlers now read from threadlocal active_impl directly.
 
     /// Convert OpenAPI path template to httpx route pattern.
     /// `/pets/{petId}` → `/pets/:petId`

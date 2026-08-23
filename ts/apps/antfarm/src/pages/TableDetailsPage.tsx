@@ -58,7 +58,7 @@ import type {
 import { queryResultTotalHits } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, type TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
@@ -82,7 +82,19 @@ import {
   generateSearchableFields,
   type SearchableField,
 } from "../utils/fieldUtils";
-import { buildTableQueryRequest, parseTableQueryRequest } from "./table-query";
+import {
+  builderArtifactRetrievalDefaults,
+  buildTableQueryRequest,
+  parseTableQueryRequest,
+  requestArtifactRetrievalDefaults,
+  type TableQueryMetadataState,
+  tableQueryBuilderConversionBlocker,
+  tableQueryErrorMessage,
+  tableQueryInput,
+  tableQueryJsonSafetyBlocker,
+  tableQueryMetadataBlocker,
+  tableRequiresSafeProjection,
+} from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -231,8 +243,17 @@ interface TableDetailsPageProps {
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
   const { tableName } = useParams<{ tableName: string }>();
+  const activeTableName = useRef(tableName);
+  activeTableName.current = tableName;
+  const indexesRequestSequence = useRef(0);
+  const tableMetadataRequestSequence = useRef(0);
+  const queryAbortController = useRef<AbortController | null>(null);
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
+  const [indexesMetadataState, setIndexesMetadataState] =
+    useState<TableQueryMetadataState>("loading");
+  const [tableStatus, setTableStatus] = useState<TableStatus | null>(null);
+  const [tableMetadataState, setTableMetadataState] = useState<TableQueryMetadataState>("loading");
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
   const [storageStatus, setStorageStatus] = useState<TableStatus["storage_status"] | null>(null);
   const [documentCount, setDocumentCount] = useState<number | null>(null);
@@ -247,10 +268,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [filterQuery, setFilterQuery] = useState(JSON.stringify({}, null, 2));
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
-  const [includeProfile, setIncludeProfile] = useState(true);
+  const [includeProfile, setIncludeProfile] = useState(false);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
+  const hasFullTextQuery = query.trim().length > 0 && !hasSemanticQuery;
   const hasFilterQuery = useMemo(() => {
     try {
       const parsed = JSON.parse(filterQuery);
@@ -264,15 +286,16 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
-  // Auto-select first vector index when indexes load
-  useEffect(() => {
-    if (queryIndexes.length === 0) {
-      const vectorIndexes = indexes.filter((idx) => idx.config.type === "embeddings");
-      if (vectorIndexes.length > 0) {
-        setQueryIndexes([vectorIndexes[0].config.name]);
-      }
-    }
-  }, [indexes, queryIndexes.length]);
+  const artifactRetrieval = useMemo(
+    () => builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus),
+    [indexes, query, queryIndexes, tableStatus]
+  );
+  const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
+  const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
+  const artifactPayloadProjectionRequired = useMemo(
+    () => tableRequiresSafeProjection(indexes, tableStatus),
+    [indexes, tableStatus]
+  );
 
   const semanticQueryRequest = useMemo(() => {
     return buildTableQueryRequest({
@@ -282,19 +305,38 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       semanticQuery,
       filterQuery,
       includeProfile,
+      artifactSearchFields: artifactRetrieval?.searchFields,
+      artifactProjectionFields: artifactRetrieval?.projectionFields,
+      returnArtifactMatches: artifactRetrieval?.returnMatches,
+      requireSafeProjection: artifactPayloadProjectionRequired,
     });
-  }, [query, queryIndexes, filterQuery, semanticQuery, selectedFields, includeProfile]);
+  }, [
+    query,
+    queryIndexes,
+    filterQuery,
+    semanticQuery,
+    selectedFields,
+    includeProfile,
+    artifactRetrieval,
+    artifactPayloadProjectionRequired,
+  ]);
   const semanticQueryRequestString = useMemo(
     () => JSON.stringify(semanticQueryRequest, null, 2),
     [semanticQueryRequest]
   );
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
-  const parsedJsonQuery = useMemo(
-    () => parseTableQueryRequest(queryJsonString),
-    [queryJsonString]
-  );
+  const parsedJsonQuery = useMemo(() => parseTableQueryRequest(queryJsonString), [queryJsonString]);
   const isJsonQueryValid = parsedJsonQuery !== null;
+  const jsonArtifactRetrieval = useMemo(
+    () => requestArtifactRetrievalDefaults(indexes, parsedJsonQuery, tableStatus),
+    [indexes, parsedJsonQuery, tableStatus]
+  );
+  const jsonQuerySafetyBlocker = tableQueryJsonSafetyBlocker(
+    queryMetadataBlocker,
+    artifactPayloadProjectionRequired || jsonArtifactRetrieval !== null,
+    parsedJsonQuery
+  );
 
   const handleQueryModeChange = (v: string) => {
     const mode = v as "builder" | "json";
@@ -303,19 +345,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     } else if (mode === "builder") {
       const queryRequest = parseTableQueryRequest(queryJsonString);
       if (queryRequest) {
-        setQueryIndexes(queryRequest.indexes || []);
-        setSelectedFields(queryRequest.fields || []);
-        setFieldInput(""); // Clear field input when switching from JSON mode
+        const nextQueryIndexes = Array.isArray(queryRequest.indexes)
+          ? queryRequest.indexes.filter((index): index is string => typeof index === "string")
+          : [];
+        const nextSelectedFields = Array.isArray(queryRequest.fields)
+          ? queryRequest.fields.filter((field): field is string => typeof field === "string")
+          : [];
+        const nextArtifactRetrieval = requestArtifactRetrievalDefaults(
+          indexes,
+          queryRequest,
+          tableStatus
+        );
+        const nextQuery = tableQueryInput(queryRequest, nextArtifactRetrieval?.searchFields);
 
-        // Set query content (search mode is auto-detected from content)
-        setQuery(queryRequest.semantic_search || "");
-
-        // Set filter query content
-        if (queryRequest.filter_query) {
-          setFilterQuery(JSON.stringify(queryRequest.filter_query, null, 2));
-        } else {
-          setFilterQuery(JSON.stringify({}, null, 2));
-        }
+        const nextFilterQuery = JSON.stringify(queryRequest.filter_query || {}, null, 2);
         const { aggregations, limit, offset } = queryRequest;
         const semanticPart: {
           aggregations?: unknown;
@@ -325,7 +368,32 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         if (aggregations) semanticPart.aggregations = aggregations;
         if (limit !== undefined) semanticPart.limit = limit;
         if (offset !== undefined) semanticPart.offset = offset;
-        setSemanticQuery(JSON.stringify(semanticPart, null, 2));
+        const nextSemanticQuery = JSON.stringify(semanticPart, null, 2);
+        const rebuilt = buildTableQueryRequest({
+          query: nextQuery,
+          queryIndexes: nextQueryIndexes,
+          selectedFields: nextSelectedFields,
+          semanticQuery: nextSemanticQuery,
+          filterQuery: nextFilterQuery,
+          includeProfile: queryRequest.profile === true,
+          artifactSearchFields: nextArtifactRetrieval?.searchFields,
+          artifactProjectionFields: nextArtifactRetrieval?.projectionFields,
+          returnArtifactMatches: nextArtifactRetrieval?.returnMatches,
+          requireSafeProjection: artifactPayloadProjectionRequired,
+        });
+        const conversionBlocker = tableQueryBuilderConversionBlocker(queryRequest, rebuilt);
+        if (conversionBlocker) {
+          setError(conversionBlocker);
+          return;
+        }
+
+        setQueryIndexes(nextQueryIndexes);
+        setSelectedFields(nextSelectedFields);
+        setIncludeProfile(queryRequest.profile === true);
+        setFieldInput("");
+        setQuery(nextQuery);
+        setFilterQuery(nextFilterQuery);
+        setSemanticQuery(nextSemanticQuery);
         setError(null);
       } else {
         setError("The query editor must contain one JSON object.");
@@ -337,10 +405,33 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const fetchIndexes = useCallback(async () => {
     if (!tableName) return;
+    if (activeTableName.current !== tableName) return;
+    const requestSequence = ++indexesRequestSequence.current;
+    setIndexesMetadataState("loading");
     try {
       const response = await api.indexes.list(tableName);
-      setIndexes(response as IndexStatus[]);
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== indexesRequestSequence.current
+      )
+        return;
+      if (!Array.isArray(response)) throw new Error("Index metadata response was empty.");
+      const nextIndexes = response as IndexStatus[];
+      const liveVectorIndexes = new Set(
+        nextIndexes
+          .filter((index) => index.config.type === "embeddings")
+          .map((index) => index.config.name)
+      );
+      setIndexes(nextIndexes);
+      setQueryIndexes((current) => current.filter((name) => liveVectorIndexes.has(name)));
+      setIndexesMetadataState("ready");
     } catch (e) {
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== indexesRequestSequence.current
+      )
+        return;
+      setIndexesMetadataState("error");
       setError(`Failed to fetch indexes for table ${tableName}.`);
       console.error(e);
     }
@@ -348,8 +439,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const fetchTableSchema = useCallback(async () => {
     if (!tableName) return;
+    if (activeTableName.current !== tableName) return;
+    const requestSequence = ++tableMetadataRequestSequence.current;
+    setTableMetadataState("loading");
     try {
       const response = await api.tables.get(tableName);
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== tableMetadataRequestSequence.current
+      )
+        return;
+      if (!response) throw new Error("Table metadata response was empty.");
+      setTableStatus(response as TableStatus);
       if (response?.schema && Object.keys(response.schema).length > 0) {
         setTableSchema(response.schema as TableSchema);
       } else {
@@ -357,11 +458,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       }
       setStorageStatus((response as TableStatus | undefined)?.storage_status ?? null);
       setMigration(response?.migration);
-    } catch {
-      // This is a 404, so we can ignore it.
-      setTableSchema(null);
-      setStorageStatus(null);
-      setMigration(undefined);
+      setTableMetadataState("ready");
+    } catch (e) {
+      if (
+        activeTableName.current !== tableName ||
+        requestSequence !== tableMetadataRequestSequence.current
+      )
+        return;
+      // Keep the last known-good metadata. Clearing it here can silently remove
+      // artifact projections and turn a bounded query into a source rollup.
+      setTableMetadataState("error");
+      setError(tableQueryErrorMessage(e, `Failed to fetch table metadata for ${tableName}.`));
+      console.error(e);
     }
   }, [tableName]);
 
@@ -377,8 +485,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         count: true,
         limit: 0,
       } as QueryRequest);
+      if (activeTableName.current !== tableName) return;
       setDocumentCount(queryResultTotalHits(response?.responses?.[0]) ?? null);
     } catch {
+      if (activeTableName.current !== tableName) return;
       setDocumentCount(null);
     }
   }, [storageStatus?.empty, tableName]);
@@ -392,10 +502,32 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     fetchDocumentCount();
   }, [fetchDocumentCount]);
 
-  // Reset editing state when switching tables
+  const refreshQueryMetadata = useCallback(async () => {
+    setError(null);
+    await Promise.all([fetchIndexes(), fetchTableSchema()]);
+  }, [fetchIndexes, fetchTableSchema]);
+
+  // Reset table-specific editor state when switching tables.
   useEffect(() => {
+    if (!tableName) return;
+    queryAbortController.current?.abort();
+    queryAbortController.current = null;
     setIsEditingSchema(false);
-  }, []);
+    setIndexes([]);
+    setIndexesMetadataState("loading");
+    setTableStatus(null);
+    setTableMetadataState("loading");
+    setQuery("");
+    setQueryResult(null);
+    setQueryIndexes([]);
+    setFilterQuery(JSON.stringify({}, null, 2));
+    setSemanticQuery(JSON.stringify({}, null, 2));
+    setSelectedFields([]);
+    setIncludeProfile(false);
+    setQueryMode("builder");
+    setError(null);
+    return () => queryAbortController.current?.abort();
+  }, [tableName]);
 
   const handleOpenCreateDialog = () => {
     setOpenCreateDialog(true);
@@ -406,7 +538,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   };
 
   const handleIndexCreated = () => {
-    fetchIndexes();
+    void refreshQueryMetadata();
   };
 
   const handleOpenDropDialog = (index: IndexStatus) => {
@@ -421,8 +553,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const handleDropIndex = async () => {
     if (!tableName || !selectedIndex) return;
     try {
-      await api.indexes.drop(tableName, selectedIndex.config.name);
-      fetchIndexes();
+      const droppedIndexName = selectedIndex.config.name;
+      await api.indexes.drop(tableName, droppedIndexName);
+      setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
+      await refreshQueryMetadata();
       handleCloseDropDialog();
     } catch (e) {
       setError(`Failed to drop index ${selectedIndex.config.name}.`);
@@ -440,19 +574,61 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const handleRunQuery = useCallback(async () => {
     if (!tableName) return;
+    queryAbortController.current?.abort();
+    const controller = new AbortController();
+    queryAbortController.current = controller;
+    setError(null);
     try {
+      if (queryMode === "builder" && queryMetadataBlocker) {
+        setError(queryMetadataBlocker);
+        return;
+      }
+      if (queryMode === "builder" && artifactSelectionError) {
+        setError(artifactSelectionError);
+        return;
+      }
+      if (queryMode === "json" && jsonQuerySafetyBlocker) {
+        setError(jsonQuerySafetyBlocker);
+        return;
+      }
       const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
       if (!queryRequest) {
         setError("The query editor must contain one JSON object.");
         return;
       }
-      const response = await api.tables.query(tableName, queryRequest);
+      const response = await api.tables.query(tableName, queryRequest, {
+        signal: controller.signal,
+      });
+      if (
+        controller.signal.aborted ||
+        queryAbortController.current !== controller ||
+        activeTableName.current !== tableName
+      )
+        return;
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
-      setError(`Failed to run query on table ${tableName}.`);
+      if (
+        controller.signal.aborted ||
+        queryAbortController.current !== controller ||
+        activeTableName.current !== tableName
+      )
+        return;
+      setError(tableQueryErrorMessage(e, `Failed to run query on table ${tableName}.`));
       console.error(e);
+    } finally {
+      if (queryAbortController.current === controller) {
+        queryAbortController.current = null;
+      }
     }
-  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest]);
+  }, [
+    tableName,
+    queryMode,
+    parsedJsonQuery,
+    semanticQueryRequest,
+    artifactSelectionError,
+    jsonQuerySafetyBlocker,
+    queryMetadataBlocker,
+  ]);
 
   // Global Ctrl+Enter handler for search section
   useEffect(() => {
@@ -957,6 +1133,16 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                         </div>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1 space-y-2.5">
+                        {artifactPayloadProjectionRequired && selectedFields.length === 0 && (
+                          <p className="text-xs text-muted-foreground">
+                            {artifactRetrieval && artifactRetrieval.projectionFields.length > 0
+                              ? `Artifact retrieval defaults to the ${artifactRetrieval.projectionFields.join(", ")} ${artifactRetrieval.projectionFields.length === 1 ? "field" : "fields"} so source files and inline URLs are not returned.`
+                              : artifactRetrieval
+                                ? "Generated asset output fields are not declared, so artifact retrieval defaults to identity-only results."
+                                : "Artifact-backed source browsing defaults to identity-only results so large source fields are not returned."}{" "}
+                            Select fields here to override that projection.
+                          </p>
+                        )}
                         <Input
                           id="fields-input"
                           placeholder="Type field name and press Enter"
@@ -991,19 +1177,44 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       </AccordionContent>
                     </AccordionItem>
 
-                    {/* Semantic Search */}
+                    {/* Search query and optional semantic index */}
                     <AccordionItem value="semantic" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
-                        <span className="font-medium text-sm">Semantic Search</span>
+                        <span className="font-medium text-sm">Search Query</span>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1">
                         <div className="space-y-2.5">
+                          {queryMetadataBlocker && (
+                            <Alert
+                              variant={
+                                indexesMetadataState === "error" || tableMetadataState === "error"
+                                  ? "destructive"
+                                  : "default"
+                              }
+                              className="py-2 px-3"
+                            >
+                              <AlertDescription className="flex items-center justify-between gap-3 text-xs">
+                                <span>{queryMetadataBlocker}</span>
+                                {(indexesMetadataState === "error" ||
+                                  tableMetadataState === "error") && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => void refreshQueryMetadata()}
+                                  >
+                                    Retry
+                                  </Button>
+                                )}
+                              </AlertDescription>
+                            </Alert>
+                          )}
                           <div>
-                            <Label className="text-xs mb-1 block">Vector Index</Label>
+                            <Label className="text-xs mb-1 block">Vector Index (optional)</Label>
                             {indexes.filter((idx) => idx.config.type === "embeddings").length ===
                             0 ? (
                               <p className="text-xs text-muted-foreground">
-                                No vector indexes available. Create one to enable semantic search.
+                                No vector indexes available. Entered text will use full-text search.
                               </p>
                             ) : (
                               <MultiSelect
@@ -1025,6 +1236,12 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                 </MultiSelectContent>
                               </MultiSelect>
                             )}
+                            {indexes.some((idx) => idx.config.type === "embeddings") && (
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                Select a vector index for semantic search, or clear the selection to
+                                use full-text search.
+                              </p>
+                            )}
                           </div>
                           {queryIndexes.length > 1 && (
                             <Alert className="py-1.5 px-3">
@@ -1038,6 +1255,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                 >
                                   Learn more about RRF ranking
                                 </a>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+                          {artifactSelectionError && (
+                            <Alert variant="destructive" className="py-1.5 px-3">
+                              <AlertDescription className="text-xs">
+                                {artifactSelectionError}
                               </AlertDescription>
                             </Alert>
                           )}
@@ -1059,10 +1283,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       </AccordionContent>
                     </AccordionItem>
 
-                    {/* Full-Text Search */}
+                    {/* Structured filters */}
                     <AccordionItem value="filter" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
-                        <span className="font-medium text-sm">Full-Text Search</span>
+                        <span className="font-medium text-sm">Filters</span>
                       </AccordionTrigger>
                       <AccordionContent className="pb-3 pt-1">
                         <QueryBuilder
@@ -1123,30 +1347,35 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </CardContent>
                   </Card>
                 </TabsContent>
-                <TabsContent value="json">
-                  {(() => {
-                    if (!parsedJsonQuery) {
-                      return (
-                        <div className="flex flex-col gap-2">
-                          <Alert variant="destructive">
-                            <AlertDescription>
-                              The current query must be one valid JSON object.
-                            </AlertDescription>
-                          </Alert>
-                          <Textarea
-                            value={queryJsonString}
-                            onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
-                              setQueryJsonString(event.target.value)
-                            }
-                            rows={20}
-                            className="font-mono"
-                          />
-                        </div>
-                      );
+                <TabsContent value="json" className="space-y-2">
+                  {!isJsonQueryValid && (
+                    <Alert variant="destructive">
+                      <AlertDescription>
+                        The current query must be one valid JSON object.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                  {jsonQuerySafetyBlocker && (
+                    <Alert
+                      variant={
+                        indexesMetadataState === "error" || tableMetadataState === "error"
+                          ? "destructive"
+                          : "default"
+                      }
+                    >
+                      <AlertDescription>{jsonQuerySafetyBlocker}</AlertDescription>
+                    </Alert>
+                  )}
+                  <Textarea
+                    aria-invalid={!isJsonQueryValid || Boolean(jsonQuerySafetyBlocker)}
+                    value={queryJsonString}
+                    onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
+                      setQueryJsonString(event.target.value)
                     }
-
-                    return <JsonViewer json={parsedJsonQuery} />;
-                  })()}
+                    rows={20}
+                    className="font-mono"
+                    spellCheck={false}
+                  />
                 </TabsContent>
               </div>
             </Tabs>
@@ -1154,19 +1383,28 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
             <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
               <Button
                 onClick={handleRunQuery}
-                disabled={queryMode === "json" && !isJsonQueryValid}
+                disabled={
+                  (queryMode === "json" &&
+                    (!isJsonQueryValid || Boolean(jsonQuerySafetyBlocker))) ||
+                  (queryMode === "builder" && Boolean(queryMetadataBlocker)) ||
+                  (queryMode === "builder" && Boolean(artifactSelectionError))
+                }
                 size="lg"
               >
                 Run Query
               </Button>
               <span className="text-xs text-muted-foreground">
                 {hasSemanticQuery && hasFilterQuery
-                  ? "Running semantic + full-text search"
+                  ? "Running semantic search with filters"
                   : hasSemanticQuery
                     ? "Running semantic search"
-                    : hasFilterQuery
-                      ? "Running full-text search"
-                      : "Browsing all documents"}
+                    : hasFullTextQuery && hasFilterQuery
+                      ? "Running full-text search with filters"
+                      : hasFullTextQuery
+                        ? "Running full-text search"
+                        : hasFilterQuery
+                          ? "Filtering documents"
+                          : "Browsing all documents"}
               </span>
             </DashboardToolbar>
 

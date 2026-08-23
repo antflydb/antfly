@@ -1449,6 +1449,32 @@ pub fn build(b: *std.Build) void {
     configureOnnxRuntime(b, tests.root_module, enable_onnx, effective_onnx_root);
     tests.root_module.link_libc = link_libc;
 
+    // Keep the standalone server's CLI and configuration parsing covered too.
+    // `src/inference.zig` does not import `src/main.zig`, so tests declared by
+    // the executable root otherwise compile only when invoked manually.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = main_test_filters,
+        .test_runner = runtime_filter_test_runner,
+    });
+    cli_tests.root_module.addImport("inference", runtime_graph.inference_mod);
+    cli_tests.root_module.addImport("build_options", build_options_mod);
+    cli_tests.root_module.addImport("structlog", structlog_mod);
+    cli_tests.root_module.addImport("antfly_platform", platform_mod);
+    cli_tests.root_module.link_libc = link_libc;
+
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    for (selected_test_filters) |filter| {
+        run_cli_tests.addArgs(&.{ "--test-filter", filter });
+    }
+    build_test_filters.addRuntimeControls(run_cli_tests, b.args orelse &.{});
+    const cli_test_step = b.step("test-cli", "Run standalone inference CLI and configuration tests");
+    cli_test_step.dependOn(&run_cli_tests.step);
+
     const finetune_ctx = finetune_common.Context{
         .b = b,
         .target = target,
@@ -1503,6 +1529,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
+    // A focused server/library filter need not match an executable-root test.
+    // The default aggregate still owns the complete CLI suite.
+    if (selected_test_filters.len == 0) {
+        test_step.dependOn(&run_cli_tests.step);
+    }
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
     });

@@ -349,6 +349,23 @@ fn loadNodeReadHandle(
     return .{ .owned = loaded };
 }
 
+fn loadMutationNodeReadHandle(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+) !CachedNodeReadHandle(@TypeOf(self)) {
+    // Mutation routing must see nodes staged by earlier writes in the active
+    // publication session. The search helper intentionally bypasses those
+    // caches while a session is open so public queries remain on committed
+    // state; using it here turns every routed child into an LSM point read.
+    if (try borrowCachedNodeHandle(self, node_id)) |cached| return cached;
+
+    var loaded = try self.loadNodeFromStorage(txn, node_id);
+    errdefer loaded.deinit(self.alloc);
+    try self.cacheNode(&loaded);
+    return .{ .owned = loaded };
+}
+
 fn loadQuantizedReadHandleProfiled(
     self: anytype,
     txn: anytype,
@@ -1361,8 +1378,11 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
         var max_key: ?[]u8 = null;
         errdefer if (max_key) |key| self.alloc.free(key);
 
-        for (node.members) |member_id| {
-            const metadata = (try loadMetadataRaw(self, txn, member_id, is_not_found)) orelse continue;
+        const metadata_values = try self.alloc.alloc(?[]const u8, node.members.len);
+        defer self.alloc.free(metadata_values);
+        try getMetadataManySortedInTxn(self, txn, node.members, metadata_values);
+        for (metadata_values) |maybe_metadata| {
+            const metadata = maybe_metadata orelse continue;
             if (min_key == null) {
                 min_key = try self.alloc.dupe(u8, metadata);
                 max_key = try self.alloc.dupe(u8, metadata);
@@ -1394,10 +1414,45 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
     var max_key: ?[]u8 = null;
     errdefer if (max_key) |key| self.alloc.free(key);
 
-    for (node.children) |child_id| {
+    const RangeLookup = struct {
+        child_id: u64,
+        key: [12]u8,
+        key_len: u8,
+
+        fn lessThan(_: void, a: @This(), b: @This()) bool {
+            return std.mem.order(u8, a.key[0..a.key_len], b.key[0..b.key_len]) == .lt;
+        }
+    };
+    const lookups = try self.alloc.alloc(RangeLookup, node.children.len);
+    defer self.alloc.free(lookups);
+    for (node.children, lookups) |child_id, *lookup| {
+        lookup.child_id = child_id;
+        const key = hbc.encodeNodeKey(&lookup.key, child_id, .range);
+        lookup.key_len = @intCast(key.len);
+    }
+    std.mem.sort(RangeLookup, lookups, {}, RangeLookup.lessThan);
+
+    const keys = try self.alloc.alloc([]const u8, lookups.len);
+    defer self.alloc.free(keys);
+    for (lookups, keys) |*lookup, *key| key.* = lookup.key[0..lookup.key_len];
+    const values = try self.alloc.alloc(?[]const u8, lookups.len);
+    defer self.alloc.free(values);
+    if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
+        try txn.getManySorted(.nodes, keys, values);
+    } else {
+        @memset(values, null);
+        for (keys, values) |key, *value| {
+            value.* = txn.get(.nodes, key) catch |err| {
+                if (is_not_found(err)) continue;
+                return err;
+            };
+        }
+    }
+
+    for (lookups, values) |lookup, maybe_value| {
         const child_range = blk: {
-            if (try loadNodeSplitRange(self, txn, child_id, is_not_found)) |range| break :blk range;
-            var child = try loadNode(self, txn, child_id);
+            if (maybe_value) |value| break :blk try bulk_build.decodeNodeRange(self.alloc, value);
+            var child = try loadNode(self, txn, lookup.child_id);
             defer child.deinit(self.alloc);
             const computed = (try computeNodeSplitRange(self, txn, &child, is_not_found)) orelse continue;
             break :blk computed;
@@ -1406,20 +1461,7 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
             var owned = child_range;
             owned.deinit(self.alloc);
         }
-
-        if (min_key == null) {
-            min_key = try self.alloc.dupe(u8, child_range.min_key);
-            max_key = try self.alloc.dupe(u8, child_range.max_key);
-            continue;
-        }
-        if (std.mem.order(u8, child_range.min_key, min_key.?) == .lt) {
-            self.alloc.free(min_key.?);
-            min_key = try self.alloc.dupe(u8, child_range.min_key);
-        }
-        if (std.mem.order(u8, child_range.max_key, max_key.?) == .gt) {
-            self.alloc.free(max_key.?);
-            max_key = try self.alloc.dupe(u8, child_range.max_key);
-        }
+        try includeSplitRangeBounds(self.alloc, &min_key, &max_key, &child_range);
     }
 
     if (min_key == null or max_key == null) {
@@ -1431,6 +1473,128 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
         .min_key = min_key.?,
         .max_key = max_key.?,
     };
+}
+
+fn includeSplitRangeBounds(
+    alloc: std.mem.Allocator,
+    min_key: *?[]u8,
+    max_key: *?[]u8,
+    range: *const types.NodeSplitRange,
+) !void {
+    if (min_key.* == null) {
+        min_key.* = try alloc.dupe(u8, range.min_key);
+        errdefer {
+            alloc.free(min_key.*.?);
+            min_key.* = null;
+        }
+        max_key.* = try alloc.dupe(u8, range.max_key);
+        return;
+    }
+    if (std.mem.order(u8, range.min_key, min_key.*.?) == .lt) {
+        const replacement = try alloc.dupe(u8, range.min_key);
+        alloc.free(min_key.*.?);
+        min_key.* = replacement;
+    }
+    if (std.mem.order(u8, range.max_key, max_key.*.?) == .gt) {
+        const replacement = try alloc.dupe(u8, range.max_key);
+        alloc.free(max_key.*.?);
+        max_key.* = replacement;
+    }
+}
+
+test "internal node split range loads child ranges in one sorted batch" {
+    const TestIndex = struct {
+        alloc: Allocator,
+    };
+    const TestTxn = struct {
+        first: []const u8,
+        second: []const u8,
+        calls: usize = 0,
+
+        fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
+            try std.testing.expectEqual(.nodes, namespace);
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expect(std.mem.order(u8, keys[0], keys[1]) == .lt);
+            self.calls += 1;
+            values[0] = self.first;
+            values[1] = self.second;
+        }
+    };
+
+    const first = try bulk_build.encodeNodeRange(std.testing.allocator, &.{
+        .min_key = @constCast("a"),
+        .max_key = @constCast("c"),
+    });
+    defer std.testing.allocator.free(first);
+    const second = try bulk_build.encodeNodeRange(std.testing.allocator, &.{
+        .min_key = @constCast("x"),
+        .max_key = @constCast("z"),
+    });
+    defer std.testing.allocator.free(second);
+
+    var children = [_]u64{ 9, 3 };
+    const node = types.Node{
+        .id = 1,
+        .is_leaf = false,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &children,
+        .members = &.{},
+    };
+    const index = TestIndex{ .alloc = std.testing.allocator };
+    var txn = TestTxn{ .first = first, .second = second };
+    var range = (try computeNodeSplitRange(index, &txn, &node, isNotFoundGeneric)).?;
+    defer range.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+    try std.testing.expectEqualStrings("a", range.min_key);
+    try std.testing.expectEqualStrings("z", range.max_key);
+}
+
+test "leaf node split range loads member metadata in one sorted batch" {
+    const TestIndex = struct {
+        alloc: Allocator,
+
+        fn getCachedMetadata(_: @This(), _: u64) ?[]const u8 {
+            return null;
+        }
+
+        fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
+            return metadata;
+        }
+    };
+    const TestTxn = struct {
+        calls: usize = 0,
+
+        fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
+            try std.testing.expectEqual(.vecs, namespace);
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expect(std.mem.order(u8, keys[0], keys[1]) == .lt);
+            self.calls += 1;
+            values[0] = "a";
+            values[1] = "z";
+        }
+    };
+
+    var members = [_]u64{ 9, 3 };
+    const node = types.Node{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &.{},
+        .children = &.{},
+        .members = &members,
+    };
+    const index = TestIndex{ .alloc = std.testing.allocator };
+    var txn = TestTxn{};
+    var range = (try computeNodeSplitRange(index, &txn, &node, isNotFoundGeneric)).?;
+    defer range.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+    try std.testing.expectEqualStrings("a", range.min_key);
+    try std.testing.expectEqualStrings("z", range.max_key);
 }
 
 pub fn saveNodeSplitRange(self: anytype, txn: anytype, node: *const types.Node, is_not_found: fn (anyerror) bool) !void {
@@ -2823,6 +2987,25 @@ fn loadTransformedVectorIdsIntoMatrix(
         const transformed = matrix[missing_positions[i] * dims ..][0..dims];
         _ = self.transformVector(vector, transformed);
     }
+}
+
+pub fn loadPostingVectorsTransformed(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    matrix: []f32,
+) !void {
+    try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids, matrix, .{});
+}
+
+pub fn loadPostingVectorsTransformedWithOptions(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    matrix: []f32,
+    options: anytype,
+) !void {
+    try loadTransformedVectorIdsIntoMatrix(self, txn, vector_ids, matrix, options);
 }
 
 fn recomputeAncestorCentroidsWithOptions(
@@ -5754,7 +5937,7 @@ fn routeBatchNodeToLeaves(
     const child_nodes = try self.alloc.alloc(*const types.Node, child_ids.len);
     defer self.alloc.free(child_nodes);
     for (child_ids, 0..) |child_id, child_index| {
-        child_handles[child_index] = try loadNodeReadHandle(self, txn, child_id);
+        child_handles[child_index] = try loadMutationNodeReadHandle(self, txn, child_id);
         child_handle_count += 1;
         child_nodes[child_index] = child_handles[child_index].ptr();
     }

@@ -27,6 +27,7 @@ const dense_replay_window_shrink_denominator: u64 = 4;
 const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
+const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -154,6 +155,44 @@ pub const SliceAmount = struct {
     bytes: u64,
 };
 
+/// An exactly-once batch ownership token. Callers retain this value for the
+/// lifetime of the admitted memory instead of reconstructing release amounts.
+/// This prevents a duplicate teardown from consuming an equivalent reservation
+/// owned by unrelated work in the same logical slices.
+pub const BatchReservation = struct {
+    manager: *ResourceManager,
+    identity: u64,
+    amounts: [slice_count]u64,
+    host_charge_bytes: u64,
+    released: bool = false,
+
+    pub fn retain(
+        self: *BatchReservation,
+        retained: []const SliceAmount,
+        retained_host_charge_bytes: u64,
+    ) !void {
+        if (self.released) return error.ReservationReleased;
+        const normalized = ResourceManager.normalizeSliceAmounts(retained) catch |err| {
+            self.manager.recordAccountingError();
+            return err;
+        };
+        try self.manager.retainBatchReservation(
+            self,
+            normalized,
+            retained_host_charge_bytes,
+        );
+    }
+
+    pub fn release(self: *BatchReservation) void {
+        if (self.released) return;
+        _ = self.manager.releaseBatchReservation(self);
+        // A failed accounting validation intentionally retains capacity, but
+        // the ownership token is still consumed so retries cannot repeatedly
+        // mutate or inflate the error counter.
+        self.released = true;
+    }
+};
+
 /// Internal HBC cache safety ceilings. These are not index configuration:
 /// byte admission remains authoritative and shared across every index using
 /// this manager. The ceilings only bound the local CLOCK bookkeeping arrays.
@@ -207,12 +246,21 @@ pub const Policy = struct {
 };
 
 pub const Options = struct {
+    /// Aggregate host-memory budget for every memory slice owned by this
+    /// manager. A zero limit preserves the legacy unlimited behavior for
+    /// tests and callers that do not own a process envelope.
+    memory_budget: Budget = .{},
     budgets: [slice_count]Budget = defaultBudgets(),
     policies: [slice_count]Policy = defaultPolicies(),
     /// Bound durable replay debt by record count as well as encoded bytes.
     /// These are runtime policy values, not index or API configuration.
     derived_backlog_high_sequences: usize = 200,
     derived_backlog_resume_sequences: usize = 100,
+    /// Bound how much sequence-only replay debt one foreground admission must
+    /// inherit. Byte and aggregate LSM pressure can still request a larger
+    /// drain; this window only prevents a healthy async index backlog from
+    /// concentrating minutes of work into one public write acknowledgement.
+    derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
     /// index configuration. The larger of the fixed floor and this fraction
     /// of observed capacity is kept available for WAL, checkpoints, and
@@ -224,6 +272,11 @@ pub const Options = struct {
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
     query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
     query_embedding_max_inflight: usize = 16,
+    /// Allocates identity tables only as concurrent reservations/observers
+    /// exceed their previous high-water mark. Production owners should pass
+    /// their lifetime allocator; the page allocator keeps lightweight tests
+    /// source-compatible.
+    identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
         return .{
@@ -314,7 +367,19 @@ pub const SliceStats = struct {
 };
 
 pub const Stats = struct {
+    memory: MemoryStats,
     slices: [slice_count]SliceStats,
+};
+
+pub const MemoryStats = struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+    accounting_errors: u64 = 0,
+    pressure: Pressure = .normal,
 };
 
 /// Stable identity for one independently exhausted storage capacity domain.
@@ -404,6 +469,7 @@ pub const DenseReplayWindowResult = struct {
 pub const DerivedBacklogLimits = struct {
     high_sequences: usize,
     resume_sequences: usize,
+    throttle_window_sequences: usize,
 };
 
 pub const QueryEmbeddingPolicy = struct {
@@ -476,9 +542,40 @@ const MutableSlice = struct {
     oversized_single_grants: u64 = 0,
 };
 
+const MutableMemory = struct {
+    budget: Budget = .{},
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+    accounting_errors: u64 = 0,
+};
+
+const ReservationIdentity = struct {
+    slice: Slice,
+    bytes: u64,
+};
+
+const BatchReservationIdentity = struct {
+    amounts: [slice_count]u64,
+    host_charge_bytes: u64,
+};
+
+const ObserverIdentity = struct {
+    current: u64,
+};
+
+const ObserverKey = struct {
+    slice: Slice,
+    identity: usize,
+};
+
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     pressure_change: PressureChange = .{},
+    memory: MutableMemory,
+    latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -486,6 +583,7 @@ pub const ResourceManager = struct {
     dense_replay_last_write_pressure_compactions: u64 = 0,
     derived_backlog_high_sequences: usize,
     derived_backlog_resume_sequences: usize,
+    derived_backlog_throttle_window_sequences: usize,
     disk_safety_floor_bytes: u64,
     disk_safety_floor_divisor: u64,
     capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
@@ -495,6 +593,11 @@ pub const ResourceManager = struct {
     index_repair_activation: IndexRepairActivationStats = .{},
     derived_recoverable_retry_counters: DerivedRecoverableRetryCounters = .{},
     capacity_source: ?CapacitySource = null,
+    identity_allocator: std.mem.Allocator,
+    next_identity: u64 = 1,
+    reservation_identities: std.AutoHashMapUnmanaged(u64, ReservationIdentity) = .empty,
+    batch_reservation_identities: std.AutoHashMapUnmanaged(u64, BatchReservationIdentity) = .empty,
+    observer_identities: std.AutoHashMapUnmanaged(ObserverKey, ObserverIdentity) = .empty,
 
     pub fn init(options: Options) ResourceManager {
         var slices: [slice_count]MutableSlice = undefined;
@@ -506,22 +609,51 @@ pub const ResourceManager = struct {
         }
         const high_sequences = options.derived_backlog_high_sequences;
         return .{
+            .memory = .{ .budget = options.memory_budget },
             .slices = slices,
             .derived_backlog_high_sequences = high_sequences,
             .derived_backlog_resume_sequences = if (high_sequences == 0)
                 0
             else
                 @min(options.derived_backlog_resume_sequences, high_sequences - 1),
+            .derived_backlog_throttle_window_sequences = options.derived_backlog_throttle_window_sequences,
             .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
             .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
             .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
+            .identity_allocator = options.identity_allocator,
         };
     }
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    /// Marks a replay session whose query-visible projection work should take
+    /// precedence over optional background compaction. This does not relax LSM
+    /// durability or hard write-pressure limits; it only lets backends defer
+    /// their soft compaction lane while replay is actively consuming the same
+    /// CPU and storage bandwidth.
+    pub fn beginLatencySensitiveDerivedReplay(self: *ResourceManager) void {
+        _ = self.latency_sensitive_derived_replay_sessions.fetchAdd(1, .release);
+    }
+
+    pub fn finishLatencySensitiveDerivedReplay(self: *ResourceManager) void {
+        const previous = self.latency_sensitive_derived_replay_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            const now_ns = platform_time.monotonicNs();
+            self.latency_sensitive_derived_replay_quiet_until_ns.store(
+                now_ns +| dense_replay_soft_compaction_quiet_ns,
+                .release,
+            );
+        }
+    }
+
+    pub fn shouldDeferSoftCompactionForDerivedReplay(self: *const ResourceManager) bool {
+        if (self.latency_sensitive_derived_replay_sessions.load(.acquire) != 0) return true;
+        return platform_time.monotonicNs() < self.latency_sensitive_derived_replay_quiet_until_ns.load(.acquire);
     }
 
     pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
@@ -591,13 +723,34 @@ pub const ResourceManager = struct {
 
     /// Required only for managers that have admitted capacity reservations.
     /// Owners must call this after all reservations have been released.
+    ///
+    /// Observations are manager-owned accounting snapshots rather than leases:
+    /// destroying the manager is the terminal cancellation boundary for any
+    /// observer that was not explicitly reconciled to zero. This matters for
+    /// shutdown and failed-open paths, where the observed allocation and its
+    /// manager are torn down together and there is no later consumer of the
+    /// ledger. Reservation handles remain strict because they can outlive the
+    /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var it = self.capacity_domains.valueIterator();
-        while (it.next()) |domain| std.debug.assert(domain.reserved_bytes == 0);
+        while (it.next()) |domain| {
+            if (domain.reserved_bytes != 0)
+                @panic("resource manager deinitialized with live capacity reservations");
+        }
+        if (self.reservation_identities.count() != 0)
+            @panic("resource manager deinitialized with live reservations");
+        if (self.batch_reservation_identities.count() != 0)
+            @panic("resource manager deinitialized with live batch reservations");
         self.capacity_domains.deinit(alloc);
         self.capacity_domains = .empty;
+        self.reservation_identities.deinit(self.identity_allocator);
+        self.reservation_identities = .empty;
+        self.batch_reservation_identities.deinit(self.identity_allocator);
+        self.batch_reservation_identities = .empty;
+        self.observer_identities.deinit(self.identity_allocator);
+        self.observer_identities = .empty;
     }
 
     pub fn reserveCapacity(
@@ -789,6 +942,7 @@ pub const ResourceManager = struct {
         return .{
             .high_sequences = self.derived_backlog_high_sequences,
             .resume_sequences = self.derived_backlog_resume_sequences,
+            .throttle_window_sequences = self.derived_backlog_throttle_window_sequences,
         };
     }
 
@@ -797,6 +951,99 @@ pub const ResourceManager = struct {
         ResourceRequestTooLarge,
         ResourceTemporarilyUnavailable,
     };
+
+    fn normalizeSliceAmounts(
+        amounts: []const SliceAmount,
+    ) error{DuplicateResourceSlice}![slice_count]u64 {
+        var normalized = [_]u64{0} ** slice_count;
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const index = sliceIndex(amount.slice);
+            if (normalized[index] != 0) return error.DuplicateResourceSlice;
+            normalized[index] = amount.bytes;
+        }
+        return normalized;
+    }
+
+    fn hostChargeForAmounts(amounts: []const SliceAmount) ClassifiedBatchReserveError!u64 {
+        var total: u64 = 0;
+        for (amounts) |amount| {
+            total = std.math.add(u64, total, amount.bytes) catch
+                return error.ResourceRequestTooLarge;
+        }
+        return total;
+    }
+
+    fn commitMemoryLocked(self: *ResourceManager, next: u64) void {
+        self.memory.used_bytes = next;
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, next);
+        if (self.memory.budget.soft_limit_bytes > 0 and next > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+    }
+
+    fn checkMemoryLocked(self: *ResourceManager, additional_bytes: u64) !u64 {
+        const next = std.math.add(u64, self.memory.used_bytes, additional_bytes) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        if (self.memory.budget.hard_limit_bytes > 0 and next > self.memory.budget.hard_limit_bytes) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        }
+        return next;
+    }
+
+    fn issueIdentityLocked(self: *ResourceManager) u64 {
+        var identity = self.next_identity;
+        while (identity == 0 or
+            self.reservation_identities.contains(identity) or
+            self.batch_reservation_identities.contains(identity))
+        {
+            identity +%= 1;
+        }
+        self.next_identity = identity +% 1;
+        if (self.next_identity == 0) self.next_identity = 1;
+        return identity;
+    }
+
+    fn registerReservationIdentityLocked(
+        self: *ResourceManager,
+        slice: Slice,
+        bytes: u64,
+    ) !u64 {
+        const identity = self.issueIdentityLocked();
+        try self.reservation_identities.put(
+            self.identity_allocator,
+            identity,
+            .{ .slice = slice, .bytes = bytes },
+        );
+        return identity;
+    }
+
+    fn reservationIdentityLocked(
+        self: *ResourceManager,
+        reservation: *Reservation,
+    ) !*ReservationIdentity {
+        if (reservation.identity == 0) {
+            if (reservation.bytes != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            reservation.identity = try self.registerReservationIdentityLocked(
+                reservation.slice,
+                0,
+            );
+        }
+        const owned = self.reservation_identities.getPtr(reservation.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        return owned;
+    }
 
     /// Atomically reserve several independent slices while distinguishing a
     /// request that can never fit from temporary contention with reservations
@@ -808,17 +1055,30 @@ pub const ResourceManager = struct {
     pub fn reserveBatchClassified(
         self: *ResourceManager,
         amounts: []const SliceAmount,
-    ) ClassifiedBatchReserveError!void {
-        for (amounts, 0..) |amount, index| {
-            if (amount.bytes == 0) continue;
-            for (amounts[0..index]) |previous| {
-                if (previous.bytes > 0 and previous.slice == amount.slice)
-                    return error.DuplicateResourceSlice;
-            }
-        }
+    ) ClassifiedBatchReserveError!BatchReservation {
+        const host_charge_bytes = try hostChargeForAmounts(amounts);
+        return self.reserveBatchClassifiedWithHostCharge(amounts, host_charge_bytes);
+    }
+
+    /// Reserve logical slices while charging only their physical host-memory
+    /// component to the process aggregate. This is used by bridges whose
+    /// logical metrics include accelerator bytes; ordinary callers should use
+    /// `reserveBatchClassified`, which charges the full batch.
+    pub fn reserveBatchClassifiedWithHostCharge(
+        self: *ResourceManager,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
+    ) ClassifiedBatchReserveError!BatchReservation {
+        const normalized = try normalizeSliceAmounts(amounts);
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+
+        const memory_hard_limit = self.memory.budget.hard_limit_bytes;
+        if (memory_hard_limit > 0 and host_charge_bytes > memory_hard_limit) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceRequestTooLarge;
+        }
 
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
@@ -828,6 +1088,15 @@ pub const ResourceManager = struct {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceRequestTooLarge;
             }
+        }
+
+        const next_memory = std.math.add(u64, self.memory.used_bytes, host_charge_bytes) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceTemporarilyUnavailable;
+        };
+        if (memory_hard_limit > 0 and next_memory > memory_hard_limit) {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceTemporarilyUnavailable;
         }
 
         for (amounts) |amount| {
@@ -843,6 +1112,19 @@ pub const ResourceManager = struct {
             }
         }
 
+        const identity = self.issueIdentityLocked();
+        self.batch_reservation_identities.put(
+            self.identity_allocator,
+            identity,
+            .{
+                .amounts = normalized,
+                .host_charge_bytes = host_charge_bytes,
+            },
+        ) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceTemporarilyUnavailable;
+        };
+
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const state = &self.slices[sliceIndex(amount.slice)];
@@ -851,12 +1133,19 @@ pub const ResourceManager = struct {
             if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
                 state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
+        return .{
+            .manager = self,
+            .identity = identity,
+            .amounts = normalized,
+            .host_charge_bytes = host_charge_bytes,
+        };
     }
 
     /// Compatibility wrapper for callers that do not need denial
     /// classification.
-    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !void {
+    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !BatchReservation {
         return self.reserveBatchClassified(amounts) catch |err| switch (err) {
             error.DuplicateResourceSlice => error.DuplicateResourceSlice,
             error.ResourceRequestTooLarge,
@@ -865,19 +1154,104 @@ pub const ResourceManager = struct {
         };
     }
 
-    pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
+    fn retainBatchReservation(
+        self: *ResourceManager,
+        reservation: *BatchReservation,
+        retained: [slice_count]u64,
+        retained_host_charge_bytes: u64,
+    ) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        for (amounts) |amount| {
-            if (amount.bytes == 0) continue;
-            const state = &self.slices[sliceIndex(amount.slice)];
-            state.used_bytes -|= amount.bytes;
+
+        const owned = self.batch_reservation_identities.getPtr(reservation.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        if (!std.meta.eql(owned.amounts, reservation.amounts) or
+            owned.host_charge_bytes != reservation.host_charge_bytes)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
         }
+
+        if (retained_host_charge_bytes > reservation.host_charge_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.InvalidReservationReduction;
+        }
+        inline for (0..slice_count) |index| {
+            if (retained[index] > reservation.amounts[index]) {
+                self.memory.accounting_errors +|= 1;
+                return error.InvalidReservationReduction;
+            }
+        }
+
+        const released_host = reservation.host_charge_bytes - retained_host_charge_bytes;
+        if (released_host > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        inline for (0..slice_count) |index| {
+            const released = reservation.amounts[index] - retained[index];
+            if (released > self.slices[index].used_bytes) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+        }
+        inline for (0..slice_count) |index| {
+            self.slices[index].used_bytes -= reservation.amounts[index] - retained[index];
+        }
+        self.memory.used_bytes -= released_host;
+        reservation.amounts = retained;
+        reservation.host_charge_bytes = retained_host_charge_bytes;
+        owned.amounts = retained;
+        owned.host_charge_bytes = retained_host_charge_bytes;
         self.pressure_change.advance();
     }
 
+    pub fn recordAccountingError(self: *ResourceManager) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.memory.accounting_errors +|= 1;
+    }
+
+    fn releaseBatchReservation(
+        self: *ResourceManager,
+        reservation: *const BatchReservation,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const owned = self.batch_reservation_identities.get(reservation.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        };
+        if (!std.meta.eql(owned.amounts, reservation.amounts) or
+            owned.host_charge_bytes != reservation.host_charge_bytes)
+        {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+
+        if (reservation.host_charge_bytes > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        inline for (0..slice_count) |index| {
+            if (reservation.amounts[index] > self.slices[index].used_bytes) {
+                self.memory.accounting_errors +|= 1;
+                return false;
+            }
+        }
+        inline for (0..slice_count) |index|
+            self.slices[index].used_bytes -= reservation.amounts[index];
+        self.memory.used_bytes -= reservation.host_charge_bytes;
+        _ = self.batch_reservation_identities.remove(reservation.identity);
+        self.pressure_change.advance();
+        return true;
+    }
+
     pub fn reserve(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
-        if (bytes == 0) return .{ .manager = self, .slice = slice, .bytes = 0 };
+        if (bytes == 0) return .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 };
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -892,13 +1266,16 @@ pub const ResourceManager = struct {
             state.hard_limit_rejections += 1;
             return error.ResourceBudgetExceeded;
         }
+        const next_memory = try self.checkMemoryLocked(bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes);
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events += 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
-        return .{ .manager = self, .slice = slice, .bytes = bytes };
+        return .{ .manager = self, .identity = identity, .slice = slice, .bytes = bytes };
     }
 
     /// Admits one bounded minimum-progress operation even when its working set
@@ -912,7 +1289,7 @@ pub const ResourceManager = struct {
         bytes: u64,
         max_hard_limit_multiple: u64,
     ) !Reservation {
-        if (bytes == 0) return .{ .manager = self, .slice = slice, .bytes = 0 };
+        if (bytes == 0) return .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 };
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -923,21 +1300,28 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         };
         const hard_limit = state.budget.hard_limit_bytes;
+        var oversized_grant = false;
         if (hard_limit > 0 and next > hard_limit) {
             const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
             if (max_hard_limit_multiple <= 1 or state.used_bytes != 0 or bytes > bounded_limit) {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceBudgetExceeded;
             }
-            state.oversized_single_grants +|= 1;
+            oversized_grant = true;
         }
+        // Minimum-progress exceptions are local slice policy; they may never
+        // bypass the process-wide physical-memory envelope.
+        const next_memory = try self.checkMemoryLocked(bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes);
+        if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
-        return .{ .manager = self, .slice = slice, .bytes = bytes };
+        return .{ .manager = self, .identity = identity, .slice = slice, .bytes = bytes };
     }
 
     fn growReservationBoundedOversized(
@@ -950,6 +1334,7 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        const owned = try self.reservationIdentityLocked(reservation);
         const state = &self.slices[sliceIndex(reservation.slice)];
         const next = std.math.add(u64, state.used_bytes, additional_bytes) catch {
             state.hard_limit_rejections +|= 1;
@@ -960,6 +1345,7 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         };
         const hard_limit = state.budget.hard_limit_bytes;
+        var oversized_grant = false;
         if (hard_limit > 0 and next > hard_limit) {
             const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
             const reservation_is_sole_user = state.used_bytes == reservation.bytes;
@@ -967,14 +1353,18 @@ pub const ResourceManager = struct {
                 state.hard_limit_rejections +|= 1;
                 return error.ResourceBudgetExceeded;
             }
-            if (reservation.bytes <= hard_limit) state.oversized_single_grants +|= 1;
+            oversized_grant = reservation.bytes <= hard_limit;
         }
+        const next_memory = try self.checkMemoryLocked(additional_bytes);
+        if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         reservation.bytes = next_reservation;
+        owned.bytes = next_reservation;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events +|= 1;
         }
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
     }
 
@@ -989,6 +1379,7 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        const owned = try self.reservationIdentityLocked(reservation);
         const state = &self.slices[sliceIndex(reservation.slice)];
         const hard_limit = state.budget.hard_limit_bytes;
         const bounded_limit = if (hard_limit == 0)
@@ -1040,59 +1431,235 @@ pub const ResourceManager = struct {
             }
         }
 
+        const MemoryCandidate = struct {
+            fn allowed(current: u64, additional: u64, hard: u64) bool {
+                const next = std.math.add(u64, current, additional) catch return false;
+                return hard == 0 or next <= hard;
+            }
+        };
+        if (!MemoryCandidate.allowed(self.memory.used_bytes, granted, self.memory.budget.hard_limit_bytes)) {
+            granted = minimum_bytes;
+            if (!Candidate.allowed(
+                state.used_bytes,
+                reservation.bytes,
+                granted,
+                hard_limit,
+                bounded_limit,
+                reservation_is_sole_user,
+                max_hard_limit_multiple,
+            ) or !MemoryCandidate.allowed(
+                self.memory.used_bytes,
+                granted,
+                self.memory.budget.hard_limit_bytes,
+            )) {
+                self.memory.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
         const previous_reservation = reservation.bytes;
+        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch unreachable;
         state.used_bytes += granted;
         reservation.bytes += granted;
+        owned.bytes = reservation.bytes;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
         if (hard_limit > 0 and state.used_bytes > hard_limit and previous_reservation <= hard_limit)
             state.oversized_single_grants +|= 1;
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
             state.soft_limit_events +|= 1;
+        self.commitMemoryLocked(next_memory);
         self.pressure_change.advance();
         return granted;
     }
 
-    pub fn releaseBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
-        if (bytes == 0) return;
+    fn releaseReservation(self: *ResourceManager, reservation: *const Reservation) bool {
+        if (reservation.identity == 0 and reservation.bytes == 0) return true;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        const owned = self.reservation_identities.get(reservation.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        };
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        const state = &self.slices[sliceIndex(owned.slice)];
+        if (owned.bytes > state.used_bytes or owned.bytes > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        state.used_bytes -= owned.bytes;
+        self.memory.used_bytes -= owned.bytes;
+        _ = self.reservation_identities.remove(reservation.identity);
+        self.pressure_change.advance();
+        return true;
+    }
+
+    fn shrinkReservation(self: *ResourceManager, reservation: *Reservation, bytes: u64) bool {
+        if (bytes == 0 or reservation.bytes == 0) return true;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const owned = self.reservation_identities.getPtr(reservation.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        };
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        const released = @min(bytes, owned.bytes);
+        const state = &self.slices[sliceIndex(owned.slice)];
+        if (released > state.used_bytes or released > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return false;
+        }
+        state.used_bytes -= released;
+        self.memory.used_bytes -= released;
+        owned.bytes -= released;
+        reservation.bytes -= released;
+        self.pressure_change.advance();
+        return true;
+    }
+
+    fn reconcileUsageLocked(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+        enforce_limits: bool,
+    ) !void {
+        const key = ObserverKey{ .slice = slice, .identity = observer_id };
+        var inserted = false;
+        const owned = self.observer_identities.getPtr(key) orelse blk: {
+            if (previous != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            if (next == 0) return;
+            const entry = try self.observer_identities.getOrPut(
+                self.identity_allocator,
+                key,
+            );
+            entry.value_ptr.* = .{ .current = 0 };
+            inserted = true;
+            break :blk entry.value_ptr;
+        };
+        errdefer {
+            if (inserted) _ = self.observer_identities.remove(key);
+        }
+        if (owned.current != previous) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+
         const state = &self.slices[sliceIndex(slice)];
-        state.used_bytes -|= bytes;
+        if (previous > state.used_bytes or previous > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const slice_next = std.math.add(u64, state.used_bytes - previous, next) catch
+            return error.ResourceBudgetExceeded;
+        const memory_next = std.math.add(u64, self.memory.used_bytes - previous, next) catch
+            return error.ResourceBudgetExceeded;
+        // Observation-only callers may report allocations that already exist,
+        // but admission callers must reject growth before allocation. A
+        // validated decrease is always accepted, even while the aggregate is
+        // still above a hard limit, so owners can converge out of pressure.
+        if (enforce_limits and next > previous) {
+            if ((state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes) or
+                (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes))
+            {
+                state.hard_limit_rejections +|= 1;
+                if (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
+                    self.memory.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
+        state.used_bytes = slice_next;
+        self.memory.used_bytes = memory_next;
+        owned.current = next;
+        state.peak_bytes = @max(state.peak_bytes, slice_next);
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, memory_next);
+        if (state.budget.soft_limit_bytes > 0 and slice_next > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        if (!enforce_limits and state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes)
+            state.hard_limit_rejections +|= 1;
+        if (self.memory.budget.soft_limit_bytes > 0 and memory_next > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
+            self.memory.hard_limit_rejections +|= 1;
+        if (next == 0) _ = self.observer_identities.remove(key);
         self.pressure_change.advance();
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
-        if (next == current.*) return;
-        if (next < current.*) {
-            self.releaseBytes(slice, current.* - next);
-            current.* = next;
-            return;
-        }
-
-        const delta = next - current.*;
-        var reservation = try self.reserve(slice, delta);
-        reservation.released = true;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
         current.* = next;
     }
 
     pub fn observeUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) void {
-        if (next == current.*) return;
+        _ = self.tryObserveUsage(slice, current, next);
+    }
+
+    /// Reconcile one observer-owned contribution without allowing stale input
+    /// to debit bytes belonging to another observer or slice. On failure both
+    /// ledgers and the caller's current value remain unchanged.
+    pub fn tryObserveUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) bool {
+        if (!self.tryObserveUsageIdentity(slice, @intFromPtr(current), current.*, next))
+            return false;
+        current.* = next;
+        return true;
+    }
+
+    /// Reconcile an owner-issued stable observer identity. ABI adapters use
+    /// this form because their local hash-map values may move during growth;
+    /// identity remains stable and stale previous totals still fail closed.
+    pub fn tryObserveUsageIdentity(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        if (observer_id == 0) {
+            self.recordAccountingError();
+            return false;
+        }
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        self.reconcileUsageLocked(slice, observer_id, previous, next, false) catch {
+            return false;
+        };
+        return true;
+    }
 
-        const state = &self.slices[sliceIndex(slice)];
-        state.used_bytes = state.used_bytes -| current.*;
-        state.used_bytes = state.used_bytes +| next;
-        current.* = next;
-        state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
-        if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes) {
-            state.soft_limit_events += 1;
+    /// Reconcile an owner-issued stable identity as an admission operation.
+    /// Growth is rejected before it crosses either the slice or aggregate hard
+    /// limit. Validated shrink and teardown always remain possible so pressure
+    /// cannot strand cache memory above a newly tightened limit.
+    pub fn tryAdjustUsageIdentity(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        if (observer_id == 0) {
+            self.recordAccountingError();
+            return false;
         }
-        if (state.budget.hard_limit_bytes > 0 and state.used_bytes > state.budget.hard_limit_bytes) {
-            state.hard_limit_rejections += 1;
-        }
-        self.pressure_change.advance();
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.reconcileUsageLocked(slice, observer_id, previous, next, true) catch {
+            return false;
+        };
+        return true;
     }
 
     pub fn snapshot(self: *ResourceManager) Stats {
@@ -1116,7 +1683,19 @@ pub const ResourceManager = struct {
                 .hard_action = state.policy.hard_action,
             };
         }
-        return .{ .slices = stats };
+        return .{
+            .memory = .{
+                .used_bytes = self.memory.used_bytes,
+                .peak_bytes = self.memory.peak_bytes,
+                .soft_limit_bytes = self.memory.budget.soft_limit_bytes,
+                .hard_limit_bytes = self.memory.budget.hard_limit_bytes,
+                .soft_limit_events = self.memory.soft_limit_events,
+                .hard_limit_rejections = self.memory.hard_limit_rejections,
+                .accounting_errors = self.memory.accounting_errors,
+                .pressure = pressureFor(self.memory.budget, self.memory.used_bytes),
+            },
+            .slices = stats,
+        };
     }
 
     pub fn sliceStats(self: *ResourceManager, slice: Slice) SliceStats {
@@ -1153,17 +1732,24 @@ pub const ResourceManager = struct {
 
         const state = self.slices[sliceIndex(slice)];
         const projected_bytes = state.used_bytes +| additional_bytes;
-        const pressure = pressureFor(state.budget, projected_bytes);
+        const slice_pressure = pressureFor(state.budget, projected_bytes);
+        const projected_memory = self.memory.used_bytes +| additional_bytes;
+        const memory_pressure = pressureFor(self.memory.budget, projected_memory);
+        const aggregate_dominates = memory_pressure != .normal and
+            @intFromEnum(memory_pressure) >= @intFromEnum(slice_pressure);
+        const pressure = if (aggregate_dominates) memory_pressure else slice_pressure;
         return .{
             .pressure = pressure,
-            .action = switch (pressure) {
+            .action = if (aggregate_dominates and pressure == .hard)
+                .reject_work
+            else switch (pressure) {
                 .normal => .report,
                 .soft => state.policy.soft_action,
                 .hard => state.policy.hard_action,
             },
-            .used_bytes = projected_bytes,
-            .soft_limit_bytes = state.budget.soft_limit_bytes,
-            .hard_limit_bytes = state.budget.hard_limit_bytes,
+            .used_bytes = if (aggregate_dominates) projected_memory else projected_bytes,
+            .soft_limit_bytes = if (aggregate_dominates) self.memory.budget.soft_limit_bytes else state.budget.soft_limit_bytes,
+            .hard_limit_bytes = if (aggregate_dominates) self.memory.budget.hard_limit_bytes else state.budget.hard_limit_bytes,
             .change_epoch = self.pressure_change.snapshot(),
         };
     }
@@ -1369,13 +1955,14 @@ fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
 
 pub const Reservation = struct {
     manager: *ResourceManager,
+    identity: u64,
     slice: Slice,
     bytes: u64,
     released: bool = false,
 
     pub fn release(self: *Reservation) void {
         if (self.released) return;
-        self.manager.releaseBytes(self.slice, self.bytes);
+        _ = self.manager.releaseReservation(self);
         self.released = true;
     }
 
@@ -1394,9 +1981,7 @@ pub const Reservation = struct {
 
     pub fn shrink(self: *Reservation, bytes: u64) void {
         if (self.released or bytes == 0) return;
-        const released_bytes = @min(bytes, self.bytes);
-        self.manager.releaseBytes(self.slice, released_bytes);
-        self.bytes -= released_bytes;
+        _ = self.manager.shrinkReservation(self, bytes);
     }
 };
 
@@ -1426,6 +2011,7 @@ pub const BudgetedAllocator = struct {
             .backing = backing,
             .reservation = .{
                 .manager = manager,
+                .identity = 0,
                 .slice = slice,
                 .bytes = 0,
             },
@@ -1574,6 +2160,55 @@ test "default tokenizer cache budget is aligned with its resource slice" {
     );
 }
 
+test "identity allocation failure rolls back every memory ledger" {
+    var identity_storage: [1]u8 = undefined;
+    var identity_fba = std.heap.FixedBufferAllocator.init(&identity_storage);
+    var manager = ResourceManager.init(.{
+        .identity_allocator = identity_fba.allocator(),
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        manager.reserve(.inference_tokenizer_cache, 10),
+    );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        manager.reserveBatchClassified(&.{.{
+            .slice = .inference_model_residency,
+            .bytes = 10,
+        }}),
+    );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    var observed: u64 = 0;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        manager.adjustUsage(.inference_prompt_cache, &observed, 10),
+    );
+    try std.testing.expectEqual(@as(u64, 0), observed);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "manager teardown retires live observer snapshots" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+    });
+    var observed: u64 = 0;
+    try std.testing.expect(manager.tryObserveUsage(
+        .inference_prompt_cache,
+        &observed,
+        4096,
+    ));
+    try std.testing.expectEqual(@as(u64, 4096), manager.snapshot().memory.used_bytes);
+
+    // The observed allocation and manager share this shutdown boundary. The
+    // manager owns and frees the identity registry even when no final zero
+    // observation is useful to a caller.
+    manager.deinit(std.testing.allocator);
+}
+
 fn sliceIndex(slice: Slice) usize {
     return @intFromEnum(slice);
 }
@@ -1650,12 +2285,12 @@ test "batch reservation is atomic across inference resource slices" {
         .{ .slice = .inference_model_residency, .bytes = 80 },
         .{ .slice = .inference_kv_working_set, .bytes = 20 },
     };
-    try manager.reserveBatch(&admitted);
+    var reservation = try manager.reserveBatch(&admitted);
     try std.testing.expectEqual(
         @as(u64, 80),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
-    manager.releaseBatch(&admitted);
+    reservation.release();
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
@@ -1677,7 +2312,7 @@ test "classified batch reservation distinguishes size from contention" {
     const admitted = [_]SliceAmount{
         .{ .slice = .inference_model_residency, .bytes = 80 },
     };
-    try manager.reserveBatchClassified(&admitted);
+    var reservation = try manager.reserveBatchClassified(&admitted);
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
         manager.reserveBatchClassified(&.{
@@ -1689,12 +2324,157 @@ test "classified batch reservation distinguishes size from contention" {
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
 
-    manager.releaseBatch(&admitted);
+    reservation.release();
     const after_release = [_]SliceAmount{
         .{ .slice = .inference_model_residency, .bytes = 21 },
     };
-    try manager.reserveBatchClassified(&after_release);
-    manager.releaseBatch(&after_release);
+    var after_release_reservation = try manager.reserveBatchClassified(&after_release);
+    after_release_reservation.release();
+}
+
+test "aggregate host memory admission is atomic across slices" {
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 75, .hard_limit_bytes = 100 },
+    });
+
+    var first = try manager.reserve(.full_text_build_working_set, 70);
+    defer first.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        manager.reserveBatchClassified(&.{
+            .{ .slice = .lsm_compaction_work, .bytes = 20 },
+            .{ .slice = .dense_apply_working_set, .bytes = 11 },
+        }),
+    );
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 70), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.memory.hard_limit_rejections);
+}
+
+test "logical inference slices can charge only physical host memory" {
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+    });
+    const logical = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 240 },
+        .{ .slice = .inference_kv_working_set, .bytes = 60 },
+    };
+    var reservation = try manager.reserveBatchClassifiedWithHostCharge(&logical, 80);
+    try std.testing.expectEqual(@as(u64, 300), manager.sliceStats(.inference_model_residency).used_bytes +
+        manager.sliceStats(.inference_kv_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+    reservation.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "batch release accounting errors fail closed" {
+    var manager = ResourceManager.init(.{});
+    const admitted = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 20 },
+        .{ .slice = .inference_kv_working_set, .bytes = 10 },
+    };
+    var first = try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
+    var second = try manager.reserveBatchClassifiedWithHostCharge(&admitted, 15);
+    var first_copy = first;
+
+    first.release();
+    first.release();
+    first_copy.release();
+    var stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.memory.accounting_errors);
+
+    try std.testing.expectError(
+        error.InvalidReservationReduction,
+        second.retain(&.{.{ .slice = .inference_model_residency, .bytes = 21 }}, 15),
+    );
+    try std.testing.expectError(
+        error.DuplicateResourceSlice,
+        second.retain(&.{
+            .{ .slice = .inference_model_residency, .bytes = 10 },
+            .{ .slice = .inference_model_residency, .bytes = 10 },
+        }, 15),
+    );
+    try std.testing.expectEqual(@as(u64, 15), manager.snapshot().memory.used_bytes);
+
+    // Simulate a damaged aggregate ledger. Release must retain every slice
+    // reservation and make the mismatch observable rather than saturating.
+    manager.memory.used_bytes = 14;
+    second.release();
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 14), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 4), stats.memory.accounting_errors);
+}
+
+test "single release and observer mismatch cannot debit unrelated memory" {
+    var manager = ResourceManager.init(.{});
+    var first = try manager.reserve(.inference_tokenizer_cache, 10);
+    var unrelated = try manager.reserve(.inference_model_residency, 20);
+
+    var corrupt_copy = first;
+    corrupt_copy.bytes = 11;
+    corrupt_copy.release();
+    var stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 10), manager.sliceStats(.inference_tokenizer_cache).used_bytes);
+
+    var stale_observation: u64 = 11;
+    try std.testing.expect(!manager.tryObserveUsage(
+        .inference_tokenizer_cache,
+        &stale_observation,
+        0,
+    ));
+    stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 11), stale_observation);
+    try std.testing.expectEqual(@as(u64, 2), stats.memory.accounting_errors);
+
+    var observed_first: u64 = 0;
+    var observed_second: u64 = 0;
+    try std.testing.expect(manager.tryObserveUsage(
+        .inference_prompt_cache,
+        &observed_first,
+        10,
+    ));
+    try std.testing.expect(manager.tryObserveUsage(
+        .inference_prompt_cache,
+        &observed_second,
+        20,
+    ));
+    observed_first = 0;
+    try std.testing.expect(!manager.tryObserveUsage(
+        .inference_prompt_cache,
+        &observed_first,
+        0,
+    ));
+    try std.testing.expectEqual(
+        @as(u64, 30),
+        manager.sliceStats(.inference_prompt_cache).used_bytes,
+    );
+    observed_first = 10;
+    try std.testing.expect(manager.tryObserveUsage(.inference_prompt_cache, &observed_first, 0));
+    try std.testing.expect(manager.tryObserveUsage(.inference_prompt_cache, &observed_second, 0));
+
+    first.release();
+    unrelated.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "bounded oversized progress cannot bypass aggregate host memory" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.text_merge_buffers)] = .{ .hard_limit_bytes = 10 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 15 },
+        .budgets = budgets,
+    });
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2),
+    );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "resource manager coordinates growable capacity by physical domain" {
@@ -1851,6 +2631,22 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
 }
 
+test "latency-sensitive derived replay defers only optional background work" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.beginLatencySensitiveDerivedReplay();
+    manager.beginLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.finishLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.finishLatencySensitiveDerivedReplay();
+    try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
+    manager.latency_sensitive_derived_replay_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+}
+
 test "resource manager background deferral follows slice policy" {
     var budgets = Options.defaultBudgets();
     var policies = Options.defaultPolicies();
@@ -2003,6 +2799,71 @@ test "resource manager observes over-budget external usage" {
     try std.testing.expectEqual(@as(u64, 5), current);
     try std.testing.expectEqual(@as(u64, 5), stats.slices[sliceIndex(.lsm_block_table_cache)].used_bytes);
     try std.testing.expectEqual(Pressure.normal, stats.slices[sliceIndex(.lsm_block_table_cache)].pressure);
+}
+
+test "identity-aware cache admission rejects growth and always permits shrink" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.inference_tokenizer_cache)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 24 },
+        .budgets = budgets,
+        .identity_allocator = std.testing.allocator,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        0,
+        18,
+    ));
+    try std.testing.expect(!manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        18,
+        21,
+    ));
+    try std.testing.expectEqual(
+        @as(u64, 18),
+        manager.sliceStats(.inference_tokenizer_cache).used_bytes,
+    );
+    try std.testing.expect(!manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        42,
+        0,
+        7,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        42,
+        0,
+        0,
+    ));
+
+    // Simulate an allocation that was observed after an operator tightened a
+    // limit. Admission must still allow the owner to converge to zero.
+    try std.testing.expect(manager.tryObserveUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        18,
+        30,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        30,
+        12,
+    ));
+    try std.testing.expect(manager.tryAdjustUsageIdentity(
+        .inference_tokenizer_cache,
+        41,
+        12,
+        0,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "resource manager evaluates projected admission with configured action" {

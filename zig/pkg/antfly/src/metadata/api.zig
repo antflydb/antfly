@@ -22,11 +22,30 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("incarnation.zig");
+const reallocation_request = @import("reallocation_request.zig");
 
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
+    /// Zero means the peer predates the causal reallocation barrier.
+    reallocation_barrier_protocol_version: u16 = 0,
+    /// Maximum embedded runtime-status record version this replica can apply;
+    /// zero means the peer predates rolling-safe format negotiation.
+    runtime_status_record_version: u16 = 0,
+    /// Highest runtime-status record version durably activated for this
+    /// metadata incarnation. Zero means activation has not committed yet.
+    runtime_status_protocol_activated_version: u16 = 0,
+    /// Highest version the current metadata membership can safely commit now.
+    /// This may lead activation by one command and lets rolling reporters
+    /// establish their incarnation without speculative registration churn.
+    runtime_status_protocol_ready_version: u16 = 0,
+    /// Whether this replica currently has one capability probe in flight.
+    runtime_status_protocol_probe_in_flight: bool = false,
+    /// Consecutive failed probes since the last successful probe or durable
+    /// activation. This is rate-limited by exponential backoff.
+    runtime_status_protocol_probe_failures: u32 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     metadata_epoch: u64 = 0,
     metadata_raft_local_node_id: u64 = 0,
@@ -36,6 +55,10 @@ pub const MetadataStatus = struct {
     metadata_raft_commit_index: u64 = 0,
     metadata_raft_local_voter: bool = false,
     metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
     metadata_raft_election_elapsed: u32 = 0,
     metadata_raft_randomized_election_timeout: u32 = 0,
     metadata_raft_votes_granted: usize = 0,
@@ -131,6 +154,24 @@ pub const MetadataHead = struct {
     metadata_epoch: u64 = 0,
 };
 
+/// Compact, constant-size runtime topology consumed by safety monitors.
+/// Keep this separate from MetadataStatus so frequent topology probes never
+/// walk or clone the projected catalog.
+pub const MetadataRuntimeTopology = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    metadata_raft_local_node_id: u64 = 0,
+    metadata_raft_role: []const u8 = "absent",
+    metadata_raft_leader_id: ?u64 = null,
+    metadata_raft_term: u64 = 0,
+    metadata_raft_local_voter: bool = false,
+    metadata_raft_voter_count: usize = 0,
+    metadata_raft_voter_set_fingerprint: ?MetadataRaftVoterSetFingerprint = null,
+    metadata_raft_joint_consensus: bool = false,
+    /// Includes both stable and staged learners (`learners_next`).
+    metadata_raft_learner_count: usize = 0,
+};
+
 pub const ReplicationSourceActionHint = struct {
     table_id: u64,
     table_name: []u8,
@@ -142,6 +183,7 @@ pub const ReplicationSourceActionHint = struct {
 
 pub const AdminSnapshot = struct {
     status: MetadataStatus,
+    reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
     nodes: []table_manager.NodeRecord = &.{},
@@ -367,15 +409,42 @@ pub const CatalogTablePublicationContract = struct {
 };
 
 pub fn catalogTableTopology(table_id: u64, ranges: []const table_manager.RangeRecord) CatalogTableTopology {
+    return catalogTableTopologyResolution(table_id, ranges).topology;
+}
+
+pub const CatalogTableTopologyResolution = struct {
+    topology: CatalogTableTopology,
+    single_group_id: ?u64,
+};
+
+/// Computes the order-independent topology fence and the sole storage group in
+/// one catalog pass. `single_group_id` is null for both empty and multi-range
+/// tables; callers distinguish those cases with `topology.range_count`.
+pub fn catalogTableTopologyResolution(
+    table_id: u64,
+    ranges: []const table_manager.RangeRecord,
+) CatalogTableTopologyResolution {
     var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
     var range_count: u64 = 0;
+    var single_group_id: ?u64 = null;
     for (ranges) |range| {
         if (range.table_id != table_id) continue;
         range_count += 1;
+        if (range_count == 1) {
+            single_group_id = range.group_id;
+        } else {
+            single_group_id = null;
+        }
         addCatalogTopologyDigest(&accumulator, catalogRangeTopologyDigest(range));
     }
 
-    return .{ .range_count = range_count, .digest = finalizeCatalogTableTopology(table_id, range_count, accumulator) };
+    return .{
+        .topology = .{
+            .range_count = range_count,
+            .digest = finalizeCatalogTableTopology(table_id, range_count, accumulator),
+        },
+        .single_group_id = single_group_id,
+    };
 }
 
 fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
@@ -526,6 +595,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
         .merge_transitions = &.{},
     };
     errdefer freeSnapshot(alloc, source, &snapshot);
+    if (@hasDecl(SourceDeclType, "getProjectedReallocationRequest")) {
+        snapshot.reallocation_request = try source.getProjectedReallocationRequest();
+    }
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {

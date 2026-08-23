@@ -386,6 +386,50 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
     };
 }
 
+const deberta_reranker_weight_mirror_min_rows: usize = 128;
+
+fn debertaRerankerPrefersWeightMirrors(enabled: bool, batch: usize, seq_len: usize) bool {
+    if (!enabled) return false;
+    const rows = std.math.mul(usize, batch, seq_len) catch return false;
+    return rows >= deberta_reranker_weight_mirror_min_rows;
+}
+
+fn sessionEnablesDebertaRerankerWeightMirrors(
+    model_type: manifest_mod.ModelType,
+    arch_type: ArchType,
+    task: SessionTask,
+) bool {
+    return model_type == .reranker and arch_type == .deberta and task == .classifier;
+}
+
+/// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
+/// reserve for native DeBERTa and GLiNER sessions. An absent reranker
+/// architecture hint is treated conservatively because GGUF metadata can still
+/// identify DeBERTa at load.
+pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runtime.tier.memory.AdmissionAmounts {
+    const gliner_bundle = mf.gliner_head_gguf_path != null or
+        mf.gliner_head_safetensors_path != null or
+        mf.gliner_model_type.len != 0 or
+        std.mem.startsWith(u8, mf.inference_bundle_family, "gliner2");
+    const direct_deberta = mf.config_model_arch.len > 0 and deberta_mod.isDebertaModel(mf.config_model_arch);
+    const unknown_reranker = mf.model_type == .reranker and mf.config_model_arch.len == 0;
+    if (!gliner_bundle and !direct_deberta and !unknown_reranker) return .{};
+
+    const reservation = deberta_arch.metalFastPathReservationBytes(.{
+        .hidden_size = mf.hidden_size,
+        .num_hidden_layers = mf.num_hidden_layers,
+        .num_attention_heads = mf.num_attention_heads,
+        .intermediate_size = mf.intermediate_size,
+        .vocab_size = mf.bert_vocab_size,
+        .max_position_embeddings = mf.max_position_embeddings,
+        .num_labels = mf.num_labels,
+    }, gliner_bundle or mf.model_type == .reranker);
+    return .{
+        .backend_weight_bytes = reservation.persistent_bytes,
+        .backend_scratch_bytes = reservation.scratch_bytes,
+    };
+}
+
 pub const UnsupportedTensorTypeCount = struct {
     tensor_type: gguf_mod.tensor_types.TensorType,
     count: usize,
@@ -680,11 +724,17 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         }
     }
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = .native,
         .backend_data = .{ .native = .{
             .allocator = allocator,
@@ -949,11 +999,17 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         break :blk client;
     };
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = .pjrt,
         .backend_data = .{ .pjrt = .{
             .native = .{
@@ -1536,11 +1592,17 @@ fn createGpuHostedSessionWithTaskOverride(
         }
     }
 
+    const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = arch_config,
-        .task = sessionTaskForModelType(mf.model_type, override),
+        .task = task,
+        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
+            mf.model_type,
+            std.meta.activeTag(arch_config),
+            task,
+        ),
         .backend_type = backend_type,
         .kernel_jit_config = kernel_jit_config,
         // Startup authority is a constructor-local capability. Never retain
@@ -3494,6 +3556,7 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+            .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
             .deinit = @ptrCast(&deinitSelf),
         };
@@ -3542,6 +3605,8 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
                 .allocator = self.allocator,
             };
         }
+
+        fn discardTensorFileCacheImpl(_: *@This(), _: []const u8) void {}
 
         fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
             return &self.encoder_file;
@@ -4426,6 +4491,51 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
+test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors" {
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(false, 1, 512));
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, 1, 127));
+    try std.testing.expect(debertaRerankerPrefersWeightMirrors(true, 1, 128));
+    try std.testing.expect(debertaRerankerPrefersWeightMirrors(true, 8, 16));
+    try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, std.math.maxInt(usize), 2));
+
+    try std.testing.expect(sessionEnablesDebertaRerankerWeightMirrors(.reranker, .deberta, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.classifier, .deberta, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.reranker, .bert, .classifier));
+    try std.testing.expect(!sessionEnablesDebertaRerankerWeightMirrors(.reranker, .deberta, .generic));
+
+    const classifier_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .config_model_arch = "deberta-v2",
+    };
+    const classifier_admission = metalDebertaFastPathAdmissionAmounts(classifier_manifest);
+    try std.testing.expect(classifier_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        classifier_admission.backend_scratch_bytes,
+    );
+    const bert_reranker_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .config_model_arch = "bert",
+    };
+    try std.testing.expectEqual(
+        runtime.tier.memory.AdmissionAmounts{},
+        metalDebertaFastPathAdmissionAmounts(bert_reranker_manifest),
+    );
+    const gliner_manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+        .inference_bundle_family = "gliner2_split_bundle/v1",
+    };
+    const gliner_admission = metalDebertaFastPathAdmissionAmounts(gliner_manifest);
+    try std.testing.expect(gliner_admission.backend_weight_bytes > 0);
+    try std.testing.expectEqual(
+        deberta_arch.metalDebertaMpsAttentionScratchMaxBytes(),
+        gliner_admission.backend_scratch_bytes,
+    );
+}
+
 test "detectArchitecture recognizes generic deberta classifier configs" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4949,6 +5059,9 @@ const ArchSession = struct {
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
     task: SessionTask = .generic,
+    /// Only real DeBERTa reranker sessions may trade persistent mirror memory
+    /// for the resident fused-layer path. Generic classifiers stay unchanged.
+    deberta_reranker_weight_mirrors: bool = false,
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config = .{},
     kernel_jit_load_context: kernel_jit.LoadContext = .dynamic,
@@ -5610,6 +5723,63 @@ pub fn widenBudgetLimitsForSession(
     return widenLimits(limits, self.budget_floor);
 }
 
+/// Bind a session's lazy residency cache to the serving owner's hard limits
+/// before the session is published. Cache defaults are derived from host/node
+/// capacity during construction and can be much larger than a container or an
+/// explicit serving policy; leaving those defaults in place lets lazy weight
+/// promotion bypass the ModelManager/ResourceManager envelope.
+pub fn configureSharedCacheAdmissionForSession(
+    session: Session,
+    allocator: std.mem.Allocator,
+    controller: *runtime.tier.memory.AdmissionController,
+    backend_class: runtime.tier.memory.BackendClass,
+    limits: runtime.tier.memory.Limits,
+    resident: runtime.tier.memory.AdmissionAmounts,
+) !void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const hard_budget = runtime.tier.cache.Budget{
+        .host_limit_bytes = limits.host_limit_bytes,
+        .backend_limit_bytes = limits.backend_limit_bytes,
+    };
+    const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
+        .native => if (self.backend_data.native.tier_cache) |*cache| cache else null,
+        .metal => if (build_options.enable_metal)
+            if (gpuBackendData(self).tier_cache) |*cache| cache else null
+        else
+            null,
+        .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
+        .cuda, .onnx, .wasm => null,
+    };
+    const cache = tier_cache orelse return;
+    cache.configureHardBudget(hard_budget);
+    try cache.configureAdmission(
+        allocator,
+        controller,
+        backend_class,
+        limits,
+        .{
+            .host_limit_bytes = resident.host_weight_bytes,
+            .backend_limit_bytes = resident.backend_weight_bytes,
+        },
+    );
+}
+
+/// Release one backend-owned, unpinned host-cache entry without unloading the
+/// model identity. ModelManager uses this after an authoritative aggregate or
+/// live-host denial, then re-probes admission before choosing another victim.
+/// Unsupported backends return zero and retain their existing whole-model
+/// eviction behavior.
+pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.backend_type) {
+        .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
+        .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
+        .metal, .cuda, .onnx, .wasm => 0,
+    };
+}
+
 pub fn memoryBudgetExceededDetail(
     session: Session,
     run_budget: *const runtime.tier.memory.RunBudget,
@@ -5801,7 +5971,16 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const attention_mask = inputs[1].asInt64();
 
             if (self.task == .classifier) {
-                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
+                // Long-sequence DeBERTa rerankers need the same bounded F16
+                // mirrors as GLiNER to stay on the resident fused-layer path.
+                // Non-Metal backends ignore this preference, and the existing
+                // TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS switch opts out.
+                const prefer_weight_mirrors = debertaRerankerPrefersWeightMirrors(
+                    self.deberta_reranker_weight_mirrors,
+                    batch,
+                    seq_len,
+                );
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors);
                 defer cb.free(hidden_ct);
 
                 const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
@@ -6694,6 +6873,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.native);
             if (self.backend_data.native.residency) |*residency| residency.deinit();
             if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .metal => {
             if (comptime build_options.enable_metal) {
@@ -6713,6 +6894,8 @@ fn archClose(ptr: *anyopaque) void {
                 if (gpu_data.residency) |*residency| residency.deinit();
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
+                if (gpu_data.tier_cache) |*tier_cache|
+                    tier_cache.deinitAdmission();
             }
         },
         .pjrt => {
@@ -6741,6 +6924,8 @@ fn archClose(ptr: *anyopaque) void {
             native_mod.deinitPrefetchQueue(&self.backend_data.pjrt.native);
             if (self.backend_data.pjrt.native.residency) |*residency| residency.deinit();
             if (self.backend_data.pjrt.native.tensor_store) |tensor_store| tensor_store.deinit();
+            if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
+                tier_cache.deinitAdmission();
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {

@@ -13,14 +13,18 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
+const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
 const storage_source_options = @import("storage_source_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const api_operation = @import("operation.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
 const backups_api = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -76,11 +80,13 @@ const table_router = @import("table_router.zig");
 const table_writes = if (builtin.is_test) @import("table_writes.zig") else @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const ha_mutation_inventory = @import("../storage/ha/mutation_inventory.zig");
+const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
 const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
+const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
@@ -89,9 +95,9 @@ const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
-const http_internal_routes = @import("http_internal_routes.zig");
-const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
-const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
+const internal_query_operations = @import("internal_query_operations.zig");
+const internal_group_operations = @import("internal_group_operations.zig");
+const contextual_operations = @import("contextual_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const docstore_mod = if (builtin.is_test) @import("../storage/docstore.zig") else struct {};
@@ -164,6 +170,39 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"documents\":[");
+    var lines = std.mem.splitScalar(u8, ndjson, '\n');
+    var count: usize = 0;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidScanResponse;
+        if (count != 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, line);
+        count += 1;
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+test "MCP document samples convert multiple NDJSON rows to one JSON value" {
+    const alloc = std.testing.allocator;
+    const body = try mcpSampleDocumentsJsonAlloc(
+        alloc,
+        "{\"_id\":\"doc:a\",\"body\":\"hello\"}\n{\"_id\":\"doc:b\",\"body\":\"world\"}\n",
+    );
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"documents\":[{\"_id\":\"doc:a\",\"body\":\"hello\"},{\"_id\":\"doc:b\",\"body\":\"world\"}]}",
+        body,
+    );
 }
 
 const TestSseEvent = struct {
@@ -600,9 +639,68 @@ pub const RestoreExecutionGuard = struct {
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
 };
 
+/// Process-local admission shared by every protocol adapter that invokes the
+/// public application operations below.
+pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
+
+pub const HAMutationPolicySnapshot = struct {
+    failover_safe_mutations_only: bool = false,
+    remote_apply_mutations_enabled: bool = false,
+};
+
+/// Live HA ingress policy owned by the process runtime. Promotion changes the
+/// authority role without rebuilding the HTTP router, so policy cannot be a
+/// startup-only boolean.
+pub const HAMutationPolicySource = struct {
+    ptr: *const anyopaque,
+    snapshot_fn: *const fn (ptr: *const anyopaque) HAMutationPolicySnapshot,
+
+    pub fn snapshot(self: HAMutationPolicySource) HAMutationPolicySnapshot {
+        return self.snapshot_fn(self.ptr);
+    }
+};
+
+/// Optional request-count admission owner for an embedded inference runtime.
+/// API-only processes omit this and use their local fallback admission gate.
+pub const InferenceRequestAdmissionSource = struct {
+    ptr: *anyopaque,
+    try_acquire_fn: *const fn (ptr: *anyopaque) bool,
+    release_fn: *const fn (ptr: *anyopaque) void,
+    stats_fn: *const fn (ptr: *anyopaque) RequestAdmission.Stats,
+
+    pub fn tryAcquire(self: InferenceRequestAdmissionSource) bool {
+        return self.try_acquire_fn(self.ptr);
+    }
+
+    pub fn release(self: InferenceRequestAdmissionSource) void {
+        self.release_fn(self.ptr);
+    }
+
+    pub fn stats(self: InferenceRequestAdmissionSource) RequestAdmission.Stats {
+        return self.stats_fn(self.ptr);
+    }
+};
+
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
     experimental: bool = false,
+    /// Maximum serialized MCP tools/call result size. Zero disables the guard.
+    /// The conservative default leaves headroom beneath 100 KiB connector
+    /// limits after the JSON-RPC response envelope is added.
+    mcp_max_tool_result_bytes: usize = common_config.default_mcp_max_tool_result_bytes,
+    /// Node-local public database-query admission capacity. Zero is unlimited.
+    query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
+    write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
+    /// Node-local inference request admission capacity. Zero is unlimited.
+    inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// Shared owner used when inference runs in this process. When present it
+    /// supersedes the local fallback so every inference endpoint shares one cap.
+    inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
+    /// Explicit in-process transport for the reserved local-inference virtual
+    /// connection. The destination route owns admission and no public listener
+    /// connection is consumed. Configured connections are always remote.
+    local_inference_connection_target: ?connections_api.LocalInferenceConnectionTarget = null,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -619,7 +717,7 @@ pub const ApiHttpServerConfig = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
-    routed_raft_batch_writer: ?http_internal_group_write_routes.RoutedRaftBatchWriter = null,
+    routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
@@ -633,11 +731,11 @@ pub const ApiHttpServerConfig = struct {
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
-    ha_admin_executor: ?http_common.RequestExecutor = null,
+    ha_admin_executor: ?ha_http_operation.Executor = null,
     /// Dedicated HA administration credential. This is intentionally separate
     /// from native user authentication and other internal admin surfaces.
     ha_admin_bearer_token: ?[]const u8 = null,
-    ha_internal_executor: ?http_common.RequestExecutor = null,
+    ha_internal_executor: ?ha_http_operation.Executor = null,
     /// When continuous standalone HA is active, only mutations classified as
     /// synchronously replicated may reach their handler. Non-replicated
     /// security, catalog, restore, and workflow state fails closed before any
@@ -647,6 +745,9 @@ pub const ApiHttpServerConfig = struct {
     /// synchronous RemoteApply. The route classifier alone cannot establish
     /// the active durability policy.
     ha_remote_apply_mutations_enabled: bool = false,
+    /// Optional live source supplied by HA-aware runtimes. Static fields above
+    /// remain the policy for kernels and tests without a mutable role.
+    ha_mutation_policy_source: ?HAMutationPolicySource = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -694,7 +795,7 @@ pub const SemanticStatusResolver = struct {
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
-    query_cancellation: ?*const std.atomic.Value(bool) = null,
+    query_cancellation: ?CancellationToken = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -716,7 +817,7 @@ pub const SemanticStatusResolver = struct {
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         try ensureRequestActive(self.query_cancellation);
-        const planned = try http_internal_group_read_routes.planSemanticQuery(.{
+        const planned = try internal_query_operations.planSemanticQuery(.{
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -772,7 +873,7 @@ pub const StatusSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
-        ensure_linearizable_read: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+        linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: api_operation.RequestContext) anyerror!?metadata_api.AdminSnapshot = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
@@ -822,9 +923,11 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("cached_admin_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
-    pub fn ensureLinearizableRead(self: StatusSource) !void {
-        const fn_ptr = self.vtable.ensure_linearizable_read orelse return;
-        return try BoundaryAbi.call("ensure_linearizable_read", self.boundary_dispatch, fn_ptr, .{self.ptr});
+    /// Returns the exact owned snapshot covered by the authority barrier.
+    /// `null` is reserved for sources that do not support the capability.
+    pub fn linearizableSnapshot(self: StatusSource, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+        const fn_ptr = self.vtable.linearizable_snapshot orelse return null;
+        return try BoundaryAbi.call("linearizable_snapshot", self.boundary_dispatch, fn_ptr, .{ self.ptr, request });
     }
 
     pub fn freeAdminSnapshot(self: StatusSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -986,8 +1089,8 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
-            fn ensureLinearizableRead(ptr: *anyopaque) anyerror!void {
-                return try cast(ptr).ensureLinearizableRead();
+            fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) anyerror!?metadata_api.AdminSnapshot {
+                return try metadata_service.coherentLinearizableAdminSnapshot(T, cast(ptr), request);
             }
 
             fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -1111,7 +1214,7 @@ pub const StatusSource = struct {
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
-            .ensure_linearizable_read = Gen.ensureLinearizableRead,
+            .linearizable_snapshot = Gen.linearizableSnapshot,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
             .create_table = Gen.createTable,
             .replace_table_definition = Gen.replaceTableDefinition,
@@ -1695,6 +1798,9 @@ pub const ApiHttpServer = struct {
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
+    query_admission: RequestAdmission,
+    write_admission: RequestAdmission,
+    inference_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
@@ -1731,6 +1837,15 @@ pub const ApiHttpServer = struct {
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     backup_maintenance_owner_id: u64 = 0,
+    index_installation_owner_id: u64 = 0,
+    index_installation_closing: std.atomic.Value(bool) = .init(false),
+    index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
+    index_installation_mutex: std.atomic.Mutex = .unlocked,
+    index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
+    index_installation_queue: std.ArrayListUnmanaged(PendingIndexInstallation) = .empty,
+    index_installation_reserved_slots: usize = 0,
+    index_installation_next_generation: u64 = 1,
+    index_installation_cursor: usize = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: ClusterBackupMaintenanceQueue = .{},
@@ -1758,6 +1873,7 @@ pub const ApiHttpServer = struct {
         restore: u64 = 0,
         session_maintenance: u64 = 0,
         backup_maintenance: u64 = 0,
+        index_installation: u64 = 0,
     };
 
     fn allocRuntimeOwnerIds(runtime: ?*db_mod.background_runtime.BackendRuntime) !RuntimeOwnerIds {
@@ -1768,11 +1884,13 @@ pub const ApiHttpServer = struct {
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
+            if (ids.index_installation != 0) active.durable_jobs.closeOwner(ids.index_installation);
         }
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
+        ids.index_installation = try active.allocOwnerId();
         return ids;
     }
 
@@ -1788,6 +1906,14 @@ pub const ApiHttpServer = struct {
         else
             platform.allocator.processAllocator(std.heap.smp_allocator);
         return ApiHttpServer.initWithRequestAllocator(alloc, request_alloc, cfg, source, table_read_source, table_write_source);
+    }
+
+    pub fn haMutationPolicy(self: *const ApiHttpServer) HAMutationPolicySnapshot {
+        if (self.cfg.ha_mutation_policy_source) |source| return source.snapshot();
+        return .{
+            .failover_safe_mutations_only = self.cfg.ha_failover_safe_mutations_only,
+            .remote_apply_mutations_enabled = self.cfg.ha_remote_apply_mutations_enabled,
+        };
     }
 
     pub fn initWithProcessRequestAllocator(
@@ -1856,6 +1982,9 @@ pub const ApiHttpServer = struct {
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
             .cfg = cfg,
+            .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
+            .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
+            .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
             .source = source,
             .table_reads = table_read_source,
             .table_writes = table_write_source,
@@ -1897,6 +2026,7 @@ pub const ApiHttpServer = struct {
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
+            .index_installation_owner_id = owner_ids.index_installation,
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
@@ -1951,7 +2081,61 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
+    pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.query_admission.stats();
+    }
+
+    pub fn tryAcquireQuery(self: *ApiHttpServer) bool {
+        return self.query_admission.tryAcquire();
+    }
+
+    pub fn releaseQuery(self: *ApiHttpServer) void {
+        self.query_admission.release();
+    }
+
+    pub fn queryOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualRetryableTextResponse(self.alloc, 429, "query capacity exhausted");
+    }
+
+    pub fn writeAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        return self.write_admission.stats();
+    }
+
+    pub fn tryAcquireWrite(self: *ApiHttpServer) bool {
+        return self.write_admission.tryAcquire();
+    }
+
+    pub fn releaseWrite(self: *ApiHttpServer) void {
+        self.write_admission.release();
+    }
+
+    pub fn writeOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualRetryableTextResponse(self.alloc, 429, "write capacity exhausted");
+    }
+
+    pub fn tryAcquireInference(self: *ApiHttpServer) bool {
+        if (self.cfg.inference_request_admission_source) |source| return source.tryAcquire();
+        return self.inference_admission.tryAcquire();
+    }
+
+    pub fn inferenceAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
+        if (self.cfg.inference_request_admission_source) |source| return source.stats();
+        return self.inference_admission.stats();
+    }
+
+    pub fn releaseInference(self: *ApiHttpServer) void {
+        if (self.cfg.inference_request_admission_source) |source| {
+            source.release();
+            return;
+        }
+        self.inference_admission.release();
+    }
+
+    pub fn inferenceOverloadedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return try contextualInferenceCapacityResponse(self.alloc);
+    }
+
+    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
         self.cfg.ha_internal_executor = executor_value;
     }
 
@@ -1963,6 +2147,42 @@ pub const ApiHttpServer = struct {
     pub fn currentStorageRuntimeStatus(self: *const ApiHttpServer) ?metadata_openapi.StorageRuntimeStatus {
         const maintenance = self.cfg.storage_maintenance orelse return null;
         return storageRuntimeStatus(maintenance.status());
+    }
+
+    /// Transport-neutral status operation shared by direct callers and every
+    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
+    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+        const metadata_status = try self.source.status();
+        var status = try cluster.fromMetadataStatus(alloc, metadata_status);
+        errdefer status.deinit(alloc);
+        status.auth_enabled = self.cfg.auth_enabled;
+        status.deployment_mode = self.cfg.deployment_mode;
+        status.storage = self.currentStorageRuntimeStatus();
+        if (self.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            try cluster.applySecretStoreHealth(alloc, &status, secret_store.healthSnapshot());
+        }
+        if (self.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &status, health);
+        }
+        return status;
+    }
+
+    /// Transport-neutral topology operation. It composes the shared status
+    /// operation with the best available metadata snapshot and returns one
+    /// typed result instead of serialized HTTP bytes.
+    pub fn loadClusterTopology(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterTopology {
+        var status = try self.loadClusterStatus(alloc);
+        defer status.deinit(alloc);
+        var snapshot_opt = try self.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
+        if (snapshot_opt) |*snapshot| {
+            defer self.source.freeAdminSnapshot(snapshot);
+            return try cluster.topologyFromStatusAndSnapshot(alloc, status, snapshot);
+        }
+        return try cluster.topologyFromStatus(alloc, status);
     }
 
     pub fn initWithConfig(
@@ -1985,6 +2205,7 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
                 if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
                 if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
+                if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
         };
         var server = initWithRequestAllocatorAndOwners(
@@ -2090,13 +2311,19 @@ pub const ApiHttpServer = struct {
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.backup_maintenance_closing.store(true, .release);
+        self.index_installation_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
+            if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        for (self.index_installation_queue.items) |*entry| entry.deinit();
+        self.index_installation_queue.deinit(std.heap.page_allocator);
+        self.index_installation_mutex.unlock();
         platform_sync.lockYielding(&self.backup_maintenance_mutex);
         self.backup_maintenance_queue.deinit(self.owner_alloc);
         self.backup_maintenance_mutex.unlock();
@@ -2246,18 +2473,52 @@ pub const ApiHttpServer = struct {
         connection_id: []const u8,
         operation: []const u8,
         body: []const u8,
+        cancellation: ?httpx.CancellationToken,
+        deadline_ns: u64,
+        stream: kernel_abi.StreamSink,
     ) !connections_api.InvokeResult {
-        const node_config = self.cfg.node_config orelse return error.ConnectionNotFound;
+        if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
+            return connections_api.invokeInferenceConnection(
+                alloc,
+                null,
+                self.cfg.node_config,
+                self.cfg.local_inference_connection_target,
+                self.cfg.secret_store,
+                connection_id,
+                operation,
+                body,
+                cancellation,
+                deadline_ns,
+                stream,
+            );
+        }
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
         return connections_api.invokeInferenceConnection(
             alloc,
             &client,
-            node_config,
+            self.cfg.node_config,
+            self.cfg.local_inference_connection_target,
             self.cfg.secret_store,
             connection_id,
             operation,
             body,
+            cancellation,
+            deadline_ns,
+            stream,
+        );
+    }
+
+    pub fn inferenceConnectionAdmissionOwner(
+        self: *const ApiHttpServer,
+        connection_id: []const u8,
+        operation: []const u8,
+    ) !connections_api.InferenceAdmissionOwner {
+        return connections_api.inferenceConnectionAdmissionOwner(
+            self.cfg.node_config,
+            self.cfg.local_inference_connection_target,
+            connection_id,
+            operation,
         );
     }
 
@@ -2354,12 +2615,12 @@ pub const ApiHttpServer = struct {
         _ = try self.source.removeJoinShuffleLease(job_id);
     }
 
-    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.QueryResponse {
+    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, cancellation);
     }
 
-    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror![]u8 {
+    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
@@ -2373,9 +2634,9 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!query_api.OwnedQueryRequest {
+    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (cancellation) |value| if (value.load(.acquire)) return error.Cancelled;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         return try self.buildOwnedSearchRequestFromQueryValue(
             alloc,
             table_name,
@@ -2390,29 +2651,19 @@ pub const ApiHttpServer = struct {
         return try self.ensureForeignRegistry();
     }
 
-    pub fn executor(self: *ApiHttpServer) http_common.RequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .execute = execute,
-            },
-        };
-    }
-
-    pub fn streamingExecutor(self: *ApiHttpServer) http_common.StreamingRequestExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .execute = executeStreaming,
-            },
-        };
-    }
-
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
         if (!self.mutationBackgroundExecutionPermitted()) return;
+        // Queue insertion is durable in server memory even when the bounded
+        // executor temporarily rejects the worker submission. The periodic
+        // supervisor is the independent wake source that makes such an
+        // obligation self-healing without retaining a sleeping worker solely
+        // to retry admission.
+        self.ensurePendingIndexInstallationWorker() catch |err| {
+            std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
+        };
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
@@ -2436,7 +2687,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn mutationBackgroundExecutionPermitted(self: *const ApiHttpServer) bool {
-        return !self.cfg.ha_failover_safe_mutations_only;
+        return !self.haMutationPolicy().failover_safe_mutations_only;
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
@@ -2484,8 +2735,30 @@ pub const ApiHttpServer = struct {
                         // a new leader may discard it before apply. Upgrade
                         // only the weakest level, preserving stronger caller
                         // visibility contracts without extra hot-path work.
-                        if (commit.sync_level == .propose) .write else commit.sync_level,
+                        if (commit.repair_handoff_needs_coordinator or commit.sync_level == .propose)
+                            .write
+                        else
+                            commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.EnrichmentWorkerFailed => {
+                            // Older records and third-party sources may expose a
+                            // committed terminal repair only as an error. Persist
+                            // that fact now; the next claim uses write durability
+                            // to recover coordinator metadata without calling the
+                            // failed provider again.
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
+                                self.alloc,
+                                txn_id,
+                                .committed,
+                                true,
+                                null,
+                                null,
+                            ) catch |persist_err| {
+                                std.log.warn("stable transaction repair handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                                continue;
+                            }) orelse continue;
+                            continue;
+                        },
                         error.InvalidBatchRequest,
                         error.InvalidArgument,
                         error.InvalidGraphEdges,
@@ -2512,16 +2785,18 @@ pub const ApiHttpServer = struct {
                             _ = self.txn_sessions.remove(self.alloc, txn_id);
                         },
                         .committed => |committed| {
-                            const status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
-                                .committed_recovery_pending
-                            else if (committed.visibility_pending)
-                                .committed_visibility_pending
-                            else
-                                .committed;
-                            _ = (self.txn_sessions.recordTerminalCommit(
+                            const repair_required = commit.repair_required or committed.visibility_repair_required;
+                            const status = transactions_api.terminalCommitStatusForOutcome(
+                                committed.propagation_pending,
+                                committed.visibility_pending,
+                                committed.visibility_retry_pending,
+                                committed.visibility_repair_required,
+                            );
+                            _ = (self.txn_sessions.recordTerminalCommitWithRepair(
                                 self.alloc,
                                 txn_id,
                                 status,
+                                repair_required,
                                 committed.coordinator_group_id,
                                 committed.coordinator_table_name,
                             ) catch |err| {
@@ -2779,6 +3054,12 @@ pub const ApiHttpServer = struct {
         return coordinator.isExclusiveActive();
     }
 
+    /// Transport-neutral readiness operation used by root probe adapters in
+    /// both direct and independently linked runtimes.
+    pub fn checkReady(self: *ApiHttpServer) !void {
+        _ = try self.source.status();
+    }
+
     fn localTableRuntimeStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -2800,6 +3081,39 @@ pub const ApiHttpServer = struct {
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, snapshot_index, null, false);
+    }
+
+    const IndexRuntimeTarget = struct {
+        name: []const u8,
+        identity: ?indexes_api.IndexRuntimeIdentity,
+    };
+
+    fn indexTableRuntimeStatusesWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        target: IndexRuntimeTarget,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, target, false);
+    }
+
+    fn lifecycleTableRuntimeStatusesWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndexOptions(table_name, snapshot, null, null, true);
+    }
+
+    fn localTableRuntimeStatusesWithSnapshotIndexOptions(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
+        force_write_refresh: bool,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
         defer item_indexes.deinit(self.alloc);
@@ -2818,19 +3132,22 @@ pub const ApiHttpServer = struct {
                 } else {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
-                    read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                    read_needs_refresh = if (target_index) |target|
+                        runtimeStatusesNeedWriterRefreshForIndex(owned.items, target)
+                    else
+                        runtimeStatusesNeedWriterRefresh(owned.items);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
                 }
             }
         }
         if (snapshot) |admin_snapshot| {
             if (snapshot_index) |index| {
-                try self.appendRemoteRuntimeStatusesFromIndex(&items, &item_indexes, table_name, index);
+                try self.appendRemoteRuntimeStatusesFromIndex(&items, &item_indexes, table_name, index, target_index);
             } else {
-                try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
+                try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot, target_index);
             }
         }
-        const should_query_writes = if (snapshot == null)
+        const should_query_writes = force_write_refresh or if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
         else
             items.items.len == 0 or !read_statuses_present or read_needs_refresh;
@@ -2844,7 +3161,17 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
+                if (force_write_refresh) {
+                    // Lifecycle classification needs the writer observation in
+                    // addition to the best read/remote observation. A read DB
+                    // can legitimately be fresh for its retained generation
+                    // while the writer is catching up a newly admitted index;
+                    // coalescing those by group would discard the only proof
+                    // that IndexNotFound is a retryable publication window.
+                    try self.appendLocalRuntimeStatusCandidates(table_name, snapshot, snapshot_index, &items, &owned);
+                } else {
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, target_index, &items, &item_indexes, &owned);
+                }
             }
         }
         if (items.items.len == 0) {
@@ -2885,11 +3212,71 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
+    fn runtimeStatusesNeedWriterRefreshForIndex(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        target: IndexRuntimeTarget,
+    ) bool {
+        for (statuses) |status| {
+            if (runtimeStatusTargetNeedsWriterRefresh(status, target)) return true;
+        }
+        return false;
+    }
+
+    fn runtimeStatusTargetNeedsWriterRefresh(
+        status: runtime_status.LocalTableRuntimeStatus,
+        target: IndexRuntimeTarget,
+    ) bool {
+        if (runtimeStatusNeedsWriterRefresh(status)) return true;
+        // A read snapshot can be fresh for its retained index generation
+        // while the live writer is admitting or advancing a newer index.
+        if (runtimeStatusTargetRank(status, target) < 2) return true;
+        // The read cache's freshness describes the observation it retained;
+        // it does not make an incomplete lifecycle observation terminal. Only
+        // the requested index detail path pays for this writer refresh, and it
+        // stops doing so as soon as the cached proof is complete.
+        for (status.stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.name)) continue;
+            // `repair_degraded` is also the derived representation of an
+            // incomplete repair or coverage summary, so it cannot distinguish
+            // terminal damage from a retained observation that the writer may
+            // already have advanced. Explicit issues and load failures are the
+            // durable cases; keep reporting those without polling the writer.
+            if (index.load_error != null or
+                index.repair_issue_count != 0 or
+                std.mem.eql(u8, index.index_repair_phase, "terminal"))
+            {
+                return false;
+            }
+            // Refresh only for an incomplete proof attached to the requested
+            // index. Table-level degradation may belong to another index, and
+            // ordinary backfill/replay debt is already authoritative status;
+            // refreshing those on every detail read would bypass the cached
+            // status fast path without improving correctness.
+            return !index.repair_summary_ready or !index.coverage_summary_ready;
+        }
+        return true;
+    }
+
+    fn runtimeStatusTargetRank(status: runtime_status.LocalTableRuntimeStatus, target: IndexRuntimeTarget) u8 {
+        for (status.stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.name)) continue;
+            const identity = target.identity orelse return 2;
+            return if (index.coverage_identity_ready and
+                index.coverage_generation == identity.coverage_generation and
+                index.coverage_config_hash == identity.coverage_config_hash)
+                2
+            else
+                1;
+        }
+        return 0;
+    }
+
     fn appendLocalRuntimeStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
         snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         owned: *runtime_status.LocalTableRuntimeStatuses,
@@ -2912,7 +3299,36 @@ pub const ApiHttpServer = struct {
                 continue;
             }
             var candidate = item;
-            try upsertRuntimeStatus(self.alloc, items, item_indexes, &candidate);
+            try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &candidate, target_index);
+        }
+        if (owned.items.len > 0) self.alloc.free(owned.items);
+        owned.items = &.{};
+    }
+
+    fn appendLocalRuntimeStatusCandidates(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        owned: *runtime_status.LocalTableRuntimeStatuses,
+    ) !void {
+        try items.ensureUnusedCapacity(self.alloc, owned.items.len);
+        for (owned.items) |item| {
+            const allowed = if (snapshot_index) |index|
+                index.statusAllowed(
+                    table_name,
+                    item,
+                    if (self.cfg.session_router) |router| router.localNodeId() else 0,
+                )
+            else
+                self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item);
+            if (!allowed) {
+                var discard = item;
+                discard.deinit(self.alloc);
+                continue;
+            }
+            items.appendAssumeCapacity(item);
         }
         if (owned.items.len > 0) self.alloc.free(owned.items);
         owned.items = &.{};
@@ -2928,6 +3344,7 @@ pub const ApiHttpServer = struct {
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         table_name: []const u8,
         snapshot: *const metadata_api.AdminSnapshot,
+        target_index: ?IndexRuntimeTarget,
     ) !void {
         const table = tables_api.findTableByName(snapshot, table_name) orelse return;
         for (snapshot.stores) |store| {
@@ -2940,7 +3357,7 @@ pub const ApiHttpServer = struct {
                 var status = try localRuntimeStatusFromRemoteReport(self.alloc, remote);
                 var consumed = false;
                 errdefer if (!consumed) status.deinit(self.alloc);
-                try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
+                try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &status, target_index);
                 consumed = true;
             }
         }
@@ -2952,13 +3369,14 @@ pub const ApiHttpServer = struct {
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         table_name: []const u8,
         snapshot_index: *const RuntimeStatusSnapshotIndex,
+        target_index: ?IndexRuntimeTarget,
     ) !void {
         const table_id = snapshot_index.tableId(table_name) orelse return;
         for (snapshot_index.reportsForTable(table_id)) |report| {
             var status = try localRuntimeStatusFromRemoteReport(self.alloc, report.*);
             var consumed = false;
             errdefer if (!consumed) status.deinit(self.alloc);
-            try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
+            try upsertRuntimeStatusForTarget(self.alloc, items, item_indexes, &status, target_index);
             consumed = true;
         }
     }
@@ -2972,6 +3390,57 @@ pub const ApiHttpServer = struct {
         if (item_indexes.get(status.group_id)) |existing_index| {
             const existing = &items.items[existing_index];
             if (!runtimeStatusPreferred(status.*, existing.*)) {
+                status.deinit(alloc);
+                return;
+            }
+            existing.deinit(alloc);
+            existing.* = status.*;
+            status.* = undefined;
+            return;
+        }
+        try items.ensureUnusedCapacity(alloc, 1);
+        try item_indexes.ensureUnusedCapacity(alloc, 1);
+        const index = items.items.len;
+        items.appendAssumeCapacity(status.*);
+        item_indexes.putAssumeCapacity(status.group_id, index);
+        status.* = undefined;
+    }
+
+    fn upsertRuntimeStatusForTarget(
+        alloc: std.mem.Allocator,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
+        status: *runtime_status.LocalTableRuntimeStatus,
+        target: ?IndexRuntimeTarget,
+    ) !void {
+        const index_target = target orelse return try upsertRuntimeStatus(alloc, items, item_indexes, status);
+        if (item_indexes.get(status.group_id)) |existing_index| {
+            const existing = &items.items[existing_index];
+            // Quarantine is a group-level integrity fact and must retain its
+            // precedence even when another observation matches the requested
+            // index incarnation.
+            const candidate_quarantined = status.metadata.source == .rebuild_state_quarantine;
+            const existing_quarantined = existing.metadata.source == .rebuild_state_quarantine;
+            const preferred = if (candidate_quarantined != existing_quarantined)
+                runtimeStatusPreferred(status.*, existing.*)
+            else blk: {
+                const candidate_rank = runtimeStatusTargetRank(status.*, index_target);
+                const existing_rank = runtimeStatusTargetRank(existing.*, index_target);
+                if (candidate_rank != existing_rank) break :blk candidate_rank > existing_rank;
+                // Once an incomplete cached observation caused a targeted
+                // writer refresh, the live writer is the authoritative view
+                // for that same incarnation even if its freshness is still
+                // catching_up. Otherwise the cached value can win forever.
+                const candidate_is_writer = status.metadata.source == .live_writer_publish;
+                const existing_is_writer = existing.metadata.source == .live_writer_publish;
+                if (candidate_is_writer != existing_is_writer and
+                    runtimeStatusTargetNeedsWriterRefresh(existing.*, index_target))
+                {
+                    break :blk candidate_is_writer;
+                }
+                break :blk runtimeStatusPreferred(status.*, existing.*);
+            };
+            if (!preferred) {
                 status.deinit(alloc);
                 return;
             }
@@ -3116,6 +3585,8 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .index_repair_status = index.repair_status,
+                .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
                 .catch_up_phase = if (dense_catch_up_active) .replay else .idle,
                 .catch_up_applied_sequence = index.replay_applied_sequence,
@@ -3419,12 +3890,26 @@ pub const ApiHttpServer = struct {
         return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
+    fn observedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        observation: table_reads.DynamicFieldObservationQuery,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name, observation)) orelse &.{};
+    }
+
     fn bestEffortObservedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
         table_name: []const u8,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
-        const source = self.table_reads orelse return &.{};
-        return (try source.observedDynamicFieldCapabilitySets(self.alloc, table_name)) orelse &.{};
+        return self.observedDynamicFieldCapabilitySets(table_name, .{ .coverage_read_mode = .cached_only }) catch |err| switch (err) {
+            // Observability and query-builder callers can still provide the
+            // declared schema when a cold query DB has no physical evidence
+            // yet. They must not warm storage merely to enrich metadata.
+            error.StorageReadTemporarilyUnavailable => &.{},
+            else => return err,
+        };
     }
 
     fn freeObservedDynamicFieldCapabilitySets(
@@ -3482,24 +3967,6 @@ pub const ApiHttpServer = struct {
 
     pub fn cleanupExpiredSessions(self: *ApiHttpServer, cutoff_ns: u64) !usize {
         return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
-    }
-
-    fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
-        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
-        if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
-        if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
-        if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
-        if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
-        // HA administration has a separate runtime-owned bearer credential.
-        // Do not interpret that token as a native user API key before the HA
-        // dispatcher can validate it.
-        if (isHaAdminPath(path)) return false;
-        if (isHaInternalPath(path)) return false;
-        return true;
-    }
-
-    fn requestCarriesAuthentication(_: *const ApiHttpServer, req: http_common.HttpRequest) bool {
-        return req.authorization != null or req.header(trusted_principal_header) != null;
     }
 
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
@@ -3642,340 +4109,82 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const uri_parts = splitTarget(req.uri);
-        if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
-            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null and
-            routes.Routes.matchInternalTableRepairCancelState(uri_parts.path) == null)
-        {
-            return null;
-        }
-        return try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req);
-    }
+    pub const HaRouteRequest = struct {
+        method: contextual_operations.Method,
+        target: []const u8,
+        authorization: ?[]const u8,
+        content_type: ?[]const u8,
+        body: []const u8,
+    };
 
-    pub fn handle(self: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        self.recordHandledRequest();
-        const raw_path = rawPathOnly(req.uri);
-        const uri_parts = splitTarget(req.uri);
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
-
-        if (req.method == .GET and std.mem.eql(u8, raw_path, routes.Routes.healthz)) {
-            return try jsonResponse(self.alloc, .{ .status = "ok" });
-        }
-        if (req.method == .GET and std.mem.eql(u8, raw_path, routes.Routes.readyz)) {
-            _ = self.source.status() catch {
-                return try jsonResponseWithStatus(self.alloc, 503, .{ .status = "not_ready" });
-            };
-            return try jsonResponse(self.alloc, .{ .status = "ready" });
-        }
-        if (!self.cfg.experimental and isA2aProtocolPath(uri_parts.path)) {
-            return try jsonErrorResponse(self.alloc, 404, "not found");
-        }
-
-        const route_requires_authentication = self.requiresAuthentication(uri_parts.path);
-        const should_authenticate_optional_ard_catalog =
-            !route_requires_authentication and
-            std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog) and
-            self.requestCarriesAuthentication(req);
-        if (route_requires_authentication or should_authenticate_optional_ard_catalog) {
-            authenticated_identity = self.authenticateRequest(.{
-                .authorization = req.authorization,
-                .trusted_principal = req.header(trusted_principal_header),
-            }) catch |err| switch (err) {
-                error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
-                    return try unauthorizedResponse(self.alloc);
-                },
-                else => return err,
-            };
-            const identity = authenticated_identity.?;
-
-            if (route_requires_authentication and requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) {
-                return try textResponse(self.alloc, 403, "forbidden");
-            }
-            if (route_requires_authentication) {
-                const required_permission = requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch |err| switch (err) {
-                    error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid path parameter"),
-                    else => return err,
-                };
-                if (required_permission) |required| {
-                    defer required.deinit(self.alloc);
-                    if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
-                        return try textResponse(self.alloc, 403, "forbidden");
-                    }
-                }
-            }
-        }
-
-        if (self.cfg.ha_failover_safe_mutations_only) {
-            if (ha_mutation_inventory.classify(req.method, uri_parts.path)) |mutation| {
-                if (mutation.disposition == .reject or
-                    (mutation.disposition == .remote_apply and !self.cfg.ha_remote_apply_mutations_enabled))
-                {
-                    return try jsonResponseWithStatus(self.alloc, 503, .{
-                        .@"error" = "mutation is not continuously replicated while HA is active",
-                        .code = "ha_mutation_not_replicated",
-                        .surface = @tagName(mutation.surface),
-                    });
-                }
-            }
-        }
-
-        if (try self.dispatchStorageMaintenanceRoutes(req, uri_parts)) |resp| return resp;
-        if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
-        try self.resumeRestoreJobsOnce();
-        if (std.mem.eql(u8, uri_parts.path, "/restore/jobs")) {
-            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const options = parseRestoreJobListOptions(query_arena_impl.allocator(), uri_parts.query) catch
-                return try textResponse(self.alloc, 400, "invalid restore job list parameters");
-            return try self.handlePublicListRestoreJobs(authenticated_identity, options);
-        }
-        if (restoreJobIdFromPath(uri_parts.path)) |job_id| {
-            if (authenticated_identity) |identity| {
-                if (!(try self.restoreJobAllowed(self.alloc, identity, job_id))) return try textResponse(self.alloc, 404, "not found");
-            }
-            return switch (req.method) {
-                .GET => try self.handlePublicRestoreJob(job_id, false),
-                .DELETE => try self.handlePublicRestoreJob(job_id, true),
-                else => try textResponse(self.alloc, 405, "method not allowed"),
-            };
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
-            const metadata_status = try self.source.status();
-            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
-            defer public_status.deinit(self.alloc);
-            public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.deployment_mode = self.cfg.deployment_mode;
-            if (self.cfg.storage_maintenance) |maintenance| {
-                public_status.storage = storageRuntimeStatus(maintenance.status());
-            }
-            if (self.cfg.secret_store) |secret_store| {
-                _ = secret_store.refreshIfChanged() catch |err| {
-                    std.log.warn("secret store status refresh skipped err={}", .{err});
-                };
-                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
-            }
-            if (self.cfg.remote_content) |remote_content| {
-                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
-            }
-            return try jsonResponse(self.alloc, public_status);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
-            const metadata_status = try self.source.status();
-            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
-            defer public_status.deinit(self.alloc);
-            public_status.auth_enabled = self.cfg.auth_enabled;
-            public_status.deployment_mode = self.cfg.deployment_mode;
-            if (self.cfg.storage_maintenance) |maintenance| {
-                public_status.storage = storageRuntimeStatus(maintenance.status());
-            }
-            if (self.cfg.secret_store) |secret_store| {
-                _ = secret_store.refreshIfChanged() catch |err| {
-                    std.log.warn("secret store status refresh skipped err={}", .{err});
-                };
-                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
-            }
-            if (self.cfg.remote_content) |remote_content| {
-                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
-            }
-            var snapshot_opt = try self.source.cachedAdminSnapshot();
-            if (snapshot_opt == null) {
-                snapshot_opt = try self.source.adminSnapshot();
-            }
-            if (snapshot_opt) |*snapshot| {
-                defer self.source.freeAdminSnapshot(snapshot);
-                var topology_status = try cluster.topologyFromStatusAndSnapshot(self.alloc, public_status, snapshot);
-                defer topology_status.deinit(self.alloc);
-                return try jsonResponse(self.alloc, topology_status);
-            }
-            var topology_status = try cluster.topologyFromStatus(self.alloc, public_status);
-            defer topology_status.deinit(self.alloc);
-            return try jsonResponse(self.alloc, topology_status);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
-            const connection_types = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "types") catch return try textResponse(self.alloc, 400, "invalid types");
-            defer if (connection_types) |value| self.alloc.free(value);
-            const connection_include = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "include") catch return try textResponse(self.alloc, 400, "invalid include");
-            defer if (connection_include) |value| self.alloc.free(value);
-            const connection_refresh = parseSimpleQueryParamDecodedAlloc(self.alloc, uri_parts.query, "refresh") catch return try textResponse(self.alloc, 400, "invalid refresh");
-            defer if (connection_refresh) |value| self.alloc.free(value);
-            const body = try self.listConnectionsJsonAlloc(
-                self.alloc,
-                connection_types,
-                connection_include,
-                connection_refresh,
-            );
-            return .{
-                .status = 200,
-                .content_type = try self.alloc.dupe(u8, "application/json"),
-                .body = body,
-            };
-        }
-        if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
-            if (metadata_authority.isRetryableError(err)) {
-                if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
-                    return try metadataNotLeaderResponse(self.alloc);
-                }
-                return err;
-            }
-            return err;
+    pub fn executeHaRoute(self: *ApiHttpServer, request: HaRouteRequest) !?ha_http_operation.OwnedResponse {
+        const path = splitTarget(request.target).path;
+        const operation_request = ha_http_operation.Request{
+            .method = switch (request.method) {
+                .get => .get,
+                .post => .post,
+                .put => .put,
+                .delete => .delete,
+            },
+            .target = request.target,
+            .authorization = request.authorization,
+            .content_type = request.content_type,
+            .body = request.body,
         };
-        if (extension_resp) |resp| return resp;
-        if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
-        if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
-        const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| {
-            if (err == error.InvalidPathParameter)
-                return try textResponse(self.alloc, 400, "invalid path parameter");
-            if (metadata_authority.isRetryableError(err)) {
-                if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
-                    return try metadataNotLeaderResponse(self.alloc);
-                }
-                return err;
-            }
-            return err;
-        };
-        if (public_table_resp) |resp| return resp;
-        return try textResponse(self.alloc, 404, "not found");
-    }
-
-    fn dispatchHaRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (isHaAdminPath(uri_parts.path)) {
+        if (isHaAdminPath(path)) {
             const expected = (self.cfg.ha_admin_bearer_token orelse self.cfg.admin_bearer_token) orelse
-                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
+                return try haOperationTextResponse(self.alloc, 403, "HA admin API disabled without authentication");
             if (expected.len == 0)
-                return try textResponse(self.alloc, 403, "HA admin API disabled without authentication");
-            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 403, "HA admin API disabled without authentication");
+            const authorization = request.authorization orelse return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             if (!std.mem.startsWith(u8, authorization, "Bearer ") or
                 !constantTimeEql(expected, authorization["Bearer ".len..]))
             {
-                return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const ha_exec = self.cfg.ha_admin_executor orelse return null;
-            return try ha_exec.execute(self.alloc, req);
+            return try ha_exec.execute(operation_request);
         }
-        if (isHaInternalPath(uri_parts.path)) {
+        if (isHaInternalPath(path)) {
             const expected = self.cfg.admin_bearer_token orelse
-                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
+                return try haOperationTextResponse(self.alloc, 403, "HA internal API disabled without authentication");
             if (expected.len == 0)
-                return try textResponse(self.alloc, 403, "HA internal API disabled without authentication");
-            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 403, "HA internal API disabled without authentication");
+            const authorization = request.authorization orelse return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             if (!std.mem.startsWith(u8, authorization, "Bearer ") or
                 !constantTimeEql(expected, authorization["Bearer ".len..]))
             {
-                return try unauthorizedResponse(self.alloc);
+                return try haOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const ha_exec = self.cfg.ha_internal_executor orelse return null;
-            return try ha_exec.execute(self.alloc, req);
+            return try ha_exec.execute(operation_request);
         }
         return null;
     }
 
-    fn dispatchStorageMaintenanceRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (!isStorageMaintenancePath(uri_parts.path)) return null;
-        if (!self.requiresAuthentication(uri_parts.path)) {
-            const expected = self.cfg.admin_bearer_token orelse return try textResponse(self.alloc, 403, "admin API disabled without authentication");
-            const authorization = req.authorization orelse return try unauthorizedResponse(self.alloc);
-            if (!std.mem.startsWith(u8, authorization, "Bearer ") or
-                !constantTimeEql(expected, authorization["Bearer ".len..]))
-            {
-                return try unauthorizedResponse(self.alloc);
-            }
+    pub fn executeArd(
+        self: *ApiHttpServer,
+        path: []const u8,
+        query: []const u8,
+        request_body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_openapi)) {
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, build_options.ard_openapi_ard_yaml));
         }
-        const coordinator = self.cfg.storage_maintenance orelse return try textResponse(self.alloc, 422, "storage maintenance unsupported");
-        if (std.mem.startsWith(u8, uri_parts.path, admin_routes.maintenance_jobs_prefix)) {
-            if (req.method != .GET and req.method != .DELETE) return try textResponse(self.alloc, 405, "method not allowed");
-            const raw_id = uri_parts.path[admin_routes.maintenance_jobs_prefix.len..];
-            if (raw_id.len == 0 or std.mem.indexOfScalar(u8, raw_id, '/') != null) return try textResponse(self.alloc, 404, "not found");
-            const job_id = std.fmt.parseUnsigned(u64, raw_id, 10) catch return try textResponse(self.alloc, 404, "not found");
-            const snapshot = if (req.method == .DELETE) coordinator.cancel(job_id) else coordinator.get(job_id);
-            return try storageMaintenanceJobResponse(self.alloc, if (req.method == .DELETE) 202 else 200, snapshot orelse return try textResponse(self.alloc, 404, "not found"));
-        }
-        if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
-        const operation: @import("../storage/maintenance.zig").Operation = if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_check))
-            .check
-        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_compact))
-            .compact
-        else if (std.mem.eql(u8, uri_parts.path, admin_routes.maintenance_vacuum))
-            .vacuum
-        else
-            return try textResponse(self.alloc, 404, "not found");
-        const capabilities = coordinator.status().maintenance;
-        const supported = switch (operation) {
-            .check => capabilities.check,
-            .compact => capabilities.compact,
-            .vacuum => capabilities.vacuum,
-        };
-        if (!supported) return try textResponse(self.alloc, 422, "storage maintenance operation unsupported");
-        const snapshot = coordinator.start(operation, req.header("Idempotency-Key")) catch |err| switch (err) {
-            error.MaintenanceBusy => return try textResponse(self.alloc, 409, "storage maintenance already running"),
-            error.IdempotencyConflict => return try textResponse(self.alloc, 409, "idempotency key reused for another operation"),
-            error.InvalidIdempotencyKey => return try textResponse(self.alloc, 400, "invalid idempotency key"),
-            error.MaintenanceHistoryFull => return try textResponse(self.alloc, 429, "maintenance job history is full; retry after retained job records expire"),
-            error.MaintenanceJobIdExhausted => return try textResponse(self.alloc, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
-            else => return err,
-        };
-        return try storageMaintenanceJobResponse(self.alloc, 202, snapshot);
-    }
-
-    fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
-            if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_extension_profiles_prefix)) {
-                const profile = uri_parts.path[routes.Routes.mcp_v1_extension_profiles_prefix.len..];
-                if (!std.mem.eql(u8, profile, "copilot")) return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
-            }
-            if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
-                return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
-            }
-        }
-        if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
-            return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
-            return try protocol_adapters.handleA2aRequest(
-                self,
-                req,
-                queryEmbeddingSecurityScope(authenticated_identity),
-                authenticated_identity,
-            );
-        }
-        if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
-            return try protocol_adapters.handleA2aCard(
-                self,
-                queryEmbeddingSecurityScope(null),
-                @as(?AuthenticatedIdentity, null),
-            );
-        }
-        return null;
-    }
-
-    fn dispatchArdRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            return try self.bodyResponse(200, "application/yaml", build_options.ard_openapi_ard_yaml, false);
-        }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_openapi_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const name = uri_parts.path[routes.Routes.ard_v1_openapi_prefix.len..];
-            const spec = ardOpenApiSpec(name) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_openapi_prefix)) {
+            const name = path[routes.Routes.ard_v1_openapi_prefix.len..];
+            const spec = ardOpenApiSpec(name) orelse return error.NotFound;
             if (spec.admin_only and self.cfg.auth_enabled and !authenticatedIdentityIsAdmin(authenticated_identity)) {
-                if (authenticated_identity == null) return try unauthorizedResponse(self.alloc);
-                return try textResponse(self.alloc, 403, "forbidden");
+                if (authenticated_identity == null) return error.Unauthorized;
+                return error.Forbidden;
             }
-            return try self.bodyResponse(200, "application/yaml", spec.body, false);
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, spec.body));
         }
         var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer query_arena_impl.deinit();
         const query_alloc = query_arena_impl.allocator();
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ai_catalog)) {
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
             var snapshot_opt: ?metadata_api.AdminSnapshot = null;
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -3985,88 +4194,73 @@ pub const ApiHttpServer = struct {
             } else null;
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, mode, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, mode, query, authenticated_identity),
                 extension_context,
             );
-            return try self.ardCatalogResponse(200, body, mode == .public_bootstrap);
+            return contextual_operations.json(body, mode == .public_bootstrap);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_catalog)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
-            return try self.ardCatalogResponse(200, body, false);
+            return contextual_operations.json(body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_search)) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_search)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+            const response_body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                req.body,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                request_body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD search request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_explore)) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_explore)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.searchJsonWithExtensionsAlloc(
+            const response_body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                req.body,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                request_body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdSearchRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD explore request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_agents)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1_agents)) {
             var snapshot_opt = try self.source.adminSnapshot();
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-            const body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
+            const response_body = ard_catalog.agentsJsonWithExtensionsQueryAlloc(
                 self.alloc,
-                try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
-                uri_parts.query,
+                try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
+                query,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
-            ) catch |err| switch (err) {
-                error.InvalidArdAgentsRequest => return try jsonErrorResponse(self.alloc, 400, "invalid ARD agents request"),
-                else => return err,
-            };
-            return try self.ardCatalogResponse(200, body, false);
+            ) catch |err| return err;
+            return contextual_operations.json(response_body, false);
         }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_skills_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const slug = uri_parts.path[routes.Routes.ard_v1_skills_prefix.len..];
-            const options = try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity);
-            const body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_skills_prefix)) {
+            const slug = path[routes.Routes.ard_v1_skills_prefix.len..];
+            const options = try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity);
+            const response_body = (try ard_catalog.skillMarkdownAlloc(self.alloc, options, slug)) orelse blk: {
                 var snapshot_opt = try self.source.adminSnapshot();
                 defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
                 break :blk (try ard_catalog.extensionSkillMarkdownAlloc(
                     self.alloc,
                     options,
                     slug,
-                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return try jsonErrorResponse(self.alloc, 404, "not found"),
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+                    self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity) orelse return error.NotFound,
+                )) orelse return error.NotFound;
             };
-            return try self.bodyResponseOwned(200, "text/markdown; charset=utf-8", body, false);
+            return contextual_operations.bytes("text/markdown; charset=utf-8", response_body);
         }
-        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_resources_prefix)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            const rest = uri_parts.path[routes.Routes.ard_v1_resources_prefix.len..];
+        if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_resources_prefix)) {
+            const rest = path[routes.Routes.ard_v1_resources_prefix.len..];
             if (std.mem.startsWith(u8, rest, "mcp/")) {
                 const name = rest["mcp/".len..];
                 var snapshot_opt = if (std.mem.eql(u8, name, "default") or std.mem.startsWith(u8, name, "extensions/") or std.mem.startsWith(u8, name, "profiles/")) try self.source.adminSnapshot() else null;
@@ -4074,10 +4268,10 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.mcpDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try self.ardCatalogResponse(200, body, false);
+                )) orelse return error.NotFound;
+                return contextual_operations.json(body, false);
             }
             if (std.mem.startsWith(u8, rest, "agents/")) {
                 const name = rest["agents/".len..];
@@ -4086,53 +4280,57 @@ pub const ApiHttpServer = struct {
                 const body = (try ard_catalog.agentDescriptorJsonAlloc(
                     self.alloc,
                     name,
-                    try self.ardCatalogOptions(query_alloc, .tenant, uri_parts.query, authenticated_identity),
+                    try self.ardCatalogOptions(query_alloc, .tenant, query, authenticated_identity),
                     if (snapshot_opt) |snapshot| self.ardExtensionCatalogContext(snapshot, authenticated_identity) else null,
-                )) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
-                return try self.ardCatalogResponse(200, body, false);
+                )) orelse return error.NotFound;
+                return contextual_operations.json(body, false);
             }
-            return try jsonErrorResponse(self.alloc, 404, "not found");
+            return error.NotFound;
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1)) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
-            return try self.ardCatalogResponse(200, try self.ardRegistryRootJsonAlloc(), false);
+        if (std.mem.eql(u8, path, routes.Routes.ard_v1)) {
+            return contextual_operations.json(try self.ardRegistryRootJsonAlloc(), false);
         }
-        return null;
+        return error.NotFound;
     }
 
-    fn dispatchExtensionAgentRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        const parsed = parseExtensionAgentRunRoute(uri_parts.path) orelse return null;
-        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, uri_parts.query, authenticated_identity)) orelse
-            return try jsonErrorResponse(self.alloc, 404, "not found");
+    pub fn executeExtensionAgent(
+        self: *ApiHttpServer,
+        method: contextual_operations.Method,
+        path: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const parsed = parseExtensionAgentRunRoute(path) orelse return error.NotFound;
+        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, query, authenticated_identity)) orelse
+            return error.NotFound;
         self.alloc.free(descriptor);
 
         if (std.mem.eql(u8, parsed.tail, "runs")) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .post) return error.MethodNotAllowed;
             const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, null);
-            return try self.bodyResponseOwned(501, "application/json", body, false);
+            return .{ .status = 501, .content_type = "application/json", .body = body };
         }
-        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return error.NotFound;
         const run_tail = parsed.tail["runs/".len..];
-        if (run_tail.len == 0) return try jsonErrorResponse(self.alloc, 404, "not found");
+        if (run_tail.len == 0) return error.NotFound;
         if (std.mem.endsWith(u8, run_tail, "/events")) {
-            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .get) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/events".len];
-            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
             const body = try extensionAgentUnsupportedRuntimeEventAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
-            defer self.alloc.free(body);
-            return try eventStreamResponse(self.alloc, 501, body);
+            return .{ .status = 501, .content_type = "text/event-stream", .body = body };
         }
         if (std.mem.endsWith(u8, run_tail, "/cancel")) {
-            if (req.method != .POST) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            if (method != .post) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/cancel".len];
-            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
             const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
-            return try self.bodyResponseOwned(501, "application/json", body, false);
+            return .{ .status = 501, .content_type = "application/json", .body = body };
         }
-        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return try jsonErrorResponse(self.alloc, 404, "not found");
-        if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return error.NotFound;
+        if (method != .get) return error.MethodNotAllowed;
         const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_tail);
-        return try self.bodyResponseOwned(501, "application/json", body, false);
+        return .{ .status = 501, .content_type = "application/json", .body = body };
     }
 
     fn visibleExtensionAgentDescriptorJsonAlloc(
@@ -4222,1436 +4420,248 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
-        errdefer self.alloc.free(body);
-        var headers: []http_common.Header = &.{};
-        errdefer {
-            for (headers) |*header| header.deinit(self.alloc);
-            if (headers.len > 0) self.alloc.free(headers);
-        }
-        if (public_cors) {
-            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
-                .{
-                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
-                    .value = try self.alloc.dupe(u8, "*"),
-                },
-            });
-        }
-        return .{
-            .status = status,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .headers = headers,
-            .body = body,
-        };
-    }
+    pub fn executeExtensionRoute(
+        self: *ApiHttpServer,
+        method: contextual_operations.Method,
+        path: []const u8,
+        body: []const u8,
+    ) !?contextual_operations.OwnedResponse {
+        if (!isExtensionPath(path)) return null;
 
-    fn bodyResponse(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []const u8, public_cors: bool) !http_common.HttpResponse {
-        return try self.bodyResponseOwned(status, content_type, try self.alloc.dupe(u8, body), public_cors);
-    }
-
-    fn bodyResponseOwned(self: *ApiHttpServer, status: u16, content_type: []const u8, body: []u8, public_cors: bool) !http_common.HttpResponse {
-        errdefer self.alloc.free(body);
-        var headers: []http_common.Header = &.{};
-        errdefer {
-            for (headers) |*header| header.deinit(self.alloc);
-            if (headers.len > 0) self.alloc.free(headers);
-        }
-        if (public_cors) {
-            headers = try self.alloc.dupe(http_common.Header, &[_]http_common.Header{
-                .{
-                    .name = try self.alloc.dupe(u8, "Access-Control-Allow-Origin"),
-                    .value = try self.alloc.dupe(u8, "*"),
-                },
-            });
-        }
-        return .{
-            .status = status,
-            .content_type = try self.alloc.dupe(u8, content_type),
-            .headers = headers,
-            .body = body,
-        };
-    }
-
-    fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (!isExtensionPath(uri_parts.path)) return null;
-
-        if (req.method != .GET) {
-            if (req.method == .POST) {
-                if (routes.Routes.matchInstalledExtensionUpdate(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension update request");
+        if (method != .get) {
+            if (method == .post) {
+                if (routes.Routes.matchInstalledExtensionUpdate(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension update request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.updateExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension drop request");
+                if (routes.Routes.matchInstalledExtensionDrop(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension drop request");
                     };
                     defer parsed.deinit();
                     self.source.dropExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
-                    return try jsonResponse(self.alloc, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
+                    return try contextualJsonResponse(self.alloc, 200, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
                 }
-                if (routes.Routes.matchInstalledExtensionEnable(uri_parts.path)) |installed_route| {
+                if (routes.Routes.matchInstalledExtensionEnable(path)) |installed_route| {
                     var installed = self.source.enableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtensionDisable(uri_parts.path)) |installed_route| {
+                if (routes.Routes.matchInstalledExtensionDisable(path)) |installed_route| {
                     var installed = self.source.disableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
-                if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension install request");
+                if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension install request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.installExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     if (!parsed.value.dry_run) {
                         self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                            error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                            error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                             else => return err,
                         };
                     }
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
             }
-            if (req.method == .PUT) {
-                if (routes.Routes.matchInstalledExtensionConfig(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try jsonErrorResponse(self.alloc, 400, "invalid extension config request");
+            if (method == .put) {
+                if (routes.Routes.matchInstalledExtensionConfig(path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension config request");
                     };
                     defer parsed.deinit();
                     var installed = self.source.configureExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                        return try extensionLifecycleContextualResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try jsonResponse(self.alloc, installed);
+                    return try contextualJsonResponse(self.alloc, 200, installed);
                 }
             }
-            return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try contextualJsonErrorResponse(self.alloc, 405, "method not allowed");
         }
 
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1)) {
-            return try jsonResponse(self.alloc, .{
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1)) {
+            return try contextualJsonResponse(self.alloc, 200, .{
                 .packages = routes.Routes.extensions_v1_packages,
                 .installed = routes.Routes.extensions_v1_installed,
             });
         }
 
-        var snapshot = (try self.source.adminSnapshot()) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
         defer self.source.freeAdminSnapshot(&snapshot);
 
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_packages)) {
-            return try jsonResponse(self.alloc, snapshot.extension_packages);
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1_packages)) {
+            return try contextualJsonResponse(self.alloc, 200, snapshot.extension_packages);
         }
-        if (routes.Routes.matchExtensionPackageVersion(uri_parts.path)) |package_version| {
+        if (routes.Routes.matchExtensionPackageVersion(path)) |package_version| {
             const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, package.*);
+            return try contextualJsonResponse(self.alloc, 200, package.*);
         }
-        if (routes.Routes.matchExtensionPackage(uri_parts.path)) |package_route| {
+        if (routes.Routes.matchExtensionPackage(path)) |package_route| {
             const package = findLatestExtensionPackage(&snapshot, package_route.name) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, package.*);
+            return try contextualJsonResponse(self.alloc, 200, package.*);
         }
-        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_installed)) {
-            return try jsonResponse(self.alloc, snapshot.installed_extensions);
+        if (std.mem.eql(u8, path, routes.Routes.extensions_v1_installed)) {
+            return try contextualJsonResponse(self.alloc, 200, snapshot.installed_extensions);
         }
-        if (routes.Routes.matchInstalledExtensionObjects(uri_parts.path)) |installed_route| {
+        if (routes.Routes.matchInstalledExtensionObjects(path)) |installed_route| {
             const members = try extensionMembersForName(self.alloc, snapshot.extension_members, installed_route.name);
             defer if (members.len > 0) self.alloc.free(members);
             if (members.len == 0 and findInstalledExtension(&snapshot, installed_route.name) == null) {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             }
-            return try jsonResponse(self.alloc, members);
+            return try contextualJsonResponse(self.alloc, 200, members);
         }
-        if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+        if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
             const installed = findInstalledExtension(&snapshot, installed_route.name) orelse {
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             };
-            return try jsonResponse(self.alloc, installed.*);
+            return try contextualJsonResponse(self.alloc, 200, installed.*);
         }
         return null;
     }
 
-    fn recordHandledRequest(self: *ApiHttpServer) void {
+    pub fn recordHandledRequest(self: *ApiHttpServer) void {
         const prior = self.request_count.fetchAdd(1, .monotonic);
         if (prior == 0) {
             self.first_request_started_at_ns.store(platform_time.monotonicNs(), .monotonic);
         }
     }
 
-    fn dispatchUserRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.users_me)) {
-            const identity = authenticated_identity orelse return try unauthorizedResponse(self.alloc);
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const current_user = try makeCurrentUserResponse(arena_impl.allocator(), identity.username, identity.permissions, identity.metadata_json);
-            return try jsonResponse(self.alloc, current_user);
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.users)) {
-            const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-            const users = try manager.listUsers();
-            defer freeOwnedStrings(self.alloc, users);
-            const listed_users = try makeListedUsers(self.alloc, users);
-            defer self.alloc.free(listed_users);
-            return try jsonResponse(self.alloc, listed_users);
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var create_req = parseCreateUserRequest(self.alloc, req.body, user_path.user_name) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid create user request");
-                };
-                defer create_req.deinit(self.alloc);
-                var created = manager.createUserWithMetadata(create_req.username, create_req.password, create_req.initial_policies, create_req.metadata_json) catch |err| switch (err) {
-                    error.UserExists => return try jsonErrorResponse(self.alloc, 409, "user already exists"),
-                    error.InvalidMetadata => return try jsonErrorResponse(self.alloc, 400, "invalid create user request"),
-                    else => return err,
-                };
-                defer created.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try userToOpenApi(arena_impl.allocator(), created);
-                return try jsonResponseWithStatus(self.alloc, 201, generated);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var user = manager.getUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer user.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try userToOpenApi(arena_impl.allocator(), user);
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserPath(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.deleteUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchUserPassword(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const new_password = parsePasswordUpdateRequest(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid password update request");
-                };
-                defer self.alloc.free(new_password);
-                manager.updatePassword(user_path.user_name, new_password) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return try jsonResponse(self.alloc, .{ .message = "Password updated successfully" });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const permissions = manager.getPermissionsForUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freePermissions(self.alloc, permissions);
-                const generated_permissions = try clonePermissionsToOpenApi(self.alloc, permissions);
-                defer self.alloc.free(generated_permissions);
-                return try jsonResponse(self.alloc, generated_permissions);
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const roles = manager.getRolesForUser(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeOwnedStrings(self.alloc, roles);
-                return try jsonResponse(self.alloc, roles);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var permission = parsePermissionBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid permission request");
-                };
-                defer permission.deinit(self.alloc);
-                manager.addPermissionToUser(user_path.user_name, permission) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.InvalidPermissionType, error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid permission request"),
-                    else => return err,
-                };
-                return try jsonResponseWithStatus(self.alloc, 201, struct { message: []const u8 }{
-                    .message = "Permission added successfully",
-                });
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const role = parseRoleAssignmentBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid role request");
-                };
-                defer self.alloc.free(role);
-                manager.addRoleToUser(user_path.user_name, role) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.InvalidRole => return try jsonErrorResponse(self.alloc, 400, "invalid role request"),
-                    else => return err,
-                };
-                return try jsonResponseWithStatus(self.alloc, 201, struct { message: []const u8 }{
-                    .message = "Role added successfully",
-                });
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserPermissions(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer query_arena_impl.deinit();
-                const params = parseRemovePermissionFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch |err| switch (err) {
-                    error.MissingResource => return try jsonErrorResponse(self.alloc, 400, "missing resource"),
-                    error.MissingResourceType => return try jsonErrorResponse(self.alloc, 400, "missing resourceType"),
-                    error.InvalidResourceType => return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
-                    error.InvalidArgument => return try jsonErrorResponse(self.alloc, 400, "invalid query parameter"),
-                    else => return err,
-                };
-                manager.removePermissionFromUser(
-                    user_path.user_name,
-                    params.resource,
-                    usermgr.ResourceType.fromSlice(params.resource_type) catch return try jsonErrorResponse(self.alloc, 400, "invalid resourceType"),
-                ) catch |err| switch (err) {
-                    error.UserNotFound, error.RoleNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-            if (routes.Routes.matchUserRoles(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer query_arena_impl.deinit();
-                const params = parseRemoveRoleFromUserParams(query_arena_impl.allocator(), uri_parts.query) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "missing role");
-                };
-                manager.removeRoleFromUser(user_path.user_name, params.role) catch |err| switch (err) {
-                    error.UserNotFound, error.RoleNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchUserApiKeys(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const keys = manager.listApiKeys(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeApiKeys(self.alloc, keys);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.ApiKey, keys.len);
-                for (keys, 0..) |api_key, i| {
-                    generated[i] = try apiKeyToOpenApi(arena, api_key);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchUserApiKeys(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var create_req = parseCreateApiKeyRequest(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid api key request");
-                };
-                defer create_req.deinit(self.alloc);
-                var created = manager.createApiKey(
-                    user_path.user_name,
-                    create_req.name,
-                    create_req.permissions,
-                    create_req.row_filter,
-                    create_req.expires_at_ns,
-                ) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    error.PrivilegeEscalation => return try jsonErrorResponse(self.alloc, 403, "privilege escalation"),
-                    else => return err,
-                };
-                defer created.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try createdApiKeyToOpenApi(arena_impl.allocator(), created);
-                return try jsonResponseWithStatus(self.alloc, 201, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchUserApiKey(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.deleteApiKey(user_path.user_name, user_path.key_id) catch |err| switch (err) {
-                    error.ApiKeyNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .GET) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.auth_subjects)) {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const subjects = try manager.listAuthSubjects();
-                defer freeAuthSubjects(self.alloc, subjects);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                return try jsonResponse(self.alloc, try authSubjectsToResponse(arena_impl.allocator(), subjects));
-            }
-            if (routes.Routes.matchSubjectRowFilters(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const row_filters = try manager.listSubjectRowFilters(subject_path.subject);
-                defer freeRowFilters(self.alloc, row_filters);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.RowFilterEntry, row_filters.len);
-                for (row_filters, 0..) |entry, i| {
-                    generated[i] = try rowFilterEntryToOpenApi(arena, entry);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const filter_json = manager.getSubjectRowFilter(subject_path.subject, subject_path.table) catch |err| switch (err) {
-                    error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer self.alloc.free(filter_json);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(subject_path.table),
-                    .filter = @constCast(filter_json),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilters(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const row_filters = manager.listRowFilters(user_path.user_name) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer freeRowFilters(self.alloc, row_filters);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const generated = try arena.alloc(usermgr_openapi.RowFilterEntry, row_filters.len);
-                for (row_filters, 0..) |entry, i| {
-                    generated[i] = try rowFilterEntryToOpenApi(arena, entry);
-                }
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                const filter_json = manager.getRowFilter(user_path.user_name, user_path.table) catch |err| switch (err) {
-                    error.UserNotFound, error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                defer self.alloc.free(filter_json);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(user_path.table),
-                    .filter = @constCast(filter_json),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var parsed_filter = usermgr_openapi.server.parseSetSubjectRowFilterBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                defer parsed_filter.deinit();
-                const normalized_filter = try std.json.Stringify.valueAlloc(self.alloc, parsed_filter.value, .{});
-                defer self.alloc.free(normalized_filter);
-                validateAuthRowFilterJson(self.alloc, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                manager.setSubjectRowFilter(subject_path.subject, subject_path.table, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(subject_path.table),
-                    .filter = @constCast(normalized_filter),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                var parsed_filter = usermgr_openapi.server.parseSetRowFilterBody(self.alloc, req.body) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                defer parsed_filter.deinit();
-                const normalized_filter = try std.json.Stringify.valueAlloc(self.alloc, parsed_filter.value, .{});
-                defer self.alloc.free(normalized_filter);
-                validateAuthRowFilterJson(self.alloc, normalized_filter) catch {
-                    return try jsonErrorResponse(self.alloc, 400, "invalid row filter");
-                };
-                manager.setRowFilter(user_path.user_name, user_path.table, normalized_filter) catch |err| switch (err) {
-                    error.UserNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return try jsonErrorResponse(self.alloc, 400, "invalid row filter"),
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const generated = try rowFilterEntryToOpenApi(arena_impl.allocator(), .{
-                    .table = @constCast(user_path.table),
-                    .filter = @constCast(normalized_filter),
-                });
-                return try jsonResponse(self.alloc, generated);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchSubjectRowFilter(uri_parts.path)) |subject_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.removeSubjectRowFilter(subject_path.subject, subject_path.table) catch |err| switch (err) {
-                    error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-            if (routes.Routes.matchUserRowFilter(uri_parts.path)) |user_path| {
-                const manager = self.cfg.user_manager orelse return try jsonErrorResponse(self.alloc, 503, "user management not configured");
-                manager.removeRowFilter(user_path.user_name, user_path.table) catch |err| switch (err) {
-                    error.UserNotFound, error.RowFilterNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        return null;
-    }
+    pub fn executeQueryBuilderAgent(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
+            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
+        defer parsed.deinit();
+        if (parsed.value.intent.len == 0)
+            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
+        comptime std.debug.assert(request_admission_policy.publicOperationClass("queryBuilderAgent").? == .query);
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
 
-    fn dispatchSecretRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.secrets)) {
-            const listed = if (self.cfg.secret_store) |secret_store|
-                try secret_store.list(self.alloc)
-            else
-                try common_secrets.listEnvironmentSecrets(self.alloc);
-            defer common_secrets.freeListedSecrets(self.alloc, listed);
-            const secret_list = try makeSecretList(self.alloc, listed);
-            defer self.alloc.free(secret_list.secrets);
-            return try jsonResponse(self.alloc, secret_list);
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchSecretPath(uri_parts.path)) |secret_path| {
-                const secret_store = self.cfg.secret_store orelse return try textResponse(self.alloc, 503, "secret management not available in multi-node mode");
-                var parsed = metadata_openapi.server.parsePutSecretBody(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid secret request");
-                };
-                defer parsed.deinit();
-                var listed = secret_store.put(self.alloc, secret_path.key, parsed.value.value) catch |err| switch (err) {
-                    error.InvalidSecretKey => return try textResponse(self.alloc, 400, "invalid secret key"),
-                    else => return err,
-                };
-                defer listed.deinit(self.alloc);
-                return try jsonResponse(self.alloc, makeSecretEntry(listed));
+        var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
+        defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
+        var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
+        if (parsed.value.table) |table_name| {
+            if (authenticated_identity) |identity| {
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
             }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchSecretPath(uri_parts.path)) |secret_path| {
-                const secret_store = self.cfg.secret_store orelse return try textResponse(self.alloc, 503, "secret management not available in multi-node mode");
-                if (!(try secret_store.delete(secret_path.key))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        return null;
-    }
-
-    fn dispatchTransactionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions)) {
-                const sessions = try self.txn_sessions.listStatusesForPrincipal(
-                    self.alloc,
-                    transactionPrincipal(authenticated_identity),
-                );
-                defer self.alloc.free(sessions);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionListResponse(arena_impl.allocator(), sessions);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_cleanup)) {
-            const now_ns = platform_time.realtimeNs();
-            const cutoff_ns = if (try parseUnsignedQueryParam(uri_parts.query, "cutoff_ns")) |explicit_cutoff|
-                explicit_cutoff
-            else if (self.cfg.session_ttl_ns) |ttl_ns|
-                now_ns -| ttl_ns
-            else
-                return try textResponse(self.alloc, 400, "missing cutoff");
-            const removed = try self.cleanupExpiredSessions(cutoff_ns);
-            return try jsonResponse(self.alloc, transactions_api.buildSessionCleanupResponse(removed, cutoff_ns));
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.eval)) {
-            var parsed = metadata_openapi.server.parseEvaluateBody(self.alloc, req.body) catch {
-                return try jsonErrorResponse(self.alloc, 400, "invalid eval request");
-            };
-            defer parsed.deinit();
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const response = retrieval_agent.buildEvalResponse(arena_impl.allocator(), parsed.value) catch |err| switch (err) {
-                error.InvalidEvalRequest => return try jsonErrorResponse(self.alloc, 400, "invalid eval request"),
+            table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
+                error.TableNotFound => return try contextual_operations.jsonErrorAlloc(self.alloc, 404, "not found"),
                 else => return err,
             };
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.agents_query_builder)) {
-            var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, req.body) catch {
-                return try jsonErrorResponse(self.alloc, 400, "invalid query builder request");
-            };
-            defer parsed.deinit();
-            if (parsed.value.intent.len == 0) return try jsonErrorResponse(self.alloc, 400, "invalid query builder request");
-
-            var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
-            defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
-            var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
-            if (parsed.value.table) |table_name| {
-                if (self.cfg.auth_enabled) {
-                    const identity = authenticated_identity orelse return try unauthorizedResponse(self.alloc);
-                    if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
-                        return try jsonErrorResponse(self.alloc, 403, "forbidden");
-                    }
-                }
-                table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
-                    error.TableNotFound => return try jsonErrorResponse(self.alloc, 404, "not found"),
-                    else => return err,
+            if (self.table_reads) |reads| {
+                runtime_validator_context = .{
+                    .server = self,
+                    .source = reads,
+                    .table_name = table_name,
+                    .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
                 };
-                if (self.table_reads) |reads| {
-                    runtime_validator_context = .{
-                        .server = self,
-                        .source = reads,
-                        .table_name = table_name,
-                        .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
-                    };
-                    table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
-                }
-            }
-
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const QueryBuilderGenerationRunner = struct {
-                antfly_provider: ?managed_embedder.AntflyProvider,
-                secret_store: ?*common_secrets.FileStore,
-                inference_api_key: ?[]const u8,
-                io: std.Io,
-
-                fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
-                    return .{
-                        .ptr = runner,
-                        .vtable = &.{ .execute_chain = executeChain },
-                    };
-                }
-
-                fn executeChain(
-                    ptr: *anyopaque,
-                    alloc: std.mem.Allocator,
-                    chain: []const generating_runtime.ChainLink,
-                    messages: []const generating_runtime.ChatMessage,
-                ) !generating_runtime.GenerateResult {
-                    const runner: *@This() = @ptrCast(@alignCast(ptr));
-                    var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
-                    defer client.deinit();
-                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
-                }
-            };
-            var generation_runner = QueryBuilderGenerationRunner{
-                .antfly_provider = self.antfly_provider,
-                .secret_store = self.cfg.secret_store,
-                .inference_api_key = self.cfg.inference_api_key,
-                .io = self.inferenceIo(),
-            };
-            var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
-            const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
-                error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
-                error.DocIdentityNamespaceMismatch => return try jsonErrorResponse(self.alloc, 503, "doc identity unavailable"),
-                error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-                error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-                error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-                error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-                error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-                error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
-                else => {
-                    if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
-                    return err;
-                },
-            };
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTransactionSession(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var details = (self.txn_sessions.getDetails(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                defer details.deinit(self.alloc);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionDetailsResponse(arena_impl.allocator(), details);
-                return try jsonResponse(self.alloc, response);
+                table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
             }
         }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_begin)) {
-                const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction begin request");
-                };
-                const session = self.txn_sessions.beginForPrincipal(
-                    self.alloc,
-                    begin_req,
-                    self.localSessionNodeId(),
-                    transactionPrincipal(authenticated_identity),
-                ) catch |err| switch (err) {
-                    error.SessionLimitExceeded => return try textResponse(self.alloc, 429, "transaction session limit exceeded"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
-                return try jsonResponseWithStatus(self.alloc, 201, response);
+
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const QueryBuilderGenerationRunner = struct {
+            antfly_provider: ?managed_embedder.AntflyProvider,
+            secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
+            io: std.Io,
+
+            fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
+                return .{ .ptr = runner, .vtable = &.{ .execute_chain = executeChain } };
             }
-        }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions_commit)) {
-                const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                var commit_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.InvalidTransactionCommitRequest => {
-                        return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                    },
-                    else => return err,
-                };
-                defer commit_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
 
-                const distributed_tables = try commit_req.distributedTables(self.alloc);
-                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    else => return err,
-                };
-                if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildCommitResponse(
-                        arena_impl.allocator(),
-                        "aborted",
-                        conflict,
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                const outcome = (source.commitTransaction(self.alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    error.TopologyChanged => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DecisionConflict => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DocIdentityNamespaceMismatch => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.TxnNotFound, error.InvalidTxnRecord => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            transactions_api.tornStateConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.CommitVisibilityNotSatisfied => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "committed_visibility_pending",
-                            null,
-                            commit_req.tables,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
-                    },
-                    error.CommitPropagationIncomplete => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "committed_recovery_pending",
-                            null,
-                            commit_req.tables,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
-                    },
-                    error.CommitDecisionUnknown => return try textResponse(
-                        self.alloc,
-                        500,
-                        "transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits",
-                    ),
-                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction coordinator is temporarily unavailable",
-                    ),
-                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                switch (outcome) {
-                    .committed => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
-                        return try jsonResponseOmitNullOptionals(self.alloc, response);
-                    },
-                    .conflict => |conflict| {
-                        const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildCommitResponse(
-                            arena_impl.allocator(),
-                            "aborted",
-                            enriched_conflict,
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                }
+            fn executeChain(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                }, messages);
             }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionRead(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var read_req = transactions_api.parseStageReadPayload(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction read request");
-                };
-                defer read_req.deinit(self.alloc);
-                if (!transactionTablePermissionAllowed(authenticated_identity, read_req.table_name, .read)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                var owned_snapshot: transactions_api.SessionReadSnapshot = (self.txn_sessions.getReadSnapshot(self.alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse .{
-                    .table_name = try self.alloc.dupe(u8, read_req.table_name),
-                    .key = try self.alloc.dupe(u8, read_req.key),
-                    .version = 0,
-                    .document_json = null,
-                };
-                defer owned_snapshot.deinit(self.alloc);
-
-                if (owned_snapshot.version == 0 and self.table_reads != null) {
-                    const fetched = try self.lookupStageReadSnapshot(read_req.table_name, read_req.key);
-                    if (owned_snapshot.document_json) |document_json| self.alloc.free(document_json);
-                    self.alloc.free(owned_snapshot.table_name);
-                    self.alloc.free(owned_snapshot.key);
-                    owned_snapshot = .{
-                        .table_name = try self.alloc.dupe(u8, fetched.table_name),
-                        .key = try self.alloc.dupe(u8, fetched.key),
-                        .version = fetched.version,
-                        .document_json = if (fetched.document_json) |document_json| try self.alloc.dupe(u8, document_json) else null,
-                    };
-                    if (fetched.document_json) |document_json| self.alloc.free(document_json);
-                } else if (owned_snapshot.version == 0) {
-                    owned_snapshot.version = read_req.version;
-                }
-                if (!(try self.transactionReadSnapshotVisible(
-                    authenticated_identity,
-                    owned_snapshot.table_name,
-                    owned_snapshot.key,
-                    owned_snapshot.document_json,
-                ))) {
-                    if (owned_snapshot.document_json) |document_json| {
-                        self.alloc.free(document_json);
-                        owned_snapshot.document_json = null;
-                    }
-                    owned_snapshot.version = 0;
-                }
-                if (owned_snapshot.version != read_req.version) {
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        "conflict",
-                        transactions_api.versionConflict(read_req.table_name, read_req.key, read_req.version, owned_snapshot.version),
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                var stage_req = try transactions_api.ownedRequestFromStageReadRequest(self.alloc, read_req);
-                defer stage_req.deinit(self.alloc);
-
-                const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageReadResponse(arena_impl.allocator(), session.txn_id, owned_snapshot.stage());
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionWrite(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var stage_req = transactions_api.parseStageWriteRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction write request");
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionDelete(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                var stage_req = transactions_api.parseStageDeleteRequest(self.alloc, req.body) catch {
-                    return try textResponse(self.alloc, 400, "invalid transaction delete request");
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionSavepoints(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSavepointResponse(arena_impl.allocator(), info);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionRollback(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildRollbackResponse(arena_impl.allocator(), info);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionStage(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                var stage_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.InvalidTransactionCommitRequest => {
-                        return try textResponse(self.alloc, 400, "invalid transaction stage request");
-                    },
-                    else => return err,
-                };
-                defer stage_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
-                    error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionCommit(uri_parts.path)) |session_route| {
-                const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                const session = self.txn_sessions.getInfo(txn_id) orelse return try textResponse(self.alloc, 404, "not found");
-
-                var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
-                defer if (parsed_req) |*commit_req| commit_req.deinit(self.alloc);
-                if (!transactions_api.isEmptySessionCommitBody(req.body)) {
-                    parsed_req = transactions_api.parseCommitRequest(self.alloc, req.body) catch |err| switch (err) {
-                        error.InvalidTransactionCommitRequest => {
-                            return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                        },
-                        else => return err,
-                    };
-                }
-                var commit_req = (self.txn_sessions.cloneCommitRequest(self.alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
-                    error.TransactionCommitRequestMismatch => {
-                        return try textResponse(self.alloc, 409, "transaction commit retry body does not match the sealed request");
-                    },
-                    error.SessionLeaseLost => {
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    else => return err,
-                }) orelse {
-                    return try textResponse(self.alloc, 400, "transaction has no staged writes");
-                };
-                defer commit_req.deinit(self.alloc);
-                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-
-                if (try self.txn_sessions.getTerminalCommit(self.alloc, txn_id)) |terminal_value| {
-                    var terminal = terminal_value;
-                    defer terminal.deinit(self.alloc);
-                    var status = terminal.status;
-                    // A pending terminal state still requires commit replay;
-                    // acknowledging the coordinator here would release the
-                    // topology fence and strand the durable API response.
-                    if (status == .committed and !terminal.coordinator_acknowledged) {
-                        if (terminal.coordinator_group_id) |coordinator_group_id| {
-                            const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                            const acknowledged = source.acknowledgeTransactionCommit(
-                                self.alloc,
-                                txn_id,
-                                coordinator_group_id,
-                                coordinator_table_name,
-                            ) catch |err| blk: {
-                                std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            };
-                            if (acknowledged == null) {
-                                status = .committed_recovery_pending;
-                            } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
-                                std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            }) == null) {
-                                // The replicated ACK is idempotent, but until
-                                // its receipt is durable the API handoff still
-                                // requires recovery and must not report 200.
-                                status = .committed_recovery_pending;
-                            }
-                        }
-                    }
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        status.text(),
-                        null,
-                        commit_req.tables,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(
-                        self.alloc,
-                        if (status == .committed) 200 else 202,
-                        response,
-                    );
-                }
-
-                const distributed_tables = try commit_req.distributedTables(self.alloc);
-                defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
-                self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    else => return err,
-                };
-                if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    _ = self.txn_sessions.remove(self.alloc, txn_id);
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response = try transactions_api.buildSessionCommitResponse(
-                        arena_impl.allocator(),
-                        txn_id,
-                        "aborted",
-                        conflict,
-                        null,
-                    );
-                    return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                }
-
-                // This durable marker closes the crash window between the
-                // first successful 2PC decision and persistence of the API
-                // terminal response. Maintenance can safely replay the sealed
-                // request with the same transaction ID after this point.
-                _ = (self.txn_sessions.markCommitExecutionStarted(self.alloc, txn_id) catch |err| switch (err) {
-                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                const outcome = (source.commitTransactionWithId(self.alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-                    error.InvalidBatchRequest,
-                    error.InvalidArgument,
-                    error.InvalidGraphEdges,
-                    error.UnsupportedTransformOperation,
-                    => {
-                        // The participant has terminally aborted a transaction
-                        // that reached write validation; do not retain a local
-                        // session that can no longer be committed with its ID.
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 400, "invalid transaction commit request");
-                    },
-                    error.TopologyChanged => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DecisionConflict => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.DocIdentityNamespaceMismatch => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.UnsupportedOperation => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 405, "method not allowed");
-                    },
-                    error.TableNotFound => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        return try textResponse(self.alloc, 404, "not found");
-                    },
-                    error.UnknownGroup => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            transactions_api.participantUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                    error.CommitVisibilityNotSatisfied => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed, but the requested visibility barrier was not reached",
-                    ),
-                    error.CommitPropagationIncomplete => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed; participant recovery is pending",
-                    ),
-                    error.CommitDecisionUnknown => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction outcome is unknown; retry this transaction id",
-                    ),
-                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction coordinator is temporarily unavailable",
-                    ),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-
-                switch (outcome) {
-                    .committed => |committed| {
-                        var status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
-                            .committed_recovery_pending
-                        else if (committed.visibility_pending)
-                            .committed_visibility_pending
-                        else
-                            .committed;
-                        _ = (self.txn_sessions.recordTerminalCommit(
-                            self.alloc,
-                            txn_id,
-                            status,
-                            committed.coordinator_group_id,
-                            committed.coordinator_table_name,
-                        ) catch |err| {
-                            std.log.err("failed to persist stable transaction terminal result txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                            return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
-                        }) orelse return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
-
-                        if (status == .committed) {
-                            if (committed.coordinator_group_id) |coordinator_group_id| {
-                                const coordinator_table_name = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                                const acknowledged = source.acknowledgeTransactionCommit(
-                                    self.alloc,
-                                    txn_id,
-                                    coordinator_group_id,
-                                    coordinator_table_name,
-                                ) catch |err| blk: {
-                                    std.log.warn("stable transaction coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    break :blk null;
-                                };
-                                if (acknowledged == null) {
-                                    status = .committed_recovery_pending;
-                                } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
-                                    std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    break :blk null;
-                                }) == null) {
-                                    status = .committed_recovery_pending;
-                                }
-                            }
-                        }
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, status.text(), null, commit_req.tables);
-                        return try jsonResponseWithStatusOmitNullOptionals(
-                            self.alloc,
-                            if (status == .committed) 200 else 202,
-                            response,
-                        );
-                    },
-                    .conflict => |conflict| {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
-                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                        defer arena_impl.deinit();
-                        const response = try transactions_api.buildSessionCommitResponse(
-                            arena_impl.allocator(),
-                            txn_id,
-                            "aborted",
-                            enriched_conflict,
-                            null,
-                        );
-                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
-                    },
-                }
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTransactionSessionAbort(uri_parts.path)) |session_route| {
-                const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
-                if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
-                    return try textResponse(self.alloc, 404, "not found");
-                }
-                if (try self.txn_sessions.getTerminalCommit(self.alloc, txn_id)) |terminal_value| {
-                    var terminal = terminal_value;
-                    defer terminal.deinit(self.alloc);
-                    return try textResponse(self.alloc, 409, "transaction is already committed");
-                }
-                if (!self.txn_sessions.remove(self.alloc, txn_id)) return try textResponse(self.alloc, 404, "not found");
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildAbortResponse(arena_impl.allocator(), txn_id);
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        return null;
+        };
+        var generation_runner = QueryBuilderGenerationRunner{
+            .antfly_provider = self.antfly_provider,
+            .secret_store = self.cfg.secret_store,
+            .inference_api_key = self.cfg.inference_api_key,
+            .io = self.inferenceIo(),
+        };
+        var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
+        const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(
+            arena_impl.allocator(),
+            parsed.value,
+            &collected_context,
+            generation_runner.iface(),
+        ) catch |err| return switch (err) {
+            error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request"),
+            error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
+            error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try contextual_operations.jsonErrorAlloc(self.alloc, 504, "query embedding timed out"),
+            else => return err,
+        };
+        return contextual_operations.json(
+            try std.fmt.allocPrint(self.alloc, "{f}", .{std.json.fmt(response, .{})}),
+            false,
+        );
     }
 
-    fn internalQueryPlanningContext(self: *ApiHttpServer) ?http_internal_group_read_routes.QueryPlanningContext {
+    fn internalQueryPlanningContext(self: *ApiHttpServer) ?internal_query_operations.QueryPlanningContext {
         return .{
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return null,
@@ -5669,48 +4679,18 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn internalRoutesContext(self: *ApiHttpServer, uri_parts: UriParts) http_internal_routes.Context {
+    pub fn internalQueryContext(self: *ApiHttpServer) internal_query_operations.Context {
         return .{
-            .alloc = self.alloc,
-            .path = uri_parts.path,
-            .query = uri_parts.query,
-            .read_ctx = .{
-                .alloc = self.alloc,
-                .reads = self.table_reads,
-                .catalog = .{
-                    .ptr = self.source.ptr,
-                    .admin_snapshot = self.source.vtable.admin_snapshot,
-                    .free_admin_snapshot = self.source.vtable.free_admin_snapshot,
-                },
-                .query_router = .{
-                    .ptr = self,
-                    .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
-                },
-                .query_planning = self.internalQueryPlanningContext(),
+            .catalog = .{
+                .ptr = self.source.ptr,
+                .admin_snapshot = self.source.vtable.admin_snapshot,
+                .free_admin_snapshot = self.source.vtable.free_admin_snapshot,
             },
-            .join_ctx = self.joinContext(),
-            .join_job_store = &self.join_job_store,
-            .write_ctx = .{
-                .alloc = self.alloc,
-                .shard_ops = self.cfg.shard_ops,
-                .shard_db_adapter = self.cfg.shard_db_adapter,
-                .writes = self.table_writes,
-                .routed_raft_batch_writer = self.cfg.routed_raft_batch_writer,
-                .repair_job_store = &self.repair_job_store,
-                .repair_cancel_executor = self.cfg.session_executor,
-                .batch_validator = .{
-                    .ptr = self,
-                    .validate = validateInternalGroupBatchWrites,
-                },
-                .txn_validator = .{
-                    .ptr = self,
-                    .validate = validateInternalGroupTxnWrites,
-                },
-            },
-            .retrieval_executor = .{
+            .query_router = .{
                 .ptr = self,
-                .execute = executeInternalRetrievalRoute,
+                .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
             },
+            .query_planning = self.internalQueryPlanningContext(),
         };
     }
 
@@ -5728,6 +4708,12 @@ pub const ApiHttpServer = struct {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
         };
+        comptime std.debug.assert(request_admission_policy.publicOperationClass("retrievalAgent").? == .query);
+        if (!self.tryAcquireQuery()) {
+            try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
+            return;
+        }
+        defer self.releaseQuery();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -5739,11 +4725,27 @@ pub const ApiHttpServer = struct {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn authorizeQuery(
+                ptr_inner: *anyopaque,
+                table_name: []const u8,
+                discovers_tree_roots: bool,
+            ) !void {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                const identity = runner.authenticated_identity orelse return;
+                if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                    return error.Forbidden;
+                // Root discovery probes the physical reverse index, which
+                // cannot yet distinguish parents hidden by a row filter.
+                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                    return error.Forbidden;
             }
 
             fn runQuery(
@@ -5753,6 +4755,10 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 var semantic_resolver = runner.server.semanticStatusResolver(
                     runner.query_embedding_security_scope.domain,
                     runner.query_embedding_security_scope.value,
@@ -5804,6 +4810,10 @@ pub const ApiHttpServer = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                }
                 return try runner.server.scanRetrievalKeyPage(
                     inner_alloc,
                     runner.source,
@@ -5824,6 +4834,12 @@ pub const ApiHttpServer = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                if (runner.authenticated_identity) |identity| {
+                    if (!permissionsAllow(identity.permissions, .table, table_name, .read))
+                        return error.Forbidden;
+                    if (effectiveRowFilterJson(identity, table_name) != null)
+                        return error.Forbidden;
+                }
                 return try runner.server.probeRetrievalIncomingEdges(
                     inner_alloc,
                     runner.source,
@@ -5927,6 +4943,10 @@ pub const ApiHttpServer = struct {
                 try queue.status(alloc, task_id, context_id, "failed", "not found");
                 return;
             },
+            error.Forbidden => {
+                try queue.status(alloc, task_id, context_id, "failed", "forbidden");
+                return;
+            },
             error.DocIdentityNamespaceMismatch => {
                 try queue.status(alloc, task_id, context_id, "failed", "doc identity unavailable");
                 return;
@@ -5952,11 +4972,10 @@ pub const ApiHttpServer = struct {
         defer alloc.free(retrieval_resp.body);
     }
 
-    fn executeInternalRetrievalRoute(ptr: *anyopaque, req: http_common.HttpRequest, path: []const u8) !?http_common.HttpResponse {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (req.method != .POST or !std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return null;
-
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+    /// Execute the internal retrieval worker protocol without manufacturing
+    /// an HTTP request. The caller owns `response.body` with `self.alloc`.
+    pub fn executeInternalRetrieval(self: *ApiHttpServer, body: []const u8) !retrieval_agent.EncodedResponse {
+        const source = self.table_reads orelse return error.TableNotFound;
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -6079,687 +5098,7 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        const retrieval_resp = retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), req.body) catch |err| switch (err) {
-            error.TreeRootSetTooLarge => return try textResponse(self.alloc, 422, "tree root set exceeds the bounded retrieval limit"),
-            error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
-            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => return try textResponse(self.alloc, 504, "query embedding timed out"),
-            else => {
-                if (try queryEmbeddingOperationalResponse(self.alloc, err)) |operational_response| return operational_response;
-                std.log.err("public retrieval failed err={}", .{err});
-                return err;
-            },
-        };
-        defer self.alloc.free(retrieval_resp.body);
-        if (std.mem.eql(u8, retrieval_resp.content_type, "text/event-stream")) {
-            return try eventStreamResponse(self.alloc, 200, retrieval_resp.body);
-        }
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_impl.deinit();
-        const response = try parseJsonResponseBody(metadata_openapi.RetrievalAgentResult, arena_impl.allocator(), retrieval_resp.body);
-        return try jsonResponse(self.alloc, response);
-    }
-
-    fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const params = parseListBackupsParams(query_arena_impl.allocator(), uri_parts.query) catch return try textResponse(self.alloc, 400, "invalid backup list parameters");
-            return try self.handlePublicClusterBackupList(params.location, params.connection, .{
-                .limit = params.limit,
-                .cursor = params.cursor,
-            });
-        }
-        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.tables)) {
-            var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-            defer self.source.freeAdminSnapshot(&snapshot);
-            var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer query_arena_impl.deinit();
-            const params = try parseListTablesParams(query_arena_impl.allocator(), uri_parts.query);
-            if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
-            const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, params.prefix);
-            defer if (storage_statuses) |items| self.alloc.free(items);
-            var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_impl.deinit();
-            const response = try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, params.prefix, storage_statuses);
-            return try jsonResponse(self.alloc, response);
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableIndexes(uri_parts.path)) |table_indexes| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_indexes.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableListIndexes(table_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                if (runtimeSchemaDebugRequested(uri_parts.query)) {
-                    if (!self.runtimeSchemaDebugAllowed(authenticated_identity)) return try textResponse(self.alloc, 403, "forbidden");
-                    var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                    defer self.source.freeAdminSnapshot(&snapshot);
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const arena = arena_impl.allocator();
-                    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try textResponse(self.alloc, 404, "not found");
-                    var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
-                    defer if (local_statuses) |*status| status.deinit(self.alloc);
-                    const body = (indexes_api.encodeSingleIndex(
-                        arena,
-                        &snapshot,
-                        table_name,
-                        index_name,
-                        if (local_statuses) |*status| status else null,
-                    ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
-                    var value = parseOwnedJsonValueAlloc(arena, body) catch return try textResponse(self.alloc, 500, "index lookup failed");
-                    if (value != .object) return try textResponse(self.alloc, 500, "index lookup failed");
-                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
-                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-                    try value.object.put(
-                        arena,
-                        try arena.dupe(u8, "debug"),
-                        try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed_dynamic_capability_sets),
-                    );
-                    return try jsonResponse(self.alloc, value);
-                }
-                return try self.handlePublicTableGetIndex(table_name, index_name);
-            }
-        }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
-            return try self.handlePublicClusterBackup(req.body);
-        }
-        if (req.method == .POST) {
-            if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                return try self.handlePublicClusterRestore(
-                    req.body,
-                    req.header("idempotency-key"),
-                    if (authenticated_identity) |identity| identity.username else null,
-                );
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableBackup(uri_parts.path)) |table_backup| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_backup.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableBackup(table_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableRestore(
-                    table_name,
-                    req.body,
-                    req.header("idempotency-key"),
-                    if (authenticated_identity) |identity| identity.username else null,
-                );
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableArtifactRepair(uri_parts.path)) |repair_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicListArtifactRepairIssues(table_name, req.body);
-            }
-            if (routes.Routes.matchTableArtifactRepairRun(uri_parts.path)) |repair_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, repair_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicRunTableRepair(table_name, req.body);
-            }
-            if (routes.Routes.matchTableRepairJobs(uri_parts.path)) |job_route| {
-                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair job requests use json body");
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicStartTableRepairJob(table_name, req.body);
-            }
-            if (routes.Routes.matchTableRepairJobAdvance(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
-            }
-            if (routes.Routes.matchTableRepairJobCancel(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicStartDocumentArtifactReprocessJob(table_name, job_route.artifact_name, req.body);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicCancelDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-            }
-            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicReprocessDocumentArtifactRange(table_name, artifact_route.artifact_name, req.body);
-            }
-            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicReprocessDocumentArtifact(table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                return try self.handlePublicTableCreateIndex(table_name, index_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
-                    if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
-                        std.log.err("create table request parsing failed: {} body_len={d}", .{ err, req.body.len });
-                        return err;
-                    }
-                    std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
-                    return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, req.body));
-                };
-                defer create_req.deinit(self.alloc);
-                const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
-                    self.alloc,
-                    create_req.indexes_json orelse tables_api.default_indexes_json,
-                    .{
-                        .antfly_provider = self.antfly_provider,
-                        .io = self.inferenceIo(),
-                        .secret_store = self.cfg.secret_store,
-                        .remote_content = self.cfg.remote_content,
-                        .inference_api_url = self.configuredInferenceAPIURL(),
-                        .inference_api_key = self.cfg.inference_api_key,
-                    },
-                ) catch |err| switch (err) {
-                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
-                    error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
-                    error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
-                    else => return err,
-                };
-                if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
-                create_req.indexes_json = normalized_indexes_json;
-                tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
-                    return try textResponse(self.alloc, 400, "unsupported table index configuration");
-                };
-                std.log.info("public create table begin table={s}", .{table_name});
-                const metadata_create_start_ns = platform_time.monotonicNs();
-                var metadata_create_attempts: usize = 0;
-                while (true) {
-                    metadata_create_attempts += 1;
-                    self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
-                        error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
-                        error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnexpectedHttpStatus => {
-                            const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                            if (!self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
-                                std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
-                                return err;
-                            }
-                            sleepNs(self.metadata_mutation_retry_policy.poll_ns);
-                            continue;
-                        },
-                        else => {
-                            if (metadata_authority.isRetryableError(err)) {
-                                const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
-                                if (self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
-                                    sleepNs(self.metadata_mutation_retry_policy.poll_ns);
-                                    continue;
-                                }
-                                return error.NotLeader;
-                            }
-                            std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
-                            return err;
-                        },
-                    };
-                    break;
-                }
-                std.log.info("public create table metadata done table={s}", .{table_name});
-                const local_create_handled = if (self.table_writes) |table_writes_source| blk: {
-                    break :blk (table_writes_source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
-                        error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
-                        else => {
-                            std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });
-                            return err;
-                        },
-                    }) != null;
-                } else false;
-                if (local_create_handled) {
-                    std.log.info("public create table wait projected presence table={s}", .{table_name});
-                    self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
-                        error.TableVisibilityTimeout => {
-                            std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
-                            return try textResponse(self.alloc, 500, "table create did not converge");
-                        },
-                        else => return err,
-                    };
-                    // A local standalone create is the write-readiness barrier:
-                    // the owned DB has already been opened and initialized before
-                    // createTable returns. Distributed mode additionally requires
-                    // the projected Raft voter quorum and leader to be observable;
-                    // accepting only catalog presence there would acknowledge a
-                    // table before another node can safely route writes to it.
-                    if (!self.cfg.deployment_mode.isStandalone()) {
-                        self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                            error.TableVisibilityTimeout => {
-                                std.log.err("public create table write quorum timed out table={s}", .{table_name});
-                                return try textResponse(self.alloc, 500, "table create did not converge");
-                            },
-                            else => return err,
-                        };
-                    }
-                } else {
-                    const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
-                        break :lifecycle switch (err) {
-                            error.TableVisibilityTimeout => {
-                                self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
-                                    error.TableVisibilityTimeout => {
-                                        std.log.err("public create table metadata lifecycle timed out table={s}", .{table_name});
-                                        return try textResponse(self.alloc, 500, "table create did not converge");
-                                    },
-                                    else => return fallback_err,
-                                };
-                                break :lifecycle true;
-                            },
-                            error.NotLeader => return err,
-                            else => {
-                                std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ table_name, err });
-                                return err;
-                            },
-                        };
-                    };
-                    if (!metadata_wait_handled) {
-                        std.log.info("public create table wait metadata visibility table={s}", .{table_name});
-                        self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
-                            error.TableVisibilityTimeout => {
-                                std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
-                                return try textResponse(self.alloc, 500, "table create did not converge");
-                            },
-                            else => return err,
-                        };
-                    }
-                }
-                std.log.info("public create table visible table={s}", .{table_name});
-
-                var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.source.freeAdminSnapshot(&snapshot);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_name, null)) orelse {
-                    return try textResponse(self.alloc, 404, "not found");
-                };
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        if (req.method == .PUT) {
-            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicPutArtifactEnrichment(table_name, artifact_route.artifact_name, req.body);
-            }
-            if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
-                defer self.alloc.free(table_name);
-                var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, req.body);
-                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch |err| {
-                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, req.body);
-                    return try textResponse(self.alloc, 400, invalid_schema_message);
-                };
-                defer self.alloc.free(schema_json);
-
-                const table_before = try self.loadOwnedTableRecord(self.alloc, table_name);
-                if (table_before == null) {
-                    _ = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                        error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
-                        error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => blk: {
-                            const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                                else => return write_err,
-                            } orelse return try textResponse(self.alloc, 404, "not found");
-                            break :blk null;
-                        },
-                        else => return err,
-                    };
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
-                    return try jsonResponse(self.alloc, value);
-                }
-                defer metadata_table_manager.freeTable(self.alloc, table_before.?);
-
-                var local_schema_applied = false;
-                const committed_version = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
-                    error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
-                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => blk: {
-                        const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                            else => return write_err,
-                        };
-                        local_schema_applied = true;
-                        break :blk null;
-                    },
-                    else => return err,
-                };
-                var expectation = try self.schemaProjectionExpectationAlloc(self.alloc, &table_before.?, schema_json, committed_version);
-                defer expectation.deinit(self.alloc);
-                self.waitForSchemaUpdateProjection(table_name, expectation, committed_version) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
-                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "schema update was superseded; retry request"),
-                    else => return err,
-                };
-                self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
-                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                    else => return write_err,
-                };
-
-                const body = try self.encodeSchemaUpdateResponse(table_name, schema_json);
-                defer self.alloc.free(body);
-                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDeleteArtifactEnrichment(table_name, artifact_route.artifact_name);
-            }
-            if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
-                defer self.alloc.free(table_name);
-                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
-                defer self.alloc.free(index_name);
-                return try self.handlePublicTableDeleteIndex(table_name, index_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableLookup(uri_parts.path)) |lookup| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, lookup.table_name);
-                defer self.alloc.free(table_name);
-                const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const decoded_key = try decodeRequestPathParamAlloc(self.alloc, lookup.key);
-                defer self.alloc.free(decoded_key);
-                var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
-                defer lookup_opts.deinit(self.alloc);
-                const consistency = parseLookupReadConsistency(uri_parts.query) catch {
-                    return try textResponse(self.alloc, 400, "invalid read consistency");
-                };
-
-                var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
-                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
-                    error.HAReadWaitForApply,
-                    error.HAReadWaitForMetadata,
-                    error.ReadUnavailable,
-                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted,
-                    error.StorageReadTemporarilyUnavailable,
-                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
-                    else => {
-                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
-                        return try textResponse(self.alloc, 500, "lookup failed");
-                    },
-                }) orelse {
-                    return try textResponse(self.alloc, 404, "not found");
-                };
-                defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-                defer if (row_filter_json) |value| self.alloc.free(value);
-                if (row_filter_json) |value| {
-                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
-                        return try textResponse(self.alloc, 404, "not found");
-                    }
-                }
-                var version_buf: [20]u8 = undefined;
-                const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
-                return try http_route_helpers.jsonWithHeadersResponse(self.alloc, 200, result.json, &.{
-                    .{
-                        .name = "X-Antfly-Version",
-                        .value = version,
-                    },
-                });
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableRepairJob(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableRepairJob(table_name, job_route.job_id);
-            }
-            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifests(table_name, artifact_route.key, uri_parts.query, authenticated_identity);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicDocumentArtifactManifest(table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTableArtifacts(uri_parts.path)) |artifact_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicListArtifactEnrichments(table_name);
-            }
-        }
-        if (req.method == .GET) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                if (runtimeSchemaDebugRequested(uri_parts.query) and !self.runtimeSchemaDebugAllowed(authenticated_identity)) {
-                    return try textResponse(self.alloc, 403, "forbidden");
-                }
-                var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.source.freeAdminSnapshot(&snapshot);
-                var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
-                if (runtimeSchemaDebugRequested(uri_parts.query)) {
-                    const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
-                    defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-                    if (storage_statuses != null) {
-                        storage_status_buf[0].observed_dynamic_field_capability_sets = observed_dynamic_capability_sets;
-                    }
-                    var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena_impl.deinit();
-                    const response =
-                        (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                    return try jsonResponse(self.alloc, response);
-                }
-                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
-                defer self.alloc.free(body);
-                return try jsonBodyResponseWithStatus(self.alloc, 200, body);
-            }
-        }
-        if (req.method == .DELETE) {
-            if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
-                defer self.alloc.free(table_name);
-                var local_drop_group_ids: ?[]u64 = null;
-                defer if (local_drop_group_ids) |group_ids| self.alloc.free(group_ids);
-                if (self.table_writes != null) {
-                    if (try self.source.adminSnapshot()) |snapshot_value| {
-                        var snapshot = snapshot_value;
-                        defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
-                    }
-                }
-                self.source.dropTable(self.alloc, table_name) catch |err| switch (err) {
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
-                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.NotLeader => return err,
-                    else => {
-                        std.log.err("public drop table metadata remove failed table={s} err={s}", .{
-                            table_name,
-                            @errorName(err),
-                        });
-                        return err;
-                    },
-                };
-                if (self.table_writes) |write_source| {
-                    const group_ids = local_drop_group_ids orelse &.{};
-                    _ = write_source.dropTable(self.alloc, table_name, group_ids) catch |err| switch (err) {
-                        error.TableNotFound => null,
-                        else => {
-                            std.log.err("public drop table local cleanup failed table={s} err={s}", .{
-                                table_name,
-                                @errorName(err),
-                            });
-                            return err;
-                        },
-                    };
-                }
-                self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => {
-                        std.log.err("public drop table metadata visibility timed out table={s}", .{table_name});
-                        return try textResponse(self.alloc, 500, "table delete did not converge");
-                    },
-                    else => return err,
-                };
-                return .{
-                    .status = 204,
-                    .content_type = null,
-                    .body = &.{},
-                };
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableScan(uri_parts.path)) |scan| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, scan.table_name);
-                defer self.alloc.free(table_name);
-                const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                var scan_req = http_route_helpers.parseScanKeysRequest(self.alloc, req.body) catch |err| {
-                    if (try http_route_helpers.scanRequestErrorResponse(self.alloc, err)) |response| {
-                        return response;
-                    }
-                    return err;
-                };
-                defer scan_req.deinit(self.alloc);
-
-                var result = (source.scan(
-                    self.alloc,
-                    table_name,
-                    scan_req.from,
-                    scan_req.to,
-                    scan_req.opts,
-                    .read_index,
-                ) catch |err| switch (err) {
-                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
-                    error.HAReadWaitForApply,
-                    error.HAReadWaitForMetadata,
-                    error.ReadUnavailable,
-                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted,
-                    error.StorageReadTemporarilyUnavailable,
-                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
-                    else => return err,
-                }) orelse return try textResponse(self.alloc, 404, "not found");
-                defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-                defer if (row_filter_json) |value| self.alloc.free(value);
-                if (row_filter_json) |value| {
-                    const filtered = try self.filterScanResultByRowFilter(self.alloc, source, table_name, result.ndjson, value);
-                    defer self.alloc.free(filtered);
-                    return try http_route_helpers.ndjsonResponse(self.alloc, 200, filtered);
-                }
-                return try http_route_helpers.ndjsonResponse(self.alloc, 200, result.ndjson);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, query_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, req.body, req.content_type, authenticated_identity, req.cancellation);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, batch_route.table_name);
-                defer self.alloc.free(table_name);
-                return try self.handlePublicTableBatch(table_name, req.body);
-            }
-        }
-        if (req.method == .POST) {
-            if (routes.Routes.matchTableMerge(uri_parts.path)) |merge_route| {
-                const table_name = try decodeRequestPathParamAlloc(self.alloc, merge_route.table_name);
-                defer self.alloc.free(table_name);
-                const reads = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const writes = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                if (!(try self.tableExists(table_name))) return try textResponse(self.alloc, 404, "not found");
-
-                var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
-                    error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
-                    error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-                defer merge_req.deinit(self.alloc);
-
-                self.validateTableWritesAgainstSchema(table_name, merge_req.writes) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const response = linear_merge_api.executeResponse(
-                    arena_impl.allocator(),
-                    reads,
-                    writes,
-                    table_name,
-                    merge_req,
-                ) catch |err| switch (err) {
-                    error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
-                    else => return err,
-                };
-                return try jsonResponse(self.alloc, response);
-            }
-        }
-        return null;
+        return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
     }
 
     pub fn localSessionNodeId(self: *ApiHttpServer) u64 {
@@ -6782,16 +5121,6 @@ pub const ApiHttpServer = struct {
         return try self.maybeRouteQueryToReadSchema(table_name, req);
     }
 
-    fn validateInternalGroupBatchWrites(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.validateTableWritesAgainstSchema(table_name, writes);
-    }
-
-    fn validateInternalGroupTxnWrites(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.validateTableWritesAgainstSchema(table_name, writes);
-    }
-
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -6805,6 +5134,9 @@ pub const ApiHttpServer = struct {
         query_req: db_mod.types.SearchRequest,
     ) !void {
         if (!publicSearchRequestHasSortPageControls(query_req)) return;
+        // Reject shape/source errors and finish synthetic-only sorts before
+        // opening table state or validating any physical column.
+        if (try validatePublicQuerySortRequestContract(query_req)) return;
 
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -6819,9 +5151,59 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
+        defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
+        const can_observe_physical_coverage = if (self.table_reads) |source|
+            source.supportsObservedDynamicFieldCapabilitySets()
+        else
+            false;
+        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0 or !can_observe_physical_coverage)
+            &.{}
+        else
+            try self.queryObservedDynamicFieldCapabilitySets(table_name, query_req, .{
+                .index_name = query_req.primary_text_index_name orelse query_req.index_name,
+                .fields = physical_sort_fields,
+                .coverage_read_mode = .validate,
+                .execution_deadline_ns = query_req.execution_deadline_ns,
+                .cancellation = query_req.cancellation,
+            });
         defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-        try validatePublicQuerySortCapabilitiesAgainstRuntime(query_req, runtime_schema, observed_dynamic_capability_sets);
+        try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+            query_req,
+            runtime_schema,
+            observed_dynamic_capability_sets,
+            can_observe_physical_coverage,
+        );
+    }
+
+    fn queryObservedDynamicFieldCapabilitySets(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query_req: db_mod.types.SearchRequest,
+        observation: table_reads.DynamicFieldObservationQuery,
+    ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
+        const source = self.table_reads orelse return &.{};
+        return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |err| switch (err) {
+            error.StorageReadTemporarilyUnavailable => {
+                // A cold provisioned table has not installed a resident query
+                // handle yet. Let the normal preflight retry protocol prepare
+                // it without making GET /tables perform cold index loading,
+                // then re-read the physical coverage used by sort admission.
+                var summary = (try source.preflightQuery(
+                    self.alloc,
+                    table_name,
+                    query_req,
+                    .read_index,
+                    0,
+                )) orelse return error.StorageReadTemporarilyUnavailable;
+                defer summary.deinit(self.alloc);
+                return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |retry_err| switch (retry_err) {
+                    error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+                    else => retry_err,
+                };
+            },
+            else => return err,
+        };
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
@@ -6862,8 +5244,21 @@ pub const ApiHttpServer = struct {
     pub fn maybeEncodeTableStatus(self: *ApiHttpServer, table_name: []const u8) !?[]u8 {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
+        if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
+        if (storage_statuses) |_| {
+            const observed = self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    std.log.debug("runtime field capability observation unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+                    return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+                },
+            };
+            defer self.freeObservedDynamicFieldCapabilitySets(observed);
+            storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+            return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+        }
         return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
     }
 
@@ -7659,6 +6054,77 @@ pub const ApiHttpServer = struct {
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
     }
 
+    pub fn shouldRetryConfiguredMetadataMutation(
+        self: *const ApiHttpServer,
+        err: anyerror,
+        elapsed_ns: u64,
+        attempt_count: usize,
+    ) bool {
+        return self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, attempt_count);
+    }
+
+    pub fn metadataMutationRetryPollNs(self: *const ApiHttpServer) u64 {
+        return self.metadata_mutation_retry_policy.poll_ns;
+    }
+
+    pub fn encodeTableRuntimeSchemaDebugAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]u8 {
+        var snapshot = (try self.source.adminSnapshot()) orelse return null;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
+        const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
+        const observed = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        if (storage_statuses != null) storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const response = (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(
+            arena_impl.allocator(),
+            &snapshot,
+            table_name,
+            storage_statuses,
+        )) orelse return null;
+        return try std.json.Stringify.valueAlloc(alloc, response, .{});
+    }
+
+    pub fn encodeIndexRuntimeSchemaDebugAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !?[]u8 {
+        var snapshot = (try self.source.adminSnapshot()) orelse return null;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+
+        var local_statuses = try self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot);
+        defer if (local_statuses) |*status| status.deinit(self.alloc);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        const body = (try indexes_api.encodeSingleIndex(
+            arena,
+            &snapshot,
+            table_name,
+            index_name,
+            if (local_statuses) |*status| status else null,
+        )) orelse return null;
+        var value = try parseOwnedJsonValueAlloc(arena, body);
+        if (value != .object) return error.InvalidIndexResponse;
+        const observed = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
+        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        try value.object.put(
+            arena,
+            try arena.dupe(u8, "debug"),
+            try tables_api.buildTableIndexRuntimeSchemaDebugValueWithObserved(arena, table, index_name, observed),
+        );
+        return try std.json.Stringify.valueAlloc(alloc, value, .{});
+    }
+
     pub fn documentArtifactManifestOptionsForRequest(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -7825,28 +6291,19 @@ pub const ApiHttpServer = struct {
         try self.waitForTableMetadata(table_name, expected_schema_json, expected_indexes_json);
     }
 
-    fn waitForIndexMetadataProjection(
+    fn isIndexMetadataProjected(
         self: *ApiHttpServer,
         table_name: []const u8,
         index_name: []const u8,
         expected_index_json: []const u8,
-    ) !void {
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const poll_interval_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
-        while (true) {
-            const table = try self.loadOwnedTableRecord(self.alloc, table_name);
-            if (table) |record| {
-                defer metadata_table_manager.freeTable(self.alloc, record);
-                const projected = try indexes_api.storedIndexConfigJsonAlloc(self.alloc, record.indexes_json, index_name);
-                if (projected) |config_json| {
-                    defer self.alloc.free(config_json);
-                    if (try jsonDocumentsEqual(self.alloc, config_json, expected_index_json)) return;
-                }
-            }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-            sleepNs(poll_interval_ns);
-        }
+    ) !bool {
+        const table = try self.loadOwnedTableRecord(self.alloc, table_name);
+        const record = table orelse return false;
+        defer metadata_table_manager.freeTable(self.alloc, record);
+        const projected = try indexes_api.storedIndexConfigJsonAlloc(self.alloc, record.indexes_json, index_name);
+        const config_json = projected orelse return false;
+        defer self.alloc.free(config_json);
+        return try jsonDocumentsEqual(self.alloc, config_json, expected_index_json);
     }
 
     fn hasLocalTableRuntime(self: *ApiHttpServer, table_name: []const u8) bool {
@@ -7947,6 +6404,8 @@ pub const ApiHttpServer = struct {
     fn backupOwnedTable(
         self: *ApiHttpServer,
         io: std.Io,
+        table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
         location_uri: []const u8,
@@ -7958,6 +6417,8 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(artifact_backup_id);
         return try self.backupOwnedTableWithArtifactId(
             io,
+            table,
+            fence,
             table_name,
             backup_location,
             location_uri,
@@ -7965,12 +6426,35 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             connection,
+            .logical_create,
         );
     }
+
+    const TableBackupWriterLeaseRole = enum {
+        /// Owns the logical reservation and may retire writer state once its
+        /// canonical manifest is durable.
+        logical_create,
+        /// A rolling-upgrade storage owner creates a same-ID lease on behalf
+        /// of an older coordinator. It must leave that fence for coordinator
+        /// resolution because the storage manifest is only an envelope.
+        legacy_forwarded_create,
+        /// A current storage owner adopts the coordinator-created generation.
+        adopt,
+
+        fn createsLease(self: @This()) bool {
+            return self != .adopt;
+        }
+
+        fn ownsCommittedRetirement(self: @This()) bool {
+            return self == .logical_create;
+        }
+    };
 
     fn backupOwnedTableWithArtifactId(
         self: *ApiHttpServer,
         io: std.Io,
+        table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
         location_uri: []const u8,
@@ -7978,14 +6462,101 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        writer_lease_role: TableBackupWriterLeaseRole,
     ) !void {
-        if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id))
+        if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
+        if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
+        if (try backups_api.manifestExistsAtLocationWithIo(self.alloc, io, backup_location, backup_id)) {
+            if (writer_lease_role.ownsCommittedRetirement()) {
+                _ = backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    backup_id,
+                ) catch |err| {
+                    std.log.warn("committed table backup writer-state reconciliation deferred class={s}", .{@errorName(err)});
+                    return error.BackupOutcomeAmbiguous;
+                };
+            }
             return error.BackupAlreadyExists;
-        try backups_api.reserveBackupAtLocation(self.alloc, io, backup_location, backup_id, false);
-        var committed = false;
-        var cleanup_safe = true;
-        errdefer if (!committed) {
-            if (cleanup_safe) {
+        }
+        const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+        var writer_fence = fence;
+        const initial_writer_lease_expiration = switch (writer_lease_role) {
+            .logical_create, .legacy_forwarded_create => admission_now +| backups_api.table_backup_writer_lease_duration_ns,
+            .adopt => writer_fence.writer_not_after_unix_ns orelse
+                admission_now +| backups_api.table_backup_writer_lease_duration_ns,
+        };
+        // Only creators can mint a delivery deadline. A rolling-upgrade
+        // coordinator that omitted the header still gets a finite writer
+        // lease, but its reservation remains explicitly legacy so cleanup
+        // retains the delayed-delivery tombstone permanently.
+        if (writer_lease_role == .logical_create)
+            writer_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
+        if (writer_lease_role == .adopt and
+            writer_fence.writer_not_after_unix_ns != null and
+            admission_now >= initial_writer_lease_expiration)
+            return error.BackupAttemptLeaseLost;
+        var reclaimed_stale_attempt = false;
+        while (true) {
+            backups_api.reserveTableBackupAttemptAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_fence,
+            ) catch |err| switch (err) {
+                error.BackupAlreadyExists => {
+                    const retained_artifact_id = backups_api.tableBackupAttemptArtifactIdAlloc(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                    ) catch return error.BackupAlreadyExists;
+                    if (retained_artifact_id) |value| {
+                        defer self.alloc.free(value);
+                        if (!reclaimed_stale_attempt) {
+                            const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+                            switch (backups_api.reclaimExpiredTableBackupAttemptAtLocation(
+                                self.alloc,
+                                io,
+                                backup_location,
+                                backup_id,
+                                now_unix_ns,
+                            ) catch return error.BackupOutcomeAmbiguous) {
+                                .reclaimed => {
+                                    reclaimed_stale_attempt = true;
+                                    continue;
+                                },
+                                .committed => return error.BackupAlreadyExists,
+                                .active => {},
+                            }
+                        }
+                        return error.BackupOutcomeAmbiguous;
+                    }
+                    return error.BackupAlreadyExists;
+                },
+                else => return err,
+            };
+            break;
+        }
+        var writer_lease_heartbeat: TableBackupWriterLeaseHeartbeat = .{
+            .alloc = self.alloc,
+            .io = io,
+            .location = backup_location,
+            .artifact_backup_id = artifact_backup_id,
+            .expires_at_unix_ns = .init(initial_writer_lease_expiration),
+        };
+        switch (writer_lease_role) {
+            .logical_create, .legacy_forwarded_create => backups_api.reserveTableBackupWriterLeaseAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                artifact_backup_id,
+                initial_writer_lease_expiration,
+            ) catch |err| {
                 backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
                     self.alloc,
                     io,
@@ -7993,38 +6564,167 @@ pub const ApiHttpServer = struct {
                     backup_id,
                     artifact_backup_id,
                     format,
-                ) catch |cleanup_err| {
-                    // A retained reservation fences retries when cleanup
-                    // cannot be confirmed, preventing new work from colliding
-                    // with orphans.
-                    std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
+                ) catch {};
+                return err;
+            },
+            .adopt => {
+                const adopt_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+                if (writer_fence.writer_not_after_unix_ns != null and
+                    adopt_now >= initial_writer_lease_expiration)
+                {
+                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        artifact_backup_id,
+                        format,
+                    ) catch {};
+                    return error.BackupAttemptLeaseLost;
+                }
+                writer_lease_heartbeat.ensureOwned() catch |err| {
+                    backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                        self.alloc,
+                        io,
+                        backup_location,
+                        backup_id,
+                        artifact_backup_id,
+                        format,
+                    ) catch {};
+                    return err;
                 };
-            } else {
-                // A transport error after starting conditional publication is
-                // ambiguous: the manifest may be visible. Keep both the data
-                // and reservation so no retry can destroy or overwrite a
-                // potentially committed backup.
-                std.log.err("table backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
+            },
+        }
+        const reservation_owned = backups_api.tableBackupAttemptMatchesAtLocation(
+            self.alloc,
+            io,
+            backup_location,
+            backup_id,
+            artifact_backup_id,
+        ) catch return error.BackupOutcomeAmbiguous;
+        if (!reservation_owned) {
+            if (writer_lease_role.createsLease()) {
+                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch false;
             }
+            return error.BackupAttemptLeaseLost;
+        }
+        var writer_lease_future = std.Io.async(
+            io,
+            TableBackupWriterLeaseHeartbeat.run,
+            .{&writer_lease_heartbeat},
+        );
+        var writer_lease_future_running = true;
+        defer if (writer_lease_future_running) {
+            writer_lease_heartbeat.stop_event.set(io);
+            writer_lease_future.await(io);
         };
-        const table = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
-        defer metadata_table_manager.freeTable(self.alloc, table);
-        if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
+        var cleanup_safe = true;
+        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
+            writer_lease_heartbeat.stop_event.set(io);
+            writer_lease_future.await(io);
+            writer_lease_future_running = false;
+            if (!cleanup_safe) {
+                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
+                return error.BackupOutcomeAmbiguous;
+            }
+            backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+            ) catch |cleanup_err| {
+                // A retained reservation fences retries when cleanup cannot be
+                // confirmed. Surface ambiguity rather than preserving a
+                // retryable authority/storage error from before rollback.
+                std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
+                return error.BackupOutcomeAmbiguous;
+            };
+            if (writer_lease_role.createsLease()) {
+                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch |release_err| blk: {
+                    std.log.warn("table backup writer lease release deferred phase=rollback class={s}", .{@errorName(release_err)});
+                    break :blk false;
+                };
+            }
+            return err;
+        };
+        writer_lease_heartbeat.stop_event.set(io);
+        writer_lease_future.await(io);
+        writer_lease_future_running = false;
+        if (writer_lease_role.ownsCommittedRetirement()) {
+            backups_api.releaseCommittedTableBackupWriterStateAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                artifact_backup_id,
+            ) catch |release_err| {
+                std.log.warn("table backup writer lease release deferred phase=commit class={s}", .{@errorName(release_err)});
+                // The manifest is already durable. Preserve the reservation as
+                // a reconciliation journal and surface the committed outcome
+                // as ambiguous so a same-ID inspection/retry retires the
+                // sidecar instead of leaking it permanently.
+                return error.BackupOutcomeAmbiguous;
+            };
+        }
+    }
 
+    fn executeReservedTableBackup(
+        self: *ApiHttpServer,
+        io: std.Io,
+        table: *const metadata_table_manager.TableRecord,
+        fence: backups_api.TableBackupFence,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        connection: []const u8,
+        writer_lease: *TableBackupWriterLeaseHeartbeat,
+        cleanup_safe: *bool,
+    ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, location_uri, connection, backup_location)) |shards| {
+        const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location) catch |err| {
+            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
+            return err;
+        };
+        if (forwarded_shards) |shards| {
             defer freeBackupShards(self.alloc, shards);
-            var manifest = try backups_api.createManifest(self.alloc, backup_id, format, &table, shards);
+            try writer_lease.ensureOwned();
+            var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
-            cleanup_safe = false;
+            cleanup_safe.* = false;
             backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-                cleanup_safe = switch (err) {
+                cleanup_safe.* = switch (err) {
                     error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                     else => false,
                 };
                 return err;
             };
-            committed = true;
+            if (!std.mem.eql(u8, backup_id, artifact_backup_id)) {
+                backups_api.retireForwardedTableBackupEnvelopeAtLocation(
+                    self.alloc,
+                    io,
+                    backup_location,
+                    artifact_backup_id,
+                ) catch |cleanup_err| {
+                    // The canonical manifest is already committed and owns the
+                    // payload. A stale forwarding envelope is harmless and can
+                    // be reclaimed later; never turn success into ambiguity.
+                    std.log.warn("forwarded table backup envelope retirement deferred class={s}", .{@errorName(cleanup_err)});
+                };
+            }
             return;
         }
 
@@ -8037,13 +6737,19 @@ pub const ApiHttpServer = struct {
             .remote => self.destroyBackupStagingRoot(local_backup_root),
         };
 
-        const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
+        const local_shards = table_writes_source.backupTable(self.alloc, table_name, .{
             .backup_root = local_backup_root,
             .backup_id = artifact_backup_id,
             .format = format,
             .io = io,
-        })) orelse return error.TableNotFound;
+            .fence = fence,
+        }) catch |err| {
+            if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
+            return err;
+        };
+        const shards = local_shards orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
+        try writer_lease.ensureOwned();
 
         if (switch (backup_location.*) {
             .remote => true,
@@ -8071,17 +6777,17 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        var manifest = try backups_api.createManifest(self.alloc, backup_id, format, &table, shards);
+        var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
-        cleanup_safe = false;
+        try writer_lease.ensureOwned();
+        cleanup_safe.* = false;
         backups_api.writeManifestToLocationWithIo(self.alloc, io, backup_location, &manifest) catch |err| {
-            cleanup_safe = switch (err) {
+            cleanup_safe.* = switch (err) {
                 error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
                 else => false,
             };
             return err;
         };
-        committed = true;
     }
 
     fn cleanupClusterBackupAttempt(
@@ -8247,6 +6953,74 @@ pub const ApiHttpServer = struct {
                         return;
                     }
                     std.log.warn("cluster repository lease renewal deferred class={s}", .{@errorName(err)});
+                    break :blk true;
+                }) continue;
+                self.lost.store(true, .release);
+                return;
+            }
+        }
+    };
+
+    const TableBackupWriterLeaseHeartbeat = struct {
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        location: *backups_api.BackupLocation,
+        artifact_backup_id: []const u8,
+        stop_event: std.Io.Event = .unset,
+        lost: std.atomic.Value(bool) = .init(false),
+        expires_at_unix_ns: std.atomic.Value(u64),
+
+        fn renewedExpiration(self: *@This()) u64 {
+            const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+            return now +| backups_api.table_backup_writer_lease_duration_ns;
+        }
+
+        fn renew(self: *@This()) !bool {
+            const expiration = self.renewedExpiration();
+            const owned = try backups_api.renewTableBackupWriterLeaseAtLocation(
+                self.alloc,
+                self.io,
+                self.location,
+                self.artifact_backup_id,
+                expiration,
+            );
+            if (owned) self.expires_at_unix_ns.store(expiration, .release);
+            return owned;
+        }
+
+        fn ensureOwned(self: *@This()) !void {
+            if (self.lost.load(.acquire) or !try self.renew()) {
+                self.lost.store(true, .release);
+                return error.BackupAttemptLeaseLost;
+            }
+        }
+
+        fn run(self: *@This()) void {
+            while (!self.stop_event.isSet()) {
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(
+                            backups_api.backup_attempt_lease_renew_interval_ns,
+                        ),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.lost.store(true, .release);
+                        return;
+                    },
+                };
+                if (self.stop_event.isSet()) return;
+                if (self.renew() catch |err| blk: {
+                    const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+                    if (now >= self.expires_at_unix_ns.load(.acquire)) {
+                        std.log.err("table backup writer lease expired after renewal failures class={s}", .{@errorName(err)});
+                        self.lost.store(true, .release);
+                        return;
+                    }
+                    std.log.warn("table backup writer lease renewal deferred class={s}", .{@errorName(err)});
                     break :blk true;
                 }) continue;
                 self.lost.store(true, .release);
@@ -8825,7 +7599,53 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+    pub const SessionForwardRequest = struct {
+        method: contextual_operations.Method,
+        target: []const u8,
+        authorization: ?[]const u8,
+        content_type: ?[]const u8,
+        body: []const u8,
+    };
+
+    pub fn forwardSessionOperation(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        request: SessionForwardRequest,
+    ) !?contextual_operations.OwnedResponse {
+        var response = (try self.forwardSessionRequest(txn_id, .{
+            .method = switch (request.method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            },
+            .uri = request.target,
+            .authorization = request.authorization,
+            .content_type = request.content_type,
+            .body = request.body,
+        })) orelse return null;
+        defer response.deinit(self.alloc);
+
+        const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len);
+        errdefer self.alloc.free(headers);
+        var initialized: usize = 0;
+        errdefer for (headers[0..initialized]) |*header| header.deinit(self.alloc);
+        for (response.headers, headers) |source, *target| {
+            target.* = try ownedContextualHeader(self.alloc, source.name, source.value);
+            initialized += 1;
+        }
+        return .{
+            .status = response.status,
+            .content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
+                "application/json"
+            else
+                "text/plain; charset=utf-8",
+            .body = try self.alloc.dupe(u8, response.body),
+            .headers = headers,
+        };
+    }
+
+    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -8855,31 +7675,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn publicTableRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
+    pub fn extensionRouteMutatesMetadata(method: contextual_operations.Method, path: []const u8) bool {
         return switch (method) {
-            .POST => std.mem.eql(u8, path, routes.Routes.backup) or
-                std.mem.eql(u8, path, routes.Routes.restore) or
-                routes.Routes.matchTableRestore(path) != null or
-                routes.Routes.matchTableIndex(path) != null or
-                routes.Routes.matchTablePath(path) != null,
-            .PUT => routes.Routes.matchTableSchema(path) != null or
-                routes.Routes.matchTableArtifactEnrichment(path) != null,
-            .DELETE => routes.Routes.matchTablePath(path) != null or
-                routes.Routes.matchTableIndex(path) != null or
-                routes.Routes.matchTableArtifactEnrichment(path) != null,
-            .GET => false,
-        };
-    }
-
-    fn publicExtensionRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
-        return switch (method) {
-            .POST => routes.Routes.matchInstalledExtension(path) != null or
+            .post => routes.Routes.matchInstalledExtension(path) != null or
                 routes.Routes.matchInstalledExtensionUpdate(path) != null or
                 routes.Routes.matchInstalledExtensionDrop(path) != null or
                 routes.Routes.matchInstalledExtensionEnable(path) != null or
                 routes.Routes.matchInstalledExtensionDisable(path) != null,
-            .PUT => routes.Routes.matchInstalledExtensionConfig(path) != null,
-            .GET, .DELETE => false,
+            .put => routes.Routes.matchInstalledExtensionConfig(path) != null,
+            .get, .delete => false,
         };
     }
 
@@ -9013,48 +7817,13 @@ pub const ApiHttpServer = struct {
         return enriched;
     }
 
-    fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        var response = try self.handle(req);
-        if (response.owner_allocator == null) response.owner_allocator = self.alloc;
-        return response;
-    }
-
-    fn executeStreaming(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
-        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const uri_parts = splitTarget(req.uri);
-        if (!self.cfg.experimental) return false;
-        if (!std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) return false;
-        if (!protocol_adapters.isA2aStreamingRequest(self.alloc, req)) return false;
-
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
-        if (self.requiresAuthentication(uri_parts.path)) {
-            authenticated_identity = self.authenticateRequest(.{
-                .authorization = req.authorization,
-                .trusted_principal = req.header(trusted_principal_header),
-            }) catch return false;
-            const identity = authenticated_identity.?;
-            if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
-            if (requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch return false) |required| {
-                defer required.deinit(self.alloc);
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) return false;
-            }
-        }
-
-        self.recordHandledRequest();
-        return try protocol_adapters.handleA2aStreamingRequest(
-            self,
-            req,
-            writer,
-            queryEmbeddingSecurityScope(authenticated_identity),
-            authenticated_identity,
-        );
-    }
-
-    pub fn tableApi(self: *ApiHttpServer) public_table_http.TableApi {
+    pub fn tableApi(
+        self: *ApiHttpServer,
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi {
         return .{
             .ptr = self,
+            .request = request,
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -9092,8 +7861,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
@@ -9115,7 +7886,11 @@ pub const ApiHttpServer = struct {
             .transforms = req.transforms,
             .predicates = req.predicates,
         }};
-        const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
+        // Cancellation is safe before commit begins. Once commitBatch enters
+        // the transaction protocol, preserve its typed outcome instead of
+        // reporting cancellation for a write that may already be durable.
+        try ensureTableOperationActive(request);
+        const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -9129,14 +7904,17 @@ pub const ApiHttpServer = struct {
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
             => return error.CommittedPending,
+            error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
             => return error.WriteUnavailable,
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress,
             error.ResourceBudgetExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
@@ -9165,7 +7943,17 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return error.NotFound;
         switch (outcome) {
-            .committed => |committed| if (committed.propagation_pending or committed.visibility_pending) return error.CommittedPending,
+            .committed => |committed| {
+                const status = transactions_api.terminalCommitStatusForOutcome(
+                    committed.propagation_pending,
+                    committed.visibility_pending,
+                    committed.visibility_retry_pending,
+                    committed.visibility_repair_required,
+                );
+                if (status != .committed) return error.CommittedPending;
+                if (committed.visibility_repair_required)
+                    return error.CommittedRepairRequired;
+            },
             .conflict => return error.Conflict,
         }
     }
@@ -9176,10 +7964,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, null) catch |err| switch (err) {
+        try ensureTableOperationActive(request);
+        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -9187,6 +7977,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
@@ -9205,6 +7996,7 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.Cancelled, error.Canceled => return error.Canceled,
             error.InvalidManifest => return error.InvalidManifest,
             error.InvalidTableFile => return error.InvalidTableFile,
             error.TableBlockChecksumMismatch => return error.TableBlockChecksumMismatch,
@@ -9247,7 +8039,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
@@ -9289,6 +8081,45 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    /// Point reads use the same bounded cold-runtime readiness policy as
+    /// public queries. A successful table creation or write should not expose
+    /// an internal read-cache installation race to the next lookup, while
+    /// remote/read-only deployments still fail fast and callers can cancel.
+    pub fn lookupWithReadinessRetry(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+        request: api_operation.RequestContext,
+    ) !?table_reads.LookupResponse {
+        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            try ensureTableOperationActive(request);
+            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => {
+                    const now_ns = platform_time.monotonicNs();
+                    if (retry_timeout_ns == 0) return err;
+                    const sleep_ns = boundedRetrySleepNs(
+                        request.deadline_ns,
+                        now_ns,
+                        start_ns,
+                        retry_timeout_ns,
+                        retry_poll_ns,
+                    ) orelse return err;
+                    if (sleep_ns == 0) return error.DeadlineExceeded;
+                    try sleepNsCancellable(sleep_ns, request.cancellation);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     fn executePublicTableQueryDispatchWithIdentity(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -9298,7 +8129,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9324,6 +8155,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+                error.HierarchyCursorStale => return error.HierarchyCursorStale,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.QueryEmbeddingInputTooLarge,
@@ -9378,6 +8210,7 @@ pub const ApiHttpServer = struct {
             error.EmbedUpstreamFailure,
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
@@ -9446,6 +8279,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge,
@@ -9524,7 +8358,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) anyerror!?[]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9578,7 +8412,7 @@ pub const ApiHttpServer = struct {
         request: anytype,
         foreign_source: foreign_mod.PostgresConfig,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9706,7 +8540,7 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
         request_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) anyerror![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -9828,7 +8662,7 @@ pub const ApiHttpServer = struct {
         foreign_source: foreign_mod.PostgresConfig,
         rows: []const std.json.Value,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) ![]db_mod.types.SearchHit {
         if (rows.len == 0) return &.{};
 
@@ -9877,7 +8711,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !query_api.QueryResponse {
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
@@ -9931,6 +8765,7 @@ pub const ApiHttpServer = struct {
             table_name,
             query_req.req,
             .read_index,
+            .{ .resolve = self },
         ) catch |err| switch (err) {
             // Public filter syntax is validated and attributed during request
             // normalization. A later InvalidArgument can originate from any
@@ -9968,12 +8803,170 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn tableConfigContainsIndex(alloc: std.mem.Allocator, indexes_json: []const u8, index_name: []const u8) !bool {
+        if (index_name.len == 0) return false;
+        var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return false;
+        lookup.deinit();
+        return true;
+    }
+
+    const RuntimeIndexLifecycle = enum {
+        healthy,
+        rebuilding,
+        unavailable,
+    };
+
+    fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
+        return metadata.freshness == .fresh or metadata.freshness == .catching_up;
+    }
+
+    fn runtimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
+        index_name: []const u8,
+    ) RuntimeIndexLifecycle {
+        if (expected_group_ids.len == 0) return .unavailable;
+        var observed_active_build = false;
+        for (expected_group_ids) |group_id| {
+            var observed_group_index = false;
+            var group_active_build = false;
+            for (statuses) |status| {
+                if (status.group_id != group_id) continue;
+                // Quarantine is an explicit fail-closed owner observation and
+                // must dominate healthy or rebuilding candidates retained by
+                // another cache generation.
+                if (status.metadata.source == .rebuild_state_quarantine) return .unavailable;
+                if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) continue;
+                const index = for (status.stats.indexes) |item| {
+                    if (std.mem.eql(u8, item.name, index_name)) break item;
+                } else continue;
+                observed_group_index = true;
+                if (index.load_error != null) return .unavailable;
+                // Terminal and operator-paused repairs are actionable failures,
+                // not retryable publication windows.
+                if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
+                    std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
+                if (index.backfill_active or
+                    index.replay_catch_up_required or
+                    index.catch_up_active or
+                    index.index_repair_id != null or
+                    index.replay_applied_sequence < index.replay_target_sequence or
+                    index.catch_up_applied_sequence < index.catch_up_target_sequence)
+                {
+                    group_active_build = true;
+                } else if (index.repair_degraded) {
+                    return .unavailable;
+                }
+            }
+            if (!observed_group_index) return .unavailable;
+            observed_active_build = observed_active_build or group_active_build;
+        }
+        return if (observed_active_build) .rebuilding else .healthy;
+    }
+
+    fn observeRuntimeIndexLifecycle(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+        expected_group_ids: []const u64,
+        index_name: []const u8,
+        observed_rebuilding: *bool,
+    ) bool {
+        return switch (runtimeIndexLifecycle(statuses, expected_group_ids, index_name)) {
+            .healthy => true,
+            .rebuilding => blk: {
+                observed_rebuilding.* = true;
+                break :blk true;
+            },
+            .unavailable => false,
+        };
+    }
+
+    fn queryHasRebuildingCatalogIndex(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+    ) !bool {
+        var snapshot = (try self.source.adminSnapshot()) orelse return false;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return false;
+
+        // Validate every explicit index first. If any name is absent from the
+        // catalog, IndexNotFound belongs to the request rather than an online
+        // build lifecycle and must not be rewritten as retryable.
+        var referenced = false;
+        if (req.index_name) |name| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, name)) return false;
+        }
+        for (req.full_text_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.dense_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.sparse_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+        }
+        for (req.graph_queries) |query| {
+            referenced = true;
+            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.query.index_name)) return false;
+        }
+        if (!referenced) return false;
+
+        // Unknown or partial runtime state is not proof of an active build.
+        // Merge local and remotely published observations, then require one
+        // current lifecycle fact for every catalog group below.
+        const expected_group_ids = try indexes_api.expectedTableGroupIds(self.alloc, &snapshot, table.table_id);
+        defer if (expected_group_ids.len > 0) self.alloc.free(expected_group_ids);
+        if (expected_group_ids.len == 0) return false;
+        var statuses = (try self.lifecycleTableRuntimeStatusesWithSnapshot(table_name, &snapshot)) orelse return false;
+        defer statuses.deinit(self.alloc);
+
+        // IndexNotFound is retryable only when every referenced catalog index
+        // has usable runtime state and at least one is actively rebuilding. A
+        // failed or missing sibling must retain the actionable original error.
+        var observed_rebuilding = false;
+        if (req.index_name) |name| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, name, &observed_rebuilding)) return false;
+        }
+        for (req.full_text_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.dense_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.sparse_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
+        }
+        for (req.graph_queries) |query| {
+            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.query.index_name, &observed_rebuilding)) return false;
+        }
+        return observed_rebuilding;
+    }
+
+    const MissingIndexLifecycle = union(enum) {
+        none,
+        rebuilding,
+        resolve: *ApiHttpServer,
+
+        fn isRebuilding(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !bool {
+            return switch (self) {
+                .none => false,
+                .rebuilding => true,
+                .resolve => |server| try server.queryHasRebuildingCatalogIndex(table_name, req),
+            };
+        }
+    };
+
     fn queryWithTransientReadRetry(
         alloc: std.mem.Allocator,
         source: table_reads.TableReadSource,
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
+        missing_index_lifecycle: MissingIndexLifecycle,
     ) !?query_api.QueryResponse {
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
@@ -10002,6 +8995,12 @@ pub const ApiHttpServer = struct {
                     try sleepNsCancellable(sleep_ns, req.cancellation);
                     continue;
                 },
+                // Only translate a missing physical index when catalog and
+                // runtime lifecycle observations prove that a requested index
+                // is still being published. A genuinely unknown index, or a
+                // supposedly-ready index that disappeared, retains its
+                // diagnostic instead of being masked as transient readiness.
+                error.IndexNotFound => if (try missing_index_lifecycle.isRebuilding(table_name, req)) return error.IndexRebuilding else return err,
                 error.Timeout, error.Cancelled => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
@@ -10033,7 +9032,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         query_value: std.json.Value,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !query_api.OwnedQueryRequest {
         try ensureRequestActive(cancellation);
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
@@ -10061,6 +9060,7 @@ pub const ApiHttpServer = struct {
         _: std.mem.Allocator,
         _: []const u8,
         _: public_table_http.TableApi.TableQueryView,
+        _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
         return error.NotFound;
     }
@@ -10071,29 +9071,81 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        expected_fence: ?backups_api.TableBackupFence,
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.source.ensureLinearizableRead() catch |err| {
-            std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
-            return metadataAccessFailure(err);
+        try ensureTableOperationActive(request);
+        var admitted_fence: backups_api.TableBackupFence = undefined;
+        var table = table: {
+            var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+                if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+                if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
+                std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
+                return metadataAccessFailure(err);
+            }) orelse {
+                std.log.warn("table backup metadata read barrier unsupported phase=admission", .{});
+                return error.MetadataCapabilityUnavailable;
+            };
+            defer self.source.freeAdminSnapshot(&authoritative_snapshot);
+            const record = tables_api.findTableByName(&authoritative_snapshot, table_name) orelse return error.NotFound;
+            admitted_fence = backups_api.tableBackupFence(&authoritative_snapshot, record);
+            if (expected_fence) |expected| {
+                if (!expected.matches(admitted_fence)) return error.CatalogChanged;
+            }
+            break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
+        defer metadata_table_manager.freeTable(self.alloc, table);
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
         const io = self.sharedApiIo() orelse fallback_io.?.io();
-        self.backupOwnedTable(io, table_name, location, location_uri, backup_id, format, connection) catch |err| switch (err) {
+        // This is the last safe cancellation point: once backup publication
+        // starts, returning cancellation could invite an unsafe replay after
+        // an ambiguous durable outcome.
+        try ensureTableOperationActive(request);
+        // A forwarded storage-owner hop must preserve the coordinator's
+        // generation ID. Generating another ID here would leave cleanup unable
+        // to address the actual payload after a failed or ambiguous transport.
+        const backup_result = if (expected_fence) |forwarded_fence| blk: {
+            var storage_fence = admitted_fence;
+            storage_fence.writer_not_after_unix_ns = forwarded_fence.writer_not_after_unix_ns;
+            break :blk self.backupOwnedTableWithArtifactId(
+                io,
+                &table,
+                storage_fence,
+                table_name,
+                location,
+                location_uri,
+                backup_id,
+                backup_id,
+                format,
+                connection,
+                // Legacy coordinators forward only the original four-field
+                // fence and cannot pre-create a writer lease. Preserve that
+                // one rolling-upgrade direction by letting the new owner
+                // create the lease; current coordinators carry metadata
+                // identity and require adoption of their delivery fence.
+                if (forwarded_fence.hasMetadataIdentity()) .adopt else .legacy_forwarded_create,
+            );
+        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
+        backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
             error.LeaderTransferInProgress,
             error.MetadataLinearizableReadTimeout,
             error.ReconcileLeaseNotHeld,
             => return error.NotLeader,
+            error.MetadataCapabilityUnavailable => return error.MetadataCapabilityUnavailable,
+            error.CatalogChanged => return error.CatalogChanged,
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
+            error.BackupOutcomeAmbiguous => return error.BackupOutcomeAmbiguous,
+            error.BackupAttemptLeaseLost => return error.BackupOutcomeAmbiguous,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -10115,8 +9167,10 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         if (!self.cfg.deployment_mode.isStandalone()) {
             var manifest = backups_api.readManifestFromLocation(self.alloc, location, backup_id) catch |err| switch (err) {
                 error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
@@ -10198,8 +9252,10 @@ pub const ApiHttpServer = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         if (tables_api.findTableByName(&snapshot, table_name) == null) return error.NotFound;
@@ -10218,19 +9274,29 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
-        var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse
+            return error.NotFound;
         defer lookup.deinit();
-        var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
+        const target = IndexRuntimeTarget{
+            .name = index_name,
+            .identity = indexes_api.indexRuntimeIdentity(alloc, index_name, lookup.config) catch return error.InternalFailure,
+        };
+        var local_statuses = self.indexTableRuntimeStatusesWithSnapshot(table_name, target, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
-        return indexes_api.encodeSingleIndexLookup(
+        return indexes_api.encodeSingleIndexLookupForTable(
             alloc,
+            &snapshot,
+            table,
             index_name,
             lookup.config,
+            target.identity,
             if (local_statuses) |*status| status else null,
         ) catch return error.InternalFailure;
     }
@@ -10239,12 +9305,353 @@ pub const ApiHttpServer = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListArtifactEnrichmentsError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
         return indexes_api.encodeArtifactEnrichmentList(alloc, table_name, table.indexes_json) catch return error.InternalFailure;
+    }
+
+    const PendingIndexInstallation = struct {
+        table_name: []u8,
+        index_name: []u8,
+        index_json: ?[]u8,
+        generation: u64,
+        failures: u8 = 0,
+        retry_after_ns: u64 = 0,
+
+        fn deinit(self: *PendingIndexInstallation) void {
+            const alloc = std.heap.page_allocator;
+            alloc.free(self.table_name);
+            alloc.free(self.index_name);
+            if (self.index_json) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    const PendingIndexInstallationSnapshot = struct {
+        table_name: []u8,
+        index_name: []u8,
+        index_json: ?[]u8,
+        generation: u64,
+
+        fn deinit(self: *PendingIndexInstallationSnapshot) void {
+            const alloc = std.heap.page_allocator;
+            alloc.free(self.table_name);
+            alloc.free(self.index_name);
+            if (self.index_json) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    const PreparedIndexInstallation = struct {
+        table_name: []u8,
+        index_name: []u8,
+        index_json: ?[]u8,
+        reservation_active: bool = true,
+        owns_payload: bool = true,
+
+        fn deinit(self: *PreparedIndexInstallation, server: *ApiHttpServer) void {
+            const alloc = std.heap.page_allocator;
+            if (self.reservation_active) {
+                platform_sync.lockYielding(&server.index_installation_mutex);
+                std.debug.assert(server.index_installation_reserved_slots > 0);
+                server.index_installation_reserved_slots -= 1;
+                server.index_installation_mutex.unlock();
+            }
+            if (self.owns_payload) {
+                alloc.free(self.table_name);
+                alloc.free(self.index_name);
+                if (self.index_json) |value| alloc.free(value);
+            }
+            self.* = undefined;
+        }
+    };
+
+    const IndexInstallationReconcileResult = enum {
+        complete,
+        retry,
+    };
+
+    const IndexInstallationWorker = struct {
+        server: *ApiHttpServer,
+
+        fn run(ptr: *anyopaque) !void {
+            const work: *IndexInstallationWorker = @ptrCast(@alignCast(ptr));
+            work.server.runIndexInstallationReconciler();
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *IndexInstallationWorker = @ptrCast(@alignCast(ptr));
+            std.heap.page_allocator.destroy(work);
+        }
+    };
+
+    fn prepareIndexInstallationReconcile(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: ?[]const u8,
+    ) !?PreparedIndexInstallation {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return null;
+        if (self.index_installation_closing.load(.acquire)) return null;
+
+        const alloc = std.heap.page_allocator;
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        var payload_transferred = false;
+        defer if (!payload_transferred) alloc.free(owned_table_name);
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        defer if (!payload_transferred) alloc.free(owned_index_name);
+        const owned_index_json = if (index_json) |value| try alloc.dupe(u8, value) else null;
+        defer if (!payload_transferred) {
+            if (owned_index_json) |value| alloc.free(value);
+        };
+
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_closing.load(.acquire)) return null;
+        // Keep capacity for every pre-commit reservation even while unrelated
+        // requests append their own entries. Activation can therefore append
+        // after consensus without allocating or stealing another request's
+        // reserved slot.
+        try self.index_installation_queue.ensureUnusedCapacity(
+            alloc,
+            self.index_installation_reserved_slots + 1,
+        );
+        self.index_installation_reserved_slots += 1;
+        payload_transferred = true;
+        return .{
+            .table_name = owned_table_name,
+            .index_name = owned_index_name,
+            .index_json = owned_index_json,
+        };
+    }
+
+    fn activatePreparedIndexInstallation(
+        self: *ApiHttpServer,
+        prepared: *PreparedIndexInstallation,
+        enqueue_if_absent: bool,
+    ) bool {
+        const runtime = self.cfg.backend_runtime orelse return false;
+        if (!prepared.reservation_active or !prepared.owns_payload) return false;
+
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_closing.load(.acquire)) return false;
+        var existing: ?*PendingIndexInstallation = null;
+        for (self.index_installation_queue.items) |*pending| {
+            if (std.mem.eql(u8, pending.table_name, prepared.table_name) and
+                std.mem.eql(u8, pending.index_name, prepared.index_name))
+            {
+                existing = pending;
+                break;
+            }
+        }
+        if (existing == null and !enqueue_if_absent) return false;
+
+        const generation = self.index_installation_next_generation;
+        self.index_installation_next_generation +%= 1;
+        if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
+        std.debug.assert(self.index_installation_reserved_slots > 0);
+        self.index_installation_reserved_slots -= 1;
+        if (existing) |pending| {
+            pending.deinit();
+            pending.* = .{
+                .table_name = prepared.table_name,
+                .index_name = prepared.index_name,
+                .index_json = prepared.index_json,
+                .generation = generation,
+            };
+        } else {
+            // prepareIndexInstallationReconcile reserved this exact slot.
+            self.index_installation_queue.appendAssumeCapacity(.{
+                .table_name = prepared.table_name,
+                .index_name = prepared.index_name,
+                .index_json = prepared.index_json,
+                .generation = generation,
+            });
+        }
+        prepared.reservation_active = false;
+        prepared.owns_payload = false;
+        self.ensureIndexInstallationWorkerLocked(runtime) catch |err| {
+            // The keyed obligation is already installed. The independent
+            // maintenance supervisor will retry worker admission.
+            std.log.warn("index installation reconciliation worker admission deferred table={s} index={s} err={s}", .{
+                prepared.table_name,
+                prepared.index_name,
+                @errorName(err),
+            });
+        };
+        return true;
+    }
+
+    fn ensureIndexInstallationWorkerLocked(
+        self: *ApiHttpServer,
+        runtime: *db_mod.background_runtime.BackendRuntime,
+    ) !void {
+        if (self.index_installation_worker_in_flight.swap(true, .acq_rel)) return;
+        errdefer self.index_installation_worker_in_flight.store(false, .release);
+        const work = try std.heap.page_allocator.create(IndexInstallationWorker);
+        errdefer std.heap.page_allocator.destroy(work);
+        work.* = .{ .server = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.index_installation_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = IndexInstallationWorker.run,
+            .deinit = IndexInstallationWorker.deinit,
+        }) catch |err| return err;
+    }
+
+    fn ensurePendingIndexInstallationWorker(self: *ApiHttpServer) !void {
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
+        if (self.index_installation_closing.load(.acquire)) return;
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_queue.items.len == 0 or
+            self.index_installation_closing.load(.acquire)) return;
+        try self.ensureIndexInstallationWorkerLocked(runtime);
+    }
+
+    fn runIndexInstallationReconciler(self: *ApiHttpServer) void {
+        while (!self.index_installation_closing.load(.acquire)) {
+            const next = self.nextIndexInstallationSnapshot() catch {
+                sleepNs(if (builtin.is_test) std.time.ns_per_ms else 25 * std.time.ns_per_ms);
+                continue;
+            };
+            if (next.snapshot == null) {
+                if (next.wait_ns == 0) return;
+                sleepNs(@min(next.wait_ns, 100 * std.time.ns_per_ms));
+                continue;
+            }
+            var snapshot = next.snapshot.?;
+            defer snapshot.deinit();
+            platform_sync.lockYielding(&self.index_installation_apply_mutex);
+            const result = self.reconcileIndexInstallation(&snapshot);
+            self.index_installation_apply_mutex.unlock();
+            switch (result) {
+                .complete => self.completeIndexInstallation(snapshot.generation),
+                .retry => self.deferIndexInstallation(snapshot.generation),
+            }
+        }
+    }
+
+    const NextIndexInstallation = struct {
+        snapshot: ?PendingIndexInstallationSnapshot = null,
+        wait_ns: u64 = 0,
+    };
+
+    fn nextIndexInstallationSnapshot(self: *ApiHttpServer) !NextIndexInstallation {
+        const alloc = std.heap.page_allocator;
+        const now_ns = platform_time.monotonicNs();
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        if (self.index_installation_queue.items.len == 0) {
+            self.index_installation_worker_in_flight.store(false, .release);
+            return .{};
+        }
+        var minimum_wait_ns: u64 = std.math.maxInt(u64);
+        var offset: usize = 0;
+        while (offset < self.index_installation_queue.items.len) : (offset += 1) {
+            const index = (self.index_installation_cursor + offset) % self.index_installation_queue.items.len;
+            const pending = &self.index_installation_queue.items[index];
+            if (pending.retry_after_ns > now_ns) {
+                minimum_wait_ns = @min(minimum_wait_ns, pending.retry_after_ns - now_ns);
+                continue;
+            }
+            const table_copy = try alloc.dupe(u8, pending.table_name);
+            errdefer alloc.free(table_copy);
+            const index_copy = try alloc.dupe(u8, pending.index_name);
+            errdefer alloc.free(index_copy);
+            const config_copy = if (pending.index_json) |value| try alloc.dupe(u8, value) else null;
+            self.index_installation_cursor = (index + 1) % self.index_installation_queue.items.len;
+            return .{ .snapshot = .{
+                .table_name = table_copy,
+                .index_name = index_copy,
+                .index_json = config_copy,
+                .generation = pending.generation,
+            } };
+        }
+        return .{ .wait_ns = minimum_wait_ns };
+    }
+
+    fn reconcileIndexInstallation(
+        self: *ApiHttpServer,
+        pending: *const PendingIndexInstallationSnapshot,
+    ) IndexInstallationReconcileResult {
+        const writes = self.table_writes orelse return .complete;
+        const alloc = std.heap.page_allocator;
+        var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
+        defer self.source.freeAdminSnapshot(&authoritative_snapshot);
+        const table = tables_api.findTableByName(&authoritative_snapshot, pending.table_name) orelse return .complete;
+        const current = indexes_api.storedIndexConfigJsonAlloc(alloc, table.indexes_json, pending.index_name) catch return .retry;
+        defer if (current) |value| alloc.free(value);
+
+        if (pending.index_json) |expected| {
+            const visible = current orelse {
+                _ = writes.dropIndex(alloc, pending.table_name, pending.index_name) catch |err| switch (err) {
+                    error.IndexNotFound, error.TableNotFound => return .complete,
+                    else => return .retry,
+                };
+                return .complete;
+            };
+            const equivalent = indexes_api.equivalentIndexConfigJson(alloc, visible, expected) catch return .retry;
+            // Once the read is authoritative, the queue entry is a keyed
+            // reconciliation trigger rather than an instruction to replay
+            // stale state. Applying the visible config also repairs any
+            // foreground operation whose post-commit handler ran out of order.
+            _ = writes.createIndex(
+                alloc,
+                pending.table_name,
+                pending.index_name,
+                if (equivalent) expected else visible,
+            ) catch return .retry;
+            return .complete;
+        }
+
+        if (current) |visible| {
+            _ = writes.createIndex(alloc, pending.table_name, pending.index_name, visible) catch return .retry;
+            return .complete;
+        }
+        _ = writes.dropIndex(alloc, pending.table_name, pending.index_name) catch |err| switch (err) {
+            error.IndexNotFound, error.TableNotFound => return .complete,
+            else => return .retry,
+        };
+        return .complete;
+    }
+
+    fn completeIndexInstallation(self: *ApiHttpServer, generation: u64) void {
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        for (self.index_installation_queue.items, 0..) |*pending, index| {
+            if (pending.generation != generation) continue;
+            var removed = self.index_installation_queue.orderedRemove(index);
+            removed.deinit();
+            if (self.index_installation_queue.items.len == 0) {
+                self.index_installation_cursor = 0;
+            } else if (self.index_installation_cursor >= self.index_installation_queue.items.len) {
+                self.index_installation_cursor = 0;
+            }
+            return;
+        }
+    }
+
+    fn deferIndexInstallation(self: *ApiHttpServer, generation: u64) void {
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        defer self.index_installation_mutex.unlock();
+        for (self.index_installation_queue.items) |*pending| {
+            if (pending.generation != generation) continue;
+            pending.failures +|= 1;
+            const base_ns: u64 = if (builtin.is_test) std.time.ns_per_ms else 25 * std.time.ns_per_ms;
+            const shift: u6 = @intCast(@min(pending.failures - 1, 6));
+            pending.retry_after_ns = platform_time.monotonicNs() + @min(base_ns << shift, 2 * std.time.ns_per_s);
+            return;
+        }
     }
 
     fn executePublicTableCreateIndex(
@@ -10253,8 +9660,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         index_name: []const u8,
         body: []const u8,
-    ) public_table_http.TableApi.ExecuteCreateIndexError!void {
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
@@ -10285,7 +9694,10 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index normalization failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
         defer alloc.free(normalized_index_json);
 
@@ -10300,8 +9712,17 @@ pub const ApiHttpServer = struct {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("public create index validation failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                return error.InternalFailure;
+            },
         };
+
+        // Reserve the response before consensus. Nothing after the irreversible
+        // mutation boundary should fail solely because response memory could
+        // not be allocated.
+        const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
+        errdefer alloc.free(response_body);
 
         // Materialize catalog-owned fields once. The same exact config is sent
         // through consensus and used as the projection expectation, making the
@@ -10314,6 +9735,20 @@ pub const ApiHttpServer = struct {
         const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, expected_indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
         defer alloc.free(stored_index_json);
 
+        // Reserve the keyed fallback payload and queue capacity before the
+        // catalog commit. It remains inactive until consensus succeeds, so a
+        // failed proposal cannot mutate local state, while post-commit
+        // supersession and fallback enqueue are allocation-free.
+        var prepared_installation = if (self.table_writes != null)
+            self.prepareIndexInstallationReconcile(table_name, index_name, stored_index_json) catch return error.InternalFailure
+        else
+            null;
+        defer if (prepared_installation) |*prepared| prepared.deinit(self);
+
+        // Catalog mutation is the irreversible boundary. Observe cancellation
+        // after all potentially expensive validation, but never claim a
+        // canceled result once consensus may have committed the mutation.
+        try ensureTableOperationActive(request);
         self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
@@ -10327,31 +9762,74 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        self.waitForIndexMetadataProjection(table_name, index_name, stored_index_json) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public create index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
-            return error.InternalFailure;
-        };
         if (self.table_writes) |table_writes_source| {
-            const scheduled = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| {
-                std.log.err("public create index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                return error.InternalFailure;
+            // A prior operation for this key may still be retrying even when
+            // this operation needs no new fallback job. Supersede that stale
+            // generation before applying the new local state.
+            const superseded_existing_installation = if (prepared_installation) |*prepared|
+                self.activatePreparedIndexInstallation(prepared, false)
+            else
+                false;
+            // Never poll after the consensus commit boundary: a slow
+            // projection must not hold an HTTP worker for up to the client's
+            // own timeout and invite an ambiguous retry. One read preserves
+            // the synchronous embedded fast path when the exact committed
+            // config is already visible; otherwise the idempotent reconciler
+            // owns convergence. Avoid even this read for API-only processes.
+            const projection_ready = self.isIndexMetadataProjected(table_name, index_name, stored_index_json) catch |err| projection: {
+                std.log.warn("public create index committed; metadata projection deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
+                break :projection false;
             };
-            // Embedded/direct DB sources have no serving reconciliation queue.
-            // Preserve their synchronous contract while provisioned serving
-            // performs potentially corpus-sized backfill in the background.
-            if (scheduled == null) {
-                _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
-                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
-                    error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
-                    else => {
-                        std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
-                        return error.InternalFailure;
-                    },
+            // Install the local write capability before the create request
+            // returns. Provisioned sources make this an O(groups) online-DDL
+            // barrier; embedded sources preserve their synchronous contract.
+            // Generic reconciliation is separate because the same queue also
+            // repairs index deletion.
+            var local_installation_complete = false;
+            if (projection_ready) {
+                const installed = install: {
+                    if (superseded_existing_installation) platform_sync.lockYielding(&self.index_installation_apply_mutex);
+                    defer if (superseded_existing_installation) self.index_installation_apply_mutex.unlock();
+                    break :install table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                        // Consensus already committed the resource. Local
+                        // resource pressure and partial O(groups) installation
+                        // are readiness conditions, not create failures.
+                        std.log.warn("public create index committed; local installation deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
+                        break :install null;
+                    };
                 };
+                local_installation_complete = installed != null;
+            }
+            // Consensus is the request's commit boundary. Queue insertion is
+            // an idempotent repair accelerator, so queue pressure after commit
+            // must not turn a created resource into a false HTTP failure that
+            // invites ambiguous client retries.
+            const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
+                std.log.warn("public create index structural reconcile enqueue deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                break :requested null;
+            };
+            if (!local_installation_complete and reconcile_requested == null) {
+                const scheduled = if (prepared_installation) |*prepared|
+                    if (!prepared.owns_payload)
+                        true
+                    else
+                        self.activatePreparedIndexInstallation(prepared, true)
+                else
+                    false;
+                if (!scheduled) {
+                    // Manual and embedded runtimes have no background executor.
+                    // Preserve their synchronous convergence contract without
+                    // imposing an O(groups) barrier on hosted HTTP workers.
+                    _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                        std.log.warn("public create index committed; fallback installation deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    };
+                }
             }
         }
+        // Return the normalized public resource already computed before the
+        // irreversible catalog mutation. This avoids a second fallible status
+        // lookup after commit and exposes inferred settings such as dimension.
+        return response_body;
     }
 
     fn executePublicTableDeleteIndex(
@@ -10359,10 +9837,20 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
-        defer metadata_table_manager.freeTable(alloc, table_before);
+        try ensureTableOperationActive(request);
+        // The admin snapshot is an asynchronous projection and must not decide
+        // whether the table or index exists: their create routes intentionally
+        // return before that projection catches up. Reserve recovery capacity
+        // now, then let the authoritative mutation below decide NotFound.
+        var prepared_installation = if (self.table_writes != null)
+            self.prepareIndexInstallationReconcile(table_name, index_name, null) catch return error.InternalFailure
+        else
+            null;
+        defer if (prepared_installation) |*prepared| prepared.deinit(self);
+        try ensureTableOperationActive(request);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
@@ -10375,24 +9863,29 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        const expected_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table_before.indexes_json, index_name) catch return error.InternalFailure) orelse {
-            return error.NotFound;
-        };
-        defer alloc.free(expected_indexes_json);
-        self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public delete index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
-            return error.InternalFailure;
-        };
         if (self.table_writes) |table_writes_source| {
+            // Fence an older create immediately after the catalog commit. A
+            // lagging projection is reconciler input, never an HTTP response
+            // dependency after the commit boundary.
+            var reconcile_activated = if (prepared_installation) |*prepared|
+                self.activatePreparedIndexInstallation(prepared, false)
+            else
+                false;
+            const reconcile_requested = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |err| requested: {
+                std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, err });
+                break :requested null;
+            };
+            if (reconcile_requested == null and !reconcile_activated) {
+                reconcile_activated = if (prepared_installation) |*prepared|
+                    self.activatePreparedIndexInstallation(prepared, true)
+                else
+                    false;
+            }
+            if (reconcile_activated) platform_sync.lockYielding(&self.index_installation_apply_mutex);
+            defer if (reconcile_activated) self.index_installation_apply_mutex.unlock();
             _ = table_writes_source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
                 error.IndexNotFound => {},
-                else => {
-                    std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err });
-                    _ = table_writes_source.requestTableIndexStructuralReconcile(alloc, table_name, index_name) catch |reconcile_err| {
-                        std.log.warn("public delete index structural reconcile enqueue failed table={s} index={s} err={}", .{ table_name, index_name, reconcile_err });
-                    };
-                },
+                else => std.log.warn("public delete index local apply deferred table={s} index={s} err={}", .{ table_name, index_name, err }),
             };
         }
     }
@@ -10403,8 +9896,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         body: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
@@ -10422,6 +9917,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
 
+        try ensureTableOperationActive(request);
         self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
@@ -10457,8 +9953,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDeleteArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
@@ -10470,6 +9968,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
 
+        try ensureTableOperationActive(request);
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
@@ -10503,8 +10002,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -10527,8 +10028,10 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         doc_key: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -10552,9 +10055,12 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
+        try ensureTableOperationActive(request);
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument, error.NotFound => return error.NotFound,
@@ -10573,8 +10079,10 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
@@ -10610,8 +10118,14 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         req: backups_api.ClusterBackupRequest,
         location: *backups_api.BackupLocation,
+        request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         const op_alloc = self.alloc;
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
@@ -10622,10 +10136,21 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        self.source.ensureLinearizableRead() catch |err| {
+        var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+            if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return trace.internal(err);
+        }) orelse {
+            std.log.warn("cluster backup metadata read barrier unsupported", .{});
+            return error.MetadataCapabilityUnavailable;
+        };
+        defer self.source.freeAdminSnapshot(&authoritative_snapshot);
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
         };
         trace.enter(.manifest_probe);
         if (backups_api.clusterManifestExistsAtLocationWithIo(alloc, backup_io, location, req.backup_id) catch |err| return trace.internal(err))
@@ -10635,16 +10160,8 @@ pub const ApiHttpServer = struct {
         trace.enter(.table_selection);
         const table_names: [][]u8 = if (req.table_names) |values|
             cloneTableNamesAlloc(op_alloc, values) catch |err| return trace.internal(err)
-        else blk: {
-            var snapshot = (self.source.adminSnapshot() catch |err| {
-                if (metadataAccessFailure(err) == error.NotLeader)
-                    return error.NotLeader;
-                return trace.internal(err);
-            }) orelse
-                break :blk op_alloc.alloc([]u8, 0) catch |err| return trace.internal(err);
-            defer self.source.freeAdminSnapshot(&snapshot);
-            break :blk tableNamesFromAdminSnapshotAlloc(op_alloc, &snapshot) catch |err| return trace.internal(err);
-        };
+        else
+            tableNamesFromAdminSnapshotAlloc(op_alloc, &authoritative_snapshot) catch |err| return trace.internal(err);
         defer freeOwnedTableNames(op_alloc, table_names);
         if (table_names.len > restore_jobs.max_cluster_tables_per_job or
             table_names.len > backups_api.max_cluster_backup_attempt_tables)
@@ -10709,12 +10226,22 @@ pub const ApiHttpServer = struct {
             .cluster_backup_id = req.backup_id,
             .created_at_unix_ns = now_unix_ns,
             .format = req.format,
+            .writer_lease_fencing = true,
+            .writer_delivery_deadline_fencing = true,
             .tables = attempt_tables,
         };
         // Publish the immutable journal before acquiring the admission fence.
         // This ordering guarantees that a process crash can never leave an
         // undiscoverable reservation: every production reservation has an
         // attempt marker that the bounded stale reclaimer can later retire.
+        // Cancellation is safe through this point because no durable backup
+        // state exists. Once the marker is published, preserve the existing
+        // ambiguous-outcome invariant and let cleanup own failure handling.
+        request.ensureActive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         trace.enter(.attempt_marker);
         backups_api.writeClusterBackupAttemptMarker(
             op_alloc,
@@ -10771,6 +10298,7 @@ pub const ApiHttpServer = struct {
         };
         var cluster_committed = false;
         var cluster_cleanup_safe = true;
+        var table_outcome_ambiguous = false;
         errdefer if (!cluster_committed) {
             if (cluster_cleanup_safe) {
                 self.cleanupClusterBackupAttempt(
@@ -10821,12 +10349,7 @@ pub const ApiHttpServer = struct {
             lease_heartbeat.stop_event.set(backup_io);
             lease_future.await(backup_io);
         };
-        var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
-            else => if (metadata_authority.isRetryableError(err)) return error.NotLeader else null,
-        };
-        defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-        const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (extension_snapshot_opt) |*snapshot| snapshot else null;
+        const extension_snapshot: ?*const metadata_api.AdminSnapshot = &authoritative_snapshot;
 
         trace.enter(.table_snapshots);
         for (table_names, attempt_tables, 0..) |table_name, attempt_table, i| {
@@ -10837,8 +10360,15 @@ pub const ApiHttpServer = struct {
             status_name_count += 1;
             statuses[i] = .{ .name = status_name, .status = "failed", .@"error" = null };
 
+            const table = tables_api.findTableByName(&authoritative_snapshot, table_name) orelse {
+                statuses[i].@"error" = "not found";
+                continue;
+            };
+
             self.backupOwnedTableWithArtifactId(
                 backup_io,
+                table,
+                backups_api.tableBackupFence(&authoritative_snapshot, table),
                 table_name,
                 location,
                 req.location,
@@ -10846,7 +10376,22 @@ pub const ApiHttpServer = struct {
                 attempt_table.artifact_backup_id,
                 req.format,
                 connection,
+                .logical_create,
             ) catch |err| {
+                if (err == error.BackupOutcomeAmbiguous) {
+                    // The forwarded owner may still be completing work after a
+                    // post-send transport failure. Immediate partial cleanup
+                    // could race that writer and resurrect an unfenced
+                    // manifest. Retain the attempt marker and exact artifact
+                    // identities for bounded stale-attempt reconciliation.
+                    table_outcome_ambiguous = true;
+                    cluster_cleanup_safe = false;
+                    statuses[i].status = "ambiguous";
+                    statuses[i].code = "backup_outcome_ambiguous";
+                    statuses[i].retryable = false;
+                    statuses[i].backup_id = attempt_table.table_backup_id;
+                    statuses[i].artifact_backup_id = attempt_table.artifact_backup_id;
+                }
                 statuses[i].@"error" = switch (err) {
                     // Once table execution begins, the request may already have
                     // published artifacts for an earlier table. Never return
@@ -10866,6 +10411,8 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedMultiRangeTable => "backup does not support multi-range tables",
                     error.UnsupportedBackupMigrationState => "backup does not support active schema migration",
                     error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
+                    error.CatalogChanged => backups_api.catalog_changed_message,
+                    error.BackupOutcomeAmbiguous => backups_api.backup_outcome_ambiguous_message,
                     else => blk: {
                         std.log.warn("cluster backup table snapshot failed table={s} class={s}", .{
                             table_name,
@@ -10961,6 +10508,12 @@ pub const ApiHttpServer = struct {
                 std.log.warn("cluster backup committed with lease already fenced", .{});
             }
             cluster_committed = true;
+        } else if (table_outcome_ambiguous) {
+            trace.enter(.partial_cleanup);
+            lease_heartbeat.stop_event.set(backup_io);
+            lease_future.await(backup_io);
+            lease_future_running = false;
+            std.log.err("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
         } else {
             trace.enter(.partial_cleanup);
             // A partial aggregate is not a restore candidate. Reclaim every
@@ -11382,40 +10935,313 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreExecutionPermitted(self: *ApiHttpServer) bool {
-        if (self.cfg.ha_failover_safe_mutations_only) return false;
+        if (self.haMutationPolicy().failover_safe_mutations_only) return false;
         if (self.restore_dispatch_paused.load(.acquire)) return false;
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
         return term != 0 and guard.is_current(guard.ptr, term);
     }
 
-    pub fn handlePublicTableBatch(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        var response = switch (resp.status) {
-            201 => blk: {
+    pub fn executeExtensionHostBatch(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+    ) ![]u8 {
+        comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
+        if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
+        defer self.releaseWrite();
+        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(.{}));
+        defer response.deinit(self.alloc);
+        if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
+        return try result_alloc.dupe(u8, response.body);
+    }
+
+    pub fn executeExtensionHostQuery(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]u8 {
+        comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
+        if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
+        defer self.releaseQuery();
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const source = self.table_reads orelse return error.TableNotFound;
+        db_mod.resetLastSortRejectionDiagnostic();
+        const response_body = try self.executePublicTableQueryDispatchWithReadinessRetry(
+            self.alloc,
+            source,
+            table_name,
+            body,
+            row_filter_json,
+            authenticated_identity,
+            null,
+        );
+        defer self.alloc.free(response_body);
+        return try result_alloc.dupe(u8, response_body);
+    }
+
+    pub fn executeMcpApplicationOperation(
+        self: *ApiHttpServer,
+        operation: contextual_operations.McpApplicationOperation,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const admission_class = request_admission_policy.mcpOperationClass(operation);
+        const admitted = switch (admission_class) {
+            .none => true,
+            .query => self.tryAcquireQuery(),
+            .write => self.tryAcquireWrite(),
+            .inference => self.tryAcquireInference(),
+        };
+        if (!admitted) return switch (admission_class) {
+            .none => unreachable,
+            .query => try self.queryOverloadedResponse(),
+            .write => try self.writeOverloadedResponse(),
+            .inference => try self.inferenceOverloadedResponse(),
+        };
+        defer switch (admission_class) {
+            .none => {},
+            .query => self.releaseQuery(),
+            .write => self.releaseWrite(),
+            .inference => self.releaseInference(),
+        };
+
+        switch (operation) {
+            .list_tables => {
+                var snapshot = (try self.source.adminSnapshot()) orelse
+                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                defer self.source.freeAdminSnapshot(&snapshot);
+                const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, null);
+                defer if (storage_statuses) |items| self.alloc.free(items);
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
+                return try contextualJsonResponse(
+                    self.alloc,
+                    200,
+                    try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, null, storage_statuses),
+                );
             },
-            else => if (resp.json)
-                try jsonBodyResponseWithStatus(self.alloc, resp.status, resp.body)
-            else
-                try textResponse(self.alloc, resp.status, resp.body),
-        };
-        if (resp.retry_after_seconds) |seconds| {
-            response.headers = try self.alloc.alloc(http_common.Header, 1);
-            errdefer {
-                self.alloc.free(response.headers);
-                response.headers = &.{};
-                response.deinit(self.alloc);
-            }
-            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
-            defer self.alloc.free(value);
-            response.headers[0] = try ownedHeader(self.alloc, "Retry-After", value);
+            .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body),
+            .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
+            .describe_table => |request| {
+                const body = (try self.maybeEncodeTableStatus(request.table_name)) orelse
+                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                return contextual_operations.json(body, false);
+            },
+            .list_indexes => |request| {
+                var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi(.{}));
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromPublicTable(self.alloc, response);
+            },
+            .create_index => |request| {
+                var response = try public_table_http.handleTableCreateIndex(self.alloc, request.table_name, request.index_name, request.body, self.tableApi(.{}));
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromPublicTable(self.alloc, response);
+            },
+            .drop_index => |request| {
+                var response = try public_table_http.handleTableDeleteIndex(self.alloc, request.table_name, request.index_name, self.tableApi(.{}));
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromPublicTable(self.alloc, response);
+            },
+            .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
+            .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
+            .query => |request| {
+                var response = try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+                    request.table_name,
+                    request.body,
+                    null,
+                    authenticated_identity,
+                    null,
+                );
+                defer response.deinit(self.alloc);
+                return try cloneContextualResponse(self.alloc, response);
+            },
+            .backup => |request| {
+                var response = try public_table_http.handleTableBackup(
+                    self.alloc,
+                    request.table_name,
+                    request.body,
+                    self.tableApi(.{}),
+                    self.cfg.secret_store,
+                    self.cfg.node_config,
+                    self.sharedApiIo(),
+                );
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromPublicTable(self.alloc, response);
+            },
+            .restore => |request| {
+                var response = try self.handlePublicTableRestore(
+                    request.table_name,
+                    request.body,
+                    null,
+                    if (authenticated_identity) |identity| identity.username else null,
+                );
+                defer response.deinit(self.alloc);
+                return try cloneContextualResponse(self.alloc, response);
+            },
+            .batch => |request| {
+                var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi(.{}));
+                defer response.deinit(self.alloc);
+                return try contextualResponseFromPublicTable(self.alloc, response);
+            },
         }
-        return response;
+    }
+
+    fn executeMcpCreateTable(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !contextual_operations.OwnedResponse {
+        var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
+            return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
+        defer request.deinit(self.alloc);
+        const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .io = self.inferenceIo(),
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+                .inference_api_url = self.configuredInferenceAPIURL(),
+                .inference_api_key = self.cfg.inference_api_key,
+            },
+        ) catch |err| return switch (err) {
+            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "table index validation probe unavailable"),
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
+            else => return err,
+        };
+        if (request.indexes_json) |old| self.alloc.free(old);
+        request.indexes_json = normalized_indexes_json;
+        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
+            error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
+            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        const local_handled = if (self.table_writes) |writes|
+            (try writes.createTable(self.alloc, table_name, request)) != null
+        else
+            false;
+        if (local_handled) {
+            self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
+                error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                else => return err,
+            };
+            if (!self.cfg.deployment_mode.isStandalone()) {
+                self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
+                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                    else => return err,
+                };
+            }
+        } else {
+            const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
+                break :lifecycle switch (err) {
+                    error.TableVisibilityTimeout => {
+                        self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
+                            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                            else => return fallback_err,
+                        };
+                        break :lifecycle true;
+                    },
+                    error.NotLeader => return err,
+                    else => return err,
+                };
+            };
+            if (!metadata_wait_handled) {
+                self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
+                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
+                    else => return err,
+                };
+            }
+        }
+        const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
+            return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        return contextual_operations.json(response_body, false);
+    }
+
+    fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
+        var group_ids: ?[]u64 = null;
+        defer if (group_ids) |values| self.alloc.free(values);
+        if (self.table_writes != null) {
+            if (try self.source.adminSnapshot()) |snapshot_value| {
+                var snapshot = snapshot_value;
+                defer self.source.freeAdminSnapshot(&snapshot);
+                group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
+            }
+        }
+        self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+            error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
+            error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        if (self.table_writes) |writes| {
+            _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
+                error.TableNotFound => null,
+                else => return err,
+            };
+        }
+        self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table delete did not converge"),
+            else => return err,
+        };
+        return try contextual_operations.textAlloc(self.alloc, 204, "");
+    }
+
+    fn executeMcpGetDocument(
+        self: *ApiHttpServer,
+        request: contextual_operations.McpApplicationOperation.DocumentRead,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        const query = if (request.fields) |fields| try std.fmt.allocPrint(self.alloc, "fields={s}", .{fields}) else try self.alloc.dupe(u8, "");
+        defer self.alloc.free(query);
+        var lookup_options = try http_route_helpers.parseLookupOptions(self.alloc, query);
+        defer lookup_options.deinit(self.alloc);
+        var result = (source.lookup(self.alloc, request.table_name, request.key, lookup_options.opts, .read_index) catch |err| switch (err) {
+            error.TableNotFound => return try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        if (row_filter_json) |value| {
+            if (!(try self.docJsonMatchesRowFilter(request.key, result.json, value)))
+                return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        }
+        return contextual_operations.json(try self.alloc.dupe(u8, result.json), false);
+    }
+
+    fn executeMcpSampleDocuments(
+        self: *ApiHttpServer,
+        request: contextual_operations.McpApplicationOperation.TableBody,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        var scan_request = http_route_helpers.parseScanKeysRequest(self.alloc, request.body) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid scan request");
+        defer scan_request.deinit(self.alloc);
+        var result = (try source.scan(
+            self.alloc,
+            request.table_name,
+            scan_request.from,
+            scan_request.to,
+            scan_request.opts,
+            .read_index,
+        )) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const body = if (row_filter_json) |value|
+            try self.filterScanResultByRowFilter(self.alloc, source, request.table_name, result.ndjson, value)
+        else
+            try self.alloc.dupe(u8, result.ndjson);
+        defer self.alloc.free(body);
+        return contextual_operations.json(try mcpSampleDocumentsJsonAlloc(self.alloc, body), false);
     }
 
     pub fn handlePublicTableQueryWithContentType(
@@ -11424,7 +11250,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         content_type: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, content_type, authenticated_identity, null);
     }
 
@@ -11435,14 +11261,36 @@ pub const ApiHttpServer = struct {
         content_type: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+            table_name,
+            body,
+            content_type,
+            authenticated_identity,
+            cancellation,
+        );
+    }
+
+    /// Execute while the caller holds this server's query permit. Transport
+    /// adapters use this to retain protocol-specific overload responses
+    /// without double-counting application admission.
+    pub fn handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
         }
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation);
     }
 
-    pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
         return try self.handlePublicGlobalMultiQueryWithCancellation(body, authenticated_identity, null);
     }
 
@@ -11454,87 +11302,74 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
+    }
+
+    pub fn handleAdmittedPublicGlobalMultiQueryWithCancellation(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation);
     }
 
-    fn publicQueryDispatchErrorResponse(
+    fn publicQueryOperationErrorResponse(
         self: *ApiHttpServer,
         table_name: []const u8,
         body: []const u8,
         err: anyerror,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return switch (err) {
-            error.InvalidQueryRequest => try invalidPublicQueryRequestResponse(self.alloc),
-            error.InvalidFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "filter_query",
-                .invalid,
-            ),
-            error.InvalidExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "exclusion_query",
-                .invalid,
-            ),
-            error.UnsupportedFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "filter_query",
-                .unsupported,
-            ),
-            error.UnsupportedExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
-                self.alloc,
-                body,
-                "exclusion_query",
-                .unsupported,
-            ),
-            error.UnsupportedExactSort => try unsupportedExactSortResponse(self.alloc),
-            error.UnsupportedQueryRequest => try unsupportedPublicQueryResponse(self.alloc, body),
-            error.IdentityReadGenerationChanged => try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
-            error.QueryCandidateBudgetExceeded => try queryCandidateBudgetExceededResponse(self.alloc),
-            error.QueryEmbeddingInputTooLarge => try textResponse(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => try textResponse(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try textResponse(self.alloc, 504, "query timed out"),
-            // A peer disconnect is expected control flow. The listener will
-            // discard this response when the socket is already gone.
-            error.Cancelled => try textResponse(self.alloc, 499, "client closed request"),
-            error.NotFound, error.TableNotFound => try textResponse(self.alloc, 404, "not found"),
-            error.ModelNotFound => try modelNotFoundResponse(self.alloc),
-            error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.IndexRebuilding => try indexRebuildingResponse(self.alloc),
-            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try textResponse(self.alloc, 503, "read requires primary"),
-            error.HAReadWaitForApply,
-            error.HAReadWaitForMetadata,
-            error.ReadUnavailable,
-            => try textResponse(self.alloc, 503, "standby read unavailable"),
-            error.PersistentDescriptorAdmissionExhausted,
-            error.StorageReadTemporarilyUnavailable,
-            => try storageReadTemporarilyUnavailableResponse(self.alloc),
+            error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
+                try contextualUnsupportedExactSortResponse(self.alloc)
+            else
+                try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
+            error.InvalidFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .invalid),
+            error.InvalidExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .invalid),
+            error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
+            error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
+            error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
+            error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
+                try contextualUnsupportedExactSortResponse(self.alloc)
+            else
+                try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
+            error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
+            error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
+            error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
+            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query timed out"),
+            error.Cancelled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
+            error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
+            error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
+            error.IndexRebuilding => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
+            error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
-            => .{
-                .status = 500,
-                .content_type = try self.alloc.dupe(u8, "application/json"),
-                .body = try public_table_http.tableStorageUnreadableBody(self.alloc, err),
-            },
+            => contextual_operations.jsonWithStatus(500, try public_table_http.tableStorageUnreadableBody(self.alloc, err), false),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "query failed");
+                return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             },
         };
     }
 
-    pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, null);
+    pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
+        return try self.handlePublicTableQueryWithContentTypeCancellation(table_name, body, null, authenticated_identity, null);
     }
 
     fn handlePublicTableQueryWithCancellation(
@@ -11543,11 +11378,11 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
@@ -11556,14 +11391,9 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
-            if (cancellation) |value| value.signal() else null,
-        ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
-        defer self.alloc.free(response_body);
-
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_impl.deinit();
-        const parsed = try parseJsonResponseBody(metadata_openapi.QueryResponses, arena_impl.allocator(), response_body);
-        return try jsonResponse(self.alloc, parsed);
+            if (cancellation) |value| value.token() else null,
+        ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        return contextual_operations.json(response_body, false);
     }
 
     fn handlePublicTableMultiQuery(
@@ -11571,7 +11401,7 @@ pub const ApiHttpServer = struct {
         route_table_name: ?[]const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         return try self.handlePublicTableMultiQueryWithCancellation(route_table_name, body, authenticated_identity, null);
     }
 
@@ -11581,7 +11411,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
-    ) !http_common.HttpResponse {
+    ) !contextual_operations.OwnedResponse {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -11595,7 +11425,7 @@ pub const ApiHttpServer = struct {
         while (lines.next()) |raw_line| {
             if (cancellation) |value| {
                 if (value.isCancelled()) {
-                    return try self.publicQueryDispatchErrorResponse(
+                    return try self.publicQueryOperationErrorResponse(
                         route_table_name orelse "",
                         raw_line,
                         error.Cancelled,
@@ -11607,11 +11437,11 @@ pub const ApiHttpServer = struct {
 
             const table_name = if (route_table_name) |name| name else blk: {
                 var parsed_table = parseGlobalQueryTable(arena, line) catch {
-                    return try textResponse(self.alloc, 400, "invalid query request");
+                    return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
                 };
                 defer parsed_table.deinit();
                 if (parsed_table.table_name.len == 0) {
-                    return try textResponse(self.alloc, 400, "invalid query request");
+                    return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
                 }
                 break :blk parsed_table.table_name;
             };
@@ -11619,7 +11449,7 @@ pub const ApiHttpServer = struct {
             const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
             defer if (row_filter_json) |value| self.alloc.free(value);
 
-            const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+            const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
             const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
@@ -11628,22 +11458,22 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
-                if (cancellation) |value| value.signal() else null,
-            ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
+                if (cancellation) |value| value.token() else null,
+            ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
             var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
                 .allocate = .alloc_always,
-            }) catch return try textResponse(self.alloc, 500, "query failed");
+            }) catch return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             defer parsed.deinit();
             const object = switch (parsed.value) {
                 .object => |object| object,
-                else => return try textResponse(self.alloc, 500, "query failed"),
+                else => return try contextual_operations.textAlloc(self.alloc, 500, "query failed"),
             };
-            const responses_value = object.get("responses") orelse return try textResponse(self.alloc, 500, "query failed");
+            const responses_value = object.get("responses") orelse return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             const responses = switch (responses_value) {
                 .array => |array| array.items,
-                else => return try textResponse(self.alloc, 500, "query failed"),
+                else => return try contextual_operations.textAlloc(self.alloc, 500, "query failed"),
             };
             for (responses) |response_value| {
                 if (emitted > 0) try out.writer.writeByte(',');
@@ -11652,165 +11482,9 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        if (emitted == 0) return try textResponse(self.alloc, 400, "invalid query request");
+        if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
-        return try jsonBodyResponseWithStatus(self.alloc, 200, out.written());
-    }
-
-    pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableGetIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicListArtifactEnrichments(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleListArtifactEnrichments(self.alloc, table_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableCreateIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicTableDeleteIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableDeleteIndex(self.alloc, table_name, index_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicPutArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        var resp = try public_table_http.handlePutArtifactEnrichment(self.alloc, table_name, artifact_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDeleteArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        var resp = try public_table_http.handleDeleteArtifactEnrichment(self.alloc, table_name, artifact_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
-            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
-            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
-        };
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, opts, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
-            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
-            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
-        };
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, opts, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
-        defer self.alloc.free(doc_key);
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-
-        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
-        defer self.alloc.free(artifact_name);
-
-        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
     }
 
     const PublicRepairListRequest = struct {
@@ -11821,15 +11495,15 @@ pub const ApiHttpServer = struct {
         limit: ?u32 = null,
     };
 
-    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair list request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request");
         };
         defer parsed.deinit();
-        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
         const raw_limit: u32 = parsed.value.limit orelse 50;
-        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (raw_limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 500);
         var result = (source.listArtifactRepairIssues(self.alloc, table_name, .{
             .target = target,
@@ -11838,12 +11512,12 @@ pub const ApiHttpServer = struct {
             .limit = limit,
             .cursor = parsed.value.cursor,
         }) catch |err| switch (err) {
-            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid cursor"),
+            error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid cursor"),
             else => {
                 std.log.err("artifact repair issue list failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "artifact repair issue list failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact repair issue list failed");
             },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
 
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
@@ -11856,8 +11530,7 @@ pub const ApiHttpServer = struct {
             .next_cursor = result.next_cursor,
             .issues = result.issues,
         }, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        return .{ .status = 200, .body = response_body, .json = true };
     }
 
     const PublicRepairRunRequest = struct {
@@ -11871,23 +11544,23 @@ pub const ApiHttpServer = struct {
         repair_id: ?[]const u8 = null,
     };
 
-    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
-        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try textResponse(self.alloc, 400, "invalid repair target");
+        const body_target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
         const target = body_target;
         const raw_limit = parsed.value.limit orelse 100;
-        if (raw_limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (raw_limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
         const limit: u32 = @min(raw_limit, 1000);
         const control = if (parsed.value.control) |raw|
-            std.meta.stringToEnum(db_mod.types.IndexRepairControl, raw) orelse return try textResponse(self.alloc, 400, "invalid repair control")
+            std.meta.stringToEnum(db_mod.types.IndexRepairControl, raw) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair control")
         else
             null;
         const repair_id = if (parsed.value.repair_id) |raw|
-            std.fmt.parseInt(u128, raw, 10) catch return try textResponse(self.alloc, 400, "invalid repair id")
+            std.fmt.parseInt(u128, raw, 10) catch return try publicOperationTextResponse(self.alloc, 400, "invalid repair id")
         else
             null;
         var result = (source.repairArtifactIssues(self.alloc, table_name, .{
@@ -11900,13 +11573,13 @@ pub const ApiHttpServer = struct {
             .control = control,
             .repair_id = repair_id,
         }) catch |err| switch (err) {
-            error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid repair request"),
-            error.StaleIndexRepairControl => return try textResponse(self.alloc, 409, "repair changed; refresh and retry"),
+            error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid repair request"),
+            error.StaleIndexRepairControl => return try publicOperationTextResponse(self.alloc, 409, "repair changed; refresh and retry"),
             else => {
                 std.log.err("table repair failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "table repair failed");
+                return try publicOperationTextResponse(self.alloc, 500, "table repair failed");
             },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
@@ -11914,18 +11587,17 @@ pub const ApiHttpServer = struct {
             .limit = limit,
             .result = result,
         }, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        return .{ .status = 200, .body = response_body, .json = true };
     }
 
-    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 400, "invalid repair job request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair job request");
         };
         defer parsed.deinit();
-        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try textResponse(self.alloc, 400, "invalid repair target");
-        if (parsed.value.limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
+        if (parsed.value.limit == 0) return try publicOperationTextResponse(self.alloc, 400, "invalid limit");
 
         const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
             .target = parsed.value.target,
@@ -11939,51 +11611,51 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         if (parsed.value.advance) {
             var parsed_state = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-                return try textResponse(self.alloc, 500, "repair job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
             };
             defer parsed_state.deinit();
             return try self.advanceTableRepairJobState(table_name, parsed_state.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+        return try publicOperationJsonResponse(self.alloc, 202, encoded);
     }
 
-    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
-        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
+        return try publicOperationJsonResponse(self.alloc, 200, encoded);
     }
 
-    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
         return try self.advanceTableRepairJobState(table_name, parsed.value);
     }
 
-    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "repair job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "repair job failed");
         };
         defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try publicOperationTextResponse(self.alloc, 404, "not found");
         const cancelled = try self.repair_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
         var parsed_cancelled = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_cancelled.deinit();
         if (repair_jobs.requiresDurableCancel(parsed_cancelled.value) and
@@ -11991,25 +11663,25 @@ pub const ApiHttpServer = struct {
         {
             return try self.advanceTableRepairJobState(table_name, parsed_cancelled.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+        return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
-    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !http_common.HttpResponse {
+    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !public_table_http.OwnedResponse {
         if (repair_jobs.isTerminalPhase(state.phase)) {
             const encoded = try repair_jobs.encodeState(self.alloc, state);
             defer self.alloc.free(encoded);
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
 
         const begin = try self.repair_job_store.beginAdvance(self.alloc, state);
         defer self.alloc.free(begin.encoded);
         var parsed_running = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_running.deinit();
         const running_state = parsed_running.value;
         if (!begin.started) {
-            return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+            return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
         }
 
         const updated = if (try self.submitTableRepairJobPass(table_name, begin.encoded, running_state.job_id)) |submitted|
@@ -12018,10 +11690,10 @@ pub const ApiHttpServer = struct {
             try self.runTableRepairJobPass(table_name, running_state);
         defer self.alloc.free(updated);
         var parsed_updated = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, updated, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid repair job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid repair job state");
         };
         defer parsed_updated.deinit();
-        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
+        return try publicOperationJsonResponse(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
     }
 
     const TableRepairJobPassWork = struct {
@@ -12296,12 +11968,12 @@ pub const ApiHttpServer = struct {
         return try self.repair_job_store.recordPass(self.alloc, running_state, result);
     }
 
-    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        if (self.table_writes == null) return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
-            return try textResponse(self.alloc, 400, "invalid request");
+            return try publicOperationTextResponse(self.alloc, 400, "invalid request");
         };
         defer parsed.deinit();
 
@@ -12309,93 +11981,93 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(encoded);
         if (parsed.value.advance) {
             var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
             };
             defer parsed_state.deinit();
             return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+        return try publicOperationJsonResponse(self.alloc, 202, encoded);
     }
 
-    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
-        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        return try publicOperationJsonResponse(self.alloc, 200, encoded);
     }
 
-    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
         return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
     }
 
-    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !public_table_http.OwnedResponse {
         const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
-        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try publicOperationTextResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
         };
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
+            return try publicOperationTextResponse(self.alloc, 404, "not found");
         }
         if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
         const cancelled = try self.artifact_reprocess_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
         var parsed_cancelled = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid artifact reprocess job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid artifact reprocess job state");
         };
         defer parsed_cancelled.deinit();
-        return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+        return try publicOperationJsonResponse(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
-    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !public_table_http.OwnedResponse {
         if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
             const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
             defer self.alloc.free(encoded);
-            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+            return try publicOperationJsonResponse(self.alloc, 200, encoded);
         }
 
         const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
         defer self.alloc.free(begin.encoded);
         var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
-            return try textResponse(self.alloc, 500, "invalid job state");
+            return try publicOperationTextResponse(self.alloc, 500, "invalid job state");
         };
         defer parsed_running.deinit();
         const running_state = parsed_running.value;
         if (!begin.started) {
-            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+            return try publicOperationJsonResponse(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
         }
 
         const source = self.table_writes orelse {
             const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
-            return try textResponse(self.alloc, 405, "method not allowed");
+            return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         };
 
         const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
@@ -12417,52 +12089,35 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 503, "doc identity unavailable");
+                return try publicOperationTextResponse(self.alloc, 503, "doc identity unavailable");
             },
             error.InvalidArgument => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 400, "invalid request");
+                return try publicOperationTextResponse(self.alloc, 400, "invalid request");
             },
             error.NotFound => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                return try textResponse(self.alloc, 404, "not found");
+                return try publicOperationTextResponse(self.alloc, 404, "not found");
             },
             else => {
                 const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, running_state.job_id, err });
-                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+                return try publicOperationTextResponse(self.alloc, 500, "artifact reprocess job failed");
             },
         };
         if (result == null) {
             const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
-            return try textResponse(self.alloc, 405, "method not allowed");
+            return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
         }
         var pass = result.?;
         defer pass.deinit(self.alloc);
         const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, pass);
         defer self.alloc.free(updated);
-        return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
-    }
-
-    pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            201 => blk: {
-                const BackupSuccess = struct {
-                    backup: []const u8,
-                };
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(BackupSuccess, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
-            },
-            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
-        };
+        return try publicOperationJsonResponse(self.alloc, 202, updated);
     }
 
     pub fn handlePublicTableRestore(
@@ -12471,11 +12126,10 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         idempotency_key: ?[]const u8,
         principal: ?[]const u8,
-    ) !http_common.HttpResponse {
-        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+    ) !contextual_operations.OwnedResponse {
+        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer parsed.deinit();
-        backups_api.validateBackupId(parsed.value.backup_id) catch return try jsonErrorResponse(self.alloc, 400, "invalid backup id");
-        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
         const connection = parsed.value.connection;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
             .secret_store = self.cfg.secret_store,
@@ -12483,8 +12137,9 @@ pub const ApiHttpServer = struct {
             .connection = connection,
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
-        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .table, table_name);
         defer self.alloc.free(idempotency_namespace);
         const encoded = self.restore_job_store.start(self.alloc, .{
@@ -12504,48 +12159,25 @@ pub const ApiHttpServer = struct {
         return try self.restoreJobResponse(202, encoded);
     }
 
-    pub fn handlePublicClusterBackupList(self: *ApiHttpServer, location_uri: []const u8, connection: ?[]const u8, options: backups_api.BackupListOptions) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, connection, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo(), options);
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
-    pub fn handlePublicClusterBackup(self: *ApiHttpServer, body: []const u8) !http_common.HttpResponse {
-        var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store, self.cfg.node_config, self.sharedApiIo());
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterBackupResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, parsed);
-            },
-            else => try jsonErrorResponse(self.alloc, resp.status, resp.body),
-        };
-    }
-
     pub fn handlePublicClusterRestore(
         self: *ApiHttpServer,
         body: []const u8,
         idempotency_key: ?[]const u8,
         principal: ?[]const u8,
-    ) !http_common.HttpResponse {
-        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore request");
+    ) !contextual_operations.OwnedResponse {
+        var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
-        const connection = req.connection orelse return try jsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
-        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try jsonErrorResponse(self.alloc, 400, "invalid restore mode");
-        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        const connection = req.connection orelse return try contextualJsonErrorResponse(self.alloc, 400, "restore requires a named external_io connection");
+        const restore_mode = backups_api.validateClusterRestoreMode(req.restore_mode) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore mode");
         var location = backups_api.openBackupLocationWithOptions(self.alloc, req.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
-        }) catch |err| return try jsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .cluster, null);
         defer self.alloc.free(idempotency_namespace);
         const encoded = self.restore_job_store.start(self.alloc, .{
@@ -12567,7 +12199,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *ApiHttpServer) !void {
-        if (self.cfg.ha_failover_safe_mutations_only) return;
+        if (self.haMutationPolicy().failover_safe_mutations_only) return;
         if (self.restore_jobs_resumed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.schedulePendingRestoreJobs() catch |err| {
             self.restore_jobs_resumed.store(false, .release);
@@ -12772,6 +12404,7 @@ pub const ApiHttpServer = struct {
                         state.location,
                         state.connection,
                         &location,
+                        .{},
                     ) catch |err| switch (err) {
                         // The local owned-table path reports durable completion as
                         // a sentinel because the public callback otherwise has no
@@ -12886,13 +12519,13 @@ pub const ApiHttpServer = struct {
         self.alloc.free(finished);
     }
 
-    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
+    pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !contextual_operations.OwnedResponse {
         const encoded = if (cancel) blk: {
             const cancelled = (try self.restore_job_store.cancel(self.alloc, job_id)) orelse
-                return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
             self.signalRestoreRetryWakeup();
             break :blk cancelled;
-        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -12911,8 +12544,8 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         identity: ?AuthenticatedIdentity,
         options: RestoreJobListOptions,
-    ) !http_common.HttpResponse {
-        if (options.limit == 0 or options.limit > 100) return try jsonErrorResponse(self.alloc, 400, "invalid restore job list limit");
+    ) !contextual_operations.OwnedResponse {
+        if (options.limit == 0 or options.limit > 100) return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore job list limit");
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
@@ -12963,7 +12596,7 @@ pub const ApiHttpServer = struct {
         }
 
         const next_cursor = if (continuation_cursor) |value| try std.fmt.allocPrint(arena, "{d}", .{value}) else null;
-        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 200, .{
+        return try contextualJsonResponseOmitNullOptionals(self.alloc, 200, .{
             .jobs = jobs.items,
             .next_cursor = next_cursor,
         });
@@ -13034,14 +12667,14 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !http_common.HttpResponse {
+    fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !contextual_operations.OwnedResponse {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
         const view = try restoreJobViewAlloc(arena, encoded);
-        var response = try jsonResponseWithStatusOmitNullOptionals(self.alloc, status, view);
+        var response = try contextualJsonResponseOmitNullOptionals(self.alloc, status, view);
         if (status == 202) {
-            response.headers = try self.alloc.alloc(http_common.Header, 2);
+            response.headers = try self.alloc.alloc(contextual_operations.Header, 2);
             var initialized: usize = 0;
             errdefer {
                 for (response.headers[0..initialized]) |*header| header.deinit(self.alloc);
@@ -13051,9 +12684,9 @@ pub const ApiHttpServer = struct {
             }
             const location_value = try std.fmt.allocPrint(self.alloc, "/db/v1/restore/jobs/{s}", .{view.job_id});
             defer self.alloc.free(location_value);
-            response.headers[0] = try ownedHeader(self.alloc, "Location", location_value);
+            response.headers[0] = try ownedContextualHeader(self.alloc, "Location", location_value);
             initialized += 1;
-            response.headers[1] = try ownedHeader(self.alloc, "Retry-After", "1");
+            response.headers[1] = try ownedContextualHeader(self.alloc, "Retry-After", "1");
         }
         return response;
     }
@@ -13198,17 +12831,17 @@ fn restoreJobIdFromPath(path: []const u8) ?u64 {
     return std.fmt.parseUnsigned(u64, raw, 10) catch null;
 }
 
-fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
-    if (metadata_authority.isRetryableError(err)) return try metadataNotLeaderResponse(alloc);
+fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    if (metadata_authority.isRetryableError(err)) return try contextualRetryableJsonErrorResponse(alloc, 503, "metadata leader unavailable");
     return switch (err) {
-        error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
-        error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
-        error.AsyncRestoreUnavailable => try jsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
-        error.RestoreJobPersistenceUnavailable => try jsonErrorResponse(alloc, 503, "durable restore store unavailable"),
-        error.RestoreJobCapacityExceeded => try jsonErrorResponse(alloc, 503, "restore job history is at capacity"),
-        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try jsonErrorResponse(alloc, 400, "restore request is too large"),
-        error.DuplicateRestoreTableName => try jsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
-        else => try jsonErrorResponse(alloc, 500, "failed to create restore job"),
+        error.InvalidIdempotencyKey => try contextualJsonErrorResponse(alloc, 400, "invalid idempotency key"),
+        error.IdempotencyConflict => try contextualJsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
+        error.AsyncRestoreUnavailable => try contextualJsonErrorResponse(alloc, 503, "asynchronous restore worker unavailable"),
+        error.RestoreJobPersistenceUnavailable => try contextualJsonErrorResponse(alloc, 503, "durable restore store unavailable"),
+        error.RestoreJobCapacityExceeded => try contextualJsonErrorResponse(alloc, 503, "restore job history is at capacity"),
+        error.RestoreJobRecordTooLarge, error.TooManyRestoreTables => try contextualJsonErrorResponse(alloc, 400, "restore request is too large"),
+        error.DuplicateRestoreTableName => try contextualJsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
+        else => try contextualJsonErrorResponse(alloc, 500, "failed to create restore job"),
     };
 }
 
@@ -13409,13 +13042,21 @@ fn ensureRequestDeadline(deadline_ns: ?u64) !void {
     if (retryDeadlineExpired(deadline_ns, platform_time.monotonicNs())) return error.Timeout;
 }
 
-fn ensureRequestActive(cancellation: ?*const std.atomic.Value(bool)) !void {
+fn ensureRequestActive(cancellation: ?CancellationToken) !void {
     if (cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
+        if (value.isCancelled()) return error.Cancelled;
     }
 }
 
-fn sleepNsCancellable(duration_ns: u64, cancellation: ?*const std.atomic.Value(bool)) !void {
+fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canceled, DeadlineExceeded }!void {
+    request.ensureActive() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.DeadlineExceeded => return error.DeadlineExceeded,
+        else => unreachable,
+    };
+}
+
+fn sleepNsCancellable(duration_ns: u64, cancellation: ?CancellationToken) !void {
     // Retry sleeps are deliberately broken into short slices so a vanished
     // peer does not occupy an expensive query slot for the full backoff.
     var remaining = duration_ns;
@@ -13459,6 +13100,10 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             return try service.adminSnapshot();
         }
 
+        fn cachedAdminSnapshot(ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot {
+            return try adminSnapshot(ptr);
+        }
+
         fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
             service.freeAdminSnapshot(snapshot);
@@ -13500,6 +13145,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
         .vtable = &.{
             .status = V.status,
             .admin_snapshot = V.adminSnapshot,
+            .cached_admin_snapshot = V.cachedAdminSnapshot,
             .free_admin_snapshot = V.freeAdminSnapshot,
             .create_table = V.createTable,
             .drop_table = V.dropTable,
@@ -13556,13 +13202,22 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
     runtime_schema: storage_schema.TableSchema,
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !void {
+    return validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+        query_req,
+        runtime_schema,
+        observed_dynamic_capability_sets,
+        true,
+    );
+}
+
+fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
+    query_req: db_mod.types.SearchRequest,
+    runtime_schema: storage_schema.TableSchema,
+    observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    physical_evidence_available: bool,
+) !void {
+    if (try validatePublicQuerySortRequestContract(query_req)) return;
     const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
-    if (query_req.order_by.len == 0 and cursor.len == 0) return;
-    try validatePublicCountOnlySortPageContract(query_req);
-    try validatePublicSortCursorContract(query_req);
-    try validatePublicScoreSortSource(query_req);
-    try validatePublicApproximateSortSource(query_req);
-    if (query_req.order_by.len == 0) return;
     for (query_req.order_by, 0..) |field, i| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
@@ -13575,7 +13230,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
                 field.field,
                 mapping.field_type,
             ) == null) {
-                try validatePublicMappedSortCoverage(field.field, mapping);
+                if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
             }
             if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
             continue;
@@ -13591,15 +13246,80 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntime(
             continue;
         }
 
-        recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
-        return error.UnsupportedExactSort;
+        // A routed gateway cannot see shard-local wildcard/dynamic mappings.
+        // Defer only the physical question; every owning shard still performs
+        // the same fail-closed native-sort planning before reading results.
+        if (physical_evidence_available) {
+            recordPublicSortCapabilityRejection(field.field, "unmapped_sort_field", "unmapped_field");
+            return error.UnsupportedExactSort;
+        }
     }
+}
+
+/// Validate everything that does not require physical typed-doc-values
+/// evidence. Returning true means the request is fully handled by synthetic
+/// sort keys and query admission can avoid table/index access entirely.
+fn validatePublicQuerySortRequestContract(query_req: db_mod.types.SearchRequest) !bool {
+    const cursor = if (query_req.search_after.len > 0) query_req.search_after else query_req.search_before;
+    if (query_req.order_by.len == 0 and cursor.len == 0) return true;
+    try validatePublicCountOnlySortPageContract(query_req);
+    try validatePublicSortCursorContract(query_req);
+    if (query_req.hierarchy_children != null) {
+        // `_hierarchy.position` is produced by the traversal planner, not by a
+        // mapped document field. The query contract has already selected the
+        // dedicated child-navigation mode; validate its exact synthetic order
+        // here instead of sending it through the native doc-value capability
+        // gate used by ordinary search sorts.
+        if (query_req.order_by.len != 2 or
+            !std.mem.eql(u8, query_req.order_by[0].field, "_hierarchy.position") or
+            query_req.order_by[0].desc or
+            !std.mem.eql(u8, query_req.order_by[1].field, "_id") or
+            query_req.order_by[1].desc or
+            query_req.search_before.len != 0 or
+            (query_req.search_after.len > 0 and
+                (query_req.search_after.len != 2 or
+                    query_req.search_after[0] != .string or
+                    query_req.search_after[1] != .string)))
+        {
+            recordPublicSortCapabilityRejection("_hierarchy.position", "invalid_cursor_arity", "invalid_hierarchy_navigation_order");
+            return error.InvalidQueryRequest;
+        }
+        return true;
+    }
+    try validatePublicScoreSortSource(query_req);
+    try validatePublicApproximateSortSource(query_req);
+    for (query_req.order_by) |field| {
+        if (!std.mem.eql(u8, field.field, "_id") and !std.mem.eql(u8, field.field, "_score")) return false;
+    }
+    return true;
 }
 
 fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest) bool {
     return query_req.order_by.len > 0 or
         query_req.search_after.len > 0 or
         query_req.search_before.len > 0;
+}
+
+fn publicPhysicalSortFieldsAlloc(
+    alloc: std.mem.Allocator,
+    order_by: []const db_mod.types.SortField,
+) ![]const []const u8 {
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer fields.deinit(alloc);
+    for (order_by) |sort_field| {
+        if (std.mem.eql(u8, sort_field.field, "_id") or
+            std.mem.eql(u8, sort_field.field, "_score") or
+            std.mem.eql(u8, sort_field.field, "_hierarchy.position")) continue;
+        var duplicate = false;
+        for (fields.items) |field| {
+            if (std.mem.eql(u8, field, sort_field.field)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try fields.append(alloc, sort_field.field);
+    }
+    return try fields.toOwnedSlice(alloc);
 }
 
 fn validatePublicCountOnlySortPageContract(query_req: db_mod.types.SearchRequest) !void {
@@ -14113,31 +13833,206 @@ fn tableNamesFromClusterManifestAlloc(
     return names;
 }
 
-fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return .{
-        .status = 401,
-        .headers = try alloc.dupe(http_common.Header, &[_]http_common.Header{
-            .{
-                .name = try alloc.dupe(u8, "WWW-Authenticate"),
-                .value = try alloc.dupe(u8, "Basic realm=\"antfly\""),
-            },
-        }),
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt("unauthorized", .{})}),
-    };
-}
-
 fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
 }
 
-fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+fn contextualJsonResponse(alloc: std.mem.Allocator, status: u16, value: anytype) !contextual_operations.OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "application/json",
+        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
+    };
+}
+
+fn contextualJsonResponseOmitNullOptionals(alloc: std.mem.Allocator, status: u16, value: anytype) !contextual_operations.OwnedResponse {
+    return .{
+        .status = status,
+        .content_type = "application/json",
+        .body = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false }),
+    };
+}
+
+fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
+    return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
+}
+
+fn contextualPublicFilterQueryErrorResponseForBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    field: []const u8,
+    kind: query_api.PublicFilterQueryErrorKind,
+) !contextual_operations.OwnedResponse {
+    return .{
+        .status = query_api.publicFilterQueryErrorStatus(kind),
+        .content_type = "application/json",
+        .body = try query_api.encodePublicFilterQueryErrorBodyAlloc(alloc, body, field, kind),
+    };
+}
+
+fn contextualUnsupportedExactSortResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try contextualJsonResponse(alloc, 422, .{
+        .status = 422,
+        .@"error" = "unsupported_exact_sort",
+        .message = "exact sort is unsupported for this query",
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn contextualQueryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try contextualJsonResponse(alloc, 422, .{
+        .status = 422,
+        .@"error" = "query_candidate_budget_exceeded",
+        .message = "query candidate budget exceeded",
+        .reason = public_rejection.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    });
+}
+
+fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 409,
+        .content_type = "application/json",
+        .body = try public_table_http.hierarchyCursorStaleBody(alloc),
+    };
+}
+
+fn contextualQueryTemporarilyUnavailableResponse(
+    alloc: std.mem.Allocator,
+    reason: public_table_http.QueryTemporarilyUnavailableReason,
+) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, reason);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
+}
+
+fn ownedContextualHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !contextual_operations.Header {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+}
+
+fn contextualRetryableJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonErrorResponse(alloc, status, message);
+    errdefer response.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (response.headers[0..initialized]) |*header| header.deinit(alloc);
+        alloc.free(response.headers);
+        response.headers = &.{};
+    }
+    response.headers[0] = try ownedContextualHeader(alloc, "Retry-After", "1");
+    initialized += 1;
+    response.headers[1] = try ownedContextualHeader(alloc, http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+    return response;
+}
+
+fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operations.OwnedResponse) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, response.headers.len);
+    errdefer alloc.free(headers);
+    var initialized: usize = 0;
+    errdefer for (headers[0..initialized]) |*header| header.deinit(alloc);
+    for (response.headers, headers) |source, *target| {
+        target.* = try ownedContextualHeader(alloc, source.name, source.value);
+        initialized += 1;
+    }
+    return .{
+        .status = response.status,
+        .content_type = response.content_type,
+        .body = try alloc.dupe(u8, response.body),
+        .public_cors = response.public_cors,
+        .headers = headers,
+    };
+}
+
+fn contextualResponseFromPublicTable(
+    alloc: std.mem.Allocator,
+    response: public_table_http.OwnedResponse,
+) !contextual_operations.OwnedResponse {
+    var result = contextual_operations.OwnedResponse{
+        .status = response.status,
+        .content_type = if (response.json) "application/json" else "text/plain",
+        .body = try alloc.dupe(u8, response.body),
+    };
+    errdefer result.deinit(alloc);
+    if (response.retry_after_seconds) |seconds| {
+        result.headers = try alloc.alloc(contextual_operations.Header, 1);
+        var value_buf: [10]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "{d}", .{seconds});
+        result.headers[0] = ownedContextualHeader(alloc, "Retry-After", value) catch |err| {
+            alloc.free(result.headers);
+            result.headers = &.{};
+            return err;
+        };
+    }
+    return result;
+}
+
+fn haOperationTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !ha_http_operation.OwnedResponse {
+    return .{
+        .owner_allocator = alloc,
+        .status = status,
+        .content_type = try alloc.dupe(u8, "text/plain"),
+        .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = .{
+        .name = try alloc.dupe(u8, "Retry-After"),
+        .value = alloc.dupe(u8, "1") catch |err| {
+            alloc.free(headers[0].name);
+            return err;
+        },
+    };
+    errdefer headers[0].deinit(alloc);
+    return .{
+        .status = status,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, body),
+        .headers = headers,
+    };
+}
+
+fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
+    errdefer response.deinit(alloc);
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = .{
+        .name = try alloc.dupe(u8, "Retry-After"),
+        .value = alloc.dupe(u8, connections_api.inference_retry_after_seconds) catch |err| {
+            alloc.free(headers[0].name);
+            return err;
+        },
+    };
+    response.headers = headers;
+    return response;
+}
+
+fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
-        error.UnsupportedOperation => try jsonErrorResponse(alloc, 405, "method not allowed"),
-        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try jsonErrorResponse(alloc, 404, "not found"),
-        error.ExtensionAlreadyInstalled => try jsonErrorResponse(alloc, 409, "extension already installed"),
-        error.DependentExtensionExists => try jsonErrorResponse(alloc, 409, "dependent extension exists"),
-        error.RequiredExtensionNotInstalled => try jsonErrorResponse(alloc, 409, "required extension not installed"),
+        error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
+        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
+        error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
+        error.DependentExtensionExists => try contextualJsonErrorResponse(alloc, 409, "dependent extension exists"),
+        error.RequiredExtensionNotInstalled => try contextualJsonErrorResponse(alloc, 409, "required extension not installed"),
         error.UnsupportedManifestApiVersion,
         error.UnsupportedPackageKind,
         error.UnsupportedExtensionScope,
@@ -14158,7 +14053,7 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.EmptyName,
         error.InvalidIdentifier,
         error.MemberTableOutsideScope,
-        => try jsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
+        => try contextualJsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
         else => err,
     };
 }
@@ -14680,16 +14575,10 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
-    if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.a2a)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
-}
-
-fn isA2aProtocolPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, routes.Routes.a2a) or
-        std.mem.eql(u8, path, routes.Routes.agent_card) or
-        std.mem.eql(u8, path, routes.Routes.agent_card_legacy);
 }
 
 fn isHaAdminPath(path: []const u8) bool {
@@ -14713,23 +14602,6 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
             .asynchronous = status.maintenance.asynchronous,
         },
     };
-}
-
-fn storageMaintenanceJobResponse(
-    alloc: std.mem.Allocator,
-    status_code: u16,
-    snapshot: @import("../storage/maintenance.zig").Coordinator.Snapshot,
-) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, status_code, .{
-        .job_id = snapshot.job_id,
-        .operation = snapshot.operation,
-        .state = snapshot.state,
-        .created_at_ms = snapshot.created_at_ms,
-        .started_at_ms = snapshot.started_at_ms,
-        .completed_at_ms = snapshot.completed_at_ms,
-        .result = snapshot.result,
-        .@"error" = snapshot.error_name,
-    });
 }
 
 fn isHaInternalPath(path: []const u8) bool {
@@ -14761,6 +14633,11 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
 }
 
 pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
+    if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
+        .resource_type = .inference,
+        .resource = "*",
+        .permission_type = .write,
+    };
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
             .resource_type = .table,
@@ -14860,6 +14737,29 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
+}
+
+test "inference connection invocation requires inference write permission" {
+    const required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/connections/local-inference/inference/generate",
+    )).?;
+    defer required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usermgr.ResourceType.inference, required.resource_type);
+    try std.testing.expectEqualStrings("*", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
+
+    try std.testing.expect((try requiredPermissionForRequest(
+        std.testing.allocator,
+        .GET,
+        "/connections/local-inference/inference/generate",
+    )) == null);
+    try std.testing.expect((try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/connections/local-inference/inference/generate/extra",
+    )) == null);
 }
 
 fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
@@ -15169,7 +15069,7 @@ fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     return out;
 }
 
-fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
+pub fn constantTimeEql(lhs: []const u8, rhs: []const u8) bool {
     if (lhs.len != rhs.len) return false;
     var diff: u8 = 0;
     for (lhs, rhs) |left, right| diff |= left ^ right;
@@ -15299,91 +15199,6 @@ fn applyAuthenticatedIdentityToJoinRequest(
     }
 }
 
-fn jsonResponseWithStatus(alloc: std.mem.Allocator, status: u16, value: anytype) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
-    };
-}
-
-fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, 200, value);
-}
-
-fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
-        .reason = "candidate_budget_exceeded",
-        .detail = "candidate_budget_exceeded",
-    };
-    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
-    return try jsonResponseWithStatus(alloc, 422, .{
-        .status = 422,
-        .@"error" = "query_candidate_budget_exceeded",
-        .message = "query candidate budget exceeded",
-        .reason = public_rejection.reason,
-        .budget_rejection_reason = diagnostic.detail,
-        .sort_rejection_reason = public_rejection.reason,
-        .sort_rejection_detail = public_rejection.detail,
-        .sort_rejection_field = diagnostic.field,
-    });
-}
-
-fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return try jsonResponseWithStatus(alloc, 503, .{
-        .code = "index_rebuilding",
-        .message = "required index is rebuilding",
-        .retryable = true,
-    });
-}
-
-pub fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    var response = try jsonBodyResponseWithStatus(alloc, 503, public_table_http.storage_read_temporarily_unavailable_body);
-    errdefer response.deinit(alloc);
-
-    response.headers = try alloc.alloc(http_common.Header, 1);
-    errdefer {
-        alloc.free(response.headers);
-        response.headers = &.{};
-    }
-    response.headers[0] = try ownedHeader(alloc, "Retry-After", "1");
-    return response;
-}
-
-fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
-    if (queryBodyHasSortPageControls(alloc, body)) {
-        return try unsupportedExactSortResponse(alloc);
-    }
-    return try textResponse(alloc, 422, "unsupported query request");
-}
-
-fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    if (db_mod.peekLastSortRejectionDiagnostic() != null) {
-        return try unsupportedExactSortResponse(alloc);
-    }
-    return try textResponse(alloc, 400, "invalid query request");
-}
-
-fn publicFilterQueryErrorResponseForBody(
-    alloc: std.mem.Allocator,
-    body: []const u8,
-    field: []const u8,
-    kind: query_api.PublicFilterQueryErrorKind,
-) !http_common.HttpResponse {
-    const response_body = try query_api.encodePublicFilterQueryErrorBodyAlloc(
-        alloc,
-        body,
-        field,
-        kind,
-    );
-    errdefer alloc.free(response_body);
-    return .{
-        .status = query_api.publicFilterQueryErrorStatus(kind),
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = response_body,
-    };
-}
-
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
         error.QueryEmbeddingInputTooLarge,
@@ -15429,20 +15244,6 @@ fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []co
     return error.InvalidQueryRequest;
 }
 
-fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
-    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
-    return try jsonResponseWithStatus(alloc, 422, .{
-        .status = 422,
-        .@"error" = "unsupported_exact_sort",
-        .message = "exact sort is unsupported for this query",
-        .reason = public_rejection.reason,
-        .sort_rejection_reason = public_rejection.reason,
-        .sort_rejection_detail = public_rejection.detail,
-        .sort_rejection_field = diagnostic.field,
-    });
-}
-
 fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
     defer parsed.deinit();
@@ -15465,57 +15266,26 @@ fn writeMaybeAbsoluteUrl(writer: *std.Io.Writer, base_url: ?[]const u8, url: []c
     try std.json.Stringify.value(resolved, .{}, writer);
 }
 
-fn jsonBodyResponseWithStatus(
+fn publicOperationTextResponse(
     alloc: std.mem.Allocator,
     status: u16,
     body: []const u8,
-) !http_common.HttpResponse {
+) !public_table_http.OwnedResponse {
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
         .body = try alloc.dupe(u8, body),
     };
 }
 
-fn jsonResponseWithStatusOmitNullOptionals(
+fn publicOperationJsonResponse(
     alloc: std.mem.Allocator,
     status: u16,
-    value: anytype,
-) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false }),
-    };
-}
-
-fn jsonResponseOmitNullOptionals(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
-    return try jsonResponseWithStatusOmitNullOptionals(alloc, 200, value);
-}
-
-fn parseJsonResponseBody(
-    comptime T: type,
-    alloc: std.mem.Allocator,
     body: []const u8,
-) !T {
-    return try std.json.parseFromSliceLeaky(T, alloc, body, .{
-        .allocate = .alloc_always,
-    });
-}
-
-fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !http_common.HttpResponse {
+) !public_table_http.OwnedResponse {
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
-    };
-}
-
-fn modelNotFoundResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    return .{
-        .status = 404,
-        .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+        .body = try alloc.dupe(u8, body),
+        .json = true,
     };
 }
 
@@ -17338,102 +17108,6 @@ pub fn makeCurrentUserResponse(
     };
 }
 
-fn eventStreamResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/event-stream"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    return .{
-        .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain"),
-        .body = try alloc.dupe(u8, body),
-    };
-}
-
-fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
-    const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
-    return .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
-}
-
-fn retryableTextResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
-    const headers = try alloc.alloc(http_common.Header, 1);
-    errdefer alloc.free(headers);
-    headers[0] = .{
-        .name = try alloc.dupe(u8, "Retry-After"),
-        .value = alloc.dupe(u8, "1") catch |err| {
-            alloc.free(headers[0].name);
-            return err;
-        },
-    };
-    errdefer headers[0].deinit(alloc);
-
-    const content_type = try alloc.dupe(u8, "text/plain");
-    errdefer alloc.free(content_type);
-    const owned_body = try alloc.dupe(u8, body);
-    return .{
-        .status = status,
-        .content_type = content_type,
-        .headers = headers,
-        .body = owned_body,
-    };
-}
-
-fn queryEmbeddingOperationalResponse(alloc: std.mem.Allocator, err: anyerror) !?http_common.HttpResponse {
-    const normalized = normalizeQueryEmbeddingOperationalError(err) orelse return null;
-    return switch (normalized) {
-        error.QueryEmbeddingInputTooLarge => try textResponse(alloc, 413, "query embedding input too large"),
-        error.QueryEmbeddingOverloaded => try retryableTextResponse(alloc, 429, "query embedding overloaded"),
-        error.EmbedRateLimited => try retryableTextResponse(alloc, 429, "query embedding rate limited"),
-        error.EmbedTransientFailure => try retryableTextResponse(alloc, 503, "query embedding temporarily unavailable"),
-        error.EmbedUpstreamFailure => try textResponse(alloc, 502, "query embedding provider failed"),
-        error.Timeout => try textResponse(alloc, 504, "query embedding timed out"),
-        else => null,
-    };
-}
-
-pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    const headers = try alloc.alloc(http_common.Header, 2);
-    var initialized_headers: usize = 0;
-    errdefer {
-        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
-        alloc.free(headers);
-    }
-
-    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
-    errdefer if (retry_after_name) |value| alloc.free(value);
-    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
-    errdefer if (retry_after_value) |value| alloc.free(value);
-    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
-    retry_after_name = null;
-    retry_after_value = null;
-    initialized_headers += 1;
-
-    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
-    errdefer if (not_leader_name) |value| alloc.free(value);
-    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
-    errdefer if (not_leader_value) |value| alloc.free(value);
-    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
-    not_leader_name = null;
-    not_leader_value = null;
-    initialized_headers += 1;
-
-    const content_type = try alloc.dupe(u8, "application/json");
-    errdefer alloc.free(content_type);
-    const body = try alloc.dupe(u8, "{\"error\":\"metadata leader unavailable\"}");
-    errdefer alloc.free(body);
-    return .{
-        .status = 503,
-        .content_type = content_type,
-        .headers = headers,
-        .body = body,
-    };
-}
-
 fn restoreIdempotencyNamespaceAlloc(
     alloc: std.mem.Allocator,
     principal: ?[]const u8,
@@ -17593,6 +17267,13 @@ test "generated client query params decode for metadata parsers" {
     try std.testing.expectEqualStrings("table", permission.resource_type);
 }
 
+/// Send a compact test request through the production `httpx` router.
+/// Generated data API paths are canonicalized below `/db/v1`; root probes
+/// and contextual protocols retain their Kubernetes/protocol locations.
+fn executeHttpxTestRequest(server: *ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+    return test_runtime_support.executeOnce(std.testing.allocator, server, req);
+}
+
 test "api http server serves status" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -17616,7 +17297,7 @@ test "api http server serves status" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -17625,7 +17306,7 @@ test "api http server serves status" {
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
 
-    var cluster_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.cluster });
+    var cluster_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.cluster });
     defer cluster_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), cluster_resp.status);
     var parsed_cluster = try std.json.parseFromSlice(cluster.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
@@ -17633,28 +17314,8 @@ test "api http server serves status" {
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
     try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
 
-    var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), healthz.status);
-    try std.testing.expectEqualStrings("application/json", healthz.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, healthz.body, "\"status\":\"ok\"") != null);
-
-    var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
-    defer readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), readyz.status);
-    try std.testing.expectEqualStrings("application/json", readyz.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, readyz.body, "\"status\":\"ready\"") != null);
-
-    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/db/v1/healthz" });
-    defer prefixed_healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), prefixed_healthz.status);
-
-    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/db/v1/readyz" });
-    defer prefixed_readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
-
     const request_stats = server.requestStats();
-    try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
+    try std.testing.expectEqual(@as(u64, 2), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
@@ -17666,11 +17327,11 @@ test "api http query budget rejection response exposes stable sort reason" {
         "candidate_budget_exceeded",
         "text_field_sort_candidate_window",
     );
-    var resp = try queryCandidateBudgetExceededResponse(alloc);
+    var resp = try contextualQueryCandidateBudgetExceededResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -17697,11 +17358,11 @@ test "api http query budget rejection response exposes stable sort reason" {
 test "api http unsupported sorted query response exposes stable sort reason" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -17730,11 +17391,11 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
         "missing_doc_values_coverage",
         "missing_doc_values_section",
     );
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"order_by\":[{\"field\":\"created_at\"}]}");
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -17763,13 +17424,11 @@ test "api http unsupported count ordered page response exposes stable sort reaso
         "unsupported_exact_sort",
         "count_only_ordered_page",
     );
-    var resp = try unsupportedPublicQueryResponse(alloc,
-        \\{"count":true,"order_by":[{"field":"created_at"}]}
-    );
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -17799,11 +17458,11 @@ test "api http invalid query with sort diagnostic returns exact sort response" {
         "invalid_sort_tuple",
         "non_numeric_score",
     );
-    var resp = try invalidPublicQueryRequestResponse(alloc);
+    var resp = try contextualUnsupportedExactSortResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
 
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
@@ -17828,7 +17487,7 @@ test "api http invalid query with sort diagnostic returns exact sort response" {
 test "api http invalid filter query response names the offending node" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try publicFilterQueryErrorResponseForBody(
+    var resp = try contextualPublicFilterQueryErrorResponseForBody(
         alloc,
         \\{"filter_query":{"prefix":17,"field":"path"}}
     ,
@@ -17838,7 +17497,7 @@ test "api http invalid filter query response names the offending node" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -17861,7 +17520,7 @@ test "api http invalid filter query response names the offending node" {
 
 test "api http unsupported filter query response names the offending node" {
     const alloc = std.testing.allocator;
-    var resp = try publicFilterQueryErrorResponseForBody(
+    var resp = try contextualPublicFilterQueryErrorResponseForBody(
         alloc,
         \\{"filter_query":{"query_string":"path:tenant/*"}}
     ,
@@ -17871,7 +17530,7 @@ test "api http unsupported filter query response names the offending node" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -17893,12 +17552,36 @@ test "api http unsupported filter query response names the offending node" {
 test "api http unsupported unsorted query response remains generic" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try unsupportedPublicQueryResponse(alloc, "{\"join\":{}}");
+    var resp = try contextual_operations.textAlloc(alloc, 422, "unsupported query request");
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type);
     try std.testing.expectEqualStrings("unsupported query request", resp.body);
+}
+
+test "api http stale hierarchy cursor response is actionable and machine readable" {
+    const alloc = std.testing.allocator;
+    var resp = try contextualHierarchyCursorStaleResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    const ErrorBody = struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        action: []const u8,
+        restart_without: []const u8,
+        retryable: bool,
+    };
+    var parsed = try std.json.parseFromSlice(ErrorBody, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 409), parsed.value.status);
+    try std.testing.expectEqualStrings("hierarchy_cursor_stale", parsed.value.@"error");
+    try std.testing.expectEqualStrings("restart_hierarchy_traversal", parsed.value.action);
+    try std.testing.expectEqualStrings("search_after", parsed.value.restart_without);
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "api http retry sleep is bounded by request deadline" {
@@ -17915,6 +17598,88 @@ test "api http retry sleep is bounded by request deadline" {
         @as(?u64, null),
         boundedRetrySleepNs(null, now_ns, now_ns - 100, 50, 25 * std.time.ns_per_ms),
     );
+}
+
+test "api http point lookup retries bounded local readiness races" {
+    const FakeStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn source() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:1", key);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.StorageReadTemporarilyUnavailable;
+            return .{
+                .json = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 7,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+    const DummyWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{ .batch = batch } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return;
+        }
+    };
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{},
+        FakeStatus.source(),
+        reads.source(),
+        DummyWrites.source(),
+    );
+    var response = (try server.lookupWithReadinessRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        "doc:1",
+        .{},
+        .read_index,
+        .{},
+    )).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqual(@as(u64, 7), response.version);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", response.json);
 }
 
 test "api http transient read retry honors expired request deadline before source query" {
@@ -17975,6 +17740,7 @@ test "api http transient read retry honors expired request deadline before sourc
         "docs",
         .{ .execution_deadline_ns = 0 },
         .read_index,
+        .none,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
@@ -18007,6 +17773,7 @@ test "api http transient read retry stops before source query when client cancel
         "docs",
         .{ .cancellation = &cancelled },
         .read_index,
+        .none,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
@@ -18070,10 +17837,315 @@ test "api http retries identity generation churn from a fresh query snapshot" {
         "docs",
         .{},
         .read_index,
+        .none,
     )).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
+}
+
+test "api http maps missing physical index only for rebuilding lifecycle" {
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.IndexNotFound;
+        }
+    };
+
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        FakeReads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .rebuilding,
+    ));
+    try std.testing.expectError(error.IndexNotFound, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        FakeReads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .none,
+    ));
+}
+
+test "api http missing index classification requires active rebuild evidence" {
+    const active_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .index_repair_id = 42,
+        .index_repair_phase = "building",
+    }};
+    const active_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(active_indexes[0..]) },
+    }};
+    const expected_group_ids = [_]u64{10};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(&.{}, &expected_group_ids, "semantic_idx"),
+    );
+
+    const fresh_missing_and_active = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 10,
+            .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+            .stats = .{},
+        },
+        active_statuses[0],
+    };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(fresh_missing_and_active[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const two_group_ids = [_]u64{ 10, 11 };
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &two_group_ids, "semantic_idx"),
+    );
+    var stale_statuses = active_statuses;
+    stale_statuses[0].metadata.freshness = .stale;
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(stale_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const terminal_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .repair_degraded = true,
+        .index_repair_id = 42,
+        .index_repair_phase = "terminal",
+    }};
+    const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(terminal_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const paused_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .index_repair_id = 42,
+        .index_repair_phase = "building",
+        .index_repair_automation = "paused",
+    }};
+    const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(paused_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .repair_degraded = true,
+    }};
+    const degraded_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(degraded_indexes[0..]) },
+    }};
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
+        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "missing_idx"),
+    );
+
+    // An active build cannot mask an actionable failure from another index in
+    // the same query, regardless of reference order.
+    const mixed_indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "building_idx",
+            .kind = .dense_vector,
+            .index_repair_id = 43,
+            .index_repair_phase = "building",
+        },
+        .{
+            .name = "failed_idx",
+            .kind = .dense_vector,
+            .repair_degraded = true,
+            .index_repair_id = 44,
+            .index_repair_phase = "terminal",
+        },
+    };
+    const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(mixed_indexes[0..]) },
+    }};
+    var observed_rebuilding = false;
+    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "building_idx", &observed_rebuilding));
+    try std.testing.expect(observed_rebuilding);
+    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "failed_idx", &observed_rebuilding));
+}
+
+test "api http lifecycle classification preserves catching-up writer beside fresh read snapshot" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 10,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.IndexNotFound;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+                // The retained read generation is internally fresh but predates
+                // physical publication of the catalog-visible index.
+                .stats = .{},
+            };
+            return .{ .items = items };
+        }
+    };
+
+    const FakeWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return;
+        }
+
+        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
+            errdefer inner_alloc.free(indexes);
+            indexes[0] = .{
+                .name = try inner_alloc.dupe(u8, "semantic_idx"),
+                .kind = .dense_vector,
+                .index_repair_id = 42,
+                .index_repair_phase = "building",
+            };
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            errdefer {
+                db_mod.types.freeDBStats(inner_alloc, .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                });
+                inner_alloc.free(items);
+            }
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+                .stats = .{
+                    .index_count = 1,
+                    .indexes = indexes,
+                },
+            };
+            return .{ .items = items };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), FakeWrites.source());
+    defer server.deinit();
+
+    try std.testing.expect(try server.queryHasRebuildingCatalogIndex("docs", .{
+        .index_name = "semantic_idx",
+    }));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {
@@ -18189,6 +18261,175 @@ test "api http plain public query preserves outer absolute request deadline" {
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
 }
 
+test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {
+    const alloc = std.testing.allocator;
+    const position = "hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066";
+    const public_unit_id = "af1:asset:unit:page-1";
+    const row_filter = "{\"term\":{\"tenant\":\"acme\"}}";
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expect(req.hierarchy_children != null);
+            try std.testing.expectEqualStrings("doc:a", req.hierarchy_children.?.parent_id);
+            try std.testing.expectEqualStrings(row_filter, req.filter_query_json);
+            try std.testing.expectEqual(@as(usize, 2), req.order_by.len);
+            try std.testing.expectEqualStrings("_hierarchy.position", req.order_by[0].field);
+            try std.testing.expectEqualStrings("_id", req.order_by[1].field);
+            if (self.calls == 0) {
+                try std.testing.expectEqual(@as(usize, 0), req.search_after.len);
+            } else {
+                try std.testing.expectEqual(@as(usize, 2), req.search_after.len);
+                try std.testing.expectEqualStrings(position, req.search_after[0].string);
+                try std.testing.expectEqualStrings(public_unit_id, req.search_after[1].string);
+            }
+
+            // Exercise the coordinator-to-shard serializer and the trusted
+            // internal parser with the policy field injected at ingress.
+            const encoded = try table_reads.testing.encodeRemoteQueryRequestAlloc(inner_alloc, req);
+            defer inner_alloc.free(encoded);
+            var remote = try query_contract.parseQueryRequest(inner_alloc, null, table_name, encoded);
+            defer remote.deinit(inner_alloc);
+            try std.testing.expect(remote.req.hierarchy_children != null);
+            try std.testing.expectEqualStrings(row_filter, remote.req.filter_query_json);
+            try std.testing.expectEqual(req.search_after.len, remote.req.search_after.len);
+
+            var sort_values = [_]std.json.Value{
+                .{ .string = @constCast(position) },
+                .{ .string = @constCast(public_unit_id) },
+            };
+            var hit = db_mod.types.SearchHit{
+                .id = @constCast(public_unit_id),
+                .sort_values = sort_values[0..],
+                .artifact_ref = .{
+                    .document_id = @constCast("doc:a"),
+                    .name = @constCast("document_units_v1"),
+                    .kind = .asset,
+                    .unit_id = @constCast("page:000001"),
+                },
+            };
+            try table_reads.testing.applyHierarchyNavigationLookupForTest(
+                inner_alloc,
+                &hit,
+                "{\"unit_id\":\"page:000001\",\"unit_type\":\"page\",\"text\":\"page one\",\"_artifact_unit_fingerprint\":\"fingerprint-v1\"}",
+            );
+            defer inner_alloc.free(hit.stored_data.?);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"_hierarchy\"") == null);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"text\":\"page one\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "_artifact_unit_fingerprint") == null);
+
+            self.calls += 1;
+            return .{ .json = try std.fmt.allocPrint(
+                inner_alloc,
+                "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ public_unit_id, position, public_unit_id, hit.stored_data.? },
+            ) };
+        }
+    };
+
+    const first_body =
+        \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1}
+    ;
+    const replay_body =
+        \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1,"search_after":["hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066","af1:asset:unit:page-1"]}
+    ;
+
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    var first = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        first_body,
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+    );
+    defer first.deinit(alloc);
+    var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
+    defer first_json.deinit();
+    const first_hit = first_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    try std.testing.expectEqualStrings(position, first_hit.get("_sort").?.array.items[0].string);
+    try std.testing.expectEqualStrings(public_unit_id, first_hit.get("_sort").?.array.items[1].string);
+    try std.testing.expectEqualStrings("page one", first_hit.get("_source").?.object.get("text").?.string);
+
+    var replay = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        replay_body,
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+    );
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+}
+
 test "api http server obtains query embedding policy from resource manager" {
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{
@@ -18228,7 +18469,7 @@ test "api http retryable embedding failures provide retry guidance" {
         "{\"semantic_search\":\"bounded failure mapping\",\"indexes\":[\"semantic_idx\"]}",
     ));
 
-    var response = try retryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
+    var response = try contextualRetryableTextResponse(std.testing.allocator, 429, "query embedding overloaded");
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 429), response.status);
@@ -18251,6 +18492,48 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"join\":{}}",
     ));
+}
+
+test "api http exact sort observation selects only unique physical fields" {
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_score" },
+        .{ .field = "price", .desc = true },
+        .{ .field = "quantity" },
+        .{ .field = "_id" },
+        .{ .field = "_hierarchy.position" },
+    };
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order);
+    defer if (fields.len > 0) std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0]);
+    try std.testing.expectEqualStrings("quantity", fields[1]);
+}
+
+test "api http public sort gate accepts synthetic hierarchy child positions" {
+    const runtime_schema = storage_schema.TableSchema{};
+    const order = [_]db_mod.types.SortField{
+        .{ .field = "_hierarchy.position" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .string = "hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066" },
+        .{ .string = "af1:asset:unit" },
+    };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .order_by = &order,
+        .search_after = &cursor,
+    }, runtime_schema, &.{});
+
+    const wrong_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at" },
+        .{ .field = "_id" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+        .order_by = &wrong_order,
+    }, runtime_schema, &.{}));
 }
 
 test "api http public sort capability gate validates mapped sortable fields" {
@@ -18307,6 +18590,23 @@ test "api http public sort capability gate validates mapped sortable fields" {
     };
 
     const created_order = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    // Routed gateways validate the declaration and cursor shape, then defer
+    // physical coverage to the fail-closed shard executor because they do not
+    // own a local text-index catalog.
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &created_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false);
+    const routed_bad_cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:1" } };
+    const routed_effective_order = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{
+        .order_by = &routed_effective_order,
+        .search_after = &routed_bad_cursor,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{}, false));
     try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
         .order_by = &created_order,
         .primary_text_index_name = "full_text_index_v0",
@@ -18700,7 +19000,7 @@ test "api http server serves extension catalog reads" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var packages_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
+    var packages_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
     defer packages_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), packages_resp.status);
     var packages = try std.json.parseFromSlice([]extension_domain.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
@@ -18708,32 +19008,32 @@ test "api http server serves extension catalog reads" {
     try std.testing.expectEqual(@as(usize, 1), packages.value.len);
     try std.testing.expectEqualStrings("memoryaf", packages.value[0].name);
 
-    var package_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
+    var package_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
     defer package_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), package_resp.status);
     var package = try std.json.parseFromSlice(extension_domain.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
     defer package.deinit();
     try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
 
-    var installed_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
+    var installed_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
     defer installed_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), installed_resp.status);
     var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
     defer installed.deinit();
     try std.testing.expectEqualStrings("1.0.0", installed.value.package_version);
 
-    var objects_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
+    var objects_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
     defer objects_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), objects_resp.status);
     var objects = try std.json.parseFromSlice([]extension_domain.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
     defer objects.deinit();
     try std.testing.expectEqual(@as(usize, 2), objects.value.len);
 
-    var missing_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
+    var missing_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
     defer missing_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), missing_resp.status);
 
-    var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
+    var write_resp = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
     defer write_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), write_resp.status);
 }
@@ -18815,7 +19115,7 @@ test "api http server validates writes against extension data shape members" {
 
     const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
     defer alloc.free(valid_body);
-    var valid_resp = try routed_server.handle(.{
+    var valid_resp = try executeHttpxTestRequest(&routed_server, .{
         .method = .POST,
         .uri = "/tables/memories/batch",
         .content_type = "application/json",
@@ -18826,7 +19126,7 @@ test "api http server validates writes against extension data shape members" {
 
     const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
     defer alloc.free(invalid_body);
-    var invalid_resp = try routed_server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&routed_server, .{
         .method = .POST,
         .uri = "/tables/memories/batch",
         .content_type = "application/json",
@@ -18834,103 +19134,6 @@ test "api http server validates writes against extension data shape members" {
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
-}
-
-test "api http server exposes storage status and asynchronous maintenance jobs" {
-    const maintenance_mod = @import("../storage/maintenance.zig");
-    const FakeStatus = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{ .ptr = self, .vtable = &.{ .status = status } };
-        }
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{} };
-        }
-    };
-    const FakeMaintenance = struct {
-        fn source(self: *@This()) maintenance_mod.Source {
-            return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };
-        }
-        fn status(_: *anyopaque) maintenance_mod.Status {
-            return .{ .engine = "lite", .format = "aflite", .fsync = true, .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = true } };
-        }
-        fn run(_: *anyopaque, operation: maintenance_mod.Operation, cancel: *const maintenance_mod.CancelToken) anyerror!maintenance_mod.Result {
-            try cancel.check();
-            return switch (operation) {
-                .check => .{ .valid = true, .file_size = 4096 },
-                .compact, .vacuum => .{ .before_size = 8192, .after_size = 4096, .reclaimed_bytes = 4096 },
-            };
-        }
-    };
-
-    var status_source = FakeStatus{};
-    var maintenance_source = FakeMaintenance{};
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
-    var coordinator = try maintenance_mod.Coordinator.init(std.testing.allocator, maintenance_source.source(), backend_runtime.ptr());
-    defer coordinator.deinit();
-    var server = ApiHttpServer.init(std.testing.allocator, .{
-        .storage_maintenance = &coordinator,
-        .admin_bearer_token = "maintenance-secret",
-    }, status_source.iface(), null, null);
-    defer server.deinit();
-
-    var status_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
-    defer status_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), status_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"engine\":\"lite\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_resp.body, "\"vacuum\":true") != null);
-
-    const headers = [_]http_common.RequestHeader{.{ .name = "Idempotency-Key", .value = "check-1" }};
-    var unauthorized_resp = try server.handle(.{ .method = .POST, .uri = admin_routes.maintenance_check, .headers = &headers });
-    defer unauthorized_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 401), unauthorized_resp.status);
-
-    var start_resp = try server.handle(.{
-        .method = .POST,
-        .uri = admin_routes.maintenance_check,
-        .headers = &headers,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer start_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), start_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, start_resp.body, "\"operation\":\"check\"") != null);
-    const MaintenanceStart = struct { job_id: u64 };
-    var parsed_start = try std.json.parseFromSlice(MaintenanceStart, std.testing.allocator, start_resp.body, .{ .ignore_unknown_fields = true });
-    defer parsed_start.deinit();
-    const maintenance_job_id = parsed_start.value.job_id;
-    const maintenance_job_path = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ admin_routes.maintenance_jobs_prefix, maintenance_job_id });
-    defer std.testing.allocator.free(maintenance_job_path);
-
-    var replay_resp = try server.handle(.{
-        .method = .POST,
-        .uri = admin_routes.maintenance_check,
-        .headers = &headers,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer replay_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), replay_resp.status);
-    const expected_job_id = try std.fmt.allocPrint(std.testing.allocator, "\"job_id\":{d}", .{maintenance_job_id});
-    defer std.testing.allocator.free(expected_job_id);
-    try std.testing.expect(std.mem.indexOf(u8, replay_resp.body, expected_job_id) != null);
-
-    while (coordinator.get(maintenance_job_id).?.state != .succeeded) std.Thread.yield() catch {};
-    var get_resp = try server.handle(.{
-        .method = .GET,
-        .uri = maintenance_job_path,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer get_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, get_resp.body, "\"valid\":true") != null);
-
-    var cancel_resp = try server.handle(.{
-        .method = .DELETE,
-        .uri = maintenance_job_path,
-        .authorization = "Bearer maintenance-secret",
-    });
-    defer cancel_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 202), cancel_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"succeeded\"") != null);
 }
 
 test "api http server dispatches extension lifecycle mutations" {
@@ -18975,7 +19178,7 @@ test "api http server dispatches extension lifecycle mutations" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var install_resp = try server.handle(.{
+    var install_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/extensions/v1/installed/memoryaf",
         .content_type = "application/json",
@@ -18993,7 +19196,7 @@ test "api http server dispatches extension lifecycle mutations" {
 }
 
 test "extension lifecycle maps unrequested capability grants to client errors" {
-    var resp = try extensionLifecycleErrorResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
+    var resp = try extensionLifecycleContextualResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid extension lifecycle request") != null);
@@ -19543,7 +19746,7 @@ test "api http server serves connections with partial provider failures" {
     );
     defer server.deinit();
 
-    var resp = try server.handle(.{ .method = .GET, .uri = "/connections?include=models" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/connections?include=models" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -19582,7 +19785,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expect(saw_wiki);
 
     // The kind filter trims the response to the requested connection types.
-    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=external_io" });
+    var filtered = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/connections?types=external_io" });
     defer filtered.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), filtered.status);
     var parsed_filtered = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, filtered.body, .{});
@@ -19592,7 +19795,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expectEqualStrings("wiki", filtered_list[0].object.get("name").?.string);
 
     // The /db/v1 prefix variant resolves to the same route.
-    var prefixed = try server.handle(.{ .method = .GET, .uri = "/db/v1/connections" });
+    var prefixed = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/db/v1/connections" });
     defer prefixed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), prefixed.status);
 }
@@ -19615,7 +19818,7 @@ test "api http server serves MCP and hides A2A by default" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var mcp_resp = try server.handle(.{
+    var mcp_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19634,11 +19837,11 @@ test "api http server serves MCP and hides A2A by default" {
         },
         .{ .method = .GET, .uri = routes.Routes.agent_card },
         .{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" },
-        .{ .method = .GET, .uri = routes.Routes.agent_card_legacy },
+        .{ .method = .GET, .uri = "/.well-known/agent.json" },
         .{ .method = .GET, .uri = "/db/v1/.well-known/agent.json" },
     };
     for (hidden_requests) |request| {
-        var response = try server.handle(request);
+        var response = try executeHttpxTestRequest(&server, request);
         defer response.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 404), response.status);
     }
@@ -19668,7 +19871,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     );
     defer server.deinit();
 
-    var mcp_resp = try server.handle(.{
+    var mcp_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -19676,16 +19879,14 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer mcp_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mcp_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, mcp_resp.body, "\"protocolVersion\":\"2025-06-18\"") != null);
-    try std.testing.expectEqual(@as(usize, 2), mcp_resp.headers.len);
-    try std.testing.expectEqualStrings("Mcp-Session-Id", mcp_resp.headers[0].name);
-    try std.testing.expectEqualStrings("Mcp-Protocol-Version", mcp_resp.headers[1].name);
-    try std.testing.expectEqualStrings("2025-06-18", mcp_resp.headers[1].value);
+    try mcp.testing.expectResultSubset(std.testing.allocator, mcp_resp.body, "{\"protocolVersion\":\"2025-06-18\"}");
+    const mcp_session_id = mcp_resp.header("Mcp-Session-Id") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("2025-06-18", mcp_resp.header("Mcp-Protocol-Version").?);
     const mcp_session_headers = [_]http_common.RequestHeader{
-        .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
+        .{ .name = mcp.session_id_header, .value = mcp_session_id },
     };
 
-    var mcp_stream = try server.handle(.{
+    var mcp_stream = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19697,10 +19898,10 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, mcp_stream.body, "event: endpoint") != null);
 
     const mcp_resume_headers = [_]http_common.RequestHeader{
-        .{ .name = mcp.session_id_header, .value = mcp_resp.headers[0].value },
+        .{ .name = mcp.session_id_header, .value = mcp_session_id },
         .{ .name = mcp.last_event_id_header, .value = "9" },
     };
-    var mcp_resumed_stream = try server.handle(.{
+    var mcp_resumed_stream = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_resume_headers,
@@ -19709,7 +19910,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), mcp_resumed_stream.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resumed_stream.body, "id: 10\n") != null);
 
-    var mcp_delete = try server.handle(.{
+    var mcp_delete = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -19717,24 +19918,27 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     defer mcp_delete.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), mcp_delete.status);
 
-    var mcp_missing_session = try server.handle(.{
+    var mcp_missing_session = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.mcp_v1,
     });
     defer mcp_missing_session.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), mcp_missing_session.status);
 
-    var card_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.agent_card });
+    var card_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.agent_card });
     defer card_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"query-builder\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"retrieval\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"skills\":[{\"id\":\"query-builder\"},{\"id\":\"retrieval\"}]}",
+        card_resp.body,
+    );
 
-    var prefixed_card_resp = try server.handle(.{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
+    var prefixed_card_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
     defer prefixed_card_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), prefixed_card_resp.status);
+    try std.testing.expectEqual(@as(u16, 404), prefixed_card_resp.status);
 
-    var a2a_resp = try server.handle(.{
+    var a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19742,18 +19946,18 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"preferredTransport\":\"JSONRPC\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, a2a_resp.body, "{\"preferredTransport\":\"JSONRPC\"}");
 
-    var prefixed_a2a_resp = try server.handle(.{
+    var prefixed_a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/db/v1/a2a",
         .content_type = "application/json",
         .body = "{\"jsonrpc\":\"2.0\",\"id\":\"prefixed-card\",\"method\":\"agent/getAuthenticatedExtendedCard\",\"params\":{}}",
     });
     defer prefixed_a2a_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), prefixed_a2a_resp.status);
+    try std.testing.expectEqual(@as(u16, 404), prefixed_a2a_resp.status);
 
-    var stream_resp = try server.handle(.{
+    var stream_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19765,7 +19969,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: message") != null);
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: done") != null);
 
-    var task_resp = try server.handle(.{
+    var task_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19773,9 +19977,9 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer task_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), task_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, task_resp.body, "\"id\":\"t1\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, task_resp.body, "{\"id\":\"t1\"}");
 
-    var cancel_resp = try server.handle(.{
+    var cancel_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
@@ -19783,7 +19987,7 @@ test "api http server serves MCP and opted-in A2A protocol surfaces" {
     });
     defer cancel_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), cancel_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
+    try a2a.testing.expectResultSubset(std.testing.allocator, cancel_resp.body, "{\"status\":{\"state\":\"canceled\"}}");
 }
 
 test "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries" {
@@ -19807,21 +20011,19 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     }, source.iface(), null, null);
     defer server.deinit();
 
-    var public_catalog = try server.handle(.{
+    var public_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
     defer public_catalog.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_catalog.status);
     try std.testing.expectEqualStrings("application/json", public_catalog.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), public_catalog.headers.len);
-    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_catalog.headers[0].name);
-    try std.testing.expectEqualStrings("*", public_catalog.headers[0].value);
+    try std.testing.expectEqualStrings("*", public_catalog.header("Access-Control-Allow-Origin").?);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var tenant_catalog = try server.handle(.{
+    var tenant_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -19847,7 +20049,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
         try std.testing.expect(has_url != has_data);
     }
 
-    var hidden_agents = try server.handle(.{
+    var hidden_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -19855,7 +20057,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), hidden_agents.status);
     try std.testing.expect(std.mem.indexOf(u8, hidden_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var hidden_search = try server.handle(.{
+    var hidden_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"Antfly A2A Agent\"},\"federation\":\"none\"}",
@@ -19864,7 +20066,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), hidden_search.status);
     try std.testing.expect(std.mem.indexOf(u8, hidden_search.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var hidden_explore = try server.handle(.{
+    var hidden_explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -19879,7 +20081,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
         .ard_display_name = "Tenant Antfly",
     }, source.iface(), null, null);
     defer experimental_server.deinit();
-    var experimental_catalog = try experimental_server.handle(.{
+    var experimental_catalog = try executeHttpxTestRequest(&experimental_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -19887,7 +20089,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_catalog.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_agents = try experimental_server.handle(.{
+    var experimental_agents = try executeHttpxTestRequest(&experimental_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -19895,7 +20097,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_agents.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_search = try experimental_server.handle(.{
+    var experimental_search = try executeHttpxTestRequest(&experimental_server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"Antfly A2A Agent\",\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"federation\":\"none\"}",
@@ -19904,7 +20106,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqual(@as(u16, 200), experimental_search.status);
     try std.testing.expect(std.mem.indexOf(u8, experimental_search.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
 
-    var experimental_explore = try experimental_server.handle(.{
+    var experimental_explore = try executeHttpxTestRequest(&experimental_server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -19957,14 +20159,14 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     );
     defer server.deinit();
 
-    var unauthorized = try server.handle(.{
+    var unauthorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
 
-    var unauthorized_well_known = try server.handle(.{
+    var unauthorized_well_known = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
@@ -19985,7 +20187,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
         .{ .name = trusted_principal_header, .value = token },
     };
 
-    var authorized = try server.handle(.{
+    var authorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &trusted_principal_headers,
@@ -20000,17 +20202,17 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Query Builder") != null);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Schema Design") == null);
 
-    var authorized_well_known = try server.handle(.{
+    var authorized_well_known = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
         .headers = &trusted_principal_headers,
     });
     defer authorized_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized_well_known.status);
-    try std.testing.expectEqual(@as(usize, 0), authorized_well_known.headers.len);
+    try std.testing.expect(authorized_well_known.header("Access-Control-Allow-Origin") == null);
     try std.testing.expect(std.mem.indexOf(u8, authorized_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 
-    var forbidden_spec = try server.handle(.{
+    var forbidden_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/extensions.yaml",
         .headers = &trusted_principal_headers,
@@ -20018,7 +20220,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer forbidden_spec.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), forbidden_spec.status);
 
-    var forbidden_auth_spec = try server.handle(.{
+    var forbidden_auth_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/auth.yaml",
         .headers = &trusted_principal_headers,
@@ -20026,7 +20228,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer forbidden_auth_spec.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 403), forbidden_auth_spec.status);
 
-    var hidden_admin_skill = try server.handle(.{
+    var hidden_admin_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-extension-management",
         .headers = &trusted_principal_headers,
@@ -20034,7 +20236,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer hidden_admin_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_admin_skill.status);
 
-    var read_skill = try server.handle(.{
+    var read_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-retrieval",
         .headers = &trusted_principal_headers,
@@ -20045,7 +20247,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
 
     const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
     defer std.testing.allocator.free(admin_auth);
-    var admin_catalog = try server.handle(.{
+    var admin_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .authorization = admin_auth,
@@ -20057,7 +20259,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extension Management") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Schema Design") != null);
 
-    var admin_spec = try server.handle(.{
+    var admin_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/extensions.yaml",
         .authorization = admin_auth,
@@ -20067,7 +20269,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
 
-    var admin_auth_spec = try server.handle(.{
+    var admin_auth_spec = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/auth.yaml",
         .authorization = admin_auth,
@@ -20077,7 +20279,7 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     try std.testing.expectEqualStrings("application/yaml", admin_auth_spec.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, admin_auth_spec.body, "title: User Management API") != null);
 
-    var admin_skill = try server.handle(.{
+    var admin_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-extension-management",
         .authorization = admin_auth,
@@ -20101,27 +20303,25 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     );
     defer public_catalog_server.deinit();
 
-    var public_well_known = try public_catalog_server.handle(.{
+    var public_well_known = try executeHttpxTestRequest(&public_catalog_server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
     });
     defer public_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_well_known.status);
     try std.testing.expectEqualStrings("application/json", public_well_known.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), public_well_known.headers.len);
-    try std.testing.expectEqualStrings("Access-Control-Allow-Origin", public_well_known.headers[0].name);
-    try std.testing.expectEqualStrings("*", public_well_known.headers[0].value);
+    try std.testing.expectEqualStrings("*", public_well_known.header("Access-Control-Allow-Origin").?);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_well_known.body, "\"type\":\"application/mcp-server+json\"") == null);
 
-    var public_flag_authenticated_well_known = try public_catalog_server.handle(.{
+    var public_flag_authenticated_well_known = try executeHttpxTestRequest(&public_catalog_server, .{
         .method = .GET,
         .uri = routes.Routes.ai_catalog,
         .headers = &trusted_principal_headers,
     });
     defer public_flag_authenticated_well_known.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), public_flag_authenticated_well_known.status);
-    try std.testing.expectEqual(@as(usize, 0), public_flag_authenticated_well_known.headers.len);
+    try std.testing.expect(public_flag_authenticated_well_known.header("Access-Control-Allow-Origin") == null);
     try std.testing.expect(std.mem.indexOf(u8, public_flag_authenticated_well_known.body, "\"type\":\"application/mcp-server+json\"") != null);
 }
 
@@ -20143,7 +20343,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), null, null);
     defer server.deinit();
 
-    var catalog = try server.handle(.{
+    var catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
     });
@@ -20155,7 +20355,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"representativeQueries\"") != null);
 
-    var openapi = try server.handle(.{
+    var openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_openapi,
     });
@@ -20181,28 +20381,28 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "MethodNotAllowed:") != null);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "RegistryRoot") != null);
 
-    var openapi_wrong_method = try server.handle(.{
+    var openapi_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_openapi,
     });
     defer openapi_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), openapi_wrong_method.status);
 
-    var catalog_wrong_method = try server.handle(.{
+    var catalog_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_catalog,
     });
     defer catalog_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), catalog_wrong_method.status);
 
-    var well_known_wrong_method = try server.handle(.{
+    var well_known_wrong_method = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ai_catalog,
     });
     defer well_known_wrong_method.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), well_known_wrong_method.status);
 
-    var antfly_openapi = try server.handle(.{
+    var antfly_openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/antfly.yaml",
     });
@@ -20211,7 +20411,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("application/yaml", antfly_openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, antfly_openapi.body, "title: Antfly Public API") != null);
 
-    var inference_openapi = try server.handle(.{
+    var inference_openapi = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/openapi/inference-config.yaml",
     });
@@ -20220,7 +20420,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("application/yaml", inference_openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, inference_openapi.body, "title: Antfly Inference Configuration Schema") != null);
 
-    var skill = try server.handle(.{
+    var skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/antfly-retrieval",
     });
@@ -20229,7 +20429,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqualStrings("text/markdown; charset=utf-8", skill.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, skill.body, "# Antfly Retrieval") != null);
 
-    var mcp_resource = try server.handle(.{
+    var mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
     });
@@ -20237,14 +20437,14 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_resource.body, "\"endpoint\":\"/mcp/v1\"") != null);
 
-    var skill_filtered_mcp_resource = try server.handle(.{
+    var skill_filtered_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default?types=application/ai-skill+md",
     });
     defer skill_filtered_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_mcp_resource.status);
 
-    var registry_root = try server.handle(.{
+    var registry_root = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1,
     });
@@ -20255,14 +20455,14 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
 
     var hosted_server = ApiHttpServer.init(std.testing.allocator, .{ .ard_base_url = "https://tenant.example.com/" }, source.iface(), null, null);
     defer hosted_server.deinit();
-    var hosted_mcp_resource = try hosted_server.handle(.{
+    var hosted_mcp_resource = try executeHttpxTestRequest(&hosted_server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
     });
     defer hosted_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), hosted_mcp_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, hosted_mcp_resource.body, "\"endpoint\":\"https://tenant.example.com/mcp/v1\"") != null);
-    var hosted_registry_root = try hosted_server.handle(.{
+    var hosted_registry_root = try executeHttpxTestRequest(&hosted_server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1,
     });
@@ -20273,7 +20473,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"explore\":\"https://tenant.example.com/ard/v1/explore\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, hosted_registry_root.body, "\"agents\":\"https://tenant.example.com/ard/v1/agents\"") != null);
 
-    var search = try server.handle(.{
+    var search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
@@ -20284,7 +20484,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, search.body, "\"type\":\"application/mcp-server+json\"") == null);
 
-    var filter_only_search = try server.handle(.{
+    var filter_only_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
@@ -20292,7 +20492,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer filter_only_search.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), filter_only_search.status);
 
-    var blank_text_search = try server.handle(.{
+    var blank_text_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"   \",\"filter\":{\"type\":[\"application/ai-skill+md\"]}}}",
@@ -20300,7 +20500,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer blank_text_search.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), blank_text_search.status);
 
-    var profile_search = try server.handle(.{
+    var profile_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/ard/v1/search?profile=copilot",
         .body = "{\"query\":{\"text\":\"retrieval\",\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"federation\":\"none\"}",
@@ -20309,7 +20509,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), profile_search.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_search.body, "\"results\":[]") != null);
 
-    var federated_search = try server.handle(.{
+    var federated_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"referrals\"}",
@@ -20319,7 +20519,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"federation\":\"referrals\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, federated_search.body, "\"referrals\":[]") != null);
 
-    var invalid_federation = try server.handle(.{
+    var invalid_federation = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .body = "{\"query\":{\"text\":\"retrieval\"},\"federation\":\"recursive\"}",
@@ -20327,7 +20527,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer invalid_federation.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), invalid_federation.status);
 
-    var explore = try server.handle(.{
+    var explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_explore,
         .body = "{\"query\":{\"filter\":{\"capabilities\":[\"retrieval\"]}}}",
@@ -20339,7 +20539,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"buckets\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, explore.body, "\"value\":\"retrieval\"") != null);
 
-    var profile_explore = try server.handle(.{
+    var profile_explore = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/ard/v1/explore?profile=copilot",
         .body = "{\"query\":{\"filter\":{\"type\":[\"application/ai-skill+md\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
@@ -20348,7 +20548,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), profile_explore.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_explore.body, "\"value\":\"application/ai-skill+md\"") == null);
 
-    var agents = try server.handle(.{
+    var agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_agents,
     });
@@ -20358,7 +20558,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents.body, "\"type\":\"application/mcp-server+json\"") != null);
 
-    var profile_agents = try server.handle(.{
+    var profile_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?profile=copilot",
     });
@@ -20367,7 +20567,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, profile_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var mcp_agents = try server.handle(.{
+    var mcp_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?include=mcp",
     });
@@ -20376,7 +20576,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/mcp-server+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mcp_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
-    var skill_agents = try server.handle(.{
+    var skill_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?types=application/ai-skill+md",
     });
@@ -20385,7 +20585,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"agents\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, skill_agents.body, "\"count\":0") != null);
 
-    var paged_agents = try server.handle(.{
+    var paged_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1",
     });
@@ -20396,7 +20596,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, paged_agents.body, "\"pageToken\":\"1\"") != null);
 
-    var next_agents_page = try server.handle(.{
+    var next_agents_page = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?filter=%7B%22type%22%3A%5B%22application%2Fmcp-server%2Bjson%22%5D%7D&orderBy=displayName%20desc&pageSize=1&pageToken=1",
     });
@@ -20405,7 +20605,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_agents_page.body, "\"pageToken\"") == null);
 
-    var invalid_agents = try server.handle(.{
+    var invalid_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?orderBy=updatedAt",
     });
@@ -20465,7 +20665,7 @@ test "api http server lists extension-owned mcp tools" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -20477,7 +20677,7 @@ test "api http server lists extension-owned mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20486,9 +20686,11 @@ test "api http server lists extension-owned mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"description\":\"Search long-term memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"query\"]") != null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const search_memories = mcp.testing.findTool(parsed_tools.value.result.tools, "search_memories") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Search long-term memory", search_memories.description);
+    try ant_json.testing.expectSubsetJsonValue(std.testing.allocator, "{\"required\":[\"query\"]}", search_memories.inputSchema);
 }
 
 test "api http server scopes mcp endpoint to one extension" {
@@ -20563,7 +20765,7 @@ test "api http server scopes mcp endpoint to one extension" {
     defer server.deinit();
 
     const scoped_uri = "/mcp/v1/extensions/memoryaf";
-    var init_resp = try server.handle(.{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .content_type = "application/json",
@@ -20575,7 +20777,7 @@ test "api http server scopes mcp endpoint to one extension" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = scoped_uri,
         .headers = &mcp_session_headers,
@@ -20584,9 +20786,12 @@ test "api http server scopes mcp endpoint to one extension" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"other_tool\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "recall") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "other_tool") == null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "create_table") == null);
 }
 
 test "api http server filters extension mcp tools by trusted principal table permissions" {
@@ -20749,7 +20954,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const trusted_principal_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = token },
     };
-    var init_resp = try server.handle(.{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -20763,7 +20968,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20772,14 +20977,17 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_docs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(std.testing.allocator, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "search_docs") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "store_doc") == null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "search_memories") == null);
 
     // Discovery is not the authorization boundary: a read-only client may
     // retain an older write-tool schema and hand-craft tools/call. The current
     // request identity must still prevent the mutation from reaching a route.
-    var denied_builtin_write = try server.handle(.{
+    var denied_builtin_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20788,9 +20996,9 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_builtin_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_builtin_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_builtin_write.body, "\"message\":\"unknown tool\"") != null);
+    try mcp.testing.expectError(std.testing.allocator, denied_builtin_write.body, -32602, "unknown tool");
 
-    var denied_extension_write = try server.handle(.{
+    var denied_extension_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -20799,7 +21007,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_extension_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_extension_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_extension_write.body, "\"message\":\"unknown tool\"") != null);
+    try mcp.testing.expectError(std.testing.allocator, denied_extension_write.body, -32602, "unknown tool");
 
     const write_payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -20813,7 +21021,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     const write_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var write_init = try server.handle(.{
+    var write_init = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_headers,
@@ -20825,7 +21033,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = mcp.session_id_header, .value = write_init.headers[0].value },
         .{ .name = trusted_principal_header, .value = write_token },
     };
-    var denied_cross_table_write = try server.handle(.{
+    var denied_cross_table_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -20834,10 +21042,9 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_cross_table_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_cross_table_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"text\":\"permission denied\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, denied_cross_table_write.body, "\"isError\":true") != null);
+    try mcp.testing.expectToolResultTextContains(std.testing.allocator, denied_cross_table_write.body, true, "permission denied");
 
-    var denied_unscoped_write = try server.handle(.{
+    var denied_unscoped_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &write_session_headers,
@@ -20846,10 +21053,9 @@ test "api http server filters extension mcp tools by trusted principal table per
     });
     defer denied_unscoped_write.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), denied_unscoped_write.status);
-    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"text\":\"permission denied\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, denied_unscoped_write.body, "\"isError\":true") != null);
+    try mcp.testing.expectToolResultTextContains(std.testing.allocator, denied_unscoped_write.body, true, "permission denied");
 
-    var ard_catalog_resp = try server.handle(.{
+    var ard_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &trusted_principal_headers,
@@ -20870,7 +21076,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") != null);
 
-    var hidden_memory_skill = try server.handle(.{
+    var hidden_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory",
         .headers = &trusted_principal_headers,
@@ -20878,7 +21084,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_memory_skill.status);
 
-    var ard_extension_mcp_resource = try server.handle(.{
+    var ard_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf",
         .headers = &trusted_principal_headers,
@@ -20890,7 +21096,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_mcp_resource.body, "\"name\":\"search_memories\"") == null);
 
-    var ard_extension_agent_resource = try server.handle(.{
+    var ard_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/docsaf/research",
         .headers = &trusted_principal_headers,
@@ -20901,7 +21107,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"profile\":\"copilot\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_extension_agent_resource.body, "\"streamHandler\":\"wasm:docsaf/research_stream\"") != null);
 
-    var mcp_filtered_extension_agent_resource = try server.handle(.{
+    var mcp_filtered_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/docsaf/research?include=mcp",
         .headers = &trusted_principal_headers,
@@ -20909,7 +21115,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer mcp_filtered_extension_agent_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), mcp_filtered_extension_agent_resource.status);
 
-    var hidden_extension_agent_resource = try server.handle(.{
+    var hidden_extension_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
         .headers = &trusted_principal_headers,
@@ -20917,7 +21123,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_agent_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_resource.status);
 
-    var extension_agents = try server.handle(.{
+    var extension_agents = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/agents?include=agents",
         .headers = &trusted_principal_headers,
@@ -20928,7 +21134,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:docsaf:agent:research") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agents.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") == null);
 
-    var extension_agent_run = try server.handle(.{
+    var extension_agent_run = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/v1/extensions/docsaf/research/runs",
         .headers = &trusted_principal_headers,
@@ -20940,7 +21146,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"status\":\"unsupported_runtime\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_run.body, "\"descriptor\":\"/ard/v1/resources/agents/extensions/docsaf/research\"") != null);
 
-    var extension_agent_events = try server.handle(.{
+    var extension_agent_events = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/agents/v1/extensions/docsaf/research/runs/run-1/events",
         .headers = &trusted_principal_headers,
@@ -20951,7 +21157,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "event: error") != null);
     try std.testing.expect(std.mem.indexOf(u8, extension_agent_events.body, "\"runId\":\"run-1\"") != null);
 
-    var hidden_extension_agent_run = try server.handle(.{
+    var hidden_extension_agent_run = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/agents/v1/extensions/memoryaf/research/runs",
         .headers = &trusted_principal_headers,
@@ -20959,7 +21165,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_agent_run.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_agent_run.status);
 
-    var skill_filtered_extension_mcp_resource = try server.handle(.{
+    var skill_filtered_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf?include=skills",
         .headers = &trusted_principal_headers,
@@ -20967,7 +21173,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer skill_filtered_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_extension_mcp_resource.status);
 
-    var hidden_extension_mcp_resource = try server.handle(.{
+    var hidden_extension_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/memoryaf",
         .headers = &trusted_principal_headers,
@@ -20975,7 +21181,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer hidden_extension_mcp_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), hidden_extension_mcp_resource.status);
 
-    var aggregate_mcp_resource = try server.handle(.{
+    var aggregate_mcp_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
         .headers = &trusted_principal_headers,
@@ -21001,7 +21207,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = trusted_principal_header, .value = memory_token },
     };
 
-    var memory_catalog_resp = try server.handle(.{
+    var memory_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.ard_v1_catalog,
         .headers = &memory_headers,
@@ -21013,7 +21219,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/skills/extensions/memoryaf/memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, memory_catalog_resp.body, "/ard/v1/resources/agents/extensions/memoryaf/research") != null);
 
-    var memory_skill = try server.handle(.{
+    var memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory",
         .headers = &memory_headers,
@@ -21023,7 +21229,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqualStrings("text/markdown; charset=utf-8", memory_skill.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill.body, "# Memoryaf") != null);
 
-    var profile_memory_skill = try server.handle(.{
+    var profile_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?profile=copilot",
         .headers = &memory_headers,
@@ -21032,7 +21238,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), profile_memory_skill.status);
     try std.testing.expect(std.mem.indexOf(u8, profile_memory_skill.body, "# Memoryaf") != null);
 
-    var mcp_filtered_memory_skill = try server.handle(.{
+    var mcp_filtered_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?include=mcp",
         .headers = &memory_headers,
@@ -21040,7 +21246,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer mcp_filtered_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), mcp_filtered_memory_skill.status);
 
-    var wrong_type_memory_skill = try server.handle(.{
+    var wrong_type_memory_skill = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/skills/extensions/memoryaf/memory?types=application/mcp-server+json",
         .headers = &memory_headers,
@@ -21048,7 +21254,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer wrong_type_memory_skill.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), wrong_type_memory_skill.status);
 
-    var memory_skill_search = try server.handle(.{
+    var memory_skill_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &memory_headers,
@@ -21058,7 +21264,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_skill_search.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_skill_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:skill:memory") != null);
 
-    var memory_agent_resource = try server.handle(.{
+    var memory_agent_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/agents/extensions/memoryaf/research",
         .headers = &memory_headers,
@@ -21067,7 +21273,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_agent_resource.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_agent_resource.body, "\"runEndpoint\":\"/agents/v1/extensions/memoryaf/research/runs\"") != null);
 
-    var memory_agent_search = try server.handle(.{
+    var memory_agent_search = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &memory_headers,
@@ -21077,7 +21283,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expectEqual(@as(u16, 200), memory_agent_search.status);
     try std.testing.expect(std.mem.indexOf(u8, memory_agent_search.body, "urn:ai:antfly.local:antfly:extension:memoryaf:agent:research") != null);
 
-    var ard_filtered_catalog_resp = try server.handle(.{
+    var ard_filtered_catalog_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21090,7 +21296,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"url\":\"/ard/v1/resources/mcp/extensions/docsaf\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
 
-    var copilot_profile_resource = try server.handle(.{
+    var copilot_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot",
         .headers = &trusted_principal_headers,
@@ -21103,7 +21309,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"store_doc\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, copilot_profile_resource.body, "\"name\":\"search_memories\"") == null);
 
-    var skill_filtered_profile_resource = try server.handle(.{
+    var skill_filtered_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot?types=application/ai-skill+md",
         .headers = &trusted_principal_headers,
@@ -21111,7 +21317,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer skill_filtered_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), skill_filtered_profile_resource.status);
 
-    var profile_filtered_default_resource = try server.handle(.{
+    var profile_filtered_default_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default?profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21119,7 +21325,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer profile_filtered_default_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), profile_filtered_default_resource.status);
 
-    var profile_filtered_extension_resource = try server.handle(.{
+    var profile_filtered_extension_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/extensions/docsaf?profile=copilot",
         .headers = &trusted_principal_headers,
@@ -21140,7 +21346,7 @@ test "api http server filters extension mcp tools by trusted principal table per
         .{ .name = trusted_principal_header, .value = no_permission_token },
     };
 
-    var no_permission_profile_catalog = try server.handle(.{
+    var no_permission_profile_catalog = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
         .headers = &no_permission_headers,
@@ -21150,7 +21356,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly Copilot MCP Profile") == null);
     try std.testing.expect(std.mem.indexOf(u8, no_permission_profile_catalog.body, "Antfly MCP Server") == null);
 
-    var no_permission_profile_resource = try server.handle(.{
+    var no_permission_profile_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/profiles/copilot",
         .headers = &no_permission_headers,
@@ -21158,7 +21364,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer no_permission_profile_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), no_permission_profile_resource.status);
 
-    var no_permission_aggregate_resource = try server.handle(.{
+    var no_permission_aggregate_resource = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/ard/v1/resources/mcp/default",
         .headers = &no_permission_headers,
@@ -21166,7 +21372,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer no_permission_aggregate_resource.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), no_permission_aggregate_resource.status);
 
-    var ard_search_resp = try server.handle(.{
+    var ard_search_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &trusted_principal_headers,
@@ -21177,7 +21383,7 @@ test "api http server filters extension mcp tools by trusted principal table per
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_search_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
 
-    var ard_agent_search_resp = try server.handle(.{
+    var ard_agent_search_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &trusted_principal_headers,
@@ -21224,8 +21430,6 @@ test "api http server authenticates trusted principal" {
         null,
     );
     defer server.deinit();
-    try std.testing.expect(server.requiresAuthentication(routes.Routes.tables));
-
     var identity = try server.authenticateRequest(.{ .trusted_principal = token });
     defer identity.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("user:alice", identity.username);
@@ -21246,6 +21450,11 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(requiresAdminPermission("/extensions/v1/installed/memoryaf"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/packagesXYZ"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
+}
+
+test "retrieval route delegates authorization to referenced tables" {
+    try std.testing.expect(!requiresAdminPermission(routes.Routes.agents_retrieval));
+    try std.testing.expect(requiresAdminPermission(routes.Routes.a2a));
 }
 
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
@@ -21341,34 +21550,24 @@ test "api http server requires auth on public routes when enabled" {
         .user_manager = &auth.manager,
     }, source.iface(), null, null);
 
-    var unauthorized = try server.handle(.{ .method = .GET, .uri = routes.Routes.status });
+    var unauthorized = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.status });
     defer unauthorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqualStrings("application/json", unauthorized.content_type.?);
-    try std.testing.expectEqual(@as(usize, 1), unauthorized.headers.len);
-    try std.testing.expectEqualStrings("WWW-Authenticate", unauthorized.headers[0].name);
-    try std.testing.expectEqualStrings("Basic realm=\"antfly\"", unauthorized.headers[0].value);
+    try std.testing.expectEqualStrings("Basic realm=\"antfly\"", unauthorized.header("WWW-Authenticate").?);
     var unauthorized_body = try std.json.parseFromSlice(ErrorResponse, std.testing.allocator, unauthorized.body, .{});
     defer unauthorized_body.deinit();
     try std.testing.expectEqualStrings("unauthorized", unauthorized_body.value.@"error");
 
     const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
     defer std.testing.allocator.free(admin_auth);
-    var authorized = try server.handle(.{
+    var authorized = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
         .authorization = admin_auth,
     });
     defer authorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
-
-    var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer healthz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), healthz.status);
-
-    var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
-    defer readyz.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), readyz.status);
 }
 
 test "continuous HA rejects non-replicated public mutations before handlers" {
@@ -21488,7 +21687,7 @@ test "continuous HA rejects non-replicated public mutations before handlers" {
     var catalog_status: u16 = 0;
     var rejected: usize = 0;
     for (cases) |case| {
-        var response = try server.handle(.{ .method = case.method, .uri = case.uri, .body = case.body });
+        var response = try executeHttpxTestRequest(&server, .{ .method = case.method, .uri = case.uri, .body = case.body });
         defer response.deinit(std.testing.allocator);
         if (std.mem.eql(u8, case.surface, "auth_user")) auth_status = response.status;
         if (std.mem.eql(u8, case.surface, "table_catalog")) catalog_status = response.status;
@@ -21530,9 +21729,7 @@ test "continuous HA rejects non-replicated public mutations before handlers" {
     try std.testing.expectEqual(@as(usize, 0), users.len);
 
     // Read availability is unchanged by the mutation policy.
-    var health = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
-    defer health.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), health.status);
+    try server.checkReady();
 }
 
 test "continuous HA freezes pre-existing restore workers and resumption" {
@@ -21585,7 +21782,7 @@ test "continuous HA allows a configured RemoteApply batch write" {
     }, source.iface(), null, table_source.source());
     const body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:ha\":{\"title\":\"remote-apply\"}}}");
     defer alloc.free(body);
-    var response = try server.handle(.{
+    var response = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -21660,7 +21857,7 @@ test "api http server document scan requires table read permission" {
 
     const other_reader_auth = try encodeBasicAuthorization(alloc, "other-reader", "reader");
     defer alloc.free(other_reader_auth);
-    var forbidden = try server.handle(.{
+    var forbidden = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/secrets/documents",
         .authorization = other_reader_auth,
@@ -21668,12 +21865,12 @@ test "api http server document scan requires table read permission" {
     });
     defer forbidden.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), forbidden.status);
-    try std.testing.expectEqualStrings("text/plain", forbidden.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", forbidden.body);
+    try std.testing.expectEqualStrings("application/json", forbidden.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", forbidden.body);
 
     const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
     defer alloc.free(secrets_reader_auth);
-    var allowed = try server.handle(.{
+    var allowed = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/secrets/documents",
         .authorization = secrets_reader_auth,
@@ -21685,7 +21882,23 @@ test "api http server document scan requires table read permission" {
     try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"_id\":\"doc:secret\"") != null);
 }
 
-test "api http server dispatches HA admin and internal executors" {
+fn executeHaRouteForTest(
+    server: *ApiHttpServer,
+    method: contextual_operations.Method,
+    target: []const u8,
+    authorization: ?[]const u8,
+    body: []const u8,
+) !ha_http_operation.OwnedResponse {
+    return (try server.executeHaRoute(.{
+        .method = method,
+        .target = target,
+        .authorization = authorization,
+        .content_type = if (body.len > 0) "application/json" else null,
+        .body = body,
+    })) orelse error.TestUnexpectedResult;
+}
+
+test "typed HA route operation dispatches admin and internal executors" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -21707,24 +21920,25 @@ test "api http server dispatches HA admin and internal executors" {
         alloc: std.mem.Allocator,
         body: []const u8,
         calls: usize = 0,
-        last_method: ?http_common.Method = null,
+        last_method: ?ha_http_operation.Method = null,
         last_uri: ?[]const u8 = null,
         last_body: ?[]const u8 = null,
 
-        fn executor(self: *@This()) http_common.RequestExecutor {
+        fn executor(self: *@This()) ha_http_operation.Executor {
             return .{
                 .ptr = self,
                 .vtable = &.{ .execute = execute },
             };
         }
 
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        fn execute(ptr: *anyopaque, req: ha_http_operation.Request) !ha_http_operation.OwnedResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             self.last_method = req.method;
-            self.last_uri = req.uri;
+            self.last_uri = req.target;
             self.last_body = req.body;
             return .{
+                .owner_allocator = self.alloc,
                 .status = 200,
                 .content_type = try self.alloc.dupe(u8, "application/json"),
                 .body = try self.alloc.dupe(u8, self.body),
@@ -21741,39 +21955,42 @@ test "api http server dispatches HA admin and internal executors" {
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
 
-    var admin_resp = try server.handle(.{
-        .method = .GET,
-        .uri = admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
-        .authorization = "Bearer ha-internal-secret",
-    });
-    defer admin_resp.deinit(alloc);
+    var admin_resp = try executeHaRouteForTest(
+        &server,
+        .get,
+        admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
+        "Bearer ha-internal-secret",
+        "",
+    );
+    defer admin_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
     try std.testing.expectEqualStrings("{\"handler\":\"ha-admin\"}", admin_resp.body);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
-    try std.testing.expectEqual(http_common.Method.GET, admin_exec.last_method.?);
+    try std.testing.expectEqual(ha_http_operation.Method.get, admin_exec.last_method.?);
     try std.testing.expectEqualStrings(admin_routes.ha_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
 
-    var internal_resp = try server.handle(.{
-        .method = .POST,
-        .uri = internal_api_routes.ha_replication_status,
-        .authorization = "Bearer ha-internal-secret",
-        .body = "{\"slot_name\":\"standby-a\"}",
-    });
-    defer internal_resp.deinit(alloc);
+    var internal_resp = try executeHaRouteForTest(
+        &server,
+        .post,
+        internal_api_routes.ha_replication_status,
+        "Bearer ha-internal-secret",
+        "{\"slot_name\":\"standby-a\"}",
+    );
+    defer internal_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expectEqualStrings("{\"handler\":\"ha-internal\"}", internal_resp.body);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
-    try std.testing.expectEqual(http_common.Method.POST, internal_exec.last_method.?);
+    try std.testing.expectEqual(ha_http_operation.Method.post, internal_exec.last_method.?);
     try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
-    var missing = try server.handle(.{ .method = .GET, .uri = admin_routes.ha });
-    defer missing.deinit(alloc);
+    var missing = try executeHaRouteForTest(&server, .get, admin_routes.ha, null, "");
+    defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 }
 
-test "api http server requires exact HA bearer token for internal replication routes" {
+test "typed HA route operation requires exact bearer token for internal replication routes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -21795,17 +22012,18 @@ test "api http server requires exact HA bearer token for internal replication ro
         alloc: std.mem.Allocator,
         calls: usize = 0,
 
-        fn executor(self: *@This()) http_common.RequestExecutor {
+        fn executor(self: *@This()) ha_http_operation.Executor {
             return .{
                 .ptr = self,
                 .vtable = &.{ .execute = execute },
             };
         }
 
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+        fn execute(ptr: *anyopaque, _: ha_http_operation.Request) !ha_http_operation.OwnedResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             return .{
+                .owner_allocator = self.alloc,
                 .status = 200,
                 .content_type = try self.alloc.dupe(u8, "text/plain"),
                 .body = try self.alloc.dupe(u8, "ha"),
@@ -21840,39 +22058,27 @@ test "api http server requires exact HA bearer token for internal replication ro
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
 
-    var unauthorized = try server.handle(.{ .method = .GET, .uri = admin_routes.ha_primary_status });
-    defer unauthorized.deinit(alloc);
+    var unauthorized = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, null, "");
+    defer unauthorized.deinit();
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var forbidden = try server.handle(.{
-        .method = .GET,
-        .uri = admin_routes.ha_primary_status,
-        .authorization = reader_auth,
-    });
-    defer forbidden.deinit(alloc);
+    var forbidden = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, reader_auth, "");
+    defer forbidden.deinit();
     try std.testing.expectEqual(@as(u16, 401), forbidden.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    var native_admin_rejected = try server.handle(.{
-        .method = .GET,
-        .uri = admin_routes.ha_primary_status,
-        .authorization = admin_auth,
-    });
-    defer native_admin_rejected.deinit(alloc);
+    var native_admin_rejected = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, admin_auth, "");
+    defer native_admin_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 401), native_admin_rejected.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
-    var authorized = try server.handle(.{
-        .method = .GET,
-        .uri = admin_routes.ha_primary_status,
-        .authorization = "Bearer ha-internal-secret",
-    });
-    defer authorized.deinit(alloc);
+    var authorized = try executeHaRouteForTest(&server, .get, admin_routes.ha_primary_status, "Bearer ha-internal-secret", "");
+    defer authorized.deinit();
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 
@@ -21883,39 +22089,27 @@ test "api http server requires exact HA bearer token for internal replication ro
         internal_api_routes.ha_replication_status,
     };
     for (internal_routes) |path| {
-        var internal_missing = try server.handle(.{ .method = .GET, .uri = path });
-        defer internal_missing.deinit(alloc);
+        var internal_missing = try executeHaRouteForTest(&server, .get, path, null, "");
+        defer internal_missing.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_missing.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
 
-        var internal_wrong = try server.handle(.{
-            .method = .GET,
-            .uri = path,
-            .authorization = "Bearer wrong-token",
-        });
-        defer internal_wrong.deinit(alloc);
+        var internal_wrong = try executeHaRouteForTest(&server, .get, path, "Bearer wrong-token", "");
+        defer internal_wrong.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_wrong.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
     }
 
-    var internal = try server.handle(.{
-        .method = .GET,
-        .uri = internal_api_routes.ha_replication_identify,
-        .authorization = "Bearer ha-internal-secret",
-    });
-    defer internal.deinit(alloc);
+    var internal = try executeHaRouteForTest(&server, .get, internal_api_routes.ha_replication_identify, "Bearer ha-internal-secret", "");
+    defer internal.deinit();
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 
     var disabled_server = ApiHttpServer.init(alloc, .{
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
-    var disabled = try disabled_server.handle(.{
-        .method = .GET,
-        .uri = internal_api_routes.ha_replication_identify,
-        .authorization = "Bearer ha-internal-secret",
-    });
-    defer disabled.deinit(alloc);
+    var disabled = try executeHaRouteForTest(&disabled_server, .get, internal_api_routes.ha_replication_identify, "Bearer ha-internal-secret", "");
+    defer disabled.deinit();
     try std.testing.expectEqual(@as(u16, 403), disabled.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 
@@ -21923,12 +22117,8 @@ test "api http server requires exact HA bearer token for internal replication ro
         .admin_bearer_token = "",
         .ha_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
-    var empty_token = try empty_token_server.handle(.{
-        .method = .GET,
-        .uri = internal_api_routes.ha_replication_identify,
-        .authorization = "Bearer ",
-    });
-    defer empty_token.deinit(alloc);
+    var empty_token = try executeHaRouteForTest(&empty_token_server, .get, internal_api_routes.ha_replication_identify, "Bearer ", "");
+    defer empty_token.deinit();
     try std.testing.expectEqual(@as(u16, 403), empty_token.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }
@@ -21990,7 +22180,7 @@ test "api http server serves secrets crud when backed by a local store" {
         .secret_store = &store,
     }, source.iface(), null, null);
 
-    var put_resp = try server.handle(.{
+    var put_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/secrets/openai.api_key",
         .body = "{\"value\":\"sk-test\"}",
@@ -22006,7 +22196,7 @@ test "api http server serves secrets crud when backed by a local store" {
     try std.testing.expect(put_entry.value.created_at != null);
     try std.testing.expect(put_entry.value.updated_at != null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/secrets",
     });
@@ -22029,7 +22219,7 @@ test "api http server serves secrets crud when backed by a local store" {
         .data = "{\"secrets\":[{\"key\":\"gemini.api_key\",\"value\":\"externally-managed\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
     });
 
-    var external_list_resp = try server.handle(.{
+    var external_list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/secrets",
     });
@@ -22049,7 +22239,7 @@ test "api http server serves secrets crud when backed by a local store" {
     var restored = try store.put(alloc, "openai.api_key", "sk-test");
     defer restored.deinit(alloc);
 
-    var delete_resp = try server.handle(.{
+    var delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/secrets/openai.api_key",
     });
@@ -22103,7 +22293,7 @@ test "api http server status includes secret store reload health" {
         .data = "{not-json",
     });
 
-    var status_resp = try server.handle(.{
+    var status_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
     });
@@ -22139,7 +22329,7 @@ test "api http server lists secrets status without a local secret store" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.secrets,
     });
@@ -22212,15 +22402,15 @@ test "api http server forbids non-admin secret access when auth is enabled" {
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.secrets,
         .authorization = reader_auth,
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", resp.body);
 }
 
 test "api http server query builder requires table read permission when auth is enabled" {
@@ -22294,7 +22484,7 @@ test "api http server query builder requires table read permission when auth is 
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .authorization = reader_auth,
@@ -22396,19 +22586,19 @@ test "api http server restricts runtime schema debug to admins when auth is enab
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var reader_resp = try server.handle(.{
+    var reader_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs?debug=runtime_schema",
         .authorization = reader_auth,
     });
     defer reader_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), reader_resp.status);
-    try std.testing.expectEqualStrings("text/plain", reader_resp.content_type.?);
-    try std.testing.expectEqualStrings("forbidden", reader_resp.body);
+    try std.testing.expectEqualStrings("application/json", reader_resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", reader_resp.body);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    var admin_resp = try server.handle(.{
+    var admin_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs?debug=runtime_schema",
         .authorization = admin_auth,
@@ -22481,7 +22671,7 @@ test "api http server serves user management routes when auth is enabled" {
         username: []const u8,
     };
 
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22495,7 +22685,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqualStrings("alice", created_user.value.username);
     try std.testing.expectEqualStrings("acme", created_user.value.metadata.?.map.get("tenant_id").?.string);
 
-    var me_resp = try server.handle(.{
+    var me_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.users_me,
         .authorization = admin_auth,
@@ -22508,7 +22698,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer me.deinit();
     try std.testing.expectEqualStrings("admin", me.value.username);
 
-    var users_resp = try server.handle(.{
+    var users_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.users,
         .authorization = admin_auth,
@@ -22521,7 +22711,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer users.deinit();
     try std.testing.expectEqual(@as(usize, 2), users.value.len);
 
-    var permissions_resp = try server.handle(.{
+    var permissions_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22535,7 +22725,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(usize, 1), permissions.value.len);
     try std.testing.expectEqualStrings("docs", permissions.value[0].resource);
 
-    var user_resp = try server.handle(.{
+    var user_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22547,7 +22737,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer user.deinit();
     try std.testing.expectEqualStrings("alice", user.value.username);
 
-    var add_permission_resp = try server.handle(.{
+    var add_permission_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22561,7 +22751,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expect(add_permission.value.message != null);
     try std.testing.expect(add_permission.value.message.?.len > 0);
 
-    var add_role_resp = try server.handle(.{
+    var add_role_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/roles",
         .authorization = admin_auth,
@@ -22571,7 +22761,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(u16, 201), add_role_resp.status);
     try std.testing.expectEqualStrings("application/json", add_role_resp.content_type.?);
 
-    var roles_resp = try server.handle(.{
+    var roles_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/roles",
         .authorization = admin_auth,
@@ -22584,7 +22774,7 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(usize, 1), roles.value.len);
     try std.testing.expectEqualStrings("role:tenant_reader", roles.value[0]);
 
-    var subjects_resp = try server.handle(.{
+    var subjects_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.auth_subjects,
         .authorization = admin_auth,
@@ -22596,7 +22786,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer subjects.deinit();
     try std.testing.expect(subjects.value.len >= 2);
 
-    var delete_role_resp = try server.handle(.{
+    var delete_role_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/roles?role=role:tenant_reader",
         .authorization = admin_auth,
@@ -22604,7 +22794,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer delete_role_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_role_resp.status);
 
-    var password_resp = try server.handle(.{
+    var password_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/password",
         .authorization = admin_auth,
@@ -22622,7 +22812,7 @@ test "api http server serves user management routes when auth is enabled" {
     defer authed.deinit(alloc);
     try std.testing.expectEqualStrings("alice", authed.username);
 
-    var delete_resp = try server.handle(.{
+    var delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice",
         .authorization = admin_auth,
@@ -22684,7 +22874,7 @@ test "api http server serves api key and row filter routes" {
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
 
-    var api_key_resp = try server.handle(.{
+    var api_key_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -22699,7 +22889,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expect(created.value.key_secret.len > 0);
     try std.testing.expect(created.value.encoded.len > 0);
 
-    var list_api_keys_resp = try server.handle(.{
+    var list_api_keys_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -22717,7 +22907,7 @@ test "api http server serves api key and row filter routes" {
 
     const bearer_auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{created_encoded});
     defer alloc.free(bearer_auth);
-    var bearer_status = try server.handle(.{
+    var bearer_status = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.status,
         .authorization = bearer_auth,
@@ -22725,7 +22915,7 @@ test "api http server serves api key and row filter routes" {
     defer bearer_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), bearer_status.status);
 
-    var put_subject_row_filter_resp = try server.handle(.{
+    var put_subject_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters/docs",
         .authorization = admin_auth,
@@ -22735,7 +22925,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(u16, 200), put_subject_row_filter_resp.status);
     try std.testing.expectEqualStrings("application/json", put_subject_row_filter_resp.content_type.?);
 
-    var subject_row_filters_resp = try server.handle(.{
+    var subject_row_filters_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters",
         .authorization = admin_auth,
@@ -22748,7 +22938,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(usize, 1), subject_row_filters.value.len);
     try std.testing.expectEqualStrings("docs", subject_row_filters.value[0].table);
 
-    var put_row_filter_resp = try server.handle(.{
+    var put_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22761,7 +22951,7 @@ test "api http server serves api key and row filter routes" {
     defer created_row_filter.deinit();
     try std.testing.expectEqualStrings("docs", created_row_filter.value.table);
 
-    var row_filters_resp = try server.handle(.{
+    var row_filters_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/row-filters",
         .authorization = admin_auth,
@@ -22775,7 +22965,7 @@ test "api http server serves api key and row filter routes" {
     try std.testing.expectEqual(@as(usize, 1), row_filters.value.len);
     try std.testing.expectEqualStrings("docs", row_filters.value[0].table);
 
-    var single_row_filter_resp = try server.handle(.{
+    var single_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22787,7 +22977,7 @@ test "api http server serves api key and row filter routes" {
     defer single_row_filter.deinit();
     try std.testing.expectEqualStrings("docs", single_row_filter.value.table);
 
-    var delete_row_filter_resp = try server.handle(.{
+    var delete_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22795,7 +22985,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_row_filter_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_row_filter_resp.status);
 
-    var delete_subject_row_filter_resp = try server.handle(.{
+    var delete_subject_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/subjects/role:tenant_reader/row-filters/docs",
         .authorization = admin_auth,
@@ -22803,7 +22993,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_subject_row_filter_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_subject_row_filter_resp.status);
 
-    var delete_permission_resp = try server.handle(.{
+    var delete_permission_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/permissions?resource=docs&resourceType=table",
         .authorization = admin_auth,
@@ -22811,7 +23001,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_permission_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_permission_resp.status);
 
-    var empty_permissions_resp = try server.handle(.{
+    var empty_permissions_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/permissions",
         .authorization = admin_auth,
@@ -22827,7 +23017,7 @@ test "api http server serves api key and row filter routes" {
 
     const delete_api_key_uri = try std.fmt.allocPrint(alloc, "/auth/v1/users/alice/api-keys/{s}", .{created_key_id});
     defer alloc.free(delete_api_key_uri);
-    var delete_api_key_resp = try server.handle(.{
+    var delete_api_key_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = delete_api_key_uri,
         .authorization = admin_auth,
@@ -22835,7 +23025,7 @@ test "api http server serves api key and row filter routes" {
     defer delete_api_key_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_api_key_resp.status);
 
-    var empty_api_keys_resp = try server.handle(.{
+    var empty_api_keys_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/auth/v1/users/alice/api-keys",
         .authorization = admin_auth,
@@ -22893,7 +23083,7 @@ test "api http server returns json user auth errors" {
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
 
-    var bad_delete_resp = try server.handle(.{
+    var bad_delete_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/auth/v1/users/alice/permissions?resource=docs&resource_type=table",
         .authorization = admin_auth,
@@ -22902,11 +23092,11 @@ test "api http server returns json user auth errors" {
     try std.testing.expectEqual(@as(u16, 400), bad_delete_resp.status);
     try std.testing.expectEqualStrings("application/json", bad_delete_resp.content_type.?);
 
-    var bad_delete_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_delete_resp.body, .{});
+    var bad_delete_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_delete_resp.body, .{ .ignore_unknown_fields = true });
     defer bad_delete_body.deinit();
-    try std.testing.expectEqualStrings("missing resourceType", bad_delete_body.value.@"error");
+    try std.testing.expectEqualStrings("missing_query_param", bad_delete_body.value.@"error");
 
-    var bad_row_filter_resp = try server.handle(.{
+    var bad_row_filter_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/auth/v1/users/alice/row-filters/docs",
         .authorization = admin_auth,
@@ -22916,7 +23106,7 @@ test "api http server returns json user auth errors" {
     try std.testing.expectEqual(@as(u16, 400), bad_row_filter_resp.status);
     try std.testing.expectEqualStrings("application/json", bad_row_filter_resp.content_type.?);
 
-    var bad_row_filter_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_row_filter_resp.body, .{});
+    var bad_row_filter_body = try std.json.parseFromSlice(ErrorResponse, alloc, bad_row_filter_resp.body, .{ .ignore_unknown_fields = true });
     defer bad_row_filter_body.deinit();
     try std.testing.expectEqualStrings("invalid row filter", bad_row_filter_body.value.@"error");
 }
@@ -22943,14 +23133,14 @@ test "api http server rejects secret writes without a local secret store" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/secrets/openai.api_key",
         .body = "{\"value\":\"sk-test\"}",
     });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", resp.content_type.?);
     try std.testing.expectEqualStrings("secret management not available in multi-node mode", resp.body);
 }
 
@@ -23018,16 +23208,23 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.executor().execute(std.heap.page_allocator, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
+    defer server.deinit();
+    const http_test_runtime = @import("http_test_runtime.zig");
+    var runtime = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
+    defer runtime.deinit();
+    const base_uri = try runtime.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+    const http_client = @import("http_client.zig");
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    var client = http_client.ApiHttpClient.init(std.heap.page_allocator, executor.executor());
+    var resp = try client.fetchLookup(base_uri, "docs", "doc:a", "title");
     defer resp.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
-    try std.testing.expectEqual(@as(usize, 1), resp.headers.len);
-    try std.testing.expectEqualStrings("X-Antfly-Version", resp.headers[0].name);
-    try std.testing.expectEqualStrings("4321", resp.headers[0].value);
+    try std.testing.expectEqualStrings("4321", resp.version.?);
 }
 
 test "api http server allows explicit stale table lookup consistency" {
@@ -23087,13 +23284,13 @@ test "api http server allows explicit stale table lookup consistency" {
     };
 
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", resp.body);
 
-    var invalid = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
+    var invalid = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
     defer invalid.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid.status);
     try std.testing.expectEqualStrings("invalid read consistency", invalid.body);
@@ -23163,7 +23360,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
+    var resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
@@ -23255,7 +23452,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = trusted_principal_header, .value = token },
     };
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &trusted_principal_headers,
@@ -23269,7 +23466,7 @@ test "api http server serves document lookup through mcp tool" {
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
         .{ .name = trusted_principal_header, .value = token },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23278,10 +23475,13 @@ test "api http server serves document lookup through mcp tool" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(alloc, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "get_document") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "lookup") == null);
 
-    var call_resp = try server.handle(.{
+    var call_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23290,7 +23490,7 @@ test "api http server serves document lookup through mcp tool" {
     });
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, call_resp.body, "{\"title\":\"alpha\"}");
 }
 
 test "api http server serves fielded full-text search through mcp tools" {
@@ -23307,11 +23507,15 @@ test "api http server serves fielded full-text search through mcp tools" {
     }
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello\"}" }},
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"world\"}" },
+        },
         .sync_level = .full_index,
     });
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -23356,10 +23560,10 @@ test "api http server serves fielded full-text search through mcp tools" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), table_write_source.source());
     defer server.deinit();
 
-    var init_resp = try server.handle(.{
+    var init_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .content_type = "application/json",
@@ -23371,7 +23575,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const mcp_session_headers = [_]http_common.RequestHeader{
         .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
     };
-    var tools_resp = try server.handle(.{
+    var tools_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23380,20 +23584,190 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_query_request\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_table\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_indexes\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"sample_documents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"describe_mcp_capabilities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"queryRequest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "Raw Antfly QueryRequest body") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"fullTextSearchField\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"full_text_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"oneOf\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"inclusiveFrom\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"boolean\"") != null);
+    var parsed_tools = try mcp.testing.parseToolsListResponse(alloc, tools_resp.body);
+    defer parsed_tools.deinit();
+    const listed_tools = parsed_tools.value.result.tools;
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_query_request") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_table") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_indexes") != null);
+    try std.testing.expect(mcp.testing.findTool(listed_tools, "describe_mcp_capabilities") != null);
 
-    var describe_table_resp = try server.handle(.{
+    const query_tool = mcp.testing.findTool(listed_tools, "query") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_input_schema.json"), query_tool.inputSchema);
+    const query_properties = query_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
+    const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
+    const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
+    const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
+    try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
+    try std.testing.expect(query_properties.object.get("full_text_search") != null);
+    const query_request_properties = query_request_contract_schema.object.get("properties") orelse return error.TestExpectedEqual;
+    try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
+    const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
+    const hierarchy_properties = hierarchy_schema.object.get("properties").?.object;
+    try std.testing.expect(hierarchy_properties.get("group_by") != null);
+    try std.testing.expect(hierarchy_properties.get("ancestors") != null);
+    try std.testing.expect(hierarchy_properties.get("return_level") == null);
+    try std.testing.expect(hierarchy_properties.get("rollup") == null);
+    try std.testing.expect(hierarchy_properties.get("include") == null);
+    try std.testing.expect(hierarchy_properties.get("max_children_per_parent") == null);
+    try std.testing.expect(hierarchy_schema.object.get("minProperties") == null);
+    const group_by_schema = hierarchy_properties.get("group_by").?.object;
+    const matches_schema = group_by_schema.get("properties").?.object.get("matches").?.object;
+    const matches_limit = matches_schema.get("properties").?.object.get("limit").?.object;
+    try std.testing.expectEqual(@as(i64, 100), matches_limit.get("maximum").?.integer);
+    const hierarchy_constraints = hierarchy_schema.object.get("allOf").?.array.items;
+    var found_source_group_projection_constraint = false;
+    for (hierarchy_constraints) |constraint| {
+        const not_schema = constraint.object.get("not") orelse continue;
+        const ancestor_properties = not_schema.object.get("properties") orelse continue;
+        const ancestor_schema = ancestor_properties.object.get("ancestors") orelse continue;
+        const required = ancestor_schema.object.get("required") orelse continue;
+        if (required.array.items.len == 1 and
+            required.array.items[0] == .string and
+            std.mem.eql(u8, required.array.items[0].string, "source"))
+        {
+            found_source_group_projection_constraint = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_source_group_projection_constraint);
+    const query_request_not = query_request_contract_schema.object.get("not") orelse return error.TestExpectedEqual;
+    const invalid_query_states = query_request_not.object.get("anyOf") orelse return error.TestExpectedEqual;
+    var guards_group_projection = false;
+    var guards_child_projection = false;
+    var guards_child_order = false;
+    for (invalid_query_states.array.items) |invalid_state| {
+        const all_of = invalid_state.object.get("allOf") orelse continue;
+        if (all_of.array.items.len != 2) continue;
+        const hierarchy = all_of.array.items[0].object.get("properties") orelse continue;
+        const hierarchy_value = hierarchy.object.get("hierarchy") orelse continue;
+        const required_mode = hierarchy_value.object.get("required") orelse continue;
+        if (required_mode.array.items.len != 1 or required_mode.array.items[0] != .string) continue;
+        const missing = all_of.array.items[1].object.get("not") orelse continue;
+        const missing_required = missing.object.get("required") orelse continue;
+        if (missing_required.array.items.len != 1 or missing_required.array.items[0] != .string) continue;
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "group_by") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "fields"))
+        {
+            guards_group_projection = true;
+        }
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "children") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "fields"))
+        {
+            guards_child_projection = true;
+        }
+        if (std.mem.eql(u8, required_mode.array.items[0].string, "children") and
+            std.mem.eql(u8, missing_required.array.items[0].string, "order_by"))
+        {
+            guards_child_order = true;
+        }
+    }
+    try std.testing.expect(guards_group_projection);
+    try std.testing.expect(guards_child_projection);
+    try std.testing.expect(guards_child_order);
+    const query_tool_not = query_tool.inputSchema.object.get("not") orelse return error.TestExpectedEqual;
+    try std.testing.expect(query_tool_not.object.get("anyOf").?.array.items.len > 0);
+
+    const sample_tool = mcp.testing.findTool(listed_tools, "sample_documents") orelse return error.TestExpectedEqual;
+    const sample_properties = sample_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
+    const inclusive_from_schema = sample_properties.object.get("inclusiveFrom") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("boolean", inclusive_from_schema.object.get("type").?.string);
+    const sample_limit_schema = sample_properties.object.get("limit") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 1), sample_limit_schema.object.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), sample_limit_schema.object.get("maximum").?.integer);
+
+    const backup_tool = mcp.testing.findTool(listed_tools, "backup") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_backup_input_schema.json"), backup_tool.inputSchema);
+    const restore_tool = mcp.testing.findTool(listed_tools, "restore") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_restore_input_schema.json"), restore_tool.inputSchema);
+    const batch_tool = mcp.testing.findTool(listed_tools, "batch") orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_batch_input_schema.json"), batch_tool.inputSchema);
+
+    var batch_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{\"doc:b\":{\"title\":\"beta\",\"body\":\"world\"}},\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"$.title\",\"value\":\"updated\"}]}],\"syncLevel\":\"full_index\"}}}",
+    });
+    defer batch_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), batch_resp.status);
+    var parsed_batch = try mcp.testing.parseToolCallResponse(alloc, batch_resp.body);
+    defer parsed_batch.deinit();
+    try std.testing.expect(!parsed_batch.value.result.isError);
+    var inserted = (try db.lookup(alloc, "doc:b", .{})) orelse return error.TestExpectedEqual;
+    defer inserted.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.json, "world") != null);
+    var transformed = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer transformed.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, transformed.json, "updated") != null);
+
+    var ambiguous_batch_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":{},\"writes\":{}}}}",
+    });
+    defer ambiguous_batch_resp.deinit(std.testing.allocator);
+    try mcp.testing.expectToolResultTextContains(alloc, ambiguous_batch_resp.body, true, "inserts and writes cannot be combined");
+
+    // SDKs and MCP clients commonly serialize unset optionals as JSON null.
+    // Null canonical arguments must remain equivalent to omission so aliases
+    // and defaults continue to work.
+    var nullable_batch_alias_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/call\",\"params\":{\"name\":\"batch\",\"arguments\":{\"tableName\":\"docs\",\"inserts\":null,\"writes\":{\"doc:c\":{\"title\":\"gamma\",\"body\":\"nullable alias\"}},\"transforms\":null,\"syncLevel\":null}}}",
+    });
+    defer nullable_batch_alias_resp.deinit(std.testing.allocator);
+    var parsed_nullable_batch = try mcp.testing.parseToolCallResponse(alloc, nullable_batch_alias_resp.body);
+    defer parsed_nullable_batch.deinit();
+    try std.testing.expect(!parsed_nullable_batch.value.result.isError);
+    var nullable_alias_inserted = (try db.lookup(alloc, "doc:c", .{})) orelse return error.TestExpectedEqual;
+    defer nullable_alias_inserted.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, nullable_alias_inserted.json, "nullable alias") != null);
+
+    var missing_backup_connection_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\"}}}",
+    });
+    defer missing_backup_connection_resp.deinit(std.testing.allocator);
+    try mcp.testing.expectToolResultTextContains(alloc, missing_backup_connection_resp.body, true, "missing connection");
+
+    var forwarded_backup_format_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"backup\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\",\"format\":\"invalid\"}}}",
+    });
+    defer forwarded_backup_format_resp.deinit(std.testing.allocator);
+    try mcp.testing.expectToolResultTextContains(alloc, forwarded_backup_format_resp.body, true, "unsupported backup format");
+
+    var forwarded_restore_connection_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"restore\",\"arguments\":{\"tableName\":\"docs\",\"backupId\":\"backup-1\",\"location\":\"s3://bucket/path\",\"connection\":\"archive\"}}}",
+    });
+    defer forwarded_restore_connection_resp.deinit(std.testing.allocator);
+    var parsed_restore = try mcp.testing.parseToolCallResponse(alloc, forwarded_restore_connection_resp.body);
+    defer parsed_restore.deinit();
+    try std.testing.expect(parsed_restore.value.result.isError);
+    const restore_error = mcp.testing.findTextContent(parsed_restore.value.result.content) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, restore_error, "named backup connection is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restore_error, "invalid restore request") == null);
+
+    var describe_table_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23402,10 +23776,13 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_table_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"name\":\"docs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_table_resp.body, "\"full_text_index_v0\"") != null);
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        describe_table_resp.body,
+        "{\"name\":\"docs\",\"indexes\":{\"full_text_index_v0\":{}}}",
+    );
 
-    var describe_indexes_resp = try server.handle(.{
+    var describe_indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23414,10 +23791,10 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_indexes_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"full_text_index_v0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, describe_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, describe_indexes_resp.body);
 
-    var list_indexes_resp = try server.handle(.{
+    var list_indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23426,22 +23803,26 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer list_indexes_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), list_indexes_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"full_text_index_v0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list_indexes_resp.body, "\"structuredContent\":{\"indexes\":[") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, list_indexes_resp.body, "{\"indexes\":[{\"config\":{\"name\":\"full_text_index_v0\"}}]}");
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, list_indexes_resp.body);
 
-    var sample_documents_resp = try server.handle(.{
+    var sample_documents_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":1,\"inclusiveFrom\":true}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"sample_documents\",\"arguments\":{\"tableName\":\"docs\",\"fields\":[\"title\",\"body\"],\"limit\":2,\"inclusiveFrom\":true}}}",
     });
     defer sample_documents_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"doc:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_resp.body, "\"hello\"") != null);
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        sample_documents_resp.body,
+        "{\"documents\":[{\"_id\":\"doc:a\",\"body\":\"hello\"},{\"_id\":\"doc:b\",\"body\":\"world\"}]}",
+    );
+    try mcp.testing.expectToolJsonRepresentationsEqual(alloc, sample_documents_resp.body);
 
-    var sample_documents_zero_limit_resp = try server.handle(.{
+    var sample_documents_zero_limit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23450,10 +23831,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer sample_documents_zero_limit_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_zero_limit_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_zero_limit_resp.body, "limit must be greater than 0") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, sample_documents_zero_limit_resp.body, true, "limit must be greater than 0");
 
-    var sample_documents_large_limit_resp = try server.handle(.{
+    var sample_documents_large_limit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23462,10 +23842,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer sample_documents_large_limit_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), sample_documents_large_limit_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sample_documents_large_limit_resp.body, "limit exceeds maximum sample size") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, sample_documents_large_limit_resp.body, true, "limit exceeds maximum sample size");
 
-    var describe_capabilities_resp = try server.handle(.{
+    var describe_capabilities_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23474,11 +23853,21 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_capabilities_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_capabilities_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"structuredContent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "query-builder") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_capabilities_resp.body, "\"raw_query_request\":true") != null);
+    try mcp.testing.expectToolStructuredSubset(
+        alloc,
+        describe_capabilities_resp.body,
+        "{\"query_builder\":\"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.\",\"query\":{\"raw_query_request\":true}}",
+    );
+    var parsed_capabilities = try mcp.testing.parseToolCallResponse(alloc, describe_capabilities_resp.body);
+    defer parsed_capabilities.deinit();
+    const capabilities_text = mcp.testing.findTextContent(parsed_capabilities.value.result.content) orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"query\":{\"raw_query_request\":true},\"tools\":{\"schema_helpers\":[\"describe_query_request\",\"describe_mcp_capabilities\"]}}",
+        capabilities_text,
+    );
 
-    var wrong_field_resp = try server.handle(.{
+    var wrong_field_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23487,9 +23876,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer wrong_field_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), wrong_field_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, wrong_field_resp.body, "\"doc:a\"") == null);
+    try mcp.testing.expectToolStructuredSubset(alloc, wrong_field_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}");
 
-    var query_resp = try server.handle(.{
+    var query_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23498,9 +23887,20 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
-    var query_object_resp = try server.handle(.{
+    var nullable_query_request_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":null,\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\",\"fields\":[\"title\",\"body\"],\"limit\":5}}}",
+    });
+    defer nullable_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), nullable_query_request_resp.status);
+    try mcp.testing.expectToolStructuredSubset(alloc, nullable_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
+
+    var query_object_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23509,9 +23909,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_object_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_object_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_object_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_object_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
-    var query_rest_alias_resp = try server.handle(.{
+    var query_rest_alias_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23520,9 +23920,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer query_rest_alias_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), query_rest_alias_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, query_rest_alias_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, query_rest_alias_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
-    var raw_query_request_resp = try server.handle(.{
+    var raw_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23531,9 +23931,34 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer raw_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_resp.body, "\"doc:a\"") != null);
+    try mcp.testing.expectToolStructuredSubset(alloc, raw_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
 
-    var mixed_query_request_resp = try server.handle(.{
+    var nullable_raw_query_request_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"queryRequest\":{\"table\":null,\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"},\"limit\":5},\"semanticSearch\":null,\"fields\":null,\"limit\":null}}}",
+    });
+    defer nullable_raw_query_request_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), nullable_raw_query_request_resp.status);
+    try mcp.testing.expectToolStructuredSubset(alloc, nullable_raw_query_request_resp.body, "{\"responses\":[{\"hits\":{\"hits\":[{\"_id\":\"doc:a\"}]}}]}");
+
+    // Some MCP clients ignore structuredContent. Verify the compatibility
+    // TextContent block independently carries the complete query response.
+    var parsed_mcp = try mcp.testing.parseToolCallResponse(alloc, raw_query_request_resp.body);
+    defer parsed_mcp.deinit();
+    const text_content = mcp.testing.findTextContent(parsed_mcp.value.result.content) orelse return error.TestExpectedEqual;
+    var parsed_text_content = try std.json.parseFromSlice(std.json.Value, alloc, text_content, .{});
+    defer parsed_text_content.deinit();
+    const text_hit = parsed_text_content.value.object
+        .get("responses").?.array.items[0].object
+        .get("hits").?.object
+        .get("hits").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", text_hit.get("_id").?.string);
+    try std.testing.expectEqualStrings("hello", text_hit.get("_source").?.object.get("body").?.string);
+
+    var mixed_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23542,10 +23967,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer mixed_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), mixed_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_query_request_resp.body, "queryRequest cannot be combined") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, mixed_query_request_resp.body, true, "queryRequest cannot be combined");
 
-    var raw_query_request_table_resp = try server.handle(.{
+    var raw_query_request_table_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23554,10 +23978,9 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer raw_query_request_table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), raw_query_request_table_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw_query_request_table_resp.body, "queryRequest.table is not allowed") != null);
+    try mcp.testing.expectToolResultTextContains(alloc, raw_query_request_table_resp.body, true, "queryRequest.table is not allowed");
 
-    var describe_query_request_resp = try server.handle(.{
+    var describe_query_request_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
@@ -23566,11 +23989,54 @@ test "api http server serves fielded full-text search through mcp tools" {
     });
     defer describe_query_request_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), describe_query_request_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"structuredContent\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "metadata.yaml#/components/schemas/QueryRequest") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"queryRequest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fielded_full_text\":{\"full_text_search\":{\"match\":\"hello\",\"field\":\"body\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, describe_query_request_resp.body, "\"fields\":[\"title\",\"body\"],\"limit\":5") != null);
+    var parsed_description = try mcp.testing.parseToolCallResponse(alloc, describe_query_request_resp.body);
+    defer parsed_description.deinit();
+    const query_description = parsed_description.value.result.structuredContent orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonValue(
+        alloc,
+        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"},\"examples\":{\"fielded_full_text\":{\"fields\":[\"title\",\"body\"]},\"match_retrieval\":{\"hierarchy\":{\"ancestors\":{\"source\":{\"fields\":[\"title\",\"url\"]}}}}}}",
+        query_description,
+    );
+    const query_description_text = mcp.testing.findTextContent(parsed_description.value.result.content) orelse return error.TestExpectedEqual;
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"openapi_schema\":\"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest\",\"mcp_usage\":{\"raw_body_argument\":\"queryRequest\"}}",
+        query_description_text,
+    );
+    const rules = query_description.object.get("mcp_usage").?.object.get("rules").?.array.items;
+    var found_chunks_guidance = false;
+    for (rules) |rule| {
+        if (rule == .string and std.mem.eql(u8, rule.string, "Never request _chunks.* through MCP because it can expand every child stored on a matched source.")) {
+            found_chunks_guidance = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_chunks_guidance);
+
+    server.cfg.mcp_max_tool_result_bytes = common_config.minimum_mcp_max_tool_result_bytes;
+    var oversized_query_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"tools/call\",\"params\":{\"name\":\"query\",\"arguments\":{\"tableName\":\"docs\",\"fullTextSearch\":\"hello\",\"fullTextSearchField\":\"body\"}}}",
+    });
+    defer oversized_query_resp.deinit(std.testing.allocator);
+    var parsed_oversized = try mcp.testing.parseToolCallResponse(alloc, oversized_query_resp.body);
+    defer parsed_oversized.deinit();
+    try std.testing.expect(parsed_oversized.value.result.isError);
+    try std.testing.expect(parsed_oversized.value.result.structuredContent == null);
+    const oversized_text = mcp.testing.findTextContent(parsed_oversized.value.result.content) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, oversized_text, "avoid _chunks.*") != null);
+    const raw_oversized = try std.json.parseFromSlice(std.json.Value, alloc, oversized_query_resp.body, .{});
+    defer raw_oversized.deinit();
+    const encoded_oversized_result = try std.json.Stringify.valueAlloc(
+        alloc,
+        raw_oversized.value.object.get("result").?,
+        .{},
+    );
+    defer alloc.free(encoded_oversized_result);
+    try std.testing.expect(encoded_oversized_result.len <= server.cfg.mcp_max_tool_result_bytes);
 }
 
 test "api http server serves table scan as ndjson" {
@@ -23615,7 +24081,7 @@ test "api http server serves table scan as ndjson" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23630,7 +24096,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 
-    var empty_body_resp = try server.handle(.{
+    var empty_body_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = null,
@@ -23640,7 +24106,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqual(@as(u16, 200), empty_body_resp.status);
     try std.testing.expectEqualStrings("application/x-ndjson", empty_body_resp.content_type.?);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23650,7 +24116,7 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
     try std.testing.expectEqualStrings("invalid scan request", invalid_resp.body);
 
-    var unsupported_resp = try server.handle(.{
+    var unsupported_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/documents",
         .content_type = "application/json",
@@ -23700,7 +24166,7 @@ test "api http server serves table query response envelope" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -23714,7 +24180,7 @@ test "api http server serves table query response envelope" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
 
-    var internal_field_resp = try server.handle(.{
+    var internal_field_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -23804,7 +24270,7 @@ test "api http server executes public Query filter roots and compositions" {
             .{filter},
         );
         defer alloc.free(body);
-        var resp = try server.handle(.{
+        var resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/files/query",
             .content_type = "application/json",
@@ -23830,7 +24296,7 @@ test "api http server executes public Query filter roots and compositions" {
         );
     }
 
-    var exclusion_resp = try server.handle(.{
+    var exclusion_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -23850,7 +24316,7 @@ test "api http server executes public Query filter roots and compositions" {
         exclusion_parsed.value.responses.?[0].hits.?.hits.?.len,
     );
 
-    var unsupported_resp = try server.handle(.{
+    var unsupported_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -23864,7 +24330,7 @@ test "api http server executes public Query filter roots and compositions" {
         "\"offending_node\":\"query_string\"",
     ) != null);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -23919,7 +24385,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/files/query",
         .content_type = "application/json",
@@ -23995,9 +24461,9 @@ test "api http server serves retrieval agent response envelope" {
     const retrieval_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -24013,15 +24479,140 @@ test "api http server serves retrieval agent response envelope" {
     const internal_query_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]},"limit":5}]}
     ;
-    var internal_resp = try server.handle(.{
+    var internal_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = internal_query_body,
     });
     defer internal_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), internal_resp.status);
     try std.testing.expectEqualStrings("invalid retrieval agent request", internal_resp.body);
+
+    // Retrieval has one canonical, authenticated public route. Keeping a
+    // second root-level binding would bypass authorizeRequest and the
+    // per-query table and row-filter checks below.
+    var root_alias = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/agents/retrieval",
+        .content_type = "application/json",
+        .body = retrieval_body,
+    });
+    defer root_alias.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), root_alias.status);
+
+    const secret = "retrieval-trusted-principal-secret";
+    var auth_server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    defer auth_server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+
+    const denied_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, denied_payload);
+    defer std.testing.allocator.free(denied_token);
+    var denied_identity = try auth_server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(std.testing.allocator);
+    try std.testing.expect(!permissionsAllow(denied_identity.permissions, .table, "docs", .read));
+    const denied_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = denied_token },
+    };
+    var denied = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body = retrieval_body,
+    });
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("forbidden", denied.body);
+
+    var denied_stream = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &denied_headers,
+        .body =
+        \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+        ,
+    });
+    defer denied_stream.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), denied_stream.status);
+    try std.testing.expectEqualStrings("forbidden", denied_stream.body);
+
+    const allowed_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(allowed_payload);
+    const allowed_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, allowed_payload);
+    defer std.testing.allocator.free(allowed_token);
+    const allowed_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = allowed_token },
+    };
+    var allowed = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &allowed_headers,
+        .body = retrieval_body,
+    });
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
+
+    const filtered_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"match_all":{{}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(filtered_payload);
+    const filtered_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, filtered_payload);
+    defer std.testing.allocator.free(filtered_token);
+    const filtered_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = filtered_token },
+    };
+    var filtered = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body = retrieval_body,
+    });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+
+    // `$roots` asks the physical reverse index whether each candidate has a
+    // parent. Until that probe can apply row filters to parent documents, it
+    // must fail before an SSE response can reveal hidden graph structure.
+    var filtered_roots = try executeHttpxTestRequest(&auth_server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .headers = &filtered_headers,
+        .body =
+        \\{"query":"find roots","stream":true,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        ,
+    });
+    defer filtered_roots.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), filtered_roots.status);
+    try std.testing.expectEqualStrings("forbidden", filtered_roots.body);
 }
 
 test "api http server maps retrieval agent doc identity mismatch to unavailable" {
@@ -24073,9 +24664,9 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
     const retrieval_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -24121,12 +24712,13 @@ test "api http server serves retrieval agent event stream" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), table_source.source(), null);
+    defer server.deinit();
     const retrieval_body =
         \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
-        .uri = "/agents/retrieval",
+        .uri = "/db/v1/agents/retrieval",
         .content_type = "application/json",
         .body = retrieval_body,
     });
@@ -24163,18 +24755,72 @@ test "api http server serves retrieval agent event stream" {
     try std.testing.expect(saw_hit);
     try std.testing.expect(saw_done);
 
-    var a2a_resp = try server.handle(.{
+    var a2a_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.a2a,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"retrieval-stream\",\"method\":\"message/stream\",\"params\":{\"taskId\":\"rt1\",\"contextId\":\"rc1\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"retrieval\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find hello\"},{\"kind\":\"data\",\"data\":{\"table\":\"docs\",\"limit\":5}}]}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"retrieval-stream\",\"method\":\"message/stream\",\"params\":{\"taskId\":\"rt1\",\"contextId\":\"rc1\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"retrieval\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find hello\"},{\"kind\":\"data\",\"data\":{\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}}]}}}",
     });
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
     try std.testing.expectEqualStrings("text/event-stream", a2a_resp.content_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"event\":\"hit\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"name\":\"result\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"state\":\"completed\"") != null);
+    const a2a_events = try parseSseEventsAlloc(alloc, a2a_resp.body);
+    defer alloc.free(a2a_events);
+    var expected_a2a_hit = try std.json.parseFromSlice(std.json.Value, alloc, "{\"artifact\":{\"name\":\"hit\",\"parts\":[{\"data\":{\"event\":\"hit\"}}]}}", .{});
+    defer expected_a2a_hit.deinit();
+    var expected_a2a_result = try std.json.parseFromSlice(std.json.Value, alloc, "{\"artifact\":{\"name\":\"result\"}}", .{});
+    defer expected_a2a_result.deinit();
+    var expected_a2a_completed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"status\":{\"state\":\"completed\"}}", .{});
+    defer expected_a2a_completed.deinit();
+    var saw_a2a_hit = false;
+    var saw_a2a_result = false;
+    var saw_a2a_completed = false;
+    for (a2a_events) |event| {
+        if (!std.mem.eql(u8, event.event, "message")) continue;
+        var parsed_event = try std.json.parseFromSlice(std.json.Value, alloc, event.data, .{});
+        defer parsed_event.deinit();
+        const value = parsed_event.value;
+        if (ant_json.testing.valueIsSubset(expected_a2a_hit.value, value)) saw_a2a_hit = true;
+        if (ant_json.testing.valueIsSubset(expected_a2a_result.value, value)) saw_a2a_result = true;
+        if (ant_json.testing.valueIsSubset(expected_a2a_completed.value, value)) saw_a2a_completed = true;
+    }
+    try std.testing.expect(saw_a2a_hit);
+    try std.testing.expect(saw_a2a_result);
+    try std.testing.expect(saw_a2a_completed);
+
+    const secret = "a2a-retrieval-trusted-principal-secret";
+    server.cfg.trusted_principal_secret = secret;
+    server.cfg.trusted_principal_issuer = "trusted-upstream";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const denied_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"browser-key","tenant":"tenant-1","tables":["other"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(denied_payload);
+    const denied_token = try encodeTrustedPrincipalToken(alloc, secret, denied_payload);
+    defer alloc.free(denied_token);
+    var denied_identity = try server.authenticateRequest(.{ .trusted_principal = denied_token });
+    defer denied_identity.deinit(alloc);
+    var denied_arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer denied_arena_impl.deinit();
+    const denied_arena = denied_arena_impl.allocator();
+    var denied_queue = a2a.EventQueue.init(denied_arena);
+    defer denied_queue.deinit(denied_arena);
+    try server.executeA2aRetrieval(
+        denied_arena,
+        "{\"query\":\"find hello\",\"stream\":false,\"queries\":[{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:hello\"},\"limit\":5}]}",
+        "denied-task",
+        "denied-context",
+        &denied_queue,
+        ApiHttpServer.queryEmbeddingSecurityScope(denied_identity),
+        denied_identity,
+    );
+    const denied_events_json = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .array = denied_queue.events }, .{});
+    defer alloc.free(denied_events_json);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied_events_json, "forbidden") != null);
 }
 
 test "api http server serves eval response envelope" {
@@ -24198,7 +24844,7 @@ test "api http server serves eval response envelope" {
     const eval_body =
         \\{"evaluators":["precision","recall","relevance","faithfulness"],"query":"How does raft consensus work?","output":"Raft uses leader election and replicated logs. [doc:1]","context":[{"title":"Raft","body":"Raft uses leader election and replicated logs."},{"title":"Other","body":"Unrelated content."}],"retrieved_ids":["doc:1","doc:2"],"ground_truth":{"relevant_ids":["doc:1"],"expectations":"leader election replicated logs"}}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.eval,
         .body = eval_body,
@@ -24265,7 +24911,7 @@ test "api http server serves query builder response envelope" {
     const query_builder_body =
         \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":3,"max_user_clarifications":2}
     ;
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = query_builder_body,
@@ -24337,7 +24983,7 @@ test "api http server query builder infers semantic indexes from table metadata"
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"semantic\"}",
@@ -24354,7 +25000,7 @@ test "api http server query builder infers semantic indexes from table metadata"
     try std.testing.expectEqual(@as(usize, 1), parsed.value.query_request.?.indexes.?.len);
     try std.testing.expect(parsed.value.query_request.?.full_text_search == null);
 
-    var invalid_resp = try server.handle(.{
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"semantic\",\"constraints\":{\"prefer_indexes\":[\"missing_idx\"],\"require_executable\":true}}",
@@ -24464,7 +25110,7 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"full_text\",\"output\":\"query_request\"}",
@@ -24515,8 +25161,64 @@ test "api http server query builder loads structured table index metadata" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    const ColdReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn observedDynamicFieldCapabilitySets(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: table_reads.DynamicFieldObservationQuery,
+        ) anyerror!?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+
     var source = FakeSource{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), ColdReads.source(), null);
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 
@@ -24609,7 +25311,7 @@ test "api http server query builder handles tree graph indexes" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var inferred_resp = try server.handle(.{
+    var inferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_single\",\"intent\":\"find raft architecture\",\"mode\":\"tree\"}",
@@ -24622,7 +25324,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expect(inferred.value.retrieval_query_request != null);
     try std.testing.expectEqualStrings("doc_hierarchy", inferred.value.retrieval_query_request.?.tree_search.?.index);
 
-    var graph_inferred_resp = try server.handle(.{
+    var graph_inferred_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_single\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\"}",
@@ -24636,7 +25338,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
     try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
 
-    var question_resp = try server.handle(.{
+    var question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find raft architecture\",\"mode\":\"tree\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24648,7 +25350,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, question.value.status.?);
     try std.testing.expectEqualStrings("select_tree_index", question.value.questions.?[0].id);
 
-    var answer_resp = try server.handle(.{
+    var answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find raft architecture\",\"mode\":\"tree\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_tree_index\",\"answer\":\"topic_graph\"}]}",
@@ -24660,7 +25362,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, answer.value.status.?);
     try std.testing.expectEqualStrings("topic_graph", answer.value.retrieval_query_request.?.tree_search.?.index);
 
-    var graph_question_resp = try server.handle(.{
+    var graph_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24672,7 +25374,7 @@ test "api http server query builder handles tree graph indexes" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, graph_question.value.status.?);
     try std.testing.expectEqualStrings("select_graph_index", graph_question.value.questions.?[0].id);
 
-    var graph_answer_resp = try server.handle(.{
+    var graph_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs_multi\",\"intent\":\"find related raft architecture\",\"mode\":\"graph\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_graph_index\",\"answer\":\"topic_graph\"}]}",
@@ -24728,7 +25430,7 @@ test "api http server query builder replays clarification decisions" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var table_question_resp = try server.handle(.{
+    var table_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"interactive\":true,\"max_user_clarifications\":1,\"constraints\":{\"require_executable\":true}}",
@@ -24740,7 +25442,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, table_question.value.status.?);
     try std.testing.expectEqualStrings("select_query_table", table_question.value.questions.?[0].id);
 
-    var table_answer_resp = try server.handle(.{
+    var table_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"interactive\":true,\"max_user_clarifications\":1,\"constraints\":{\"require_executable\":true},\"decisions\":[{\"question_id\":\"select_query_table\",\"answer\":\"docs\"}]}",
@@ -24753,7 +25455,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expect(table_answer.value.questions == null);
     try std.testing.expectEqualStrings("docs", table_answer.value.query_request.?.table.?);
 
-    var field_question_resp = try server.handle(.{
+    var field_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"title\",\"body\",\"status\"],\"mode\":\"full_text\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24765,7 +25467,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, field_question.value.status.?);
     try std.testing.expectEqualStrings("select_text_field", field_question.value.questions.?[0].id);
 
-    var field_answer_resp = try server.handle(.{
+    var field_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"title\",\"body\",\"status\"],\"mode\":\"full_text\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_text_field\",\"answer\":\"title\"}]}",
@@ -24777,7 +25479,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, field_answer.value.status.?);
     try std.testing.expectEqualStrings("title", field_answer.value.query_request.?.full_text_search.?.object.get("field").?.string);
 
-    var semantic_question_resp = try server.handle(.{
+    var semantic_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"mode\":\"semantic\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24789,7 +25491,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, semantic_question.value.status.?);
     try std.testing.expectEqualStrings("select_semantic_index", semantic_question.value.questions.?[0].id);
 
-    var semantic_answer_resp = try server.handle(.{
+    var semantic_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"find raft architecture\",\"schema_fields\":[\"body\",\"status\"],\"mode\":\"semantic\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_semantic_index\",\"answer\":\"body_embedding\"}]}",
@@ -24802,7 +25504,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqualStrings("semantic", semantic_answer.value.specialist.?);
     try std.testing.expectEqualStrings("body_embedding", semantic_answer.value.query_request.?.indexes.?[0]);
 
-    var strategy_question_resp = try server.handle(.{
+    var strategy_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"auto\",\"interactive\":true,\"max_user_clarifications\":1}",
@@ -24814,7 +25516,7 @@ test "api http server query builder replays clarification decisions" {
     try std.testing.expectEqual(metadata_openapi.AgentStatus.clarification_required, strategy_question.value.status.?);
     try std.testing.expectEqualStrings("select_query_strategy", strategy_question.value.questions.?[0].id);
 
-    var strategy_answer_resp = try server.handle(.{
+    var strategy_answer_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"docs\",\"intent\":\"find raft architecture\",\"mode\":\"auto\",\"interactive\":true,\"max_user_clarifications\":1,\"decisions\":[{\"question_id\":\"select_query_strategy\",\"answer\":\"full_text\"}]}",
@@ -24850,7 +25552,7 @@ test "api http server returns json eval and query builder validation errors" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var eval_resp = try server.handle(.{
+    var eval_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.eval,
         .body = "{}",
@@ -24863,7 +25565,7 @@ test "api http server returns json eval and query builder validation errors" {
     defer eval_body.deinit();
     try std.testing.expectEqualStrings("invalid eval request", eval_body.value.@"error");
 
-    var query_builder_resp = try server.handle(.{
+    var query_builder_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"intent\":\"\"}",
@@ -24916,7 +25618,7 @@ test "api http server returns json not found for missing query builder table" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.agents_query_builder,
         .body = "{\"table\":\"missing\",\"intent\":\"find docs\"}",
@@ -25005,7 +25707,7 @@ test "api http server routes table query through read schema full text index" {
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/query",
         .content_type = "application/json",
@@ -25056,7 +25758,7 @@ test "api http server serves table batch writes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"]}");
     defer std.testing.allocator.free(batch_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25092,7 +25794,7 @@ test "api http server serves table batch writes" {
         );
     }
     try compact_writer.writeAll("},\"sync_level\":\"write\"}");
-    var compact_resp = try server.handle(.{
+    var compact_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25128,6 +25830,9 @@ test "api http server routes table batches through the batch commit hook" {
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
+        commit_error: ?anyerror = null,
+        repair_outcome: bool = false,
+        legacy_visibility_pending_outcome: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -25178,6 +25883,15 @@ test "api http server routes table batches through the batch commit hook" {
             try std.testing.expectEqual(@as(usize, 1), tables[0].deletes.len);
             try std.testing.expectEqualStrings("doc:gone", tables[0].deletes[0]);
             try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            if (self.commit_error) |err| return err;
+            if (self.repair_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_repair_required = true,
+            } };
+            if (self.legacy_visibility_pending_outcome) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_pending = true,
+            } };
             return .{ .committed = .{ .participant_count = 2 } };
         }
     };
@@ -25191,7 +25905,7 @@ test "api http server routes table batches through the batch commit hook" {
     );
     defer std.testing.allocator.free(batch_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25207,6 +25921,52 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
+
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
+        writes.commit_error = wait_err;
+        var pending_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer pending_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 202), pending_resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    }
+    writes.commit_error = error.EnrichmentWorkerFailed;
+    var repair_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.commit_error = null;
+    writes.repair_outcome = true;
+    var repair_outcome_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer repair_outcome_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), repair_outcome_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_outcome_resp.body, "\"status\":\"committed_repair_required\"") != null);
+    writes.repair_outcome = false;
+    writes.legacy_visibility_pending_outcome = true;
+    var legacy_pending_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer legacy_pending_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
+    try std.testing.expectEqual(@as(usize, 7), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {
@@ -25252,7 +26012,7 @@ test "api http server serves table batch transforms" {
         "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"priority\":10,\"version\":1}}}",
     );
     defer std.testing.allocator.free(insert_body);
-    var insert_resp = try server.handle(.{
+    var insert_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25270,7 +26030,7 @@ test "api http server serves table batch transforms" {
         "{\"transforms\":[{\"key\":\"doc:a\",\"operations\":[{\"op\":\"$set\",\"path\":\"status\",\"value\":\"updated\"},{\"op\":\"$min\",\"path\":\"priority\",\"value\":4},{\"op\":\"$max\",\"path\":\"version\",\"value\":3}]}]}",
     );
     defer std.testing.allocator.free(transform_body);
-    var transform_resp = try server.handle(.{
+    var transform_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25334,7 +26094,7 @@ test "api http graph push preserves projected edges across restart" {
             \\{"inserts":{"a":{"title":"A","_edges":{"graph":{"FRIEND":[{"target":"b","weight":2,"metadata":{"since":2024}}]}}},"b":{"title":"B"},"c":{"title":"C"}},"sync_level":"full_index"}
         );
         defer alloc.free(insert_body);
-        var insert_resp = try server.handle(.{
+        var insert_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/batch",
             .content_type = "application/json",
@@ -25347,7 +26107,7 @@ test "api http graph push preserves projected edges across restart" {
             \\{"transforms":[{"key":"a","operations":[{"op":"$push","path":"$._edges.graph.FRIEND","value":{"target":"c","weight":3}}]}],"sync_level":"full_index"}
         );
         defer alloc.free(transform_body);
-        var transform_resp = try server.handle(.{
+        var transform_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/batch",
             .content_type = "application/json",
@@ -25369,7 +26129,7 @@ test "api http graph push preserves projected edges across restart" {
         for (invalid_transforms) |invalid_body_json| {
             const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, invalid_body_json);
             defer alloc.free(invalid_body);
-            var invalid_resp = try server.handle(.{
+            var invalid_resp = try executeHttpxTestRequest(&server, .{
                 .method = .POST,
                 .uri = "/tables/docs/batch",
                 .content_type = "application/json",
@@ -25390,7 +26150,7 @@ test "api http graph push preserves projected edges across restart" {
             "full_index",
         );
         defer alloc.free(invalid_txn_body);
-        var invalid_txn_resp = try server.handle(.{
+        var invalid_txn_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = routes.Routes.transactions_commit,
             .content_type = "application/json",
@@ -25452,7 +26212,7 @@ test "api http server updates local table schema through bound write source" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
 
-    var managed_version_resp = try server.handle(.{
+    var managed_version_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -25463,7 +26223,7 @@ test "api http server updates local table schema through bound write source" {
     try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", managed_version_resp.body);
 
     const schema_body = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}";
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -25482,7 +26242,7 @@ test "api http server updates local table schema through bound write source" {
 
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"unexpected\"}}}");
     defer std.testing.allocator.free(batch_body);
-    var batch_resp = try server.handle(.{
+    var batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -25541,7 +26301,7 @@ test "api http server serves public transaction commit route" {
     );
     defer std.testing.allocator.free(commit_body);
 
-    var commit_resp = try server.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25573,7 +26333,7 @@ test "api http server serves public transaction commit route" {
     );
     defer std.testing.allocator.free(stale_body);
 
-    var stale_resp = try server.handle(.{
+    var stale_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25689,7 +26449,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25797,7 +26557,7 @@ test "api http server surfaces structured decision conflicts for transaction com
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -25903,7 +26663,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26011,7 +26771,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26116,7 +26876,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
     );
     defer alloc.free(commit_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_commit,
         .content_type = "application/json",
@@ -26174,7 +26934,7 @@ test "api http server serves long-lived public transaction session routes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26233,7 +26993,7 @@ test "api http server serves long-lived public transaction session routes" {
     });
     defer std.testing.allocator.free(delete_stage_uri_committed);
 
-    var read_stage_resp = try server.handle(.{
+    var read_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_stage_uri,
         .content_type = "application/json",
@@ -26248,7 +27008,7 @@ test "api http server serves long-lived public transaction session routes" {
     try std.testing.expectEqualStrings("7", parsed_read_stage.value.snapshot.version);
     try std.testing.expectEqualStrings("alpha", parsed_read_stage.value.snapshot.document.object.get("title").?.string);
 
-    var write_stage_resp = try server.handle(.{
+    var write_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = write_stage_uri,
         .content_type = "application/json",
@@ -26261,7 +27021,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_write_stage.deinit();
     try std.testing.expectEqualStrings("staged", parsed_write_stage.value.status);
 
-    var savepoint_resp = try server.handle(.{
+    var savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -26273,7 +27033,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_savepoint.deinit();
     const savepoint_id = parsed_savepoint.value.savepoint_id;
 
-    var delete_after_savepoint_resp = try server.handle(.{
+    var delete_after_savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = delete_stage_uri_committed,
         .content_type = "application/json",
@@ -26294,7 +27054,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_rollback_suffix,
     });
     defer std.testing.allocator.free(rollback_uri);
-    var rollback_resp = try server.handle(.{
+    var rollback_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = rollback_uri,
         .body = "",
@@ -26306,7 +27066,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_rollback.deinit();
     try std.testing.expectEqualStrings("rolled_back", parsed_rollback.value.status);
 
-    var commit_resp = try server.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26320,7 +27080,7 @@ test "api http server serves long-lived public transaction session routes" {
     try std.testing.expectEqualStrings("committed", parsed_commit.value.status);
     try std.testing.expect(parsed_commit.value.tables != null);
 
-    var commit_again = try server.handle(.{
+    var commit_again = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26332,7 +27092,7 @@ test "api http server serves long-lived public transaction session routes" {
     defer parsed_commit_again.deinit();
     try std.testing.expectEqualStrings("committed", parsed_commit_again.value.status);
 
-    var abort_begin = try server.handle(.{
+    var abort_begin = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26355,7 +27115,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_delete_suffix,
     });
     defer std.testing.allocator.free(delete_stage_uri);
-    var delete_stage_resp = try server.handle(.{
+    var delete_stage_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = delete_stage_uri,
         .content_type = "application/json",
@@ -26373,7 +27133,7 @@ test "api http server serves long-lived public transaction session routes" {
         routes.Routes.transactions_abort_suffix,
     });
     defer std.testing.allocator.free(abort_uri);
-    var abort_resp = try server.handle(.{
+    var abort_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = abort_uri,
         .body = "",
@@ -26453,7 +27213,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         .{ .name = trusted_principal_header, .value = bob_token },
     };
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .headers = &alice_headers,
@@ -26470,7 +27230,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         parsed_begin.value.transaction_id,
     });
     defer alloc.free(session_uri);
-    var cross_principal = try server.handle(.{
+    var cross_principal = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = session_uri,
         .headers = &bob_headers,
@@ -26483,7 +27243,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         routes.Routes.transactions_write_suffix,
     });
     defer alloc.free(write_uri);
-    var denied_write = try server.handle(.{
+    var denied_write = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = write_uri,
         .headers = &alice_headers,
@@ -26498,7 +27258,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         routes.Routes.transactions_read_suffix,
     });
     defer alloc.free(read_uri);
-    var hidden_read = try server.handle(.{
+    var hidden_read = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_uri,
         .headers = &alice_headers,
@@ -26512,7 +27272,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     try std.testing.expectEqualStrings("0", parsed_hidden.value.snapshot.version);
     try std.testing.expect(parsed_hidden.value.snapshot.document == .null);
 
-    var denied_table_read = try server.handle(.{
+    var denied_table_read = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = read_uri,
         .headers = &alice_headers,
@@ -26522,7 +27282,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer denied_table_read.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), denied_table_read.status);
 
-    var alice_list = try server.handle(.{
+    var alice_list = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .headers = &alice_headers,
@@ -26532,7 +27292,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer parsed_alice_list.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_alice_list.value.session_count);
 
-    var bob_list = try server.handle(.{
+    var bob_list = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .headers = &bob_headers,
@@ -26542,7 +27302,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
     defer parsed_bob_list.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_bob_list.value.session_count);
 
-    var denied_cleanup = try server.handle(.{
+    var denied_cleanup = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_cleanup,
         .headers = &alice_headers,
@@ -26571,7 +27331,7 @@ test "api http server serves transaction session cleanup route" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26580,7 +27340,7 @@ test "api http server serves transaction session cleanup route" {
     defer begin_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), begin_resp.status);
 
-    var cleanup_resp = try server.handle(.{
+    var cleanup_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/transactions/cleanup?cutoff_ns=18446744073709551615",
         .content_type = "application/json",
@@ -26593,7 +27353,7 @@ test "api http server serves transaction session cleanup route" {
     defer parsed_cleanup.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_cleanup.value.removed);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = routes.Routes.transactions,
         .content_type = null,
@@ -26650,7 +27410,7 @@ test "api http server reloads durable transaction sessions after restart" {
     var server1 = try ApiHttpServer.initWithConfig(std.testing.allocator, .{ .session_store_path = session_path }, source.iface(), null, table_source.source());
     defer server1.deinit();
 
-    var begin_resp = try server1.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server1, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26667,7 +27427,7 @@ test "api http server reloads durable transaction sessions after restart" {
         routes.Routes.transactions_write_suffix,
     });
     defer std.testing.allocator.free(stage_uri);
-    var stage_resp = try server1.handle(.{
+    var stage_resp = try executeHttpxTestRequest(&server1, .{
         .method = .POST,
         .uri = stage_uri,
         .content_type = "application/json",
@@ -26688,7 +27448,7 @@ test "api http server reloads durable transaction sessions after restart" {
         routes.Routes.transactions_commit_suffix,
     });
     defer std.testing.allocator.free(commit_uri);
-    var commit_resp = try server2.handle(.{
+    var commit_resp = try executeHttpxTestRequest(&server2, .{
         .method = .POST,
         .uri = commit_uri,
         .content_type = "application/json",
@@ -26783,7 +27543,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
     defer server.deinit();
-    var begin = try server.handle(.{
+    var begin = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -26808,7 +27568,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     );
     defer alloc.free(body);
 
-    var first = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), first.status);
     var parsed_first = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, first.body, .{});
@@ -26824,7 +27584,7 @@ test "api http server retries stable terminal commits without replaying writes" 
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
     try server.runSessionMaintenanceOnce();
-    var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var retry = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
@@ -26836,7 +27596,7 @@ test "api http server retries stable terminal commits without replaying writes" 
         routes.Routes.transactions_abort_suffix,
     });
     defer alloc.free(abort_uri);
-    var abort = try server.handle(.{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
+    var abort = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
     defer abort.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), abort.status);
 }
@@ -26908,7 +27668,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     defer server.deinit();
     writes.durable = server.opened_session_store.?.durableStore();
 
-    var begin = try server.handle(.{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
+    var begin = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
     defer begin.deinit(alloc);
     var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body, .{});
     defer parsed_begin.deinit();
@@ -26928,7 +27688,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     );
     defer alloc.free(body);
 
-    var first = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), first.status);
     try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
@@ -26939,7 +27699,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
 
-    var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    var retry = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
@@ -26995,7 +27755,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     );
     defer server.deinit();
 
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27008,7 +27768,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
 
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_before = try server.handle(.{
+    var info_before = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27024,7 +27784,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
         routes.Routes.transactions_savepoints_suffix,
     });
     defer alloc.free(savepoint_uri);
-    var savepoint_resp = try server.handle(.{
+    var savepoint_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -27032,7 +27792,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     defer savepoint_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), savepoint_resp.status);
 
-    var info_after = try server.handle(.{
+    var info_after = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27042,7 +27802,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     try std.testing.expectEqual(@as(?usize, 1), parsed_info_after.value.savepoint_limit);
     try std.testing.expectEqual(@as(?usize, 0), parsed_info_after.value.remaining_savepoints);
 
-    var savepoint_again = try server.handle(.{
+    var savepoint_again = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = savepoint_uri,
         .body = "",
@@ -27206,7 +27966,7 @@ test "api http server keeps session maintenance off public request paths" {
         .{
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
             .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
         },
         source.iface(),
@@ -27215,7 +27975,7 @@ test "api http server keeps session maintenance off public request paths" {
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27230,7 +27990,7 @@ test "api http server keeps session maintenance off public request paths" {
     owner.last_session_lease_renew_ns.store(0, .release);
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_resp = try owner.handle(.{
+    var info_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27300,7 +28060,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
         .{
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
             .session_owner_lease_renew_interval_ns = std.time.ns_per_ms,
         },
         source.iface(),
@@ -27309,7 +28069,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27326,7 +28086,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
 
     const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
     defer alloc.free(info_uri);
-    var info_resp = try owner.handle(.{
+    var info_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = info_uri,
     });
@@ -27342,7 +28102,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
         .{
             .session_store_path = session_path,
             .session_router = adopter_router.iface(),
-            .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
+            .session_owner_lease_ttl_ns = 5 * std.time.ns_per_s,
         },
         source.iface(),
         null,
@@ -27420,7 +28180,7 @@ test "api http server keeps session maintenance off internal request paths" {
     );
     defer owner.deinit();
 
-    var begin_resp = try owner.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&owner, .{
         .method = .POST,
         .uri = routes.Routes.transactions_begin,
         .content_type = "application/json",
@@ -27431,17 +28191,17 @@ test "api http server keeps session maintenance off internal request paths" {
     defer parsed_begin.deinit();
     _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
     owner.last_session_lease_renew_ns.store(0, .release);
-    var internal_resp = (try owner.handleInternalRoute(.{
+    var internal_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
         .body = "",
-    })).?;
+    });
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), internal_resp.status);
     try std.testing.expectEqual(@as(u64, 0), owner.last_session_lease_renew_ns.load(.acquire));
 }
 
-test "api http server handleInternalRoute matches handle for internal group lookups" {
+test "legacy api dispatcher no longer handles internal group lookups" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -27528,24 +28288,18 @@ test "api http server handleInternalRoute matches handle for internal group look
     };
 
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    defer server.deinit();
 
     const req: http_common.HttpRequest = .{
         .method = .GET,
         .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
-    var via_handle = try server.handle(req);
-    defer via_handle.deinit(alloc);
-    var via_internal = (try server.handleInternalRoute(req)).?;
-    defer via_internal.deinit(alloc);
+    var response = try executeHttpxTestRequest(&server, req);
+    defer response.deinit(alloc);
 
-    try std.testing.expectEqual(via_handle.status, via_internal.status);
-    try std.testing.expectEqualStrings(via_handle.content_type.?, via_internal.content_type.?);
-    try std.testing.expectEqualStrings(via_handle.body, via_internal.body);
-    try std.testing.expectEqual(@as(usize, 1), via_handle.headers.len);
-    try std.testing.expectEqual(@as(usize, 1), via_internal.headers.len);
-    try std.testing.expectEqualStrings(via_handle.headers[0].name, via_internal.headers[0].name);
-    try std.testing.expectEqualStrings(via_handle.headers[0].value, via_internal.headers[0].value);
+    try std.testing.expectEqual(@as(u16, 404), response.status);
+    try std.testing.expectEqualStrings("not found", response.body);
 }
 
 test "api http server preserves public query availability errors" {
@@ -27621,12 +28375,15 @@ test "api http server preserves public query availability errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        unavailable_code: ?[]const u8 = null,
+        unavailable_message: []const u8 = "",
     }{
-        .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
-        .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
-        .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
-        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
-        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "", .json = true, .unavailable_code = "doc_identity_unavailable", .unavailable_message = "doc identity unavailable" },
+        .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
+        .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
+        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
@@ -27641,10 +28398,20 @@ test "api http server preserves public query availability errors" {
         defer resp.deinit(alloc);
 
         try std.testing.expectEqual(case.status, resp.status);
-        try std.testing.expectEqualStrings(case.body, resp.body);
-        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
+        if (case.unavailable_code) |code| {
+            const expected = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = code,
+                .message = case.unavailable_message,
+                .retryable = true,
+            }, .{});
+            defer alloc.free(expected);
+            try ant_json.testing.expectSubsetJsonText(alloc, expected, resp.body);
+        } else {
+            try std.testing.expectEqualStrings(case.body, resp.body);
+        }
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type);
         try std.testing.expectEqual(
-            case.query_error == error.StorageReadTemporarilyUnavailable,
+            case.unavailable_code != null,
             resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
         );
 
@@ -27653,9 +28420,79 @@ test "api http server preserves public query availability errors" {
         , null);
         defer multi_resp.deinit(alloc);
         try std.testing.expectEqual(case.status, multi_resp.status);
-        try std.testing.expectEqualStrings(case.body, multi_resp.body);
-        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type.?);
+        if (case.unavailable_code) |code| {
+            const expected = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = code,
+                .message = case.unavailable_message,
+                .retryable = true,
+            }, .{});
+            defer alloc.free(expected);
+            try ant_json.testing.expectSubsetJsonText(alloc, expected, multi_resp.body);
+        } else {
+            try std.testing.expectEqualStrings(case.body, multi_resp.body);
+        }
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
     }
+}
+
+test "shared application admission covers MCP query and write operations" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .query_max_concurrent_requests = 1, .write_max_concurrent_requests = 1 },
+        FakeSource.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+    try std.testing.expect(server.tryAcquireQuery());
+    defer server.releaseQuery();
+    try std.testing.expect(server.tryAcquireWrite());
+    defer server.releaseWrite();
+
+    var query = try server.executeMcpApplicationOperation(.{ .query = .{
+        .table_name = "docs",
+        .body = "{\"limit\":1}",
+    } }, null);
+    defer query.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), query.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", query.body);
+    try std.testing.expectEqualStrings("1", query.headers[0].value);
+
+    var sample = try server.executeMcpApplicationOperation(.{ .sample_documents = .{
+        .table_name = "docs",
+        .body = "{\"limit\":1}",
+    } }, null);
+    defer sample.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), sample.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", sample.body);
+    try std.testing.expectEqualStrings("1", sample.headers[0].value);
+
+    var query_builder = try server.executeQueryBuilderAgent("{\"intent\":\"find relevant documents\"}", null);
+    defer query_builder.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), query_builder.status);
+    try std.testing.expectEqualStrings("query capacity exhausted", query_builder.body);
+    try std.testing.expectEqualStrings("1", query_builder.headers[0].value);
+
+    var write = try server.executeMcpApplicationOperation(.{ .batch = .{
+        .table_name = "docs",
+        .body = "{\"inserts\":{}}",
+    } }, null);
+    defer write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), write.status);
+    try std.testing.expectEqualStrings("write capacity exhausted", write.body);
+    try std.testing.expectEqual(@as(u64, 3), server.queryAdmissionStats().rejected_total);
+    try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
 }
 
 test "api http server maps cancelled NDJSON multi-query to client closed response" {
@@ -27812,14 +28649,16 @@ test "api http server serves internal group transaction routes" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     defer server.deinit();
     const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const participant = try distributed_txn.participantIdForGroup(std.testing.allocator, "docs", 7);
+    defer std.testing.allocator.free(participant);
 
     const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
         .txn_id = txn_id,
         .begin_timestamp = 10_000,
-        .participants = &.{"group:7"},
+        .participants = &.{participant},
     });
     defer std.testing.allocator.free(begin_body);
-    var begin_resp = try server.handle(.{
+    var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-begin",
         .content_type = "application/json",
@@ -27835,7 +28674,7 @@ test "api http server serves internal group transaction routes" {
         },
     });
     defer std.testing.allocator.free(prepare_body);
-    var prepare_resp = try server.handle(.{
+    var prepare_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-prepare",
         .content_type = "application/json",
@@ -27846,7 +28685,7 @@ test "api http server serves internal group transaction routes" {
 
     const status_body = try distributed_txn.encodeTxnStatusRequest(std.testing.allocator, txn_id);
     defer std.testing.allocator.free(status_body);
-    var pending_resp = try server.handle(.{
+    var pending_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
         .content_type = "application/json",
@@ -27863,7 +28702,7 @@ test "api http server serves internal group transaction routes" {
         .commit_version = 10_001,
     });
     defer std.testing.allocator.free(resolve_body);
-    var resolve_resp = try server.handle(.{
+    var resolve_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-resolve",
         .content_type = "application/json",
@@ -27872,7 +28711,7 @@ test "api http server serves internal group transaction routes" {
     defer resolve_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resolve_resp.status);
 
-    var committed_resp = try server.handle(.{
+    var committed_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
         .content_type = "application/json",
@@ -27884,11 +28723,12 @@ test "api http server serves internal group transaction routes" {
 
     var lookup = (try db.lookup(alloc, "doc:a", .{})).?;
     defer lookup.deinit(alloc);
-    const stored = try std.json.parseFromSliceLeaky(StoredTitle, alloc, lookup.json, .{
+    var stored = try std.json.parseFromSlice(StoredTitle, alloc, lookup.json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
-    try std.testing.expectEqualStrings("alpha", stored.title);
+    defer stored.deinit();
+    try std.testing.expectEqualStrings("alpha", stored.value.title);
 }
 
 test "api http server serves table metadata list and detail" {
@@ -27932,7 +28772,7 @@ test "api http server serves table metadata list and detail" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{ .method = .GET, .uri = "/tables?prefix=do" });
+    var list_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables?prefix=do" });
     defer list_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), list_resp.status);
     try std.testing.expectEqualStrings("application/json", list_resp.content_type.?);
@@ -27941,7 +28781,7 @@ test "api http server serves table metadata list and detail" {
     try std.testing.expectEqual(@as(usize, 1), parsed_list.value.len);
     try std.testing.expectEqualStrings("docs", parsed_list.value[0].name);
 
-    var detail_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs" });
+    var detail_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs" });
     defer detail_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), detail_resp.status);
     try std.testing.expectEqualStrings("application/json", detail_resp.content_type.?);
@@ -28053,7 +28893,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var table_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs?debug=runtime_schema" });
+    var table_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs?debug=runtime_schema" });
     defer table_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), table_resp.status);
     try std.testing.expectEqualStrings("application/json", table_resp.content_type.?);
@@ -28082,7 +28922,7 @@ test "api http server serves runtime schema debug on table and index detail" {
     try std.testing.expect(parsed_table.value.debug.runtime_schemas[0].runtime_schema != null);
     try std.testing.expect(Helpers.hasAnalyzer(parsed_table.value.debug.runtime_schemas[0].runtime_schema.?, "french"));
 
-    var index_resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/indexes/full_text_index_v0?debug=runtime_schema" });
+    var index_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/tables/docs/indexes/full_text_index_v0?debug=runtime_schema" });
     defer index_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), index_resp.status);
     try std.testing.expectEqualStrings("application/json", index_resp.content_type.?);
@@ -28167,7 +29007,7 @@ test "api http server serves table index metadata routes" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes",
     });
@@ -28183,7 +29023,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("embed_idx", parsed_list.value.array.items[1].object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("alg", parsed_list.value.array.items[2].object.get("config").?.object.get("name").?.string);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -28197,7 +29037,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("embed_idx", parsed_detail.value.object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqual(@as(usize, 2), source.cached_snapshot_calls);
 
-    var artifacts_resp = try server.handle(.{
+    var artifacts_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/artifacts",
     });
@@ -28218,7 +29058,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("body_chunks_v1", artifacts[1].object.get("source_artifact_name").?.string);
     try std.testing.expectEqual(@as(usize, 3), source.cached_snapshot_calls);
 
-    var encoded_table_artifacts_resp = try server.handle(.{
+    var encoded_table_artifacts_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs%20table/artifacts",
     });
@@ -28234,7 +29074,7 @@ test "api http server serves table index metadata routes" {
 
     try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
 
-    var algebraic_detail_resp = try server.handle(.{
+    var algebraic_detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/alg",
     });
@@ -28249,7 +29089,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqualStrings("algebraic", parsed_algebraic_detail.value.object.get("config").?.object.get("type").?.string);
     try std.testing.expect(parsed_algebraic_detail.value.object.get("status") != null);
 
-    var algebraic_child_resp = try server.handle(.{
+    var algebraic_child_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/alg/algebraic",
     });
@@ -28309,7 +29149,7 @@ test "api http server index status is cache only" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -28384,7 +29224,7 @@ test "api http server reports table storage empty from read visibility" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
 
-    var empty_resp = try server.handle(.{
+    var empty_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28400,7 +29240,7 @@ test "api http server reports table storage empty from read visibility" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    var non_empty_resp = try server.handle(.{
+    var non_empty_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28412,7 +29252,7 @@ test "api http server reports table storage empty from read visibility" {
     try std.testing.expectEqual(@as(?i64, null), parsed_non_empty.value.storage_status.disk_usage);
     try std.testing.expectEqual(@as(?bool, false), parsed_non_empty.value.storage_status.empty);
 
-    var list_resp = try server.handle(.{
+    var list_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables",
     });
@@ -28525,7 +29365,7 @@ test "api http server table status uses runtime stats without probing storage" {
     var reads = FakeReads{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -28752,7 +29592,7 @@ test "api http server serves local index runtime backfill status" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/search_idx",
     });
@@ -28778,12 +29618,16 @@ test "api http server serves local index runtime backfill status" {
     try std.testing.expectEqual(@as(?u64, 1), local_shard.doc_count);
 }
 
-test "api http server create index waits for exact target config projection" {
+test "api http server create index installs exact visible config and defers lagging projection" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
+        pending_indexes_json: ?[]u8 = null,
+        project_create: bool = true,
+        mutex: std.atomic.Mutex = .unlocked,
+        projection_wait_calls: std.atomic.Value(usize) = .init(0),
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -28791,14 +29635,18 @@ test "api http server create index waits for exact target config projection" {
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
+                    .drop_index = dropIndex,
+                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
 
         fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             if (self.owns_indexes_json) allocator.free(self.indexes_json);
+            if (self.pending_indexes_json) |pending| allocator.free(pending);
         }
 
         fn replaceIndexesJson(self: *@This(), allocator: std.mem.Allocator, next: []const u8, owns_next: bool) void {
@@ -28813,6 +29661,8 @@ test "api http server create index waits for exact target config projection" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
             const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
             errdefer std.testing.allocator.free(tables);
             const indexes_json = try std.testing.allocator.dupe(u8, self.indexes_json);
@@ -28846,8 +29696,15 @@ test "api http server create index waits for exact target config projection" {
 
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
             try std.testing.expectEqualStrings("docs", table_name);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
+            if (!self.project_create) {
+                if (self.pending_indexes_json) |pending| allocator.free(pending);
+                self.pending_indexes_json = next;
+                return;
+            }
             defer allocator.free(next);
             // An unrelated metadata mutation may commit before this projection
             // is observed; target convergence must not require whole-document
@@ -28855,15 +29712,56 @@ test "api http server create index waits for exact target config projection" {
             const concurrent = try indexes_api.addIndexToTableIndexesJson(allocator, next, "concurrent_text", "{\"type\":\"full_text\"}");
             self.replaceIndexesJson(allocator, concurrent, true);
         }
+
+        fn dropIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            try std.testing.expectEqualStrings("docs", table_name);
+            // pending_indexes_json models the authoritative catalog state that
+            // has committed but is not yet present in adminSnapshot.
+            const authoritative = self.pending_indexes_json orelse self.indexes_json;
+            const next = (try indexes_api.removeIndexFromTableIndexesJson(allocator, authoritative, index_name)) orelse return error.IndexNotFound;
+            if (self.pending_indexes_json) |pending| {
+                allocator.free(pending);
+                self.pending_indexes_json = next;
+            } else {
+                self.replaceIndexesJson(allocator, next, true);
+            }
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            platform_sync.lockYielding(&self.mutex);
+            if (self.pending_indexes_json) |pending| {
+                self.pending_indexes_json = null;
+                self.replaceIndexesJson(std.testing.allocator, pending, true);
+            }
+            self.mutex.unlock();
+            return try adminSnapshot(ptr);
+        }
+
+        fn waitTableProjection(ptr: *anyopaque, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
+            return error.TestProjectionUnavailable;
+        }
     };
 
     const FakeWrites = struct {
+        create_error: ?anyerror = null,
+        enqueue_error: ?anyerror = null,
+        create_calls: usize = 0,
+        enqueue_calls: usize = 0,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .batch = batch,
                     .create_index = createIndex,
+                    .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
                 },
             };
         }
@@ -28872,7 +29770,22 @@ test "api http server create index waits for exact target config projection" {
             return error.UnsupportedOperation;
         }
 
-        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {}
+        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            if (self.create_error) |err| return err;
+        }
+
+        fn requestTableIndexStructuralReconcile(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.enqueue_calls += 1;
+            if (self.enqueue_error) |err| return err;
+        }
     };
 
     var source = FakeSource{};
@@ -28886,9 +29799,27 @@ test "api http server create index waits for exact target config projection" {
         writes.source(),
     );
 
+    // Runtime-semantic graph validation must happen before metadata commit.
+    // Otherwise reconciliation would retry a permanently invalid config after
+    // this endpoint had already reported success.
+    var invalid_graph_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/invalid_graph",
+        .content_type = "application/json",
+        .body = "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+    });
+    defer invalid_graph_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_graph_resp.status);
+    var rejected_lookup = try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "invalid_graph");
+    defer if (rejected_lookup) |*found| found.deinit();
+    try std.testing.expect(rejected_lookup == null);
+    try std.testing.expect(source.pending_indexes_json == null);
+    try std.testing.expectEqual(@as(usize, 0), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.enqueue_calls);
+
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "embed_idx");
     defer alloc.free(create_index_body);
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -28900,7 +29831,7 @@ test "api http server create index waits for exact target config projection" {
     var first_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer first_lookup.deinit();
     const first_incarnation = coverage_policy.incarnation(first_lookup.config) orelse return error.TestUnexpectedResult;
-    var retry_resp = try server.handle(.{
+    var retry_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -28911,6 +29842,352 @@ test "api http server create index waits for exact target config projection" {
     var retry_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer retry_lookup.deinit();
     try std.testing.expectEqual(first_incarnation, coverage_policy.incarnation(retry_lookup.config).?);
+    try std.testing.expectEqual(@as(usize, 2), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
+
+    // Metadata is already committed when local capacity rejects the barrier.
+    // Return the created resource and hand convergence to reconciliation;
+    // reporting 429 here would invite an ambiguous replay after success.
+    writes.create_error = error.ResourceBudgetExceeded;
+    var locally_deferred_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer locally_deferred_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), locally_deferred_resp.status);
+    try std.testing.expectEqual(@as(usize, 3), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
+
+    // Queue pressure after the local capability barrier is not a false create
+    // failure: durable state and foreground write admission have both won.
+    writes.create_error = null;
+    writes.enqueue_error = error.ResourceBudgetExceeded;
+    var enqueue_deferred_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/embed_idx",
+        .content_type = "application/json",
+        .body = create_index_body,
+    });
+    defer enqueue_deferred_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), enqueue_deferred_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), writes.enqueue_calls);
+
+    // A committed proposal whose read projection is not visible yet returns
+    // immediately and relies on the targeted reconciler. In particular, it
+    // must not install against stale catalog state or poll for 30 seconds.
+    source.project_create = false;
+    writes.enqueue_error = null;
+    const lagging_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "lagging_embed_idx");
+    defer alloc.free(lagging_index_body);
+    var lagging_projection_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/lagging_embed_idx",
+        .content_type = "application/json",
+        .body = lagging_index_body,
+    });
+    defer lagging_projection_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 5), writes.enqueue_calls);
+
+    // Hosted sources historically exposed create_index without either
+    // structural-reconcile callback. A lagging projection must still install
+    // after commit, and that O(groups) work must not block the HTTP worker.
+    const NoReconcileWrites = struct {
+        create_calls: std.atomic.Value(usize) = .init(0),
+        drop_calls: std.atomic.Value(usize) = .init(0),
+        transient_failures: std.atomic.Value(usize) = .init(12),
+        block_creates: std.atomic.Value(bool) = .init(false),
+        block_drops: std.atomic.Value(bool) = .init(false),
+        installed: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .create_index = createIndex,
+                    .drop_index = dropIndex,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.create_calls.fetchAdd(1, .monotonic);
+            if (self.block_creates.load(.acquire)) return error.ResourceBudgetExceeded;
+            if (self.transient_failures.load(.acquire) != 0) {
+                _ = self.transient_failures.fetchSub(1, .acq_rel);
+                return error.ResourceBudgetExceeded;
+            }
+            self.installed.store(true, .release);
+            return {};
+        }
+
+        fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.drop_calls.fetchAdd(1, .monotonic);
+            if (self.block_drops.load(.acquire)) return error.ResourceBudgetExceeded;
+            self.installed.store(false, .release);
+            return {};
+        }
+    };
+
+    const FlakyDurableLane = struct {
+        delegate: db_mod.background_runtime.DurableJobLane,
+        fail_owner_id: u64,
+        failures_remaining: std.atomic.Value(usize) = .init(1),
+
+        fn iface(self: *@This()) db_mod.background_runtime.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .submit = submit,
+                    .drain_owner = drainOwner,
+                    .close_owner = closeOwner,
+                    .poll = poll,
+                },
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: db_mod.background_runtime.Job) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (job.owner_id == self.fail_owner_id and self.failures_remaining.swap(0, .acq_rel) != 0) {
+                return error.ResourceBudgetExceeded;
+            }
+            try self.delegate.submit(job);
+        }
+
+        fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.delegate.drainOwner(owner_id);
+        }
+
+        fn closeOwner(ptr: *anyopaque, owner_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.delegate.closeOwner(owner_id);
+        }
+
+        fn poll(ptr: *anyopaque, max_jobs: usize) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.delegate.poll(max_jobs);
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var unprojected_source = FakeSource{ .project_create = false };
+    defer unprojected_source.deinit(alloc);
+    var no_reconcile_writes = NoReconcileWrites{};
+    var fallback_server = ApiHttpServer.init(
+        alloc,
+        .{ .backend_runtime = &runtime },
+        unprojected_source.iface(),
+        null,
+        no_reconcile_writes.iface(),
+    );
+    defer fallback_server.deinit();
+
+    const fallback_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "fallback_embed_idx");
+    defer alloc.free(fallback_index_body);
+    var fallback_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/fallback_embed_idx",
+        .content_type = "application/json",
+        .body = fallback_index_body,
+    });
+    defer fallback_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), fallback_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    // Retry is an obligation, not a short best-effort loop: convergence still
+    // succeeds after more failures than the legacy eight-attempt cutoff.
+    try std.testing.expectEqual(@as(usize, 13), no_reconcile_writes.create_calls.load(.acquire));
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+
+    // A successful create is immediately deletable from the authoritative
+    // catalog even while adminSnapshot still omits it. Reject the first worker
+    // admission so no background linearizable read can accidentally make the
+    // projection current before DELETE performs its lookup.
+    {
+        const real_durable_lane = runtime.durable_jobs;
+        var rejected_lane = FlakyDurableLane{
+            .delegate = real_durable_lane,
+            .fail_owner_id = fallback_server.index_installation_owner_id,
+        };
+        runtime.durable_jobs = rejected_lane.iface();
+        defer runtime.durable_jobs = real_durable_lane;
+        const immediate_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "immediate_delete_idx");
+        defer alloc.free(immediate_body);
+        var immediate_create_resp = try executeHttpxTestRequest(&fallback_server, .{
+            .method = .POST,
+            .uri = "/tables/docs/indexes/immediate_delete_idx",
+            .content_type = "application/json",
+            .body = immediate_body,
+        });
+        defer immediate_create_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), immediate_create_resp.status);
+        try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+
+        var immediate_delete_resp = try executeHttpxTestRequest(&fallback_server, .{
+            .method = .DELETE,
+            .uri = "/tables/docs/indexes/immediate_delete_idx",
+        });
+        defer immediate_delete_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), immediate_delete_resp.status);
+        runtime.durable_jobs = real_durable_lane;
+        real_durable_lane.drainOwner(fallback_server.index_installation_owner_id);
+        try std.testing.expectEqual(@as(usize, 0), unprojected_source.projection_wait_calls.load(.acquire));
+    }
+
+    // A delete that commits while an older create installation is retrying
+    // supersedes that generation. Even if the stale attempt was already
+    // snapshotted, foreground application and the worker share an apply fence,
+    // and the final keyed tombstone wins.
+    no_reconcile_writes.block_creates.store(true, .release);
+    const superseded_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "superseded_embed_idx");
+    defer alloc.free(superseded_body);
+    const calls_before_superseded = no_reconcile_writes.create_calls.load(.acquire);
+    var superseded_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/superseded_embed_idx",
+        .content_type = "application/json",
+        .body = superseded_body,
+    });
+    defer superseded_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), superseded_resp.status);
+    var wait_attempts: usize = 0;
+    while (no_reconcile_writes.create_calls.load(.acquire) == calls_before_superseded and wait_attempts < 1_000) : (wait_attempts += 1) {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(no_reconcile_writes.create_calls.load(.acquire) > calls_before_superseded);
+
+    var delete_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/superseded_embed_idx",
+    });
+    defer delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), delete_resp.status);
+    try std.testing.expectEqual(@as(usize, 0), unprojected_source.projection_wait_calls.load(.acquire));
+    no_reconcile_writes.block_creates.store(false, .release);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) >= 1);
+    try std.testing.expect(!no_reconcile_writes.installed.load(.acquire));
+
+    // The opposite race is equally important: a queued delete must not drop a
+    // later incarnation recreated under the same path-owned name.
+    const recreated_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "recreated_embed_idx");
+    defer alloc.free(recreated_body);
+    var initial_recreate_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+        .content_type = "application/json",
+        .body = recreated_body,
+    });
+    defer initial_recreate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), initial_recreate_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+
+    no_reconcile_writes.block_drops.store(true, .release);
+    const drops_before_retry = no_reconcile_writes.drop_calls.load(.acquire);
+    var queued_delete_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+    });
+    defer queued_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), queued_delete_resp.status);
+    wait_attempts = 0;
+    while (no_reconcile_writes.drop_calls.load(.acquire) == drops_before_retry and wait_attempts < 1_000) : (wait_attempts += 1) {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) > drops_before_retry);
+
+    var final_recreate_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/recreated_embed_idx",
+        .content_type = "application/json",
+        .body = recreated_body,
+    });
+    defer final_recreate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), final_recreate_resp.status);
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+    no_reconcile_writes.block_drops.store(false, .release);
+
+    // Executor admission failure leaves the keyed obligation queued. The
+    // independent supervisor tick must restart it without another client
+    // mutation or a permanently sleeping retry job.
+    const real_durable_lane = runtime.durable_jobs;
+    var flaky_lane = FlakyDurableLane{
+        .delegate = real_durable_lane,
+        .fail_owner_id = fallback_server.index_installation_owner_id,
+    };
+    runtime.durable_jobs = flaky_lane.iface();
+    no_reconcile_writes.block_creates.store(true, .release);
+    const submission_retry_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "submission_retry_idx");
+    defer alloc.free(submission_retry_body);
+    var submission_retry_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/submission_retry_idx",
+        .content_type = "application/json",
+        .body = submission_retry_body,
+    });
+    defer submission_retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), submission_retry_resp.status);
+    try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const queued_after_submission_failure = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), queued_after_submission_failure);
+    const create_calls_after_submission_failure = no_reconcile_writes.create_calls.load(.acquire);
+
+    runtime.durable_jobs = real_durable_lane;
+    no_reconcile_writes.block_creates.store(false, .release);
+    try fallback_server.runSessionMaintenanceOnce();
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.create_calls.load(.acquire) > create_calls_after_submission_failure);
+    try std.testing.expect(no_reconcile_writes.installed.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const queued_after_supervisor = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), queued_after_supervisor);
+
+    var flaky_delete_lane = FlakyDurableLane{
+        .delegate = real_durable_lane,
+        .fail_owner_id = fallback_server.index_installation_owner_id,
+    };
+    runtime.durable_jobs = flaky_delete_lane.iface();
+    no_reconcile_writes.block_drops.store(true, .release);
+    const drops_before_submission_failure = no_reconcile_writes.drop_calls.load(.acquire);
+    var delete_submission_retry_resp = try executeHttpxTestRequest(&fallback_server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/submission_retry_idx",
+    });
+    defer delete_submission_retry_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), delete_submission_retry_resp.status);
+    try std.testing.expect(!fallback_server.index_installation_worker_in_flight.load(.acquire));
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const delete_queued_after_submission_failure = fallback_server.index_installation_queue.items.len;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), delete_queued_after_submission_failure);
+
+    runtime.durable_jobs = real_durable_lane;
+    no_reconcile_writes.block_drops.store(false, .release);
+    try fallback_server.runSessionMaintenanceOnce();
+    runtime.durable_jobs.drainOwner(fallback_server.index_installation_owner_id);
+    try std.testing.expect(no_reconcile_writes.drop_calls.load(.acquire) > drops_before_submission_failure);
+    platform_sync.lockYielding(&fallback_server.index_installation_mutex);
+    const delete_queued_after_supervisor = fallback_server.index_installation_queue.items.len;
+    const reserved_after_supervisor = fallback_server.index_installation_reserved_slots;
+    fallback_server.index_installation_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), delete_queued_after_supervisor);
+    try std.testing.expectEqual(@as(usize, 0), reserved_after_supervisor);
 }
 
 test "api http server create index expands schema-derived algebraic config" {
@@ -28987,9 +30264,16 @@ test "api http server create index expands schema-derived algebraic config" {
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"derive_from_schema\"") == null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"group_fields\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"measure_fields\"") != null);
+            try ant_json.testing.expectSubsetJsonText(
+                allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                index_json,
+            );
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, index_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("derive_from_schema") == null);
+            try std.testing.expect(parsed.value.object.get("group_fields") != null);
+            try std.testing.expect(parsed.value.object.get("measure_fields") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
         }
@@ -29010,9 +30294,15 @@ test "api http server create index expands schema-derived algebraic config" {
             return error.UnsupportedOperation;
         }
 
-        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, index_json: []const u8) anyerror!?void {
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"derive_from_schema\"") == null);
-            try std.testing.expect(std.mem.indexOf(u8, index_json, "\"materializations\"") != null);
+        fn createIndex(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, index_json: []const u8) anyerror!?void {
+            try ant_json.testing.expectSubsetJsonText(
+                allocator,
+                "{\"type\":\"algebraic\",\"table\":\"docs\",\"schema_version\":1,\"materializations\":[]}",
+                index_json,
+            );
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, index_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("derive_from_schema") == null);
         }
     };
 
@@ -29030,7 +30320,7 @@ test "api http server create index expands schema-derived algebraic config" {
     const create_index_body =
         \\{"name":"sales_rollup","type":"algebraic","derive_from_schema":true}
     ;
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/sales_rollup",
         .content_type = "application/json",
@@ -29039,11 +30329,19 @@ test "api http server create index expands schema-derived algebraic config" {
     defer create_index_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"sum_by_customer\"") == null);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"name\":\"sales_rollup\",\"version\":2,\"type\":\"algebraic\"}",
+        create_index_resp.body,
+    );
+    var parsed_stored = try std.json.parseFromSlice(std.json.Value, alloc, source.indexes_json, .{});
+    defer parsed_stored.deinit();
+    const stored = parsed_stored.value.object.get("sales_rollup").?.object;
+    try std.testing.expect(stored.get("derive_from_schema") == null);
+    try std.testing.expect(stored.get("group_fields") != null);
+    try std.testing.expect(stored.get("measure_fields") != null);
+    try std.testing.expectEqual(@as(usize, 0), stored.get("materializations").?.array.items.len);
+    try std.testing.expect(stored.get("sum_by_customer") == null);
 }
 
 test "api http server rejects public algebraic materialization config" {
@@ -29115,7 +30413,7 @@ test "api http server rejects public algebraic materialization config" {
         null,
     );
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/manual_alg",
         .content_type = "application/json",
@@ -29269,7 +30567,7 @@ test "api http server serves provisioned index runtime backfill status across sh
     var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), read_source.source(), null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/search_idx",
     });
@@ -29286,20 +30584,22 @@ test "api http server serves provisioned index runtime backfill status across sh
     });
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("search_idx", parsed_detail.value.config.object.get("name").?.string);
-    // Provisioned runtime status reopens shard DBs, so pending backfill is resumed before stats are read.
+    // A status-only provisioned open reports persisted lifecycle state without
+    // running writer-owned backfill work. The synthetic rebuild cursors above
+    // therefore have no physical indexed documents yet.
     if (parsed_detail.value.status.backfill_active) |active| try std.testing.expect(active);
     if (parsed_detail.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
-    if (parsed_detail.value.status.doc_count) |doc_count| try std.testing.expect(doc_count >= 1);
-    if (parsed_detail.value.status.total_indexed) |total_indexed| try std.testing.expect(total_indexed >= 1);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.doc_count);
+    try std.testing.expectEqual(@as(?u64, 0), parsed_detail.value.status.total_indexed);
     if (parsed_detail.value.shard_status.@"7001" orelse parsed_detail.value.shard_status.local) |provisioned_left_shard| {
         try std.testing.expectEqual(@as(?bool, true), provisioned_left_shard.backfill_active);
-        try std.testing.expectEqual(@as(?u64, 1), provisioned_left_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), provisioned_left_shard.doc_count);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
         try std.testing.expectEqual(@as(?bool, true), right_shard.backfill_active);
     }
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
-        try std.testing.expectEqual(@as(?u64, 1), right_shard.doc_count);
+        try std.testing.expectEqual(@as(?u64, 0), right_shard.doc_count);
     }
 }
 
@@ -29364,6 +30664,7 @@ test "api http server serves table create and drop" {
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .cached_admin_snapshot = cachedAdminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
                     .drop_table = dropTable,
@@ -29397,6 +30698,10 @@ test "api http server serves table create and drop" {
                 .split_transitions = @constCast(self.empty_splits[0..]),
                 .merge_transitions = @constCast(self.empty_merges[0..]),
             };
+        }
+
+        fn cachedAdminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            return try adminSnapshot(ptr);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
@@ -29462,7 +30767,7 @@ test "api http server serves table create and drop" {
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29478,7 +30783,7 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqualStrings("docs", parsed_create.value.name);
     try std.testing.expectEqualStrings("docs table", parsed_create.value.description.?);
 
-    var duplicate_create_resp = try server.handle(.{
+    var duplicate_create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29486,10 +30791,10 @@ test "api http server serves table create and drop" {
     });
     defer duplicate_create_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), duplicate_create_resp.status);
-    try std.testing.expectEqualStrings("text/plain", duplicate_create_resp.content_type.?);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", duplicate_create_resp.content_type.?);
     try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
-    var drop_resp = try server.handle(.{
+    var drop_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
@@ -29498,7 +30803,7 @@ test "api http server serves table create and drop" {
 
     const update_schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
     defer std.testing.allocator.free(update_schema_body);
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -29516,7 +30821,7 @@ test "api http server serves table create and drop" {
 
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(std.testing.allocator, "embed_idx");
     defer std.testing.allocator.free(create_index_body);
-    var create_index_resp = try server.handle(.{
+    var create_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/embed_idx",
         .content_type = "application/json",
@@ -29525,10 +30830,14 @@ test "api http server serves table create and drop" {
     defer create_index_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
     try std.testing.expectEqualStrings("application/json", create_index_resp.content_type.?);
-    try std.testing.expectEqualStrings("{}", create_index_resp.body);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        create_index_resp.body,
+    );
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"embed_idx\"") != null);
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -29545,7 +30854,7 @@ test "api http server serves table create and drop" {
     defer parsed_index.deinit();
     try std.testing.expectEqualStrings("embed_idx", parsed_index.value.config.name);
 
-    var drop_index_resp = try server.handle(.{
+    var drop_index_resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs/indexes/embed_idx",
     });
@@ -29553,7 +30862,10 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqual(@as(u16, 201), drop_index_resp.status);
     try std.testing.expectEqualStrings("application/json", drop_index_resp.content_type.?);
     try std.testing.expectEqualStrings("{}", drop_index_resp.body);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    // Catalog commit is the response boundary; local projection and index
+    // installation converge asynchronously so structural UX is not coupled
+    // to control-loop latency.
+    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
 }
 
 test "api http server table visibility helper prefers metadata lifecycle wait" {
@@ -29716,9 +31028,20 @@ test "api http server create table with local writes waits for projected presenc
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
 
+    var invalid_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expect(!source.created);
+    try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29769,6 +31092,20 @@ test "schema projection expectation uses backend committed generation" {
     try std.testing.expectEqual(@as(u32, 2), try tables_api.schemaVersion(legacy.schema_json));
     try std.testing.expect(legacy.indexes_json != null);
     try std.testing.expect(std.mem.indexOf(u8, legacy.indexes_json.?, "full_text_index_v2") != null);
+}
+
+test "status source reports an absent linearizable read capability without failing" {
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var fake: u8 = 0;
+    const source = StatusSource{
+        .ptr = &fake,
+        .vtable = &.{ .status = FakeSource.status },
+    };
+    try std.testing.expect((try source.linearizableSnapshot(.{})) == null);
 }
 
 test "status source prefers authoritative schema generation result" {
@@ -29891,7 +31228,7 @@ test "api http server rejects unsupported table index before metadata publicatio
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -29929,7 +31266,7 @@ test "api http server rejects caller-managed schema version before metadata publ
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -30371,7 +31708,7 @@ test "api index status uses read runtime status without consulting write source"
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -30428,8 +31765,167 @@ test "api index status refreshes synthetic configured index status from write so
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
 }
 
-test "api index status asks write source when read runtime status is absent" {
+test "api index status refreshes writer when read snapshot omits requested index" {
+    const indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "older_idx",
+        .kind = .dense_vector,
+        .doc_count = 1,
+    }};
+    const statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = indexes.len,
+            .indexes = @constCast(indexes[0..]),
+        },
+    }};
+
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+        .name = "older_idx",
+        .identity = null,
+    }));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(statuses[0..], .{
+        .name = "newer_idx",
+        .identity = null,
+    }));
+
+    var current = indexes[0];
+    current.coverage_generation = 41;
+    current.coverage_config_hash = 99;
+    current.coverage_identity_ready = true;
+    const current_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 42, .coverage_config_hash = 99 },
+    }));
+
+    const unrelated_incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{current})[0..]),
+            .repair_summary_ready = false,
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var incomplete_index = current;
+    incomplete_index.repair_summary_ready = false;
+    incomplete_index.repair_degraded = true;
+    incomplete_index.backfill_active = true;
+    const incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{incomplete_index})[0..]),
+            // DB stats derive table degradation from the incomplete index.
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var retained_live_incomplete = incomplete_statuses[0];
+    retained_live_incomplete.metadata.source = .live_writer_publish;
+    try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var terminal_index = incomplete_index;
+    terminal_index.repair_issue_count = 1;
+    const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{terminal_index})[0..]),
+            .repair_degraded = true,
+            .repair_issue_count = 1,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+
+    var terminal_phase_index = incomplete_index;
+    terminal_phase_index.index_repair_phase = "terminal";
+    const terminal_phase_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = @constCast((&[_]db_mod.types.DBIndexStats{terminal_phase_index})[0..]),
+            .repair_degraded = true,
+        },
+    }};
+    try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
+        .name = "older_idx",
+        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+    }));
+}
+
+test "api index status prefers current same-name incarnation from write source" {
     const alloc = std.testing.allocator;
+
+    const StatusFactory = struct {
+        fn make(
+            inner_alloc: std.mem.Allocator,
+            coverage_generation: u64,
+            coverage_config_hash: u64,
+            source: runtime_status.RuntimeStatusSource,
+            freshness: runtime_status.RuntimeStatusFreshness,
+            doc_count: u64,
+        ) !runtime_status.LocalTableRuntimeStatuses {
+            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
+            errdefer inner_alloc.free(indexes);
+            indexes[0] = .{
+                .name = try inner_alloc.dupe(u8, "vec"),
+                .kind = .dense_vector,
+                .doc_count = doc_count,
+                .coverage_generation = coverage_generation,
+                .coverage_config_hash = coverage_config_hash,
+                .coverage_identity_ready = true,
+            };
+            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            errdefer {
+                db_mod.types.freeDBStats(inner_alloc, .{ .doc_count = doc_count, .index_count = 1, .indexes = indexes });
+                inner_alloc.free(items);
+            }
+            items[0] = .{
+                .group_id = 10,
+                .metadata = .{ .source = source, .freshness = freshness },
+                .stats = .{ .doc_count = doc_count, .index_count = 1, .indexes = indexes },
+            };
+            return .{ .items = items };
+        }
+    };
 
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -30454,10 +31950,15 @@ test "api index status asks write source when read runtime status is absent" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 10,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -30474,6 +31975,7 @@ test "api index status asks write source when read runtime status is absent" {
 
     const FakeReads = struct {
         status_calls: std.atomic.Value(u32) = .init(0),
+        current_incomplete: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -30499,10 +32001,26 @@ test "api index status asks write source when read runtime status is absent" {
             return error.TestUnexpectedResult;
         }
 
-        fn localRuntimeStatuses(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+        fn localRuntimeStatuses(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.status_calls.fetchAdd(1, .monotonic);
-            return null;
+            if (!self.current_incomplete) return try StatusFactory.make(inner_alloc, 41, 1, .cached_snapshot, .fresh, 7);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                inner_alloc,
+                "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}",
+                .{},
+            );
+            defer parsed.deinit();
+            const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
+                return error.TestUnexpectedResult;
+            var statuses = try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .cached_snapshot, .fresh, 7);
+            statuses.items[0].stats.repair_summary_ready = false;
+            statuses.items[0].stats.repair_degraded = true;
+            statuses.items[0].stats.indexes[0].repair_summary_ready = false;
+            statuses.items[0].stats.indexes[0].repair_degraded = true;
+            statuses.items[0].stats.indexes[0].backfill_active = true;
+            return statuses;
         }
     };
 
@@ -30523,10 +32041,21 @@ test "api index status asks write source when read runtime status is absent" {
             return;
         }
 
-        fn localRuntimeStatuses(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+        fn localRuntimeStatuses(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.status_calls.fetchAdd(1, .monotonic);
-            return null;
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                inner_alloc,
+                "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}",
+                .{},
+            );
+            defer parsed.deinit();
+            const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
+                return error.TestUnexpectedResult;
+            // The current writer may legitimately be catching up. Its matching
+            // incarnation must still beat a fresh retained read snapshot.
+            return try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .live_writer_publish, .catching_up, 11);
         }
     };
 
@@ -30535,7 +32064,7 @@ test "api index status asks write source when read runtime status is absent" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -30543,6 +32072,35 @@ test "api index status asks write source when read runtime status is absent" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 1), reads.status_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"config\":{\"name\":\"vec\",\"type\":\"embeddings\"},\"shard_status\":{\"10\":{\"runtime_source\":\"live_writer_publish\",\"runtime_freshness\":\"catching_up\"}}}",
+        resp.body,
+    );
+    var parsed_response = try ant_json.parseFromSlice(ant_json.Value, alloc, resp.body, .{});
+    defer parsed_response.deinit();
+    const config = parsed_response.value.object.get("config") orelse return error.TestUnexpectedResult;
+    if (config != .object) return error.TestUnexpectedResult;
+    try std.testing.expect(config.object.get("_coverage_incarnation") == null);
+
+    // A same-incarnation cache entry is not authoritative while it still
+    // advertises lifecycle debt. The targeted detail request must refresh it
+    // and prefer the writer's completed view even when the writer is marked
+    // catching_up at the group level.
+    reads.current_incomplete = true;
+    var refreshed_resp = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/tables/docs/indexes/vec",
+    });
+    defer refreshed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), refreshed_resp.status);
+    try std.testing.expectEqual(@as(u32, 2), reads.status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), writes.status_calls.load(.monotonic));
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"shard_status\":{\"10\":{\"runtime_source\":\"live_writer_publish\"}}}",
+        refreshed_resp.body,
+    );
 }
 
 test "api index status uses propagated remote store runtime status" {
@@ -30700,7 +32258,7 @@ test "api index status uses propagated remote store runtime status" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -30772,6 +32330,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .replay_applied_sequence = 225,
             .replay_target_sequence = 300,
             .replay_catch_up_required = true,
+            .repair_status = .waiting,
+            .repair_active_generation_serviceable = false,
         }})[0..]),
     };
 
@@ -30783,6 +32343,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 225), index.replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.replay_target_sequence);
     try std.testing.expectEqual(true, index.replay_catch_up_required);
+    try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
+    try std.testing.expect(!index.index_repair_active_generation_serviceable);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);
@@ -31132,7 +32694,7 @@ test "api index status ignores propagated runtime status from removed owner" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31141,11 +32703,11 @@ test "api index status ignores propagated runtime status from removed owner" {
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.doc_count);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.expected_groups);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.reported_groups);
-    try std.testing.expectEqual(@as(?u64, null), parsed.value.status.missing_groups);
-    try std.testing.expectEqual(@as(?bool, null), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.doc_count);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.expected_groups);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.reported_groups);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.missing_groups);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
 }
 
 test "api index status reports missing remote shard as not ready" {
@@ -31272,7 +32834,7 @@ test "api index status reports missing remote shard as not ready" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31281,18 +32843,15 @@ test "api index status reports missing remote shard as not ready" {
     try std.testing.expectEqual(@as(u32, 1), writes.status_calls.load(.monotonic));
     var parsed = try std.json.parseFromSlice(Response, alloc, resp.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.status.rebuilding) |rebuilding| try std.testing.expect(rebuilding);
-    if (parsed.value.status.backfill_active) |active| try std.testing.expect(active);
-    if (parsed.value.status.expected_groups) |expected_groups| try std.testing.expect(expected_groups >= 1);
-    if (parsed.value.status.reported_groups) |reported_groups| try std.testing.expectEqual(@as(u64, 0), reported_groups);
-    if (parsed.value.status.missing_groups) |missing_groups| try std.testing.expect(missing_groups >= 1);
-    if (parsed.value.status.replay_catch_up_required) |required| try std.testing.expect(required);
-    if (parsed.value.shard_status) |shards| {
-        if (shards.@"10") |shard| {
-            try std.testing.expectEqual(@as(?bool, true), shard.backfill_active);
-            try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
-        }
-    }
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.backfill_active);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.expected_groups);
+    try std.testing.expectEqual(@as(?u64, 0), parsed.value.status.reported_groups);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.value.status.missing_groups);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
+    const shards = parsed.value.shard_status orelse return error.TestExpectedEqual;
+    const shard = shards.@"10" orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?bool, true), shard.backfill_active);
+    try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
 }
 
 test "api http server drop table waits for metadata lifecycle absence" {
@@ -31387,7 +32946,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
     });
@@ -31500,7 +33059,7 @@ test "api http server get missing index returns 404 without runtime status looku
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/vec",
     });
@@ -31585,6 +33144,17 @@ test "api http server serves table metadata routes against real metadata service
     }, .{});
     defer svc.deinit();
 
+    // Exercise the production StatusSource adapter, not only the metadata
+    // service method: a canceled backup request must not be replaced with an
+    // empty context at this compiled boundary.
+    var canceled_linearizable_read = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        StatusSource.fromMetadataService(&svc).linearizableSnapshot(.{
+            .cancellation = CancellationToken.fromAtomic(&canceled_linearizable_read),
+        }),
+    );
+
     _ = try svc.ensureMetadataReplica(.{
         .group_id = 1988,
         .replica_id = 1,
@@ -31598,7 +33168,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
     defer std.testing.allocator.free(create_body);
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -31617,7 +33187,7 @@ test "api http server serves table metadata routes against real metadata service
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
-    var detail_resp = try server.handle(.{
+    var detail_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -31630,7 +33200,7 @@ test "api http server serves table metadata routes against real metadata service
     try std.testing.expectEqualStrings("docs table", parsed_detail.value.description.?);
     try std.testing.expect(parsed_detail.value.indexes.map.count() > 0);
 
-    var indexes_resp = try server.handle(.{
+    var indexes_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes",
     });
@@ -31644,7 +33214,7 @@ test "api http server serves table metadata routes against real metadata service
     try std.testing.expectEqual(@as(usize, 1), parsed_indexes.value.array.items.len);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes.value.array.items[0].object.get("config").?.object.get("name").?.string);
 
-    var index_resp = try server.handle(.{
+    var index_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs/indexes/full_text_index_v0",
     });
@@ -31659,7 +33229,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const update_schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
     defer std.testing.allocator.free(update_schema_body);
-    var update_resp = try server.handle(.{
+    var update_resp = try executeHttpxTestRequest(&server, .{
         .method = .PUT,
         .uri = "/tables/docs/schema",
         .content_type = "application/json",
@@ -31678,7 +33248,7 @@ test "api http server serves table metadata routes against real metadata service
     rounds = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
-    var updated_detail = try server.handle(.{
+    var updated_detail = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = "/tables/docs",
     });
@@ -31693,7 +33263,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const valid_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:ok\":{\"title\":\"alpha\",\"status\":\"published\"}}}");
     defer std.testing.allocator.free(valid_batch_body);
-    var valid_batch_resp = try server.handle(.{
+    var valid_batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -31704,7 +33274,7 @@ test "api http server serves table metadata routes against real metadata service
 
     const invalid_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:bad\":{\"title\":\"alpha\",\"body\":\"unexpected\"}}}");
     defer std.testing.allocator.free(invalid_batch_body);
-    var invalid_batch_resp = try server.handle(.{
+    var invalid_batch_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/batch",
         .content_type = "application/json",
@@ -31817,7 +33387,7 @@ test "api http server create table with replication sources returns encoded tabl
         \\  ]
         \\}
     ;
-    var create_resp = try server.handle(.{
+    var create_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -31915,7 +33485,7 @@ test "api http server lists cluster backups through public route" {
     const uri = try std.fmt.allocPrint(alloc, "/backups?location={s}&connection=test-backups", .{location_uri});
     defer alloc.free(uri);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
         .uri = uri,
     });
@@ -31936,7 +33506,28 @@ test "api http server lists cluster backups through public route" {
 fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
-    try std.testing.expectEqualStrings("{\"error\":\"metadata leader unavailable\"}", resp.body);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
+        resp.body,
+    );
+    var parsed = try std.json.parseFromSlice(
+        metadata_openapi.BackupMetadataUnavailableError,
+        std.testing.allocator,
+        resp.body,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .metadata_leader_unavailable_error => |value| {
+            try std.testing.expectEqualStrings("metadata_leader_unavailable", value.code);
+            try std.testing.expectEqualStrings("metadata leader unavailable", value.@"error");
+            try std.testing.expectEqualStrings("metadata leader unavailable", value.message);
+            try std.testing.expect(value.retryable);
+            try std.testing.expectEqual(@as(i32, 1000), value.retry_after_ms);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var retry_after = false;
     var metadata_not_leader = false;
@@ -31952,6 +33543,46 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     }
     try std.testing.expect(retry_after);
     try std.testing.expect(metadata_not_leader);
+}
+
+fn expectPublicMetadataCapabilityUnavailableResponse(resp: http_common.HttpResponse) !void {
+    const expected_json =
+        \\{"code":"metadata_capability_unavailable","error":"metadata capability unavailable","message":"backup requires metadata capability linearizable_snapshot; upgrade metadata nodes before retrying","required_capability":"linearizable_snapshot","retryable":true,"retry_after_ms":5000}
+    ;
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        expected_json,
+        resp.body,
+    );
+    var parsed = try std.json.parseFromSlice(
+        metadata_openapi.BackupMetadataUnavailableError,
+        std.testing.allocator,
+        resp.body,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .metadata_capability_unavailable_error => |value| {
+            try std.testing.expectEqualStrings("metadata_capability_unavailable", value.code);
+            try std.testing.expectEqualStrings("metadata capability unavailable", value.@"error");
+            try std.testing.expectEqualStrings("linearizable_snapshot", value.required_capability);
+            try std.testing.expect(value.retryable);
+            try std.testing.expectEqual(@as(i32, 5000), value.retry_after_ms);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var retry_after = false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+            try std.testing.expectEqualStrings("5", header.value);
+            retry_after = true;
+        }
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header));
+    }
+    try std.testing.expect(retry_after);
 }
 
 test "api http server returns retryable not leader when local reconcile lease is lost" {
@@ -31987,7 +33618,7 @@ test "api http server returns retryable not leader when local reconcile lease is
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -32032,7 +33663,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
@@ -32104,7 +33735,7 @@ test "api http server returns retryable not leader through public table adapter 
     const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "body");
     defer alloc.free(create_index_body);
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/indexes/body",
         .content_type = "application/json",
@@ -32126,7 +33757,7 @@ test "api http server returns retryable not leader when cluster backup read barr
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .ensure_linearizable_read = ensureLinearizableRead,
+                    .linearizable_snapshot = linearizableSnapshot,
                 },
             };
         }
@@ -32135,7 +33766,8 @@ test "api http server returns retryable not leader when cluster backup read barr
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.linearizable_read_calls += 1;
             return error.MetadataLinearizableReadTimeout;
@@ -32146,8 +33778,9 @@ test "api http server returns retryable not leader when cluster backup read barr
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
 
-    var resp = try server.handle(.{
+    var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32159,6 +33792,61 @@ test "api http server returns retryable not leader when cluster backup read barr
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
 }
 
+test "api http server fails closed when backup fences are unsupported" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        linearizable_read_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .linearizable_snapshot = linearizableSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_read_calls += 1;
+            return null;
+        }
+    };
+
+    var source = FakeSource{};
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, null);
+    defer server.deinit();
+
+    var resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}",
+    });
+    defer resp.deinit(alloc);
+
+    try expectPublicMetadataCapabilityUnavailableResponse(resp);
+    try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
+
+    var table_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\",\"connection\":\"test-backups\"}",
+    });
+    defer table_resp.deinit(alloc);
+    try expectPublicMetadataCapabilityUnavailableResponse(table_resp);
+    try std.testing.expectEqual(@as(usize, 2), source.linearizable_read_calls);
+}
+
 test "api http server rejects an empty cluster backup without publishing a manifest" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -32167,6 +33855,7 @@ test "api http server rejects an empty cluster backup without publishing a manif
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
@@ -32175,6 +33864,11 @@ test "api http server rejects an empty cluster backup without publishing a manif
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -32213,6 +33907,7 @@ test "api http server rejects an empty cluster backup without publishing a manif
                 .connection = "backups",
             },
             &location,
+            .{},
         ),
     );
     try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "empty")));
@@ -32250,7 +33945,7 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .ensure_linearizable_read = ensureLinearizableRead,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
@@ -32261,9 +33956,11 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.read_timeout) return error.MetadataLinearizableReadTimeout;
+            return try adminSnapshot(ptr);
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -32308,7 +34005,7 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
     );
     defer alloc.free(backup_body);
 
-    var retry_response = try timed_out_server.handle(.{
+    var retry_response = try executeHttpxTestRequest(&timed_out_server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32317,7 +34014,7 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
     defer retry_response.deinit(alloc);
     try expectPublicMetadataNotLeaderResponse(retry_response);
 
-    var success_response = try recovered_server.handle(.{
+    var success_response = try executeHttpxTestRequest(&recovered_server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32365,7 +34062,7 @@ test "api http server does not advertise a retry after cluster backup side effec
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
-                    .ensure_linearizable_read = ensureLinearizableRead,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
@@ -32376,14 +34073,14 @@ test "api http server does not advertise a retry after cluster backup side effec
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn ensureLinearizableRead(_: *anyopaque) !void {}
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
+        }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.snapshot_calls += 1;
-            // extension snapshot, then the first table lookup, then leadership
-            // loss while resolving the second table.
-            if (self.snapshot_calls == 3) return error.NotLeader;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -32421,7 +34118,7 @@ test "api http server does not advertise a retry after cluster backup side effec
         .{location_uri},
     );
     defer alloc.free(body);
-    var response = try server.handle(.{
+    var response = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/backup",
         .content_type = "application/json",
@@ -32430,7 +34127,8 @@ test "api http server does not advertise a retry after cluster backup side effec
     defer response.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 200), response.status);
-    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "not found") != null);
+    try std.testing.expectEqual(@as(usize, 1), source.snapshot_calls);
     for (response.headers) |header| {
         try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header));
         try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, "Retry-After"));
@@ -32442,6 +34140,370 @@ test "api http server does not advertise a retry after cluster backup side effec
         &location,
         "partial-snap",
     )));
+}
+
+test "cluster backup retains its fenced attempt after an ambiguous table outcome" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .linearizable_snapshot = linearizableSnapshot,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                    .metrics = .{},
+                },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const AmbiguousWrites = struct {
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .backup_table = backupTable,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn backupTable(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: backups_api.TableBackupPlan,
+        ) !?[]backups_api.ShardSnapshot {
+            return error.BackupOutcomeAmbiguous;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-cluster", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    var source = FakeSource{};
+    var writes = AmbiguousWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    const body = try ApiHttpServer.executePublicClusterBackup(
+        &server,
+        alloc,
+        .{
+            .backup_id = "ambiguous-cluster",
+            .location = "file:///backups",
+            .connection = "backups",
+            .table_names = &.{"docs"},
+        },
+        &location,
+        .{},
+    );
+    defer alloc.free(body);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":\"ambiguous\",\"tables\":[{\"name\":\"docs\",\"status\":\"ambiguous\",\"code\":\"backup_outcome_ambiguous\",\"retryable\":false}]}",
+        body,
+    );
+    var parsed = try ant_json.parseFromSlice(
+        struct {
+            tables: []const struct {
+                backup_id: []const u8,
+                artifact_backup_id: []const u8,
+            },
+        },
+        alloc,
+        body,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.tables.len);
+    try std.testing.expect(parsed.value.tables[0].backup_id.len > 0);
+    try std.testing.expect(parsed.value.tables[0].artifact_backup_id.len > 0);
+    try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "ambiguous-cluster")));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        backups_api.reserveBackupAtLocation(alloc, std.testing.io, &location, "other", true),
+    );
+}
+
+test "table backup retry preserves the retained ambiguous generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-table-retry", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupAttemptAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "retained-generation",
+        .portable,
+        fence,
+    );
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    try std.testing.expectError(
+        error.BackupOutcomeAmbiguous,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            "docs",
+            &location,
+            "file:///backups",
+            "logical",
+            "new-generation",
+            .portable,
+            "backups",
+            .logical_create,
+        ),
+    );
+    const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+    )).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained-generation", retained);
+}
+
+test "table backup writer roles enforce rolling forwarded lease lifecycle" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const SuccessfulForwardedWrites = struct {
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .backup_table_to_location = backupTableToLocation,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn backupTableToLocation(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            _: []const u8,
+            backup_id: []const u8,
+            _: backups_api.BackupFormat,
+            _: backups_api.TableBackupFence,
+            _: []const u8,
+            _: []const u8,
+            _: *anyopaque,
+        ) !?[]backups_api.ShardSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const shards = try inner_alloc.alloc(backups_api.ShardSnapshot, 1);
+            errdefer inner_alloc.free(shards);
+            const start_key = try inner_alloc.dupe(u8, "");
+            errdefer inner_alloc.free(start_key);
+            const snapshot_path = try std.fmt.allocPrint(inner_alloc, "{s}.afb", .{backup_id});
+            errdefer inner_alloc.free(snapshot_path);
+            var integrity = try backups_api.portableBytesIntegrityAlloc(inner_alloc, "payload");
+            errdefer integrity.deinit(inner_alloc);
+            shards[0] = .{
+                .group_id = 1,
+                .start_key = start_key,
+                .snapshot_path = snapshot_path,
+                .artifact_size_bytes = integrity.size_bytes,
+                .artifact_sha256 = integrity.sha256,
+            };
+            return shards;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/writer-role-lifecycle", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    var source = FakeSource{};
+    var writes = SuccessfulForwardedWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = table.table_id,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "logical",
+        "logical-artifact",
+        .portable,
+        "backups",
+        .logical_create,
+    );
+    try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical-artifact",
+        std.math.maxInt(u64),
+    ));
+
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "legacy",
+        "legacy",
+        .portable,
+        "backups",
+        .legacy_forwarded_create,
+    );
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "legacy",
+        std.math.maxInt(u64),
+    ));
+
+    var adopt_fence = fence;
+    adopt_fence.writer_not_after_unix_ns = std.math.maxInt(u64);
+    try backups_api.reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "adopt-artifact",
+        std.math.maxInt(u64),
+    );
+    try server.backupOwnedTableWithArtifactId(
+        std.testing.io,
+        &table,
+        adopt_fence,
+        table.name,
+        &location,
+        "file:///backups",
+        "adopt-artifact",
+        "adopt-artifact",
+        .portable,
+        "backups",
+        .adopt,
+    );
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "adopt-artifact",
+        std.math.maxInt(u64),
+    ));
+    try std.testing.expectEqual(@as(usize, 3), writes.calls);
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {
@@ -32469,7 +34531,7 @@ test "api http server rejects restore before persistence without an asynchronous
     );
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), response.status);
-    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
     try std.testing.expectEqualStrings("{\"error\":\"asynchronous restore worker unavailable\"}", response.body);
     try std.testing.expectEqual(@as(usize, 0), server.restore_job_store.jobs.count());
 
@@ -32723,6 +34785,7 @@ test "api http server backs up and restores a table through public routes" {
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
@@ -32733,6 +34796,11 @@ test "api http server backs up and restores a table through public routes" {
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            return try adminSnapshot(ptr);
         }
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -32798,7 +34866,7 @@ test "api http server backs up and restores a table through public routes" {
 
     const backup_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(backup_body);
-    var backup_resp = try server.handle(.{
+    var backup_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/backup",
         .content_type = "application/json",
@@ -32822,7 +34890,7 @@ test "api http server backs up and restores a table through public routes" {
 
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"file://{s}\",\"connection\":\"test-backups\"}}", .{backup_root_abs});
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -33059,7 +35127,7 @@ test "api http server durability-pending restore preserves committed metadata" {
     const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}", .{location_uri});
     defer alloc.free(restore_body);
     {
-        var unsupported_resp = try server.handle(.{
+        var unsupported_resp = try executeHttpxTestRequest(&server, .{
             .method = .POST,
             .uri = "/tables/docs/restore",
             .content_type = "application/json",
@@ -33081,7 +35149,7 @@ test "api http server durability-pending restore preserves committed metadata" {
     defer alloc.free(invalid_manifest_path);
     try std.Io.Dir.cwd().deleteFile(std.testing.io, invalid_manifest_path);
     try writeTestRestoreManifestAndArtifact(alloc, backup_root_abs, &manifest);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -33426,7 +35494,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .content_type = "application/json",
@@ -33584,7 +35652,7 @@ test "api http server cluster restore rejects missing extension package digest" 
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .content_type = "application/json",
@@ -33802,7 +35870,7 @@ test "api http server cluster restore rehydrates extension metadata" {
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/restore",
         .body = restore_body,
@@ -33942,7 +36010,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -34018,7 +36086,7 @@ test "api http server retries stale metadata table-exists restore race" {
         .{location_uri},
     );
     defer alloc.free(restore_body);
-    var restore_resp = try server.handle(.{
+    var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
@@ -34757,17 +36825,17 @@ test "api http server distributed index lookup join uses group-local queries" {
                 201 => blk: {
                     self.group_201_queries += 1;
                     const body = if (wants_a)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 202 => blk: {
                     self.group_202_queries += 1;
                     const body = if (wants_z)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 else => return error.TestUnexpectedResult,
@@ -34889,17 +36957,17 @@ test "api http server distributed shuffle join uses group-local queries" {
                 201 => blk: {
                     self.group_201_queries += 1;
                     const body = if (wants_a)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 202 => blk: {
                     self.group_202_queries += 1;
                     const body = if (wants_z)
-                        "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
                     else
-                        "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
+                        "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[]}}]}";
                     break :blk .{ .json = try inner_alloc.dupe(u8, body) };
                 },
                 else => return error.TestUnexpectedResult,
@@ -34977,6 +37045,7 @@ test "api http server join partition worker joins left rows locally" {
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .query_group_local = queryGroupLocal,
                 },
             };
         }
@@ -34989,19 +37058,13 @@ test "api http server join partition worker joins left rows locally" {
             return error.UnsupportedOperation;
         }
 
-        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            const wants_a = std.mem.indexOf(u8, req.filter_query_json, "cust:a") != null;
-            const wants_z = std.mem.indexOf(u8, req.filter_query_json, "cust:z") != null;
-            const body = if (wants_a and wants_z)
-                "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
-            else if (wants_a)
-                "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}"
-            else if (wants_z)
-                "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}"
-            else
-                "{\"responses\":[{\"hits\":{\"total\":0,\"max_score\":0,\"hits\":[]}}]}";
-            return .{ .json = try inner_alloc.dupe(u8, body) };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+        }
+
+        fn queryGroupLocal(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return query(ptr, inner_alloc, table_name, req, consistency);
         }
     };
 
@@ -35051,6 +37114,7 @@ test "api http server join partition worker tracks matched right ids for right j
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .query_group_local = queryGroupLocal,
                 },
             };
         }
@@ -35065,7 +37129,11 @@ test "api http server join partition worker tracks matched right ids for right j
 
         fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
+        }
+
+        fn queryGroupLocal(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return query(ptr, inner_alloc, table_name, req, consistency);
         }
     };
 
@@ -35301,14 +37369,14 @@ test "api http server distributed right shuffle appends unmatched right rows aft
 
         fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
-            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":2,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}},{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") };
         }
 
         fn queryGroupLocal(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             try std.testing.expectEqualStrings("customers", table_name);
             return switch (group_id) {
-                201 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") },
-                202 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") },
+                201 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") },
+                202 => .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:z\",\"_score\":0,\"_source\":{\"name\":\"Zoe\"}}]}}]}") },
                 else => return error.TestUnexpectedResult,
             };
         }
@@ -35443,7 +37511,7 @@ test "api http server join partition worker fetches remote partition rows" {
             return switch (group_id) {
                 201 => blk: {
                     self.local_group_queries += 1;
-                    break :blk .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":1,\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
+                    break :blk .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"max_score\":0,\"hits\":[{\"_id\":\"cust:a\",\"_score\":0,\"_source\":{\"name\":\"Alice\"}}]}}]}") };
                 },
                 else => return error.TestUnexpectedResult,
             };

@@ -48,14 +48,18 @@ export class InferenceAPIError extends Error {
   }
 }
 
+type CompatibleTransientCapacityError = Omit<TransientCapacityError, "reason"> & {
+  reason: TransientCapacityError["reason"] | "request_queue";
+};
+
 /** Structured temporary-capacity failure with an actionable backoff delay. */
 export class InferenceCapacityError extends InferenceAPIError {
   readonly code: string;
-  readonly reason: TransientCapacityError["reason"];
+  readonly reason: CompatibleTransientCapacityError["reason"];
   readonly retryAfterMs: number;
   readonly retryable = true as const;
 
-  constructor(details: TransientCapacityError) {
+  constructor(details: CompatibleTransientCapacityError) {
     super(503, details.error, `${details.message} (${details.error})`, true);
     this.name = "InferenceCapacityError";
     this.code = details.error;
@@ -64,13 +68,15 @@ export class InferenceCapacityError extends InferenceAPIError {
   }
 }
 
-function isTransientCapacityError(value: unknown): value is TransientCapacityError {
+function isTransientCapacityError(value: unknown): value is CompatibleTransientCapacityError {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return (
     typeof candidate.error === "string" &&
     typeof candidate.message === "string" &&
-    (candidate.reason === "inference_capacity" || candidate.reason === "request_queue") &&
+    (candidate.reason === "inference_capacity" ||
+      candidate.reason === "inference_admission" ||
+      candidate.reason === "request_queue") &&
     candidate.retryable === true &&
     typeof candidate.retry_after_ms === "number" &&
     Number.isFinite(candidate.retry_after_ms) &&
@@ -438,6 +444,8 @@ export class InferenceClient {
       multiLabel?: boolean;
       threshold?: number;
       includeConfidence?: boolean;
+      hypothesisTemplate?: string;
+      topK?: number;
     }
   ): Promise<ClassificationResult[]> {
     const response = await this.extractRaw({
@@ -449,6 +457,8 @@ export class InferenceClient {
             name: "classification",
             labels,
             multi_label: options?.multiLabel,
+            hypothesis_template: options?.hypothesisTemplate,
+            top_k: options?.topK,
           },
         ],
       },

@@ -17,6 +17,8 @@ import type {
   ChatStreamCallbacks,
   ClusterRestoreRequest,
   ConnectionsResponse,
+  CreateIndexRequest,
+  CreatedIndex,
   CreateTableRequest,
   CreateUserRequest,
   DocumentArtifactManifest,
@@ -27,7 +29,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
-  IndexConfig,
+  IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
   MultiBatchRequest,
@@ -56,6 +58,10 @@ export interface RestoreOptions {
   idempotencyKey?: string;
 }
 
+export interface QueryExecutionOptions {
+  signal?: AbortSignal;
+}
+
 export interface RestoreJobListOptions {
   limit?: number;
   cursor?: string;
@@ -66,6 +72,83 @@ export interface RestoreJobListOptions {
 export interface RestoreJobPage {
   jobs: RestoreJob[];
   next_cursor?: string;
+}
+
+export interface IndexOperations {
+  list(tableName: string): Promise<IndexStatus[]>;
+  get(tableName: string, indexName: string): Promise<IndexStatus>;
+  create(
+    tableName: string,
+    indexName: string,
+    config: CreateIndexRequest
+  ): Promise<CreatedIndex>;
+  drop(tableName: string, indexName: string): Promise<true>;
+}
+
+export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
+  "doc_identity_unavailable",
+  "read_requires_primary",
+  "standby_read_unavailable",
+  "storage_read_temporarily_unavailable",
+  "index_rebuilding",
+  "query_embedding_temporarily_unavailable",
+] as const;
+
+export type QueryTemporarilyUnavailableCode = (typeof QUERY_TEMPORARILY_UNAVAILABLE_CODES)[number];
+
+/** A retryable query dependency or read-availability failure. */
+export class QueryTemporarilyUnavailableError extends Error {
+  readonly status = 503 as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly code: QueryTemporarilyUnavailableCode,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "QueryTemporarilyUnavailableError";
+  }
+}
+
+/** A retryable storage-admission rejection with an actionable delay. */
+export class StorageResourceExhaustedError extends Error {
+  readonly status = 429 as const;
+  readonly code = "storage_resource_exhausted" as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "StorageResourceExhaustedError";
+  }
+}
+
+/** @deprecated Catch QueryTemporarilyUnavailableError to handle every retryable query 503. */
+export class StorageReadTemporarilyUnavailableError extends QueryTemporarilyUnavailableError {
+  declare readonly code: "storage_read_temporarily_unavailable";
+
+  constructor(message: string, retryAfterSeconds: number | undefined) {
+    super(message, "storage_read_temporarily_unavailable", retryAfterSeconds);
+    this.name = "StorageReadTemporarilyUnavailableError";
+  }
+}
+
+/** The source artifact changed while a hierarchy traversal cursor was in use. */
+export class HierarchyCursorStaleError extends Error {
+  readonly status = 409 as const;
+  readonly code = "hierarchy_cursor_stale" as const;
+  readonly action = "restart_hierarchy_traversal" as const;
+  readonly restartWithout = "search_after" as const;
+  readonly retryable = false as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "HierarchyCursorStaleError";
+  }
 }
 
 export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
@@ -143,6 +226,44 @@ function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
 
 function errorMessage(error: unknown): string {
   return apiErrorMessage(error);
+}
+
+function queryError(prefix: string, error: unknown, response: Response | undefined): Error {
+  const stale = error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  if (
+    response?.status === 409 &&
+    stale?.error === "hierarchy_cursor_stale" &&
+    stale.action === "restart_hierarchy_traversal" &&
+    stale.restart_without === "search_after" &&
+    stale.retryable === false
+  ) {
+    const detail =
+      typeof stale.message === "string" && stale.message.trim()
+        ? stale.message.trim()
+        : errorMessage(error);
+    return new HierarchyCursorStaleError(`${prefix}: ${detail}`);
+  }
+  const message = `${prefix}: ${errorMessage(error)}`;
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (
+    response?.status === 503 &&
+    typeof code === "string" &&
+    (QUERY_TEMPORARILY_UNAVAILABLE_CODES as readonly string[]).includes(code) &&
+    (error as { retryable?: unknown }).retryable === true
+  ) {
+    const retryAfter = Number.parseInt(response?.headers.get("Retry-After") ?? "", 10);
+    const retryAfterSeconds =
+      Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined;
+    if (code === "storage_read_temporarily_unavailable") {
+      return new StorageReadTemporarilyUnavailableError(message, retryAfterSeconds);
+    }
+    return new QueryTemporarilyUnavailableError(
+      message,
+      code as QueryTemporarilyUnavailableCode,
+      retryAfterSeconds
+    );
+  }
+  return new Error(message);
 }
 
 function normalizedWriteOptions(
@@ -411,20 +532,23 @@ export class AntflyClient {
   private async performQuery(
     path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     request: QueryRequest,
-    tableName?: string
+    tableName?: string,
+    options?: QueryExecutionOptions
   ): Promise<QueryResponses | undefined> {
     if (path === "/db/v1/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
+      const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: request,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
-      if (error) throw new Error(`Table query failed: ${error.error}`);
+      if (error) throw queryError("Table query failed", error, response);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/db/v1/query", {
+      const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
-      if (error) throw new Error(`Query failed: ${error.error}`);
+      if (error) throw queryError("Query failed", error, response);
       return data;
     }
   }
@@ -440,23 +564,23 @@ export class AntflyClient {
     const ndjson = `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`;
 
     if (path === "/db/v1/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
+      const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: ndjson,
         headers: {
           "Content-Type": "application/x-ndjson",
         },
       });
-      if (error) throw new Error(`Table multi-query failed: ${error.error}`);
+      if (error) throw queryError("Table multi-query failed", error, response);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/db/v1/query", {
+      const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: ndjson,
         headers: {
           "Content-Type": "application/x-ndjson",
         },
       });
-      if (error) throw new Error(`Multi-query failed: ${error.error}`);
+      if (error) throw queryError("Multi-query failed", error, response);
       return data;
     }
   }
@@ -464,8 +588,11 @@ export class AntflyClient {
   /**
    * Global query operations
    */
-  async query(request: QueryRequest): Promise<QueryResult | undefined> {
-    const data = await this.performQuery("/db/v1/query", request);
+  async query(
+    request: QueryRequest,
+    options?: QueryExecutionOptions
+  ): Promise<QueryResult | undefined> {
+    const data = await this.performQuery("/db/v1/query", request, undefined, options);
     // The global query returns QueryResponses, extract the first result
     return data?.responses?.[0];
   }
@@ -849,7 +976,7 @@ export class AntflyClient {
       const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error) throw new Error(`Failed to get table: ${error.error}`);
+      if (error) throw new Error(`Failed to get table: ${apiErrorMessage(error)}`);
       return data;
     },
 
@@ -893,8 +1020,8 @@ export class AntflyClient {
     /**
      * Query a specific table
      */
-    query: async (tableName: string, request: QueryRequest) => {
-      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName);
+    query: async (tableName: string, request: QueryRequest, options?: QueryExecutionOptions) => {
+      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName, options);
     },
 
     /**
@@ -1375,7 +1502,7 @@ export class AntflyClient {
   /**
    * Index operations
    */
-  indexes = {
+  indexes: IndexOperations = {
     /**
      * List all indexes for a table
      */
@@ -1384,6 +1511,7 @@ export class AntflyClient {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
+      if (!data) throw new Error("Failed to list indexes: unexpected empty response");
       return data;
     },
 
@@ -1398,19 +1526,55 @@ export class AntflyClient {
         }
       );
       if (error) throw new Error(`Failed to get index: ${error.error}`);
+      if (!data) throw new Error("Failed to get index: unexpected empty response");
       return data;
     },
 
     /**
      * Create a new index
      */
-    create: async (tableName: string, config: IndexConfig) => {
-      const { error } = await this.client.POST("/db/v1/tables/{tableName}/indexes/{indexName}", {
-        params: { path: { tableName, indexName: config.name } },
-        body: config,
-      });
-      if (error) throw new Error(`Failed to create index: ${error.error}`);
-      return true;
+    create: async (tableName: string, indexName: string, config: CreateIndexRequest) => {
+      const { data, error, response } = await this.client.POST(
+        "/db/v1/tables/{tableName}/indexes/{indexName}",
+        {
+          params: { path: { tableName, indexName } },
+          body: config,
+        }
+      );
+      if (error) {
+        const detail = error as {
+          code?: unknown;
+          error?: unknown;
+          message?: unknown;
+          retryable?: unknown;
+          retry_after_ms?: unknown;
+        };
+        if (
+          response?.status === 429 &&
+          detail.code === "storage_resource_exhausted" &&
+          detail.retryable === true
+        ) {
+          const retryAfterHeader = response.headers.get("Retry-After");
+          const parsedRetryAfter = retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
+            ? Number(retryAfterHeader)
+            : NaN;
+          const retryAfterSeconds = Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
+            ? parsedRetryAfter
+            : undefined;
+          const retryAfterMs = typeof detail.retry_after_ms === "number" &&
+            Number.isFinite(detail.retry_after_ms) &&
+            detail.retry_after_ms > 0
+            ? detail.retry_after_ms
+            : (retryAfterSeconds ?? 0) * 1000;
+          const message = typeof detail.message === "string" && detail.message
+            ? detail.message
+            : "storage capacity is temporarily exhausted";
+          throw new StorageResourceExhaustedError(message, retryAfterMs, retryAfterSeconds);
+        }
+        throw new Error(`Failed to create index: ${detail.error}`);
+      }
+      if (!data) throw new Error("Failed to create index: unexpected empty response");
+      return data;
     },
 
     /**

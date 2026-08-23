@@ -16,6 +16,9 @@ const std = @import("std");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
+pub const operation = @import("operation.zig");
+pub const probe_operations = @import("probe_operations.zig");
+pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
@@ -54,12 +57,16 @@ pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const repair_jobs = @import("repair_jobs.zig");
+pub const internal_group_operations = @import("internal_group_operations.zig");
+pub const contextual_operations = @import("contextual_operations.zig");
+pub const internal_join_operations = @import("internal_join_operations.zig");
+pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
-pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
-pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
-pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
+pub const internal_query_operations = @import("internal_query_operations.zig");
+pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
+const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
@@ -73,6 +80,7 @@ pub const QueryResponse = query.QueryResponse;
 pub const TableReadSource = table_reads.TableReadSource;
 pub const BoundTableReadSource = table_reads.BoundTableReadSource;
 pub const ProvisionedGroupStorage = provisioned_storage.ProvisionedGroupStorage;
+pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
@@ -228,6 +236,10 @@ test "api module compiles" {
     _ = public_text_query;
     _ = query_builder_agent;
     _ = distributed_txn;
+    _ = internal_group_operations;
+    _ = contextual_operations;
+    _ = internal_join_operations;
+    _ = internal_repair_operations;
     _ = transactions;
     _ = e2e;
     _ = multi_node_e2e;
@@ -245,10 +257,11 @@ test "api module compiles" {
     _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;
-    _ = http_internal_group_read_routes;
-    _ = http_internal_group_write_routes;
-    _ = http_internal_group_join_routes;
+    _ = internal_query_operations;
+    _ = internal_transition_wire;
     _ = http_server;
+    _ = kernel_abi;
+    _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
     _ = connections;
@@ -304,6 +317,10 @@ test "distributed graph result_ref fail-closed guards are covered" {
 
 test "api distributed graph hydrate carries identity generation and clears cross-range ordinals" {
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
+}
+
+test "api distributed graph preserves per-shard snapshots across result refs expansion and hydration" {
+    try distributed_graph.testPerShardSnapshotsAcrossGraphPhases(std.testing.allocator);
 }
 
 test "api distributed graph cross-table hydrate enforces target authorization" {

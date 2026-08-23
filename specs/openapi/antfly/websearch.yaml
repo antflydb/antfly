@@ -107,13 +107,13 @@ components:
       discriminator:
         propertyName: provider
         mapping:
-          exa: "#/components/schemas/ExaSearchConfig"
-          serper: "#/components/schemas/SerperSearchConfig"
-          tavily: "#/components/schemas/TavilySearchConfig"
-          brave: "#/components/schemas/BraveSearchConfig"
-          you: "#/components/schemas/YouSearchConfig"
-          linkup: "#/components/schemas/LinkupSearchConfig"
-          vertex: "#/components/schemas/VertexSearchConfig"
+          exa: "websearch.yaml#/components/schemas/ExaSearchConfig"
+          serper: "websearch.yaml#/components/schemas/SerperSearchConfig"
+          tavily: "websearch.yaml#/components/schemas/TavilySearchConfig"
+          brave: "websearch.yaml#/components/schemas/BraveSearchConfig"
+          you: "websearch.yaml#/components/schemas/YouSearchConfig"
+          linkup: "websearch.yaml#/components/schemas/LinkupSearchConfig"
+          vertex: "websearch.yaml#/components/schemas/VertexSearchConfig"
 
     ExaSearchConfig:
       type: object
@@ -427,7 +427,7 @@ components:
       description: |
         Configuration for URL content fetching.
 
-        Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports:
+        Uses Antfly's content fetcher for downloading and processing. Supports:
         - HTTP/HTTPS URLs with security validation
         - HTML pages (extracts readable text via go-readability)
         - PDF files (extracts text)
@@ -435,7 +435,7 @@ components:
         - Plain text files
         - S3 URLs (requires s3_credentials)
 
-        Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig):
+        Security features include:
         - Allowed host whitelist
         - Private IP blocking (SSRF prevention)
         - Download size limits
@@ -475,7 +475,7 @@ components:
     FetchResult:
       type: object
       description: |
-        Result from fetching a URL via go/pkg/antfly/lib/scraping.
+        Result from fetching a URL through Antfly's content fetcher.
 
         Content is automatically processed based on MIME type:
         - HTML: Readable text extracted via go-readability

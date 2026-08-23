@@ -23,7 +23,7 @@ class QueryHits:
     Attributes:
         total (QueryHitsTotal | Unset): Total hit count metadata.
         hits (list[QueryHit] | Unset):
-        max_score (float | Unset): Maximum score of the results.
+        max_score (float | Unset): Best relevance score among the returned results. Scores are always higher-is-better.
     """
 
     total: QueryHitsTotal | Unset = UNSET

@@ -263,6 +263,8 @@ pub const LocalQueryReturnMode = enum(u32) {
     parent = 0,
     chunk = 1,
     parent_with_chunks = 2,
+    unit = 3,
+    unit_with_chunks = 4,
 };
 
 /// Scalar execution details that are not losslessly represented by the
@@ -292,7 +294,8 @@ pub const LocalQueryRequest = extern struct {
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     execution_options: LocalQueryExecutionOptions = .{},
-    cancellation_flag: ?*const anyopaque = null,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
     execution_deadline_ns: u64 = 0,
 };
 
@@ -504,6 +507,8 @@ pub const MetadataProjectionKind = enum(u32) {
     restore_job_rows = 24,
     restore_job_value = 25,
     maintenance_stats = 26,
+    runtime_status_protocol_activation_version = 27,
+    placement_version_fences = 28,
 };
 
 pub const MetadataProjectionRequest = extern struct {
@@ -1164,8 +1169,8 @@ pub const SnapshotPublishResult = extern struct {
 };
 
 /// JSON operation with synchronous local execution controls. The cancellation
-/// pointer refers to the caller's atomic boolean for the duration of the call;
-/// it is never retained by the storage owner.
+/// callback and its opaque context remain borrowed for the duration of the
+/// call; neither is retained by the storage owner.
 pub const ControlledJsonOperationRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1174,7 +1179,8 @@ pub const ControlledJsonOperationRequest = extern struct {
     execution_deadline_ns: u64 = 0,
     has_execution_deadline: u8 = 0,
     _reserved1: [7]u8 = @splat(0),
-    cancellation_flag: ?*const anyopaque = null,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 pub const ArtifactOperation = enum(u32) {
@@ -1360,6 +1366,12 @@ pub extern fn antfly_data_apply_store_latest_for_transition(
     store: ?*anyopaque,
     request: *const DataApplyGroupRequest,
     out_result: *DataApplyLatestResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_raft_batch_protocol_version(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupRequest,
+    out_version: *u16,
 ) callconv(.c) Status;
 
 pub extern fn antfly_data_apply_store_projection(

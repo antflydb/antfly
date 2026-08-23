@@ -22,7 +22,8 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const Tokenizer = @import("inference_tokenizer").Tokenizer;
+const tokenizer_mod = @import("inference_tokenizer");
+const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
 
@@ -31,6 +32,9 @@ pub const ClassificationConfig = struct {
     hypothesis_template: []const u8 = "This example is {}.",
     multi_label: bool = false,
     entailment_index: ?usize = null, // index of entailment class; auto-detect if null
+    /// Dynamic text encoders should execute only through the longest active
+    /// premise/hypothesis pair instead of materializing max_length padding.
+    trim_padding_to_batch_max: bool = true,
     distributed: runtime.distributed.Config = .{},
 };
 
@@ -87,7 +91,20 @@ pub const ClassificationPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) ![][]ClassificationResult {
+        var prompt_tokens: usize = 0;
+        return self.classifyBatchWithPromptTokens(texts, labels, &prompt_tokens);
+    }
+
+    /// Classify a batch and report the exact number of non-padding tokens sent
+    /// to the NLI model across every text-label hypothesis pair.
+    pub fn classifyBatchWithPromptTokens(
+        self: *ClassificationPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        prompt_tokens: *usize,
+    ) ![][]ClassificationResult {
         const alloc = self.allocator;
+        prompt_tokens.* = 0;
         const results = try alloc.alloc([]ClassificationResult, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -107,13 +124,16 @@ pub const ClassificationPipeline = struct {
 
         const max_len = self.config.max_length;
         const total_pairs = std.math.mul(usize, texts.len, labels.len) catch return error.ClassificationBatchTooLarge;
-        const input_len = std.math.mul(usize, total_pairs, max_len) catch return error.ClassificationBatchTooLarge;
+        const admitted_input_len = std.math.mul(usize, total_pairs, max_len) catch return error.ClassificationBatchTooLarge;
+        // Reserve the configured upper bound before tokenizer and packing
+        // buffers are allocated. Dynamic sessions execute the shorter,
+        // batch-local sequence below without weakening admission.
         var run_permit = try self.session.admit(.{
             .batch = total_pairs,
             .sequence = max_len,
-            .input_bytes = std.math.mul(usize, input_len, 24) catch
+            .input_bytes = std.math.mul(usize, admitted_input_len, 24) catch
                 return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, input_len, 40) catch
+            .host_preprocess_bytes = std.math.mul(usize, admitted_input_len, 40) catch
                 return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
@@ -127,18 +147,57 @@ pub const ClassificationPipeline = struct {
             hypotheses[i] = try self.formatHypothesis(label);
         }
 
+        const encoded = try alloc.alloc(tokenizer_mod.EncodeResult, total_pairs);
+        defer alloc.free(encoded);
+        var encoded_count: usize = 0;
+        defer {
+            for (encoded[0..encoded_count]) |*result| result.deinit();
+        }
+
+        const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
+        const trim_padding = self.config.trim_padding_to_batch_max and !fixed_len;
+        var effective_len: usize = if (trim_padding) 1 else max_len;
+        for (texts, 0..) |text, text_i| {
+            for (hypotheses, 0..) |hyp, label_i| {
+                const pair_i = text_i * labels.len + label_i;
+                encoded[pair_i] = try self.tok.encodeForPair(alloc, text, hyp, max_len);
+                encoded_count += 1;
+                for (encoded[pair_i].attention_mask) |mask| {
+                    if (mask != 0) {
+                        prompt_tokens.* = std.math.add(usize, prompt_tokens.*, 1) catch
+                            return error.ClassificationBatchTooLarge;
+                    }
+                }
+                if (trim_padding) {
+                    effective_len = @max(
+                        effective_len,
+                        activeTokenLength(encoded[pair_i].attention_mask),
+                    );
+                }
+            }
+        }
+
+        const input_len = std.math.mul(usize, total_pairs, effective_len) catch
+            return error.ClassificationBatchTooLarge;
         const all_ids = try alloc.alloc(i32, input_len);
         defer alloc.free(all_ids);
         const all_mask = try alloc.alloc(i32, input_len);
         defer alloc.free(all_mask);
 
-        for (texts, 0..) |text, text_i| {
-            for (hypotheses, 0..) |hyp, label_i| {
+        for (texts, 0..) |_, text_i| {
+            for (hypotheses, 0..) |_, label_i| {
                 const pair_i = text_i * labels.len + label_i;
-                var result = try self.tok.encodeForPair(alloc, text, hyp, max_len);
-                defer result.deinit();
-                @memcpy(all_ids[pair_i * max_len .. (pair_i + 1) * max_len], result.ids);
-                @memcpy(all_mask[pair_i * max_len .. (pair_i + 1) * max_len], result.attention_mask);
+                const result = encoded[pair_i];
+                if (result.ids.len < effective_len or result.attention_mask.len < effective_len)
+                    return error.UnexpectedInputShape;
+                @memcpy(
+                    all_ids[pair_i * effective_len .. (pair_i + 1) * effective_len],
+                    result.ids[0..effective_len],
+                );
+                @memcpy(
+                    all_mask[pair_i * effective_len .. (pair_i + 1) * effective_len],
+                    result.attention_mask[0..effective_len],
+                );
             }
         }
 
@@ -151,7 +210,7 @@ pub const ClassificationPipeline = struct {
             mask_i64[j] = @intCast(all_mask[j]);
         }
 
-        const shape = [_]i64{ @intCast(total_pairs), @intCast(max_len) };
+        const shape = [_]i64{ @intCast(total_pairs), @intCast(effective_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
@@ -175,8 +234,8 @@ pub const ClassificationPipeline = struct {
             for (0..total_pairs) |b| {
                 var in_segment_b = false;
                 var sep_count: usize = 0;
-                for (0..max_len) |s| {
-                    const idx = b * max_len + s;
+                for (0..effective_len) |s| {
+                    const idx = b * effective_len + s;
                     if (all_mask[idx] == 0) {
                         type_ids[idx] = 0;
                     } else if (in_segment_b) {
@@ -289,6 +348,26 @@ pub const ClassificationPipeline = struct {
     }
 };
 
+fn activeTokenLength(mask: []const i32) usize {
+    var last_active: usize = 0;
+    var found = false;
+    for (mask, 0..) |value, idx| {
+        if (value > 0) {
+            last_active = idx;
+            found = true;
+        }
+    }
+    return if (found) last_active + 1 else @min(mask.len, 1);
+}
+
+fn hasFixedTextSequenceLength(input_info: []const backends.TensorInfo) bool {
+    for (input_info) |info| {
+        if (!std.mem.eql(u8, info.name, "input_ids")) continue;
+        return info.shape.len >= 2 and info.shape[1] > 0;
+    }
+    return false;
+}
+
 fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
@@ -319,7 +398,8 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     const texts = [_][]const u8{ "first", "second", "third" };
     const labels = [_][]const u8{ "negative", "positive" };
-    const results = try pipeline.classifyBatch(&texts, &labels);
+    var prompt_tokens: usize = 0;
+    const results = try pipeline.classifyBatchWithPromptTokens(&texts, &labels, &prompt_tokens);
     defer {
         for (results) |row| allocator.free(row);
         allocator.free(results);
@@ -327,6 +407,8 @@ test "classifyBatch runs all text-label pairs in one session batch" {
 
     try std.testing.expectEqual(@as(usize, 1), fake_session.run_count);
     try std.testing.expectEqual(@as(usize, 6), fake_session.last_batch);
+    try std.testing.expectEqual(@as(usize, 5), fake_session.last_sequence);
+    try std.testing.expectEqual(@as(usize, 30), prompt_tokens);
     try std.testing.expectEqual(@as(usize, texts.len), results.len);
     for (results) |row| {
         try std.testing.expectEqual(@as(usize, labels.len), row.len);
@@ -334,9 +416,33 @@ test "classifyBatch runs all text-label pairs in one session batch" {
     }
 }
 
+test "classification trims dynamic padding but preserves fixed input shapes" {
+    const allocator = std.testing.allocator;
+
+    var fake_session = FakeClassificationSession{ .fixed_sequence = true };
+    var fake_tokenizer = FakeClassificationTokenizer{};
+    var pipeline = ClassificationPipeline.init(
+        allocator,
+        fake_session.session(),
+        fake_tokenizer.tokenizer(),
+        .{ .max_length = 8 },
+    );
+
+    const results = try pipeline.classifyBatch(&.{"first"}, &.{"positive"});
+    defer {
+        for (results) |row| allocator.free(row);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), fake_session.run_count);
+    try std.testing.expectEqual(@as(usize, 8), fake_session.last_sequence);
+}
+
 const FakeClassificationSession = struct {
     run_count: usize = 0,
     last_batch: usize = 0,
+    last_sequence: usize = 0,
+    fixed_sequence: bool = false,
 
     fn session(self: *FakeClassificationSession) backends.Session {
         return .{
@@ -356,8 +462,10 @@ const FakeClassificationSession = struct {
         try std.testing.expectEqual(@as(usize, 2), inputs.len);
         try std.testing.expectEqual(@as(usize, 2), inputs[0].shape.len);
         const batch: usize = @intCast(inputs[0].shape[0]);
+        const sequence: usize = @intCast(inputs[0].shape[1]);
         self.run_count += 1;
         self.last_batch = batch;
+        self.last_sequence = sequence;
 
         const logits = try allocator.alloc(f32, batch * 3);
         defer allocator.free(logits);
@@ -372,11 +480,18 @@ const FakeClassificationSession = struct {
         return out;
     }
 
-    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
-        return &.{
-            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 8 } },
-            .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, 8 } },
-        };
+    fn inputInfo(ptr: *anyopaque) []const backends.TensorInfo {
+        const self: *FakeClassificationSession = @ptrCast(@alignCast(ptr));
+        return if (self.fixed_sequence)
+            &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 8 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, 8 } },
+            }
+        else
+            &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+            };
     }
 
     fn outputInfo(_: *anyopaque) []const backends.TensorInfo {

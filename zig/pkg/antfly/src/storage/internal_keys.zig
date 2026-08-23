@@ -31,6 +31,8 @@ pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
+pub const document_unit_navigation_summary_kind: u8 = 0x37;
+pub const document_unit_navigation_block_kind: u8 = 0x38;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
@@ -54,6 +56,23 @@ pub const managed_index_admission_kind: u8 = 0x2b;
 pub const index_artifact_cleanup_kind: u8 = 0x2c;
 pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
 pub const artifact_repair_completion_kind: u8 = 0x2e;
+/// Private completion marker used to hand resolution artifacts from the
+/// resolver to the DB writer. Keep replay metadata kinds centralized here so
+/// independently-owned protocols cannot silently alias one another.
+pub const resolution_handoff_kind: u8 = 0x2f;
+/// Failure-only indexes that preserve every source sequence associated with a
+/// coalesced repair issue. The sequence index serves synchronous visibility
+/// checks; the issue index supports bounded per-artifact retirement pages.
+pub const enrichment_terminal_failure_sequence_kind: u8 = 0x3a;
+pub const enrichment_terminal_failure_issue_kind: u8 = 0x3b;
+/// Durable incarnation token for one live coalesced terminal enrichment issue.
+pub const enrichment_terminal_failure_generation_kind: u8 = 0x3c;
+pub const enrichment_terminal_failure_generation_counter_kind: u8 = 0x3d;
+pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
+    replay_namespace,
+    0xff,
+    enrichment_terminal_failure_generation_counter_kind,
+};
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
@@ -550,6 +569,63 @@ pub fn artifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
     return try list.toOwnedSlice(alloc);
 }
 
+pub fn enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind });
+}
+
+pub fn enrichmentTerminalFailureSequencePrefixAlloc(alloc: Allocator, sequence: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind });
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureSequenceKeyAlloc(alloc: Allocator, sequence: u64, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const prefix = try enrichmentTerminalFailureSequencePrefixAlloc(alloc, sequence);
+    defer alloc.free(prefix);
+    try list.appendSlice(alloc, prefix);
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureSequence(key: []const u8) !u64 {
+    const prefix = [_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind };
+    if (!std.mem.startsWith(u8, key, &prefix) or key.len < prefix.len + @sizeOf(u64) + 2)
+        return error.InvalidInternalUserKey;
+    return std.mem.bigToNative(u64, std.mem.bytesToValue(u64, key[prefix.len..][0..@sizeOf(u64)]));
+}
+
+pub fn enrichmentTerminalFailureIssuePrefixAlloc(alloc: Allocator, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_issue_kind });
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureIssueKeyAlloc(alloc: Allocator, issue_key: []const u8, sequence: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const prefix = try enrichmentTerminalFailureIssuePrefixAlloc(alloc, issue_key);
+    defer alloc.free(prefix);
+    try list.appendSlice(alloc, prefix);
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureGenerationKeyAlloc(alloc: Allocator, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_generation_kind });
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
 pub fn managedIndexAdmissionKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -635,6 +711,52 @@ pub fn artifactRepairIssueKeyAlloc(
     try appendEncodedComponent(&list, alloc, repair_artifact_kind);
     try appendEncodedComponent(&list, alloc, issue_id);
     return try list.toOwnedSlice(alloc);
+}
+
+pub const ArtifactRepairIssueKeyParts = struct {
+    index_name: []u8,
+    repair_artifact_kind: []u8,
+    issue_id: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.repair_artifact_kind);
+        alloc.free(self.issue_id);
+        self.* = undefined;
+    }
+};
+
+/// Decode the authoritative identity embedded in a primary repair-issue key.
+/// Cleanup uses this when the value is malformed, so callers never have to
+/// trust corrupt payload fields to locate secondary or completion metadata.
+pub fn artifactRepairIssueKeyPartsAlloc(
+    alloc: Allocator,
+    key: []const u8,
+) !ArtifactRepairIssueKeyParts {
+    const prefix = [_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+
+    var pos = prefix.len;
+    const index_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const index_name = try decodeBodyAlloc(alloc, key[pos..index_end]);
+    errdefer alloc.free(index_name);
+
+    pos = index_end + 2;
+    const kind_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const repair_artifact_kind = try decodeBodyAlloc(alloc, key[pos..kind_end]);
+    errdefer alloc.free(repair_artifact_kind);
+
+    pos = kind_end + 2;
+    const issue_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    if (issue_end + 2 != key.len) return error.InvalidInternalUserKey;
+    const issue_id = try decodeBodyAlloc(alloc, key[pos..issue_end]);
+    errdefer alloc.free(issue_id);
+
+    return .{
+        .index_name = index_name,
+        .repair_artifact_kind = repair_artifact_kind,
+        .issue_id = issue_id,
+    };
 }
 
 /// Durable single-flight fence for producer repair work. Repair issues remain
@@ -1162,6 +1284,73 @@ pub fn matchesAssetArtifactName(key: []const u8, artifact_name: []const u8) bool
         return unit_term + 2 == key.len;
     }
     return false;
+}
+
+pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "asset")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    pos = name_term + 2;
+    if (pos >= key.len or key[pos] != document_unit_record_kind) return false;
+    pos += 1;
+    const unit_term = findComponentTerminator(key, pos) orelse return false;
+    return unit_term + 2 == key.len;
+}
+
+/// Parent-owned compact hierarchy summary. Keeping navigation metadata outside
+/// the unit payload namespace lets sequential browsing seek without loading
+/// every page body or reparsing the complete extraction state.
+pub fn documentUnitNavigationSummaryKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_summary_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// A fixed-size parent-owned block of unit keys and fingerprints. The block
+/// number is big-endian so the keys retain traversal order for diagnostics and
+/// repair tooling even though the query path performs direct point reads.
+pub fn documentUnitNavigationBlockKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    block_index: u32,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).fromOwnedSlice(
+        try documentUnitNavigationBlockPrefixAlloc(alloc, doc_key, artifact_name),
+    );
+    defer list.deinit(alloc);
+    var encoded_index: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_index, block_index, .big);
+    try list.appendSlice(alloc, &encoded_index);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Prefix shared by every compact navigation block for one extraction
+/// artifact. Repair and deletion paths use it to reclaim exact persisted keys
+/// when the state record is missing or corrupt.
+pub fn documentUnitNavigationBlockPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_block_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
 }
 
 /// Returns true if key is a summary artifact: [0x01][doc][0x00 0x00][0x20]["summary"][0x00 0x00][name][0x00 0x00]
@@ -1767,6 +1956,34 @@ test "matchesAssetArtifactName matches top-level and document unit assets" {
     try std.testing.expect(!matchesAssetArtifactName(chunk, "document_units_v1"));
 }
 
+test "document unit navigation keys are parent scoped and block ordered" {
+    const alloc = std.testing.allocator;
+    const doc_key = "doc\x00:a";
+    const artifact_name = "document\x00units:v1";
+    const summary = try documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(summary);
+    const block_zero = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0);
+    defer alloc.free(block_zero);
+    const block_one = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 1);
+    defer alloc.free(block_one);
+    const block_large = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0x0100_0000);
+    defer alloc.free(block_large);
+
+    try std.testing.expect(isInternalUserKey(summary));
+    try std.testing.expect(isInternalUserKey(block_zero));
+    try std.testing.expect(!std.mem.eql(u8, summary, block_zero));
+    try std.testing.expect(std.mem.lessThan(u8, block_zero, block_one));
+    try std.testing.expect(std.mem.lessThan(u8, block_one, block_large));
+
+    const unit = try documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001");
+    defer alloc.free(unit);
+    const chunk = try documentUnitChunkArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001", 0);
+    defer alloc.free(chunk);
+    try std.testing.expect(isDocumentUnitArtifactRecordKey(unit));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(chunk));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(summary));
+}
+
 test "asset artifact source index keys group by source artifact" {
     const alloc = std.testing.allocator;
     const root = try assetArtifactSourceIndexRootPrefixAlloc(alloc);
@@ -1781,6 +1998,47 @@ test "asset artifact source index keys group by source artifact" {
     try std.testing.expect(std.mem.startsWith(u8, prefix, root));
     try std.testing.expect(std.mem.startsWith(u8, key, prefix));
     try std.testing.expect(!std.mem.startsWith(u8, other, prefix));
+}
+
+test "terminal enrichment failure indexes preserve sequence order and issue ownership" {
+    try std.testing.expect(resolution_handoff_kind != enrichment_terminal_failure_sequence_kind);
+    try std.testing.expect(resolution_handoff_kind != enrichment_terminal_failure_issue_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_issue_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_generation_kind);
+    try std.testing.expect(enrichment_terminal_failure_issue_kind != enrichment_terminal_failure_generation_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_generation_counter_kind);
+    try std.testing.expect(enrichment_terminal_failure_issue_kind != enrichment_terminal_failure_generation_counter_kind);
+    try std.testing.expect(enrichment_terminal_failure_generation_kind != enrichment_terminal_failure_generation_counter_kind);
+
+    const alloc = std.testing.allocator;
+    const repair_issue_key = "\x02\xff\x23repair\x00issue";
+    const root = try enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const first = try enrichmentTerminalFailureSequenceKeyAlloc(alloc, 10, repair_issue_key);
+    defer alloc.free(first);
+    const second = try enrichmentTerminalFailureSequenceKeyAlloc(alloc, 20, repair_issue_key);
+    defer alloc.free(second);
+    const issue_prefix = try enrichmentTerminalFailureIssuePrefixAlloc(alloc, repair_issue_key);
+    defer alloc.free(issue_prefix);
+    const reverse = try enrichmentTerminalFailureIssueKeyAlloc(alloc, repair_issue_key, 10);
+    defer alloc.free(reverse);
+    const generation = try enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+    defer alloc.free(generation);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, root));
+    try std.testing.expect(std.mem.lessThan(u8, first, second));
+    try std.testing.expectEqual(@as(u64, 10), try enrichmentTerminalFailureSequence(first));
+    try std.testing.expectEqual(@as(u64, 20), try enrichmentTerminalFailureSequence(second));
+    try std.testing.expect(std.mem.startsWith(u8, reverse, issue_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, generation, issue_prefix));
+    try std.testing.expectError(error.InvalidInternalUserKey, enrichmentTerminalFailureSequence(reverse));
+
+    const handoff_prefix = [_]u8{ replay_namespace, 0xff, resolution_handoff_kind };
+    try std.testing.expect(!std.mem.startsWith(u8, first, &handoff_prefix));
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        enrichmentTerminalFailureSequence(&handoff_prefix),
+    );
 }
 
 test "derived coverage outcome keys are generation scoped" {
@@ -1817,6 +2075,30 @@ test "derived coverage outcome keys are generation scoped" {
     var encoded_count: [8]u8 = undefined;
     const encoded = encodeDerivedCoverageOutcomeCount(&encoded_count, 42);
     try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageOutcomeCount(encoded));
+}
+
+test "artifact repair issue keys expose authoritative encoded identity" {
+    const alloc = std.testing.allocator;
+    const key = try artifactRepairIssueKeyAlloc(
+        alloc,
+        "semantic\x00index",
+        "embedding",
+        "artifact\x00identity",
+    );
+    defer alloc.free(key);
+
+    var parts = try artifactRepairIssueKeyPartsAlloc(alloc, key);
+    defer parts.deinit(alloc);
+    try std.testing.expectEqualStrings("semantic\x00index", parts.index_name);
+    try std.testing.expectEqualStrings("embedding", parts.repair_artifact_kind);
+    try std.testing.expectEqualStrings("artifact\x00identity", parts.issue_id);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        artifactRepairIssueKeyPartsAlloc(alloc, malformed),
+    );
 }
 
 test "managed index admission keys round trip encoded names" {

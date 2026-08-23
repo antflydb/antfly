@@ -57,6 +57,12 @@ const (
 	// InferenceAPIPort is the port the Inference API server listens on.
 	// This must match ANTFLY_INFERENCE_URL in the container image (default: http://0.0.0.0:8080).
 	InferenceAPIPort = 8080
+
+	defaultInferenceKeepAliveMillis uint64 = 300_000
+	defaultLibTPUURL                       = "https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/libtpu/1.12.0/libtpu.so"
+	defaultLibTPUSHA256                    = "1bb180fcc38ca309e8b7fbe04e7c47d5fdf8c5157a4f5dcb67fc05710652c4f5"
+	pjrtPluginMountPath                    = "/pjrt"
+	pjrtPluginPath                         = pjrtPluginMountPath + "/libtpu.so"
 )
 
 var (
@@ -261,6 +267,13 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	if pool.Spec.Models.RegistryURL != "" {
 		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
 	}
+	if backend := inferencePreferredBackend(pool); backend != "" {
+		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backend
+	}
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		cm.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"] = pjrtPluginPath
+		cm.Data["PJRT_PLUGIN_PATH"] = pjrtPluginPath
+	}
 
 	// Set owner reference
 	if err := ctrl.SetControllerReference(pool, cm, r.Scheme); err != nil {
@@ -295,91 +308,71 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		}
 	}
 
-	// Build preload model list
-	preload := make([]string, 0, len(pool.Spec.Models.Preload))
-	for _, m := range pool.Spec.Models.Preload {
-		preload = append(preload, m.Name)
+	loadingStrategy := pool.Spec.Models.LoadingStrategy
+	if loadingStrategy == "" {
+		loadingStrategy = antflyaiv1alpha1.LoadingStrategyEager
+	}
+
+	// Init containers provision every model. Only eager models are warmed before
+	// serving; lazy and bounded models remain available for request-time loading.
+	// Accelerator selection is configured independently through
+	// ANTFLY_INFERENCE_PREFERRED_BACKEND.
+	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
+	for _, model := range pool.Spec.Models.Preload {
+		modelStrategy := model.Strategy
+		if modelStrategy == "" {
+			modelStrategy = loadingStrategy
+		}
+		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager {
+			continue
+		}
+
+		entry := map[string]any{
+			"kind": zigWarmModelKind(model.Tasks),
+			"name": model.Name,
+		}
+		if format, quantization, ok := inferenceArtifactSelection(model.Name); ok {
+			entry["format"] = format
+			if quantization != "" {
+				entry["quantization"] = quantization
+			}
+		}
+		preload = append(preload, entry)
 	}
 
 	// Set auto-generated config (don't override if user specified)
 	if _, exists := config["preload"]; !exists && len(preload) > 0 {
 		config["preload"] = preload
 	}
-
-	// Build per-model loading strategies map
-	// Only include models that have an explicit strategy override
-	// Key format is the canonical model ref from spec.models.preload[].name.
-	if _, exists := config["model_strategies"]; !exists {
-		modelStrategies := make(map[string]string)
-		for _, m := range pool.Spec.Models.Preload {
-			if m.Strategy != "" {
-				modelStrategies[m.Name] = string(m.Strategy)
-			}
-		}
-		if len(modelStrategies) > 0 {
-			config["model_strategies"] = modelStrategies
-		}
+	if _, exists := config["models_dir"]; !exists {
+		config["models_dir"] = "/models"
 	}
 
-	// Set model directories based on models-dir default
-	if _, exists := config["embedder_models_dir"]; !exists {
-		config["embedder_models_dir"] = "/models/embedders"
-	}
-	if _, exists := config["chunker_models_dir"]; !exists {
-		config["chunker_models_dir"] = "/models/chunkers"
-	}
-	if _, exists := config["reranker_models_dir"]; !exists {
-		config["reranker_models_dir"] = "/models/rerankers"
-	}
-
-	// Set loading strategy config
-	// Note: Inference defaults to lazy loading (5m keep_alive) like Ollama.
-	// Eager loading must be explicitly set with keep_alive="0".
-	if pool.Spec.Models.LoadingStrategy != "" {
-		switch pool.Spec.Models.LoadingStrategy {
+	// Translate Kubernetes durations to the Zig runtime's millisecond setting.
+	if _, exists := config["keep_alive_ms"]; !exists {
+		switch loadingStrategy {
 		case antflyaiv1alpha1.LoadingStrategyEager:
-			// Eager loading: explicitly set keep_alive=0 to load all models at startup
-			if _, exists := config["keep_alive"]; !exists {
-				config["keep_alive"] = "0"
-			}
+			config["keep_alive_ms"] = uint64(0)
 		case antflyaiv1alpha1.LoadingStrategyLazy:
-			// Lazy loading: set keep_alive if not specified (matches Inference default)
-			if _, exists := config["keep_alive"]; !exists {
-				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
-				} else {
-					config["keep_alive"] = "5m" // Default 5 minutes
-				}
+			keepAlive, err := inferenceKeepAliveMillis(pool)
+			if err != nil {
+				return "", err
 			}
+			config["keep_alive_ms"] = keepAlive
 		case antflyaiv1alpha1.LoadingStrategyBounded:
-			// Bounded loading: set max_loaded_models
-			if _, exists := config["max_loaded_models"]; !exists {
-				if pool.Spec.Models.MaxLoadedModels != nil {
-					config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
-				}
+			keepAlive, err := inferenceKeepAliveMillis(pool)
+			if err != nil {
+				return "", err
 			}
-			// Also set keep_alive for LRU eviction
-			if _, exists := config["keep_alive"]; !exists {
-				if pool.Spec.Models.KeepAlive != nil {
-					config["keep_alive"] = pool.Spec.Models.KeepAlive.Duration.String()
-				} else {
-					config["keep_alive"] = "5m"
-				}
-			}
+			config["keep_alive_ms"] = keepAlive
 		}
 	}
-
-	// Set backend_priority based on accelerator type.
-	// For CPU-only pools, the default from the container env var is sufficient.
-	// This must be a JSON array (not a comma-separated string) so that
-	// viper.GetStringSlice parses it correctly.
-	if _, exists := config["backend_priority"]; !exists && pool.Spec.Hardware.Accelerator != "" {
-		if strings.Contains(pool.Spec.Hardware.Accelerator, "tpu") {
-			// TPU: prefer XLA backend
-			config["backend_priority"] = []string{"xla", "onnx", "go"}
-		} else {
-			// GPU (nvidia, etc.): prefer ONNX backend (CUDA support)
-			config["backend_priority"] = []string{"onnx", "xla", "go"}
+	if _, exists := config["max_loaded_models"]; !exists {
+		if pool.Spec.Models.MaxLoadedModels != nil {
+			config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
+		} else if len(preload) > 10 {
+			// Ensure eager startup can retain every requested model.
+			config["max_loaded_models"] = len(preload)
 		}
 	}
 
@@ -390,6 +383,102 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 
 	return string(configJSON), nil
+}
+
+func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, error) {
+	if pool.Spec.Models.KeepAlive == nil {
+		return defaultInferenceKeepAliveMillis, nil
+	}
+	milliseconds := pool.Spec.Models.KeepAlive.Milliseconds()
+	if milliseconds < 0 {
+		return 0, fmt.Errorf("models.keepAlive must not be negative")
+	}
+	return uint64(milliseconds), nil
+}
+
+func isTPUAccelerator(accelerator string) bool {
+	return strings.Contains(strings.ToLower(accelerator), "tpu")
+}
+
+func inferencePreferredBackend(pool *antflyaiv1alpha1.InferencePool) string {
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		return "pjrt"
+	}
+	if pool.Spec.Hardware.Accelerator != "" || hasInferenceGPUResources(pool.Spec.Resources) {
+		return "cuda"
+	}
+	return ""
+}
+
+func hasInferenceGPUResources(resources *corev1.ResourceRequirements) bool {
+	if resources == nil {
+		return false
+	}
+	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
+		if _, ok := resources.Limits[resourceName]; ok {
+			return true
+		}
+		if _, ok := resources.Requests[resourceName]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func zigWarmModelKind(tasks []string) string {
+	// Match the Zig registry's task-to-kind precedence. Model task hints are
+	// written into the pulled manifest by the init container.
+	for _, candidate := range []struct {
+		tasks []string
+		kind  string
+	}{
+		{[]string{"extract", "extractors", "recognize", "recognizer"}, "extractor"},
+		{[]string{"rerank", "rerankers"}, "reranker"},
+		{[]string{"classify", "classifiers"}, "classifier"},
+		{[]string{"generate", "generators"}, "generator"},
+		{[]string{"read", "readers"}, "reader"},
+		{[]string{"transcribe", "transcribers"}, "transcriber"},
+		{[]string{"rewrite", "rewriters"}, "rewriter"},
+		{[]string{"chunk", "chunkers"}, "chunker"},
+		{[]string{"embed", "embedders"}, "embedder"},
+	} {
+		for _, task := range tasks {
+			for _, accepted := range candidate.tasks {
+				if strings.EqualFold(task, accepted) {
+					return candidate.kind
+				}
+			}
+		}
+	}
+	// Preserve the Zig CLI's historical default for untyped model refs.
+	return "generator"
+}
+
+// inferenceArtifactSelection recognizes only runtime artifact-family suffixes.
+// Other registry variants such as :i8 remain opaque pull references.
+func inferenceArtifactSelection(modelRef string) (format, quantization string, ok bool) {
+	ref := strings.TrimPrefix(modelRef, "hf:")
+	separator := strings.IndexByte(ref, ':')
+	if separator < 0 {
+		return "", "", false
+	}
+	suffix := ref[separator+1:]
+	if quantizationSeparator := strings.IndexByte(suffix, ':'); quantizationSeparator >= 0 {
+		format = suffix[:quantizationSeparator]
+		quantization = suffix[quantizationSeparator+1:]
+		if quantization == "" {
+			return "", "", false
+		}
+	} else {
+		format = suffix
+	}
+	format = strings.ToLower(format)
+	switch format {
+	case "gguf", "onnx", "safetensors", "hybrid":
+		return format, quantization, true
+	default:
+		return "", "", false
+	}
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
@@ -406,7 +495,20 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		return strings.Compare(a.Name, b.Name)
 	})
 
-	initContainers := make([]corev1.Container, 0, len(preloadModels))
+	initContainers := make([]corev1.Container, 0, len(preloadModels)+1)
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "pjrt-plugin",
+			Image:   image,
+			Command: []string{"/bin/sh", "-ec"},
+			Args: []string{
+				fmt.Sprintf("wget -qO %s %s && echo '%s  %s' | sha256sum -c - && chmod 0555 %s", pjrtPluginPath, defaultLibTPUURL, defaultLibTPUSHA256, pjrtPluginPath, pjrtPluginPath),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "pjrt-plugin", MountPath: pjrtPluginMountPath},
+			},
+		})
+	}
 	for i, model := range preloadModels {
 		args := []string{"inference", "pull", model.Name, "--models-dir", "/models"}
 		if len(model.Tasks) > 0 {
@@ -427,6 +529,43 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 				{ConfigMapRef: &corev1.ConfigMapEnvSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
 				}},
+			},
+		})
+	}
+
+	inferenceVolumeMounts := []corev1.VolumeMount{
+		{Name: "models", MountPath: "/models"},
+		{Name: "config", MountPath: "/config", ReadOnly: true},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "models",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: pool.Name + "-config",
+					},
+					Items: []corev1.KeyToPath{
+						{Key: "config.json", Path: "config.json"},
+					},
+				},
+			},
+		},
+	}
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
+		inferenceVolumeMounts = append(inferenceVolumeMounts, corev1.VolumeMount{
+			Name: "pjrt-plugin", MountPath: pjrtPluginMountPath, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "pjrt-plugin",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
 	}
@@ -454,14 +593,17 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    []string{"inference", "run", "--host", "0.0.0.0", "--port", strconv.Itoa(InferenceAPIPort), "--models-dir", "/models"},
+							Args: []string{
+								"inference", "run",
+								"--host", "0.0.0.0",
+								"--port", strconv.Itoa(InferenceAPIPort),
+								"--config", "/config/config.json",
+								"--allow-insecure-public-bind",
+							},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "models", MountPath: "/models"},
-								{Name: "config", MountPath: "/config", ReadOnly: true},
-							},
+							VolumeMounts: inferenceVolumeMounts,
 							EnvFrom: []corev1.EnvFromSource{
 								{ConfigMapRef: &corev1.ConfigMapEnvSource{
 									LocalObjectReference: corev1.LocalObjectReference{Name: pool.Name + "-config"},
@@ -470,27 +612,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Resources: r.buildResources(pool),
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "models",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: pool.Name + "-config",
-									},
-									Items: []corev1.KeyToPath{
-										{Key: "config.json", Path: "config.json"},
-									},
-								},
-							},
-						},
-					},
+					Volumes:          volumes,
 					ImagePullSecrets: pool.Spec.ImagePullSecrets,
 				},
 			},
@@ -508,7 +630,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 
 	// Add TPU node selector and tolerations (works in both Standard and Autopilot modes)
 	// In Autopilot, TPU provisioning is triggered by these selectors, not by compute class
-	if pool.Spec.Hardware.Accelerator != "" {
+	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		if sts.Spec.Template.Spec.NodeSelector == nil {
 			sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
 		}
@@ -983,7 +1105,7 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 		// annotation because the TPU node selectors (gke-tpu-accelerator, gke-tpu-topology)
 		// drive node provisioning directly. Adding a compute class like "Balanced" prevents
 		// the cluster autoscaler from creating TPU nodes.
-		isTPUWorkload := strings.Contains(pool.Spec.Hardware.Accelerator, "tpu")
+		isTPUWorkload := isTPUAccelerator(pool.Spec.Hardware.Accelerator)
 
 		if isTPUWorkload {
 			// For TPU workloads: don't set compute-class, let node selectors drive provisioning
@@ -1407,7 +1529,7 @@ func (r *InferencePoolReconciler) buildResources(pool *antflyaiv1alpha1.Inferenc
 // and TPU resources are not already specified. This is required for GKE Autopilot.
 func (r *InferencePoolReconciler) ensureTPUResources(resources *corev1.ResourceRequirements, pool *antflyaiv1alpha1.InferencePool) {
 	// Only add TPU resources if accelerator is configured
-	if pool.Spec.Hardware.Accelerator == "" {
+	if !isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		return
 	}
 

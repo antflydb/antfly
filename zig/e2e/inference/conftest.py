@@ -28,8 +28,16 @@ Usage:
     # Optional inference server model-cache limit:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
+    # Separate deadline for explicitly marked first-use model/backend initialization:
+    ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=1800 uv run --project e2e/inference pytest e2e/inference
+
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
+
+    # Require CUDA except for exact, reviewed model/backend pairs:
+    ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND=cuda \
+      ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS=owner/cpu-only-model=native \
+      uv run --project e2e/inference pytest e2e/inference
 
     # Against a hosted inference endpoint:
     ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv run --project e2e/inference pytest e2e/inference
@@ -59,7 +67,31 @@ from .models import (
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
-DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
+
+
+def _positive_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return value
+
+
+DEFAULT_REQUEST_TIMEOUT = _positive_timeout("ANTFLY_INFERENCE_REQUEST_TIMEOUT", 30)
+# Cold model import and backend/projector initialization are different from the
+# steady request-latency contract. Tests must opt into this larger deadline so a
+# global timeout increase cannot hide an ordinary serving hang.
+FIRST_USE_REQUEST_TIMEOUT = max(
+    DEFAULT_REQUEST_TIMEOUT,
+    _positive_timeout(
+        "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT
+    ),
+)
 SERVER_OUTPUT_LIMIT = 64 * 1024
 CAPACITY_RETRY_TIMEOUT = float(
     os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_TIMEOUT", "30")
@@ -78,6 +110,145 @@ def env_first(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _parse_backend_exceptions(
+    raw: str, supported_backends: set[str]
+) -> set[tuple[str, str]]:
+    """Parse exact `owner/model=backend` exceptions for backend enforcement."""
+
+    exceptions: set[tuple[str, str]] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.count("=") != 1:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS entries must use "
+                f"owner/model=backend, got {entry!r}"
+            )
+        model_id, backend = (part.strip() for part in entry.split("=", 1))
+        if model_id.count("/") != 1 or any(
+            not component for component in model_id.split("/")
+        ):
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS model IDs must use "
+                f"owner/model, got {model_id!r}"
+            )
+        backend = backend.lower()
+        if backend not in supported_backends:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS backends must be one of "
+                f"{', '.join(sorted(supported_backends))}, got {backend!r}"
+            )
+        exception = (model_id, backend)
+        if exception in exceptions:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS contains duplicate "
+                f"entry {entry!r}"
+            )
+        exceptions.add(exception)
+    return exceptions
+
+
+def _managed_model_id(model_path: str, models_path: str) -> str | None:
+    """Map a selected artifact path back to its exact managed owner/model ID."""
+
+    root = os.path.realpath(models_path)
+    selected = os.path.realpath(model_path)
+    try:
+        relative = os.path.relpath(selected, root)
+    except ValueError:  # pragma: no cover - Windows paths on different drives.
+        return None
+    parts = relative.split(os.sep)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return None
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    name, separator, receipt = parts[1].rpartition("--antfly-")
+    if (
+        separator
+        and 8 <= len(receipt) <= 64
+        and all(character in "0123456789abcdef" for character in receipt.lower())
+    ):
+        return f"{parts[0]}/{name}"
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _backend_selection_diagnostic(
+    selections: set[tuple[str, str]],
+    required_backend: str,
+    allowed_exceptions: set[tuple[str, str]],
+    models_path: str,
+) -> str | None:
+    """Validate exact backend/model selections and reject stale exceptions."""
+
+    if not any(backend == required_backend for backend, _ in selections):
+        return (
+            f"Inference E2E required a real {required_backend!r} model session, "
+            "but the server never selected that backend."
+        )
+
+    observed_exceptions: set[tuple[str, str]] = set()
+    disallowed: list[tuple[str, str, str | None]] = []
+    for backend, model_path in selections:
+        if backend == required_backend:
+            continue
+        model_id = _managed_model_id(model_path, models_path)
+        exception = (model_id, backend) if model_id is not None else None
+        if exception is not None and exception in allowed_exceptions:
+            observed_exceptions.add(exception)
+        else:
+            disallowed.append((backend, model_path, model_id))
+
+    if disallowed:
+        details = "; ".join(
+            f"backend={backend} model={model_id or model_path}"
+            for backend, model_path, model_id in sorted(disallowed)
+        )
+        return (
+            f"Inference E2E required model sessions to use {required_backend!r}; "
+            f"disallowed selections: {details}."
+        )
+
+    if unused := allowed_exceptions - observed_exceptions:
+        details = ", ".join(
+            f"{model_id}={backend}" for model_id, backend in sorted(unused)
+        )
+        return (
+            "Inference E2E backend exceptions must be exercised so stale fallback "
+            f"allowances cannot accumulate; unused exceptions: {details}."
+        )
+    return None
+
+
+_SERVER_BUDGET_FLAGS = (
+    ("ANTFLY_INFERENCE_HOST_BUDGET_MB", "--host-budget-mb"),
+    ("ANTFLY_INFERENCE_BACKEND_BUDGET_MB", "--backend-budget-mb"),
+    ("ANTFLY_INFERENCE_COMBINED_BUDGET_MB", "--combined-budget-mb"),
+    ("ANTFLY_INFERENCE_KV_BUDGET_MB", "--kv-budget-mb"),
+    ("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "--scratch-budget-mb"),
+)
+
+
+def _server_budget_args() -> list[str]:
+    """Translate explicit E2E budget policy into injection-safe CLI args."""
+
+    args: list[str] = []
+    for env_name, flag in _SERVER_BUDGET_FLAGS:
+        raw = env_first(env_name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw, 10)
+        except ValueError as exc:
+            raise pytest.UsageError(
+                f"{env_name} must be a non-negative integer"
+            ) from exc
+        if value < 0:
+            raise pytest.UsageError(f"{env_name} must be a non-negative integer")
+        args.extend((flag, str(value)))
+    return args
 
 
 def api_path(path: str) -> str:
@@ -184,6 +355,7 @@ class InferenceServer:
         port: int,
         max_loaded_models: str | None = None,
         extra_env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.url = f"http://{host}:{port}"
         self.failure_reported = False
@@ -207,6 +379,7 @@ class InferenceServer:
                     if max_loaded_models is not None
                     else []
                 ),
+                *(extra_args or []),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -225,7 +398,9 @@ class InferenceServer:
         offset = max(0, size - SERVER_OUTPUT_LIMIT)
         if hasattr(os, "pread"):
             data = os.pread(descriptor, SERVER_OUTPUT_LIMIT, offset)
-        elif self.proc.poll() is not None:  # pragma: no cover - Windows fallback after exit.
+        elif (
+            self.proc.poll() is not None
+        ):  # pragma: no cover - Windows fallback after exit.
             position = self.output.tell()
             try:
                 self.output.seek(offset)
@@ -235,6 +410,92 @@ class InferenceServer:
         else:  # pragma: no cover - never move a live child's shared file offset.
             return "<output tail unavailable while this platform's server is running>"
         return data.decode(errors="replace")
+
+    def output_contains(self, needle: str) -> bool:
+        """Search captured output without disturbing the child write offset."""
+
+        encoded = needle.encode()
+        if not encoded:
+            return True
+        descriptor = self.output.fileno()
+        size = os.fstat(descriptor).st_size
+        chunk_size = 64 * 1024
+        overlap = max(0, len(encoded) - 1)
+        carry = b""
+
+        if hasattr(os, "pread"):
+            offset = 0
+            while offset < size:
+                data = os.pread(descriptor, min(chunk_size, size - offset), offset)
+                if not data:
+                    break
+                combined = carry + data
+                if encoded in combined:
+                    return True
+                carry = combined[-overlap:] if overlap else b""
+                offset += len(data)
+            return False
+
+        if self.proc.poll() is None:  # pragma: no cover - Windows live-child guard.
+            return False
+        position = self.output.tell()
+        try:  # pragma: no cover - exercised only on platforms without pread.
+            self.output.seek(0)
+            while data := self.output.read(chunk_size):
+                combined = carry + data
+                if encoded in combined:
+                    return True
+                carry = combined[-overlap:] if overlap else b""
+            return False
+        finally:
+            self.output.seek(position)
+
+    def backend_selections(self, supported_backends: set[str]) -> set[tuple[str, str]]:
+        """Return every `(backend, model path)` selection without moving output."""
+
+        selections: set[tuple[str, str]] = set()
+        descriptor = self.output.fileno()
+        size = os.fstat(descriptor).st_size
+        chunk_size = 64 * 1024
+        carry = b""
+
+        def consume(data: bytes, final: bool = False) -> None:
+            nonlocal carry
+            carry += data
+            lines = carry.split(b"\n")
+            carry = b"" if final else lines.pop()
+            for line in lines:
+                marker = line.find(b"selected backend ")
+                if marker < 0:
+                    continue
+                selection = line[marker + len(b"selected backend ") :].rstrip(b"\r")
+                backend_bytes, separator, model_path = selection.partition(b" for ")
+                backend = backend_bytes.decode(errors="replace")
+                if separator and backend in supported_backends and model_path:
+                    selections.add((backend, model_path.decode(errors="replace")))
+
+        if hasattr(os, "pread"):
+            offset = 0
+            while offset < size:
+                data = os.pread(descriptor, min(chunk_size, size - offset), offset)
+                if not data:
+                    break
+                consume(data)
+                offset += len(data)
+            consume(b"", final=True)
+            return selections
+
+        if self.proc.poll() is None:  # pragma: no cover - Windows live-child guard.
+            return selections
+        position = self.output.tell()
+        try:  # pragma: no cover - exercised only on platforms without pread.
+            self.output.seek(0)
+            while data := self.output.read(chunk_size):
+                consume(data)
+            consume(b"", final=True)
+            return selections
+        finally:
+            self.output.seek(position)
 
     def failure_diagnostic(self) -> str:
         returncode = self.proc.poll()
@@ -249,6 +510,16 @@ class InferenceServer:
         else:
             status = f"exited with status {returncode}"
         return f"Local inference server {status}. Output tail:\n{self.read_output()}"
+
+    def request_failure_diagnostic(
+        self, method: str, path: str, exc: requests.RequestException
+    ) -> str:
+        """Attach bounded live-server output to transport failures."""
+
+        return (
+            f"Inference {method.upper()} {path} failed: {exc}\n"
+            f"{self.failure_diagnostic()}"
+        )
 
     def report_http_failure_once(self) -> None:
         """Expose backend logs for a live local server without moving its write offset."""
@@ -278,8 +549,44 @@ def base_url():
     If ANTFLY_INFERENCE_URL is set, use it directly (external server).
     Otherwise, start a local server from ANTFLY_BIN.
     """
+    required_backend = env_first("ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND")
+    allowed_backend_exceptions_raw = env_first(
+        "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS"
+    )
+    allowed_backend_exceptions: set[tuple[str, str]] = set()
+    if required_backend is not None:
+        required_backend = required_backend.strip().lower()
+        supported_backends = {"cuda", "metal", "native", "onnx", "pjrt", "wasm"}
+        if required_backend not in supported_backends:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND must be one of "
+                f"{', '.join(sorted(supported_backends))}, got {required_backend!r}"
+            )
+        allowed_backend_exceptions = _parse_backend_exceptions(
+            allowed_backend_exceptions_raw or "", supported_backends
+        )
+        if redundant := {
+            model_id
+            for model_id, backend in allowed_backend_exceptions
+            if backend == required_backend
+        }:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS must name only "
+                f"non-required backends; redundant models: {', '.join(sorted(redundant))}"
+            )
+    elif allowed_backend_exceptions_raw:
+        raise pytest.UsageError(
+            "ANTFLY_INFERENCE_ALLOWED_BACKEND_EXCEPTIONS requires "
+            "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND"
+        )
+
     url = env_first("ANTFLY_INFERENCE_URL")
     if url:
+        if required_backend:
+            raise pytest.UsageError(
+                "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND requires the local "
+                "E2E-managed server so its backend-selection logs can be verified"
+            )
         url = url.rstrip("/")
         if not wait_for_server(url, timeout=10):
             pytest.skip(f"Server at {url} is not reachable")
@@ -302,6 +609,7 @@ def base_url():
         "127.0.0.1",
         port,
         max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+        extra_args=_server_budget_args(),
     )
     _LOCAL_SERVERS_BY_URL[server.url] = server
     yield server.url
@@ -309,8 +617,17 @@ def base_url():
     unexpected_exit = server.proc.poll() is not None
     diagnostic = server.failure_diagnostic() if unexpected_exit else None
     server.stop(close_output=False)
+    if diagnostic is None and required_backend:
+        diagnostic = _backend_selection_diagnostic(
+            server.backend_selections(supported_backends),
+            required_backend,
+            allowed_backend_exceptions,
+            models_path,
+        )
+        if diagnostic is not None:
+            diagnostic += f"\nServer output tail:\n{server.read_output()}"
     server.output.close()
-    if unexpected_exit and not server.failure_reported:
+    if diagnostic is not None and not server.failure_reported:
         pytest.fail(diagnostic, pytrace=False)
 
 
@@ -326,11 +643,21 @@ def api(base_url):
     def _check(r):
         """Raise for status, skipping only explicit model-unavailable errors."""
         if r.status_code == 404:
-            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            body = (
+                r.json()
+                if r.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
             if body.get("error") == "MODEL_NOT_FOUND":
-                pytest.skip(f"Model unavailable: {body.get('message', 'model not found')}")
+                pytest.skip(
+                    f"Model unavailable: {body.get('message', 'model not found')}"
+                )
         if r.status_code == 400:
-            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            body = (
+                r.json()
+                if r.headers.get("content-type", "").startswith("application/json")
+                else {}
+            )
             err = body.get("error", "")
             if "INVALID_MODEL" in err or "MODEL_NOT_FOUND" in err:
                 pytest.skip(f"Model unavailable: {body.get('message', err)}")
@@ -362,12 +689,14 @@ def api(base_url):
                 try:
                     return request(f"{self.url}{normalized_path}", json=json, **kwargs)
                 except requests.RequestException as exc:
-                    if (
-                        local_server is not None
-                        and local_server.proc.poll() is not None
-                    ):
-                        local_server.failure_reported = True
-                        raise AssertionError(local_server.failure_diagnostic()) from exc
+                    if local_server is not None:
+                        if local_server.proc.poll() is not None:
+                            local_server.failure_reported = True
+                        raise AssertionError(
+                            local_server.request_failure_diagnostic(
+                                method, normalized_path, exc
+                            )
+                        ) from exc
                     raise
 
             response = send()
@@ -393,7 +722,9 @@ def api(base_url):
             return r.json()
 
         def rerank(self, query: str, documents: list[str], model: str = ""):
-            r = self.post("/rerank", json={"model": model, "query": query, "prompts": documents})
+            r = self.post(
+                "/rerank", json={"model": model, "query": query, "prompts": documents}
+            )
             _check(r)
             return r.json()
 
@@ -409,40 +740,101 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def generate(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def generate(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/generate", json=body, stream=True)
+                r = self.post("/generate", json=body, stream=True, **request_kwargs)
                 _check(r)
                 return r
-            r = self.post("/generate", json=body)
+            r = self.post("/generate", json=body, **request_kwargs)
             _check(r)
             return r.json()
 
-        def chat(self, messages: list[dict], model: str = "", stream: bool = False, **kwargs):
+        def chat(
+            self,
+            messages: list[dict],
+            model: str = "",
+            stream: bool = False,
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
             if stream:
-                r = self.post("/chat/completions", json=body, stream=True)
+                r = self.post(
+                    "/chat/completions", json=body, stream=True, **request_kwargs
+                )
                 _check(r)
                 return r
-            r = self.post("/chat/completions", json=body)
+            r = self.post("/chat/completions", json=body, **request_kwargs)
             _check(r)
             return r.json()
 
-        def classify(self, text: list[str], labels: list[str], model: str = "", **kwargs):
+        def classify(
+            self,
+            text: list[str],
+            labels: list[str],
+            model: str = "",
+            *,
+            request_timeout: float | None = None,
+            **kwargs,
+        ):
             multi_label = bool(kwargs.pop("multi_label", False))
-            body = {
-                "model": model or "cross-encoder/nli-distilroberta-base",
-                "texts": text,
+            hypothesis_template = kwargs.pop("hypothesis_template", None)
+            top_k = kwargs.pop("top_k", None)
+            threshold = kwargs.pop("threshold", None)
+            include_confidence = bool(kwargs.pop("include_confidence", True))
+            if kwargs:
+                raise TypeError(f"unsupported classify options: {sorted(kwargs)}")
+            classification_schema = {
+                "name": "classification",
                 "labels": labels,
                 "multi_label": multi_label,
-                **kwargs,
             }
-            r = self.post("/classify", json=body)
+            if hypothesis_template is not None:
+                classification_schema["hypothesis_template"] = hypothesis_template
+            if top_k is not None:
+                classification_schema["top_k"] = top_k
+            body = {
+                "model": model or "cross-encoder/nli-distilroberta-base",
+                "inputs": [
+                    {"id": f"input-{index}", "content": value}
+                    for index, value in enumerate(text)
+                ],
+                "schema": {"classifications": [classification_schema]},
+                "options": {"include_confidence": include_confidence},
+            }
+            if threshold is not None:
+                body["options"]["threshold"] = threshold
+            request_kwargs = (
+                {"timeout": request_timeout} if request_timeout is not None else {}
+            )
+            r = self.post("/extract", json=body, **request_kwargs)
             _check(r)
             return r.json()
 
-        def extract_entities(self, text: list[str], model: str = "", labels: list[str] | None = None, relations: list[str | dict] | None = None, **kwargs):
+        def extract_entities(
+            self,
+            text: list[str],
+            model: str = "",
+            labels: list[str] | None = None,
+            relations: list[str | dict] | None = None,
+            **kwargs,
+        ):
             body: dict = {
                 "model": model or DEFAULT_EXTRACTOR_MODEL,
                 "inputs": [{"content": value} for value in text],
@@ -467,9 +859,17 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def read(self, images: list[str], model: str = "antflydb/florence-2-base", prompt: str = "", **kwargs):
+        def read(
+            self,
+            images: list[str],
+            model: str = "antflydb/florence-2-base",
+            prompt: str = "",
+            **kwargs,
+        ):
             # Convert plain URL strings to ImageURL objects {url: "..."}
-            image_objs = [{"url": img} if isinstance(img, str) else img for img in images]
+            image_objs = [
+                {"url": img} if isinstance(img, str) else img for img in images
+            ]
             body = {"model": model, "images": image_objs, "prompt": prompt, **kwargs}
             r = self.post("/read", json=body)
             _check(r)
@@ -481,21 +881,33 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def extract(self, texts: list[str] | None = None, images: list[str] | None = None, schema: dict | None = None, model: str = "", **kwargs):
+        def extract(
+            self,
+            texts: list[str] | None = None,
+            images: list[str] | None = None,
+            schema: dict | None = None,
+            model: str = "",
+            **kwargs,
+        ):
             structures = {}
             for structure_name, field_defs in (schema or {}).items():
                 fields = {}
                 for field_def in field_defs:
                     parts = field_def.split("::")
                     field_name = parts[0]
-                    field_type = "list" if "list" in parts[1:] or "array" in parts[1:] else "str"
+                    field_type = (
+                        "list" if "list" in parts[1:] or "array" in parts[1:] else "str"
+                    )
                     fields[field_name] = field_type
                 structures[structure_name] = {"fields": fields}
             inputs = []
             if texts is not None:
                 inputs.extend({"content": text} for text in texts)
             if images is not None:
-                inputs.extend({"content": [{"type": "image_url", "image_url": {"url": image}}]} for image in images)
+                inputs.extend(
+                    {"content": [{"type": "image_url", "image_url": {"url": image}}]}
+                    for image in images
+                )
             body = {
                 "model": model,
                 "inputs": inputs,
@@ -535,4 +947,6 @@ def openai_client(base_url):
 def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
     if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
-        print("ANTFLY_INFERENCE_DOWNLOAD=1: missing E2E models will be fetched with `antfly inference pull` on demand")
+        print(
+            "ANTFLY_INFERENCE_DOWNLOAD=1: missing E2E models will be fetched with `antfly inference pull` on demand"
+        )

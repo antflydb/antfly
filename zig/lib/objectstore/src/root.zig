@@ -21,8 +21,14 @@ pub const gcs = @import("gcs.zig");
 pub const s3_compat = @import("s3_compat.zig");
 
 pub const ObjectMetadata = types.ObjectMetadata;
+pub const ObjectChecksum = types.ObjectChecksum;
+pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
+pub const ObjectChecksumScope = types.ObjectChecksumScope;
+pub const ObjectChecksumType = types.ObjectChecksumType;
 pub const PutOptions = types.PutOptions;
 pub const GetOptions = types.GetOptions;
+pub const StatOptions = types.StatOptions;
+pub const CancellationToken = types.CancellationToken;
 pub const DeleteOptions = types.DeleteOptions;
 pub const ListOptions = types.ListOptions;
 pub const ByteRange = types.ByteRange;
@@ -64,6 +70,8 @@ test "objectstore module compiles" {
     _ = ObjectMetadata;
     _ = PutOptions;
     _ = GetOptions;
+    _ = StatOptions;
+    _ = CancellationToken;
     _ = DeleteOptions;
     _ = ListOptions;
     _ = ByteRange;

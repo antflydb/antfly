@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for canonical /ai/v1/classify requests.
+"""Tests for classification through the canonical /ai/v1/extract endpoint.
 
 Matches Go antfly's classifier_test.go patterns.
 """
 
 import pytest
 
-from .helpers import assert_openai_list_response
+from .conftest import FIRST_USE_REQUEST_TIMEOUT
+from .models import DEFAULT_EXTRACTOR_MODEL
 
 pytestmark = pytest.mark.model_integration
 
@@ -30,9 +31,12 @@ def test_classify_native_safetensors_classifier_smoke(api):
         model="cross-encoder/nli-distilroberta-base",
         text=["The new iPhone has an impressive camera system with advanced AI features."],
         labels=["technology", "sports", "politics", "entertainment"],
+        top_k=4,
     )
     assert resp["model"] == "cross-encoder/nli-distilroberta-base"
-    assert_openai_list_response(resp, expected_len=1)
+    assert resp["object"] == "extraction"
+    assert resp["data"][0]["id"] == "input-0"
+    assert resp["usage"]["total_tokens"] >= resp["usage"]["prompt_tokens"] > 0
     classifications = [item["classifications"] for item in resp["data"]]
     assert len(classifications) == 1
     assert len(classifications[0]) == 4
@@ -51,6 +55,9 @@ def test_classify_native_safetensors_deberta_smoke(api):
         model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
         text=["The new iPhone has an impressive camera system with advanced AI features."],
         labels=["technology", "sports", "politics", "entertainment"],
+        hypothesis_template="This text is about {}.",
+        top_k=4,
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     assert resp["model"] == "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
     classifications = [item["classifications"] for item in resp["data"]]
@@ -65,6 +72,20 @@ def test_classify_native_safetensors_deberta_smoke(api):
     assert abs(total - 1.0) < 1e-3
 
 
+def test_classify_gliner2_through_extract(api):
+    """The canonical endpoint also dispatches classification-capable extractors."""
+    resp = api.classify(
+        model=DEFAULT_EXTRACTOR_MODEL,
+        text=["The new iPhone has an impressive camera system with advanced AI features."],
+        labels=["technology", "sports", "politics", "entertainment"],
+    )
+    assert resp["object"] == "extraction"
+    assert resp["model"] == DEFAULT_EXTRACTOR_MODEL
+    assert resp["data"][0]["id"] == "input-0"
+    assert len(resp["data"][0]["classifications"]) == 1
+    assert resp["data"][0]["classifications"][0]["name"] == "classification"
+
+
 def test_classify_single_text(api):
     """iPhone text should classify as technology."""
     resp = api.classify(
@@ -73,7 +94,7 @@ def test_classify_single_text(api):
     )
     classifications = [item["classifications"] for item in resp["data"]]
     assert len(classifications) == 1
-    assert len(classifications[0]) > 0
+    assert len(classifications[0]) == 1
 
     top = max(classifications[0], key=lambda x: x["score"])
     assert top["label"] == "technology", f"Expected 'technology', got '{top['label']}'"
@@ -104,6 +125,7 @@ def test_classify_multi_label(api):
         text=["The tech company's stock surged after announcing record quarterly earnings."],
         labels=["technology", "business", "sports", "politics"],
         multi_label=True,
+        threshold=0.3,
     )
     classifications = [item["classifications"] for item in resp["data"]]
     scores = {c["label"]: c["score"] for c in classifications[0]}

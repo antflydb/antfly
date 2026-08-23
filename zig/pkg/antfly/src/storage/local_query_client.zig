@@ -25,7 +25,8 @@ pub fn executeJsonAlloc(
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
     execution_options: abi.LocalQueryExecutionOptions,
-    cancellation_flag: ?*const anyopaque,
+    cancellation_ctx: ?*anyopaque,
+    cancellation_fn: ?abi.CancellationCheckFn,
     out_failure: *abi.FailureIdentity,
 ) ![]u8 {
     return executeAlloc(alloc, .{
@@ -35,7 +36,8 @@ pub fn executeJsonAlloc(
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
-        .cancellation_flag = cancellation_flag,
+        .cancellation_ctx = cancellation_ctx,
+        .cancellation_fn = cancellation_fn,
     }, .validate_provider_response, out_failure);
 }
 
@@ -46,7 +48,8 @@ pub fn executeControlledJsonAlloc(
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
-    cancellation_flag: ?*const anyopaque,
+    cancellation_ctx: ?*anyopaque,
+    cancellation_fn: ?abi.CancellationCheckFn,
     out_failure: *abi.FailureIdentity,
 ) ![]u8 {
     std.debug.assert(kind != .search);
@@ -57,7 +60,8 @@ pub fn executeControlledJsonAlloc(
         .request_json = .fromSlice(request_json),
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
         .execution_deadline_ns = execution_deadline_ns orelse 0,
-        .cancellation_flag = cancellation_flag,
+        .cancellation_ctx = cancellation_ctx,
+        .cancellation_fn = cancellation_fn,
     }, validationOperation(kind), out_failure);
 }
 

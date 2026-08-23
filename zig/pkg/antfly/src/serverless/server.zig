@@ -13,42 +13,81 @@
 // limitations.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const runtime_mod = @import("runtime/mod.zig");
 const serverless_http_server = @import("../serverless_http_server.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const test_backend = @import("test_backend.zig");
+const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
+const health_server = @import("../common/health_server.zig");
 
 pub const ServerlessServerConfig = struct {
     bootstrap: runtime_mod.BootstrapConfig,
     http: serverless_http_server.ServerlessHttpServerConfig = .{},
-    listener: ?raft_transport.StdHttpListenerConfig = null,
+    listener: ?ListenerConfig = null,
 };
+
+pub const ListenerConfig = struct {
+    bind_host: []const u8 = "127.0.0.1",
+    bind_port: u16 = 0,
+    max_request_bytes: usize = 16 * 1024 * 1024,
+    max_connections: u32 = 64,
+};
+
+fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) httpx.ServerConfig {
+    return (httpx.ServerConfig{
+        .host = cfg.bind_host,
+        .port = cfg.bind_port,
+        .max_body_size = cfg.max_request_bytes,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes,
+        .max_connections = cfg.max_connections,
+        .http_runtime = http_runtime,
+    }).normalized();
+}
 
 pub const ServerlessServer = struct {
     alloc: std.mem.Allocator,
     stack: *runtime_mod.OwnedStack,
     owned_http_server: *serverless_http_server.ServerlessHttpServer,
-    owned_listener: ?*raft_transport.StdHttpListener = null,
+    owned_http_runtime: *httpx.HttpRuntime,
+    owned_listener: ?*httpx.Server = null,
+    listener_task: ?httpx.ListenerTask = null,
 
-    pub fn init(alloc: std.mem.Allocator, cfg: ServerlessServerConfig) !ServerlessServer {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, cfg: ServerlessServerConfig) !ServerlessServer {
         const stack = try alloc.create(runtime_mod.OwnedStack);
         errdefer alloc.destroy(stack);
-        try stack.init(alloc, cfg.bootstrap);
+        try stack.init(alloc, cfg.bootstrap, io);
         errdefer stack.deinit();
 
         const http_server = try alloc.create(serverless_http_server.ServerlessHttpServer);
         errdefer alloc.destroy(http_server);
         http_server.* = serverless_http_server.ServerlessHttpServer.init(alloc, cfg.http, &stack.handler);
 
-        var owned_listener: ?*raft_transport.StdHttpListener = null;
+        const http_runtime = try alloc.create(httpx.HttpRuntime);
+        errdefer alloc.destroy(http_runtime);
+        const public_server_config: ?httpx.ServerConfig = if (cfg.listener) |listener_cfg|
+            listenerHttpxConfig(listener_cfg, null)
+        else
+            null;
+        http_runtime.* = httpx.HttpRuntime.init(alloc, .{
+            .max_active_h1_requests = if (public_server_config) |listener_config| listener_config.max_connections else 0,
+            .max_active_connections = (if (public_server_config) |listener_config| @as(usize, listener_config.max_connections) else 0) +| health_server.max_connections,
+            .max_active_requests = (if (public_server_config) |listener_config| @as(usize, listener_config.max_request_tasks) else 0) +| health_server.max_connections,
+        });
+        errdefer http_runtime.deinit();
+
+        var owned_listener: ?*httpx.Server = null;
         errdefer if (owned_listener) |listener| {
             listener.deinit();
             alloc.destroy(listener);
         };
 
-        if (cfg.listener) |listener_cfg| {
-            const listener = try alloc.create(raft_transport.StdHttpListener);
-            listener.* = raft_transport.StdHttpListener.init(alloc, listener_cfg, http_server.executor());
+        if (public_server_config) |resolved_config| {
+            const listener = try alloc.create(httpx.Server);
+            var listener_config = resolved_config;
+            listener_config.http_runtime = http_runtime;
+            listener.* = httpx.Server.initWithConfig(alloc, io, listener_config);
+            listener.global(httpx.Handler.bind(http_server, serverless_http_server.ServerlessHttpServer.handleHttpx));
             owned_listener = listener;
         }
 
@@ -56,16 +95,25 @@ pub const ServerlessServer = struct {
             .alloc = alloc,
             .stack = stack,
             .owned_http_server = http_server,
+            .owned_http_runtime = http_runtime,
             .owned_listener = owned_listener,
+            .listener_task = if (owned_listener) |listener| httpx.ListenerTask.init(listener) else null,
         };
     }
 
     pub fn deinit(self: *ServerlessServer) void {
+        self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn deinitWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         if (self.owned_listener) |listener| {
+            self.stopListenerWithDeadline(deadline);
             listener.deinit();
             self.alloc.destroy(listener);
         }
         self.alloc.destroy(self.owned_http_server);
+        self.owned_http_runtime.deinit();
+        self.alloc.destroy(self.owned_http_runtime);
         self.stack.deinit();
         self.alloc.destroy(self.stack);
         self.* = undefined;
@@ -74,17 +122,39 @@ pub const ServerlessServer = struct {
     pub fn start(self: *ServerlessServer) !void {
         try self.stack.runtime.start();
         errdefer self.stack.runtime.stop();
-        if (self.owned_listener) |listener| try listener.start();
+        try self.startListener();
     }
 
     pub fn stop(self: *ServerlessServer) void {
-        if (self.owned_listener) |listener| listener.stop();
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.stopListenerWithDeadline(deadline);
         self.stack.runtime.stop();
     }
 
     pub fn baseUri(self: *ServerlessServer, alloc: std.mem.Allocator) ![]u8 {
         const listener = self.owned_listener orelse return error.MissingListener;
-        return try listener.baseUri(alloc);
+        const address = listener.boundAddress() orelse return error.ListenerNotStarted;
+        return try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+    }
+
+    pub fn startListener(self: *ServerlessServer) !void {
+        if (self.listener_task) |*task| try task.start();
+    }
+
+    pub fn stopListener(self: *ServerlessServer) void {
+        self.stopListenerWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn stopListenerWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        if (self.listener_task) |*task| {
+            task.shutdown(deadline.remainingMilliseconds());
+            task.join() catch |err| {
+                std.log.err("serverless listener failed during shutdown err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn httpServer(self: *ServerlessServer) *serverless_http_server.ServerlessHttpServer {
@@ -94,11 +164,23 @@ pub const ServerlessServer = struct {
     pub fn runtimeStatus(self: *const ServerlessServer) *const runtime_mod.RuntimeStatus {
         return &self.stack.status;
     }
+
+    pub fn listenerFailure(self: *const ServerlessServer) ?anyerror {
+        return if (self.listener_task) |*task| task.runtimeFailure() else null;
+    }
+
+    pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {
+        return self.owned_http_runtime;
+    }
 };
 
 test "serverless server module compiles" {
     _ = ServerlessServerConfig;
     _ = ServerlessServer;
+
+    const normalized = listenerHttpxConfig(.{ .max_connections = 0 }, null);
+    try std.testing.expectEqual(@as(u32, 1000), normalized.max_connections);
+    try std.testing.expectEqual(normalized.max_connections, normalized.max_request_tasks);
 }
 
 test "serverless server starts managed runtime and serves listener requests" {
@@ -133,7 +215,7 @@ test "serverless server starts managed runtime and serves listener requests" {
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -219,7 +301,7 @@ test "serverless server query-only role rejects maintenance routes but serves re
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -333,7 +415,7 @@ test "serverless server public table routes preserve published and latest cutove
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -347,8 +429,8 @@ test "serverless server public table routes preserve published and latest cutove
         .listener = .{},
     });
     defer server.deinit();
-    try server.owned_listener.?.start();
-    defer server.owned_listener.?.stop();
+    try server.startListener();
+    defer server.stopListener();
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -481,7 +563,7 @@ test "serverless server hides remapped serving namespaces behind public table ro
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -504,8 +586,8 @@ test "serverless server hides remapped serving namespaces behind public table ro
     defer alloc.free(resolved_namespace);
     try std.testing.expectEqualStrings("docs-serving", resolved_namespace);
 
-    try server.owned_listener.?.start();
-    defer server.owned_listener.?.stop();
+    try server.startListener();
+    defer server.stopListener();
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -633,7 +715,7 @@ test "serverless server public table graph routes stay pinned until publish cuto
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -647,8 +729,8 @@ test "serverless server public table graph routes stay pinned until publish cuto
         .listener = .{},
     });
     defer server.deinit();
-    try server.owned_listener.?.start();
-    defer server.owned_listener.?.stop();
+    try server.startListener();
+    defer server.stopListener();
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -778,7 +860,7 @@ test "serverless server serves requests over env-configured s3 backend" {
     var uris = try test_backend.makeNamespaceUris(alloc, .s3, bucket, prefix_root);
     defer uris.deinit(alloc);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = uris.artifacts,
             .manifests_uri = uris.manifests,
@@ -842,7 +924,7 @@ test "serverless server serves requests over env-configured gs backend" {
     var uris = try test_backend.makeNamespaceUris(alloc, .gs, bucket, prefix_root);
     defer uris.deinit(alloc);
 
-    var server = try ServerlessServer.init(alloc, .{
+    var server = try ServerlessServer.init(alloc, std.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = uris.artifacts,
             .manifests_uri = uris.manifests,

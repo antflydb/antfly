@@ -181,7 +181,7 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
             .max_windows_per_publish = replayMaxWindowsPerPublish(),
             .max_items_per_window = denseReplayMaxItemsPerWindow(),
             .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager),
-            .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(),
+            .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(index_ref),
             .force_persist_applied_sequence = true,
             .not_found_is_recoverable = true,
         },
@@ -240,8 +240,12 @@ fn replayMaxItemsPerWindow() usize {
     return envUsize("ANTFLY_DERIVED_REPLAY_MAX_ITEMS_PER_WINDOW", replay_default_max_items_per_window);
 }
 
-fn denseReplayEstimatedVectorBytes() u64 {
-    return envU64("ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES", derived_worker.dense_replay_estimated_vector_bytes_default);
+fn denseReplayEstimatedVectorBytes(index_ref: index_manager_mod.ManagedIndexRef) u64 {
+    const fallback = if (index_ref.estimated_dense_vector_bytes > 0)
+        index_ref.estimated_dense_vector_bytes
+    else
+        derived_worker.dense_replay_estimated_vector_bytes_default;
+    return envU64("ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES", fallback);
 }
 
 fn replayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager) u64 {
@@ -328,4 +332,13 @@ test "full text replay policy bounds work by item count as well as bytes" {
     const policy = forIndex(.{ .name = "text", .kind = .full_text }, null);
     try std.testing.expectEqual(replay_default_max_items_per_window, policy.max_items_per_window);
     try std.testing.expectEqual(replay_default_window_bytes, policy.max_chunk_bytes);
+}
+
+test "dense replay policy uses the index dimensions for its byte estimate" {
+    const policy = forIndex(.{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 1536 * @sizeOf(f32),
+    }, null);
+    try std.testing.expectEqual(@as(u64, 1536 * @sizeOf(f32)), policy.estimated_dense_vector_bytes);
 }

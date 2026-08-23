@@ -32,6 +32,8 @@ pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const background_runtime = @import("../background_runtime.zig");
 pub const query_metrics = @import("query_metrics.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
+pub const documentExtractionStoredUnitFingerprintAlloc = @import("enrichment/document_unit_fingerprint.zig").storedPayloadLegacyFingerprintAlloc;
+pub const document_query = @import("document_query.zig");
 
 /// Physical DB values may occur in legacy-only lazy declarations in shared
 /// source files. Making the type opaque keeps those declarations parseable

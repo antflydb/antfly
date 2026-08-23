@@ -619,6 +619,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_buffer_count: u64 = 0,
     metal_runtime_total_bytes: u64 = 0,
     metal_runtime_private_bytes: u64 = 0,
+    metal_runtime_deberta_relative_cache_bytes: u64 = 0,
     metal_runtime_shared_bytes: u64 = 0,
     metal_runtime_managed_bytes: u64 = 0,
     metal_runtime_embedding_logical_bytes: u64 = 0,
@@ -688,6 +689,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_decode_gqa_split_calls: u64 = 0,
+    metal_runtime_decode_gqa_split_fallback_calls: u64 = 0,
     metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_hd512_calls: u64 = 0,
@@ -1098,6 +1100,7 @@ pub const DecoderRuntimeDecodeRequest = backend_contracts.DecoderRuntimeDecodeRe
 pub const DecoderRuntimePrefillFramePlanRequest = backend_contracts.DecoderRuntimePrefillFramePlanRequest;
 pub const DecoderRuntimeGraphCommandPlanFrameRequest = backend_contracts.DecoderRuntimeGraphCommandPlanFrameRequest;
 pub const DebertaEncoderLayerSpec = backend_contracts.DebertaEncoderLayerSpec;
+pub const DebertaRelativeEmbeddingRequest = backend_contracts.DebertaRelativeEmbeddingRequest;
 pub const DebertaEncoderFramePlanRequest = backend_contracts.DebertaEncoderFramePlanRequest;
 pub const DebertaEncoderLayerRequest = backend_contracts.DebertaEncoderLayerRequest;
 
@@ -2060,6 +2063,10 @@ pub const ComputeBackend = struct {
         /// This prepares model-specific encoder block metadata without
         /// executing the frame.
         debertaEncoderPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderFramePlanRequest) anyerror!bool = null,
+
+        /// Normalize and gather the model-scoped DeBERTa relative embedding
+        /// table. Backends may retain this immutable result across requests.
+        debertaRelativeEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaRelativeEmbeddingRequest) anyerror!?CT = null,
 
         /// Execute one GLiNER DeBERTa encoder layer from a previously
         /// prepared backend-owned slot layout. Backends return null when the
@@ -3857,6 +3864,11 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return false;
+    }
+
+    pub fn debertaRelativeEmbeddings(self: *const ComputeBackend, request: *const DebertaRelativeEmbeddingRequest) !?CT {
+        const op = self.vtable.debertaRelativeEmbeddings orelse return null;
+        return op(self.ptr, request);
     }
 
     pub fn debertaEncoderLayer(self: *const ComputeBackend, request: *const DebertaEncoderLayerRequest) !?CT {

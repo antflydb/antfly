@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -21,6 +22,7 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
@@ -29,6 +31,8 @@ const table_writes_api = @import("table_writes.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const query_response = @import("query_response.zig");
+const backup_contract = @import("backup_contract.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
 
@@ -84,6 +88,7 @@ pub const RepairCancelStateResponse = struct {
 
 pub const QueryResponse = struct {
     content_type: ?[]u8 = null,
+    identity_read_generation: ?u64 = null,
     body: []u8,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
@@ -248,8 +253,24 @@ pub const ApiHttpClient = struct {
         };
     }
 
+    /// Public generated operations live below `/db/v1`. Internal forwarding
+    /// deliberately remains rooted on the listener, so callers continue to
+    /// pass a node base URI rather than having to know which routing namespace
+    /// an operation belongs to.
+    fn joinRoute(self: *ApiHttpClient, base_uri: []const u8, path: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, path, "/internal/v1/")) {
+            return raft_routes.Routes.join(self.alloc, base_uri, path);
+        }
+        if (std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/")) {
+            return raft_routes.Routes.join(self.alloc, base_uri, path);
+        }
+        const canonical_path = try std.fmt.allocPrint(self.alloc, "/db/v1{s}", .{path});
+        defer self.alloc.free(canonical_path);
+        return raft_routes.Routes.join(self.alloc, base_uri, canonical_path);
+    }
+
     pub fn fetchClusterStatus(self: *ApiHttpClient, base_uri: []const u8) !std.json.Parsed(cluster.ClusterStatus) {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.status);
+        const uri = try self.joinRoute(base_uri, routes.Routes.status);
         defer self.alloc.free(uri);
         var resp = try self.executor.execute(self.alloc, .{
             .method = .GET,
@@ -260,6 +281,30 @@ pub const ApiHttpClient = struct {
         return try std.json.parseFromSlice(cluster.ClusterStatus, self.alloc, resp.body, .{ .allocate = .alloc_always });
     }
 
+    pub fn fetchDataRaftBatchProtocolVersion(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !u16 {
+        const uri = try self.joinRoute(base_uri, routes.Routes.internal_capabilities);
+        defer self.alloc.free(uri);
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        const Parsed = struct { data_raft_batch_protocol_version: u16 = 0 };
+        const parsed = try std.json.parseFromSlice(Parsed, self.alloc, resp.body, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        return parsed.value.data_raft_batch_protocol_version;
+    }
+
     pub fn fetchLookup(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -267,23 +312,32 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
-        const path = if (fields) |field_list|
+        const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table_name);
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
+        const encoded_fields = if (fields) |field_list|
+            try percentEncodePathComponent(self.alloc, field_list)
+        else
+            null;
+        defer if (encoded_fields) |value| self.alloc.free(value);
+        const path = if (fields) |_|
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
-                field_list,
+                encoded_key,
+                encoded_fields orelse unreachable,
             })
         else
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
+                encoded_key,
             });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -310,31 +364,70 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
-        const suffix = if (fields) |field_list|
-            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
+        return self.fetchGroupLookupWithControl(base_uri, group_id, table_name, key, fields, "read_index", null, null);
+    }
+
+    pub fn fetchGroupLookupWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        fields: ?[]const u8,
+        read_consistency: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !LookupResponse {
+        // Group lookups are also used for routed derived-artifact hydration.
+        // Those storage keys are binary and contain namespace bytes and NUL
+        // component terminators, so every externally represented component
+        // must be encoded before it enters an HTTP request target. Fields are
+        // user-controlled JSON paths and must likewise remain a single query
+        // value even when they contain URI delimiters.
+        const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table_name);
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
+        const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
+        defer self.alloc.free(encoded_consistency);
+        const encoded_fields = if (fields) |field_list|
+            try percentEncodePathComponent(self.alloc, field_list)
+        else
+            null;
+        defer if (encoded_fields) |value| self.alloc.free(value);
+        const suffix = if (fields) |_|
+            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}&read_consistency={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
-                field_list,
+                encoded_key,
+                encoded_fields orelse unreachable,
+                encoded_consistency,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?read_consistency={s}", .{
                 routes.Routes.tables_prefix,
-                table_name,
+                encoded_table_name,
                 routes.Routes.documents_marker,
-                key,
+                encoded_key,
+                encoded_consistency,
             });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{ .method = .GET, .uri = uri });
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -357,7 +450,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.documents_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -381,23 +474,102 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !TablesResponse {
+        return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &.{}, null);
+    }
+
+    pub fn fetchBackupTableFenced(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backup_contract.TableBackupFence,
+    ) !TablesResponse {
+        var metadata_group_id_buffer: [20]u8 = undefined;
+        const metadata_group_id = try std.fmt.bufPrint(&metadata_group_id_buffer, "{d}", .{fence.metadata_group_id});
+        var table_id_buffer: [20]u8 = undefined;
+        const table_id = try std.fmt.bufPrint(&table_id_buffer, "{d}", .{fence.table_id});
+        var topology_count_buffer: [20]u8 = undefined;
+        const topology_count = try std.fmt.bufPrint(&topology_count_buffer, "{d}", .{fence.topology_range_count});
+        const definition_digest = std.fmt.bytesToHex(fence.definition_digest, .lower);
+        const topology_digest = std.fmt.bytesToHex(fence.topology_digest, .lower);
+        var writer_not_after_buffer: [20]u8 = undefined;
+        const writer_not_after = try std.fmt.bufPrint(
+            &writer_not_after_buffer,
+            "{d}",
+            .{fence.writer_not_after_unix_ns orelse return error.InvalidBackupFence},
+        );
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_fence_metadata_group_id_header, .value = metadata_group_id },
+            .{ .name = backup_contract.backup_fence_metadata_incarnation_header, .value = &fence.metadata_incarnation },
+            .{ .name = backup_contract.backup_fence_table_id_header, .value = table_id },
+            .{ .name = backup_contract.backup_fence_definition_header, .value = &definition_digest },
+            .{ .name = backup_contract.backup_fence_topology_count_header, .value = topology_count },
+            .{ .name = backup_contract.backup_fence_topology_header, .value = &topology_digest },
+            .{ .name = backup_contract.backup_writer_not_after_header, .value = writer_not_after },
+        };
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &headers, &delivery_tracker);
+    }
+
+    fn fetchBackupTableWithHeaders(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+        headers: []const http_common.RequestHeader,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+    ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
             routes.Routes.backup_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = headers,
             .content_type = "application/json",
             .body = body,
-        });
+            .delivery_tracker = delivery_tracker,
+        }) catch |err| {
+            if (delivery_tracker) |tracker| {
+                const delivery = tracker.load();
+                if (delivery != .not_sent and !(delivery == .unknown and err == error.ConnectionRefused))
+                    return error.BackupOutcomeAmbiguous;
+            }
+            return err;
+        };
         defer resp.deinit(self.alloc);
-        if (resp.status != 201) return error.UnexpectedHttpStatus;
+        if (resp.status != 201) {
+            if (resp.status == 409) {
+                var conflict = ant_json.parseFromSlice(
+                    struct { code: []const u8 },
+                    self.alloc,
+                    resp.body,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return error.UnexpectedHttpStatus;
+                defer conflict.deinit();
+                if (std.mem.eql(u8, conflict.value.code, "backup_already_exists")) return error.BackupAlreadyExists;
+                if (std.mem.eql(u8, conflict.value.code, "table_catalog_changed")) return error.CatalogChanged;
+                if (std.mem.eql(u8, conflict.value.code, "backup_outcome_ambiguous")) return error.BackupOutcomeAmbiguous;
+            }
+            if (resp.status == 503) {
+                var unavailable = ant_json.parseFromSlice(
+                    struct { code: []const u8 },
+                    self.alloc,
+                    resp.body,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return error.UnexpectedHttpStatus;
+                defer unavailable.deinit();
+                if (std.mem.eql(u8, unavailable.value.code, "metadata_leader_unavailable")) return error.NotLeader;
+                if (std.mem.eql(u8, unavailable.value.code, "metadata_capability_unavailable")) return error.MetadataCapabilityUnavailable;
+            }
+            return error.UnexpectedHttpStatus;
+        }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
@@ -413,7 +585,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.restore_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -432,7 +604,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TablesResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.backup);
+        const uri = try self.joinRoute(base_uri, routes.Routes.backup);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -459,7 +631,7 @@ pub const ApiHttpClient = struct {
         const path = routes.Routes.backup;
 
         for (base_uris, 0..) |base_uri, endpoint_index| {
-            const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+            const uri = try self.joinRoute(base_uri, path);
             defer self.alloc.free(uri);
 
             var resp = try self.executor.execute(self.alloc, .{
@@ -486,7 +658,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TablesResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.restore);
+        const uri = try self.joinRoute(base_uri, routes.Routes.restore);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -507,7 +679,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}?location={s}", .{ routes.Routes.backups, location });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -534,7 +706,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -565,7 +737,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.query_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -587,7 +759,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !RetrievalAgentResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.agents_retrieval);
+        const uri = try self.joinRoute(base_uri, routes.Routes.agents_retrieval);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -630,7 +802,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -649,7 +821,10 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        return .{
+            .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchGroupQueryPreflight(
@@ -681,7 +856,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         const preflight_body = if (max_work == 0)
@@ -812,7 +987,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -858,7 +1033,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -904,7 +1079,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -951,7 +1126,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1000,12 +1175,17 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        const response_headers = [_]http_common.RequestHeader{.{
+            .name = algebraic_partials_wire.response_encoding_header,
+            .value = algebraic_partials_wire.base64_v1,
+        }};
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = &response_headers,
             .content_type = "application/json",
             .body = body,
             .timeout_ms = timeout_ms,
@@ -1048,7 +1228,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1083,7 +1263,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1128,7 +1308,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1178,7 +1358,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1228,7 +1408,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1278,7 +1458,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1298,7 +1478,10 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        return .{
+            .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchBatch(
@@ -1313,7 +1496,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.batch_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1338,7 +1521,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TransactionResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions_commit);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions_commit);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1363,7 +1546,7 @@ pub const ApiHttpClient = struct {
         base_uri: []const u8,
         body: []const u8,
     ) !TransactionBeginResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions_begin);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions_begin);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1380,7 +1563,7 @@ pub const ApiHttpClient = struct {
     }
 
     pub fn fetchTransactionSessions(self: *ApiHttpClient, base_uri: []const u8) !TransactionResponse {
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, routes.Routes.transactions);
+        const uri = try self.joinRoute(base_uri, routes.Routes.transactions);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1401,7 +1584,7 @@ pub const ApiHttpClient = struct {
         else
             try self.alloc.dupe(u8, routes.Routes.transactions_cleanup);
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1428,7 +1611,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_commit_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1455,7 +1638,7 @@ pub const ApiHttpClient = struct {
             txn_id_hex,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1482,7 +1665,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_stage_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1537,7 +1720,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_savepoints_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1566,7 +1749,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_rollback_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1592,7 +1775,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.transactions_abort_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1620,7 +1803,7 @@ pub const ApiHttpClient = struct {
             suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1676,7 +1859,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var remaining_buf: [10]u8 = undefined;
@@ -1725,6 +1908,15 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             const outcome = resp.header(internal_batch_forwarding.outcome_header);
+            if (resp.status == 202) {
+                const outcome_body = std.mem.trim(u8, resp.body, " \t\r\n");
+                if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_committed_repair_required_v1)) or
+                    std.mem.eql(u8, outcome_body, internal_batch_forwarding.committed_repair_required_body))
+                    return error.EnrichmentWorkerFailed;
+                if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_committed_visibility_pending_v1)) or
+                    std.mem.eql(u8, outcome_body, internal_batch_forwarding.committed_visibility_pending_body))
+                    return error.EnrichmentRetryInProgress;
+            }
             if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_unknown_v1)) or
                 std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "write outcome unknown"))
             {
@@ -1776,7 +1968,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1812,7 +2004,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1853,7 +2045,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1891,7 +2083,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1924,7 +2116,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1957,7 +2149,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -1995,7 +2187,7 @@ pub const ApiHttpClient = struct {
             routes.Routes.repair_cancel_state_suffix,
         });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2039,7 +2231,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2082,7 +2274,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2115,7 +2307,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2149,7 +2341,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2175,7 +2367,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body);
+        return try self.fetchGroupTxnResolveWithControl(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupTxnResolveWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, cancellation);
     }
 
     pub fn fetchGroupTxnAcknowledge(
@@ -2185,7 +2388,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null);
     }
 
     pub fn fetchGroupTxnStatus(
@@ -2203,7 +2406,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2290,6 +2493,7 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         suffix_name: []const u8,
         body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -2299,7 +2503,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2307,10 +2511,18 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => return .{},
+            202 => {
+                if (std.mem.eql(u8, resp.body, "committed_repair_required"))
+                    return error.EnrichmentWorkerFailed;
+                if (std.mem.eql(u8, resp.body, "committed_visibility_pending"))
+                    return error.CommitVisibilityNotSatisfied;
+                return error.UnexpectedHttpStatus;
+            },
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
@@ -2328,7 +2540,7 @@ pub const ApiHttpClient = struct {
     ) ![]u8 {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2361,7 +2573,7 @@ pub const ApiHttpClient = struct {
     ) ![]u8 {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2388,7 +2600,7 @@ pub const ApiHttpClient = struct {
         else
             try self.alloc.dupe(u8, routes.Routes.tables);
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2407,7 +2619,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2427,7 +2639,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2448,7 +2660,7 @@ pub const ApiHttpClient = struct {
     ) !EmptyResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2468,7 +2680,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/schema", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2489,7 +2701,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes", .{ routes.Routes.tables_prefix, table_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2509,7 +2721,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2530,7 +2742,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2555,7 +2767,7 @@ pub const ApiHttpClient = struct {
     ) !TablesResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}/indexes/{s}", .{ routes.Routes.tables_prefix, table_name, index_name });
         defer self.alloc.free(path);
-        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
         var resp = try self.executor.execute(self.alloc, .{
@@ -2826,6 +3038,8 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "IdentityReadGenerationChanged") or
         std.mem.eql(u8, body, "identity read generation changed")) return error.IdentityReadGenerationChanged;
+    if (std.mem.eql(u8, body, "HierarchyCursorStale") or
+        std.mem.eql(u8, body, "hierarchy cursor stale")) return error.HierarchyCursorStale;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
@@ -2880,9 +3094,19 @@ fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {
+    const value = resp.header(query_response.QueryResponse.identity_read_generation_header) orelse return null;
+    return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidRemoteResponse;
+}
+
 test "api http client preserves remote transaction decision conflicts" {
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
+}
+
+test "api http client preserves stale hierarchy cursor conflicts" {
+    try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("HierarchyCursorStale"));
+    try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("hierarchy cursor stale"));
 }
 
 test "api http client preserves remote storage read contention" {
@@ -2950,6 +3174,38 @@ test "api http client accepts durable pending batch responses" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"committed_pending\"") != null);
+}
+
+test "api http client encodes lookup route and query components" {
+    const LookupExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.indexOfScalar(u8, req.uri, 0) == null);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/tables/docs%2Ftenant/documents/%01doc%00%00%20asset?fields=title%2Cowner%26admin",
+            ));
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var executor = LookupExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchLookup(
+        "http://127.0.0.1:1",
+        "docs/tenant",
+        "\x01doc\x00\x00\x20asset",
+        "title,owner&admin",
+    );
+    defer response.deinit(std.testing.allocator);
 }
 
 test "api http client preserves retryable group transaction unavailability" {
@@ -3087,12 +3343,26 @@ test "api http client forwards internal query controls and maps remote timeout" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            if (std.mem.indexOf(u8, req.uri, "/join-") == null) {
-                try std.testing.expect(req.cancellation != null);
+            switch (req.method) {
+                .GET => {
+                    if (std.mem.indexOf(u8, req.uri, "%01doc%00%00%20asset") != null) {
+                        try std.testing.expect(std.mem.indexOfScalar(u8, req.uri, 0) == null);
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "fields=title%2Cowner%26admin&read_consistency=stale") != null);
+                    } else {
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "/documents/doc%3Aa?") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, req.uri, "fields=title&read_consistency=stale") != null);
+                    }
+                    try std.testing.expect(req.cancellation != null);
+                },
+                .POST => if (std.mem.indexOf(u8, req.uri, "/join-") == null) {
+                    try std.testing.expect(req.cancellation != null);
+                },
+                else => return error.TestUnexpectedMethod,
             }
             return .{
-                .status = 408,
+                // The operation layer reports server-side deadlines as 504;
+                // client-side cancellation remains the existing 408 shape.
+                .status = if (req.method == .GET) 504 else 408,
                 .body = try alloc.dupe(u8, "query timeout"),
             };
         }
@@ -3102,6 +3372,8 @@ test "api http client forwards internal query controls and maps remote timeout" 
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
     const base_uri = "http://127.0.0.1:1";
     var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(error.Timeout, client.fetchGroupLookupWithControl(base_uri, 7, "docs", "doc:a", "title", "stale", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupLookupWithControl(base_uri, 7, "docs", "\x01doc\x00\x00\x20asset", "title,owner&admin", "stale", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupQueryWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupQueryPreflightWithControl(base_uri, 7, "docs", "{}", 0, 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupTextStatsWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
@@ -3114,7 +3386,7 @@ test "api http client forwards internal query controls and maps remote timeout" 
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphExpandWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphHydrateWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphEdgesWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
-    try std.testing.expectEqual(@as(usize, 12), executor.calls);
+    try std.testing.expectEqual(@as(usize, 14), executor.calls);
 }
 
 test "api http client encodes table name for repair cancel callback" {
@@ -3243,6 +3515,49 @@ test "api http client forwards bounded raft batch routing context without alloca
     response.deinit(std.testing.allocator);
 }
 
+test "api http client preserves committed visibility outcomes for forwarded raft batches" {
+    const OutcomeExecutor = struct {
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+
+    var executor = OutcomeExecutor{ .body = "committed_visibility_pending" };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const forwarding: internal_batch_forwarding.Context = .{
+        .remaining_ms = 425,
+        .forwards_remaining = 1,
+        .campaign_allowed = false,
+    };
+    try std.testing.expectError(error.EnrichmentRetryInProgress, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        forwarding,
+        null,
+    ));
+    executor.body = "committed_repair_required";
+    try std.testing.expectError(error.EnrichmentWorkerFailed, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        forwarding,
+        null,
+    ));
+}
+
 test "api http client rejects unsupported routed batch protocol without legacy replay" {
     const UnsupportedExecutor = struct {
         attempts: usize = 0,
@@ -3361,6 +3676,45 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
     try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 }
 
+test "fenced backup forwarding treats post-send transport failure as ambiguous" {
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            try std.testing.expectEqual(@as(usize, 7), req.headers.len);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_metadata_group_id_header, req.headers[0].name);
+            try std.testing.expectEqualStrings("3", req.headers[0].value);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_metadata_incarnation_header, req.headers[1].name);
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", req.headers[1].value);
+            try std.testing.expectEqualStrings(backup_contract.backup_fence_table_id_header, req.headers[2].name);
+            try std.testing.expectEqualStrings("7", req.headers[2].value);
+            try std.testing.expectEqualStrings(backup_contract.backup_writer_not_after_header, req.headers[6].name);
+            try std.testing.expectEqualStrings("123", req.headers[6].value);
+            tracker.markMayHaveBeenSent();
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var client = ApiHttpClient.init(std.testing.allocator, Executor.iface());
+    try std.testing.expectError(error.BackupOutcomeAmbiguous, client.fetchBackupTableFenced(
+        "http://127.0.0.1:7777",
+        "docs",
+        "{}",
+        .{
+            .metadata_group_id = 3,
+            .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+            .table_id = 7,
+            .definition_digest = [_]u8{0x11} ** 32,
+            .topology_range_count = 1,
+            .topology_digest = [_]u8{0x22} ** 32,
+            .writer_not_after_unix_ns = 123,
+        },
+    ));
+}
+
 test "api http client encodes merge doc identity reassignment action flag" {
     const alloc = std.testing.allocator;
     const table_contract: metadata_mod.TransitionTableContract = .{
@@ -3394,9 +3748,9 @@ test "api http client encodes merge doc identity reassignment action flag" {
     );
 }
 
-test "api http client round-trips public status route" {
+test "api http client round-trips public status and internal capability routes" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -3423,9 +3777,8 @@ test "api http client round-trips public status route" {
     var source = FakeSource{};
     var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3436,11 +3789,15 @@ test "api http client round-trips public status route" {
     var status = try client.fetchClusterStatus(base_uri);
     defer status.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.degraded, status.value.health);
+    try std.testing.expectEqual(
+        internal_batch_forwarding.raft_batch_protocol_version,
+        try client.fetchDataRaftBatchProtocolVersion(base_uri, null, null),
+    );
 }
 
 test "api http client round-trips shard median key route" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -3495,9 +3852,8 @@ test "api http client round-trips shard median key route" {
         .shard_db_adapter = FakeShardDb.adapter(),
     }, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3517,7 +3873,7 @@ test "api http client round-trips shard median key route" {
 test "api http client round-trips public table management routes" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
     const tables_api = @import("tables.zig");
@@ -3654,9 +4010,8 @@ test "api http client round-trips public table management routes" {
     defer source.deinit(std.heap.page_allocator);
     var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, null);
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3735,8 +4090,10 @@ test "api http client round-trips public table management routes" {
 test "api http client round-trips public transaction commit route" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
+    const raft_mod = @import("../raft/mod.zig");
+    const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
 
     const alloc = std.testing.allocator;
@@ -3755,6 +4112,7 @@ test "api http client round-trips public transaction commit route" {
         .timestamp_ns = 11,
     });
 
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -3773,11 +4131,10 @@ test "api http client round-trips public transaction commit route" {
     };
 
     var source = FakeSource{};
-    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, write_source.source());
+    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), read_source.source(), write_source.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(std.heap.page_allocator, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
@@ -3821,16 +4178,16 @@ test "api http client round-trips public transaction commit route" {
     try std.testing.expectEqualStrings("docs", stateless_conflict.table);
     try std.testing.expectEqualStrings("doc:a", stateless_conflict.key);
     try std.testing.expectEqual(@as(?u64, 11), stateless_conflict.expected_version);
-    try std.testing.expectEqual(@as(?u64, 12), stateless_conflict.current_version);
-    const stateless_participant = stateless_conflict.participant.?;
-    try std.testing.expectEqual(@as(?u64, null), stateless_participant.group_id);
-    try std.testing.expectEqualStrings("prepare", stateless_participant.phase.?);
+    try std.testing.expect(stateless_conflict.current_version != null);
+    try std.testing.expect(stateless_conflict.current_version.? > 11);
+    // The read-set preflight detects this conflict before participant prepare.
+    try std.testing.expect(stateless_conflict.participant == null);
 }
 
 test "api http client round-trips long-lived public transaction session routes" {
     const http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const metadata_api = @import("../metadata/api.zig");
     const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
@@ -3873,9 +4230,8 @@ test "api http client round-trips long-lived public transaction session routes" 
     var source = FakeSource{};
     var server = http_server.ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(alloc, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -3974,7 +4330,11 @@ test "api http client round-trips long-lived public transaction session routes" 
 
     var commit_again = try client.fetchTransactionSessionCommit(base_uri, txn_id_hex, "");
     defer commit_again.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), commit_again.status);
+    try std.testing.expectEqual(@as(u16, 200), commit_again.status);
+    var parsed_commit_again = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, commit_again.body, .{});
+    defer parsed_commit_again.deinit();
+    try std.testing.expectEqualStrings("committed", parsed_commit_again.value.status);
+    try std.testing.expectEqualStrings(txn_id_hex, parsed_commit_again.value.transaction_id);
 
     var abort_begin = try client.fetchTransactionBegin(base_uri, "{}");
     defer abort_begin.deinit(alloc);
@@ -3997,12 +4357,12 @@ test "api http client round-trips long-lived public transaction session routes" 
     try std.testing.expectEqual(@as(u16, 200), cleanup.status);
     var parsed_cleanup = try std.json.parseFromSlice(transactions_api.SessionCleanupResponse, alloc, cleanup.body, .{});
     defer parsed_cleanup.deinit();
-    try std.testing.expectEqual(@as(usize, 0), parsed_cleanup.value.removed);
+    try std.testing.expectEqual(@as(usize, 1), parsed_cleanup.value.removed);
 }
 
 test "api http client maps group txn resolve decision conflicts" {
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
     const http_server = @import("http_server.zig");
     const metadata_api = @import("../metadata/api.zig");
 
@@ -4085,9 +4445,8 @@ test "api http client maps group txn resolve decision conflicts" {
     var writes = FakeWrites{};
     var server = http_server.ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
     defer server.deinit();
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, server.executor());
+    var listener = try http_test_runtime.Runtime.startOwned(alloc, &server);
     defer listener.deinit();
-    try listener.start();
 
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -4105,4 +4464,33 @@ test "api http client maps group txn resolve decision conflicts" {
     defer alloc.free(body);
 
     try std.testing.expectError(error.DecisionConflict, client.fetchGroupTxnResolve(base_uri, 7001, "docs", body));
+}
+
+test "api http client transports txn resolve cancellation and visibility reason" {
+    const ResolveExecutor = struct {
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(req.cancellation != null);
+            return .{ .status = 202, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+
+    var executor = ResolveExecutor{ .body = "committed_visibility_pending" };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(
+        error.CommitVisibilityNotSatisfied,
+        client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
+    executor.body = "committed_repair_required";
+    try std.testing.expectError(
+        error.EnrichmentWorkerFailed,
+        client.fetchGroupTxnResolveWithControl("http://127.0.0.1:1", 7, "docs", "{}", &cancellation),
+    );
 }

@@ -30,6 +30,9 @@ pub fn modelSupportsCapability(
     capability: []const u8,
 ) bool {
     if (hasCapability(capabilities, capability)) return true;
+    if (std.mem.eql(u8, model_kind, "classifier")) {
+        return std.mem.eql(u8, capability, "classification");
+    }
     if (!std.mem.eql(u8, model_kind, "recognizer")) return false;
     if (!std.mem.eql(u8, gliner_model_type, "gliner2")) return false;
     return std.mem.eql(u8, capability, "classification") or
@@ -85,6 +88,8 @@ pub fn modelKindAcceptsInput(
 }
 
 test "modelSupportsCapability infers gliner2 extraction and classification" {
+    try std.testing.expect(modelSupportsCapability("classifier", "", &.{}, "classification"));
+    try std.testing.expect(!modelSupportsCapability("classifier", "", &.{}, "extraction"));
     try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "classification"));
     try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "relations"));
     try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "extraction"));

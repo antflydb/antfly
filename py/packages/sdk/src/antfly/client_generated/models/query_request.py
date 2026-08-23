@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_hierarchy import QueryHierarchy
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -132,6 +133,10 @@ class QueryRequest:
             results.
             Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
+            When `hierarchy.group_by` is present, aggregations operate on the complete
+            set of top-level grouped source or unit records. Nested `group_by.matches` are
+            bounded evidence projections and are not counted as aggregation rows.
+
             Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
             bucketing aggregations (terms, range, date_range, histogram, date_histogram),
             geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).
@@ -171,10 +176,32 @@ class QueryRequest:
             lower-level vector search overrides are provided internally.
              Default: 0.5. Example: 0.5.
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
-            Use to reduce response size and improve performance.
+            Use to reduce response size and improve performance. This field is required when
+            hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
+            entire grouped document. Use an empty array for identity-only groups.
+            This projection is also required for hierarchy.children traversal.
              Example: ['title', 'url', 'summary', 'created_at'].
-        limit (int | Unset): Maximum number of results to return. For semantic_search, this is the topk parameter.
-            Default varies by query type (typically 10).
+        hierarchy (QueryHierarchy | Unset): Returns direct index matches with optional projected ancestor context, or
+            groups
+            those matches at a hierarchy level through `group_by`. A group's nested `matches`
+            projection is independently bounded and defaults to three hits while the top-level
+            `limit` continues to control the number of groups.
+
+            `children` is a separate sequential-browsing operation. It enumerates every unit
+            in the selected source revision, including units with no searchable chunk, and uses
+            the top-level `_sort`/`search_after` cursor contract.
+
+            Ancestor and nested-match field projections are always explicit to keep response
+            size predictable. The presence of this object selects the canonical contract:
+            without `group_by` or `children`, including when the object is empty, direct index
+            matches are returned. `ancestors` only controls projected context and never changes result
+            cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+        limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
+            parameter.
+            This does not limit nested matches attached through hierarchy.group_by.matches;
+            use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10).
+            Queries using hierarchy.group_by.matches are limited to 100 top-level groups
+            and a groups-times-matches execution budget of 1,000.
              Example: 20.
         offset (int | Unset): Number of results to skip for pagination. Supported for text-backed,
             match_all, and filter-only requests. Not supported for semantic_search
@@ -187,11 +214,15 @@ class QueryRequest:
              Example: 5000.
         order_by (list[SortField] | Unset): Sort order for results. Array of sort fields with direction.
             Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
+            Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque,
+            sortable value is bound to the complete source hierarchy revision.
             Supported for exact text-backed, match_all, and filter-only requests
             when each non-`_id` field is a mapped exact scalar field with sortable
             native doc-value coverage. Sortable mapping types are keyword,
             numeric/number/integer, boolean/bool, datetime/date/timestamp, and
-            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+            link. Declare the field with `x-antfly-field` and `sortable: true`;
+            `x-antfly-types` shorthand declarations alone are not sortable.
+            Analyzed `text` fields and `search_as_you_type`, geo, embedding,
             blob, html, object, and array fields are not directly sortable; sort
             on an exact scalar mapping such as `title.keyword` instead. Requests
             that cannot be executed through an exact native sort path return 422
@@ -209,6 +240,9 @@ class QueryRequest:
             order and the cursor tuple must contain exactly one `_id` string.
             Supported for exact text-backed, match_all, and filter-only requests;
             not supported for semantic_search or count-only requests.
+            For hierarchy child traversal, a cursor whose source-artifact revision
+            changed returns `409 hierarchy_cursor_stale`; restart the same traversal
+            without `search_after` rather than retrying the stale tuple.
         search_before (list[Any] | Unset): Cursor for backward pagination. Pass the `_sort` values from the first hit
             of the current page exactly, including the appended `_id` tie-breaker.
             Values preserve their JSON types; for example numbers remain numbers,
@@ -418,6 +452,7 @@ class QueryRequest:
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
+    hierarchy: QueryHierarchy | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -664,6 +699,10 @@ class QueryRequest:
         if not isinstance(self.fields, Unset):
             fields = self.fields
 
+        hierarchy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.hierarchy, Unset):
+            hierarchy = self.hierarchy.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -756,6 +795,8 @@ class QueryRequest:
             field_dict["search_effort"] = search_effort
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if hierarchy is not UNSET:
+            field_dict["hierarchy"] = hierarchy
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -824,6 +865,7 @@ class QueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_hierarchy import QueryHierarchy
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -1596,6 +1638,13 @@ class QueryRequest:
 
         fields = cast(list[str], d.pop("fields", UNSET))
 
+        _hierarchy = d.pop("hierarchy", UNSET)
+        hierarchy: QueryHierarchy | Unset
+        if isinstance(_hierarchy, Unset):
+            hierarchy = UNSET
+        else:
+            hierarchy = QueryHierarchy.from_dict(_hierarchy)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1695,6 +1744,7 @@ class QueryRequest:
             embeddings=embeddings,
             search_effort=search_effort,
             fields=fields,
+            hierarchy=hierarchy,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,

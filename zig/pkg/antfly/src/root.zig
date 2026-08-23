@@ -175,6 +175,7 @@ test {
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
     _ = @import("storage/test_manifest.zig");
+    _ = @import("runtime_private_error_diagnostics.zig");
 
     if (comptime build_options.standalone_runtime_focused_test) {
         _ = standalone;
@@ -247,6 +248,7 @@ test {
 
     // Inference
     _ = inference;
+    _ = table_schema;
     _ = @import("chunking/mod.zig");
     _ = pdf;
 
@@ -262,8 +264,9 @@ test {
     // Public API
     _ = public_api;
     _ = public_api.http_server;
-    _ = public_api.http_internal_group_read_routes;
-    _ = public_api.http_internal_group_join_routes;
+    _ = public_api.internal_query_operations;
+    _ = public_api.tables;
+    _ = public_api.indexes;
 
     // Raft integration
     _ = raft;

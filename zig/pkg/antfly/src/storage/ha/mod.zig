@@ -52,6 +52,7 @@ pub const compat = @import("compat.zig");
 pub const effects = @import("effects.zig");
 pub const http_admin = @import("http_admin.zig");
 pub const http_internal = @import("http_internal.zig");
+pub const http_operation = @import("http_operation.zig");
 pub const http_replication_client = @import("http_replication_client.zig");
 pub const http_client = @import("http_client.zig");
 
@@ -98,6 +99,7 @@ test {
     _ = effects;
     _ = http_admin;
     _ = http_internal;
+    _ = http_operation;
     _ = http_replication_client;
     _ = http_client;
 }

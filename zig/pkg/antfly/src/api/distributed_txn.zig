@@ -106,6 +106,14 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             req: TxnAcknowledgeRequest,
         ) anyerror!void = null,
+        resolve_group_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: TxnResolveRequest,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!void = null,
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -118,6 +126,12 @@ pub const ParticipantWorker = struct {
 
     pub fn resolveGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
         try self.vtable.resolve_group(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn resolveGroupWithCancellation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
+        const resolve = self.vtable.resolve_group_with_cancellation orelse
+            return try self.resolveGroup(alloc, group_id, table_name, req);
+        try resolve(self.ptr, alloc, group_id, table_name, req, cancellation);
     }
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -191,6 +205,7 @@ pub const HostedParticipantWorker = struct {
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
+                .resolve_group_with_cancellation = resolveGroupWithCancellation,
                 .status_group = statusGroup,
                 .acknowledge_group = acknowledgeGroup,
             },
@@ -230,16 +245,32 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
+        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, .none);
+    }
+
+    fn resolveGroupWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnResolveRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnResolve(remote.base_uri, group_id, table_name, body);
+                // The semantic callback remains process-local. Adapt it to the
+                // HTTP executor's cancellation contract so disconnecting this
+                // RPC also signals the remote request context. If delivery is
+                // ambiguous, the coordinator probes the same transaction ID
+                // before deciding whether abort is still legal.
+                var request_cancellation = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupTxnResolveWithControl(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    if (cancellation.ptr != null) &request_cancellation else null,
+                );
                 response.deinit(alloc);
             },
         }
@@ -294,6 +325,7 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
+                .resolve_group_with_cancellation = resolveGroupWithCancellation,
                 .status_group = statusGroup,
                 .acknowledge_group = acknowledgeGroup,
             },
@@ -311,8 +343,12 @@ pub const LocalTableWriteParticipantWorker = struct {
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
+        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, .none);
+    }
+
+    fn resolveGroupWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -341,6 +377,9 @@ pub const ExecuteOptions = struct {
     /// prepare, and phase-two delivery use bounded concurrent windows.
     fanout_io: ?std.Io = null,
     max_parallel_participants: usize = 8,
+    /// Consulted only by participant implementations after a committed
+    /// transaction mutation is durable, never during begin or prepare.
+    post_commit_cancellation: db_mod.types.CancellationToken = .none,
 };
 
 const ParticipantFanoutSlot = struct {
@@ -355,6 +394,42 @@ const ParticipantFanoutSlot = struct {
         self.* = .{};
     }
 };
+
+/// Participant implementations expose the same post-commit visibility state
+/// through two boundaries: local workers retain the storage error, while the
+/// internal HTTP protocol normalizes retryable visibility to the public
+/// transaction error. Keep the semantic classification in one place so a
+/// transported 202 cannot be mistaken for failed phase-two delivery.
+fn isPostCommitVisibilityError(err: anyerror) bool {
+    return switch (err) {
+        error.CommitVisibilityNotSatisfied,
+        error.EnrichmentWaitCanceled,
+        error.EnrichmentWaitTimeout,
+        error.EnrichmentRetryInProgress,
+        error.EnrichmentWorkerFailed,
+        => true,
+        else => false,
+    };
+}
+
+fn isTerminalVisibilityRepair(err: anyerror) bool {
+    return err == error.EnrichmentWorkerFailed;
+}
+
+test "distributed txn classifies local and transported visibility outcomes identically" {
+    inline for (.{
+        error.CommitVisibilityNotSatisfied,
+        error.EnrichmentWaitCanceled,
+        error.EnrichmentWaitTimeout,
+        error.EnrichmentRetryInProgress,
+        error.EnrichmentWorkerFailed,
+    }) |err| {
+        try std.testing.expect(isPostCommitVisibilityError(err));
+    }
+    try std.testing.expect(!isPostCommitVisibilityError(error.GroupLeaderUnavailable));
+    try std.testing.expect(isTerminalVisibilityRepair(error.EnrichmentWorkerFailed));
+    try std.testing.expect(!isTerminalVisibilityRepair(error.CommitVisibilityNotSatisfied));
+}
 
 fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
     if (options.fanout_io == null or participant_count <= 1) return 1;
@@ -689,12 +764,14 @@ fn executeMultiTableCommitOnce(
     // fails and a follower was only proposed). Track them independently so a
     // later phase-two outcome cannot hide an earlier recovery obligation.
     var visibility_pending = false;
+    var visibility_retry_pending = false;
+    var visibility_repair_required = false;
     var propagation_pending = false;
     var propagation_failed = false;
     if (participants.items.len > 0) {
         const participant = participants.items[0];
         const coordinator_sync_level: db_mod.types.SyncLevel = if (sync_level == .propose) .write else sync_level;
-        worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
@@ -709,7 +786,7 @@ fn executeMultiTableCommitOnce(
             // the caller's requested visibility contract and are recoverable
             // from the durable coordinator decision.
             .sync_level = coordinator_sync_level,
-        }) catch |err| switch (err) {
+        }, options.post_commit_cancellation) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
@@ -753,6 +830,7 @@ fn executeMultiTableCommitOnce(
                     commit_version,
                     coordinator_sync_level,
                     err,
+                    options.post_commit_cancellation,
                 ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
@@ -773,6 +851,8 @@ fn executeMultiTableCommitOnce(
                             participant.table_name, participant.group_id, @errorName(err),
                         });
                         visibility_pending = true;
+                        visibility_repair_required = err == error.EnrichmentWorkerFailed;
+                        visibility_retry_pending = err != error.EnrichmentWorkerFailed;
                     },
                     .pending => {
                         abort_on_error = false;
@@ -808,21 +888,43 @@ fn executeMultiTableCommitOnce(
     for (fanout_slots[follower_start..], follower_start..) |slot, participant_index| {
         if (slot.err) |err| {
             const participant = participants.items[participant_index];
+            const visibility_error = isPostCommitVisibilityError(err);
             if (trace_writer) |tw| {
                 tw.traceEvent(&.{
-                    .name = if (err == error.DecisionConflict) "ResolveDecisionConflict" else "ResolveParticipantFailure",
+                    .name = if (visibility_error)
+                        "ResolveVisibilityPending"
+                    else if (err == error.DecisionConflict)
+                        "ResolveDecisionConflict"
+                    else
+                        "ResolveParticipantFailure",
                     .txn_id = txn_id,
                     .shard_id = "",
                     .timestamp = commit_version,
                     .reason = @errorName(err),
                 });
             }
-            std.log.warn("transaction commit propagation failed table={s} group_id={} err={s}", .{
-                participant.table_name,
-                participant.group_id,
-                @errorName(err),
-            });
-            propagation_failed = true;
+            if (visibility_error) {
+                std.log.warn("transaction participant visibility deferred table={s} group_id={} err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    @errorName(err),
+                });
+                // Participant resolution reports these outcomes only after
+                // its mutation is durable. They are visibility results, not
+                // evidence that phase-two delivery failed.
+                visibility_pending = true;
+                visibility_repair_required = visibility_repair_required or
+                    isTerminalVisibilityRepair(err);
+                visibility_retry_pending = visibility_retry_pending or
+                    !isTerminalVisibilityRepair(err);
+            } else {
+                std.log.warn("transaction commit propagation failed table={s} group_id={} err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    @errorName(err),
+                });
+                propagation_failed = true;
+            }
         }
         if (slot.acknowledgement_err) |err| {
             const participant = participants.items[participant_index];
@@ -845,15 +947,18 @@ fn executeMultiTableCommitOnce(
         .coordinator_table_name = if (participants.items.len > 0) participants.items[0].table_name else null,
     };
     if (options.report_post_commit_failure) {
-        // A definite participant failure is more actionable than a failed
-        // visibility barrier. Otherwise preserve the direct visibility error
-        // ahead of proposal-only propagation that recovery will make durable.
+        // Recovery and retryable visibility remain live work even when a
+        // different participant also needs repair. Report live obligations
+        // first so callers do not incorrectly treat the transaction as final.
         // Callers requesting structured outcomes receive every pending flag.
         if (propagation_failed) return error.CommitPropagationIncomplete;
-        if (visibility_pending) return error.CommitVisibilityNotSatisfied;
         if (propagation_pending) return error.CommitPropagationIncomplete;
+        if (visibility_retry_pending) return error.CommitVisibilityNotSatisfied;
+        if (visibility_repair_required) return error.EnrichmentWorkerFailed;
     }
     result.visibility_pending = visibility_pending;
+    result.visibility_retry_pending = visibility_retry_pending;
+    result.visibility_repair_required = visibility_repair_required;
     result.propagation_pending = propagation_pending;
     if (visibility_pending) {
         std.log.warn("transaction commit acknowledged with deferred visibility txn_id={x}", .{txn_id});
@@ -879,6 +984,7 @@ fn resolveCoordinatorDecisionAfterFailure(
     commit_version: u64,
     sync_level: db_mod.types.SyncLevel,
     initial_resolve_error: anyerror,
+    cancellation: db_mod.types.CancellationToken,
 ) !db_mod.types.TxnStatus {
     var attempts: usize = 1;
     var last_resolve_error = initial_resolve_error;
@@ -900,13 +1006,13 @@ fn resolveCoordinatorDecisionAfterFailure(
                 return error.CommitDecisionUnknown;
             }
             attempts += 1;
-            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+            worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
                 .txn_id = txn_id,
                 .status = .committed,
                 .commit_version = commit_version,
                 .topology_epoch = participant.topology_epoch,
                 .sync_level = sync_level,
-            }) catch |retry_err| {
+            }, cancellation) catch |retry_err| {
                 last_resolve_error = retry_err;
                 continue;
             };
@@ -915,13 +1021,13 @@ fn resolveCoordinatorDecisionAfterFailure(
 
         if (status != .pending or attempts >= max_coordinator_resolution_attempts) return status;
         attempts += 1;
-        worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
             .topology_epoch = participant.topology_epoch,
             .sync_level = sync_level,
-        }) catch |retry_err| {
+        }, cancellation) catch |retry_err| {
             last_resolve_error = retry_err;
             continue;
         };
@@ -1088,20 +1194,30 @@ const ResolveFollowerFanoutTask = struct {
         commit_version: u64,
         sync_level: db_mod.types.SyncLevel,
         resume_committed: bool,
+        cancellation: db_mod.types.CancellationToken,
         slot: *ParticipantFanoutSlot,
     ) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+        worker.resolveGroupWithCancellation(arena.allocator(), participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
             .topology_epoch = if (resume_committed) 0 else participant.topology_epoch,
             .sync_level = sync_level,
-        }) catch |err| {
+        }, cancellation) catch |err| {
             slot.err = err;
-            slot.propagation_pending = true;
-            return;
+            // These errors are emitted only after the participant mutation is
+            // durable; only its requested derived-visibility barrier remains.
+            // The participant must still be acknowledged below: visibility
+            // debt is not phase-two delivery debt, and leaving the participant
+            // enlisted would strand topology transitions after the stable
+            // coordinator record is released.
+            const post_commit_visibility = isPostCommitVisibilityError(err);
+            if (!post_commit_visibility) {
+                slot.propagation_pending = true;
+                return;
+            }
         };
         if (sync_level == .propose) {
             // Proposal acceptance can be lost on leadership change. Retain the
@@ -1149,6 +1265,7 @@ fn runResolveFollowerFanout(
                     commit_version,
                     sync_level,
                     resume_committed,
+                    options.post_commit_cancellation,
                     &slots[i],
                 }) catch ResolveFollowerFanoutTask.run(
                     worker,
@@ -1159,6 +1276,7 @@ fn runResolveFollowerFanout(
                     commit_version,
                     sync_level,
                     resume_committed,
+                    options.post_commit_cancellation,
                     &slots[i],
                 );
             }
@@ -1173,6 +1291,7 @@ fn runResolveFollowerFanout(
                 commit_version,
                 sync_level,
                 resume_committed,
+                options.post_commit_cancellation,
                 &slots[i],
             );
         }
@@ -1226,6 +1345,7 @@ test "distributed txn retries an ambiguous coordinator decision under the same i
         // selected for the original decision submission.
         .write,
         error.InjectedResolveFailure,
+        .none,
     );
     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
     try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
@@ -1270,6 +1390,7 @@ test "distributed txn bounds unresolved coordinator decision retries" {
         10_001,
         .write,
         error.InjectedResolveFailure,
+        .none,
     ));
     try std.testing.expectEqual(max_coordinator_resolution_attempts, recorder.status_calls);
     try std.testing.expectEqual(max_coordinator_resolution_attempts - 1, recorder.resolve_calls);
@@ -3107,6 +3228,11 @@ test "distributed txn coordinator never aborts after durable commit decision" {
         abort_calls: usize = 0,
         second_conflict: bool = false,
         retry_ambiguous_coordinator: bool = false,
+        worker_failure: bool = false,
+        follower_retry_pending: bool = false,
+        follower_transported_visibility_pending: bool = false,
+        acknowledgement_failure: bool = false,
+        acknowledgement_calls: usize = 0,
         coordinator_resolve_calls: usize = 0,
         coordinator_retry_sync_level: ?db_mod.types.SyncLevel = null,
 
@@ -3116,6 +3242,7 @@ test "distributed txn coordinator never aborts after durable commit decision" {
                 .prepare_group = prepare,
                 .resolve_group = resolve,
                 .status_group = status,
+                .acknowledge_group = acknowledge,
             } };
         }
 
@@ -3136,9 +3263,12 @@ test "distributed txn coordinator never aborts after durable commit decision" {
                     return;
                 }
                 self.first_committed = true;
+                if (self.worker_failure) return error.EnrichmentWorkerFailed;
                 return error.InjectedPostCommitAckFailure;
             }
             if (self.second_conflict) return error.DecisionConflict;
+            if (self.follower_retry_pending) return error.EnrichmentRetryInProgress;
+            if (self.follower_transported_visibility_pending) return error.CommitVisibilityNotSatisfied;
         }
         fn status(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -3146,11 +3276,18 @@ test "distributed txn coordinator never aborts after durable commit decision" {
             if (group_id == 7001 and self.first_committed) return .committed;
             return .pending;
         }
+        fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.acknowledgement_calls += 1;
+            if (self.acknowledgement_failure) return error.InjectedAcknowledgementFailure;
+        }
     };
 
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("1234567890abcdef1234567890abcdef");
-    try std.testing.expectError(error.CommitVisibilityNotSatisfied, executeMultiTableCommit(
+    // Proposal-only follower delivery remains live propagation debt and takes
+    // precedence over the coordinator's retryable visibility result.
+    try std.testing.expectError(error.CommitPropagationIncomplete, executeMultiTableCommit(
         std.testing.allocator,
         FakeCatalog.iface(),
         recorder.worker(),
@@ -3169,6 +3306,116 @@ test "distributed txn coordinator never aborts after durable commit decision" {
     ));
     try std.testing.expect(recorder.first_committed);
     try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // Permanent visibility failure remains distinct from ordinary deferred
+    // visibility so clients can request repair instead of polling forever.
+    recorder = .{ .worker_failure = true };
+    const repair_txn_id = try parseTxnIdHex("1234567890abcdef0011223344556677");
+    const repair = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        repair_txn_id,
+        15_000,
+        15_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .enrichments,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(repair == .committed);
+    try std.testing.expect(repair.committed.visibility_pending);
+    try std.testing.expect(!repair.committed.visibility_retry_pending);
+    try std.testing.expect(repair.committed.visibility_repair_required);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // Repair on one participant must not hide retryable visibility debt on
+    // another. Stable sessions keep recovery active until that live barrier
+    // clears, while retaining the independent repair signal.
+    recorder = .{ .worker_failure = true, .follower_retry_pending = true };
+    const mixed_txn_id = try parseTxnIdHex("1234567890abcdef8899aabbccddeeff");
+    const mixed = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        mixed_txn_id,
+        17_000,
+        17_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .enrichments,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(mixed == .committed);
+    try std.testing.expect(mixed.committed.visibility_retry_pending);
+    try std.testing.expect(mixed.committed.visibility_repair_required);
+    try std.testing.expect(!mixed.committed.propagation_pending);
+    try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgement_calls);
+
+    // A remote participant normalizes its typed HTTP 202 to
+    // CommitVisibilityNotSatisfied. It is the same durable visibility outcome
+    // as the local EnrichmentRetryInProgress spelling and must still release
+    // the coordinator enlistment.
+    recorder = .{ .follower_transported_visibility_pending = true };
+    const transported_txn_id = try parseTxnIdHex("1234567890abcdeffedcba0987654321");
+    const transported = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        transported_txn_id,
+        17_500,
+        17_501,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .enrichments,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(transported == .committed);
+    try std.testing.expect(transported.committed.visibility_retry_pending);
+    try std.testing.expect(!transported.committed.propagation_pending);
+    try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgement_calls);
+
+    // The durable follower is still acknowledged when its visibility wait is
+    // pending. If acknowledgement itself fails, propagation recovery takes
+    // precedence over the retryable visibility result.
+    recorder = .{ .follower_retry_pending = true, .acknowledgement_failure = true };
+    const acknowledgement_txn_id = try parseTxnIdHex("1234567890abcdef7766554433221100");
+    try std.testing.expectError(error.CommitPropagationIncomplete, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        acknowledgement_txn_id,
+        18_000,
+        18_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .enrichments,
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgement_calls);
 
     // A contradictory/missing follower after the coordinator decision is a
     // committed transaction with incomplete propagation, never an abort.

@@ -151,8 +151,18 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
             .optimize = ctx.optimize,
         }),
         .filters = spec.filters,
+        // The build-protocol runner executes each test in a fresh process.
+        // Several trainer modules own process-scoped backend state and are
+        // intentionally validated with the inference runner's explicit
+        // per-test std.Io/allocator lifecycle instead.
+        .test_runner = .{
+            .path = b.path("src/test_runner_filter.zig"),
+            .mode = .simple,
+        },
     });
     addImports(ctx, test_exe.root_module, spec.imports);
+    if (!containsImport(spec.imports, .antfly_platform))
+        test_exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     configureNative(ctx, test_exe, spec.native_link, spec.imports);
 
     const run = b.addRunArtifact(test_exe);

@@ -3030,6 +3030,7 @@ fn buildGraphQueryBuilderRepairMessages(
         \\- node_filter is supported in params and pattern steps, but not inside start_nodes or target_nodes.
         \\- Do not include algorithm, algorithm_params, include_edges, or unknown fields.
         \\- shortest_path and k_shortest_paths require target_nodes.
+        \\- Pattern queries may use target_nodes to constrain the final binding; prefer it over an exact node_filter.filter_prefix when the endpoint is known.
         \\- pattern queries require unique aliases, an edge on every step after the first, and return_aliases that exist in the pattern.
     ;
     const repair_prompt = if (feedback) |value|
@@ -3556,7 +3557,7 @@ fn buildGraphQueryBuilderSystemPrompt(
         \\- Neighbors: {"type":"neighbors","index_name":"graph_idx","start_nodes":{"result_ref":"$full_text_results","limit":5},"params":{"edge_types":["links"],"max_depth":1}}
         \\- Traverse: {"type":"traverse","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
         \\- Shortest path: {"type":"shortest_path","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"target_nodes":{"keys":["doc:b"]},"params":{"edge_types":["depends_on"],"max_depth":6,"include_paths":true}}
-        \\- Pattern: {"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":1}}],"return_aliases":["b"]}
+        \\- Pattern with an exact endpoint: {"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"target_nodes":{"keys":["doc:c"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":1}},{"alias":"c","edge":{"types":["links"],"direction":"out","min_hops":1,"max_hops":1}}],"return_aliases":["c"]}
         \\
         \\Always include index_name and start_nodes. Use {"result_ref":"$full_text_results"} when node keys are not explicit. Prefer named graph indexes listed below.
         \\Use fields only from the schema context. Do not invent fields or indexes.
@@ -3695,7 +3696,6 @@ fn validateGeneratedQueryBuilderGraphQuery(
     }
     switch (query.type) {
         .pattern => {
-            if (query.target_nodes != null) return error.InvalidQueryBuilderGeneration;
             const pattern = query.pattern orelse return error.InvalidQueryBuilderGeneration;
             try validateGeneratedGraphPattern(pattern, query.return_aliases);
         },
@@ -9816,6 +9816,10 @@ test "query builder infers graph between nodes and dependency edge type" {
 }
 
 test "query builder infers graph multi hop pattern from intent" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"graph_target_nodes":"doc:z"}
+    , .{});
+    defer constraints_tree.deinit();
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_impl.deinit();
     const result = try buildQueryBuilderResponseWithContext(arena_impl.allocator(), .{
@@ -9823,6 +9827,7 @@ test "query builder infers graph multi hop pattern from intent" {
         .intent = "find two hop links from doc:a",
         .schema_fields = &.{"body"},
         .mode = "graph",
+        .constraints = constraints_tree.value,
     }, .{
         .graph_index_metadata = &.{.{ .name = "doc_graph" }},
     }, null);
@@ -9831,6 +9836,7 @@ test "query builder infers graph multi hop pattern from intent" {
     const graph_query = result.query_request.?.graph_searches.?.map.get("graph_search").?;
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.pattern, graph_query.type);
     try std.testing.expectEqualStrings("doc:a", graph_query.start_nodes.?.keys.?[0]);
+    try std.testing.expectEqualStrings("doc:z", graph_query.target_nodes.?.keys.?[0]);
     try std.testing.expectEqual(@as(usize, 3), graph_query.pattern.?.len);
     try std.testing.expectEqualStrings("a", graph_query.pattern.?[0].alias.?);
     try std.testing.expect(graph_query.pattern.?[0].edge == null);

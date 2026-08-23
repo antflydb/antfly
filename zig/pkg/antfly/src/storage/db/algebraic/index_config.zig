@@ -19,6 +19,7 @@ const std = @import("std");
 const adaptive = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
+const hll = @import("hll.zig");
 const join = @import("join.zig");
 const law = @import("law.zig");
 
@@ -26,6 +27,16 @@ pub const FieldConfig = struct {
     name: []const u8,
     path: []const u8,
     type: []const u8,
+};
+
+pub const DynamicRule = struct {
+    name: []const u8 = "",
+    match: ?[]const u8 = null,
+    unmatch: ?[]const u8 = null,
+    path_match: ?[]const u8 = null,
+    path_unmatch: ?[]const u8 = null,
+    match_mapping_type: ?[]const u8 = null,
+    type: []const u8 = "string",
 };
 
 pub const JoinConfig = struct {
@@ -64,6 +75,15 @@ pub const LawConfig = struct {
     structure: []const u8 = "",
     invertible: bool = false,
 };
+
+pub const HllCardinalityConfig = struct {
+    name: []const u8,
+    group_by: []const []const u8 = &.{},
+    value_field: []const u8,
+    precision: u8 = 0,
+};
+
+pub const max_hll_cardinality_materializations: usize = 64;
 
 pub const AdaptiveConfig = struct {
     observe: bool = true,
@@ -115,14 +135,24 @@ pub const Config = struct {
     group_fields: []const FieldConfig = &.{},
     measure_fields: []const FieldConfig = &.{},
     time_fields: []const FieldConfig = &.{},
+    dynamic_field_rules: []const DynamicRule = &.{},
+    dynamic_rules_backfill_pending: bool = false,
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
+    hll_cardinalities: []const HllCardinalityConfig = &.{},
     adaptive: AdaptiveConfig = .{},
     pathfact_policy: PathFactPolicyConfig = .{},
     max_result_buckets: ?usize = null,
     max_planner_scan_rows: ?usize = null,
     max_batch_accumulator_entries: ?usize = null,
+    max_cardinality_cache_bytes: ?usize = null,
+    max_hll_contributions_per_document: usize = 4096,
+    max_hll_contribution_bytes_per_document: usize = 8 * 1024 * 1024,
+    max_distributed_hll_partial_bytes: usize = 2 * 1024 * 1024,
+    max_hll_maintenance_rows_per_tick: u64 = 10_000,
+    max_pending_hll_observation_entries: usize = 4096,
+    max_pending_hll_observation_bytes: usize = 1024 * 1024,
     min_max_candidate_cache_size: ?usize = null,
     enable_temporal_range_pruning: bool = true,
 };
@@ -217,7 +247,98 @@ pub fn validateConfig(cfg: Config) !void {
         if (mat.group_side) |side| if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
         if (mat.measure_side) |side| if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
     }
+    if (cfg.hll_cardinalities.len > max_hll_cardinality_materializations) return error.InvalidAlgebraicConfig;
+    for (cfg.hll_cardinalities, 0..) |hcfg, i| {
+        if (hcfg.name.len == 0 or hcfg.value_field.len == 0) return error.InvalidAlgebraicConfig;
+        if (!hllGroupFieldResolvable(cfg, hcfg.value_field)) return error.InvalidAlgebraicConfig;
+        if (hcfg.precision != 0 and (hcfg.precision < hll.min_precision or hcfg.precision > hll.max_precision))
+            return error.InvalidAlgebraicConfig;
+        for (cfg.hll_cardinalities[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.name, hcfg.name)) return error.InvalidAlgebraicConfig;
+        }
+        for (hcfg.group_by, 0..) |axis, axis_idx| {
+            if (axis.len == 0 or !hllGroupFieldResolvable(cfg, axis)) return error.InvalidAlgebraicConfig;
+            for (hcfg.group_by[0..axis_idx]) |prior_axis| {
+                if (std.mem.eql(u8, prior_axis, axis)) return error.InvalidAlgebraicConfig;
+            }
+        }
+    }
     if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
+    if (cfg.max_hll_contributions_per_document == 0 or
+        cfg.max_hll_contribution_bytes_per_document == 0 or
+        cfg.max_distributed_hll_partial_bytes == 0 or
+        cfg.max_hll_maintenance_rows_per_tick == 0 or
+        cfg.max_pending_hll_observation_entries == 0 or
+        cfg.max_pending_hll_observation_bytes == 0)
+        return error.InvalidAlgebraicConfig;
+    for (cfg.dynamic_field_rules) |rule| {
+        if (rule.type.len == 0 or dynamicRuleRoleMask(rule.type) == 0) return error.InvalidAlgebraicConfig;
+        if (rule.match == null and rule.path_match == null) return error.InvalidAlgebraicConfig;
+    }
+}
+
+fn hllGroupFieldResolvable(cfg: Config, query_field: []const u8) bool {
+    if (fieldConfigExists(cfg.group_fields, query_field)) return true;
+    const field_name = fieldNameFromQueryPath(query_field);
+    var resolved_type: ?[]const u8 = null;
+    for (cfg.dynamic_field_rules) |rule| {
+        if (!dynamicRuleNamePathMatches(rule, query_field, field_name)) continue;
+        if (rule.match_mapping_type != null) return false;
+        if (resolved_type) |prior| {
+            if (!std.mem.eql(u8, prior, rule.type)) return false;
+        } else {
+            resolved_type = rule.type;
+        }
+    }
+    return if (resolved_type) |scalar_type| dynamicRuleRoleMask(scalar_type) & role_group != 0 else false;
+}
+
+const role_group: u3 = 0b001;
+const role_measure: u3 = 0b010;
+const role_time: u3 = 0b100;
+
+fn dynamicRuleRoleMask(scalar_type: []const u8) u3 {
+    if (std.mem.eql(u8, scalar_type, "integer") or std.mem.eql(u8, scalar_type, "number"))
+        return role_group | role_measure;
+    if (std.mem.eql(u8, scalar_type, "datetime")) return role_group | role_time;
+    if (std.mem.eql(u8, scalar_type, "string") or std.mem.eql(u8, scalar_type, "boolean")) return role_group;
+    return 0;
+}
+
+fn dynamicRuleNamePathMatches(rule: DynamicRule, path: []const u8, field_name: []const u8) bool {
+    if (rule.match) |pattern| if (!globMatch(pattern, field_name)) return false;
+    if (rule.unmatch) |pattern| if (globMatch(pattern, field_name)) return false;
+    if (rule.path_match) |pattern| if (!globMatch(pattern, path)) return false;
+    if (rule.path_unmatch) |pattern| if (globMatch(pattern, path)) return false;
+    return true;
+}
+
+fn fieldNameFromQueryPath(path: []const u8) []const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
+    return path[idx + 1 ..];
+}
+
+fn globMatch(pattern: []const u8, value: []const u8) bool {
+    var pattern_index: usize = 0;
+    var value_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_value_index: usize = 0;
+    while (value_index < value.len) {
+        if (pattern_index < pattern.len and (pattern[pattern_index] == value[value_index] or pattern[pattern_index] == '?')) {
+            pattern_index += 1;
+            value_index += 1;
+        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            star_value_index = value_index;
+            pattern_index += 1;
+        } else if (star_index) |star| {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else return false;
+    }
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
 }
 
 fn validateField(field: FieldConfig) !void {

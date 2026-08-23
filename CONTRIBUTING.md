@@ -3,21 +3,11 @@
 ## Repository Layout
 
 ```
-go/pkg/antfly/cmd/          CLI entry point (cobra subcommands: standalone, store, metadata, query, load, etc.)
-go/pkg/antfly/src/
-  metadata/          Metadata server (API, Raft, schema management, retrieval agents)
-  store/             Storage nodes (shards, indexes, queries, transactions)
-  mcp/               MCP server
-  a2a/               A2A protocol adapter
-  usermgr/           User management and authentication
-  raft/              Raft consensus wrapper around etcd/raft
-  tablemgr/          Table and shard lifecycle management
-go/pkg/antfly/lib/
-  multirafthttp/     HTTP transport for multi-raft communication
-  ai/                LLM provider abstraction (Ollama, OpenAI, Bedrock, Google, etc.)
-  websearch/         Web search providers (Google, Bing, Serper, Tavily)
-  types/             Shared types
+zig/pkg/antfly/      Antfly server, CLI, storage, Raft, and embedded runtime
+zig/pkg/inference/   Local inference runtime
+zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
+  antflylite/         Go binding for embedded Antfly Lite
   sdk/               Go SDK
   libaf/             Shared library (JSON, embeddings, reranking, logging, S3)
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
@@ -34,7 +24,6 @@ py/packages/sdk/     Python SDK
 rs/
   pgaf/              PostgreSQL extension (Rust/pgrx)
   crates/sdk/        Generated Rust SDK (shared types with pgaf)
-go/e2e/              End-to-end tests
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
 scripts/             Build and utility scripts
@@ -43,7 +32,8 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 ## Prerequisites
 
-- **Go 1.26+** — the Makefile sets `GOEXPERIMENT=simd` automatically
+- **Zig 0.16** — required for the server runtime
+- **Go 1.26+** — required for retained Go SDKs and tools
 - **Node.js 18+** and **pnpm** — for TypeScript SDK, React components, and Antfarm dashboard
 
 ## Makefile Targets
@@ -53,13 +43,11 @@ Run `make help` for the full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
-| `make generate` | Regenerate all code: OpenAPI types, Go/TS/Python SDKs, inference runtime, docs |
-| `make lint` | Run linters across Go (root + all submodules), inference runtime, and TypeScript |
-| `make tidy` | Run `go mod tidy` across the root module and Go submodules |
-| `make tidy-check` | Verify `go.mod`/`go.sum` are already tidy across the root module and Go submodules |
-| `make e2e` | Run E2E tests with ONNX+XLA (downloads deps on first run) |
-| `make e2e E2E_TEST=TestName` | Run a specific E2E test |
-| `make build-omni` | Build with all ML backends (ONNX + XLA) |
+| `make generate` | Regenerate OpenAPI types and Go/TS/Python SDKs |
+| `make lint` | Run linters across retained Go modules and TypeScript |
+| `make tidy` | Run `go mod tidy` across retained Go modules |
+| `make tidy-check` | Verify retained Go modules are tidy |
+| `make zig-test` | Run the Zig test aggregate |
 | `make build-antfarm` | Build the Antfarm dashboard |
 | `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
@@ -91,21 +79,11 @@ Run `make help` for the full list. Key targets:
 Runs metadata, storage, and Antfly inference together:
 
 ```bash
-cd go/pkg/antfly
-go run ./cmd standalone
+make build
+./antfly standalone
 ```
 
 Dashboard at `http://localhost:8080`. Antfly inference auto-discovers models from `~/.antfly/inference/models/`.
-
-### Docker
-
-```bash
-# Standard build
-docker build -f go/Dockerfile -t antfly .
-
-# Omni build (ONNX + XLA backends)
-docker build -f go/Dockerfile.omni -t antfly:omni .
-```
 
 ## Multi-Module Structure
 
@@ -113,8 +91,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 | Module | Directory |
 |--------|-----------|
-| Antfly | `go/pkg/antfly/` |
-| E2E tests | `go/e2e/` |
+| Antfly Lite binding | `go/pkg/antflylite/` |
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
 | Antfly proxy | `go/pkg/proxy/antfly/` |
@@ -125,6 +102,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `go/pkg/genkit/antfly/` |
 | Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
+| Memory helpers | `go/pkg/memoryaf/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.
@@ -144,9 +122,9 @@ That enables `.githooks/pre-push`, which runs `make tidy-check` when pushed chan
 ## Testing
 
 ```bash
-# Unit tests (Antfly module)
-cd go/pkg/antfly
-GOEXPERIMENT=simd go test ./...
+# Zig unit and aggregate tests
+make zig-test
+cd zig && make unit-test
 
 # Specific submodule
 cd go/pkg/sdk && go test ./...
@@ -154,17 +132,8 @@ cd go/pkg/sdk && go test ./...
 # Race detector (redirect output for long runs)
 go test -race -v ./... > /tmp/test.log 2>&1
 
-# E2E tests (downloads ONNX/XLA deps and models on first run)
-make e2e
-
-# Specific E2E test with custom timeout
-make e2e E2E_TEST=TestQuickstart E2E_TIMEOUT=15m
-
-# E2E tests gated behind env vars
-cd go/e2e
-RUN_TXN_TESTS=true go test -v ./... -run DistributedTransaction -timeout 5m > /tmp/test.log 2>&1
-RUN_AUTOSCALING_TESTS=true go test -v ./... -run Autoscaling -timeout 20m > /tmp/test.log 2>&1
-RUN_EVAL_TESTS=true go test -v ./... -timeout 10m > /tmp/test.log 2>&1
+# Zig runtime E2E tests
+uv run --project zig/e2e/antfly pytest -q
 ```
 
 ### TypeScript
@@ -189,7 +158,7 @@ cd rs/pgaf && make test-e2e   # E2E (requires running Antfly server)
 
 ## Code Generation
 
-After changing OpenAPI specs under `specs/openapi/`, component specs under `go/pkg/antfly/`, or inference runtime specs, or after changing protobuf definitions:
+After changing OpenAPI specs under `specs/openapi/` or inference runtime specs:
 
 ```bash
 make generate
@@ -198,10 +167,9 @@ make generate
 This runs:
 1. Redocly join + lint on OpenAPI specs
 2. Zig OpenAPI modules (`make zig-openapi-generate`)
-3. `go generate ./...` across root and all submodules (oapi-codegen)
-4. Inference runtime code generation
-5. TypeScript SDK generation (`@antfly/sdk`)
-6. Python SDK generation
+3. `go generate ./...` across retained Go modules (oapi-codegen)
+4. TypeScript SDK generation (`@antfly/sdk`)
+5. Python SDK generation
 
 Look for `cfg.yaml` next to any `openapi.yaml` for oapi-codegen settings. Key convention: optional fields use `omitzero` instead of pointers.
 
@@ -219,19 +187,16 @@ Example configs live in `configs/`:
 
 ## Releasing
 
-Tags follow Go module conventions and trigger CI:
+Release tags:
 
-- `go/pkg/antfly/v*` — Antfly module release + container build
+- `v*` — Zig runtime archives, CLI packages, and container images
 - `go/pkg/operator/v*` — operator container build
 
 The previous standalone operator tag streams were consolidated into
 `go/pkg/operator/v*`.
 
 ```bash
-export GITHUB_TOKEN=...
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-go tool goreleaser release --clean
+See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
 ```
 
 ## License

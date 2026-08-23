@@ -11,6 +11,7 @@ from typing import Iterable, Sequence
 
 
 TEST_DECLARATION = re.compile(r'(?m)^\s*(?:pub\s+)?test(?:\s|")')
+QUOTED_TEST_DECLARATION = re.compile(r'(?m)^\s*(?:pub\s+)?test\s+"([^"]+)"')
 MANIFEST_IMPORT = re.compile(r'(?m)^\s*_\s*=\s*@import\("([^"]+\.zig)"\);\s*$')
 
 
@@ -102,6 +103,32 @@ def audit_manifest(
     return failures
 
 
+def audit_runtime_partition(source: Path, filters: Sequence[str]) -> list[str]:
+    """Verify a name-filtered lane and its complement both retain tests."""
+    if not source.is_file():
+        return [f"runtime partition source does not exist: {source}"]
+
+    names = QUOTED_TEST_DECLARATION.findall(source.read_text(encoding="utf-8"))
+    failures: list[str] = []
+    for test_filter in filters:
+        # The custom runner applies filters containing a dot to fully-qualified
+        # names. Lane filters deliberately target declared names so module path
+        # changes cannot silently alter the partition.
+        if "." in test_filter:
+            failures.append(
+                f"runtime partition filter must target a declared name: {test_filter}"
+            )
+        elif not any(test_filter in name for name in names):
+            failures.append(f"runtime partition filter matches no tests: {test_filter}")
+
+    selected = [name for name in names if any(test_filter in name for test_filter in filters)]
+    if not selected:
+        failures.append("runtime partition selects no tests")
+    elif len(selected) == len(names):
+        failures.append("runtime partition leaves no tests for its complement")
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
@@ -114,11 +141,24 @@ def main() -> int:
         default=[],
         help="test-bearing source owned by a separately linked focused suite",
     )
+    parser.add_argument("--runtime-partition-source", type=Path)
+    parser.add_argument("--runtime-partition-filter", action="append", default=[])
     args = parser.parse_args()
     if not args.filter:
         parser.error("at least one --filter is required")
+    if bool(args.runtime_partition_source) != bool(args.runtime_partition_filter):
+        parser.error(
+            "--runtime-partition-source and --runtime-partition-filter must be used together"
+        )
 
     failures = audit_manifest(args.root, args.manifest, args.filter, args.dedicated)
+    if args.runtime_partition_source:
+        failures.extend(
+            audit_runtime_partition(
+                args.runtime_partition_source,
+                args.runtime_partition_filter,
+            )
+        )
     if not failures:
         return 0
     print("storage test shard audit failed:")

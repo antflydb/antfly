@@ -118,6 +118,16 @@ pub const RaftApplyStore = struct {
         return try decodeLatest(result);
     }
 
+    pub fn raftBatchProtocolVersionForRequest(self: *RaftApplyStore, group_id: u64) !u16 {
+        var version: u16 = 0;
+        try statusToError(abi.antfly_data_apply_store_raft_batch_protocol_version(
+            self.handle,
+            &.{ .group_id = group_id },
+            &version,
+        ));
+        return version;
+    }
+
     pub fn observeSplitControl(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,

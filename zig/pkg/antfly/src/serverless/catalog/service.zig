@@ -26,6 +26,7 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
 const impact_planner = @import("../build/impact_planner.zig");
+const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
@@ -37,6 +38,17 @@ const tables_api = @import("../../api/tables.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const shared_vector = @import("antfly_vector").vector;
 
+const PublicationPlanPurpose = enum {
+    status,
+    publication,
+};
+
+fn ensureSchemaWritesAllowedAlloc(alloc: Allocator, schema_json: []const u8) !void {
+    var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return;
+    defer binding.deinit(alloc);
+    if (binding.binding.write_policy == .read_only) return error.ExternalTableReadOnly;
+}
+
 pub const CatalogService = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -45,6 +57,7 @@ pub const CatalogService = struct {
     wal: *wal_mod.WalStore,
     builder: *builder_mod.Builder,
     store: *catalog_store.CatalogStore,
+    external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
 
     pub fn init(
         alloc: Allocator,
@@ -63,11 +76,19 @@ pub const CatalogService = struct {
             .wal = wal,
             .builder = builder,
             .store = store,
+            .external_source_plan_resolver = null,
         };
     }
 
     pub fn deinit(self: *CatalogService) void {
         self.* = undefined;
+    }
+
+    pub fn setExternalSourcePlanResolver(
+        self: *CatalogService,
+        resolver: ?publication_plan.ExternalSourcePlanResolver,
+    ) void {
+        self.external_source_plan_resolver = resolver;
     }
 
     pub fn ensureNamespace(self: *CatalogService, name: []const u8, created_at_ns: u64) !bool {
@@ -159,6 +180,18 @@ pub const CatalogService = struct {
         return null;
     }
 
+    pub fn ensureTableWritesAllowed(self: *CatalogService, table_name: []const u8) !void {
+        var table = (try self.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
+        defer table.deinit(self.alloc);
+        try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
+    }
+
+    pub fn ensureNamespaceWritesAllowed(self: *CatalogService, namespace: []const u8) !void {
+        var table = (try self.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return;
+        defer table.deinit(self.alloc);
+        try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
+    }
+
     pub fn setTableDefinition(
         self: *CatalogService,
         table_name: []const u8,
@@ -230,7 +263,7 @@ pub const CatalogService = struct {
 
     pub fn buildStatus(self: *CatalogService, namespace: []const u8) !catalog_types.BuildStatus {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status);
         defer plan.deinit(self.alloc);
         const effective_policy = plan.policy;
         var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -632,7 +665,7 @@ pub const CatalogService = struct {
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
         return try self.builder.publishNamespaceWithMetricAndPlan(
             namespace,
@@ -675,17 +708,38 @@ pub const CatalogService = struct {
         return try self.alloc.dupe(u8, table_name);
     }
 
+    fn externalSourcePlanForTableAlloc(
+        self: *CatalogService,
+        namespace: []const u8,
+        table: catalog_types.TableNamespaceRecord,
+    ) !?external_source_manifest.Plan {
+        var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
+        defer binding.deinit(self.alloc);
+        const resolver = self.external_source_plan_resolver orelse {
+            if (binding.binding.snapshot_mode.requiresDiscoveryPin()) {
+                return error.ExternalSourcePlanResolverUnavailable;
+            }
+            return null;
+        };
+        return try resolver.resolveAlloc(self.alloc, .{
+            .namespace = namespace,
+            .table_name = table.table_name,
+            .binding = binding.binding,
+        });
+    }
+
     fn publicationPlanForNamespaceAlloc(
         self: *CatalogService,
         namespace: []const u8,
         policy: catalog_types.NamespacePolicy,
+        purpose: PublicationPlanPurpose,
     ) !publication_plan.TablePublicationPlan {
         const tables = try self.listTablesAlloc(self.alloc);
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
             const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
-            const targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
+            var targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -700,6 +754,7 @@ pub const CatalogService = struct {
                     ),
                     .include_graph = true,
                 };
+            errdefer search_sources.deinitPublishedSearchSources(self.alloc, &targets.published_search_sources);
 
             var metadata_republish: publication_plan.MetadataRepublishReasons = .{};
             var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -826,15 +881,24 @@ pub const CatalogService = struct {
                     else
                         .recompute,
                 };
+                var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                    self.alloc,
+                    table.schema_json,
+                    table.read_schema_json,
+                    table.indexes_json,
+                );
+                errdefer table_definition.deinit(self.alloc);
+                var external_source_plan = if (purpose == .publication)
+                    try self.externalSourcePlanForTableAlloc(namespace, table)
+                else
+                    null;
+                errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
                 return .{
                     .targets = targets,
                     .policy = effective_policy,
-                    .table_definition = .{
-                        .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                        .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                        .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                    },
+                    .table_definition = table_definition,
+                    .external_source_plan = external_source_plan,
                     .metadata_republish = metadata_republish,
                     .artifact_actions = artifact_actions,
                     .full_text_index_actions = full_text_index_actions,
@@ -877,15 +941,24 @@ pub const CatalogService = struct {
                 0,
             );
             errdefer freeNamedArtifactActions(self.alloc, graph_index_actions);
+            var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                self.alloc,
+                table.schema_json,
+                table.read_schema_json,
+                table.indexes_json,
+            );
+            errdefer table_definition.deinit(self.alloc);
+            var external_source_plan = if (purpose == .publication)
+                try self.externalSourcePlanForTableAlloc(namespace, table)
+            else
+                null;
+            errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
             return .{
                 .targets = targets,
                 .policy = effective_policy,
-                .table_definition = .{
-                    .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                    .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                    .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                },
+                .table_definition = table_definition,
+                .external_source_plan = external_source_plan,
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,
@@ -4697,6 +4770,78 @@ test "catalog service auto-enables chunk embeddings for chunked embedding indexe
     defer status.deinit(alloc);
     try std.testing.expect(status.chunk_embeddings_enabled);
     try std.testing.expectEqual(catalog_types.DerivedOutputPublicationAction.reuse, status.derived_output_actions.chunk_embeddings);
+}
+
+test "serverless catalog service fails closed for current external binding without resolver" {
+    const alloc = std.testing.allocator;
+    const current_schema =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var table = catalog_types.TableNamespaceRecord{
+        .table_name = try alloc.dupe(u8, "events"),
+        .namespace = try alloc.dupe(u8, "events"),
+        .created_at_ns = 1,
+        .schema_json = try alloc.dupe(u8, current_schema),
+        .read_schema_json = try alloc.dupe(u8, ""),
+        .indexes_json = try alloc.dupe(u8, "{}"),
+    };
+    defer table.deinit(alloc);
+
+    var catalog: CatalogService = undefined;
+    catalog.alloc = alloc;
+    catalog.external_source_plan_resolver = null;
+    try std.testing.expectError(
+        error.ExternalSourcePlanResolverUnavailable,
+        catalog.externalSourcePlanForTableAlloc("events", table),
+    );
+}
+
+test "serverless catalog status stays local and write admission rejects read-only external tables" {
+    const alloc = std.testing.allocator;
+    const current_schema =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-external-status");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-external-status");
+    const wal_root = tmpPath(&wal_root_buf, "wal-external-status");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-external-status");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try @import("fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_catalog = try @import("fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var test_catalog_store = fs_catalog.catalogStore();
+    defer test_catalog_store.deinit();
+
+    var builder = builder_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &test_catalog_store);
+    defer catalog.deinit();
+    try std.testing.expect(try catalog.ensureTableWithDefinition("events", 1, .{}, current_schema, "", "{}"));
+
+    var status = try catalog.tableBuildStatus("events");
+    defer status.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), status.latest_wal_lsn);
+    try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
+    try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
+    try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

@@ -12,6 +12,13 @@ const antfly_middleware_openapi = @import("antfly_middleware_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
+/// Node-local foreground database request admission settings.
+pub const AdmissionConfig = struct {
+    query: ?QueryAdmissionConfig = null,
+    write: ?WriteAdmissionConfig = null,
+    inference: ?InferenceAdmissionConfig = null,
+};
+
 /// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
 pub const AwsCredentialConfig = struct {
     source: []const u8,
@@ -114,10 +121,12 @@ pub const Config = struct {
     health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
+    admission: ?AdmissionConfig = null,
+    mcp: ?McpConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
-    inference: ?antfly_inference_config_openapi.Config = null,
+    inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
@@ -381,6 +390,11 @@ pub const HttpExternalIoConfig = struct {
     headers: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
+pub const InferenceAdmissionConfig = struct {
+    /// Maximum concurrent inference requests admitted by this process. The budget covers embedded inference routes, direct providers, and public connection inference forwarding. Remote forwarding holds a slot for the full upstream request. The runtime-reserved `local-inference` connection dispatches in process and is admitted once by the destination inference route; configured URLs remain remote boundaries even when they alias the local listener. Embedded standalone uses one shared coordinator for all of those surfaces; API-only runtimes use the same setting as a local forwarding gate. For embedded inference, this value also sizes the weighted work budget: each request consumes one request slot and at least one unit, while request body size, generation workload, and image byte/count reservations can consume more than one unit. The request count can therefore never exceed this value, while expensive requests may exhaust weighted capacity sooner. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When a request or weighted-work ceiling is exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable request admission and, for embedded inference, weighted-unit accounting and the capacity-derived clamp. The default is 32.
+    max_concurrent_requests: ?i64 = null,
+};
+
 pub const InferenceConnectionConfig = struct {
     /// Inference provider type, such as openai, anthropic, antfly, ollama, or mock.
     provider: []const u8,
@@ -425,6 +439,12 @@ pub const LocalStorageConfig = struct {
     base_dir: ?[]const u8 = null,
 };
 
+/// Model Context Protocol transport compatibility settings.
+pub const McpConfig = struct {
+    /// Maximum serialized MCP `tools/call` result size, including both TextContent and structuredContent. Results above the limit are replaced with an actionable MCP tool error. The default is 96 KiB, leaving envelope headroom beneath common 100 KiB connector limits. Nonzero values must be at least 512 bytes so the replacement error itself fits. Set to 0 to disable the compatibility guard.
+    max_tool_result_bytes: ?i64 = null,
+};
+
 pub const MetadataInfo = struct {
     /// Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster
     orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
@@ -464,6 +484,11 @@ pub const ObjectStorageLocation = struct {
     connection: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
+};
+
+pub const QueryAdmissionConfig = struct {
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
 };
 
 pub const S3ExternalIoConfig = struct {
@@ -598,4 +623,9 @@ pub const WebSearchConnectionVariant = struct {
     /// Namespaced actions and workflow uses this connection supports.
     capabilities: []const []const u8,
     web_search: WebSearchConnectionConfig,
+};
+
+pub const WriteAdmissionConfig = struct {
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
+    max_concurrent_requests: ?i64 = null,
 };

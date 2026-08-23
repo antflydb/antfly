@@ -26,6 +26,9 @@ const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
+const index_repair_status = @import("../../common/index_repair_status.zig");
+pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -236,6 +239,11 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    /// Internal single-participant transaction contract. Transform expansion
+    /// still runs under the DB apply lock, but the batch is rejected before
+    /// mutation if it would emit graph projection deltas that the distributed
+    /// transaction intent format cannot represent.
+    reject_graph_transform_projections: bool = false,
     /// Internal data-Raft transition state. Public batch parsing never sets it.
     split_checkpoint: ?SplitReplicationCheckpoint = null,
     /// Internal identity context for writes to an unpublished split destination.
@@ -1076,6 +1084,12 @@ pub const Query = union(enum) {
 pub const LookupOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    /// Internal, absolute monotonic deadline used by routed lookups. It is not
+    /// part of the public lookup projection contract and is never serialized.
+    execution_deadline_ns: ?u64 = null,
+    /// Borrowed request cancellation source. Callers must keep it alive for
+    /// the synchronous lookup call.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const LookupResult = struct {
@@ -1304,6 +1318,20 @@ pub const SearchRequest = struct {
     max_chunks_per_parent: u32 = 0,
     hierarchy_include_source: bool = false,
     hierarchy_include_unit: bool = false,
+    hierarchy_omit_implicit_source_ancestor_document: bool = false,
+    hierarchy_match_fields: []const []const u8 = &.{},
+    hierarchy_match_include_all_fields: bool = true,
+    hierarchy_grouped_matches: bool = false,
+    hierarchy_group_level: HierarchyGroupLevel = .source,
+    hierarchy_children: ?HierarchyChildrenRequest = null,
+    /// Internal distributed-planning control. Parent-owned navigation and
+    /// globally merged unit groups may return identity-only hits for payloads
+    /// routed elsewhere; direct callers fail closed when payload is absent.
+    defer_hierarchy_child_hydration: bool = false,
+    hierarchy_source_fields: []const []const u8 = &.{},
+    hierarchy_source_include_all_fields: bool = true,
+    hierarchy_unit_fields: []const []const u8 = &.{},
+    hierarchy_unit_include_all_fields: bool = true,
     fields: []const []const u8 = &.{},
     order_by: []const SortField = &.{},
     search_after: []const std.json.Value = &.{},
@@ -1339,10 +1367,223 @@ pub const SearchRequest = struct {
     execution_deadline_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
     /// be retained by asynchronous work after query execution returns.
-    cancellation: ?*const std.atomic.Value(bool) = null,
+    cancellation: ?CancellationToken = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
 };
+
+pub const max_canonical_hierarchy_groups: u32 = 100;
+pub const max_canonical_hierarchy_matches_per_group: u32 = 100;
+pub const max_canonical_hierarchy_total_matches: u32 = 1000;
+
+// Every SearchRequest field must be deliberately classified for child
+// traversal. The compile-time audit prevents newly added retrieval controls
+// from becoming silently accepted no-ops at this storage boundary.
+const hierarchy_children_validated_fields = [_][]const u8{
+    "return_mode",
+    "hierarchy_grouped_matches",
+    "hierarchy_children",
+    "fields",
+    "order_by",
+    "search_after",
+    "include_all_fields",
+    "limit",
+    "offset",
+    "include_stored",
+};
+
+const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "filter_query_json",
+    "exclusion_query_json",
+    "defer_hierarchy_child_hydration",
+    "defer_stored_projection",
+    "filter_doc_ids",
+    "filter_doc_ids_positive",
+    "exclude_doc_ids",
+    "resolved_doc_filter",
+    "resolved_doc_filter_owned",
+    "resolved_doc_filter_wire_context",
+    "identity_read_generation",
+    "execution_deadline_ns",
+    "cancellation",
+};
+
+const hierarchy_children_rejected_fields = [_][]const u8{
+    "query",
+    "index_name",
+    "primary_text_index_name",
+    "aggregations_json",
+    "count_only",
+    "profile",
+    "full_text",
+    "filter_text",
+    "exclusion_text",
+    "full_text_queries",
+    "doc_filter_bindings",
+    "dense",
+    "sparse",
+    "dense_queries",
+    "sparse_queries",
+    "graph_queries",
+    "merge_config",
+    "reranker",
+    "reranker_query_text",
+    "pruner",
+    "expand_strategy",
+    "max_chunks_per_parent",
+    "hierarchy_include_source",
+    "hierarchy_include_unit",
+    "hierarchy_omit_implicit_source_ancestor_document",
+    "hierarchy_match_fields",
+    "hierarchy_match_include_all_fields",
+    "hierarchy_group_level",
+    "hierarchy_source_fields",
+    "hierarchy_source_include_all_fields",
+    "hierarchy_unit_fields",
+    "hierarchy_unit_include_all_fields",
+    "search_before",
+    "search_effort",
+    "filter_prefix",
+    "distance_over",
+    "distance_under",
+    "filter_ids",
+    "exclude_ids",
+    "resolved_text_doc_filter",
+    "graph_table_read_authorizer",
+    "require_algebraic_filter_resolution",
+    "distributed_text_stats",
+};
+
+fn auditHierarchyChildrenSearchRequestFields() void {
+    @setEvalBranchQuota(10_000);
+    inline for (@typeInfo(SearchRequest).@"struct".fields) |field| {
+        comptime var classifications: usize = 0;
+        inline for (hierarchy_children_validated_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_supported_internal_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_rejected_fields) |name| {
+            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+        }
+        if (classifications != 1) {
+            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ field.name);
+        }
+    }
+}
+
+/// Validate the fully normalized storage contract for sequential hierarchy
+/// traversal. Public parsers enforce the same shape, but typed and internal
+/// callers also cross this boundary and must never be able to trigger unchecked
+/// cursor indexing or accidentally request unbounded materialization.
+pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
+    @setEvalBranchQuota(100_000);
+    comptime auditHierarchyChildrenSearchRequestFields();
+    const children = req.hierarchy_children orelse return true;
+    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
+    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    // Traversal is deliberately not a retrieval operation. Reject every
+    // scoring, ranking, or transform control at this final typed boundary so
+    // embedded callers and worker envelopes cannot receive plausible-looking
+    // results for options that navigation would otherwise ignore. Internal
+    // authorization constraints and lifecycle controls remain supported.
+    const defaults = SearchRequest{};
+    inline for (hierarchy_children_rejected_fields) |field_name| {
+        if (!std.meta.eql(@field(req, field_name), @field(defaults, field_name))) return false;
+    }
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
+    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.order_by.len != 2 or
+        !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
+        req.order_by[0].desc or
+        !std.mem.eql(u8, req.order_by[1].field, "_id") or
+        req.order_by[1].desc)
+    {
+        return false;
+    }
+    if (req.search_after.len == 0) return true;
+    return req.search_after.len == 2 and
+        req.search_after[0] == .string and
+        req.search_after[1] == .string;
+}
+
+pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
+    if (!canonicalHierarchyChildrenRequestIsValid(req)) return false;
+    if (!req.hierarchy_grouped_matches) return true;
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.max_chunks_per_parent == 0 or
+        req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group)
+    {
+        return false;
+    }
+    return @as(u64, req.limit) * @as(u64, req.max_chunks_per_parent) <=
+        max_canonical_hierarchy_total_matches;
+}
+
+/// Return the first phase of a canonical grouped hierarchy query. Distributed
+/// coordinators use this request on every shard, merge the global group page,
+/// and only then issue one bounded expansion for those selected groups.
+pub fn canonicalGroupedMatchSelectionRequest(req: SearchRequest) SearchRequest {
+    if (!req.hierarchy_grouped_matches or
+        (req.return_mode != .parent_with_chunks and req.return_mode != .unit_with_chunks) or
+        req.max_chunks_per_parent == 0)
+    {
+        return req;
+    }
+    var selection = req;
+    selection.return_mode = switch (req.hierarchy_group_level) {
+        .source => .parent,
+        .unit => .unit,
+    };
+    selection.max_chunks_per_parent = 0;
+    selection.hierarchy_grouped_matches = false;
+    return selection;
+}
+
+/// Build a bounded grouped-match request. `parent_filter` may contain one
+/// source for local expansion or the complete globally selected page for a
+/// distributed batch expansion.
+pub fn canonicalGroupedMatchExpansionRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = req;
+    match_req.offset = 0;
+    match_req.limit = @intCast(parent_filter.len);
+    // Top-level cursors page source groups. They must never be applied to the
+    // independently ranked descendants within the selected groups.
+    match_req.search_after = &.{};
+    match_req.search_before = &.{};
+    match_req.filter_doc_ids = parent_filter;
+    match_req.filter_doc_ids_positive = true;
+    match_req.graph_queries = &.{};
+    match_req.expand_strategy = null;
+    match_req.aggregations_json = "";
+    match_req.count_only = false;
+    match_req.profile = false;
+    return match_req;
+}
+
+/// Build the exact per-source descendant query used by a storage shard after
+/// its source groups have been selected.
+pub fn canonicalGroupedMatchDescendantRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = canonicalGroupedMatchExpansionRequest(req, parent_filter);
+    match_req.return_mode = .chunk;
+    match_req.max_chunks_per_parent = 0;
+    match_req.hierarchy_grouped_matches = false;
+    match_req.limit = req.max_chunks_per_parent;
+    match_req.fields = req.hierarchy_match_fields;
+    match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+    match_req.include_stored = match_req.include_all_fields or
+        match_req.fields.len > 0 or
+        match_req.reranker != null;
+    return match_req;
+}
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
@@ -1397,6 +1638,19 @@ pub const ReturnMode = enum {
     parent,
     chunk,
     parent_with_chunks,
+    unit,
+    unit_with_chunks,
+};
+
+pub const HierarchyGroupLevel = enum {
+    source,
+    unit,
+};
+
+pub const HierarchyChildrenRequest = struct {
+    parent_id: []const u8,
+    parent_level: HierarchyGroupLevel = .source,
+    level: HierarchyGroupLevel = .unit,
 };
 
 pub const NamedGraphQuery = struct {
@@ -1436,7 +1690,11 @@ pub const SearchHit = struct {
     source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
+    /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    /// Metric-native dense-vector distance. Lower values are better. This is
+    /// retained separately so score ordering never depends on the metric.
+    distance: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
@@ -1461,6 +1719,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
@@ -1626,6 +1885,7 @@ pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
 pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
+    distance: ?f32 = null,
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
@@ -1635,6 +1895,7 @@ pub const ChunkHit = struct {
         return .{
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
+            .distance = self.distance,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
@@ -1731,12 +1992,21 @@ pub const SortProfile = struct {
     sort_rejection_field: SortProfileField = .{},
 };
 
+pub const ShardIdentityReadGeneration = struct {
+    group_id: u64,
+    generation: u64,
+};
+
 pub const SearchResult = struct {
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
+    /// Snapshot vector for a distributed result. Shard generations are
+    /// independent, so a multi-shard replay must use these tokens rather than
+    /// relying on `identity_read_generation` being globally common.
+    shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
 
@@ -1745,6 +2015,7 @@ pub const SearchResult = struct {
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
         self.* = undefined;
     }
 };
@@ -2598,6 +2869,13 @@ pub const DBIndexStats = struct {
     index_repair_next_retry_at_ms: u64 = 0,
     index_repair_last_error: ?[]const u8 = null,
     index_repair_wait_reason: []const u8 = "none",
+    // Compact lifecycle used when DBIndexStats crosses process boundaries.
+    // The full local durable diagnostics remain authoritative when present.
+    index_repair_status: ?IndexRepairStatus = null,
+    // Internal proof that the durable intent is obsolete because the active
+    // managed-admission generation has already converged. Public status uses
+    // this to avoid advertising reconstruction that no longer blocks reads.
+    index_repair_active_generation_serviceable: bool = false,
     projection_checkpoint_status: []const u8 = "clean",
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,

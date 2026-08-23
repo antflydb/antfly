@@ -1048,6 +1048,15 @@ pub const DebertaEncoderLayerSpec = struct {
     output_layer_norm_slot: usize,
 };
 
+pub const DebertaRelativeEmbeddingRequest = struct {
+    weight: CT,
+    layer_norm_weight: CT,
+    layer_norm_bias: CT,
+    bucket_ids: []const i64,
+    hidden_size: usize,
+    norm_eps: f32,
+};
+
 pub const DebertaEncoderFramePlanRequest = struct {
     contract: DecoderRuntimeDecodeContract = .gliner_deberta_encoder,
     layer_count: usize,

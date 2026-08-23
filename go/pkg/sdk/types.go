@@ -18,6 +18,7 @@ package sdk
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -28,13 +29,26 @@ import (
 // Re-export commonly used types from oapi package
 type (
 	// Table and Index types
-	CreateTableRequest = oapi.CreateTableRequest
-	TableStatus        = oapi.TableStatus
-	TableMigration     = oapi.TableMigration
-	TableSchema        = oapi.TableSchema
-	IndexConfig        = oapi.IndexConfig
-	IndexStatus        = oapi.IndexStatus
-	IndexType          = oapi.IndexType
+	CreateTableRequest           = oapi.CreateTableRequest
+	TableStatus                  = oapi.TableStatus
+	TableMigration               = oapi.TableMigration
+	TableSchema                  = oapi.TableSchema
+	IndexConfig                  = oapi.IndexConfig
+	CreateIndexRequest           = oapi.CreateIndexRequest
+	CreateFullTextIndexRequest   = oapi.CreateFullTextIndexRequest
+	CreateEmbeddingsIndexRequest = oapi.CreateEmbeddingsIndexRequest
+	CreateGraphIndexRequest      = oapi.CreateGraphIndexRequest
+	CreateAlgebraicIndexRequest  = oapi.CreateAlgebraicIndexRequest
+	CreatedFullTextIndex         = oapi.CreatedFullTextIndex
+	CreatedEmbeddingsIndex       = oapi.CreatedEmbeddingsIndex
+	CreatedGraphIndex            = oapi.CreatedGraphIndex
+	CreatedAlgebraicIndex        = oapi.CreatedAlgebraicIndex
+	CreatedFullTextIndexType     = oapi.CreatedFullTextIndexType
+	CreatedEmbeddingsIndexType   = oapi.CreatedEmbeddingsIndexType
+	CreatedGraphIndexType        = oapi.CreatedGraphIndexType
+	CreatedAlgebraicIndexType    = oapi.CreatedAlgebraicIndexType
+	IndexStatus                  = oapi.IndexStatus
+	IndexType                    = oapi.IndexType
 
 	// Artifact types
 	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
@@ -56,7 +70,9 @@ type (
 	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
 	EnrichmentConfig      = oapi.EnrichmentConfig
 	EnrichmentKind        = oapi.EnrichmentKind
+	ExecutionPolicy       = oapi.ExecutionPolicy
 	FullTextIndexConfig   = oapi.FullTextIndexConfig
+	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
 	FullTextIndexStats    = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
@@ -92,16 +108,27 @@ type (
 	SortField = oapi.SortField
 
 	// Query response types
-	QueryResponses         = oapi.QueryResponses
-	QueryResult            = oapi.QueryResult
-	Hits                   = oapi.QueryHits
-	QueryHitsTotal         = oapi.QueryHitsTotal
-	QueryHitsTotalRelation = oapi.QueryHitsTotalRelation
-	Hit                    = oapi.QueryHit
-	AggregationRequest     = oapi.AggregationRequest
-	AggregationOption      = oapi.AggregationBucket
-	AggregationResult      = oapi.AggregationResult
-	AggregationType        = oapi.AggregationType
+	QueryResponses              = oapi.QueryResponses
+	QueryResult                 = oapi.QueryResult
+	Hits                        = oapi.QueryHits
+	QueryHitsTotal              = oapi.QueryHitsTotal
+	QueryHitsTotalRelation      = oapi.QueryHitsTotalRelation
+	Hit                         = oapi.QueryHit
+	HierarchyAncestor           = oapi.HierarchyAncestor
+	HierarchyArtifact           = oapi.HierarchyArtifact
+	HierarchyArtifactKind       = oapi.HierarchyArtifactKind
+	HierarchyArtifactSource     = oapi.HierarchyArtifactSource
+	HierarchyArtifactSourceKind = oapi.HierarchyArtifactSourceKind
+	HierarchyEvidence           = oapi.HierarchyEvidence
+	HierarchyMatchContext       = oapi.HierarchyMatchContext
+	HierarchyMatchHit           = oapi.HierarchyMatchHit
+	QueryHitHierarchy           = oapi.QueryHitHierarchy
+	QueryHitHierarchyAncestors  = oapi.QueryHitHierarchyAncestors
+	QueryHitHierarchyLevel      = oapi.QueryHitHierarchyLevel
+	AggregationRequest          = oapi.AggregationRequest
+	AggregationOption           = oapi.AggregationBucket
+	AggregationResult           = oapi.AggregationResult
+	AggregationType             = oapi.AggregationType
 
 	// Embedding types
 	Embedding             = oapi.Embedding
@@ -111,10 +138,15 @@ type (
 	PackedSparseEmbedding = oapi.Embedding3 // {PackedIndices, PackedValues} as base64 LE bytes
 
 	// Other types
-	AntflyType     = oapi.AntflyType
-	MergeStrategy  = oapi.MergeStrategy
-	MergeConfig    = oapi.MergeConfig
-	DocumentSchema = oapi.DocumentSchema
+	AntflyType              = oapi.AntflyType
+	FieldMappingType        = oapi.FieldMappingType
+	DocumentFieldMapping    = oapi.DocumentFieldMapping
+	DocumentSubfieldMapping = oapi.DocumentSubfieldMapping
+	TemplateFieldMapping    = oapi.TemplateFieldMapping
+	DynamicTemplate         = oapi.DynamicTemplate
+	MergeStrategy           = oapi.MergeStrategy
+	MergeConfig             = oapi.MergeConfig
+	DocumentSchema          = oapi.DocumentSchema
 
 	// Validation types
 	ValidationError  = oapi.ValidationError
@@ -235,13 +267,30 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig       = oapi.GraphIndexConfig
-	GraphIndexStats        = oapi.GraphIndexStats
-	EdgeTypeConfig         = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
-	EdgeDirection          = oapi.EdgeDirection
-	Edge                   = oapi.Edge
-	EdgesResponse          = oapi.EdgesResponse
+	GraphIndexConfig                      = oapi.GraphIndexConfig
+	GraphIndexStats                       = oapi.GraphIndexStats
+	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
+	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
+	GraphArtifactSourceConfigKind         = oapi.GraphArtifactSourceConfigKind
+	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
+	GraphArtifactProducerConfigKind       = oapi.GraphArtifactProducerConfigKind
+	GraphArtifactProducerSourceConfig     = oapi.GraphArtifactProducerSourceConfig
+	GraphArtifactProducerSourceConfigType = oapi.GraphArtifactProducerSourceConfigType
+	GraphArtifactNodeMappingConfig        = oapi.GraphArtifactNodeMappingConfig
+	GraphArtifactNodeMappingConfigModel   = oapi.GraphArtifactNodeMappingConfigModel
+	GraphArtifactEdgeMappingConfig        = oapi.GraphArtifactEdgeMappingConfig
+	GraphArtifactContextConfig            = oapi.GraphArtifactContextConfig
+	GraphAlgebraicPlanningConfig          = oapi.GraphAlgebraicPlanningConfig
+	GraphBoundedTraversalConfig           = oapi.GraphBoundedTraversalConfig
+	GraphBoundedTraversalConfigLaw        = oapi.GraphBoundedTraversalConfigLaw
+	GraphTemplateValue                    = oapi.GraphTemplateValue
+	GraphTemplateValue0                   = oapi.GraphTemplateValue0
+	GraphTemplateValue1                   = oapi.GraphTemplateValue1
+	EdgeTypeConfig                        = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology                = oapi.EdgeTypeConfigTopology
+	EdgeDirection                         = oapi.EdgeDirection
+	Edge                                  = oapi.Edge
+	EdgesResponse                         = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery
@@ -268,9 +317,147 @@ type (
 	PathWeightMode     = oapi.PathWeightMode
 )
 
+type CreatedGraphArtifactProducerConfig = oapi.CreatedGraphArtifactProducerConfig
+type CreatedGraphArtifactProducerConfigKind = oapi.CreatedGraphArtifactProducerConfigKind
+
+// CreatedIndex is a validated discriminated create-index response.
+// Accessors reject the wrong variant instead of decoding the same payload into
+// an unrelated generated struct.
+type CreatedIndex struct {
+	generated oapi.CreatedIndex
+}
+
+func (c *CreatedIndex) UnmarshalJSON(data []byte) error {
+	var generated oapi.CreatedIndex
+	if err := json.Unmarshal(data, &generated); err != nil {
+		return err
+	}
+	c.generated = generated
+	_, err := c.Value()
+	return err
+}
+
+func (c CreatedIndex) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.generated)
+}
+
+// Kind returns the validated response discriminator.
+func (c CreatedIndex) Kind() (IndexType, error) {
+	discriminator, err := c.generated.Discriminator()
+	if err != nil {
+		return "", fmt.Errorf("decode created index discriminator: %w", err)
+	}
+	kind := IndexType(discriminator)
+	if !kind.Valid() {
+		return "", fmt.Errorf("unknown created index discriminator %q", discriminator)
+	}
+	return kind, nil
+}
+
+// Value returns the concrete response selected by the discriminator.
+func (c CreatedIndex) Value() (any, error) {
+	kind, err := c.Kind()
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
+	case IndexTypeFullText:
+		return c.AsCreatedFullTextIndex()
+	case IndexTypeEmbeddings:
+		return c.AsCreatedEmbeddingsIndex()
+	case IndexTypeGraph:
+		return c.AsCreatedGraphIndex()
+	case IndexTypeAlgebraic:
+		return c.AsCreatedAlgebraicIndex()
+	default:
+		return nil, fmt.Errorf("unknown created index discriminator %q", kind)
+	}
+}
+
+func (c CreatedIndex) AsCreatedFullTextIndex() (CreatedFullTextIndex, error) {
+	if err := c.requireKind(IndexTypeFullText); err != nil {
+		return CreatedFullTextIndex{}, err
+	}
+	value, err := c.generated.AsCreatedFullTextIndex()
+	if err != nil {
+		return CreatedFullTextIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedFullTextIndexTypeFullText {
+		return CreatedFullTextIndex{}, fmt.Errorf("invalid full-text create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedEmbeddingsIndex() (CreatedEmbeddingsIndex, error) {
+	if err := c.requireKind(IndexTypeEmbeddings); err != nil {
+		return CreatedEmbeddingsIndex{}, err
+	}
+	value, err := c.generated.AsCreatedEmbeddingsIndex()
+	if err != nil {
+		return CreatedEmbeddingsIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedEmbeddingsIndexTypeEmbeddings {
+		return CreatedEmbeddingsIndex{}, fmt.Errorf("invalid embeddings create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedGraphIndex() (CreatedGraphIndex, error) {
+	if err := c.requireKind(IndexTypeGraph); err != nil {
+		return CreatedGraphIndex{}, err
+	}
+	value, err := c.generated.AsCreatedGraphIndex()
+	if err != nil {
+		return CreatedGraphIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedGraphIndexTypeGraph {
+		return CreatedGraphIndex{}, fmt.Errorf("invalid graph create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedAlgebraicIndex() (CreatedAlgebraicIndex, error) {
+	if err := c.requireKind(IndexTypeAlgebraic); err != nil {
+		return CreatedAlgebraicIndex{}, err
+	}
+	value, err := c.generated.AsCreatedAlgebraicIndex()
+	if err != nil {
+		return CreatedAlgebraicIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedAlgebraicIndexTypeAlgebraic {
+		return CreatedAlgebraicIndex{}, fmt.Errorf("invalid algebraic create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) requireKind(expected IndexType) error {
+	actual, err := c.Kind()
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("created index is %q, not %q", actual, expected)
+	}
+	return nil
+}
+
 const (
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
+
+	HierarchyArtifactKindAsset           = oapi.HierarchyArtifactKindAsset
+	HierarchyArtifactKindChunk           = oapi.HierarchyArtifactKindChunk
+	HierarchyArtifactKindEmbedding       = oapi.HierarchyArtifactKindEmbedding
+	HierarchyArtifactSourceKindAsset     = oapi.HierarchyArtifactSourceKindAsset
+	HierarchyArtifactSourceKindChunk     = oapi.HierarchyArtifactSourceKindChunk
+	HierarchyArtifactSourceKindEmbedding = oapi.HierarchyArtifactSourceKindEmbedding
+
+	QueryHitHierarchyLevelArtifact  = oapi.QueryHitHierarchyLevelArtifact
+	QueryHitHierarchyLevelChunk     = oapi.QueryHitHierarchyLevelChunk
+	QueryHitHierarchyLevelEmbedding = oapi.QueryHitHierarchyLevelEmbedding
+	QueryHitHierarchyLevelMention   = oapi.QueryHitHierarchyLevelMention
+	QueryHitHierarchyLevelSource    = oapi.QueryHitHierarchyLevelSource
+	QueryHitHierarchyLevelUnit      = oapi.QueryHitHierarchyLevelUnit
 )
 
 // QueryHitsTotalValue returns the numeric value from total hit-count metadata.
@@ -338,9 +525,18 @@ func NewPackedSparseEmbedding(indices []uint32, values []float32) Embedding {
 // Constants from oapi
 const (
 	// IndexType values
-	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
-	IndexTypeFullText   = oapi.IndexTypeFullText
-	IndexTypeGraph      = oapi.IndexTypeGraph
+	IndexTypeEmbeddings                        = oapi.IndexTypeEmbeddings
+	CreatedEmbeddingsIndexTypeEmbeddings       = oapi.CreatedEmbeddingsIndexTypeEmbeddings
+	IndexTypeFullText                          = oapi.IndexTypeFullText
+	IndexTypeGraph                             = oapi.IndexTypeGraph
+	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	CreatedFullTextIndexTypeFullText           = oapi.CreatedFullTextIndexTypeFullText
+	CreatedGraphIndexTypeGraph                 = oapi.CreatedGraphIndexTypeGraph
+	CreatedAlgebraicIndexTypeAlgebraic         = oapi.CreatedAlgebraicIndexTypeAlgebraic
+	CreateFullTextIndexRequestTypeFullText     = oapi.CreateFullTextIndexRequestTypeFullText
+	CreateEmbeddingsIndexRequestTypeEmbeddings = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+	CreateGraphIndexRequestTypeGraph           = oapi.CreateGraphIndexRequestTypeGraph
+	CreateAlgebraicIndexRequestTypeAlgebraic   = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset
@@ -551,6 +747,18 @@ const (
 	// EdgeTypeConfigTopology values
 	EdgeTypeConfigTopologyGraph = oapi.EdgeTypeConfigTopologyGraph
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
+
+	// Graph artifact mapping values
+	GraphArtifactSourceConfigKindArtifact             = oapi.GraphArtifactSourceConfigKindArtifact
+	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
+	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
+	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset
+	GraphArtifactProducerSourceConfigTypeField        = oapi.GraphArtifactProducerSourceConfigTypeField
+	GraphArtifactProducerSourceConfigTypeTemplate     = oapi.GraphArtifactProducerSourceConfigTypeTemplate
+	CreatedGraphArtifactProducerConfigKindAsset       = oapi.CreatedGraphArtifactProducerConfigKindAsset
+	GraphArtifactNodeMappingConfigModelDocument       = oapi.GraphArtifactNodeMappingConfigModelDocument
+	GraphArtifactNodeMappingConfigModelExternal       = oapi.GraphArtifactNodeMappingConfigModelExternal
+	GraphBoundedTraversalConfigLawProvenanceSemiring  = oapi.GraphBoundedTraversalConfigLawProvenanceSemiring
 
 	// GraphQueryType values
 	GraphQueryTypeKShortestPaths = oapi.GraphQueryTypeKShortestPaths

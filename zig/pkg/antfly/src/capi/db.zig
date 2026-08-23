@@ -15,6 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const antfly = @import("antfly_storage_root");
+const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
@@ -480,6 +481,7 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
         const request_json = try table_reads_api.encodeStorageKernelQueryRequest(handle.alloc, req);
         defer handle.alloc.free(request_json);
         var failure: kernel_owner_abi.FailureIdentity = .{};
+        var cancellation = req.cancellation;
         const response_json = try local_query_client.executeJsonAlloc(
             handle.alloc,
             @ptrCast(&handle.db),
@@ -493,12 +495,15 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
                     .parent => .parent,
                     .chunk => .chunk,
                     .parent_with_chunks => .parent_with_chunks,
+                    .unit => .unit,
+                    .unit_with_chunks => .unit_with_chunks,
                 },
                 .max_chunks_per_parent = req.max_chunks_per_parent,
                 .dense_k = if (req.dense) |query| query.k else 0,
                 .sparse_k = if (req.sparse) |query| query.k else 0,
             },
-            if (req.cancellation) |cancellation| @ptrCast(cancellation) else null,
+            if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            if (cancellation != null) cancellationTokenRequested else null,
             &failure,
         );
         defer handle.alloc.free(response_json);
@@ -510,6 +515,11 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
         return result;
     }
     return try handle.db.search(handle.alloc, req);
+}
+
+fn cancellationTokenRequested(ctx: ?*anyopaque) callconv(.c) u8 {
+    const token: *const db_mod.types.CancellationToken = @ptrCast(@alignCast(ctx orelse return 0));
+    return @intFromBool(token.isCancelled());
 }
 
 const ReadableLeaseHookFn = *const fn (
@@ -2660,6 +2670,11 @@ pub fn metadataApplyStoreProjection(
                 break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .runtime_status_protocol_activation_version => blk: {
+            const value = handle.store.getRuntimeStatusProtocolActivationVersion(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .split_transitions => blk: {
             const value = handle.store.listSplitTransitions(alloc, request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -2670,6 +2685,12 @@ pub fn metadataApplyStoreProjection(
             const value = handle.store.listPlacementIntents(alloc, request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer handle.store.freePlacementIntents(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .placement_version_fences => blk: {
+            const value = handle.store.listPlacementVersionFences(alloc, request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .local_placement_intents => blk: {
@@ -3044,6 +3065,19 @@ pub fn dataApplyStoreLatestForTransition(
     const latest = handle.store.latestBatchForTransition(request.group_id) catch |err|
         return storageOwnerStatusFromError(err);
     out_result.* = dataApplyLatestResult(latest);
+    return .ok;
+}
+
+pub fn dataApplyStoreRaftBatchProtocolVersion(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_version: *u16,
+) callconv(.c) kernel_owner_abi.Status {
+    out_version.* = 0;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    out_version.* = handle.store.raftBatchProtocolVersionForRequest(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -4867,6 +4901,7 @@ fn executeStorageOwnerCompiledQueryOperation(
         request_json,
         null,
         null,
+        null,
         out_failure,
     ) catch |err| {
         if (out_failure.status != .ok) return out_failure.status;
@@ -5034,7 +5069,8 @@ fn executeStorageOwnerCompiledGraph(
         table_name,
         request.request_json.slice(),
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
-        request.cancellation_flag,
+        request.cancellation_ctx,
+        request.cancellation_fn,
         out_failure,
     ) catch |err| {
         // A valid nested provider failure retains its local-query origin and
@@ -6444,7 +6480,7 @@ fn resolveDenseHitsFromProfiled(
             (try entry.index.getMetadata(hit.vector_id)) orelse return error.Internal;
         resolved[i] = .{
             .id = id,
-            .score = hit.distance,
+            .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
         };
         resolved_count += 1;
     }
@@ -7144,7 +7180,7 @@ pub export fn antfly_db_lookup_artifact_json(
     const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
     defer handle.alloc.free(artifact_id);
 
-    var record = handle.db.getArtifact(handle.alloc, artifact_id) catch |err| return capi.mapError(err);
+    var record = handle.db.getPublicArtifact(handle.alloc, artifact_id) catch |err| return capi.mapError(err);
     if (record == null) return .not_found;
     defer record.?.deinit(handle.alloc);
 
@@ -7731,6 +7767,7 @@ fn searchStorageKernelQueryJson(
             .internal,
             .{},
             null,
+            null,
             out_failure,
         ) catch |err| {
             // A valid provider failure already carries the exact envelope.
@@ -7807,6 +7844,7 @@ fn searchPublicQueryJson(
             request_json.bytes(),
             .public,
             .{},
+            null,
             null,
             &failure,
         ) catch |err| return capi.mapError(err);
@@ -12152,7 +12190,10 @@ test "capi artifact decode and lookup json" {
     defer artifact_ref.deinit(handle.alloc);
     const internal_key = try db_mod.artifact_ids.internalKeyForArtifactRefAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(internal_key);
-    try handle.db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+    try handle.db.core.store.put(
+        internal_key,
+        "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_artifact_unit_fingerprint\":\"private\"}",
+    );
 
     const artifact_id = try db_mod.artifact_ids.artifactPublicIdAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(artifact_id);
@@ -12174,8 +12215,26 @@ test "capi artifact decode and lookup json" {
         .len = artifact_id_b64.len,
     }, &lookup_out));
     defer antfly_db_buffer_free(lookup_out.ptr, lookup_out.len);
-    try std.testing.expect(std.mem.indexOf(u8, lookup_out.ptr.?[0..lookup_out.len], "\"artifact_ref\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lookup_out.ptr.?[0..lookup_out.len], "\"_chunk_id\":0") != null);
+    var lookup_json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        lookup_out.ptr.?[0..lookup_out.len],
+        .{},
+    );
+    defer lookup_json.deinit();
+    try std.testing.expect(lookup_json.value.object.get("artifact_ref") != null);
+    const value_b64 = lookup_json.value.object.get("value_b64") orelse return error.TestUnexpectedResult;
+    if (value_b64 != .string) return error.TestUnexpectedResult;
+    const public_value = try decodeBase64Alloc(alloc, value_b64.string);
+    defer alloc.free(public_value);
+    var public_json = try std.json.parseFromSlice(std.json.Value, alloc, public_value, .{});
+    defer public_json.deinit();
+    if (public_json.value != .object) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), public_json.value.object.count());
+    try std.testing.expectEqualStrings("abcdefgh", public_json.value.object.get("body").?.string);
+    try std.testing.expectEqualStrings("body_chunks_v1", public_json.value.object.get("_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 0), public_json.value.object.get("_chunk_id").?.integer);
+    try std.testing.expect(public_json.value.object.get("_artifact_unit_fingerprint") == null);
 }
 
 test "capi dense search profile breakdown" {

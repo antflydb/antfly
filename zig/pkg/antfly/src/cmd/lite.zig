@@ -1122,6 +1122,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
             .public,
             .{},
             null,
+            null,
             &failure,
         );
     }

@@ -8,6 +8,7 @@ usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
   antfly
+  completions/
   share/
   lib/
   include/
@@ -142,6 +143,17 @@ lite_lib_name="$(lite_library_name "$target")"
 lite_lib_archive_path="$(lite_library_archive_path "$target")"
 lite_lib_prefix_path="$prefix/${lite_lib_archive_path#./}"
 
+cuda=false
+pjrt=false
+case "$target" in
+  *-linux-*)
+    # Both backends load their driver/plugin at runtime, so the same Linux
+    # artifact remains usable on CPU-only hosts.
+    cuda=true
+    pjrt=true
+    ;;
+esac
+
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$local_cache" "$cache_root/global" "$out_dir"
 
@@ -151,11 +163,13 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dlinked-runtime-libraries=true
+  -Dstorage-kernel-experiment=true
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
-  -Dcuda=false
+  -Dcuda="$cuda"
+  -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
 
@@ -200,19 +214,23 @@ run_zig_build_steps_with_retry() {
     return 0
   fi
 
-  # Zig 0.16 can fail the first ARM64 musl ReleaseSmall compile in LLVM's
-  # allocation path even though the runner has ample available memory. A replay
-  # using the local cache populated by that failed compile has been observed to
-  # complete at the same peak RSS. Limit the retry to that known failure mode so
-  # unrelated compiler and source errors still fail immediately.
-  if [ "$target" != aarch64-linux-musl ] || \
-     [ "$optimize" != ReleaseSmall ] || \
-     ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"
-  then
+  # Zig 0.16 can fail a first ARM64 release compile in LLVM's allocation path
+  # even though the runner has ample available memory. This has occurred in the
+  # historical Linux ReleaseSmall build and in the current Linux and macOS
+  # ReleaseFast builds. A replay retains completed work in the local cache and
+  # starts LLVM in a fresh process. Limit the retry to those observed production
+  # combinations and allocation signatures so unrelated errors fail immediately.
+  case "$target:$optimize" in
+    aarch64-linux-musl:ReleaseSmall | \
+    aarch64-linux-musl:ReleaseFast | \
+    aarch64-macos:ReleaseFast) ;;
+    *) return "$status" ;;
+  esac
+  if ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"; then
     return "$status"
   fi
 
-  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $label once with the populated local cache"
+  echo "::warning::Zig ARM64 release build hit a compiler allocation failure; retrying $label once with the populated local cache"
   set +e
   run_zig_build_steps "$@" 2>&1 | tee "$retry_log"
   status=${PIPESTATUS[0]}
@@ -222,11 +240,11 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # API and the shared PIC application/storage unit occupy the initial 18GiB
-  # memory-budget group. When API finishes, inference can overlap the still-
-  # running application unit within a 19GiB group. Explicit build dependencies
-  # keep Zig's randomized dependency traversal from admitting the short remote
-  # CLI unit ahead of either critical compiler unit.
+  # Physical storage and distributed control form the initial bounded-memory
+  # group. The storage-kernel experiment gives physical codegen its own archive
+  # and an 18 GiB Darwin scheduler claim, so the 20 GiB release budget cannot
+  # admit another compiler unit beside it. Downstream units retain overlap once
+  # the storage claim is released.
   run_zig_build_steps_with_retry archive antfly capi
 )
 
@@ -249,6 +267,7 @@ if [ -d "$prefix/include" ]; then
 fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
+"$repo_root/scripts/completions.sh" "$stage/completions"
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --source "$stage" \
@@ -257,4 +276,7 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"

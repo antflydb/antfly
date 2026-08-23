@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -76,6 +78,10 @@ type AntflyClusterReconciler struct {
 	// (namespace/name -> int). Reset on successful validation. Used for
 	// exponential backoff on repeated validation failures.
 	validationAttempts sync.Map
+	// metadataTopologyObservations tracks retryable runtime-topology observations
+	// so short grace periods can span reconciliations without occupying a
+	// controller worker while Raft settles or a status probe recovers.
+	metadataTopologyObservations sync.Map
 	// haIsolationGraceStarts is intentionally process-local and unpersisted. A
 	// controller or leader restart must observe the exact Lease transfer again
 	// and wait a fresh full runtime maximum fence latency.
@@ -89,6 +95,10 @@ type AntflyClusterReconciler struct {
 var defaultOperatorHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 const maxHASeededSlotActivationReceiptBytes = 64 * 1024
+
+// A checkpoint is successful durable progress, so it should restart
+// reconciliation promptly without consuming the error rate limiter.
+const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
 
 const (
 	antflyRuntimeUID int64 = 10001
@@ -1470,9 +1480,667 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 
 // validateClusterConfiguration validates the cluster configuration (T025)
 // This is a fallback validation for cases where webhook validation is disabled
-func (r *AntflyClusterReconciler) validateClusterConfiguration(cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) validateClusterConfiguration(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	// Call the webhook validation methods as fallback
-	return cluster.ValidateCreate()
+	if err := cluster.ValidateCreate(); err != nil {
+		return err
+	}
+
+	if err := r.validateMetadataReplicaTopology(ctx, cluster); err != nil {
+		return &metadataTopologyValidationError{cause: err}
+	}
+	return nil
+}
+
+// validateMetadataReplicaTopology closes the update-validation gap on clusters
+// where admission webhooks or CRD CEL transition rules are not available. It
+// uses controller-owned status and retained-PVC annotations as durable records;
+// the mutable StatefulSet replica field is used only to migrate legacy clusters.
+func (r *AntflyClusterReconciler) validateMetadataReplicaTopology(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.Mode != antflyv1.ClusterModeDistributed {
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
+		return nil
+	}
+
+	desiredReplicas := effectiveMetadataNodeReplicas(cluster)
+	// Retained storage is a safety boundary: a stale cache miss could otherwise
+	// approve and create a new StatefulSet before an incompatible retained claim
+	// becomes visible. Production wires BoundaryReader to the uncached API reader.
+	topologyReader := r.haBoundaryReader()
+	type topologyRecord struct {
+		source   string
+		replicas int32
+	}
+	records := make([]topologyRecord, 0, 3)
+	if cluster.Status.MetadataTopologyReplicas > 0 {
+		records = append(records, topologyRecord{
+			source:   "AntflyCluster status",
+			replicas: cluster.Status.MetadataTopologyReplicas,
+		})
+	}
+
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	err := topologyReader.Get(ctx, types.NamespacedName{
+		Name:      cluster.Name + "-metadata",
+		Namespace: cluster.Namespace,
+	}, metadataStatefulSet)
+	statefulSetExists := err == nil
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("read existing metadata StatefulSet: %w", err)
+	}
+	if statefulSetExists {
+		if raw, ok := metadataStatefulSet.Annotations[metadataTopologyReplicasAnnotation]; ok {
+			replicas, err := parseMetadataTopologyReplicas(raw, "metadata StatefulSet annotation")
+			if err != nil {
+				return err
+			}
+			records = append(records, topologyRecord{source: "metadata StatefulSet annotation", replicas: replicas})
+		}
+	}
+
+	pvcPrefix := metadataPVCPrefix(cluster)
+	var pvcList corev1.PersistentVolumeClaimList
+	if err := topologyReader.List(ctx, &pvcList, client.InNamespace(cluster.Namespace)); err != nil {
+		return fmt.Errorf("list metadata PVCs for topology validation: %w", err)
+	}
+	metadataPVCsExist := false
+	pvcOrdinals := make(map[int32]string)
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		ordinal, matches := metadataPVCOrdinal(cluster, pvc)
+		if !matches {
+			continue
+		}
+		metadataPVCsExist = true
+		pvcOrdinals[ordinal] = pvc.Name
+		if raw, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {
+			replicas, err := parseMetadataTopologyReplicas(raw, fmt.Sprintf("metadata PVC %s annotation", pvc.Name))
+			if err != nil {
+				return err
+			}
+			records = append(records, topologyRecord{source: fmt.Sprintf("metadata PVC %s", pvc.Name), replicas: replicas})
+		}
+	}
+
+	// Compare durable records before checking retained claim completeness so a
+	// replica-count change receives the direct immutability diagnostic.
+	for _, record := range records {
+		if record.replicas == desiredReplicas {
+			continue
+		}
+		return metadataTopologyChangeError(record.source, record.replicas, desiredReplicas)
+	}
+
+	// Any retained set must contain exactly the ordinals belonging to the
+	// recorded topology. In particular, do not let a same-name recreation fill
+	// missing ordinals with fresh claims and combine different Raft histories.
+	if metadataPVCsExist {
+		if err := validateMetadataPVCOrdinals(pvcOrdinals, desiredReplicas); err != nil {
+			return err
+		}
+	}
+
+	// Bootstrap pre-record clusters from their existing controller-owned
+	// StatefulSet only when no durable status/PVC record exists. The mutable
+	// replica field is not enough by itself: every retained claim and every
+	// running member must prove one stable Raft incarnation before migration.
+	if len(records) == 0 && statefulSetExists {
+		legacyReplicas := int32(1)
+		if metadataStatefulSet.Spec.Replicas != nil {
+			legacyReplicas = *metadataStatefulSet.Spec.Replicas
+		}
+		if legacyReplicas != desiredReplicas {
+			return metadataTopologyChangeError("legacy metadata StatefulSet", legacyReplicas, desiredReplicas)
+		}
+		if err := validateMetadataPVCOrdinals(pvcOrdinals, legacyReplicas); err != nil {
+			return fmt.Errorf("cannot safely migrate the legacy metadata topology: %w", err)
+		}
+		if err := r.validateLegacyMetadataRuntimeTopology(ctx, cluster, legacyReplicas); err != nil {
+			return err
+		}
+		return nil
+	}
+	if len(records) == 0 {
+		if metadataPVCsExist {
+			return fmt.Errorf(`cannot establish the immutable metadata topology for retained PVCs with prefix %q
+
+Problem: The metadata StatefulSet is absent and the retained PVCs predate topology recording. Reusing them with an unverified replica count can start divergent Raft incarnations.
+
+Solution: Keep the existing cluster topology if it can be recovered, or back up and restore into a differently named AntflyCluster with fresh metadata PVCs`, pvcPrefix)
+		}
+		return nil
+	}
+
+	return nil
+}
+
+func metadataTopologyChangeError(source string, recordedReplicas, desiredReplicas int32) error {
+	return fmt.Errorf(`field 'spec.metadataNodes.replicas' is immutable after cluster creation (recorded by %s: %d, attempted: %d)
+
+Problem: Metadata nodes are quorum-bearing. The operator does not yet have a quorum-aware metadata membership-change workflow. Changing the StatefulSet topology with retained PVCs can start divergent Raft incarnations.
+
+Solution: Keep the existing metadata replica count. To change topology, back up the cluster, create a differently named AntflyCluster at the target replica count so it receives fresh metadata PVCs, restore the backup, and cut over. Do not reuse retained metadata PVCs across replica-count changes`, source, recordedReplicas, desiredReplicas)
+}
+
+func validateMetadataPVCOrdinals(pvcOrdinals map[int32]string, replicas int32) error {
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		if _, ok := pvcOrdinals[ordinal]; !ok {
+			return fmt.Errorf("retained metadata PVC set is incomplete: missing ordinal %d of expected ordinals 0 through %d", ordinal, replicas-1)
+		}
+	}
+	for ordinal, name := range pvcOrdinals {
+		if ordinal >= replicas {
+			return fmt.Errorf("retained metadata PVC %s has unexpected ordinal %d outside expected ordinals 0 through %d", name, ordinal, replicas-1)
+		}
+	}
+	return nil
+}
+
+type metadataRuntimeTopologyStatus struct {
+	MetadataGroupID                 uint64  `json:"metadata_group_id"`
+	MetadataIncarnation             string  `json:"metadata_incarnation"`
+	MetadataRaftLocalNodeID         uint64  `json:"metadata_raft_local_node_id"`
+	MetadataRaftRole                string  `json:"metadata_raft_role"`
+	MetadataRaftLeaderID            *uint64 `json:"metadata_raft_leader_id"`
+	MetadataRaftTerm                uint64  `json:"metadata_raft_term"`
+	MetadataRaftLocalVoter          bool    `json:"metadata_raft_local_voter"`
+	MetadataRaftVoterCount          int32   `json:"metadata_raft_voter_count"`
+	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
+	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
+	MetadataRaftLearnerCount        *int32  `json:"metadata_raft_learner_count"`
+}
+
+const (
+	maxMetadataRuntimeStatusBytes = 64 * 1024
+	metadataRuntimeTopologyPath   = "/metadata/v1/runtime-topology"
+	metadataRuntimeStatusPath     = "/metadata/v1/status"
+)
+
+var errMetadataRuntimeMembershipStatusUnavailable = stderrors.New("metadata runtime does not expose exact Raft membership status")
+
+type metadataTopologyValidationError struct {
+	cause error
+}
+
+func (e *metadataTopologyValidationError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataTopologyValidationError) Unwrap() error {
+	return e.cause
+}
+
+type metadataLeadershipObservationError struct {
+	cause error
+}
+
+func (e *metadataLeadershipObservationError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataLeadershipObservationError) Unwrap() error {
+	return e.cause
+}
+
+type metadataRuntimeTopologyProbeError struct {
+	cause error
+}
+
+func (e *metadataRuntimeTopologyProbeError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataRuntimeTopologyProbeError) Unwrap() error {
+	return e.cause
+}
+
+type metadataTopologyObservationPendingError struct {
+	cause           error
+	retryAfter      time.Duration
+	conditionReason string
+	waitMessage     string
+}
+
+func (e *metadataTopologyObservationPendingError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *metadataTopologyObservationPendingError) Unwrap() error {
+	return e.cause
+}
+
+type metadataTopologyObservationState struct {
+	uid           types.UID
+	deadline      time.Time
+	retryInterval time.Duration
+	expired       bool
+}
+
+const (
+	metadataLeadershipObservationRetryInterval = 250 * time.Millisecond
+	// Metadata Raft uses a 30-tick election timeout with up to another 29
+	// ticks of jitter. At the runtime's default 100ms tick, an election can
+	// therefore take almost six seconds to begin; allow another second for
+	// votes and the resulting leader observation to propagate.
+	metadataLeadershipObservationGracePeriod = 7 * time.Second
+	// Runtime status probes should fail quickly enough not to monopolize the
+	// cluster controller, while tolerating a brief DNS, connection, or server
+	// interruption without changing an otherwise healthy cluster's status.
+	metadataRuntimeTopologyProbeTimeout       = 2 * time.Second
+	metadataRuntimeTopologyProbeRetryInterval = 250 * time.Millisecond
+	metadataRuntimeTopologyProbeGracePeriod   = 3 * time.Second
+)
+
+func (r *AntflyClusterReconciler) validateLegacyMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	if err := r.validateMetadataRuntimeTopology(ctx, cluster, replicas); err != nil {
+		return fmt.Errorf("cannot safely migrate legacy metadata topology: %w", err)
+	}
+	return nil
+}
+
+// validateMetadataRuntimeTopology proves that every expected member belongs to
+// one stable metadata Raft incarnation and the exact configured voter set. It
+// is used both while migrating pre-record clusters and when publishing
+// steady-state health.
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	return r.validateMetadataRuntimeTopologyWithClock(
+		ctx,
+		cluster,
+		replicas,
+		time.Now,
+		metadataLeadershipObservationRetryInterval,
+		metadataLeadershipObservationGracePeriod,
+	)
+}
+
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyAt(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	replicas int32,
+	now time.Time,
+	retryInterval time.Duration,
+	gracePeriod time.Duration,
+) error {
+	return r.validateMetadataRuntimeTopologyWithClock(
+		ctx,
+		cluster,
+		replicas,
+		func() time.Time { return now },
+		retryInterval,
+		gracePeriod,
+	)
+}
+
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyWithClock(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	replicas int32,
+	now func() time.Time,
+	retryInterval time.Duration,
+	gracePeriod time.Duration,
+) error {
+	startedAt := now()
+	err := r.validateMetadataRuntimeTopologyOnce(ctx, cluster, replicas)
+	observedAt := now()
+	key := metadataTopologyObservationKey(cluster)
+	var leadershipErr *metadataLeadershipObservationError
+	var probeErr *metadataRuntimeTopologyProbeError
+	retry := retryInterval
+	grace := gracePeriod
+	conditionReason := antflyv1.ReasonMetadataLeadershipObservationPending
+	waitMessage := "Waiting for metadata Raft leadership to settle"
+	if stderrors.As(err, &probeErr) {
+		retry = metadataRuntimeTopologyProbeRetryInterval
+		grace = metadataRuntimeTopologyProbeGracePeriod
+		conditionReason = antflyv1.ReasonMetadataTopologyObservationPending
+		waitMessage = "Waiting for metadata runtime status probes to recover"
+	} else if !stderrors.As(err, &leadershipErr) {
+		r.metadataTopologyObservations.Delete(key)
+		return err
+	}
+
+	// Member status is observed over multiple requests rather than through a
+	// linearizable cluster-wide snapshot. Carry leadership failures for a full
+	// election window and retryable probe failures for a much shorter window.
+	// Durable identity, membership, and payload failures still return immediately.
+	state := metadataTopologyObservationState{
+		uid:           cluster.UID,
+		deadline:      startedAt.Add(grace),
+		retryInterval: retry,
+	}
+	if observed, ok := r.metadataTopologyObservations.Load(key); ok {
+		candidate := observed.(metadataTopologyObservationState)
+		if candidate.uid == cluster.UID {
+			state = candidate
+			// Alternating leadership and probe failures must not restart or extend
+			// an observation window. Use the earliest applicable deadline.
+			if deadline := startedAt.Add(grace); deadline.Before(state.deadline) {
+				state.deadline = deadline
+			}
+			state.retryInterval = min(state.retryInterval, retry)
+		}
+	}
+	r.metadataTopologyObservations.Store(key, state)
+	remaining := state.deadline.Sub(observedAt)
+	if remaining <= 0 {
+		state.expired = true
+		r.metadataTopologyObservations.Store(key, state)
+		return err
+	}
+	return &metadataTopologyObservationPendingError{
+		cause:           err,
+		retryAfter:      min(retry, remaining),
+		conditionReason: conditionReason,
+		waitMessage:     waitMessage,
+	}
+}
+
+func metadataTopologyObservationKey(cluster *antflyv1.AntflyCluster) string {
+	return types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}.String()
+}
+
+func (r *AntflyClusterReconciler) metadataTopologyObservationRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	observed, ok := r.metadataTopologyObservations.Load(metadataTopologyObservationKey(cluster))
+	if !ok {
+		return 0
+	}
+	state := observed.(metadataTopologyObservationState)
+	if state.uid != cluster.UID {
+		return 0
+	}
+	if state.expired {
+		return 0
+	}
+	remaining := time.Until(state.deadline)
+	if remaining <= 0 {
+		return time.Millisecond
+	}
+	return min(state.retryInterval, remaining)
+}
+
+func (r *AntflyClusterReconciler) validateMetadataRuntimeTopologyOnce(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	if replicas < 1 {
+		return fmt.Errorf("invalid replica count %d", replicas)
+	}
+	maxNodeID := uint64(replicas) // #nosec G115 -- replicas is explicitly checked positive above.
+	expectedVoterSetFingerprint := metadataRaftVoterSetFingerprint(replicas)
+	statuses := make([]*metadataRuntimeTopologyStatus, replicas)
+	fetchErrors := make([]error, replicas)
+	var waitGroup sync.WaitGroup
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		waitGroup.Add(1)
+		go func(ordinal int32) {
+			defer waitGroup.Done()
+			status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+			statuses[ordinal] = status
+			fetchErrors[ordinal] = err
+		}(ordinal)
+	}
+	waitGroup.Wait()
+	for ordinal, err := range fetchErrors {
+		if err != nil {
+			return fmt.Errorf("member ordinal %d status is unavailable: %w", ordinal, err)
+		}
+	}
+
+	var baseline *metadataRuntimeTopologyStatus
+	membershipStatusUnavailable := false
+	for ordinal, status := range statuses {
+		expectedNodeID := uint64(ordinal + 1) // #nosec G115 -- ordinal is bounded by the positive int32 replica count.
+		if status.MetadataGroupID == 0 || !validMetadataIncarnation(status.MetadataIncarnation) {
+			return fmt.Errorf("member ordinal %d returned an invalid group or incarnation", ordinal)
+		}
+		if status.MetadataRaftLocalNodeID != expectedNodeID {
+			return fmt.Errorf("member ordinal %d reports local node %d, expected %d", ordinal, status.MetadataRaftLocalNodeID, expectedNodeID)
+		}
+		if !status.MetadataRaftLocalVoter || status.MetadataRaftVoterCount != replicas {
+			return fmt.Errorf("member ordinal %d reports local_voter=%t and voter_count=%d, expected local_voter=true and voter_count=%d", ordinal, status.MetadataRaftLocalVoter, status.MetadataRaftVoterCount, replicas)
+		}
+		if status.MetadataRaftJointConsensus != nil && *status.MetadataRaftJointConsensus {
+			return fmt.Errorf("member ordinal %d reports an active joint-consensus membership transition", ordinal)
+		}
+		if status.MetadataRaftLearnerCount != nil && *status.MetadataRaftLearnerCount != 0 {
+			return fmt.Errorf("member ordinal %d reports learner_count=%d, expected 0", ordinal, *status.MetadataRaftLearnerCount)
+		}
+		if status.MetadataRaftVoterSetFingerprint == nil || status.MetadataRaftJointConsensus == nil || status.MetadataRaftLearnerCount == nil {
+			membershipStatusUnavailable = true
+		} else if *status.MetadataRaftVoterSetFingerprint != expectedVoterSetFingerprint {
+			return fmt.Errorf("member ordinal %d reports voter set fingerprint %q, expected %q", ordinal, *status.MetadataRaftVoterSetFingerprint, expectedVoterSetFingerprint)
+		}
+
+		if baseline == nil {
+			baseline = status
+			continue
+		}
+		if status.MetadataGroupID != baseline.MetadataGroupID || status.MetadataIncarnation != baseline.MetadataIncarnation {
+			return fmt.Errorf("member ordinal %d disagrees on metadata group or incarnation", ordinal)
+		}
+	}
+
+	leaderReports := 0
+	for ordinal, status := range statuses {
+		if status.MetadataRaftLeaderID == nil || *status.MetadataRaftLeaderID < 1 || *status.MetadataRaftLeaderID > maxNodeID {
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d does not report a valid leader", ordinal)}
+		}
+		if status.MetadataRaftTerm != baseline.MetadataRaftTerm || *status.MetadataRaftLeaderID != *baseline.MetadataRaftLeaderID {
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d disagrees on Raft term or leader", ordinal)}
+		}
+		switch status.MetadataRaftRole {
+		case "leader":
+			if *status.MetadataRaftLeaderID != status.MetadataRaftLocalNodeID {
+				return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d reports leader role for node %d but leader %d", ordinal, status.MetadataRaftLocalNodeID, *status.MetadataRaftLeaderID)}
+			}
+			leaderReports++
+		case "follower":
+			if *status.MetadataRaftLeaderID == status.MetadataRaftLocalNodeID {
+				return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d reports follower role but identifies itself as leader", ordinal)}
+			}
+		default:
+			return &metadataLeadershipObservationError{cause: fmt.Errorf("member ordinal %d is not in a stable Raft role: %q", ordinal, status.MetadataRaftRole)}
+		}
+	}
+	if leaderReports != 1 {
+		return &metadataLeadershipObservationError{cause: fmt.Errorf("expected exactly one member to report leader role, got %d", leaderReports)}
+	}
+	if membershipStatusUnavailable {
+		return fmt.Errorf("%w; update spec.image to a runtime that reports metadata_raft_voter_set_fingerprint, metadata_raft_joint_consensus, and metadata_raft_learner_count", errMetadataRuntimeMembershipStatusUnavailable)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Context, cluster *antflyv1.AntflyCluster, ordinal int32) (*metadataRuntimeTopologyStatus, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, metadataRuntimeTopologyProbeTimeout)
+	defer cancel()
+
+	// New runtimes expose an O(1) topology payload. Fall back once to the
+	// historical aggregate status route only while rolling an older runtime;
+	// steady-state monitoring must not clone the projected catalog.
+	paths := [...]string{metadataRuntimeTopologyPath, metadataRuntimeStatusPath}
+	for pathIndex, requestPath := range paths {
+		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d%s",
+			cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create metadata topology request: %w", err)
+		}
+		resp, err := r.httpClient().Do(req) //nolint:gosec // URL is a deterministic cluster-internal pod address.
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("request metadata topology: %w", err)
+			}
+			return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("request metadata topology: %w", err)}
+		}
+		if pathIndex == 0 && resp.StatusCode == http.StatusNotFound {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			continue
+		}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			err := fmt.Errorf("metadata topology returned HTTP %d", resp.StatusCode)
+			if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+				return nil, &metadataRuntimeTopologyProbeError{cause: err}
+			}
+			return nil, err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMetadataRuntimeStatusBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("read metadata topology: %w", readErr)
+			}
+			return nil, &metadataRuntimeTopologyProbeError{cause: fmt.Errorf("read metadata topology: %w", readErr)}
+		}
+		if len(body) > maxMetadataRuntimeStatusBytes {
+			return nil, fmt.Errorf("metadata topology exceeds %d bytes", maxMetadataRuntimeStatusBytes)
+		}
+		var status metadataRuntimeTopologyStatus
+		if err := json.Unmarshal(body, &status); err != nil {
+			return nil, fmt.Errorf("decode metadata topology: %w", err)
+		}
+		return &status, nil
+	}
+	return nil, fmt.Errorf("metadata runtime topology route is unavailable")
+}
+
+func validMetadataIncarnation(value string) bool {
+	if len(value) != 32 || value != strings.ToLower(value) || strings.Trim(value, "0") == "" {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func metadataRaftVoterSetFingerprint(replicas int32) string {
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte("antfly-raft-voter-set-v1\x00"))
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(replicas)) // #nosec G115 -- callers validate replicas as positive.
+	_, _ = hasher.Write(encoded[:])
+	for nodeID := int32(1); nodeID <= replicas; nodeID++ {
+		binary.BigEndian.PutUint64(encoded[:], uint64(nodeID)) // #nosec G115 -- loop starts at one and is bounded by positive replicas.
+		_, _ = hasher.Write(encoded[:])
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func parseMetadataTopologyReplicas(raw, source string) (int32, error) {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+	if err != nil || parsed < 1 {
+		return 0, fmt.Errorf("%s %q is not a valid positive replica count", source, raw)
+	}
+	return int32(parsed), nil
+}
+
+func effectiveMetadataNodeReplicas(cluster *antflyv1.AntflyCluster) int32 {
+	if cluster.Spec.MetadataNodes.Replicas > 0 {
+		return cluster.Spec.MetadataNodes.Replicas
+	}
+	return 3
+}
+
+func metadataPVCPrefix(cluster *antflyv1.AntflyCluster) string {
+	return "metadata-storage-" + cluster.Name + "-metadata-"
+}
+
+// metadataPVCOrdinal matches the exact claim-name shape that this cluster's
+// metadata StatefulSet will mount. Labels are deliberately not an ownership
+// gate: Kubernetes attaches an existing claim by name even when its labels are
+// stale or incorrect, so validation must account for every canonical name.
+func metadataPVCOrdinal(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) (int32, bool) {
+	ordinalText, ok := strings.CutPrefix(pvc.Name, metadataPVCPrefix(cluster))
+	if !ok {
+		return 0, false
+	}
+	ordinal, err := strconv.ParseInt(ordinalText, 10, 32)
+	if err != nil || ordinal < 0 || strconv.FormatInt(ordinal, 10) != ordinalText {
+		return 0, false
+	}
+	return int32(ordinal), true
+}
+
+const (
+	metadataMembershipStatusCapabilityAnnotation = "antfly.io/metadata-membership-status-capability"
+	metadataMembershipStatusCapabilityVersion    = "v2"
+	metadataMembershipCapabilityRolloutInterval  = 10 * time.Second
+)
+
+type metadataMembershipCapabilityRolloutState int
+
+const (
+	metadataMembershipCapabilityRolloutStarted metadataMembershipCapabilityRolloutState = iota
+	metadataMembershipCapabilityRolloutPending
+	metadataMembershipCapabilityUnavailable
+)
+
+func metadataMembershipCapabilityRolloutComplete(statefulSet *appsv1.StatefulSet, expectedReplicas int32) bool {
+	return statefulSet.Status.ObservedGeneration >= statefulSet.Generation &&
+		statefulSet.Status.UpdatedReplicas >= expectedReplicas &&
+		statefulSet.Status.ReadyReplicas >= expectedReplicas &&
+		statefulSet.Status.CurrentRevision != "" &&
+		statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func (state metadataMembershipCapabilityRolloutState) requeueAfter() time.Duration {
+	if state == metadataMembershipCapabilityUnavailable {
+		return 0
+	}
+	return metadataMembershipCapabilityRolloutInterval
+}
+
+// reconcileLegacyMetadataRuntimeMembershipStatus rolls only the runtime image
+// and its capability marker while exact membership status is unavailable. The
+// legacy topology validator has already proved that the StatefulSet replica
+// count, retained ordinals, local node IDs, incarnation, leader, and voter
+// cardinality agree. Avoiding every other StatefulSet mutation here prevents
+// an unverified topology from being recorded or changed before the upgraded
+// runtime exposes the exact voter set, joint-consensus state, and learners.
+func (r *AntflyClusterReconciler) reconcileLegacyMetadataRuntimeMembershipStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) (metadataMembershipCapabilityRolloutState, error) {
+	statefulSet := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, statefulSet); err != nil {
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("read legacy metadata StatefulSet for runtime upgrade: %w", err)
+	}
+	if !metav1.IsControlledBy(statefulSet, cluster) {
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet %s is not controlled by the current AntflyCluster", statefulSet.Name)
+	}
+	expectedReplicas := effectiveMetadataNodeReplicas(cluster)
+	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != expectedReplicas {
+		return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet changed during runtime upgrade: replicas must remain %d", expectedReplicas)
+	}
+
+	before := statefulSet.DeepCopy()
+	for i := range statefulSet.Spec.Template.Spec.Containers {
+		container := &statefulSet.Spec.Template.Spec.Containers[i]
+		if container.Name != "antfly" {
+			continue
+		}
+		changed := container.Image != cluster.Spec.Image
+		container.Image = cluster.Spec.Image
+		if cluster.Spec.ImagePullPolicy != "" && container.ImagePullPolicy != corev1.PullPolicy(cluster.Spec.ImagePullPolicy) {
+			container.ImagePullPolicy = corev1.PullPolicy(cluster.Spec.ImagePullPolicy)
+			changed = true
+		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		if statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] != metadataMembershipStatusCapabilityVersion {
+			statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
+			changed = true
+		}
+		if !changed {
+			if metadataMembershipCapabilityRolloutComplete(statefulSet, expectedReplicas) {
+				return metadataMembershipCapabilityUnavailable, nil
+			}
+			return metadataMembershipCapabilityRolloutPending, nil
+		}
+		if err := r.Patch(ctx, statefulSet, client.MergeFrom(before)); err != nil {
+			return metadataMembershipCapabilityRolloutPending, fmt.Errorf("roll metadata runtime for exact membership status: %w", err)
+		}
+		return metadataMembershipCapabilityRolloutStarted, nil
+	}
+	return metadataMembershipCapabilityRolloutPending, fmt.Errorf("legacy metadata StatefulSet %s has no antfly container", statefulSet.Name)
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -1510,40 +2178,39 @@ func (r *AntflyClusterReconciler) resetValidationAttempts(key string) {
 }
 
 // updateStatusWithValidationError updates the cluster status with validation error (T026).
-// Skips the API call if the condition already reflects the same error.
+// Skips the API call if the complete failure status already reflects the error.
 func (r *AntflyClusterReconciler) updateStatusWithValidationError(ctx context.Context, cluster *antflyv1.AntflyCluster, validationErr error) error {
 	log := log.FromContext(ctx)
 
 	errMsg := validationErr.Error()
-
-	// Skip update if condition already reflects the same error
-	for _, existing := range cluster.Status.Conditions {
-		if existing.Type == antflyv1.TypeConfigurationValid &&
-			existing.Status == metav1.ConditionFalse &&
-			existing.Message == errMsg {
-			return nil
-		}
-	}
+	before := cluster.Status.DeepCopy()
 
 	condition := metav1.Condition{
 		Type:               antflyv1.TypeConfigurationValid,
 		Status:             metav1.ConditionFalse,
+		ObservedGeneration: cluster.Generation,
 		Reason:             antflyv1.ReasonValidationFailed,
 		Message:            errMsg,
 		LastTransitionTime: metav1.Now(),
 	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
 
-	// Find and update or append the condition
-	found := false
-	for i, existing := range cluster.Status.Conditions {
-		if existing.Type == antflyv1.TypeConfigurationValid {
-			cluster.Status.Conditions[i] = condition
-			found = true
-			break
+	var topologyErr *metadataTopologyValidationError
+	if stderrors.As(validationErr, &topologyErr) {
+		cluster.Status.Phase = "Degraded"
+		for _, conditionType := range []string{antflyv1.TypeMetadataReady, antflyv1.TypeAvailable} {
+			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+				Type:               conditionType,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: cluster.Generation,
+				Reason:             antflyv1.ReasonValidationFailed,
+				Message:            errMsg,
+			})
 		}
 	}
-	if !found {
-		cluster.Status.Conditions = append(cluster.Status.Conditions, condition)
+
+	if reflect.DeepEqual(before, &cluster.Status) {
+		return nil
 	}
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -1551,18 +2218,24 @@ func (r *AntflyClusterReconciler) updateStatusWithValidationError(ctx context.Co
 		return err
 	}
 
-	r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, antflyv1.ReasonValidationFailed, antflyv1.ReasonValidationFailed, "%s", errMsg)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, antflyv1.ReasonValidationFailed, antflyv1.ReasonValidationFailed, "%s", errMsg)
+	}
 
 	return nil
 }
 
 // updateStatusWithValidationSuccess updates the cluster status with successful validation (T026).
 // Skips the API call if the condition is already True and ObservedGeneration is current.
-func (r *AntflyClusterReconciler) updateStatusWithValidationSuccess(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) updateStatusWithValidationSuccess(ctx context.Context, cluster *antflyv1.AntflyCluster, metadataTopologyReplicas int32) error {
 	log := log.FromContext(ctx)
+	topologyRecordChanged := metadataTopologyReplicas > 0 && cluster.Status.MetadataTopologyReplicas != metadataTopologyReplicas
+	if topologyRecordChanged {
+		cluster.Status.MetadataTopologyReplicas = metadataTopologyReplicas
+	}
 
 	// Skip update if already valid for this generation
-	if cluster.Status.ObservedGeneration == cluster.Generation {
+	if !topologyRecordChanged && cluster.Status.ObservedGeneration == cluster.Generation {
 		for _, existing := range cluster.Status.Conditions {
 			if existing.Type == antflyv1.TypeConfigurationValid &&
 				existing.Status == metav1.ConditionTrue {
@@ -1759,6 +2432,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, &antflyCluster); err != nil {
 		if errors.IsNotFound(err) {
 			r.validationAttempts.Delete(req.String())
+			r.metadataTopologyObservations.Delete(req.String())
 			log.Info("AntflyCluster resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
@@ -1769,6 +2443,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Handle deletion: if the cluster is being deleted and has our finalizer, clean up storage
 	if !antflyCluster.DeletionTimestamp.IsZero() {
 		r.validationAttempts.Delete(req.String())
+		r.metadataTopologyObservations.Delete(req.String())
 		if controllerutil.ContainsFinalizer(&antflyCluster, antflyv1.FinalizerPVCCleanup) {
 			// Only run PVC cleanup if the policy still requests deletion.
 			// The finalizer is kept even when the policy changes back to Retain
@@ -1840,14 +2515,39 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if !needsValidation && haRuntimeNeedsAdminTokenMigration(&antflyCluster) {
 		needsValidation = true
 	}
+	// Seed the durable metadata topology record for clusters created by older
+	// operator versions before relying on it for future update validation.
+	if !needsValidation && !standaloneMode && antflyCluster.Status.MetadataTopologyReplicas == 0 {
+		needsValidation = true
+	}
 
 	clusterKey := req.String()
 
 	if needsValidation {
-		if err := r.validateClusterConfiguration(workingCluster); err != nil {
+		if err := r.validateClusterConfiguration(ctx, workingCluster); err != nil {
+			var topologyPending *metadataTopologyObservationPendingError
+			if stderrors.As(err, &topologyPending) {
+				r.resetValidationAttempts(clusterKey)
+				return ctrl.Result{RequeueAfter: topologyPending.retryAfter}, nil
+			}
 			log.Error(err, "Cluster configuration validation failed")
 			if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, err); statusErr != nil {
 				log.Error(statusErr, "Failed to update status with validation error")
+			}
+			if stderrors.Is(err, errMetadataRuntimeMembershipStatusUnavailable) {
+				r.resetValidationAttempts(clusterKey)
+				rolloutState, rolloutErr := r.reconcileLegacyMetadataRuntimeMembershipStatus(ctx, workingCluster)
+				if rolloutErr != nil {
+					return ctrl.Result{}, rolloutErr
+				}
+				if rolloutState == metadataMembershipCapabilityRolloutStarted {
+					log.Info("Rolling legacy metadata pods to expose exact Raft membership status", "image", workingCluster.Spec.Image)
+				}
+				if requeueAfter := rolloutState.requeueAfter(); requeueAfter > 0 {
+					return ctrl.Result{RequeueAfter: requeueAfter}, nil
+				}
+				log.Error(err, "Metadata runtime image lacks exact Raft membership status after its rollout completed; waiting for spec.image to change", "image", workingCluster.Spec.Image)
+				return ctrl.Result{}, nil
 			}
 			attempt := r.incrementValidationAttempts(clusterKey)
 			backoff := calculateBackoff(attempt - 1)
@@ -1855,9 +2555,22 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		r.resetValidationAttempts(clusterKey)
-		if err := r.updateStatusWithValidationSuccess(ctx, &antflyCluster); err != nil {
+		metadataTopologyReplicas := int32(0)
+		if !standaloneMode {
+			metadataTopologyReplicas = effectiveMetadataNodeReplicas(workingCluster)
+		}
+		if err := r.updateStatusWithValidationSuccess(ctx, &antflyCluster, metadataTopologyReplicas); err != nil {
 			log.Error(err, "Failed to update status with validation success")
-			// Don't block reconciliation if status update fails
+			// The status checkpoint is the first durable topology record for a new
+			// cluster. Continuing after a conflict could reconcile an older spec and
+			// permanently pin that stale replica count into the StatefulSet/PVC
+			// annotations, so re-read the cluster before touching resources.
+			return ctrl.Result{}, fmt.Errorf("persist validation checkpoint before reconciling resources: %w", err)
+		} else {
+			// Continue with the resource version and durable status record returned
+			// by the status update instead of overwriting it later in reconciliation.
+			workingCluster.ResourceVersion = antflyCluster.ResourceVersion
+			workingCluster.Status = antflyCluster.Status
 		}
 	}
 
@@ -1910,7 +2623,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		if err := r.updateStatus(ctx, workingCluster); err != nil {
 			if stderrors.Is(err, errHAStatusCheckpointed) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 			}
 			return ctrl.Result{}, err
 		}
@@ -2174,12 +2887,15 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Update status
 	if err := r.updateStatus(ctx, workingCluster); err != nil {
 		if stderrors.Is(err, errHAStatusCheckpointed) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: haStatusCheckpointRequeueAfter}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	if requeueAfter := periodicRequeueAfter(workingCluster); requeueAfter > 0 {
+	if requeueAfter := minPositiveDuration(
+		periodicRequeueAfter(workingCluster),
+		r.metadataTopologyObservationRequeueAfter(workingCluster),
+	); requeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
@@ -2200,6 +2916,13 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 
 func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time.Duration {
 	var requeueAfter time.Duration
+	// Metadata agreement is runtime health, not just configuration validation.
+	// Re-observe it even when the AntflyCluster generation has not changed so a
+	// split incarnation cannot remain green indefinitely without another watch
+	// event.
+	if effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Status.MetadataTopologyReplicas > 0 {
+		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
+	}
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
 	}
@@ -3352,6 +4075,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 
 const generatedConfigHashAnnotation = "antfly.io/config-hash"
 const compatibilityRolloutGenerationAnnotation = "cloud.antfly.io/compatibility-rollout-generation"
+const metadataTopologyReplicasAnnotation = "antfly.io/metadata-topology-replicas"
 
 // buildPodAnnotations returns the complete annotations for pod templates including:
 // - Service mesh annotations
@@ -3421,6 +4145,9 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name + "-metadata",
 			Namespace: cluster.Namespace,
+			Annotations: map[string]string{
+				metadataTopologyReplicasAnnotation: strconv.FormatInt(int64(replicas), 10),
+			},
 		},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName:         cluster.Name + "-metadata",
@@ -3432,8 +4159,9 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:   "metadata-storage",
-						Labels: persistentVolumeClaimLabels(cluster, "metadata"),
+						Name:        "metadata-storage",
+						Labels:      persistentVolumeClaimLabels(cluster, "metadata"),
+						Annotations: map[string]string{metadataTopologyReplicasAnnotation: strconv.FormatInt(int64(replicas), 10)},
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -3458,6 +4186,10 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 		if err := controllerutil.SetControllerReference(cluster, statefulSet, r.Scheme); err != nil {
 			return err
 		}
+		if statefulSet.Annotations == nil {
+			statefulSet.Annotations = make(map[string]string)
+		}
+		statefulSet.Annotations[metadataTopologyReplicasAnnotation] = strconv.FormatInt(int64(replicas), 10)
 
 		// Update mutable fields
 		// Note: VolumeClaimTemplates cannot be updated after creation
@@ -3568,6 +4300,10 @@ exec /antfly metadata --id $ID --config /config/config.json \
 				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,
@@ -3590,7 +4326,50 @@ exec /antfly metadata --id $ID --config /config/config.json \
 		return nil
 	})
 
-	return err
+	if err != nil {
+		return err
+	}
+	return r.recordMetadataTopologyOnPVCs(ctx, cluster, replicas)
+}
+
+func (r *AntflyClusterReconciler) recordMetadataTopologyOnPVCs(ctx context.Context, cluster *antflyv1.AntflyCluster, replicas int32) error {
+	// This runs on every steady-state reconciliation, so address only the bounded
+	// expected claim set. The validator retains the namespace-wide scan needed to
+	// detect unexpected retained ordinals before any topology is accepted.
+	topologyReader := r.haBoundaryReader()
+	pvcPrefix := metadataPVCPrefix(cluster)
+	want := strconv.FormatInt(int64(replicas), 10)
+	for ordinal := int32(0); ordinal < replicas; ordinal++ {
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{
+			Name:      pvcPrefix + strconv.FormatInt(int64(ordinal), 10),
+			Namespace: cluster.Namespace,
+		}
+		if err := topologyReader.Get(ctx, key, pvc); err != nil {
+			// StatefulSet PVC creation is asynchronous. A later pod/StatefulSet event
+			// or the periodic topology observation will retry the exact claim.
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("read metadata PVC %s for topology recording: %w", key.Name, err)
+		}
+		if got, ok := pvc.Annotations[metadataTopologyReplicasAnnotation]; ok {
+			if got != want {
+				return fmt.Errorf("metadata PVC %s records topology %q, expected %q", pvc.Name, got, want)
+			}
+			continue
+		}
+
+		before := pvc.DeepCopy()
+		if pvc.Annotations == nil {
+			pvc.Annotations = make(map[string]string)
+		}
+		pvc.Annotations[metadataTopologyReplicasAnnotation] = want
+		if err := r.Patch(ctx, pvc, client.MergeFrom(before)); err != nil {
+			return fmt.Errorf("record metadata topology on PVC %s: %w", pvc.Name, err)
+		}
+	}
+	return nil
 }
 
 func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.AntflyCluster, replicas int32) string {
@@ -3600,8 +4379,13 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 		if i > 1 {
 			config.WriteString(", ")
 		}
-		fmt.Fprintf(&config, `"%d": "http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"`,
-			i, cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port)
+		fmt.Fprintf(
+			&config,
+			`"%d": {"raft_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d","orchestration_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"}`,
+			i,
+			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port,
+			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port,
+		)
 	}
 	config.WriteString(" }")
 	return config.String()
@@ -4105,9 +4889,11 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	originalConditions := append([]metav1.Condition(nil), cluster.Status.Conditions...)
+	originalPhase := cluster.Status.Phase
 	mode := effectiveTopologyMode(cluster)
 
 	if mode == topologyModeStandalone {
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
 		standalone := cluster.Spec.Standalone
 		if standalone == nil {
 			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
@@ -4290,20 +5076,60 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	}
 	metadataFindings := poddiagnostics.DiagnosePods(metadataPods)
 	dataFindings := poddiagnostics.DiagnosePods(dataPods)
+	var metadataTopologyHealthErr error
+	var metadataTopologyPending *metadataTopologyObservationPendingError
+	if cluster.Status.MetadataNodesReady >= metadataReplicas && metadataReplicas > 0 && len(metadataFindings) == 0 {
+		if err := r.validateMetadataRuntimeTopology(ctx, cluster, metadataReplicas); err != nil {
+			if !stderrors.As(err, &metadataTopologyPending) {
+				metadataTopologyHealthErr = fmt.Errorf("metadata runtime topology validation failed: %w", err)
+			}
+		}
+	} else {
+		r.metadataTopologyObservations.Delete(metadataTopologyObservationKey(cluster))
+	}
 	r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, cluster.Status.MetadataNodesReady, metadataReplicas, metadataFindings, "metadata")
+	if metadataTopologyPending != nil {
+		preserveConditionDuringMetadataTopologyObservation(cluster, originalConditions, antflyv1.TypeMetadataReady, metadataTopologyPending)
+	} else if metadataTopologyHealthErr != nil {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               antflyv1.TypeMetadataReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: cluster.Generation,
+			Reason:             antflyv1.ReasonValidationFailed,
+			Message:            metadataTopologyHealthErr.Error(),
+		})
+	}
 	r.setComponentCondition(cluster, antflyv1.TypeDataReady, cluster.Status.DataNodesReady, dataReplicas, dataFindings, "data")
 	allRuntimeFindings := append(append([]poddiagnostics.Finding{}, metadataFindings...), dataFindings...)
+	componentsReady := cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas
 
-	if len(allRuntimeFindings) > 0 {
+	if len(allRuntimeFindings) > 0 || metadataTopologyHealthErr != nil {
 		cluster.Status.Phase = "Degraded"
-	} else if cluster.Status.MetadataNodesReady >= metadataReplicas && cluster.Status.DataNodesReady >= dataReplicas {
-		cluster.Status.Phase = "Running"
-	} else {
+	} else if !componentsReady {
 		cluster.Status.Phase = "Pending"
+	} else if metadataTopologyPending != nil {
+		if originalPhase == "" {
+			cluster.Status.Phase = "Pending"
+		} else {
+			cluster.Status.Phase = originalPhase
+		}
+	} else {
+		cluster.Status.Phase = "Running"
 	}
 
 	r.updateRolloutCondition(cluster, metadataSts, dataSts)
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
+	if metadataTopologyPending != nil && len(allRuntimeFindings) == 0 && componentsReady {
+		preserveConditionDuringMetadataTopologyObservation(cluster, originalConditions, antflyv1.TypeAvailable, metadataTopologyPending)
+	} else if metadataTopologyHealthErr != nil {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               antflyv1.TypeAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: cluster.Generation,
+			Reason:             antflyv1.ReasonValidationFailed,
+			Message:            metadataTopologyHealthErr.Error(),
+		})
+	}
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
@@ -4355,6 +5181,31 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	r.updateServiceMeshReadyCondition(cluster)
 
 	return r.Status().Update(ctx, cluster)
+}
+
+func preserveConditionDuringMetadataTopologyObservation(
+	cluster *antflyv1.AntflyCluster,
+	originalConditions []metav1.Condition,
+	conditionType string,
+	pending *metadataTopologyObservationPendingError,
+) {
+	if previous := meta.FindStatusCondition(originalConditions, conditionType); previous != nil {
+		for i := range cluster.Status.Conditions {
+			if cluster.Status.Conditions[i].Type == conditionType {
+				cluster.Status.Conditions[i] = *previous
+				return
+			}
+		}
+		cluster.Status.Conditions = append(cluster.Status.Conditions, *previous)
+		return
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             metav1.ConditionUnknown,
+		ObservedGeneration: cluster.Generation,
+		Reason:             pending.conditionReason,
+		Message:            fmt.Sprintf("%s: %v", pending.waitMessage, pending),
+	})
 }
 
 func (r *AntflyClusterReconciler) persistHAActionPlanBarrier(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -9676,12 +10527,12 @@ func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Con
 		proof.AuthorityRemainingMS <= 0 ||
 		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.AuthorityRemainingMS)*time.Millisecond ||
 		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
-		!(proof.Active && proof.AuthorityGranted && proof.CapabilityVersion == 1 &&
-			proof.LocalNodeID == strings.TrimSpace(nodeID) && proof.ObservedHolderNodeID == strings.TrimSpace(nodeID) &&
-			proof.PodUID != "" && proof.ProcessBootID != "" &&
-			proof.LeaseName == strings.TrimSpace(lease.Name) && proof.LeaseNamespace == cluster.Namespace &&
-			proof.TopologyID == strings.TrimSpace(lease.TopologyID) &&
-			observedLeaseTransitions == fenceGeneration) {
+		(!proof.Active || !proof.AuthorityGranted || proof.CapabilityVersion != 1 ||
+			proof.LocalNodeID != strings.TrimSpace(nodeID) || proof.ObservedHolderNodeID != strings.TrimSpace(nodeID) ||
+			proof.PodUID == "" || proof.ProcessBootID == "" ||
+			proof.LeaseName != strings.TrimSpace(lease.Name) || proof.LeaseNamespace != cluster.Namespace ||
+			proof.TopologyID != strings.TrimSpace(lease.TopologyID) ||
+			observedLeaseTransitions != fenceGeneration) {
 		return false, nil
 	}
 

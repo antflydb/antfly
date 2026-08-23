@@ -82,6 +82,8 @@ fn executeSearch(
             .parent => .parent,
             .chunk => .chunk,
             .parent_with_chunks => .parent_with_chunks,
+            .unit => .unit,
+            .unit_with_chunks => .unit_with_chunks,
         };
         owned.req.max_chunks_per_parent = request.execution_options.max_chunks_per_parent;
         if (request.execution_options.dense_k != 0) {
@@ -92,8 +94,7 @@ fn executeSearch(
         }
     }
 
-    if (request.cancellation_flag) |flag|
-        owned.req.cancellation = @ptrCast(@alignCast(flag));
+    owned.req.cancellation = requestCancellationToken(request);
 
     // Preserve the generation actually used by DB.search in the encoded wire
     // response. This validation belongs to the provider because the DB and its
@@ -236,10 +237,21 @@ fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) 
     else
         null;
     graph_request.timeout_ms = null;
-    graph_request.cancellation = if (request.cancellation_flag) |flag|
-        @ptrCast(@alignCast(flag))
-    else
-        null;
+    graph_request.cancellation = requestCancellationToken(request);
+}
+
+fn requestCancellationToken(request: *const abi.LocalQueryRequest) db_mod.types.CancellationToken {
+    if (request.cancellation_fn == null) return .none;
+    return .{
+        .ptr = request,
+        .is_cancelled_fn = struct {
+            fn requested(ptr: *const anyopaque) bool {
+                const local_request: *const abi.LocalQueryRequest = @ptrCast(@alignCast(ptr));
+                const callback = local_request.cancellation_fn orelse return false;
+                return callback(local_request.cancellation_ctx) != 0;
+            }
+        }.requested,
+    };
 }
 
 fn fail(

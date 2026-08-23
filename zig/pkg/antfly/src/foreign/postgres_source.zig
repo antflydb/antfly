@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
 const postgres_libpq = @import("postgres_libpq.zig");
@@ -67,7 +68,7 @@ pub const QueryExecutor = struct {
 
     pub const VTable = struct {
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
-        query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) anyerror!foreign_source.QueryResult,
+        query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!foreign_source.QueryResult,
         statistics: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) anyerror!foreign_source.TableStatistics,
         statistics_with_deadline: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror!foreign_source.TableStatistics = null,
         discover_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
@@ -83,7 +84,7 @@ pub const QueryExecutor = struct {
         if (self.vtable.deinit) |deinit_fn| deinit_fn(self.ptr, alloc);
     }
 
-    pub fn query(self: @This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
+    pub fn query(self: @This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) !foreign_source.QueryResult {
         return try self.vtable.query(self.ptr, alloc, dsn, prepared, execution_deadline_ns, cancellation);
     }
 
@@ -631,7 +632,7 @@ pub const RuntimeSource = struct {
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !std.json.Value {
         if (std.mem.eql(u8, definition.type_name, "stats")) {
             return try self.runStatsAggregateAlloc(alloc, table, definition, where_sql, where_args, execution_deadline_ns, cancellation);
@@ -650,7 +651,7 @@ pub const RuntimeSource = struct {
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !std.json.Value {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);
@@ -698,7 +699,7 @@ pub const RuntimeSource = struct {
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
         execution_deadline_ns: ?u64,
-        cancellation: ?*const std.atomic.Value(bool),
+        cancellation: ?CancellationToken,
     ) !std.json.Value {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);

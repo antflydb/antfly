@@ -1,3 +1,6 @@
+/* Keep production and CI builds hermetic: Fontsource packages the same
+   variable font locally instead of fetching Google Fonts during `next build`. */
+@import "@fontsource-variable/roboto-mono";
 @import "tailwindcss";
 @import "@antfly/design-system/styles.css";
 @import "@antfly/design-system/dashboard.css";
@@ -16,9 +19,3 @@
 @source "../../../packages/design-system/src/**/*.{ts,tsx,js,jsx}";
 @source "../../../packages/graph/src/**/*.{ts,tsx,js,jsx}";
 @source "../app/**/*.{ts,tsx}";
-
-/* next/font's Roboto_Mono exposes --font-roboto-mono; bind it to --font-mono
-   so the library's MonoLabel / font-mono utilities resolve. */
-:root {
-  --font-mono: var(--font-roboto-mono), "Menlo", "Monaco", "Courier New", monospace;
-}
