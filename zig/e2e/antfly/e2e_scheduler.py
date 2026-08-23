@@ -23,6 +23,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable
+from fcntl import LOCK_EX, flock
 from pathlib import Path
 from typing import TypeVar
 
@@ -214,7 +215,16 @@ def scheduling_group(item: pytest.Item) -> str:
         declared_process = True
         if fixture_scope is not None:
             declared_process_scopes.add(fixture_scope)
+        if fixture_scope == "session" and lifetime is None:
+            lifetime = "session"
+        if lifetime == "session" and identity is None and fixture_name is not None:
+            identity = fixture_name
         if lifetime is None:
+            if identity is not None:
+                raise pytest.UsageError(
+                    f"{nodeid}{declaration_context}: antfly_process identity requires "
+                    "lifetime='session'"
+                )
             declared_transient_process = True
             continue
         if lifetime != "session":
@@ -387,11 +397,34 @@ class DurationHistory:
             0.0, duration
         )
 
-    def save(self) -> None:
+    def save(self) -> OSError | None:
         if not self.observed:
-            return
+            return None
+
+        try:
+            self._save_locked()
+        except OSError as exc:
+            return exc
+        return None
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with lock_path.open("a", encoding="utf-8") as lock_handle:
+            # Multiple PR, base, and full jobs share one ARC history file. Reload
+            # only after acquiring the advisory lock so no observation is lost
+            # to a stale last-writer-wins replacement.
+            flock(lock_handle.fileno(), LOCK_EX)
+            latest = DurationHistory(self.path)
+            merged_tests = dict(self.tests)
+            merged_tests.update(latest.tests)
+            self._merge_observations(merged_tests)
+            self._write(merged_tests)
+            self.tests = merged_tests
+
+    def _merge_observations(self, tests: dict[str, dict[str, float | int]]) -> None:
         for nodeid, observed_seconds in self.observed.items():
-            previous = self.tests.get(nodeid)
+            previous = tests.get(nodeid)
             if previous is None:
                 seconds = observed_seconds
                 samples = 1
@@ -399,15 +432,15 @@ class DurationHistory:
                 # Favor established CI history while still adapting to real shifts.
                 seconds = 0.7 * float(previous["seconds"]) + 0.3 * observed_seconds
                 samples = int(previous["samples"]) + 1
-            self.tests[nodeid] = {
+            tests[nodeid] = {
                 "seconds": round(seconds, 6),
                 "samples": samples,
             }
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _write(self, tests: dict[str, dict[str, float | int]]) -> None:
         payload = {
             "version": DURATION_FILE_VERSION,
-            "tests": dict(sorted(self.tests.items())),
+            "tests": dict(sorted(tests.items())),
         }
         fd, temporary_path = tempfile.mkstemp(
             prefix=f".{self.path.name}.",
@@ -422,7 +455,7 @@ class DurationHistory:
         finally:
             try:
                 os.unlink(temporary_path)
-            except FileNotFoundError:
+            except OSError:
                 pass
 
 
@@ -728,6 +761,15 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
         _duration_history.observe(report.nodeid, report.duration)
 
 
-def pytest_sessionfinish() -> None:
+def pytest_sessionfinish(session: pytest.Session) -> None:
     if _duration_history is not None:
-        _duration_history.save()
+        error = _duration_history.save()
+        if error is not None:
+            terminal_reporter = session.config.pluginmanager.get_plugin(
+                "terminalreporter"
+            )
+            if terminal_reporter is not None:
+                terminal_reporter.write_line(
+                    f"warning: could not update E2E duration history at "
+                    f"{_duration_history.path}: {error}"
+                )

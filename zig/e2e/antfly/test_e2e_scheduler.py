@@ -18,6 +18,7 @@ import json
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -91,13 +92,9 @@ def test_fixture_resource_decorator_rejects_inverted_order() -> None:
 
 
 @pytest.fixture(scope="session")
-@e2e_resource(
-    "antfly_process",
-    lifetime="session",
-    identity="declared_session_process_fixture",
-)
+@e2e_resource("antfly_process")
 def declared_session_process_fixture() -> None:
-    """Exercise resource metadata attached to a real pytest fixture."""
+    """Exercise inferred lifetime metadata on a real session fixture."""
 
 
 @pytest.fixture(scope="module")
@@ -292,6 +289,39 @@ def test_duration_history_ignores_invalid_numeric_entries(tmp_path: Path) -> Non
     history = DurationHistory(path)
 
     assert history.tests == {"valid": {"seconds": 2.0, "samples": 1}}
+
+
+def test_duration_history_save_failure_is_non_fatal(tmp_path: Path) -> None:
+    history = DurationHistory(tmp_path / "durations.json")
+    history.observe("test_a.py::test_case", 1.0)
+
+    with patch("e2e_scheduler.tempfile.mkstemp", side_effect=OSError("cache full")):
+        error = history.save()
+
+    assert isinstance(error, OSError)
+    assert str(error) == "cache full"
+
+
+def test_duration_history_merges_observations_from_stale_writers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "durations.json"
+    first = DurationHistory(path)
+    second = DurationHistory(path)
+    first.observe("test_a.py::test_shared", 1.0)
+    first.observe("test_a.py::test_first", 2.0)
+    second.observe("test_a.py::test_shared", 3.0)
+    second.observe("test_a.py::test_second", 4.0)
+
+    assert first.save() is None
+    assert second.save() is None
+
+    reloaded = DurationHistory(path)
+    assert reloaded.tests == {
+        "test_a.py::test_first": {"seconds": 2.0, "samples": 1},
+        "test_a.py::test_second": {"seconds": 4.0, "samples": 1},
+        "test_a.py::test_shared": {"seconds": 1.6, "samples": 2},
+    }
 
 
 def test_scheduler_prefers_longest_eligible_work_without_exceeding_process_slots(
