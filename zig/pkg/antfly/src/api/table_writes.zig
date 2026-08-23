@@ -721,7 +721,10 @@ fn moveDroppedGroupPathToTrash(
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), trash_dir_path);
     std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io_impl.io()) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => {
+            alloc.free(trash_path);
+            return null;
+        },
         else => return err,
     };
     return trash_path;
@@ -6571,6 +6574,42 @@ pub const ProvisionedTableWriteSource = struct {
             std.heap.page_allocator.free(owned_name);
             @panic("failed to allocate publication handoff");
         };
+    }
+
+    fn retireDroppedTablePublicationAuthority(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+
+        // The successful drop owns the table-wide structural fence, so no new
+        // reconcile can install publication authority while this allocation-free
+        // cleanup retires every old group incarnation. Those deleted DBs can no
+        // longer publish the edge that would otherwise release status polling.
+        const table_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+        std.debug.assert(self.active_table_activities.items[table_index].structural_active);
+        var index: usize = 0;
+        while (index < self.active_table_activities.items.len) {
+            const entry = &self.active_table_activities.items[index];
+            if (!std.mem.eql(u8, entry.table_name, table_name) or
+                (entry.repair_handoff_status_pending == 0 and entry.publication_handoffs.items.len == 0))
+            {
+                index += 1;
+                continue;
+            }
+
+            const group_id = entry.group_id;
+            entry.repair_handoff_status_pending = 0;
+            entry.repair_handoff_clear_observed = false;
+            for (entry.publication_handoffs.items) |*handoff| handoff.deinit();
+            entry.publication_handoffs.deinit(std.heap.page_allocator);
+            entry.publication_handoffs = .empty;
+
+            const previous_len = self.active_table_activities.items.len;
+            self.pruneTableActivityLocked(table_name, group_id);
+            // swapRemove puts an unvisited entry at this index. Revisit it when
+            // pruning succeeded; otherwise advance past the still-active entry.
+            if (self.active_table_activities.items.len == previous_len) index += 1;
+        }
     }
 
     fn settlePublicationHandoffStatusBestEffort(
@@ -13820,6 +13859,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
             }
         }
+        self.retireDroppedTablePublicationAuthority(table_name);
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
@@ -40560,6 +40600,56 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(probe.remove_seen.isSet());
     try std.testing.expect(probe.clear_seen.isSet());
     try std.testing.expect(!probe.invalid_sequence.isSet());
+}
+
+test "provisioned table write source drop table retires old publication authority" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-publication-authority", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    // Model both publication fences that can outlive structural reconciliation.
+    // Include an old group absent from the drop request: table deletion ends the
+    // incarnation as a whole, not merely the catalog's current group list.
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.ensureStructuralPublicationHandoffStatus("docs", 7002, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .producer_target_sequence = 10,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("docs");
+
+    // Cleanup is scoped by table name and must not release another table's
+    // valid handoff while retiring the deleted incarnation.
+    source.reserveStructuralReconcileStatus("other");
+    source.ensureStructuralPublicationHandoffStatus("other", 9001, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 7,
+        .coverage_config_hash = 8,
+        .producer_target_sequence = 9,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("other");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
+
+    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+
+    // A same-name table with a different group incarnation must immediately be
+    // eligible for live status; no deleted group can publish another release.
+    const recreated_admission = source.beginStatusRequest("docs");
+    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, recreated_admission);
+    source.endStatusRequest("docs", recreated_admission);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 }
 
 test "provisioned table write source drop table does not hold local db mutex during background delete" {
