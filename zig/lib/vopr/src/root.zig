@@ -7,6 +7,7 @@ pub const choice = @import("choice.zig");
 pub const command = @import("command.zig");
 pub const benchmark = @import("benchmark.zig");
 pub const causal = @import("causal.zig");
+pub const clock_fault = @import("clock_fault.zig");
 pub const collector = @import("collector.zig");
 pub const coverage = @import("coverage.zig");
 pub const corpus = @import("corpus.zig");

@@ -330,18 +330,77 @@ pub const SimIo = struct {
     /// Advance the monotonic clock and ordinary realtime together. Explicit
     /// realtime jumps are modeled separately by `jumpRealtime`.
     pub fn advance(self: *SimIo, delta_ns: u64) !void {
-        const delta: i96 = @intCast(delta_ns);
-        self.monotonic_ns = std.math.add(i96, self.monotonic_ns, delta) catch
-            return error.SimIoClockOverflow;
-        self.realtime_ns = std.math.add(i96, self.realtime_ns, delta) catch
-            return error.SimIoClockOverflow;
-        self.tasks.wakeDue(self.monotonic_ns, self.realtime_ns);
+        try self.advanceClocks(delta_ns, @intCast(delta_ns), true);
     }
 
     pub fn jumpRealtime(self: *SimIo, delta_ns: i64) !void {
-        self.realtime_ns = std.math.add(i96, self.realtime_ns, delta_ns) catch
+        try self.advanceClocks(0, delta_ns, true);
+    }
+
+    pub fn advanceClocks(self: *SimIo, monotonic_delta_ns: u64, realtime_delta_ns: i96, deliver_timers: bool) !void {
+        const monotonic_delta: i96 = @intCast(monotonic_delta_ns);
+        const next_monotonic = std.math.add(i96, self.monotonic_ns, monotonic_delta) catch
             return error.SimIoClockOverflow;
+        const next_realtime = std.math.add(i96, self.realtime_ns, realtime_delta_ns) catch
+            return error.SimIoClockOverflow;
+        self.monotonic_ns = next_monotonic;
+        self.realtime_ns = next_realtime;
+        if (deliver_timers) self.tasks.wakeDue(self.monotonic_ns, self.realtime_ns);
+    }
+
+    pub fn deliverDueTimers(self: *SimIo) !void {
         self.tasks.wakeDue(self.monotonic_ns, self.realtime_ns);
+    }
+
+    pub fn dropNextNetworkPacket(self: *SimIo) void {
+        self.network.faults.drop_next = true;
+    }
+
+    pub fn duplicateNextNetworkPacket(self: *SimIo) void {
+        self.network.faults.duplicate_next = true;
+    }
+
+    pub fn setNetworkReordering(self: *SimIo, enabled: bool) void {
+        self.network.faults.reorder = enabled;
+    }
+
+    pub fn setNetworkOutage(self: *SimIo, enabled: bool) void {
+        self.network.faults.network_down = enabled;
+    }
+
+    pub fn setNetworkDeliveryPaused(self: *SimIo, paused: bool) void {
+        self.network.faults.delivery_paused = paused;
+    }
+
+    pub fn setDirectionalPartition(self: *SimIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
+        self.network.faults.partition_source = source;
+        self.network.faults.partition_destination = destination;
+    }
+
+    pub fn limitNextNetworkWrite(self: *SimIo, bytes: usize) !void {
+        if (bytes == 0) return error.InvalidPartialWriteLimit;
+        self.network.faults.partial_write_limit = bytes;
+    }
+
+    pub fn failNextFileRead(self: *SimIo) void {
+        self.files.faults.fail_next_read = true;
+    }
+
+    pub fn failNextFileWrite(self: *SimIo) void {
+        self.files.faults.fail_next_write = true;
+    }
+
+    pub fn dropNextFileSync(self: *SimIo) void {
+        self.files.faults.drop_next_sync = true;
+    }
+
+    pub fn limitNextFileWrite(self: *SimIo, bytes: usize) !void {
+        if (bytes == 0) return error.InvalidPartialWriteLimit;
+        self.files.faults.partial_write_limit = bytes;
+    }
+
+    pub fn crashFileSystem(self: *SimIo) !void {
+        try self.files.crash();
     }
 
     pub fn setCpuTime(self: *SimIo, process_ns: i64, thread_ns: i64) void {

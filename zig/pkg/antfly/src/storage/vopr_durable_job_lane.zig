@@ -42,10 +42,10 @@ pub const Lane = struct {
 
         fn deinit(ptr: *anyopaque) void {
             const self: *Entry = @ptrCast(@alignCast(ptr));
-            const lane = self.lane;
-            lane.removeEntry(self);
+            const owner = self.lane;
+            owner.removeEntry(self);
             self.job.deinit(self.job.ptr);
-            lane.allocator.destroy(self);
+            owner.allocator.destroy(self);
         }
     };
 

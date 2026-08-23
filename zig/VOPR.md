@@ -2469,6 +2469,78 @@ deleted or retired state, and require eligible cleanup after clocks stabilize.
 Every time-sensitive production path in these scenarios must consume the
 injected `std.Io` clock; a host-clock call is a harness failure.
 
+### Post-Phase-5 implementation checkpoint
+
+The numbering above records design priority only. It is not a source-code,
+artifact, fixture, or build namespace. Each suite has an independent durable
+CLI name, scenario ABI, fixture namespace, focused build gate, and
+production-regression dependency set. `domain-vopr-test` is only a convenience
+aggregate over the five model campaigns; the focused gates and their production
+regression sets remain independently owned.
+
+The five expansions are implemented as follows:
+
+- `distributed-transaction-vopr-test` drives three production `TxnManager`
+  instances over independent Antfly stores. It schedules coordinator and
+  participant initialization, prepare, durable decision, ambiguous response,
+  crash/reopen, lease adoption, stale-owner conflict, phase-two delivery,
+  participant acknowledgement, and repair. Its oracle reads the production
+  transaction records and visible values, checks them against the logical
+  client history, and rejects aborted visibility or inconsistent decisions.
+  Exact replay can emit the existing transaction TLA+ NDJSON through
+  `sim-tla --domain transaction`. The gate also runs the focused transaction,
+  DB transaction/TTL, and public transaction regression suites.
+- `data-plane-vopr-test` decomposes admission, route, modeled network packet,
+  Raft-log persistence, application, acknowledgement, writer-epoch handoff,
+  atomic split copy/cutover, and point/query visibility. The scenario is a
+  direct consumer of `SimIo` sockets, scheduler transitions, durable modeled
+  files, packet drop/duplication, and atomic file publication. Its focused
+  gate also composes the real metadata distributed-data and per-group Raft
+  VOPR suites, preserving the production lease and single-writer contracts.
+- `derived-workflow-vopr-test` schedules checkpoint, publication, repair,
+  compaction, cancellation, and cleanup through the production
+  `DurableJobLane` adapter backed by the deterministic executor. Leadership
+  fencing can race a queued publication; a stale generation is blocked and
+  repaired before terminal cleanup. The gate composes the real enrichment,
+  dense-index lifecycle, repair-job, repair-runtime, and VOPR background-lane
+  regressions.
+- `backup-restore-vopr-test` models bounded partial and duplicate transfer,
+  crash/resume, manifest publication, retention pinning, durable restore-job
+  state, download, topology reconstruction, activation-versus-cancellation,
+  and generation GC. It encodes, decodes, and content-verifies the production
+  HA backup manifest. Its gate composes portable cross-backend backup, durable
+  restore-job fencing/idempotency, Raft restore authority/restart, standalone
+  backup/restore, and HA VOPR suites.
+- `clock-fault-vopr-test` uses the reusable Antfly-independent
+  `lib/vopr/src/clock_fault.zig` surface. Realtime jumps, oscillator frequency,
+  node pause, monotonic passage, timer delivery, and stabilization are separate
+  operations under an explicit overlapping-fault budget. `SimIo` now supports
+  atomic independent advancement of its monotonic and realtime domains and
+  deferred timer delivery. The focused gate composes production TTL,
+  transaction-lease, HA retention, and seed lifecycle regressions.
+
+All five names are registered with `sim-run`, `sim-replay`, `sim-campaign`,
+reduction, promotion namespace selection, migration, splicing, causal
+explanation, and exact-choice execution. Focused conformance tests record one
+artifact, replay it from 100 clean worlds, collect a prefix state, then record
+and exact-replay sixteen additional seeds. Bounded CLI campaigns additionally
+verify multi-worker generation, semantic corpus retention, state and transition
+feedback, splice validation, and zero replay divergence. Each focused gate is
+part of `sim-test`; its bounded model campaign is labeled independently in
+`chaos-test`.
+
+The expanded ReleaseSafe transaction gate caught a production lifecycle bug:
+the transaction-recovery worker retained the address of the temporary `DB`
+wrapper constructed inside `DB.open`, even though the wrapper is returned by
+value. The optimized allocator poisoned that stale address and recovery later
+entered the HA mutation barrier through it. Recovery now owns a separately
+allocated callback context with an atomic binding to the caller's stable DB
+wrapper. Normal DB entry points and the serving-layer visibility attachment
+refresh that binding; close clears it and joins recovery before tearing down
+stores, caches, shadow indexes, or identity-hook state. A regression asserts
+that the runtime holds the stable context rather than a DB address, and the
+orphaned-intent/full-text recovery test exercises the complete optimized path.
+
 ### Self-Contained Antithesis-Class Runtime on `std.Io`
 
 The five domain scenarios should be developed alongside `SimIo`, not after a

@@ -6761,6 +6761,9 @@ pub fn build(b: *std.Build) void {
     const run_distributed_transaction_vopr_tests = b.addRunArtifact(distributed_transaction_vopr_tests);
     const distributed_transaction_vopr_test_step = b.step("distributed-transaction-vopr-test", "Run distributed transaction lifecycle VOPR campaigns");
     distributed_transaction_vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
+    distributed_transaction_vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
+    distributed_transaction_vopr_test_step.dependOn(&run_lib_db_txn_tests.step);
+    distributed_transaction_vopr_test_step.dependOn(&run_api_transactions_docid_tests.step);
 
     const data_plane_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6769,6 +6772,8 @@ pub fn build(b: *std.Build) void {
     const run_data_plane_vopr_tests = b.addRunArtifact(data_plane_vopr_tests);
     const data_plane_vopr_test_step = b.step("data-plane-vopr-test", "Run data-plane routing, persistence, apply, split, and read VOPR campaigns");
     data_plane_vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
 
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6777,6 +6782,10 @@ pub fn build(b: *std.Build) void {
     const run_derived_workflow_vopr_tests = b.addRunArtifact(derived_workflow_vopr_tests);
     const derived_workflow_vopr_test_step = b.step("derived-workflow-vopr-test", "Run enrichment, indexing, repair, and compaction VOPR campaigns");
     derived_workflow_vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
+    derived_workflow_vopr_test_step.dependOn(&run_lib_db_enrichment_tests.step);
+    derived_workflow_vopr_test_step.dependOn(&run_dense_index_lifecycle_regression_tests.step);
+    derived_workflow_vopr_test_step.dependOn(&run_dense_index_repair_job_tests.step);
+    derived_workflow_vopr_test_step.dependOn(&run_dense_index_repair_runtime_tests.step);
 
     const backup_restore_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6785,6 +6794,11 @@ pub fn build(b: *std.Build) void {
     const run_backup_restore_vopr_tests = b.addRunArtifact(backup_restore_vopr_tests);
     const backup_restore_vopr_test_step = b.step("backup-restore-vopr-test", "Run backup publication, retention, restore, activation, and GC VOPR campaigns");
     backup_restore_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_api_restore_jobs_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_portable_backup_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_raft_restore_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
+    backup_restore_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
 
     const clock_fault_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6793,6 +6807,8 @@ pub fn build(b: *std.Build) void {
     const run_clock_fault_vopr_tests = b.addRunArtifact(clock_fault_vopr_tests);
     const clock_fault_vopr_test_step = b.step("clock-fault-vopr-test", "Run wall-clock, monotonic-clock, lease, retention, and TTL fault VOPR campaigns");
     clock_fault_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
+    clock_fault_vopr_test_step.dependOn(&run_lib_db_txn_tests.step);
+    clock_fault_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
 
     const domain_vopr_test_step = b.step("domain-vopr-test", "Run all cross-domain Antfly VOPR protocol campaigns");
     domain_vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
@@ -6808,6 +6824,7 @@ pub fn build(b: *std.Build) void {
     const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
+    derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
     const run_sim_cli = b.addRunArtifact(sim_cli);
     run_sim_cli.addArg("run");

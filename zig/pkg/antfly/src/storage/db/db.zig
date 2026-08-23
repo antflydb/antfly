@@ -1340,6 +1340,13 @@ const TtlCleanupContext = struct {
     identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
 };
 
+/// Stable indirection for transaction recovery callbacks. `DB.open` returns
+/// the wrapper by value, so an address captured while open is still building
+/// may not be the address eventually owned by the caller.
+const TransactionRecoveryLocalContext = struct {
+    owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
+};
+
 const ManagedSyncTargets = struct {
     full_text_indexes: []const []const u8 = &.{},
     all_indexes: []const []const u8 = &.{},
@@ -3009,6 +3016,7 @@ pub const DB = struct {
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
+    transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
@@ -3430,6 +3438,7 @@ pub const DB = struct {
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
+                .transaction_recovery_local_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
@@ -3686,7 +3695,10 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
-        if (hook != null) self.bindTtlIdentityVisibilityOwner();
+        if (hook != null) {
+            self.bindTtlIdentityVisibilityOwner();
+            self.bindTransactionRecoveryOwner();
+        }
         var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
@@ -3734,6 +3746,11 @@ pub const DB = struct {
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
         }
+    }
+
+    fn bindTransactionRecoveryOwner(self: *DB) void {
+        const ctx = self.transaction_recovery_local_context orelse return;
+        ctx.owner.store(self, .release);
     }
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
@@ -4117,8 +4134,13 @@ pub const DB = struct {
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
         };
+        const local_ctx = try self.runtime_alloc.create(TransactionRecoveryLocalContext);
+        errdefer self.runtime_alloc.destroy(local_ctx);
+        local_ctx.* = .{};
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+        effective_cfg.local_resolution_ctx = local_ctx;
+        effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
 
         const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
         errdefer self.runtime_alloc.destroy(runtime);
@@ -4130,6 +4152,7 @@ pub const DB = struct {
         );
         errdefer runtime.deinit();
         self.transaction_recovery_identity_context = identity_ctx;
+        self.transaction_recovery_local_context = local_ctx;
         self.transaction_runtime = runtime;
     }
 
@@ -4204,8 +4227,6 @@ pub const DB = struct {
         }
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| {
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
             try runtime.start();
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
@@ -4218,10 +4239,9 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.transaction_runtime != null) return;
         try self.initOptionalTransactionRuntime(cfg);
+        self.bindTransactionRecoveryOwner();
         if (self.optional_runtime_workers_enabled) {
             const runtime = self.transaction_runtime.?;
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
             try runtime.start();
         }
     }
@@ -4292,6 +4312,20 @@ pub const DB = struct {
         // index state they may inspect.
         self.stopArtifactRepairMetadataWorker();
         self.stopQuarantineRetryWorker();
+        if (self.transaction_recovery_local_context) |ctx| ctx.owner.store(null, .release);
+        if (self.transaction_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.transaction_runtime = null;
+        }
+        if (self.transaction_recovery_local_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_local_context = null;
+        }
+        if (self.transaction_recovery_identity_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_identity_context = null;
+        }
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -4314,11 +4348,6 @@ pub const DB = struct {
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
-        if (self.transaction_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.transaction_recovery_identity_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (self.ttl_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -5173,6 +5202,7 @@ pub const DB = struct {
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
+        self.bindTransactionRecoveryOwner();
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, .{});
@@ -7937,6 +7967,7 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        self.bindTransactionRecoveryOwner();
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         return try self.core.getStoreValue(alloc, store_key);
@@ -15299,6 +15330,7 @@ pub const DB = struct {
     }
 
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
+        self.bindTransactionRecoveryOwner();
         return try self.core.getTransactionStatus(txn_id);
     }
 
@@ -20928,6 +20960,7 @@ pub const DB = struct {
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
+        self.bindTransactionRecoveryOwner();
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -21266,6 +21299,7 @@ pub const DB = struct {
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
+        self.bindTransactionRecoveryOwner();
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -22162,6 +22196,7 @@ pub const DB = struct {
     }
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+        self.bindTransactionRecoveryOwner();
         return try self.searchWithExecutionContext(alloc, req, .{});
     }
 
@@ -43685,7 +43720,8 @@ fn resolveRecoveredLocalTransaction(
     status: transactions_mod.TxnStatus,
     commit_version: u64,
 ) anyerror!void {
-    const db: *DB = @ptrCast(@alignCast(ctx));
+    const local_ctx: *TransactionRecoveryLocalContext = @ptrCast(@alignCast(ctx));
+    const db = local_ctx.owner.load(.acquire) orelse return error.TransactionRecoveryOwnerUnbound;
     try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
 }
 
@@ -46517,12 +46553,18 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
     });
 
     const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    const local_ctx = db.transaction_recovery_local_context orelse return error.TestExpectedEqual;
     try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
     try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
     try std.testing.expectEqual(
         @intFromPtr(identity_ctx),
         @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
     );
+    try std.testing.expectEqual(
+        @intFromPtr(local_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.local_resolution_ctx.?),
+    );
+    try std.testing.expect(local_ctx.owner.load(.acquire) == &db);
 
     try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
     try std.testing.expect(db.core.identity_namespace.eql(new_namespace));

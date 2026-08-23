@@ -49,7 +49,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
                 !std.mem.eql(u8, scenario, "raft") and
                 !std.mem.eql(u8, scenario, "lmdb") and
                 !std.mem.eql(u8, scenario, "lsm") and
-                !std.mem.eql(u8, scenario, "ha")) return error.UnsupportedScenario;
+                !std.mem.eql(u8, scenario, "ha") and
+                antfly.domain_vopr.kindFromCliName(scenario) == null) return error.UnsupportedScenario;
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -83,6 +84,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         49
     else if (std.mem.eql(u8, scenario, "ha"))
         33
+    else if (antfly.domain_vopr.kindFromCliName(scenario)) |kind|
+        kind.transitionBudget()
     else
         3;
     if (transition_budget == 0) return error.InvalidTransitionBudget;
@@ -129,6 +132,9 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     } else if (std.mem.eql(u8, scenario, "ha")) blk: {
         if (transition_budget != 33) return error.HaScenarioRequiresThirtyThreeTransitions;
         break :blk try antfly.ha_vopr.record(alloc, seed);
+    } else if (antfly.domain_vopr.kindFromCliName(scenario)) |kind| blk: {
+        if (transition_budget != kind.transitionBudget()) return error.ScenarioRequiresFixedTransitionBudget;
+        break :blk try antfly.domain_vopr.recordNamed(alloc, scenario, seed);
     } else blk: {
         if (transition_budget != 3) return error.TransactionScenarioRequiresThreeTransitions;
         break :blk try antfly.transaction_vopr.record(alloc, seed);
@@ -185,6 +191,8 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.lsm_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return antfly.ha_vopr.replay(alloc, recorded);
+    if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
+        return antfly.domain_vopr.replayKnown(alloc, recorded);
     return error.UnsupportedScenario;
 }
 
@@ -240,6 +248,8 @@ fn runKnownScenarioWithChoices(
         return runContextFreeWithChoices(antfly.lsm_vopr.CliScenario, alloc, recorded, source);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return runContextFreeWithChoices(antfly.ha_vopr.CliScenario, alloc, recorded, source);
+    if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
+        return antfly.domain_vopr.runKnownWithChoices(alloc, recorded, source);
     return error.UnsupportedScenario;
 }
 
@@ -255,6 +265,7 @@ fn defaultCampaignTransitions(scenario: []const u8) !usize {
     if (std.mem.eql(u8, scenario, "lmdb")) return 13;
     if (std.mem.eql(u8, scenario, "lsm")) return 49;
     if (std.mem.eql(u8, scenario, "ha")) return 33;
+    if (antfly.domain_vopr.kindFromCliName(scenario)) |kind| return kind.transitionBudget();
     return error.UnsupportedScenario;
 }
 
@@ -293,6 +304,7 @@ fn recordCampaignScenario(
     if (std.mem.eql(u8, scenario, "lmdb")) return antfly.lmdb_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "lsm")) return antfly.lsm_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "ha")) return antfly.ha_vopr.record(alloc, seed);
+    if (antfly.domain_vopr.kindFromCliName(scenario) != null) return antfly.domain_vopr.recordNamed(alloc, scenario, seed);
     return error.UnsupportedScenario;
 }
 
@@ -308,6 +320,7 @@ fn artifactMatchesScenario(artifact: *const vopr.trace.Trace, scenario: []const 
     if (std.mem.eql(u8, scenario, "lmdb")) return std.mem.eql(u8, artifact.header.scenario, antfly.lmdb_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "lsm")) return std.mem.eql(u8, artifact.header.scenario, antfly.lsm_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "ha")) return std.mem.eql(u8, artifact.header.scenario, antfly.ha_vopr.CliScenario.name);
+    if (antfly.domain_vopr.kindFromCliName(scenario) != null) return antfly.domain_vopr.artifactMatchesCliName(artifact, scenario);
     return false;
 }
 
@@ -338,6 +351,8 @@ fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     defer ndjson.deinit();
     var replayed = if (std.mem.eql(u8, domain, "raft"))
         try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer)
+    else if (std.mem.eql(u8, recorded.header.scenario, antfly.domain_vopr.DistributedTransactionScenario.name))
+        try antfly.domain_vopr.replayDistributedTransactionToTrace(alloc, &recorded, &ndjson.writer)
     else
         try antfly.transaction_vopr.replayToTransactionTrace(alloc, &recorded, &ndjson.writer);
     defer replayed.deinit();
@@ -699,6 +714,24 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
+    if (antfly.domain_vopr.kindFromArtifact(&recorded) != null) {
+        const target = if (recorded.failures.items.len > 0)
+            recorded.failures.items[0].fingerprint
+        else
+            return error.FailingTraceRequired;
+        var reduced = try antfly.domain_vopr.reduceKnown(alloc, &recorded, target, .{ .max_attempts = attempts });
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
     return error.UnsupportedScenario;
 }
 
@@ -864,6 +897,13 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/sim/fixtures/lsm";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return "pkg/antfly/src/sim/fixtures/ha";
+    if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
+        .distributed_transaction => "pkg/antfly/src/sim/fixtures/distributed-transaction",
+        .data_plane => "pkg/antfly/src/sim/fixtures/data-plane",
+        .derived_workflow => "pkg/antfly/src/sim/fixtures/derived-workflow",
+        .backup_restore => "pkg/antfly/src/sim/fixtures/backup-restore",
+        .clock_fault => "pkg/antfly/src/sim/fixtures/clock-fault",
+    };
     return error.UnsupportedScenario;
 }
 
@@ -1412,9 +1452,9 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata|transaction|distributed-data|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path>
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr migrate --trace <path> --out <path> [--force]
@@ -1525,6 +1565,11 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         "lmdb",
         "lsm",
         "ha",
+        "distributed-transaction",
+        "data-plane",
+        "derived-workflow",
+        "backup-restore",
+        "clock-fault",
     };
     for (cases, 0..) |scenario, index| {
         const transitions = try defaultCampaignTransitions(scenario);
