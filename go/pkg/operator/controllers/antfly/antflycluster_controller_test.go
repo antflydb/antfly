@@ -14528,7 +14528,20 @@ func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing
 	g.Expect(cluster.Status.HAStatus.StartupGate).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("TargetGenerationGCNotObserved"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil(),
+		"partial activation must not authorize Colony to start the target-PVC consumer before target GC")
 
+	cluster.Status.HAStatus.PlannedActions = cluster.Status.HAStatus.PlannedActions[:1]
+	reconciler.updateHAStartupGateStatus(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.StartupGate.Reason).To(Equal("TargetGenerationGCNotObserved"))
+	g.Expect(cluster.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil(),
+		"an incrementally planned chain must not expose activation authority before target GC exists")
+
+	cluster.Status.HAStatus.PlannedActions = append(cluster.Status.HAStatus.PlannedActions, antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhasePending,
+	})
 	gc := &cluster.Status.HAStatus.PlannedActions[1]
 	gc.AdminJobPhase = haAdminJobPhaseSucceeded
 	gc.SeedArtifactReceipt = &antflyv1.HASeedArtifactReceiptStatus{
@@ -14636,12 +14649,21 @@ func TestUpdateHAStartupGateStatusSkipsUnrelatedReceiptCollision(t *testing.T) {
 			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
 		},
 	}
+	targetGC := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionGCTargetSeedGenerations), StandbyName: "standby-a", SlotName: "standby-a",
+		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 1, ActionKind: "gc_local_seed_generations", Scope: "target_activation",
+			Generation: "prod-standby-a-10", SlotName: "standby-a", CheckpointSHA256: strings.Repeat("d", 64),
+			RetainedCount: 2,
+		},
+	}
 	correct := target.DeepCopy()
 	correct.Name = "z-primary"
 	correct.Spec.HighAvailability.Runtime.StartupGate = nil
 	correct.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
 	correct.Spec.HighAvailability.Runtime.NodeID = "primary-a"
-	correct.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{action}}
+	correct.Status.HAStatus = &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{action, targetGC}}
 	unrelated := correct.DeepCopy()
 	unrelated.Name = "a-unrelated-primary"
 	unrelated.Spec.HighAvailability.Identity.ClusterID = 999

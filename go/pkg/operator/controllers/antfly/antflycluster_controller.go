@@ -5645,7 +5645,7 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
 				continue
 			}
-			status.ActivationReceipt = &antflyv1.HASeedActivationReceiptStatus{
+			activationReceipt := &antflyv1.HASeedActivationReceiptStatus{
 				TopologyID:                  receipt.TopologyID,
 				TopologyGeneration:          receipt.TopologyGeneration,
 				NodeID:                      receipt.NodeID,
@@ -5672,6 +5672,7 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				GenerationPath:              receipt.GenerationPath,
 				RawGenerationPath:           receipt.RawGenerationPath,
 			}
+			targetGenerationGCObserved := false
 			for j := range actions {
 				gc := actions[j]
 				if haActionKind(gc.Kind) != haActionGCTargetSeedGenerations ||
@@ -5679,12 +5680,23 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 					strings.TrimSpace(gc.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
 					continue
 				}
+				targetGenerationGCObserved = true
 				if !haAdminActionSucceededWithEvidence(gc) {
 					status.Reason = "TargetGenerationGCNotObserved"
 					return
 				}
 				break
 			}
+			if !targetGenerationGCObserved {
+				// The action chain is planned incrementally. Publishing the activation
+				// receipt before target GC exists lets Colony open the runtime gate;
+				// the resulting live PVC consumer then prevents the mandatory GC Job
+				// from ever starting. Withhold handoff authority until that exact
+				// cleanup action is both present and durably successful.
+				status.Reason = "TargetGenerationGCNotObserved"
+				return
+			}
+			status.ActivationReceipt = activationReceipt
 			// Seed the status as eligible only for the exact matcher invocation;
 			// declarative suspension and every configured evidence mismatch still win.
 			status.RuntimeEligible = true
