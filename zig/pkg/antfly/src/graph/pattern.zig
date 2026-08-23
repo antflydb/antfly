@@ -1375,6 +1375,117 @@ fn validateCountAggregateSpecs(specs: []const CountAggregateSpec) !void {
     if (specs.len == 0 or specs.len > max_count_aggregates) return error.InvalidArgument;
 }
 
+/// Request-scoped exact aggregate state. Callers that enumerate an anchor
+/// relation in snapshot-pinned pages keep one stream for the full relation so
+/// counters and exact distinct identity sets are not reset at page boundaries.
+pub const ConjunctiveCountAggregateStream = struct {
+    accumulators: []StreamingCountAccumulator,
+
+    pub fn init(
+        alloc: Allocator,
+        specs: []const CountAggregateSpec,
+        distinct_budget: *DistinctBudget,
+    ) !ConjunctiveCountAggregateStream {
+        try validateCountAggregateSpecs(specs);
+        const accumulators = try alloc.alloc(StreamingCountAccumulator, specs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (accumulators[0..initialized]) |*accumulator| accumulator.deinit(alloc);
+            if (accumulators.len > 0) alloc.free(accumulators);
+        }
+        for (specs, 0..) |spec, i| {
+            accumulators[i] = .{ .spec = spec, .distinct_budget = distinct_budget };
+            initialized += 1;
+        }
+        return .{ .accumulators = accumulators };
+    }
+
+    pub fn deinit(self: *ConjunctiveCountAggregateStream, alloc: Allocator) void {
+        for (self.accumulators) |*accumulator| accumulator.deinit(alloc);
+        if (self.accumulators.len > 0) alloc.free(self.accumulators);
+        self.* = undefined;
+    }
+
+    /// Consume one prevalidated or validation-required anchor page. Expansion
+    /// work remains charged to the request-scoped budget carried by `opts`.
+    pub fn consumePageWithEdgeReader(
+        self: *ConjunctiveCountAggregateStream,
+        alloc: Allocator,
+        edge_reader: anytype,
+        start_keys: []const []const u8,
+        pattern: ConjunctivePattern,
+        opts: MatchOptions,
+    ) !void {
+        var aggregate_opts = opts;
+        aggregate_opts.max_results = 0;
+        aggregate_opts.require_complete = true;
+        if (pattern.nodes.len == 0 or pattern.nodes.len > max_pattern_steps) return error.InvalidArgument;
+        try validateConjunctivePattern(pattern);
+
+        const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+        var local_work_budget = WorkBudget.init(aggregate_opts.max_explored_nodes, aggregate_opts.max_explored_edges);
+        const work_budget = aggregate_opts.work_budget orelse &local_work_budget;
+        const admitted_starts = if (aggregate_opts.start_validation == .required and aggregate_opts.node_admission != null)
+            try aggregate_opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
+        else
+            null;
+        defer if (admitted_starts) |mask| alloc.free(mask);
+        const filtered_starts = if (aggregate_opts.start_validation == .required) blk: {
+            const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
+            defer alloc.free(start_refs);
+            for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
+            break :blk try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, aggregate_opts.evaluator);
+        } else null;
+        defer if (filtered_starts) |mask| alloc.free(mask);
+
+        const processed = try alloc.alloc(bool, pattern.edges.len);
+        defer alloc.free(processed);
+        for (start_keys, 0..) |key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
+            if (filtered_starts) |mask| if (!mask[start_index]) continue;
+
+            const bindings = try alloc.alloc(PatternBinding, 1);
+            bindings[0] = initPatternBinding(alloc, anchor_node.alias, key, null, 0) catch |err| {
+                alloc.free(bindings);
+                return err;
+            };
+            var state = ConjunctiveState{ .bindings = bindings };
+            defer state.deinit(alloc);
+            @memset(processed, false);
+            try streamAggregateConjunctiveGroup(
+                alloc,
+                edge_reader,
+                pattern,
+                pattern.nodes,
+                pattern.edges,
+                pattern.predicates,
+                state,
+                processed,
+                0,
+                null,
+                null,
+                aggregate_opts,
+                work_budget,
+                self.accumulators,
+            );
+        }
+    }
+
+    pub fn finishAlloc(self: *ConjunctiveCountAggregateStream, alloc: Allocator) ![]CountAggregateResult {
+        const results = try alloc.alloc(CountAggregateResult, self.accumulators.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(alloc);
+            if (results.len > 0) alloc.free(results);
+        }
+        for (self.accumulators, 0..) |*accumulator, i| {
+            results[i] = try accumulator.finish(alloc);
+            initialized += 1;
+        }
+        return results;
+    }
+};
+
 /// Stream completed graph bindings directly into aggregate accumulators. Exact
 /// aggregate queries retain only counters and distinct identities, rather than
 /// materializing either internal matcher states or public result rows.
@@ -1409,90 +1520,18 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     specs: []const CountAggregateSpec,
     opts: MatchOptions,
 ) ![]CountAggregateResult {
-    try validateCountAggregateSpecs(specs);
-    var aggregate_opts = opts;
-    aggregate_opts.max_results = 0;
-    aggregate_opts.require_complete = true;
-    if (pattern.nodes.len == 0 or pattern.nodes.len > max_pattern_steps) return error.InvalidArgument;
-    try validateConjunctivePattern(pattern);
-
-    const accumulators = try alloc.alloc(StreamingCountAccumulator, specs.len);
     var local_distinct_budget = DistinctBudget.init(
         default_max_distinct_identities,
         default_max_distinct_identity_bytes,
     );
-    const distinct_budget = aggregate_opts.distinct_budget orelse &local_distinct_budget;
-    var initialized_accumulators: usize = 0;
-    errdefer {
-        for (accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
-        if (accumulators.len > 0) alloc.free(accumulators);
-    }
-    for (specs, 0..) |spec, i| {
-        accumulators[i] = .{ .spec = spec, .distinct_budget = distinct_budget };
-        initialized_accumulators += 1;
-    }
-
-    const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
-    var local_work_budget = WorkBudget.init(aggregate_opts.max_explored_nodes, aggregate_opts.max_explored_edges);
-    const work_budget = aggregate_opts.work_budget orelse &local_work_budget;
-    const admitted_starts = if (aggregate_opts.start_validation == .required and aggregate_opts.node_admission != null)
-        try aggregate_opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
-    else
-        null;
-    defer if (admitted_starts) |mask| alloc.free(mask);
-    const filtered_starts = if (aggregate_opts.start_validation == .required) blk: {
-        const start_refs = try alloc.alloc(node_identity.Ref, start_keys.len);
-        defer alloc.free(start_refs);
-        for (start_keys, 0..) |key, i| start_refs[i] = .{ .table = null, .key = key };
-        break :blk try evaluateNodeFiltersAlloc(alloc, start_refs, anchor_node.filter, aggregate_opts.evaluator);
-    } else null;
-    defer if (filtered_starts) |mask| alloc.free(mask);
-
-    const processed = try alloc.alloc(bool, pattern.edges.len);
-    defer alloc.free(processed);
-    for (start_keys, 0..) |key, start_index| {
-        if (admitted_starts) |mask| if (!mask[start_index]) continue;
-        if (filtered_starts) |mask| if (!mask[start_index]) continue;
-
-        const bindings = try alloc.alloc(PatternBinding, 1);
-        bindings[0] = initPatternBinding(alloc, anchor_node.alias, key, null, 0) catch |err| {
-            alloc.free(bindings);
-            return err;
-        };
-        var state = ConjunctiveState{ .bindings = bindings };
-        defer state.deinit(alloc);
-        @memset(processed, false);
-        try streamAggregateConjunctiveGroup(
-            alloc,
-            edge_reader,
-            pattern,
-            pattern.nodes,
-            pattern.edges,
-            pattern.predicates,
-            state,
-            processed,
-            0,
-            null,
-            null,
-            aggregate_opts,
-            work_budget,
-            accumulators,
-        );
-    }
-
-    const results = try alloc.alloc(CountAggregateResult, specs.len);
-    var initialized_results: usize = 0;
-    errdefer {
-        for (results[0..initialized_results]) |*result| result.deinit(alloc);
-        if (results.len > 0) alloc.free(results);
-    }
-    for (accumulators, 0..) |*accumulator, i| {
-        results[i] = try accumulator.finish(alloc);
-        initialized_results += 1;
-    }
-    for (accumulators) |*accumulator| accumulator.deinit(alloc);
-    if (accumulators.len > 0) alloc.free(accumulators);
-    return results;
+    var stream = try ConjunctiveCountAggregateStream.init(
+        alloc,
+        specs,
+        opts.distinct_budget orelse &local_distinct_budget,
+    );
+    defer stream.deinit(alloc);
+    try stream.consumePageWithEdgeReader(alloc, edge_reader, start_keys, pattern, opts);
+    return try stream.finishAlloc(alloc);
 }
 
 const StreamingCountAccumulator = struct {
@@ -2473,6 +2512,58 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     }
     try std.testing.expectEqual(@as(u128, 4), streamed[0].value);
     try std.testing.expectEqual(@as(u128, 4), streamed[1].value);
+
+    var page_distinct_budget = DistinctBudget.init(
+        default_max_distinct_identities,
+        default_max_distinct_identity_bytes,
+    );
+    var page_stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &page_distinct_budget);
+    defer page_stream.deinit(alloc);
+    const paged_pattern = ConjunctivePattern{
+        .nodes = &nodes,
+        .edges = &required,
+        .predicates = &predicates,
+        .optional = &optional,
+    };
+    try page_stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"a"}, paged_pattern, .{});
+    try page_stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"x"}, paged_pattern, .{});
+    const paged = try page_stream.finishAlloc(alloc);
+    defer {
+        for (paged) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(paged);
+    }
+    try std.testing.expectEqual(@as(u128, 4), paged[0].value);
+    try std.testing.expectEqual(@as(u128, 4), paged[1].value);
+}
+
+test "serverless paged conjunctive aggregate preserves exact state across anchor pages" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const nodes = [_]MatchNode{.{ .alias = "anchor" }};
+    const pattern = ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]CountAggregateSpec{ .{}, .{ .alias = "anchor", .distinct = true } };
+    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_identity_bytes);
+    var stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &distinct_budget);
+    defer stream.deinit(alloc);
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{ "a", "b" }, pattern, .{ .start_validation = .prevalidated });
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"c"}, pattern, .{ .start_validation = .prevalidated });
+    const results = try stream.finishAlloc(alloc);
+    defer {
+        for (results) |*result| result.deinit(alloc);
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(u128, 3), results[0].value);
+    try std.testing.expectEqual(@as(u128, 3), results[1].value);
 }
 
 test "conjunctive optional predicates reject aliases outside their ordered scope" {

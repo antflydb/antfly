@@ -35,6 +35,18 @@ const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const traversal_mod = @import("traversal.zig");
 
+const GraphIndexEdgeReader = struct {
+    graph_index: *GraphIndex,
+
+    pub fn getEdges(self: @This(), alloc: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
+        return try self.graph_index.getEdges(alloc, key, "", direction);
+    }
+
+    pub fn freeEdges(_: @This(), alloc: Allocator, edges: []Edge) void {
+        GraphIndex.freeEdges(alloc, edges);
+    }
+};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -194,7 +206,26 @@ pub fn findShortestPath(
     target: []const u8,
     opts: PathFindOptions,
 ) !?Path {
-    return findShortestPathWithExclusions(alloc, graph_index, source, target, opts, null, null);
+    return findShortestPathWithEdgeReader(
+        alloc,
+        GraphIndexEdgeReader{ .graph_index = graph_index },
+        source,
+        target,
+        opts,
+    );
+}
+
+/// Find a shortest path against an immutable edge reader. This is used by
+/// serverless snapshots so they share the canonical BFS/Dijkstra semantics
+/// without rebuilding a mutable GraphIndex for every request.
+pub fn findShortestPathWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    source: []const u8,
+    target: []const u8,
+    opts: PathFindOptions,
+) !?Path {
+    return findShortestPathWithExclusionsAndEdgeReader(alloc, edge_reader, source, target, opts, null, null);
 }
 
 /// Find shortest path with optional node/edge exclusions (used by Yen's algorithm).
@@ -207,8 +238,28 @@ pub fn findShortestPathWithExclusions(
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
     excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
+    return findShortestPathWithExclusionsAndEdgeReader(
+        alloc,
+        GraphIndexEdgeReader{ .graph_index = graph_index },
+        source,
+        target,
+        opts,
+        excluded_nodes,
+        excluded_edges,
+    );
+}
+
+fn findShortestPathWithExclusionsAndEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    source: []const u8,
+    target: []const u8,
+    opts: PathFindOptions,
+    excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
+    excluded_edges: ?*const ExcludedEdgeSet,
+) !?Path {
     if (opts.node_admission) |admission| {
-        if (!try traversal_mod.startNodeAdmitted(alloc, graph_index, source, opts.direction, admission)) {
+        if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, opts.direction, admission)) {
             return null;
         }
     }
@@ -227,9 +278,9 @@ pub fn findShortestPathWithExclusions(
     }
 
     if (opts.weight_mode == .min_hops) {
-        return bfsShortestPath(alloc, graph_index, source, target, opts, excluded_nodes, excluded_edges);
+        return bfsShortestPath(alloc, edge_reader, source, target, opts, excluded_nodes, excluded_edges);
     } else {
-        return dijkstraPath(alloc, graph_index, source, target, opts, excluded_nodes, excluded_edges);
+        return dijkstraPath(alloc, edge_reader, source, target, opts, excluded_nodes, excluded_edges);
     }
 }
 
@@ -239,7 +290,7 @@ pub fn findShortestPathWithExclusions(
 
 fn bfsShortestPath(
     alloc: Allocator,
-    graph_index: *GraphIndex,
+    edge_reader: anytype,
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
@@ -292,8 +343,8 @@ fn bfsShortestPath(
 
         if (opts.max_depth > 0 and current.hops >= opts.max_depth) continue;
 
-        const edges = try graph_index.getEdges(alloc, current.key, "", opts.direction);
-        defer GraphIndex.freeEdges(alloc, edges);
+        const edges = try edge_reader.getEdges(alloc, current.key, opts.direction);
+        defer edge_reader.freeEdges(alloc, edges);
 
         const admitted_edges = if (opts.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
@@ -391,7 +442,7 @@ fn bfsShortestPath(
 
 fn dijkstraPath(
     alloc: Allocator,
-    graph_index: *GraphIndex,
+    edge_reader: anytype,
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
@@ -450,8 +501,8 @@ fn dijkstraPath(
             if (current.distance > bd) continue;
         }
 
-        const edges = try graph_index.getEdges(alloc, current.key, "", opts.direction);
-        defer GraphIndex.freeEdges(alloc, edges);
+        const edges = try edge_reader.getEdges(alloc, current.key, opts.direction);
+        defer edge_reader.freeEdges(alloc, edges);
 
         const admitted_edges = if (opts.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
@@ -566,6 +617,24 @@ pub fn findKShortestPaths(
     k: u32,
     opts: PathFindOptions,
 ) ![]Path {
+    return try findKShortestPathsWithEdgeReader(
+        alloc,
+        GraphIndexEdgeReader{ .graph_index = graph_index },
+        source,
+        target,
+        k,
+        opts,
+    );
+}
+
+pub fn findKShortestPathsWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    source: []const u8,
+    target: []const u8,
+    k: u32,
+    opts: PathFindOptions,
+) ![]Path {
     if (k == 0) return try alloc.alloc(Path, 0);
 
     var results = std.ArrayListUnmanaged(Path).empty;
@@ -575,7 +644,7 @@ pub fn findKShortestPaths(
     }
 
     // Find first shortest path
-    const first = try findShortestPath(alloc, graph_index, source, target, opts);
+    const first = try findShortestPathWithEdgeReader(alloc, edge_reader, source, target, opts);
     if (first == null) return try alloc.alloc(Path, 0);
     try results.append(alloc, first.?);
 
@@ -649,9 +718,9 @@ pub fn findKShortestPaths(
             }
 
             // Find spur path
-            const spur_path = try findShortestPathWithExclusions(
+            const spur_path = try findShortestPathWithExclusionsAndEdgeReader(
                 alloc,
-                graph_index,
+                edge_reader,
                 spur_node,
                 target,
                 opts,

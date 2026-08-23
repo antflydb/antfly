@@ -90,6 +90,29 @@ const QueueEntry = struct {
 /// Perform BFS graph traversal from start_key using the given rules.
 /// Caller owns all returned memory (use freeResults to clean up).
 pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u8, rules: TraversalRules) ![]TraversalResult {
+    const Reader = struct {
+        graph_index: *GraphIndex,
+
+        pub fn getEdges(self: @This(), a: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
+            return try self.graph_index.getEdges(a, key, "", direction);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []Edge) void {
+            GraphIndex.freeEdges(a, edges);
+        }
+    };
+    return try traverseWithEdgeReader(alloc, Reader{ .graph_index = graph_index }, start_key, rules);
+}
+
+/// Reader-generic traversal over an immutable graph snapshot. The reader owns
+/// the representation-specific edge lookup and cleanup while traversal keeps
+/// one implementation of filtering, deduplication, and admission semantics.
+pub fn traverseWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_key: []const u8,
+    rules: TraversalRules,
+) ![]TraversalResult {
     var results = std.ArrayListUnmanaged(TraversalResult).empty;
     errdefer {
         freeResults(alloc, results.items);
@@ -97,7 +120,7 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
     }
 
     if (rules.node_admission) |admission| {
-        if (!try startNodeAdmitted(alloc, graph_index, start_key, rules.direction, admission)) {
+        if (!try startNodeAdmittedWithEdgeReader(alloc, edge_reader, start_key, rules.direction, admission)) {
             return try results.toOwnedSlice(alloc);
         }
     }
@@ -167,8 +190,8 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
         if (current.target_table != null) continue;
 
         // Get edges
-        const edges = try graph_index.getEdges(alloc, current.key, "", rules.direction);
-        defer GraphIndex.freeEdges(alloc, edges);
+        const edges = try edge_reader.getEdges(alloc, current.key, rules.direction);
+        defer edge_reader.freeEdges(alloc, edges);
 
         const admitted_edges = if (rules.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
@@ -330,14 +353,41 @@ pub fn startNodeAdmitted(
     direction: EdgeDirection,
     admission: NodeAdmission,
 ) !bool {
+    const Reader = struct {
+        graph_index: *GraphIndex,
+
+        pub fn getEdges(self: @This(), a: Allocator, key: []const u8, edge_direction: EdgeDirection) ![]Edge {
+            return try self.graph_index.getEdges(a, key, "", edge_direction);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []Edge) void {
+            GraphIndex.freeEdges(a, edges);
+        }
+    };
+    return try startNodeAdmittedWithEdgeReader(
+        alloc,
+        Reader{ .graph_index = graph_index },
+        start_key,
+        direction,
+        admission,
+    );
+}
+
+pub fn startNodeAdmittedWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_key: []const u8,
+    direction: EdgeDirection,
+    admission: NodeAdmission,
+) !bool {
     const statically_external = admission.external_targets and direction == .in;
     const keys = [_][]const u8{start_key};
     const admitted = try admission.filterKeysAlloc(alloc, &keys, statically_external);
     defer alloc.free(admitted);
     if (admitted[0] or statically_external or direction == .out) return admitted[0];
 
-    const incoming = try graph_index.getEdges(alloc, start_key, "", .in);
-    defer GraphIndex.freeEdges(alloc, incoming);
+    const incoming = try edge_reader.getEdges(alloc, start_key, .in);
+    defer edge_reader.freeEdges(alloc, incoming);
     for (incoming) |edge| {
         if (std.mem.eql(u8, edge.target, start_key) and
             (admission.external_targets or metadataTargetTable(edge.metadata) != null))
