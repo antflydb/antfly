@@ -45,6 +45,8 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 		IntentConflict,
 		TxnNotFound,
 		Busy,
+		OutcomeUnknown,
+		Unsupported,
 		Internal,
 		ErrorCode(127),
 	}
@@ -427,6 +429,15 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !bytes.Contains(pendingJSON, []byte("has_async_indexes")) {
 		t.Fatalf("pending work JSON %q did not include async index status", pendingJSON)
+	}
+	for _, field := range []string{
+		"portable_import_publication_in_progress",
+		"portable_import_recovery_required",
+		"portable_runtime_activation_pending",
+	} {
+		if !bytes.Contains(pendingJSON, []byte(field)) {
+			t.Fatalf("pending work JSON %q did not include restore readiness field %q", pendingJSON, field)
+		}
 	}
 	replayed, err := db.ReplayGeneratedEnrichments()
 	if err != nil {

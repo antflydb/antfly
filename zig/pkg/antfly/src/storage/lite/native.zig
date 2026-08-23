@@ -18,6 +18,7 @@
 //! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -438,6 +439,7 @@ pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    writer_lock_marker: []const u8 = "",
 };
 
 pub const Header = struct {
@@ -475,6 +477,15 @@ pub const VacuumReport = struct {
     reclaimed_bytes: u64,
     live_file_count: u64,
     live_bytes: u64,
+};
+
+/// Result of publishing a replacement generation after the atomic rename has
+/// crossed its commit point. `durability_unknown` means the live process has
+/// adopted the replacement, but the parent-directory sync failed, so crash
+/// durability cannot be promised and callers must not retry automatically.
+pub const GenerationPublicationOutcome = enum {
+    complete,
+    durability_unknown,
 };
 
 pub const StableSnapshotReport = struct {
@@ -781,6 +792,7 @@ pub const NativeFile = struct {
     /// cached copies.
     page_cache_bypass: std.atomic.Value(u32) = .init(0),
     test_fail_vacuum_after_adoption: bool = false,
+    test_fail_generation_directory_sync: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -827,15 +839,15 @@ pub const NativeFile = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false, null);
+        return try createWithMode(allocator, path, false, false, null, "");
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false, null);
+        return try createWithMode(allocator, path, true, false, null, "");
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager);
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker);
     }
 
     fn createWithMode(
@@ -844,6 +856,7 @@ pub const NativeFile = struct {
         exclusive: bool,
         no_sync: bool,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        writer_lock_marker: []const u8,
     ) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
@@ -855,6 +868,11 @@ pub const NativeFile = struct {
         const writer_lock = try acquireWriterLock(allocator, io, path);
         var writer_lock_file = writer_lock.file;
         errdefer writer_lock_file.close(io);
+        if (writer_lock_marker.len > 0) {
+            try writer_lock_file.writePositionalAll(io, writer_lock_marker, 0);
+            try writer_lock_file.setLength(io, writer_lock_marker.len);
+            if (!no_sync) try writer_lock_file.sync(io);
+        }
 
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, .{});
@@ -3574,6 +3592,52 @@ pub const NativeFile = struct {
     pub fn sync(self: *NativeFile) !void {
         try self.syncIfRequired();
     }
+
+    pub fn failNextGenerationDirectorySyncForTest(self: *NativeFile) void {
+        std.debug.assert(builtin.is_test);
+        self.test_fail_generation_directory_sync = true;
+    }
+
+    /// Atomically publishes a fully built Lite generation into this file and
+    /// adopts its already-open descriptor. The destination writer lock stays
+    /// with `self`; `prepared` receives the retired descriptor and can be
+    /// closed normally after this returns.
+    pub fn replaceWithPreparedGeneration(self: *NativeFile, prepared: *NativeFile) !GenerationPublicationOutcome {
+        if (self.read_only or prepared.read_only) return error.ReadOnly;
+        if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
+
+        try prepared.syncIfRequired();
+        const io = self.io_impl.io();
+        try renameFilePath(io, prepared.path, self.path);
+
+        std.mem.swap(std.Io.File, &self.file, &prepared.file);
+        const retired_header = self.header;
+        self.header = prepared.header;
+        prepared.header = retired_header;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        self.namespace_directory_delta_depth = 0;
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        self.namespace_directory_cache = .empty;
+        self.page_cache.clear(self.allocator);
+
+        // The generation is already visible and the live handle has adopted
+        // it. Preserve that committed state while returning an explicit
+        // durability outcome to the layer that can finish rebinding runtime
+        // metadata before surfacing it to the caller.
+        if (!self.no_sync) {
+            if (builtin.is_test and self.test_fail_generation_directory_sync) {
+                self.test_fail_generation_directory_sync = false;
+                std.log.err("Lite restore published but parent directory sync failed path={s} class={s}", .{ self.path, @errorName(error.InjectedGenerationDirectorySyncFailure) });
+                return .durability_unknown;
+            }
+            fs_paths.syncDirPortable(io, std.fs.path.dirname(self.path) orelse ".") catch |err| {
+                std.log.err("Lite restore published but parent directory sync failed path={s} class={s}", .{ self.path, @errorName(err) });
+                return .durability_unknown;
+            };
+        }
+        return .complete;
+    }
+
     /// Publishes a fully synced vacuum file and adopts its already-open handle.
     /// Once rename succeeds there are deliberately no fallible reopen steps:
     /// even if the parent-directory sync reports an error, subsequent requests

@@ -26,6 +26,7 @@ const AtomicU64 = platform.atomic.Value(u64);
 const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
+const backup_codec = @import("../backup_codec.zig");
 const docstore_mod = @import("../docstore.zig");
 const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
@@ -692,6 +693,11 @@ const AsyncContext = struct {
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    // Heap-stable admission state shared by the DB wrapper and callbacks that
+    // outlive DB.open's by-value return. Activation publishes this flag while
+    // holding apply exclusive; every catalog-sensitive lease revalidates it
+    // after admission.
+    portable_runtime_activation_pending: std.atomic.Value(bool) = .init(false),
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     repair_sequence: u64 = 0,
     repair_issue_counter: ?*AtomicU64 = null,
@@ -893,6 +899,12 @@ const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
+var portable_activation_retry_jitter_nonce: AtomicU64 = AtomicU64.init(0);
+var test_fail_portable_activation_retry_thread_spawn: std.atomic.Value(bool) = .init(false);
+var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) = .init(false);
+var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
+var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
+var test_release_portable_activation_retry_probe: std.atomic.Value(bool) = .init(false);
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
@@ -901,6 +913,11 @@ var test_quarantine_publication_fence_entered: std.atomic.Value(bool) = .init(fa
 var test_block_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
 var test_match_all_ordinal_lookup_entered: std.atomic.Value(bool) = .init(false);
 var test_release_match_all_ordinal_lookup: std.atomic.Value(bool) = .init(false);
+const PortableRuntimeBatchPrelockTestHook = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+};
+var test_portable_runtime_batch_prelock_hook: ?*PortableRuntimeBatchPrelockTestHook = null;
 const PublishedDenseCatalogLookupTestHook = struct {
     io: std.Io,
     entered: std.Io.Event = .unset,
@@ -1244,6 +1261,7 @@ const EnrichmentAppendContext = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -1269,6 +1287,7 @@ const EnrichmentAppendContext = struct {
             .replay_source = self.replay_source,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .portable_runtime_activation_pending = self.portable_runtime_activation_pending,
             .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = doc_identity.default_namespace,
@@ -1311,6 +1330,7 @@ const BatchExecutionContext = struct {
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    portable_runtime_activation_pending: ?*const std.atomic.Value(bool) = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
@@ -2219,11 +2239,410 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
 var repair_shadow_nonce = AtomicU64.init(0);
+var portable_import_stage_nonce = AtomicU64.init(0);
+var test_fail_portable_index_activation = false;
+var test_fail_portable_promotion_runtime_start = false;
+var test_fail_portable_import_publish_after_batch = false;
+var test_fail_portable_import_rollback = false;
+var test_fail_portable_import_committed_sync = false;
+var test_fail_portable_import_stage_directory_creation = false;
+const portable_import_stage_lease_suffix = ".lease";
+const portable_import_stage_lease_magic = "antfly-portable-import-stage-v1\n";
+const portable_import_in_progress_key = "\x00\x00__metadata__:portable_import_in_progress_v1";
+const portable_import_identity_baseline_key = "\x00\x00__metadata__:portable_import_identity_baseline_v1";
+const portable_import_marker_publishing = "antfly-portable-import-publishing-v2\n";
+const portable_import_marker_committed = "antfly-portable-import-committed-v2\n";
+const portable_import_publish_batch_bytes: usize = 8 * 1024 * 1024;
+const portable_import_publish_batch_entries: usize = 4096;
+const portable_import_identity_baseline_max_entries: usize = 64;
+const portable_import_identity_baseline_max_bytes: usize = 1024 * 1024;
+
+pub fn failNextPortableIndexActivationForTest() void {
+    std.debug.assert(builtin.is_test);
+    test_fail_portable_index_activation = true;
+}
+
+pub fn failNextPortablePromotionRuntimeStartForTest() void {
+    std.debug.assert(builtin.is_test);
+    test_fail_portable_promotion_runtime_start = true;
+}
+
+pub fn failNextPortableImportPublishForTest() void {
+    std.debug.assert(builtin.is_test);
+    test_fail_portable_import_publish_after_batch = true;
+}
+
+pub fn failNextPortableImportRollbackForTest() void {
+    std.debug.assert(builtin.is_test);
+    test_fail_portable_import_publish_after_batch = true;
+    test_fail_portable_import_rollback = true;
+}
+
+pub fn failNextPortableImportCommittedSyncForTest() void {
+    std.debug.assert(builtin.is_test);
+    test_fail_portable_import_committed_sync = true;
+}
+
+fn clearPortableImportTargetBounded(alloc: Allocator, store: *docstore_mod.DocStore) !void {
+    const marker = store.getPortableImportRollback(alloc, portable_import_in_progress_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer alloc.free(marker);
+    const encoded_baseline = store.getPortableImportRollback(alloc, portable_import_identity_baseline_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (encoded_baseline) |encoded| alloc.free(encoded);
+    const baseline = if (encoded_baseline) |encoded|
+        try backup_codec.decodeKeyValueBatch(alloc, encoded)
+    else
+        try alloc.alloc(backup_codec.KeyValueEntry, 0);
+    defer {
+        for (baseline) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        alloc.free(baseline);
+    }
+    if (baseline.len > portable_import_identity_baseline_max_entries) return error.InvalidPortableImportMarker;
+    var baseline_bytes: usize = 0;
+    for (baseline) |entry| {
+        if (entry.key.len == 0 or entry.key[0] != internal_keys.identity_namespace) return error.InvalidPortableImportMarker;
+        baseline_bytes +|= entry.key.len +| entry.value.len;
+        if (baseline_bytes > portable_import_identity_baseline_max_bytes) return error.InvalidPortableImportMarker;
+    }
+
+    while (true) {
+        const Collect = struct {
+            alloc: Allocator,
+            keys: std.ArrayListUnmanaged([]u8) = .empty,
+            bytes: usize = 0,
+
+            fn deinit(self: *@This()) void {
+                for (self.keys.items) |key| self.alloc.free(key);
+                self.keys.deinit(self.alloc);
+            }
+
+            fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                // Keep the recovery authority durable until every partial
+                // generation key has been removed.
+                if (std.mem.eql(u8, key, portable_import_in_progress_key) or
+                    std.mem.eql(u8, key, portable_import_identity_baseline_key) or
+                    !portable_backup.isPortableStoreKey(key)) return .@"continue";
+                if (self.keys.items.len != 0 and
+                    (self.keys.items.len >= portable_import_publish_batch_entries or
+                        self.bytes +| key.len > portable_import_publish_batch_bytes)) return .stop;
+                const owned = try self.alloc.dupe(u8, key);
+                errdefer self.alloc.free(owned);
+                try self.keys.append(self.alloc, owned);
+                self.bytes += owned.len;
+                return .@"continue";
+            }
+        };
+        var page = Collect{ .alloc = alloc };
+        defer page.deinit();
+        try store.scanPortableImportRollbackWithContext("", "", .{}, &page, Collect.visit);
+        if (page.keys.items.len == 0) {
+            const restores: []const docstore_mod.KVPair = @ptrCast(baseline);
+            try store.putBatch(restores, &.{ portable_import_in_progress_key, portable_import_identity_baseline_key });
+            return;
+        }
+        const deletes: []const []const u8 = @ptrCast(page.keys.items);
+        try store.putBatch(&.{}, deletes);
+    }
+}
+
+fn encodePortableImportIdentityBaseline(alloc: Allocator, store: *docstore_mod.DocStore) ![]u8 {
+    const Collect = struct {
+        alloc: Allocator,
+        entries: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty,
+        bytes: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            for (self.entries.items) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.value);
+            }
+            self.entries.deinit(self.alloc);
+        }
+
+        fn visit(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (self.entries.items.len >= portable_import_identity_baseline_max_entries or
+                self.bytes +| key.len +| value.len > portable_import_identity_baseline_max_bytes)
+            {
+                return error.LiteImportTargetNotEmpty;
+            }
+            const owned_key = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(owned_key);
+            const owned_value = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(owned_value);
+            try self.entries.append(self.alloc, .{ .key = owned_key, .value = owned_value });
+            self.bytes +|= key.len +| value.len;
+            return .@"continue";
+        }
+    };
+    var baseline = Collect{ .alloc = alloc };
+    defer baseline.deinit();
+    const lower = [_]u8{internal_keys.identity_namespace};
+    const upper = [_]u8{internal_keys.identity_namespace + 1};
+    try store.scanPortableImportRollbackWithContext(&lower, &upper, .{}, &baseline, Collect.visit);
+    return try backup_codec.encodeKeyValueBatch(alloc, baseline.entries.items);
+}
+
+fn recoverIncompletePortableImport(alloc: Allocator, store: *docstore_mod.DocStore, read_only: bool) !void {
+    const marker = store.get(alloc, portable_import_in_progress_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer alloc.free(marker);
+    if (std.mem.eql(u8, marker, portable_import_marker_committed)) {
+        // The generation and committed marker crossed the same forced durable
+        // boundary. Marker removal is only housekeeping: a crash before that
+        // cleanup must preserve the acknowledged generation.
+        if (!read_only) {
+            try store.putBatch(&.{}, &.{ portable_import_in_progress_key, portable_import_identity_baseline_key });
+            store.sync(true) catch |err| {
+                std.log.warn("portable import committed-marker cleanup deferred class={s}", .{@errorName(err)});
+            };
+        }
+        return;
+    }
+    if (!std.mem.eql(u8, marker, portable_import_marker_publishing) and
+        !std.mem.eql(u8, marker, portable_import_stage_lease_magic))
+    {
+        return error.InvalidPortableImportMarker;
+    }
+    if (read_only) return error.IncompletePortableImport;
+    std.log.warn("recovering incomplete portable import by restoring pristine target", .{});
+    try clearPortableImportTargetBounded(alloc, store);
+    try store.sync(true);
+}
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
+
+/// Generic directory-store imports are decoded into a bounded, durable scratch
+/// LSM before they touch the live store. Lite restores use a disposable native
+/// generation instead, so their publication never creates an archive-sized
+/// pending transaction.
+const PortableImportStage = struct {
+    alloc: Allocator,
+    path: []u8,
+    lease_file: std.Io.File,
+    backend: lsm_backend_mod.BackendHandle,
+    runtime_store: backend_erased_mod.Store,
+    store: docstore_mod.DocStore,
+
+    fn init(
+        alloc: Allocator,
+        target_path: []const u8,
+        data: []const u8,
+        opts: portable_backup.ImportOptions,
+    ) !PortableImportStage {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedOperation;
+
+        const location = try createUniquePortableImportStageBase(alloc, target_path);
+        const path = location.path;
+        var lease_file = location.lease_file;
+        errdefer {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            lease_file.close(io_impl.io());
+            const deleted = blk: {
+                std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch break :blk false;
+                break :blk true;
+            };
+            if (deleted) deletePortableImportStageLease(alloc, io_impl.io(), path) catch {};
+            alloc.free(path);
+        }
+        var stage_options = db_config.primary_lsm_options_default;
+        // The scratch generation is disposable and never recovered after a
+        // process crash, so a WAL would only duplicate I/O and disk usage. A
+        // tighter flush bound keeps the final mutable tail modest as well.
+        stage_options.wal_enabled = false;
+        stage_options.flush_threshold_bytes = 16 * 1024 * 1024;
+        var backend = try lsm_backend_mod.BackendHandle.open(alloc, path, stage_options);
+        errdefer backend.close();
+        var runtime_store = try backend.ptr().runtimeStore(alloc, .{ .name = "portable-restore-stage" });
+        errdefer runtime_store.deinit();
+        var store = try docstore_mod.DocStore.openRuntime(alloc, &runtime_store);
+        errdefer store.close();
+
+        try portable_backup.importPortableWithOptions(alloc, &store, data, opts);
+        // Finish pending manifest/storage work before validation. Size-based
+        // flushes keep the resident staging footprint bounded for large
+        // archives; the final mutable tail is capped by the threshold above.
+        try store.sync(true);
+        return .{
+            .alloc = alloc,
+            .path = path,
+            .lease_file = lease_file,
+            .backend = backend,
+            .runtime_store = runtime_store,
+            .store = store,
+        };
+    }
+
+    fn deinit(self: *PortableImportStage) void {
+        self.store.close();
+        self.runtime_store.deinit();
+        self.backend.close();
+        if (comptime builtin.os.tag != .freestanding) {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            self.lease_file.close(io_impl.io());
+            var scratch_deleted = true;
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), self.path) catch |err| {
+                scratch_deleted = false;
+                std.log.warn("portable restore scratch cleanup failed path={s} class={s}", .{ self.path, @errorName(err) });
+            };
+            if (scratch_deleted) {
+                deletePortableImportStageLease(self.alloc, io_impl.io(), self.path) catch |err| {
+                    std.log.warn("portable restore scratch lease cleanup failed path={s} class={s}", .{ self.path, @errorName(err) });
+                };
+            }
+        }
+        self.alloc.free(self.path);
+        self.* = undefined;
+    }
+
+    fn reassignIdentityNamespace(self: *PortableImportStage, alloc: Allocator, namespace: doc_identity.Namespace) !void {
+        try doc_identity.reassignNamespaceAlloc(alloc, &self.store, namespace);
+    }
+
+    fn publish(self: *PortableImportStage, target: *docstore_mod.DocStore) !void {
+        // The target is fenced and pristine. A durable marker makes the
+        // bounded sequence of commits one recoverable publication unit: open
+        // rolls back publishing markers and preserves committed markers.
+        const identity_baseline = try encodePortableImportIdentityBaseline(self.alloc, target);
+        defer self.alloc.free(identity_baseline);
+        target.putBatch(&.{
+            .{ .key = portable_import_identity_baseline_key, .value = identity_baseline },
+            .{ .key = portable_import_in_progress_key, .value = portable_import_marker_publishing },
+        }, &.{}) catch |publish_err| {
+            return self.rollbackOrFence(target, publish_err);
+        };
+        // The rollback authority must reach durable storage before any target
+        // batch can be flushed or published independently.
+        target.sync(true) catch |publish_err| return self.rollbackOrFence(target, publish_err);
+
+        self.publishMarkedGeneration(target) catch |publish_err| {
+            return self.rollbackOrFence(target, publish_err);
+        };
+    }
+
+    fn rollbackOrFence(
+        self: *PortableImportStage,
+        target: *docstore_mod.DocStore,
+        publish_err: anyerror,
+    ) anyerror!void {
+        const rollback_result: anyerror!void = if (builtin.is_test and test_fail_portable_import_rollback) blk: {
+            test_fail_portable_import_rollback = false;
+            break :blk error.InjectedPortableImportRollbackFailure;
+        } else clearPortableImportTargetBounded(self.alloc, target);
+        rollback_result catch |rollback_err| {
+            target.requirePortableImportRecovery();
+            std.log.err(
+                "portable import failed and rollback requires reopen path={s} publish_class={s} rollback_class={s}",
+                .{ self.path, @errorName(publish_err), @errorName(rollback_err) },
+            );
+            return error.PortableImportRecoveryRequired;
+        };
+        target.sync(true) catch |rollback_sync_err| {
+            target.requirePortableImportRecovery();
+            std.log.err(
+                "portable import rollback completed in memory but durability requires reopen path={s} publish_class={s} rollback_class={s}",
+                .{ self.path, @errorName(publish_err), @errorName(rollback_sync_err) },
+            );
+            return error.PortableImportRecoveryRequired;
+        };
+        return publish_err;
+    }
+
+    fn publishMarkedGeneration(self: *PortableImportStage, target: *docstore_mod.DocStore) !void {
+        try target.beginBulkIngestSession();
+        var bulk_active = true;
+        defer if (bulk_active) target.abortBulkIngestSession();
+        const Publish = struct {
+            alloc: Allocator,
+            target: *docstore_mod.DocStore,
+            writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+            bytes: usize = 0,
+
+            fn clear(state: *@This()) void {
+                for (state.writes.items) |kv| {
+                    state.alloc.free(kv.key);
+                    state.alloc.free(kv.value);
+                }
+                state.writes.clearRetainingCapacity();
+                state.bytes = 0;
+            }
+
+            fn deinit(state: *@This()) void {
+                state.clear();
+                state.writes.deinit(state.alloc);
+            }
+
+            fn flush(state: *@This()) !void {
+                if (state.writes.items.len == 0) return;
+                try state.target.putBatchWithReplayWithOptions(null, state.writes.items, &.{}, null, .{ .mode = .bulk_ingest });
+                state.clear();
+                if (builtin.is_test and test_fail_portable_import_publish_after_batch) {
+                    test_fail_portable_import_publish_after_batch = false;
+                    return error.InjectedPortableImportPublishFailure;
+                }
+            }
+
+            fn copy(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (std.mem.eql(u8, key, portable_import_in_progress_key)) return error.InvalidBackupRequest;
+                const entry_bytes = key.len +| value.len;
+                if (state.writes.items.len != 0 and
+                    (state.writes.items.len >= portable_import_publish_batch_entries or
+                        state.bytes +| entry_bytes > portable_import_publish_batch_bytes)) try state.flush();
+                const owned_key = try state.alloc.dupe(u8, key);
+                errdefer state.alloc.free(owned_key);
+                const owned_value = try state.alloc.dupe(u8, value);
+                errdefer state.alloc.free(owned_value);
+                try state.writes.append(state.alloc, .{ .key = owned_key, .value = owned_value });
+                state.bytes +|= entry_bytes;
+                return .@"continue";
+            }
+        };
+        var state = Publish{ .alloc = self.alloc, .target = target };
+        defer state.deinit();
+        try self.store.scanWithContext("", "", .{}, &state, Publish.copy);
+        try state.flush();
+        try target.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        bulk_active = false;
+        // Preserve rollback authority until the generation and its committed
+        // marker cross the forced durability boundary together. If that sync
+        // fails, rollback can still restore routing and identity metadata from
+        // the live journal; deleting it in the marker write would make the
+        // failure path irrecoverable.
+        try target.put(portable_import_in_progress_key, portable_import_marker_committed);
+        if (builtin.is_test and test_fail_portable_import_committed_sync) {
+            test_fail_portable_import_committed_sync = false;
+            return error.InjectedPortableImportCommittedSyncFailure;
+        }
+        try target.sync(true);
+        target.putBatch(&.{}, &.{
+            portable_import_in_progress_key,
+            portable_import_identity_baseline_key,
+        }) catch |err| {
+            std.log.warn("portable import committed-journal cleanup deferred class={s}", .{@errorName(err)});
+            return;
+        };
+        target.sync(true) catch |err| {
+            std.log.warn("portable import committed-journal sync deferred class={s}", .{@errorName(err)});
+        };
+    }
+};
 
 fn loadOrCreateDurableRootIdentity(
     alloc: Allocator,
@@ -3022,6 +3441,20 @@ pub const DB = struct {
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    portable_runtime_activation_attempts: AtomicU64 = AtomicU64.init(0),
+    // Serializes the stop/load/start lifecycle without coupling worker joins
+    // to the apply lock. Public and background retries may race otherwise.
+    portable_runtime_activation_mutex: std.atomic.Mutex = .unlocked,
+    // The retry worker is intentionally short-lived: it exits after recovery
+    // instead of retaining one polling thread per DB. It is detached so a
+    // completed generation cannot retain a joinable kernel-thread resource;
+    // this state provides single-flight launch and close-safe lifetime fencing.
+    portable_activation_retry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    portable_activation_retry_worker_running: std.atomic.Value(bool) = .init(false),
+    portable_activation_retry_stop: std.atomic.Value(bool) = .init(false),
+    portable_activation_retry_jitter_salt: u64 = 0,
+    portable_activation_retry_launch_failure_streak: u32 = 0,
+    portable_activation_retry_next_launch_ns: u64 = 0,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Spawned at open only when the load left failures behind; exits once all
     // quarantined indexes recover or the DB closes.
@@ -3103,6 +3536,7 @@ pub const DB = struct {
             .replay_source = resources.replay_source,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
@@ -3121,8 +3555,32 @@ pub const DB = struct {
         };
     }
 
+    fn enforcePortableRuntimeGate(self: *const DB) !void {
+        try enforcePortableRuntimeGateOptional(&self.async_context.portable_runtime_activation_pending);
+    }
+
     fn enforceHAWriteGate(self: *DB) !void {
+        try self.enforcePortableRuntimeGate();
         try enforceHAWriteGateOptional(self.ha_write_gate);
+    }
+
+    /// Keep unavailable work out of lock queues, then revalidate after acquiring
+    /// the synchronization primitive that activation itself uses. Publication
+    /// may close the gate between those checks; a successful return therefore
+    /// owns one stable runtime-catalog generation without penalizing degraded
+    /// requests with lock contention.
+    fn lockApplyForPortableRuntime(self: *DB) !void {
+        try self.enforcePortableRuntimeGate();
+        lockApply(self);
+        errdefer self.core.unlockApply();
+        try self.enforcePortableRuntimeGate();
+    }
+
+    fn lockApplySharedForPortableRuntime(self: *DB) !void {
+        try self.enforcePortableRuntimeGate();
+        lockApplyShared(self);
+        errdefer self.core.unlockApplyShared();
+        try self.enforcePortableRuntimeGate();
     }
 
     fn haMutationBarrier(self: *const DB) ?*HAMutationBarrier {
@@ -3215,13 +3673,13 @@ pub const DB = struct {
 
         if (outbox.batch_payload) |payload| {
             try self.mirrorHAEncodedBatchMutationCommit(payload);
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.core.clearTransactionHAOutbox(txn_id, .batch);
         }
         if (outbox.replay_payload) |payload| {
             try self.mirrorHAReplayPayloadCommit(payload);
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.core.clearTransactionHAOutbox(txn_id, .replay);
         }
@@ -3369,9 +3827,26 @@ pub const DB = struct {
                 effective_index_backends,
             );
             const open_primary_started_ns = monotonicTimeNs();
-            const opened_primary = try openPrimaryStore(alloc, path, core_opts);
+            var opened_primary = try openPrimaryStore(alloc, path, core_opts);
+            var opened_primary_owned = true;
+            errdefer if (opened_primary_owned) {
+                var failed_primary = opened_primary;
+                failed_primary.store.close();
+                failed_primary.owner.close(alloc);
+            };
+            // Portable publication uses bounded commits guarded by an
+            // in-store completion marker. Recover before schema/catalog
+            // construction so no runtime can observe a partial generation.
+            try recoverIncompletePortableImport(
+                alloc,
+                &opened_primary.store,
+                openModeRequiresReadOnlyBackends(opts.open_mode),
+            );
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();
+            // openCoreResourcesFromPrimaryStore assumes ownership on entry,
+            // including all of its error paths.
+            opened_primary_owned = false;
             const core = try db_core.openCoreResourcesFromPrimaryStore(
                 alloc,
                 path,
@@ -3852,6 +4327,7 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4023,6 +4499,7 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4100,12 +4577,14 @@ pub const DB = struct {
                 .replay_source = batch_resources.replay_source,
                 .index_manager = batch_resources.index_manager,
                 .apply_mutex = batch_resources.apply_mutex,
+                .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
                 .log_mutex = batch_resources.log_mutex,
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
+                .relational_base_rows = relationalColumns(self) != null,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -4237,7 +4716,7 @@ pub const DB = struct {
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
         if (!cfg.enabled or self.transaction_runtime != null) return;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.transaction_runtime != null) return;
         try self.initOptionalTransactionRuntime(cfg);
@@ -4282,8 +4761,22 @@ pub const DB = struct {
     }
 
     fn startResolverReplayRuntimes(self: *DB) !void {
-        if (self.resolution_runtime) |runtime| try runtime.start();
+        var resolution_started = false;
+        errdefer if (resolution_started) if (self.resolution_runtime) |runtime| runtime.stop();
+        if (self.resolution_runtime) |runtime| {
+            try runtime.start();
+            resolution_started = true;
+        }
+        if (builtin.is_test and test_fail_portable_promotion_runtime_start) {
+            test_fail_portable_promotion_runtime_start = false;
+            return error.InjectedPortablePromotionRuntimeStartFailure;
+        }
         if (self.promotion_runtime) |runtime| try runtime.start();
+    }
+
+    fn stopResolverReplayRuntimes(self: *DB) void {
+        if (self.resolution_runtime) |runtime| runtime.stop();
+        if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
     fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
@@ -4314,6 +4807,7 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.stopArtifactRepairMetadataWorker();
+        self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
@@ -4336,7 +4830,7 @@ pub const DB = struct {
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
-        self.closeShadowIndexManager() catch {};
+        self.closeShadowIndexManagerLocked() catch {};
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -4467,7 +4961,7 @@ pub const DB = struct {
 
         // Serialize presumed-abort and metadata cleanup with prepare/resolve,
         // but do not hold the lock across participant callbacks above.
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         const local_stats = self.core.recoverTransactions(now_ns -| config.cutoff_ns, now_ns) catch |err| {
             self.core.unlockApply();
             return err;
@@ -4486,9 +4980,13 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        // Fail promptly while a restored catalog is degraded instead of
+        // entering the dense-session admission wait. The apply-locked check
+        // below remains authoritative and closes a concurrent publication.
+        try self.enforcePortableRuntimeGate();
         try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
         errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.store.beginBulkIngestSession();
@@ -4516,7 +5014,7 @@ pub const DB = struct {
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             var first_err: ?anyerror = null;
@@ -4552,9 +5050,10 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        try self.enforcePortableRuntimeGate();
         try beginExternalDenseBulkSessionTrackedWait(self.async_context, self.backend_runtime.io());
         errdefer finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.index_manager.beginDenseBulkIngestSessions();
@@ -4565,7 +5064,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.store.beginBulkIngestSession();
@@ -4581,7 +5080,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
@@ -4622,7 +5121,7 @@ pub const DB = struct {
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             resources.store.flushBufferedWritesWithOptions(options) catch |err| {
@@ -5316,7 +5815,7 @@ pub const DB = struct {
         const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
         defer self.alloc.free(prefix);
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
         const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
@@ -5350,7 +5849,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const deletes = [_][]const u8{key};
         try self.core.store.putBatch(&.{}, deletes[0..]);
@@ -5486,7 +5985,7 @@ pub const DB = struct {
             null;
         defer if (prepared_recovery) |*prepared| prepared.deinit();
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.validateStorageModeCompatibilityLocked(table_schema);
             if (public_schema_json) |schema_json| {
@@ -5553,6 +6052,8 @@ pub const DB = struct {
 
     fn markHAReplicationRecordApplied(self: *DB, lsn: u64) !void {
         if (lsn == 0) return;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
         const current = try self.haAppliedReplicationLsn();
         if (current >= lsn) return;
         var value_buf: [ha_applied_lsn_value_len]u8 = undefined;
@@ -5582,7 +6083,9 @@ pub const DB = struct {
 
         try self.executor.failIfUnhealthy();
 
-        lockApply(self);
+        // Recheck after lock acquisition to close publication racing the fast
+        // preflight performed by the caller.
+        try self.lockApplyForPortableRuntime();
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
 
@@ -5749,7 +6252,17 @@ pub const DB = struct {
             try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
         }
 
-        lockApply(self);
+        if (builtin.is_test) {
+            if (test_portable_runtime_batch_prelock_hook) |hook| {
+                hook.entered.store(true, .release);
+                while (!hook.release.load(.acquire)) std.Thread.yield() catch {};
+            }
+        }
+
+        // HA replay may bypass the primary-role gate, but it must never bypass
+        // portable runtime activation. Rechecking under apply also closes the
+        // interval between the fast preflight above and lock acquisition.
+        try self.lockApplyForPortableRuntime();
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
 
@@ -5783,7 +6296,7 @@ pub const DB = struct {
                 self.core.unlockApply();
                 apply_mutex_held = false;
                 try self.flushBulkIngestCoalescerWithSyncLevel(req.sync_level, profile);
-                lockApply(self);
+                try self.lockApplyForPortableRuntime();
                 apply_mutex_held = true;
             }
         }
@@ -6488,7 +7001,7 @@ pub const DB = struct {
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
                     .known_intent_keys = resolution.intent_keys,
-                    .skip_intent_keys = if (relationalColumns(self) != null) resolution.intent_keys else &.{},
+                    .skip_all_intent_application = relationalColumns(self) != null,
                 },
             );
             if (outcome.applied) {
@@ -7631,7 +8144,7 @@ pub const DB = struct {
         // this runs.
         try ctx.index_manager.finalizeRetiredIndexStorage(ctx.store, index_name);
 
-        ctx.apply_mutex.lockExclusive();
+        try lockApplyForPortableRuntimeAsync(ctx);
         defer ctx.apply_mutex.unlockExclusive();
         if (ctx.index_manager.get(index_name) != null) return error.IndexGenerationStillActive;
 
@@ -8257,7 +8770,7 @@ pub const DB = struct {
         _ = self.bulk_ingest_coalescer.stats.flush_calls.fetchAdd(1, .monotonic);
         _ = self.bulk_ingest_coalescer.stats.flushed_keys.fetchAdd(@intCast(self.bulk_ingest_coalescer.entries.items.len), .monotonic);
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         var view = try self.bulk_ingest_coalescer.snapshotRequestView(self.alloc);
         self.core.unlockApply();
         defer view.deinit(self.alloc);
@@ -8271,7 +8784,7 @@ pub const DB = struct {
             .sync_level = sync_level,
         }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest, .defer_commit_flush = true } });
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         self.bulk_ingest_coalescer.resetPending(self.alloc);
         self.bulk_ingest_coalescer.active = true;
@@ -8427,7 +8940,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
 
@@ -11030,7 +11543,7 @@ pub const DB = struct {
         // Catalog entries are owned by the apply lifecycle. Hold its exclusive
         // lock through marker validation and checkpoint publication so deletion or
         // replacement cannot free the config or commit absence in between.
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
         defer alloc.free(key);
@@ -11122,7 +11635,7 @@ pub const DB = struct {
         // This is intentionally a structural lock, not a general repair lock:
         // the primary marker, catalog membership, and borrowed config must
         // remain one lifecycle observation through checkpoint publication.
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
         defer alloc.free(prefix);
@@ -11298,7 +11811,7 @@ pub const DB = struct {
         index_name: []const u8,
         repair_id: u128,
     ) !DenseArtifactCounterBootstrapSnapshot {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) {
@@ -11332,7 +11845,7 @@ pub const DB = struct {
         attempt_id: u128,
         snapshot_count: u64,
     ) !void {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         if (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name) != null) return;
@@ -11784,7 +12297,7 @@ pub const DB = struct {
         {
             var structural_guard = self.beginIndexStructuralMutation("index repair rollback", entry.intent.index_name);
             defer structural_guard.deinit();
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.core.index_manager.restoreActiveIndexRootPointer(
                 entry.intent.index_name,
@@ -14287,7 +14800,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
@@ -14351,7 +14864,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (state == null) {
             try self.core.setSplitState(null);
@@ -14382,7 +14895,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitDeltaFinalSeq(seq);
     }
@@ -14391,7 +14904,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.clearSplitDeltaFinalSeq();
     }
@@ -14403,7 +14916,7 @@ pub const DB = struct {
     }
 
     pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
     }
@@ -14709,13 +15222,13 @@ pub const DB = struct {
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
         const end = try self.alloc.dupe(u8, byte_range.end);
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         self.core.replaceRangeInMemoryOwned(start, end);
     }
 
     pub fn clearSplitBootstrapMarker(self: *DB) !void {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.clearSplitBootstrapMarker();
     }
@@ -14767,7 +15280,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.clearSplitDeltas();
     }
@@ -14776,7 +15289,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.shadow != null) return error.ShadowIndexManagerExists;
 
@@ -14817,6 +15330,12 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.closeShadowIndexManagerLocked();
+    }
+
+    fn closeShadowIndexManagerLocked(self: *DB) !void {
         const shadow = self.shadow orelse return;
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
@@ -14848,7 +15367,7 @@ pub const DB = struct {
             const target_sequence = self.core.nextDerivedSequence();
             try self.runMaintenanceUntil(target_sequence, .{});
 
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             if (self.core.nextDerivedSequence() == target_sequence) break;
             self.core.unlockApply();
         }
@@ -14879,7 +15398,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try finalizeSplitLocked(self, new_range);
     }
@@ -14887,7 +15406,7 @@ pub const DB = struct {
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
         try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         try self.core.syncStore(true);
@@ -14907,7 +15426,7 @@ pub const DB = struct {
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
     }
@@ -15365,7 +15884,7 @@ pub const DB = struct {
     }
 
     fn rebuildGraphDerivedState(self: *DB) !usize {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.index_manager.rebuildGraphSplitDestination(
             self.getRange().start,
@@ -15389,7 +15908,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.validateStorageModeCompatibilityLocked(table_schema);
             // The public schema is an inseparable validator for the runtime
@@ -15515,7 +16034,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.preflightHAMetadataSyncCommit();
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.validateStorageModeCompatibilityLocked(runtime_schema);
             _ = try self.core.commitSchemaMetadata(runtime_schema, &.{.{
@@ -15587,7 +16106,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
     }
@@ -15622,7 +16141,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
             txn_id,
@@ -15650,7 +16169,7 @@ pub const DB = struct {
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.validateRelationalTransactionIntentsLocked(intents);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
@@ -15658,11 +16177,15 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
         // Transform expansion is a read-modify-write operation. Hold the same
         // apply fence used by ordinary batches from the source read through
         // predicate validation and durable intent installation; otherwise a
         // concurrent write can be lost between transform expansion and prepare.
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
@@ -15791,7 +16314,7 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (status != .committed) {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{}) catch |err| switch (err) {
                 // An abort decision for a participant that was declared but
@@ -15812,7 +16335,7 @@ pub const DB = struct {
             for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
             for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
-                lockApply(self);
+                try self.lockApplyForPortableRuntime();
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
                     status,
@@ -15884,7 +16407,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
     }
@@ -15895,7 +16418,7 @@ pub const DB = struct {
         cutoff_timestamp: u64,
         retained_cutoff_timestamp: u64,
     ) !bool {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
@@ -15913,7 +16436,7 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
         recovery_stats.resolved_finalized += resolved_finalized;
@@ -15946,6 +16469,8 @@ pub const DB = struct {
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
         return try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
     }
 
@@ -15957,6 +16482,8 @@ pub const DB = struct {
         rules: traversal_mod.TraversalRules,
     ) ![]traversal_mod.TraversalResult {
         if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
         return try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
     }
 
@@ -15994,6 +16521,8 @@ pub const DB = struct {
         max_weight: f64,
     ) !?paths_mod.Path {
         if (source.len == 0 or target.len == 0) return null;
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
         if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
             return path;
         }
@@ -16035,6 +16564,8 @@ pub const DB = struct {
             }
             return try alloc.alloc(paths_mod.Path, 0);
         }
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
         return try self.core.graphFindKShortestPaths(
             alloc,
             index_name,
@@ -16150,6 +16681,8 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
         return try self.matchPatternWithNodeAdmission(
             alloc,
             index_name,
@@ -16246,7 +16779,7 @@ pub const DB = struct {
         graph_queries: []const types.NamedGraphQuery,
         input_sets: []const types.NamedGraphInputSet,
     ) ![]types.GraphSearchResult {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         if (req.identity_read_generation == null) {
             for (input_sets) |input_set| {
@@ -16388,7 +16921,7 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         admission_mode: IndexAdmissionMode,
     ) !InstalledIndex {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
             return error.UnsupportedOperation;
@@ -16501,7 +17034,7 @@ pub const DB = struct {
     }
 
     fn finalizeCompletedIndexAdmission(self: *DB, index_name: []const u8) !void {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, index_name);
         defer self.alloc.free(key);
@@ -16657,7 +17190,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
     }
@@ -16667,7 +17200,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
     }
@@ -16678,7 +17211,7 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try self.core.addResolver(cfg);
         }
@@ -16708,7 +17241,7 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         const upsert_result = blk: {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             break :blk try self.core.upsertResolver(cfg);
         };
@@ -16772,7 +17305,7 @@ pub const DB = struct {
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
 
             const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
@@ -16791,7 +17324,7 @@ pub const DB = struct {
         }
 
         {
-            lockApply(self);
+            try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (!try self.core.removeResolver(name)) return false;
         }
@@ -16988,7 +17521,7 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
 
@@ -17087,17 +17620,19 @@ pub const DB = struct {
     }
 
     pub fn hasIndex(self: *DB, name: []const u8) bool {
+        self.lockApplySharedForPortableRuntime() catch return false;
+        defer self.core.unlockApplyShared();
         return self.core.hasIndex(name);
     }
 
     pub fn listIndexes(self: *DB, alloc: Allocator) ![]types.IndexConfig {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listIndexes(alloc);
     }
 
     pub fn listAlgebraicMaterializationStates(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicMaterializationState {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var out = std.ArrayListUnmanaged(types.AlgebraicMaterializationState).empty;
@@ -17137,7 +17672,7 @@ pub const DB = struct {
     }
 
     pub fn listAlgebraicQueryObservations(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicQueryObservation {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var out = std.ArrayListUnmanaged(types.AlgebraicQueryObservation).empty;
@@ -17183,7 +17718,7 @@ pub const DB = struct {
     }
 
     pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.evaluateAlgebraicAdaptiveCandidatesLocked();
     }
@@ -17199,7 +17734,7 @@ pub const DB = struct {
     }
 
     pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const target_sequence = self.core.nextDerivedSequence();
         var changed: u64 = 0;
@@ -17210,7 +17745,7 @@ pub const DB = struct {
     }
 
     pub fn listAlgebraicAdaptiveCandidates(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicAdaptiveCandidate {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var out = std.ArrayListUnmanaged(types.AlgebraicAdaptiveCandidate).empty;
@@ -17263,7 +17798,7 @@ pub const DB = struct {
     }
 
     pub fn listAlgebraicAdaptiveProgress(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicAdaptiveProgress {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var out = std.ArrayListUnmanaged(types.AlgebraicAdaptiveProgress).empty;
@@ -17321,7 +17856,7 @@ pub const DB = struct {
     }
 
     pub fn listDerivedReplayDebt(self: *DB, alloc: Allocator) ![]DerivedReplayDebtStatus {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         return try self.listDerivedReplayDebtAssumeApplyLockHeld(alloc);
@@ -17366,14 +17901,14 @@ pub const DB = struct {
 
     pub fn compactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
     }
@@ -17386,6 +17921,7 @@ pub const DB = struct {
         docs: []const introducer_mod.TextDocument,
     ) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforcePortableRuntimeGate();
         const reservation_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var publication_plan = try self.core.index_manager.planTextKernelPublication(self.alloc, docs, reservation_limit);
         defer publication_plan.deinit();
@@ -17399,7 +17935,7 @@ pub const DB = struct {
                     merge_permit = try runtime.acquireProducerPermit(index_name, planned.estimate.segment_count, planned.estimate.byte_count);
                 }
                 defer if (merge_permit) |*permit| permit.release();
-                lockApply(self);
+                try self.lockApplyForPortableRuntime();
                 const published = self.core.index_manager.indexTextKernelDocuments(index_name, chunk) catch |err| {
                     self.core.unlockApply();
                     return err;
@@ -17416,13 +17952,13 @@ pub const DB = struct {
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
     }
 
     pub fn textIndexLayoutStats(self: *DB, alloc: Allocator, index_name: []const u8) !types.TextIndexLayoutStats {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         const index = self.core.textIndex(index_name) orelse return error.IndexNotFound;
@@ -17465,7 +18001,7 @@ pub const DB = struct {
         text_query: types.TextQuery,
         options: types.TextKernelSearchOptions,
     ) !types.TextKernelResult {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
@@ -17537,7 +18073,7 @@ pub const DB = struct {
         term: []const u8,
         doc_ordinal: u32,
     ) !?index_mod.TextTermStats {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
@@ -17556,7 +18092,7 @@ pub const DB = struct {
         index_name: []const u8,
         text_query: types.TextQuery,
     ) !u32 {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
@@ -17581,25 +18117,25 @@ pub const DB = struct {
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.bestEffortForceCompactTextIndexes();
     }
 
     pub fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.getEnrichment(alloc, kind, name);
     }
 
     pub fn listEnrichments(self: *DB, alloc: Allocator) ![]types.EnrichmentConfig {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
     }
 
     pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listResolvers(alloc);
     }
@@ -17686,7 +18222,7 @@ pub const DB = struct {
     }
 
     pub fn extractEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ExtractEnrichmentsResult {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var cleaned_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -17779,7 +18315,7 @@ pub const DB = struct {
     }
 
     pub fn computeEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ComputeEnrichmentsResult {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
         var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -17883,7 +18419,7 @@ pub const DB = struct {
 
     fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
         self.executor.removeWorker(name);
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         const repair_id = try self.prepareIndexRepairForDeletion(self.alloc, name);
         defer if (repair_id != null) self.endIndexRepairLease(name);
@@ -18012,7 +18548,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
     }
@@ -18021,6 +18557,10 @@ pub const DB = struct {
         return .{
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
+            .portable_import_publication_in_progress = self.core.store.portableImportPublicationInProgress(),
+            .portable_import_recovery_required = self.core.store.portableImportRecoveryRequired(),
+            .portable_runtime_activation_pending = self.async_context.portable_runtime_activation_pending.load(.acquire),
+            .portable_runtime_activation_attempts = self.portable_runtime_activation_attempts.load(.monotonic),
             .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
@@ -18498,9 +19038,34 @@ pub const DB = struct {
         );
     }
 
+    /// Retries a top-level portable catalog activation that failed after the
+    /// durable generation commit. The restore loader rolls partial runtime
+    /// state back on error. Recovery is single-flight: callers never queue a
+    /// second full catalog reload behind one already in progress.
+    pub fn retryPortableRuntimeActivationIfNeeded(self: *DB) !bool {
+        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) return false;
+        if (!self.portable_runtime_activation_mutex.tryLock()) return error.PortableRuntimeActivationPending;
+        defer self.portable_runtime_activation_mutex.unlock();
+        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) return false;
+
+        _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
+        self.loadPortableRuntimeAfterPublication() catch |err| {
+            self.async_context.portable_runtime_activation_pending.store(true, .release);
+            return err;
+        };
+        self.async_context.portable_runtime_activation_pending.store(false, .release);
+        // Session cleanup intentionally leaves maintenance deferred while the
+        // catalog is degraded. Release that deferral only after the restored
+        // runtime is fully usable.
+        resumeDeferredBackgroundMaintenanceIfIdle(self.async_context);
+        self.startQuarantineRetryWorkerIfNeeded();
+        std.log.info("portable runtime activation recovered path={s}", .{self.core.path});
+        return true;
+    }
+
     fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         var more = false;
@@ -18515,6 +19080,8 @@ pub const DB = struct {
 
     const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
     const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
+    const portable_activation_retry_base_ns: u64 = 250 * std.time.ns_per_ms;
+    const portable_activation_retry_max_ns: u64 = 30 * std.time.ns_per_s;
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
     const artifact_repair_metadata_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
@@ -18566,9 +19133,256 @@ pub const DB = struct {
             if (!self.sleepArtifactRepairMetadataWorker(if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns)) return;
             if (self.artifact_repair_metadata_stop.load(.acquire)) return;
             _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
+                if (err == error.PortableRuntimeActivationPending) continue;
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                 continue;
             };
+        }
+    }
+
+    fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
+        self.startPortableActivationRetryWorkerIfNeededInner(false);
+    }
+
+    fn startPortableActivationRetryWorkerIfNeededInner(self: *DB, allow_test_background: bool) void {
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        if (comptime builtin.is_test) {
+            if (!allow_test_background) return;
+        }
+        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) {
+            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+            return;
+        }
+        if (comptime builtin.is_test) {
+            if (allow_test_background and test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
+                test_portable_activation_retry_probe_paused.store(true, .release);
+                while (!test_release_portable_activation_retry_probe.load(.acquire)) std.Thread.yield() catch {};
+            }
+        }
+        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
+        defer self.portable_activation_retry_lifecycle_mutex.unlock();
+        // This lifecycle-owned stop flag is permanent once close begins. A
+        // probe may already have been claimed by the reaper when close disarms
+        // it, so recheck under the same mutex used by stop before launching.
+        if (self.portable_activation_retry_stop.load(.acquire)) {
+            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+            return;
+        }
+        if (self.portable_activation_retry_worker_running.load(.acquire)) {
+            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+            return;
+        }
+        const now_ns = monotonicTimeNs();
+        if (now_ns < self.portable_activation_retry_next_launch_ns) return;
+        if (self.portable_activation_retry_jitter_salt == 0) {
+            const nonce = portable_activation_retry_jitter_nonce.fetchAdd(1, .monotonic);
+            var entropy: [16]u8 = undefined;
+            std.mem.writeInt(u64, entropy[0..8], now_ns, .little);
+            std.mem.writeInt(u64, entropy[8..16], nonce, .little);
+            const path_hash = std.hash.Wyhash.hash(0x5052544143545048, self.core.path);
+            self.portable_activation_retry_jitter_salt = std.hash.Wyhash.hash(path_hash, &entropy) | 1;
+        }
+        self.portable_activation_retry_worker_running.store(true, .release);
+        _ = self.launchPortableActivationRetryWorkerLocked() catch |err| {
+            self.portable_activation_retry_worker_running.store(false, .release);
+            self.portable_activation_retry_launch_failure_streak +|= 1;
+            const retry_delay_ns = portableActivationRetryDelayNs(
+                self.core.path,
+                self.portable_activation_retry_jitter_salt,
+                self.portable_activation_retry_launch_failure_streak - 1,
+            );
+            self.portable_activation_retry_next_launch_ns = now_ns +| retry_delay_ns;
+            self.backend_runtime.armOwnerMaintenanceProbe(self.backend_owner_id, .{
+                .ptr = self,
+                .run = portableActivationRetryMaintenanceProbeMain,
+            }) catch |arm_err| {
+                std.log.warn(
+                    "portable activation retry supervisor arm failed path={s} launch_err={s} arm_err={s}",
+                    .{ self.core.path, @errorName(err), @errorName(arm_err) },
+                );
+                return;
+            };
+            std.log.warn(
+                "portable activation retry launch deferred path={s} err={s} failures={d} next_retry_ms={d}",
+                .{
+                    self.core.path,
+                    @errorName(err),
+                    self.portable_activation_retry_launch_failure_streak,
+                    retry_delay_ns / std.time.ns_per_ms,
+                },
+            );
+            return;
+        };
+        self.portable_activation_retry_launch_failure_streak = 0;
+        self.portable_activation_retry_next_launch_ns = 0;
+        self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+    }
+
+    const PortableActivationRetryLaunch = enum {
+        detached_thread,
+        backend_runtime_fallback,
+    };
+
+    fn spawnPortableActivationRetryThread(self: *DB) !std.Thread {
+        if (comptime builtin.is_test) {
+            if (test_fail_portable_activation_retry_thread_spawn.swap(false, .acq_rel)) {
+                return error.InjectedPortableActivationRetryThreadSpawnFailure;
+            }
+        }
+        return try std.Thread.spawn(.{}, portableActivationRetryWorkerMain, .{self});
+    }
+
+    /// The ordinary worker is detached so every completed generation releases
+    /// its kernel resources immediately. If the process cannot create another
+    /// thread, hand the same bounded-backoff state machine to the runtime's
+    /// owner-scoped maintenance lane; DB.close drains that lane before any
+    /// referenced state is released.
+    fn launchPortableActivationRetryWorkerLocked(self: *DB) !PortableActivationRetryLaunch {
+        std.debug.assert(self.portable_activation_retry_worker_running.load(.acquire));
+        const thread = self.spawnPortableActivationRetryThread() catch |spawn_err| {
+            if (self.backend_runtime.durable_jobs.executesInline()) return spawn_err;
+            if (comptime builtin.is_test) {
+                if (test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel)) {
+                    return error.InjectedPortableActivationRetryFallbackSubmitFailure;
+                }
+            }
+            self.backend_runtime.durable_jobs.submit(.{
+                .owner_id = self.backend_owner_id,
+                .class = .maintenance,
+                .ptr = self,
+                .run = portableActivationRetryDurableJobMain,
+                .deinit = portableActivationRetryDurableJobDeinit,
+            }) catch |fallback_err| {
+                std.log.warn(
+                    "portable activation retry fallback scheduling failed path={s} thread_err={s} fallback_err={s}",
+                    .{ self.core.path, @errorName(spawn_err), @errorName(fallback_err) },
+                );
+                return fallback_err;
+            };
+            std.log.warn(
+                "portable activation retry using backend runtime fallback path={s} thread_err={s}",
+                .{ self.core.path, @errorName(spawn_err) },
+            );
+            return .backend_runtime_fallback;
+        };
+        thread.detach();
+        return .detached_thread;
+    }
+
+    fn portableActivationRetryDurableJobMain(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.portableActivationRetryWorkerMain();
+    }
+
+    fn portableActivationRetryDurableJobDeinit(_: *anyopaque) void {}
+
+    fn portableActivationRetryMaintenanceProbeMain(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.startPortableActivationRetryWorkerIfNeededInner(true);
+    }
+
+    fn finishPortableActivationRetryWorker(self: *DB) void {
+        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
+        self.portable_activation_retry_worker_running.store(false, .release);
+        self.portable_activation_retry_lifecycle_mutex.unlock();
+    }
+
+    fn stopPortableActivationRetryWorker(self: *DB) void {
+        self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
+        self.portable_activation_retry_stop.store(true, .release);
+        self.portable_activation_retry_lifecycle_mutex.unlock();
+
+        // Detached workers and owner-scoped fallbacks both publish completion.
+        // Wait outside the lifecycle mutex so their final handshake cannot
+        // deadlock shutdown. Sleep rather than spin; the worker observes stop
+        // in at most one short retry slice.
+        while (self.portable_activation_retry_worker_running.load(.acquire)) {
+            sleepNs(std.time.ns_per_ms);
+        }
+
+        // Completion is published immediately before the worker releases this
+        // mutex. Reacquiring it is the detached-thread join barrier: after it
+        // succeeds, the worker has made its final access to DB-owned memory.
+        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
+        std.debug.assert(!self.portable_activation_retry_worker_running.load(.acquire));
+        self.portable_activation_retry_lifecycle_mutex.unlock();
+    }
+
+    fn portableActivationRetryDelayNs(path: []const u8, jitter_salt: u64, failure_streak: u32) u64 {
+        const exponent: u6 = @intCast(@min(failure_streak, 7));
+        const nominal = @min(portable_activation_retry_base_ns << exponent, portable_activation_retry_max_ns);
+        // Stable 80-100% jitter desynchronizes restored replicas without ever
+        // exceeding the operator-facing retry cap. Including the DB path keeps
+        // independent databases from marching in lockstep after process start.
+        var streak_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &streak_bytes, failure_streak, .little);
+        const path_hash = std.hash.Wyhash.hash(0x5052544143545259, path);
+        const entropy = std.hash.Wyhash.hash(path_hash ^ jitter_salt, &streak_bytes);
+        const spread = @max(@as(u64, 1), nominal / 5);
+        return nominal - spread + entropy % (spread + 1);
+    }
+
+    fn sleepPortableActivationRetryWorker(self: *DB, target_ns: u64) bool {
+        var slept: u64 = 0;
+        while (slept < target_ns) {
+            if (self.portable_activation_retry_stop.load(.acquire)) return false;
+            const slice = @min(quarantine_retry_sleep_slice_ns, target_ns - slept);
+            sleepNs(slice);
+            slept += slice;
+        }
+        return !self.portable_activation_retry_stop.load(.acquire);
+    }
+
+    fn portableActivationRetryWorkerMain(self: *DB) void {
+        var failure_streak: u32 = 0;
+        while (true) {
+            while (self.async_context.portable_runtime_activation_pending.load(.acquire)) {
+                const delay_ns = portableActivationRetryDelayNs(self.core.path, self.portable_activation_retry_jitter_salt, failure_streak);
+                if (!self.sleepPortableActivationRetryWorker(delay_ns)) {
+                    self.finishPortableActivationRetryWorker();
+                    return;
+                }
+                _ = self.retryPortableRuntimeActivationIfNeeded() catch |err| {
+                    // Contention means an explicit recovery caller owns the single
+                    // flight; it is not another activation failure and must not
+                    // advance backoff or emit a misleading repair warning.
+                    if (err == error.PortableRuntimeActivationPending) continue;
+                    failure_streak +|= 1;
+                    std.log.warn(
+                        "portable runtime activation retry failed path={s} class={s} failures={d} next_retry_ms={d}",
+                        .{
+                            self.core.path,
+                            @errorName(err),
+                            failure_streak,
+                            portableActivationRetryDelayNs(self.core.path, self.portable_activation_retry_jitter_salt, failure_streak) / std.time.ns_per_ms,
+                        },
+                    );
+                    continue;
+                };
+            }
+
+            if (self.portable_activation_retry_stop.load(.acquire)) {
+                self.finishPortableActivationRetryWorker();
+                return;
+            }
+            _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
+            if (self.portable_activation_retry_stop.load(.acquire)) {
+                self.portable_activation_retry_worker_running.store(false, .release);
+                self.portable_activation_retry_lifecycle_mutex.unlock();
+                return;
+            }
+            if (self.async_context.portable_runtime_activation_pending.load(.acquire)) {
+                // A new generation became degraded while start() observed this
+                // handle as live. Keep servicing it instead of stranding the
+                // generation between the old worker's condition check and exit.
+                failure_streak = 0;
+                self.portable_activation_retry_lifecycle_mutex.unlock();
+                continue;
+            }
+            self.portable_activation_retry_worker_running.store(false, .release);
+            self.portable_activation_retry_lifecycle_mutex.unlock();
+            return;
         }
     }
 
@@ -18650,6 +19464,7 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
+        _ = try self.retryPortableRuntimeActivationIfNeeded();
         try self.drainReplayStagesUntilStable();
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
@@ -18707,7 +19522,7 @@ pub const DB = struct {
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
-        lockApply(self);
+        try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.index_manager.runDensePostingMaintenance(.{
             .max_postings_per_index = densePostingIdleMaxPostingsPerIndex(),
@@ -21558,6 +22373,29 @@ pub const DB = struct {
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
         if (self.core.schema != null or self.core.indexCount() != 0) return false;
 
+        // Primary rows can be empty while durable identity tombstones and
+        // forward/reverse mappings remain. Publishing over that state would
+        // combine two identity generations, so validate the catalog first and
+        // then require its pristine cardinalities rather than relying only on
+        // the visible document count.
+        doc_identity.validateStoreAlloc(alloc, self.core.store) catch |err| switch (err) {
+            error.InvalidDocIdentity => return false,
+            else => return err,
+        };
+        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        if (identity_stats.next_ordinal != 1 or
+            identity_stats.allocated_ordinals != 0 or
+            identity_stats.state_rows != 0 or
+            identity_stats.live_ordinals != 0 or
+            identity_stats.tombstone_ordinals != 0 or
+            identity_stats.visibility_chunks != 0 or
+            identity_stats.visibility_deleted_ordinals != 0 or
+            identity_stats.visibility_mask_bytes != 0 or
+            identity_stats.visibility_repair_count != 0)
+        {
+            return false;
+        }
+
         const lower = [_]u8{internal_keys.user_namespace};
         const upper = [_]u8{internal_keys.user_namespace + 1};
         const Probe = struct {
@@ -21590,7 +22428,267 @@ pub const DB = struct {
 
         const public_schema_json = try self.core.getStoreValue(alloc, public_schema_json_key);
         defer if (public_schema_json) |value| alloc.free(value);
-        return public_schema_json == null;
+        if (public_schema_json != null) return false;
+
+        // Report permanent durable disqualification before transient activity
+        // so clients never retry a target that can only be rejected. A pristine
+        // durable store is still unsafe to replace while a caller owns or is
+        // waiting on an in-memory write/projection lease; the authoritative
+        // publication check holds apply-exclusive and closes the final race.
+        if (self.bulk_ingest_coalescer.active or asyncContextHasActiveDenseBulkWork(self.async_context)) return error.WriterLocked;
+        return true;
+    }
+
+    /// Returns whether every durable catalog that participates in a portable
+    /// restore is pristine. Keep this predicate in DB so CLI, C ABI, and
+    /// embedded callers cannot drift into weaker definitions of "empty".
+    pub fn isPortableImportTargetEmpty(self: *DB, alloc: Allocator) !bool {
+        if (self.open_mode == .status_only) {
+            return try self.portableImportTargetEmptyLocked(alloc);
+        }
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.portableImportTargetEmptyLocked(alloc);
+    }
+
+    pub fn portableImportRecoveryRequired(self: *const DB) bool {
+        return self.core.store.portableImportRecoveryRequired();
+    }
+
+    pub const PreparedPortableRuntimeMetadata = struct {
+        alloc: Allocator,
+        runtime_alloc: Allocator,
+        identity_summary: ?doc_identity.VisibilitySummary,
+        schema: ?schema_mod.TableSchema,
+        validator: ?public_table_schema.CompiledTableValidator,
+        recovery: ?db_core.PreparedRecoveryRelationalState,
+        target_identity: doc_identity.Namespace,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.validator) |*validator| validator.deinit(self.alloc);
+            if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+            if (self.recovery) |*recovery| recovery.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const PortableGenerationPublication = enum {
+        complete,
+        durability_unknown,
+    };
+
+    /// Allocates every schema-dependent runtime object before a durable
+    /// generation swap. Applying this object is deliberately infallible.
+    pub fn preparePortableRuntimeMetadata(
+        self: *DB,
+        source_store: *docstore_mod.DocStore,
+        target_identity: doc_identity.Namespace,
+    ) !PreparedPortableRuntimeMetadata {
+        const identity_summary = try doc_identity.visibilitySummaryFromStore(source_store);
+        const restored_schema = try schema_mod.loadSchema(source_store, self.alloc);
+        var restored_schema_owned = true;
+        defer if (restored_schema_owned) if (restored_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+
+        var compiled_validator: ?public_table_schema.CompiledTableValidator = null;
+        if (restored_schema) |runtime_schema| {
+            if (runtime_schema.storage_mode == .relational) {
+                const schema_json = source_store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (schema_json) |value| self.alloc.free(value);
+                if (schema_json) |value| compiled_validator = try public_table_schema.CompiledTableValidator.init(self.alloc, value);
+            }
+        }
+        var compiled_validator_owned = compiled_validator != null;
+        defer if (compiled_validator_owned) compiled_validator.?.deinit(self.alloc);
+        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+            try db_core.PreparedRecoveryRelationalState.init(
+                self.runtime_alloc,
+                if (restored_schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
+            )
+        else
+            null;
+        defer if (prepared_recovery) |*prepared| prepared.deinit();
+
+        const result = PreparedPortableRuntimeMetadata{
+            .alloc = self.alloc,
+            .runtime_alloc = self.runtime_alloc,
+            .identity_summary = identity_summary,
+            .schema = restored_schema,
+            .validator = compiled_validator,
+            .recovery = prepared_recovery,
+            .target_identity = target_identity,
+        };
+        restored_schema_owned = false;
+        compiled_validator_owned = false;
+        prepared_recovery = null;
+        return result;
+    }
+
+    fn applyPreparedPortableRuntimeMetadataLocked(self: *DB, prepared: *PreparedPortableRuntimeMetadata) void {
+        std.debug.assert(prepared.alloc.ptr == self.alloc.ptr and prepared.alloc.vtable == self.alloc.vtable);
+        std.debug.assert(prepared.runtime_alloc.ptr == self.runtime_alloc.ptr and prepared.runtime_alloc.vtable == self.runtime_alloc.vtable);
+        self.clearBulkIngestIdentityAllNewLocked();
+        self.identity_visibility_summary_cache = prepared.identity_summary;
+        self.clearLiveDocSetCache();
+        self.clearNonVisibleDocSetCache();
+        self.clearRelationalSchemaValidatorLocked(true);
+        if (prepared.validator) |validator| {
+            self.relational_schema_validator = validator;
+            prepared.validator = null;
+        }
+        self.core.replaceSchemaOwned(prepared.schema);
+        prepared.schema = null;
+        self.core.identity_namespace = prepared.target_identity;
+        if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(prepared.target_identity);
+        self.publishRelationalRuntimeModePrepared(if (prepared.recovery) |*recovery| recovery else null);
+    }
+
+    fn loadPortableRuntimeAfterPublicationLocked(self: *DB) !void {
+        try self.core.loadIndexesForRestore();
+        if (builtin.is_test and test_fail_portable_index_activation) {
+            test_fail_portable_index_activation = false;
+            return error.InjectedPortableIndexActivationFailure;
+        }
+    }
+
+    /// Rebind the catalog while writes are excluded, but perform blocking
+    /// worker joins and starts outside that lock. Resolver append callbacks
+    /// take the apply lock, so joining under it can deadlock shutdown.
+    fn loadPortableRuntimeAfterPublication(self: *DB) !void {
+        // Reuse the live-catalog publication barrier so lock-free published
+        // dense readers and every structural mutation retire before reset.
+        // Acquire it before apply: its runtime drains may themselves need apply.
+        var structural_guard = self.beginIndexStructuralMutation("portable runtime activation", "*");
+        defer structural_guard.deinit();
+        self.stopResolverReplayRuntimes();
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.loadPortableRuntimeAfterPublicationLocked();
+        }
+        try self.startResolverReplayRuntimesIfConfigured();
+    }
+
+    fn activatePortableIndexesAfterPublication(self: *DB) void {
+        lockAtomic(&self.portable_runtime_activation_mutex);
+        defer self.portable_runtime_activation_mutex.unlock();
+        _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
+        const activation_result: anyerror!void = self.loadPortableRuntimeAfterPublication();
+        activation_result catch |err| {
+            self.async_context.portable_runtime_activation_pending.store(true, .release);
+            std.log.err("portable generation published but live index activation is degraded path={s} class={s}", .{ self.core.path, @errorName(err) });
+            self.startPortableActivationRetryWorkerIfNeeded();
+            return;
+        };
+        self.async_context.portable_runtime_activation_pending.store(false, .release);
+        resumeDeferredBackgroundMaintenanceIfIdle(self.async_context);
+        self.startQuarantineRetryWorkerIfNeeded();
+    }
+
+    fn refreshPortableImportedGenerationLocked(
+        self: *DB,
+        target_identity: doc_identity.Namespace,
+    ) !void {
+        var prepared = try self.preparePortableRuntimeMetadata(self.core.store, target_identity);
+        defer prepared.deinit();
+        self.applyPreparedPortableRuntimeMetadataLocked(&prepared);
+        try self.core.loadIndexesForRestore();
+    }
+
+    /// Imports directly into a disposable, unpublished DB generation. Portable
+    /// blocks are already bounded to small store transactions, so this avoids
+    /// both an archive-sized pending transaction and an equally large scratch
+    /// LSM. On any failure the owner must discard the generation.
+    pub fn importPortableIntoUnpublishedEmpty(
+        self: *DB,
+        alloc: Allocator,
+        backup: []const u8,
+        target_identity: doc_identity.Namespace,
+    ) !void {
+        if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try portable_backup.importPortableWithOptions(alloc, self.core.store, backup, .{
+            .identity_namespace = target_identity,
+            .prefer_existing_identity_namespace = true,
+        });
+        portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        try doc_identity.reassignNamespaceAlloc(alloc, self.core.store, target_identity);
+        try self.refreshPortableImportedGenerationLocked(target_identity);
+    }
+
+    /// File-backed variant for CLI restore paths. Portable decoding uses
+    /// bounded positional reads over a locked source generation, so archive
+    /// size does not become resident memory.
+    pub fn importPortableFileIntoUnpublishedEmpty(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        file: std.Io.File,
+        file_size: u64,
+        target_identity: doc_identity.Namespace,
+    ) !void {
+        if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
+            .identity_namespace = target_identity,
+            .prefer_existing_identity_namespace = true,
+        });
+        portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        try doc_identity.reassignNamespaceAlloc(alloc, self.core.store, target_identity);
+        try self.refreshPortableImportedGenerationLocked(target_identity);
+    }
+
+    /// Atomically adopts a prepared portable generation into a pristine live
+    /// DB. The caller-provided publication step runs under the same exclusive
+    /// apply fence as the final emptiness check, closing the build-time race
+    /// with concurrent writers before runtime metadata is refreshed.
+    pub fn adoptPreparedPortableGenerationIfEmpty(
+        self: *DB,
+        alloc: Allocator,
+        prepared_runtime: *PreparedPortableRuntimeMetadata,
+        context: anytype,
+        comptime adopt: anytype,
+    ) !void {
+        if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+        lockApply(self);
+        var apply_locked = true;
+        defer if (apply_locked) self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try self.core.store.beginPortableImportPublication();
+        var publication_fenced = true;
+        defer if (publication_fenced) self.core.store.finishPortableImportPublication();
+        const publication = try adopt(context);
+        self.applyPreparedPortableRuntimeMetadataLocked(prepared_runtime);
+        // The durable generation and its schema now agree. Lock-free point
+        // reads may resume; index-bearing operations remain behind the
+        // activation gate while catalog workers are rebound.
+        self.core.store.finishPortableImportPublication();
+        publication_fenced = false;
+        // Keep index-bearing operations closed while activation temporarily
+        // releases the apply lock to join and restart resolver workers.
+        self.async_context.portable_runtime_activation_pending.store(true, .release);
+        self.core.unlockApply();
+        apply_locked = false;
+        // The rename above is the commit point. Index artifacts were fully
+        // finalized in the disposable generation; a host-level allocation or
+        // descriptor failure while rebinding the live catalog is degraded
+        // runtime state, not a retryable import failure.
+        self.activatePortableIndexesAfterPublication();
+        if (publication == .durability_unknown) return error.DurabilityOutcomeUnknown;
     }
 
     /// Publish a portable archive into a pristine live DB as one store
@@ -21604,9 +22702,14 @@ pub const DB = struct {
         target_identity: doc_identity.Namespace,
     ) !void {
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
-        var stage = try portable_backup.PortableImportStage.init(alloc, backup, .{});
+        var stage = try PortableImportStage.init(alloc, self.core.path, backup, .{});
         defer stage.deinit();
+        portable_backup.validateCompleteDatabaseImageAlloc(alloc, &stage.store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
         try stage.reassignIdentityNamespace(alloc, target_identity);
+        const staged_identity_summary = try doc_identity.visibilitySummaryFromStore(&stage.store);
 
         const staged_schema = try schema_mod.loadSchema(&stage.store, self.alloc);
         var staged_schema_owned = true;
@@ -21634,9 +22737,18 @@ pub const DB = struct {
         defer if (prepared_recovery) |*prepared| prepared.deinit();
 
         lockApply(self);
-        defer self.core.unlockApply();
+        var apply_locked = true;
+        defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try self.core.store.beginPortableImportPublication();
+        var publication_fenced = true;
+        defer if (publication_fenced) self.core.store.finishPortableImportPublication();
         try stage.publish(self.core.store);
+
+        self.clearBulkIngestIdentityAllNewLocked();
+        self.identity_visibility_summary_cache = staged_identity_summary;
+        self.clearLiveDocSetCache();
+        self.clearNonVisibleDocSetCache();
 
         self.clearRelationalSchemaValidatorLocked(true);
         if (compiled_validator) |validator| {
@@ -21648,7 +22760,12 @@ pub const DB = struct {
         self.core.identity_namespace = target_identity;
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(target_identity);
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
-        try self.core.loadIndexes();
+        self.core.store.finishPortableImportPublication();
+        publication_fenced = false;
+        self.async_context.portable_runtime_activation_pending.store(true, .release);
+        self.core.unlockApply();
+        apply_locked = false;
+        self.activatePortableIndexesAfterPublication();
     }
 
     /// Refresh every schema-dependent runtime view after a portable restore
@@ -22846,6 +23963,9 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        // Keep degraded requests out of catalog/apply lock queues. Revalidate
+        // after admission below to close publication's check-to-use race.
+        try self.enforcePortableRuntimeGate();
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var generation_ns: u64 = 0;
@@ -22855,6 +23975,10 @@ pub const DB = struct {
         const search_access = self.beginDenseSearchAccess(req);
         if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
         defer self.endDenseSearchAccess(search_access);
+        // beginDenseSearchAccess either owns apply-shared or a catalog lease
+        // drained by portable activation. Validate only after that ownership is
+        // established so publication cannot slip between the check and use.
+        try self.enforcePortableRuntimeGate();
         const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
@@ -23665,7 +24789,7 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
             .ctx = self,
@@ -23703,7 +24827,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
     }
@@ -23751,7 +24875,7 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
@@ -23765,7 +24889,7 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
@@ -24291,8 +25415,13 @@ pub const DB = struct {
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        try self.enforcePortableRuntimeGate();
         const search_access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(search_access);
+        // Publication can begin after the optimistic retry above. Validate
+        // only after owning apply-shared or the published-catalog reader lease
+        // so the profiled API has the same generation guarantee as search().
+        try self.enforcePortableRuntimeGate();
         return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
     }
 
@@ -25361,7 +26490,7 @@ pub const DB = struct {
         index_name: []const u8,
         keys: []const []const u8,
     ) ![]bool {
-        lockApplyShared(self);
+        try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         const graph_entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         return try graph_entry.index.hasIncomingEdgesManyAlloc(alloc, keys);
@@ -26914,6 +28043,12 @@ fn relationalColumns(self: *const DB) ?[]const schema_mod.RelationalColumn {
 }
 
 fn encodeStoreLookupKeyAlloc(self: *const DB, alloc: Allocator, key: []const u8) ![]u8 {
+    // Point reads deliberately avoid the global apply lock. Fence before
+    // consulting the runtime schema so a native generation swap cannot encode
+    // a lookup with the old keyspace and execute it against the new store.
+    if (self.core.store.portableImportPublicationInProgress()) {
+        return error.PortableImportPublicationInProgress;
+    }
     if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key)) {
         return try alloc.dupe(u8, key);
     }
@@ -34377,7 +35512,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
-    ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeContext(ctx);
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
 
@@ -34540,7 +35675,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     } else {
         if (syncLevelRequiresDerivedVisibility(sync_level)) {
-            ctx.apply_mutex.lockExclusive();
+            try lockApplyForPortableRuntimeContext(ctx);
             defer ctx.apply_mutex.unlockExclusive();
             if (sync_level == .full_text) {
                 try applyDerivedBatchTargetsContext(ctx, derived_batch, sync_targets.full_text_indexes);
@@ -34590,7 +35725,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
-    ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeContext(ctx);
     defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
@@ -34602,6 +35737,9 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
 }
 
 fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
+    try lockApplyForPortableRuntimeContext(ctx);
+    defer ctx.apply_mutex.unlockExclusive();
+
     var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
     defer decoded.deinit();
 
@@ -34636,6 +35774,32 @@ fn encodeChangeRecordPayloadWithTargetHints(
 fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
     const configured = gate orelse return;
     try configured.check();
+}
+
+fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
+    const configured = pending orelse return;
+    if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
+}
+
+fn lockApplyForPortableRuntimeContext(ctx: *const BatchExecutionContext) !void {
+    try enforcePortableRuntimeGateOptional(ctx.portable_runtime_activation_pending);
+    ctx.apply_mutex.lockExclusive();
+    errdefer ctx.apply_mutex.unlockExclusive();
+    try enforcePortableRuntimeGateOptional(ctx.portable_runtime_activation_pending);
+}
+
+fn lockApplySharedForPortableRuntimeAsync(ctx: *const AsyncContext) !void {
+    try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
+    ctx.apply_mutex.lockShared();
+    errdefer ctx.apply_mutex.unlockShared();
+    try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
+}
+
+fn lockApplyForPortableRuntimeAsync(ctx: *const AsyncContext) !void {
+    try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
+    ctx.apply_mutex.lockExclusive();
+    errdefer ctx.apply_mutex.unlockExclusive();
+    try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
 }
 
 fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationBarrier {
@@ -35308,10 +36472,15 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
     return true;
 }
 
-fn finishDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) void {
+fn finishDenseCatchUpSessionTrackingOnly(ctx: *AsyncContext, index_name: []const u8) bool {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     const finished = finishDenseCatchUpSessionLocked(ctx, index_name);
     session_lock.unlock();
+    return finished;
+}
+
+fn finishDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) void {
+    const finished = finishDenseCatchUpSessionTrackingOnly(ctx, index_name);
     if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
 }
 
@@ -35386,10 +36555,15 @@ fn finishExternalDenseBulkSessionLocked(ctx: *AsyncContext) bool {
     return true;
 }
 
-fn finishExternalDenseBulkSessionTracked(ctx: *AsyncContext) void {
+fn finishExternalDenseBulkSessionTrackingOnly(ctx: *AsyncContext) bool {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     const finished = finishExternalDenseBulkSessionLocked(ctx);
     session_lock.unlock();
+    return finished;
+}
+
+fn finishExternalDenseBulkSessionTracked(ctx: *AsyncContext) void {
+    const finished = finishExternalDenseBulkSessionTrackingOnly(ctx);
     if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
 }
 
@@ -35397,7 +36571,13 @@ fn finishDenseCatchUpSessionTrackedAndFinalize(ctx: *AsyncContext, index_name: [
     var finished = false;
     errdefer if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
     const completed = blk: {
-        ctx.apply_mutex.lockShared();
+        lockApplySharedForPortableRuntimeAsync(ctx) catch |err| {
+            // Tracking is process-local lifecycle state, not restored-catalog
+            // state. Always release it even when catalog finalization must wait
+            // for activation recovery.
+            _ = finishDenseCatchUpSessionTrackingOnly(ctx, index_name);
+            return err;
+        };
         defer ctx.apply_mutex.unlockShared();
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
         finished = finishDenseCatchUpSessionLocked(ctx, index_name);
@@ -35415,7 +36595,10 @@ fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
     var finished = false;
     errdefer if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
     const completed = blk: {
-        ctx.apply_mutex.lockShared();
+        lockApplySharedForPortableRuntimeAsync(ctx) catch |err| {
+            _ = finishExternalDenseBulkSessionTrackingOnly(ctx);
+            return err;
+        };
         defer ctx.apply_mutex.unlockShared();
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
         finished = finishExternalDenseBulkSessionLocked(ctx);
@@ -35431,6 +36614,10 @@ fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
 
 fn finishDenseCatchUpSessionTrackedBestEffort(ctx: *AsyncContext, index_name: []const u8) void {
     const completed = finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_name) catch |err| {
+        // The tracking lease was released before this error. Activation owns
+        // catalog recovery and status reporting, so do not manufacture an
+        // unrelated index-repair incident for an expected degraded window.
+        if (err == error.PortableRuntimeActivationPending) return;
         std.log.err("dense catch-up idle finalization failed index={s} error={s}", .{ index_name, @errorName(err) });
         DB.notifyQueryVisibilityHook(ctx, .index_repair_pending);
         return;
@@ -35440,6 +36627,7 @@ fn finishDenseCatchUpSessionTrackedBestEffort(ctx: *AsyncContext, index_name: []
 
 fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
     const completed = finishExternalDenseBulkSessionTrackedAndFinalize(ctx) catch |err| {
+        if (err == error.PortableRuntimeActivationPending) return;
         std.log.err("dense external bulk idle finalization failed error={s}", .{@errorName(err)});
         DB.notifyQueryVisibilityHook(ctx, .index_repair_pending);
         return;
@@ -35737,6 +36925,45 @@ test "async context dense catch-up session finish is idempotent when already clo
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 }
 
+test "portable activation failure still releases dense session bookkeeping" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    try beginDenseCatchUpSessionTracked(&ctx, "vec");
+    ctx.portable_runtime_activation_pending.store(true, .release);
+    try std.testing.expectError(
+        error.PortableRuntimeActivationPending,
+        finishDenseCatchUpSessionTrackedAndFinalize(&ctx, "vec"),
+    );
+    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.acquire));
+    try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
+    try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
+
+    ctx.portable_runtime_activation_pending.store(false, .release);
+    resumeDeferredBackgroundMaintenanceIfIdle(&ctx);
+    try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
+
+    try beginExternalDenseBulkSessionTracked(&ctx);
+    ctx.portable_runtime_activation_pending.store(true, .release);
+    try std.testing.expectError(
+        error.PortableRuntimeActivationPending,
+        finishExternalDenseBulkSessionTrackedAndFinalize(&ctx),
+    );
+    try std.testing.expectEqual(@as(u32, 0), ctx.active_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
+
+    ctx.portable_runtime_activation_pending.store(false, .release);
+    resumeDeferredBackgroundMaintenanceIfIdle(&ctx);
+    try std.testing.expect(!asyncContextHasActiveDenseBulkWork(&ctx));
+    try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
+}
+
 test "dense target advance is not blocked by local catch-up session" {
     const alloc = std.testing.allocator;
 
@@ -35879,6 +37106,8 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
 
     var applied_batch = batch;
     applied_batch.sequence = sequence;
+    try lockApplyForPortableRuntimeContext(&batch_ctx);
+    defer batch_ctx.apply_mutex.unlockExclusive();
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
 }
@@ -35938,7 +37167,7 @@ fn publishResolutionHandoffContextWithSink(
     // resolution writer still owns the HA mutation lease; the final gate check
     // makes marker publication linearizable with a primary-role fence, while a
     // single metadata batch preserves backfill throughput.
-    ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeContext(ctx);
     defer ctx.apply_mutex.unlockExclusive();
     const transition_mutex = haTransitionMutexFromContext(ctx);
     if (transition_mutex) |mutex| lockAtomic(mutex);
@@ -36164,7 +37393,7 @@ fn appendResolutionRecordWithHook(
         store_writes[i] = .{ .key = artifact.key, .value = artifact.value };
     }
 
-    batch_ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeContext(&batch_ctx);
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) batch_ctx.apply_mutex.unlockExclusive();
     const sequence = batch_ctx.store.reserveNextReplaySequence(1);
@@ -36197,6 +37426,8 @@ fn appendResolutionRecordWithHook(
 
     var applied_batch = write.batch;
     applied_batch.sequence = sequence;
+    try lockApplyForPortableRuntimeContext(&batch_ctx);
+    defer batch_ctx.apply_mutex.unlockExclusive();
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
 }
@@ -36866,7 +38097,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     var replay_batch = batch;
     replay_batch.deleted_keys = replay_deleted_keys;
 
-    batch_ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeContext(&batch_ctx);
     const sequence = blk: {
         defer batch_ctx.apply_mutex.unlockExclusive();
         const reserved_sequence = batch_ctx.store.reserveNextReplaySequence(1);
@@ -36913,6 +38144,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
 
     var applied_batch = replay_batch;
     applied_batch.sequence = sequence;
+    try lockApplyForPortableRuntimeContext(&batch_ctx);
+    defer batch_ctx.apply_mutex.unlockExclusive();
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
 }
@@ -42852,7 +44085,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     try self.core.finalizeSplitState();
     try self.refreshManagedIndexWorkersLocked();
-    try self.closeShadowIndexManager();
+    try self.closeShadowIndexManagerLocked();
     try self.refreshManagedIndexWorkersLocked();
 }
 
@@ -43119,6 +44352,162 @@ fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
     return error.PathAlreadyExists;
 }
 
+const PortableImportStageLocation = struct {
+    path: []u8,
+    lease_file: std.Io.File,
+};
+
+fn createUniquePortableImportStageBase(alloc: Allocator, target_path: []const u8) !PortableImportStageLocation {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedOperation;
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const parent = std.fs.path.dirname(target_path) orelse ".";
+    const target_name = std.fs.path.basename(target_path);
+    try fs_paths.createDirPathPortable(io, parent);
+    scavengePortableImportStages(alloc, io, parent, target_name) catch |err| {
+        // Cleanup is opportunistic and must never make a valid restore
+        // unavailable. Locked/unknown entries remain untouched.
+        std.log.warn("portable restore scratch scavenging failed parent={s} class={s}", .{ parent, @errorName(err) });
+    };
+
+    for (0..64) |_| {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.portable-import-{d}-{x}", .{
+            parent,
+            if (target_name.len == 0) "antfly" else target_name,
+            monotonicTimeNs(),
+            portable_import_stage_nonce.fetchAdd(1, .monotonic),
+        });
+        errdefer alloc.free(candidate);
+        var lease_file = acquirePortableImportStageLease(alloc, candidate) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        var lease_open = true;
+        var lease_owned = true;
+        errdefer if (lease_owned) {
+            if (lease_open) lease_file.close(io);
+            deletePortableImportStageLease(alloc, io, candidate) catch {};
+        };
+        if (builtin.is_test and test_fail_portable_import_stage_directory_creation) {
+            test_fail_portable_import_stage_directory_creation = false;
+            return error.InjectedPortableImportStageDirectoryCreationFailure;
+        }
+        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                lease_file.close(io);
+                lease_open = false;
+                deletePortableImportStageLease(alloc, io, candidate) catch {};
+                lease_owned = false;
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer {
+            std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
+        }
+        try fs_paths.syncDirPortable(io, parent);
+        lease_open = false;
+        lease_owned = false;
+        return .{ .path = candidate, .lease_file = lease_file };
+    }
+    return error.PathAlreadyExists;
+}
+
+fn portableImportStageLeasePathAlloc(alloc: Allocator, stage_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ stage_path, portable_import_stage_lease_suffix });
+}
+
+fn acquirePortableImportStageLease(alloc: Allocator, stage_path: []const u8) !std.Io.File {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const lease_path = try portableImportStageLeasePathAlloc(alloc, stage_path);
+    defer alloc.free(lease_path);
+    var file = try std.Io.Dir.cwd().createFile(io, lease_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    errdefer file.close(io);
+    try file.writePositionalAll(io, portable_import_stage_lease_magic, 0);
+    try file.sync(io);
+    return file;
+}
+
+fn deletePortableImportStageLease(alloc: Allocator, io: Io, stage_path: []const u8) !void {
+    const lease_path = try portableImportStageLeasePathAlloc(alloc, stage_path);
+    defer alloc.free(lease_path);
+    std.Io.Dir.cwd().deleteFile(io, lease_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn scavengePortableImportStages(
+    alloc: Allocator,
+    io: Io,
+    parent: []const u8,
+    target_name: []const u8,
+) !void {
+    const prefix = try std.fmt.allocPrint(alloc, ".{s}.portable-import-", .{
+        if (target_name.len == 0) "antfly" else target_name,
+    });
+    defer alloc.free(prefix);
+
+    var dir = try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterateAssumeFirstIteration();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix) or
+            !std.mem.endsWith(u8, entry.name, portable_import_stage_lease_suffix)) continue;
+
+        const lease_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ parent, entry.name });
+        defer alloc.free(lease_path);
+        var lease = std.Io.Dir.cwd().openFile(io, lease_path, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            // Darwin reports a contended advisory lock as AccessDenied while
+            // other platforms commonly use FileBusy. Both mean the lease is
+            // live and must be left alone.
+            error.AccessDenied, error.FileBusy, error.WouldBlock, error.FileLocksUnsupported, error.FileNotFound => continue,
+            else => return err,
+        };
+        var lease_open = true;
+        defer if (lease_open) lease.close(io);
+
+        const lease_stat = lease.stat(io) catch continue;
+        if (lease_stat.size != portable_import_stage_lease_magic.len) continue;
+        var magic: [portable_import_stage_lease_magic.len]u8 = undefined;
+        _ = lease.readPositionalAll(io, &magic, 0) catch continue;
+        if (!std.mem.eql(u8, &magic, portable_import_stage_lease_magic)) continue;
+
+        const stage_name = entry.name[0 .. entry.name.len - portable_import_stage_lease_suffix.len];
+        const stage_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ parent, stage_name });
+        defer alloc.free(stage_path);
+        // deleteTree is idempotent when the directory is absent, which also
+        // covers a crash after the durable lease but before directory creation.
+        try std.Io.Dir.cwd().deleteTree(io, stage_path);
+        lease.close(io);
+        lease_open = false;
+        std.Io.Dir.cwd().deleteFile(io, lease_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        std.log.info("removed abandoned portable restore scratch path={s}", .{stage_path});
+    }
+}
+
 fn resetPath(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -43180,7 +44569,14 @@ fn beginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager
     if (index_ref.kind != .dense_vector) return;
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
-    try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
+    // Register the process-local lease under a stable catalog generation. Once
+    // visible, portable publication's final emptiness check rejects the swap;
+    // the lock is not held across index startup or any blocking replay work.
+    {
+        try lockApplySharedForPortableRuntimeAsync(ctx);
+        defer ctx.apply_mutex.unlockShared();
+        try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
+    }
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
     try beginDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
     errdefer abortDenseStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
@@ -43358,7 +44754,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
     if (index_ref.kind != .dense_vector) return true;
 
-    ctx.apply_mutex.lockExclusive();
+    try lockApplyForPortableRuntimeAsync(ctx);
     defer ctx.apply_mutex.unlockExclusive();
 
     const entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
@@ -44234,7 +45630,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
 }
 
 fn finalizeCoveredDenseProjectionCheckpointsIfIdle(ctx: *AsyncContext) !bool {
-    ctx.apply_mutex.lockShared();
+    try lockApplySharedForPortableRuntimeAsync(ctx);
     defer ctx.apply_mutex.unlockShared();
 
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
@@ -44324,7 +45720,7 @@ fn flushFinishedDenseAppliedSequenceLocked(
     // parallel while catalog replacement's exclusive lease cannot retire a
     // backend underneath this durability boundary.
     const save_ns = blk: {
-        ctx.apply_mutex.lockShared();
+        try lockApplySharedForPortableRuntimeAsync(ctx);
         defer ctx.apply_mutex.unlockShared();
         const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
             .index_name = pending.owned_name,
@@ -44385,7 +45781,7 @@ fn flushPendingAppliedSequencesLocked(
     // index generation. Shared holders may proceed concurrently; index
     // replacement and teardown require the exclusive lease.
     const save_ns = blk: {
-        ctx.apply_mutex.lockShared();
+        try lockApplySharedForPortableRuntimeAsync(ctx);
         defer ctx.apply_mutex.unlockShared();
         try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
@@ -46811,6 +48207,54 @@ test "db relational mode stores authoritative packed rows across reopen scan and
     }
 }
 
+test "db relational ttl cleanup preserves physical mode across reopen" {
+    const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = std.time.ns_per_s;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(.{
+            .version = 1,
+            .storage_mode = .relational,
+            .ttl_duration_ns = ttl_duration_ns,
+            .relational_columns = &.{.{
+                .name = "title",
+                .path = "title",
+                .column_type = .string,
+                .required = true,
+            }},
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "row:expired", .value = "{\"title\":\"expired\"}" }},
+            .timestamp_ns = currentTimeNs() - 2 * ttl_duration_ns,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
+    try initStoppedTtlRuntimeForTest(&reopened, ttl_cfg);
+    try std.testing.expect(reopened.ttl_cleanup_context.?.batch.relational_base_rows);
+    try reopened.ttl_runtime.?.runOnce();
+
+    try std.testing.expect((try reopened.get(alloc, "row:expired")) == null);
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:expired");
+    defer alloc.free(row_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, row_key));
+    const stats = try reopened.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+}
+
 test "db portable relational restore refreshes open runtime before returning" {
     const alloc = std.testing.allocator;
     var source_buf: [256]u8 = undefined;
@@ -46838,16 +48282,1169 @@ test "db portable relational restore refreshes open runtime before returning" {
 
     var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_index_workers = false });
     defer target.close();
-    try portable_backup.importPortable(alloc, target.core.store, portable.items);
-    try target.reloadSchemaForInternalRestore();
+    target.identity_visibility_summary_cache = .{
+        .live_ordinals = 99,
+        .tombstone_ordinals = 7,
+        .max_created_generation = 999,
+    };
+    target.live_doc_set_cache_generation = 999;
+    target.nonvisible_doc_set_cache_generation = 999;
+    target.nonvisible_doc_set_cache_overflow = true;
+    target.nonvisible_doc_set_cache_entries.store(7, .monotonic);
+    try target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace);
 
     const restored = (try target.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"active\"}", restored);
+    const restored_summary = target.identity_visibility_summary_cache orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), restored_summary.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), restored_summary.tombstone_ordinals);
+    try std.testing.expectEqual(@as(?u64, null), target.live_doc_set_cache_generation);
+    try std.testing.expectEqual(@as(?u64, null), target.nonvisible_doc_set_cache_generation);
+    try std.testing.expect(!target.nonvisible_doc_set_cache_overflow);
+    try std.testing.expectEqual(@as(u64, 0), target.nonvisible_doc_set_cache_entries.load(.monotonic));
     try std.testing.expectError(error.InvalidBatchRequest, target.batch(.{ .writes = &.{.{
         .key = "row:invalid",
         .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
     }} }));
+}
+
+test "db open recovers incomplete bounded portable publication before runtime load" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer interrupted.close();
+        try interrupted.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try interrupted.core.store.put(portable_import_in_progress_key, portable_import_marker_publishing);
+        const partial_key = try internal_keys.documentKeyAlloc(alloc, "doc:partial-generation");
+        defer alloc.free(partial_key);
+        try interrupted.core.store.put(partial_key, "partial-generation-value");
+        try interrupted.core.store.sync(true);
+    }
+
+    try std.testing.expectError(
+        error.IncompletePortableImport,
+        DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_optional_runtimes = false,
+        }),
+    );
+
+    var recovered = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer recovered.close();
+    try std.testing.expectError(error.NotFound, recovered.core.store.get(alloc, portable_import_in_progress_key));
+    const partial_key = try internal_keys.documentKeyAlloc(alloc, "doc:partial-generation");
+    defer alloc.free(partial_key);
+    try std.testing.expectError(error.NotFound, recovered.core.store.get(alloc, partial_key));
+    const preserved_range = try recovered.core.store.get(alloc, range_state_mod.range_key);
+    defer alloc.free(preserved_range);
+    const expected_range = try range_state_mod.encodeRangeAlloc(alloc, .{ .start = "doc:a", .end = "doc:z" });
+    defer alloc.free(expected_range);
+    try std.testing.expectEqualSlices(u8, expected_range, preserved_range);
+    try std.testing.expect(try recovered.isPortableImportTargetEmpty(alloc));
+}
+
+test "db portable import target rejects active in-memory bulk leases" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expectError(error.WriterLocked, db.isPortableImportTargetEmpty(alloc));
+    db.abortPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.beginBulkIngestSession());
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expect(!db.bulk_ingest_coalescer.active);
+    db.async_context.portable_runtime_activation_pending.store(false, .release);
+
+    try db.beginBulkIngestSession();
+    try std.testing.expectError(error.WriterLocked, db.isPortableImportTargetEmpty(alloc));
+    db.abortBulkIngestSession();
+    try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
+
+    try db.batch(.{ .writes = &.{.{
+        .key = "doc:durable-target-state",
+        .value = "{\"title\":\"permanently nonempty\"}",
+    }} });
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    defer db.abortPrimaryStoreAutoBulkIngestSession();
+    // Permanent target state takes precedence over transient activity so API
+    // clients receive invalid_argument rather than entering a futile retry loop.
+    try std.testing.expect(!(try db.isPortableImportTargetEmpty(alloc)));
+}
+
+test "db portable publication rollback preserves target routing metadata" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_optional_runtimes = false });
+        defer source.close();
+        try source.batch(.{ .writes = &.{.{
+            .key = "doc:portable-rollback",
+            .value = "{\"title\":\"must be rolled back\"}",
+        }} });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+    defer target.close();
+    const target_identity: doc_identity.Namespace = .{ .table_id = 41, .shard_id = 7, .range_id = 3 };
+    try target.reassignIdentityNamespaceForInternalTransition(target_identity);
+    try target.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+    const range_before = try target.core.store.get(alloc, range_state_mod.range_key);
+    defer alloc.free(range_before);
+
+    failNextPortableImportPublishForTest();
+    try std.testing.expectError(
+        error.InjectedPortableImportPublishFailure,
+        target.importPortableIntoEmpty(alloc, portable.items, target_identity),
+    );
+    try std.testing.expect(!target.portableImportRecoveryRequired());
+    try std.testing.expect(!target.pendingWorkStats().portable_import_publication_in_progress);
+    try std.testing.expect((try target.get(alloc, "doc:portable-rollback")) == null);
+    const range_after = try target.core.store.get(alloc, range_state_mod.range_key);
+    defer alloc.free(range_after);
+    try std.testing.expectEqualSlices(u8, range_before, range_after);
+    const identity_after = (try doc_identity.loadNamespaceFromStore(target.core.store)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(identity_after.eql(target_identity));
+}
+
+test "db portable committed sync failure retains rollback authority" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_optional_runtimes = false });
+        defer source.close();
+        try source.batch(.{ .writes = &.{.{
+            .key = "doc:portable-commit-sync",
+            .value = "{\"title\":\"must be rolled back\"}",
+        }} });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+    defer target.close();
+    const target_identity: doc_identity.Namespace = .{ .table_id = 43, .shard_id = 11, .range_id = 5 };
+    try target.reassignIdentityNamespaceForInternalTransition(target_identity);
+    try target.updateRange(.{ .start = "doc:b", .end = "doc:y" });
+    const range_before = try target.core.store.get(alloc, range_state_mod.range_key);
+    defer alloc.free(range_before);
+
+    failNextPortableImportCommittedSyncForTest();
+    try std.testing.expectError(
+        error.InjectedPortableImportCommittedSyncFailure,
+        target.importPortableIntoEmpty(alloc, portable.items, target_identity),
+    );
+    try std.testing.expect(!target.portableImportRecoveryRequired());
+    try std.testing.expect((try target.get(alloc, "doc:portable-commit-sync")) == null);
+    const range_after = try target.core.store.get(alloc, range_state_mod.range_key);
+    defer alloc.free(range_after);
+    try std.testing.expectEqualSlices(u8, range_before, range_after);
+    const identity_after = (try doc_identity.loadNamespaceFromStore(target.core.store)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(identity_after.eql(target_identity));
+    try std.testing.expectError(error.NotFound, target.core.store.get(alloc, portable_import_in_progress_key));
+    try std.testing.expectError(error.NotFound, target.core.store.get(alloc, portable_import_identity_baseline_key));
+}
+
+test "db portable publication fence blocks lock-free point reads" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.core.store.beginPortableImportPublication();
+    var fenced = true;
+    defer if (fenced) db.core.store.finishPortableImportPublication();
+
+    try std.testing.expect(db.pendingWorkStats().portable_import_publication_in_progress);
+    try std.testing.expectError(error.PortableImportPublicationInProgress, db.get(alloc, "doc:any"));
+    try std.testing.expectError(error.PortableImportPublicationInProgress, db.core.store.beginReadTxn());
+
+    db.core.store.finishPortableImportPublication();
+    fenced = false;
+    try std.testing.expect(!db.pendingWorkStats().portable_import_publication_in_progress);
+    try std.testing.expect((try db.get(alloc, "doc:any")) == null);
+}
+
+test "portable runtime lock helpers reject degraded work before lock admission" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    defer db.async_context.portable_runtime_activation_pending.store(false, .release);
+    const before = db.snapshotApplyLockStats();
+
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.lockApplyForPortableRuntime());
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.lockApplySharedForPortableRuntime());
+    var batch_ctx = db.batchContext();
+    try std.testing.expectError(error.PortableRuntimeActivationPending, lockApplyForPortableRuntimeContext(&batch_ctx));
+    try std.testing.expectError(error.PortableRuntimeActivationPending, lockApplySharedForPortableRuntimeAsync(db.async_context));
+    try std.testing.expectError(error.PortableRuntimeActivationPending, lockApplyForPortableRuntimeAsync(db.async_context));
+
+    const after = db.snapshotApplyLockStats();
+    try std.testing.expectEqual(before.exclusive_lock_calls, after.exclusive_lock_calls);
+    try std.testing.expectEqual(before.shared_lock_calls, after.shared_lock_calls);
+}
+
+test "db portable publication waits for admitted readers and rejects new ones" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var admitted = try db.core.store.beginProbeTxn();
+    var admitted_open = true;
+    defer if (admitted_open) admitted.abort();
+
+    const Publisher = struct {
+        store: *docstore_mod.DocStore,
+        returned: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.store.beginPortableImportPublication() catch |err| {
+                self.err = err;
+                self.returned.store(true, .release);
+                return;
+            };
+            self.returned.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            self.store.finishPortableImportPublication();
+        }
+    };
+    var publisher = Publisher{ .store = db.core.store };
+    const thread = try std.Thread.spawn(.{}, Publisher.run, .{&publisher});
+    var joined = false;
+    defer if (!joined) {
+        if (admitted_open) {
+            admitted.abort();
+            admitted_open = false;
+        }
+        publisher.release.store(true, .release);
+        thread.join();
+    };
+
+    const close_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!db.core.store.portableImportPublicationInProgress() and monotonicTimeNs() < close_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(db.core.store.portableImportPublicationInProgress());
+    try std.testing.expect(!publisher.returned.load(.acquire));
+    try std.testing.expectError(error.PortableImportPublicationInProgress, db.core.store.beginProbeTxn());
+
+    admitted.abort();
+    admitted_open = false;
+    const drain_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!publisher.returned.load(.acquire) and monotonicTimeNs() < drain_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(publisher.returned.load(.acquire));
+    publisher.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), publisher.err);
+    try std.testing.expect(!db.core.store.portableImportPublicationInProgress());
+}
+
+test "db portable activation gate revalidates queued and replicated writes" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer {
+        hook.release.store(true, .release);
+        test_portable_runtime_batch_prelock_hook = null;
+        db.async_context.portable_runtime_activation_pending.store(false, .release);
+    }
+
+    const Writer = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{ .writes = &.{.{
+                .key = "doc:queued-before-portable-publication",
+                .value = "{\"title\":\"must remain blocked\"}",
+            }} }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer = Writer{ .db = &db };
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_joined = false;
+    defer if (!writer_joined) writer_thread.join();
+
+    const prelock_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Model the publication transition after the fast preflight but before the
+    // queued writer owns apply. The under-lock check must reject it.
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    hook.release.store(true, .release);
+    writer_thread.join();
+    writer_joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), writer.err);
+    try std.testing.expect((try db.lookup(alloc, "doc:queued-before-portable-publication", .{})) == null);
+
+    // Replicated apply bypasses HA role admission only; portable activation is
+    // a generation-safety fence and therefore remains mandatory.
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.batchReplicatedApply(.{
+        .writes = &.{.{
+            .key = "doc:replicated-during-portable-activation",
+            .value = "{\"title\":\"must remain blocked\"}",
+        }},
+    }));
+
+    // Stable runtime callback contexts share the same gate rather than keeping
+    // a pointer into DB.open's movable wrapper value.
+    try std.testing.expectError(
+        error.PortableRuntimeActivationPending,
+        appendDerivedBatchRecord(&db, .{}),
+    );
+}
+
+test "db portable activation gate revalidates queued graph reads" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    db.core.lockApplyExclusive();
+    var apply_locked = true;
+    defer if (apply_locked) db.core.unlockApplyExclusive();
+
+    const Reader = struct {
+        db: *DB,
+        entered: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.entered.store(true, .release);
+            const edges = self.db.getEdges(std.heap.page_allocator, "restored_graph", "doc:a", "rel", .out) catch |err| {
+                self.err = err;
+                return;
+            };
+            graph_mod.GraphIndex.freeEdges(std.heap.page_allocator, edges);
+        }
+    };
+    var reader = Reader{ .db = &db };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) reader_thread.join();
+
+    const entered_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!reader.entered.load(.acquire) and monotonicTimeNs() < entered_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(reader.entered.load(.acquire));
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    defer db.async_context.portable_runtime_activation_pending.store(false, .release);
+    db.core.unlockApplyExclusive();
+    apply_locked = false;
+
+    reader_thread.join();
+    reader_joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), reader.err);
+}
+
+test "db portable activation gate revalidates profiled dense search after catalog admission" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        lookup_hook.release.set(io);
+        test_published_dense_catalog_lookup_hook = null;
+        db.async_context.portable_runtime_activation_pending.store(false, .release);
+    }
+
+    const Searcher = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(searcher: *@This()) void {
+            var profiled = searcher.db.searchDenseProfiled(std.heap.page_allocator, .{
+                .index_name = "dense_idx",
+                .limit = 1,
+                .include_stored = false,
+                .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+            }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }) catch |err| {
+                searcher.err = err;
+                return;
+            };
+            profiled.result.deinit();
+        }
+    };
+    var searcher = Searcher{ .db = &db };
+    const search_thread = try std.Thread.spawn(.{}, Searcher.run, .{&searcher});
+    var search_joined = false;
+    defer if (!search_joined) {
+        lookup_hook.release.set(io);
+        search_thread.join();
+    };
+
+    const entered_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!lookup_hook.entered.isSet() and monotonicTimeNs() < entered_deadline) {
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(lookup_hook.entered.isSet());
+    try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+
+    // Model publication after the optimistic retry but before the catalog
+    // lease is returned to the caller. The post-admission check must reject
+    // the mixed generation rather than executing against it.
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    lookup_hook.release.set(io);
+    search_thread.join();
+    search_joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), searcher.err);
+    try std.testing.expectEqual(@as(u32, 0), db.publishedDenseSearchCount());
+}
+
+test "portable activation retry backoff is bounded stable and exponential" {
+    const first = DB.portableActivationRetryDelayNs("/tmp/db-a", 0x1234, 0);
+    const second = DB.portableActivationRetryDelayNs("/tmp/db-a", 0x1234, 1);
+    const capped = DB.portableActivationRetryDelayNs("/tmp/db-a", 0x1234, 100);
+
+    try std.testing.expect(first >= DB.portable_activation_retry_base_ns * 4 / 5);
+    try std.testing.expect(first <= DB.portable_activation_retry_base_ns);
+    try std.testing.expect(second >= DB.portable_activation_retry_base_ns * 2 * 4 / 5);
+    try std.testing.expect(second <= DB.portable_activation_retry_base_ns * 2);
+    try std.testing.expect(second > first);
+    try std.testing.expect(capped >= DB.portable_activation_retry_max_ns * 4 / 5);
+    try std.testing.expect(capped <= DB.portable_activation_retry_max_ns);
+    try std.testing.expectEqual(capped, DB.portableActivationRetryDelayNs("/tmp/db-a", 0x1234, 100));
+    try std.testing.expect(capped != DB.portableActivationRetryDelayNs("/tmp/db-a", 0x5678, 100));
+}
+
+test "portable activation retry worker detaches and can be restarted" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // A worker with no pending activation exits immediately. Exercise two full
+    // detached generations to prove completion releases launch admission and
+    // no stored joinable handle is required to start the next generation.
+    for (0..2) |_| {
+        _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
+        db.portable_activation_retry_stop.store(false, .release);
+        db.portable_activation_retry_worker_running.store(true, .release);
+        const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
+            db.portable_activation_retry_worker_running.store(false, .release);
+            db.portable_activation_retry_lifecycle_mutex.unlock();
+            return err;
+        };
+        db.portable_activation_retry_lifecycle_mutex.unlock();
+        try std.testing.expectEqual(DB.PortableActivationRetryLaunch.detached_thread, launch);
+
+        const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
+        while (db.portable_activation_retry_worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
+            std.Thread.yield() catch {};
+        }
+        try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+    }
+}
+
+test "portable activation retry stop joins the detached worker final handshake" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const ExitCtx = struct {
+        db: *DB,
+        holding_final_lock: *std.atomic.Value(bool),
+        release_final_lock: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            while (!ctx.db.portable_activation_retry_stop.load(.acquire)) std.Thread.yield() catch {};
+            _ = lockAtomic(&ctx.db.portable_activation_retry_lifecycle_mutex);
+            ctx.db.portable_activation_retry_worker_running.store(false, .release);
+            ctx.holding_final_lock.store(true, .release);
+            while (!ctx.release_final_lock.load(.acquire)) std.Thread.yield() catch {};
+            ctx.db.portable_activation_retry_lifecycle_mutex.unlock();
+        }
+    };
+    const StopCtx = struct {
+        db: *DB,
+        returned: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            ctx.db.stopPortableActivationRetryWorker();
+            ctx.returned.store(true, .release);
+        }
+    };
+
+    var holding_final_lock = std.atomic.Value(bool).init(false);
+    var release_final_lock = std.atomic.Value(bool).init(false);
+    var stop_returned = std.atomic.Value(bool).init(false);
+    db.portable_activation_retry_stop.store(false, .release);
+    db.portable_activation_retry_worker_running.store(true, .release);
+
+    var worker = try std.Thread.spawn(.{}, ExitCtx.run, .{ExitCtx{
+        .db = &db,
+        .holding_final_lock = &holding_final_lock,
+        .release_final_lock = &release_final_lock,
+    }});
+    var worker_joined = false;
+    defer if (!worker_joined) {
+        release_final_lock.store(true, .release);
+        worker.join();
+    };
+    var stopper = try std.Thread.spawn(.{}, StopCtx.run, .{StopCtx{
+        .db = &db,
+        .returned = &stop_returned,
+    }});
+    var stopper_joined = false;
+    defer if (!stopper_joined) stopper.join();
+
+    const hold_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!holding_final_lock.load(.acquire) and monotonicTimeNs() < hold_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(holding_final_lock.load(.acquire));
+    // Give the stopper ample time to observe the published false state. It
+    // must still wait for the lifecycle lock that fences the worker's return.
+    sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expect(!stop_returned.load(.acquire));
+
+    release_final_lock.store(true, .release);
+    worker.join();
+    worker_joined = true;
+    stopper.join();
+    stopper_joined = true;
+    try std.testing.expect(stop_returned.load(.acquire));
+}
+
+test "portable activation retry shutdown rejects an already claimed maintenance probe" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+
+    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
+    test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
+    defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
+    defer test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(false, .release);
+    defer test_portable_activation_retry_probe_paused.store(false, .release);
+    defer test_release_portable_activation_retry_probe.store(true, .release);
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    db.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(db.portable_activation_retry_next_launch_ns > 0);
+
+    // Rearm the injected launch failures. The claimed probe must leave these
+    // untouched after close publishes the permanent stop state.
+    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
+    test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    db.portable_activation_retry_next_launch_ns = 0;
+    test_release_portable_activation_retry_probe.store(false, .release);
+    test_portable_activation_retry_probe_paused.store(false, .release);
+    test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(true, .release);
+
+    const PollCtx = struct {
+        db: *DB,
+        completed: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            // The runtime reaper and this explicit poll legitimately race to
+            // claim the probe. A zero count means the reaper won; the paused
+            // hook below proves that one of them did claim it.
+            _ = ctx.db.backend_runtime.durable_jobs.poll(1) catch return;
+            ctx.completed.store(true, .release);
+        }
+    };
+    const CloseCtx = struct {
+        db: *DB,
+        returned: *std.atomic.Value(bool),
+
+        fn run(ctx: @This()) void {
+            ctx.db.close();
+            ctx.returned.store(true, .release);
+        }
+    };
+
+    var poll_completed = std.atomic.Value(bool).init(false);
+    var close_returned = std.atomic.Value(bool).init(false);
+    var poller = try std.Thread.spawn(.{}, PollCtx.run, .{PollCtx{
+        .db = &db,
+        .completed = &poll_completed,
+    }});
+    var poller_joined = false;
+    defer if (!poller_joined) {
+        test_release_portable_activation_retry_probe.store(true, .release);
+        poller.join();
+    };
+
+    const pause_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!test_portable_activation_retry_probe_paused.load(.acquire) and monotonicTimeNs() < pause_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(test_portable_activation_retry_probe_paused.load(.acquire));
+
+    var closer = try std.Thread.spawn(.{}, CloseCtx.run, .{CloseCtx{
+        .db = &db,
+        .returned = &close_returned,
+    }});
+    var closer_joined = false;
+    defer if (!closer_joined) {
+        test_release_portable_activation_retry_probe.store(true, .release);
+        closer.join();
+    };
+
+    const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!db.portable_activation_retry_stop.load(.acquire) and monotonicTimeNs() < stop_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(db.portable_activation_retry_stop.load(.acquire));
+    try std.testing.expect(!close_returned.load(.acquire));
+
+    test_release_portable_activation_retry_probe.store(true, .release);
+    poller.join();
+    poller_joined = true;
+    closer.join();
+    closer_joined = true;
+
+    try std.testing.expect(poll_completed.load(.acquire));
+    try std.testing.expect(close_returned.load(.acquire));
+    try std.testing.expect(test_fail_portable_activation_retry_thread_spawn.load(.acquire));
+    try std.testing.expect(test_fail_portable_activation_retry_fallback_submit.load(.acquire));
+}
+
+test "portable activation retry falls back to owner scoped runtime after thread launch failure" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
+    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
+
+    _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
+    db.portable_activation_retry_stop.store(false, .release);
+    db.portable_activation_retry_worker_running.store(true, .release);
+    const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
+        db.portable_activation_retry_worker_running.store(false, .release);
+        db.portable_activation_retry_lifecycle_mutex.unlock();
+        return err;
+    };
+    db.portable_activation_retry_lifecycle_mutex.unlock();
+    try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime_fallback, launch);
+
+    const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
+        db.portable_activation_retry_worker_running.load(.acquire)) and
+        monotonicTimeNs() < recovery_deadline)
+    {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
+    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
+}
+
+test "portable activation retry automatically rearms after both launch paths fail" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
+    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
+    test_fail_portable_activation_retry_fallback_submit.store(true, .release);
+    defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
+
+    db.startPortableActivationRetryWorkerIfNeededInner(true);
+    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), db.portable_activation_retry_launch_failure_streak);
+    try std.testing.expect(db.portable_activation_retry_next_launch_ns > 0);
+
+    const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
+        db.portable_activation_retry_worker_running.load(.acquire)) and
+        monotonicTimeNs() < recovery_deadline)
+    {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
+    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.portable_activation_retry_launch_failure_streak);
+    try std.testing.expectEqual(@as(u64, 0), db.portable_activation_retry_next_launch_ns);
+    try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
+}
+
+test "db searches fail fast without joining portable activation recovery" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    db.async_context.portable_runtime_activation_pending.store(true, .release);
+    var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
+    lookup_hook.release.set(io);
+    test_published_dense_catalog_lookup_hook = &lookup_hook;
+    defer {
+        test_published_dense_catalog_lookup_hook = null;
+        db.async_context.portable_runtime_activation_pending.store(false, .release);
+    }
+    const attempts_before = db.portable_runtime_activation_attempts.load(.monotonic);
+
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.search(alloc, .{
+        .index_name = "dense_idx",
+        .limit = 1,
+        .include_stored = false,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }));
+    try std.testing.expect(!lookup_hook.entered.isSet());
+    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.searchDenseProfiled(alloc, .{
+        .index_name = "dense_idx",
+        .limit = 1,
+        .include_stored = false,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }));
+    try std.testing.expect(!lookup_hook.entered.isSet());
+    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+
+    try std.testing.expect(db.portable_runtime_activation_mutex.tryLock());
+    defer db.portable_runtime_activation_mutex.unlock();
+    try std.testing.expectError(error.PortableRuntimeActivationPending, db.retryPortableRuntimeActivationIfNeeded());
+    try std.testing.expectEqual(attempts_before, db.portable_runtime_activation_attempts.load(.monotonic));
+}
+
+test "db portable resolver activation stops partial startup before retry reload" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{});
+        defer source.close();
+        try source.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+            \\}
+            ,
+        });
+        try source.addResolver(.{
+            .name = "kg_restore",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_restore_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    var target = try DB.open(alloc, std.mem.span(target_path), .{});
+    defer target.close();
+    failNextPortablePromotionRuntimeStartForTest();
+    try target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace);
+
+    try std.testing.expect(target.pendingWorkStats().portable_runtime_activation_pending);
+    try std.testing.expect(!target.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!target.promotion_runtime.?.worker_started.load(.acquire));
+
+    try std.testing.expect(try target.retryPortableRuntimeActivationIfNeeded());
+    try std.testing.expect(!target.pendingWorkStats().portable_runtime_activation_pending);
+    try std.testing.expect(target.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(target.promotion_runtime.?.worker_started.load(.acquire));
+}
+
+test "db failed portable rollback fences live access until reopen recovery" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_optional_runtimes = false });
+        defer source.close();
+        try source.batch(.{ .writes = &.{.{
+            .key = "doc:portable-fence",
+            .value = "{\"title\":\"must never leak partially\"}",
+        }} });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    {
+        var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+        defer target.close();
+        failNextPortableImportRollbackForTest();
+        try std.testing.expectError(
+            error.PortableImportRecoveryRequired,
+            target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace),
+        );
+        try std.testing.expect(target.portableImportRecoveryRequired());
+        try std.testing.expect(target.pendingWorkStats().portable_import_recovery_required);
+        try std.testing.expectError(error.PortableImportRecoveryRequired, target.get(alloc, "doc:portable-fence"));
+        try std.testing.expectError(error.PortableImportRecoveryRequired, target.batch(.{ .writes = &.{.{
+            .key = "doc:must-not-be-accepted",
+            .value = "{\"title\":\"restart would erase this\"}",
+        }} }));
+    }
+
+    try std.testing.expectError(
+        error.IncompletePortableImport,
+        DB.open(alloc, std.mem.span(target_path), .{
+            .open_mode = .query_readonly,
+            .start_optional_runtimes = false,
+        }),
+    );
+
+    var recovered = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+    defer recovered.close();
+    try std.testing.expect(!recovered.portableImportRecoveryRequired());
+    try std.testing.expect((try recovered.get(alloc, "doc:portable-fence")) == null);
+    try std.testing.expect((try recovered.get(alloc, "doc:must-not-be-accepted")) == null);
+    try recovered.batch(.{ .writes = &.{.{
+        .key = "doc:after-recovery",
+        .value = "{\"title\":\"safe\"}",
+    }} });
+    const after = (try recovered.get(alloc, "doc:after-recovery")) orelse return error.TestExpectedEqual;
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("{\"title\":\"safe\"}", after);
+}
+
+test "db open preserves a committed portable generation when marker cleanup was interrupted" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var committed = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer committed.close();
+        try committed.core.store.put("committed-generation-key", "committed-generation-value");
+        try committed.core.store.put(portable_import_in_progress_key, portable_import_marker_committed);
+        try committed.core.store.sync(true);
+    }
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_optional_runtimes = false,
+        });
+        defer readonly.close();
+        const value = try readonly.core.store.get(alloc, "committed-generation-key");
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("committed-generation-value", value);
+    }
+
+    var recovered = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer recovered.close();
+    const value = try recovered.core.store.get(alloc, "committed-generation-key");
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("committed-generation-value", value);
+    try std.testing.expectError(error.NotFound, recovered.core.store.get(alloc, portable_import_in_progress_key));
+}
+
+test "db portable restore rejects documents without identity coverage" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "identity-incomplete-portable" });
+    defer runtime_store.deinit();
+    var source = try docstore_mod.DocStore.openRuntime(alloc, &runtime_store);
+    defer source.close();
+    const source_key = try internal_keys.documentKeyAlloc(alloc, "doc:missing-identity");
+    defer alloc.free(source_key);
+    try source.put(source_key, "{\"title\":\"must reject\"}");
+
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+    try portable_backup.exportPortable(alloc, &source, &portable);
+
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+    defer target.close();
+
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace),
+    );
+    try std.testing.expectEqual(@as(u64, 0), try target.primaryDocCount(alloc));
+    try std.testing.expect(target.core.schema == null);
+}
+
+test "db portable restore rejects target with residual identity tombstones" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var target_buf: [256]u8 = undefined;
+    const target_path = tempPath(&target_buf);
+    defer cleanupTempDir(target_path);
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_optional_runtimes = false });
+        defer source.close();
+        try source.batch(.{ .writes = &.{.{
+            .key = "doc:restored",
+            .value = "{\"title\":\"restored\"}",
+        }} });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+    defer target.close();
+    try target.batch(.{ .writes = &.{.{
+        .key = "doc:deleted",
+        .value = "{\"title\":\"deleted\"}",
+    }} });
+    try target.batch(.{ .deletes = &.{"doc:deleted"} });
+    try std.testing.expectEqual(@as(u64, 0), try target.primaryDocCount(alloc));
+    const identity_before = try doc_identity.fullStatsFromStore(target.core.store);
+    try std.testing.expectEqual(@as(u64, 1), identity_before.tombstone_ordinals);
+
+    try std.testing.expectError(
+        error.LiteImportTargetNotEmpty,
+        target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace),
+    );
+    try std.testing.expect((try target.get(alloc, "doc:restored")) == null);
+    const identity_after = try doc_identity.fullStatsFromStore(target.core.store);
+    try std.testing.expectEqual(identity_before.next_ordinal, identity_after.next_ordinal);
+    try std.testing.expectEqual(identity_before.tombstone_ordinals, identity_after.tombstone_ordinals);
+}
+
+test "portable import scratch scavenging removes abandoned stages and preserves active leases" {
+    if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(parent);
+    const target = try std.fmt.allocPrint(alloc, "{s}/target", .{parent});
+    defer alloc.free(target);
+    const abandoned = try std.fmt.allocPrint(alloc, "{s}/.target.portable-import-abandoned", .{parent});
+    defer alloc.free(abandoned);
+    const active = try std.fmt.allocPrint(alloc, "{s}/.target.portable-import-active", .{parent});
+    defer alloc.free(active);
+    const lease_only = try std.fmt.allocPrint(alloc, "{s}/.target.portable-import-lease-only", .{parent});
+    defer alloc.free(lease_only);
+    const abandoned_lease_path = try portableImportStageLeasePathAlloc(alloc, abandoned);
+    defer alloc.free(abandoned_lease_path);
+    const active_lease_path = try portableImportStageLeasePathAlloc(alloc, active);
+    defer alloc.free(active_lease_path);
+    const lease_only_path = try portableImportStageLeasePathAlloc(alloc, lease_only);
+    defer alloc.free(lease_only_path);
+
+    test_fail_portable_import_stage_directory_creation = true;
+    try std.testing.expectError(
+        error.InjectedPortableImportStageDirectoryCreationFailure,
+        createUniquePortableImportStageBase(alloc, target),
+    );
+    var parent_dir = try std.Io.Dir.cwd().openDir(std.testing.io, parent, .{ .iterate = true });
+    defer parent_dir.close(std.testing.io);
+    var entries = parent_dir.iterate();
+    while (try entries.next(std.testing.io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".target.portable-import-"));
+    }
+
+    var abandoned_lease = try acquirePortableImportStageLease(alloc, abandoned);
+    try std.Io.Dir.cwd().createDir(std.testing.io, abandoned, .default_dir);
+    abandoned_lease.close(std.testing.io);
+
+    var active_lease = try acquirePortableImportStageLease(alloc, active);
+    defer active_lease.close(std.testing.io);
+    try std.Io.Dir.cwd().createDir(std.testing.io, active, .default_dir);
+
+    var orphaned_lease = try acquirePortableImportStageLease(alloc, lease_only);
+    orphaned_lease.close(std.testing.io);
+
+    const created = try createUniquePortableImportStageBase(alloc, target);
+    defer {
+        created.lease_file.close(std.testing.io);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, created.path) catch {};
+        deletePortableImportStageLease(alloc, std.testing.io, created.path) catch {};
+        alloc.free(created.path);
+    }
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_lease_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, lease_only_path, .{}));
+    try std.Io.Dir.cwd().access(std.testing.io, active, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, active_lease_path, .{});
 }
 
 test "db relational one-shot recovery resolves orphaned intents into packed rows" {

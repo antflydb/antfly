@@ -1179,6 +1179,40 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
     if (max_ordinal > 0 and next_ordinal <= max_ordinal) return error.InvalidDocIdentity;
 }
 
+/// Validate that every authoritative base row has one live identity and that
+/// the identity catalog has no extra live rows. Unlike validateStoreAlloc(),
+/// this binds identity metadata to primary data and is therefore appropriate
+/// for admitting a complete portable DB image rather than an identity-only
+/// repair batch.
+pub fn validatePrimaryDocumentCoverageAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void {
+    try validateStoreAlloc(alloc, store);
+    const identity_stats = try fullStatsFromStore(store);
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const Coverage = struct {
+        alloc: Allocator,
+        txn: *docstore_mod.DocStore.Txn,
+        live_documents: u64 = 0,
+
+        fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return .@"continue";
+            defer self.alloc.free(doc_id);
+            const ordinal = (try lookupOrdinalTxn(self.alloc, self.txn, doc_id)) orelse return error.InvalidDocIdentity;
+            const state = (try lookupStateTxn(self.txn, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive()) return error.InvalidDocIdentity;
+            self.live_documents = std.math.add(u64, self.live_documents, 1) catch return error.InvalidDocIdentity;
+            return .@"continue";
+        }
+    };
+    var coverage = Coverage{ .alloc = alloc, .txn = &txn };
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &coverage, Coverage.visit);
+    if (coverage.live_documents != identity_stats.live_ordinals) return error.InvalidDocIdentity;
+}
+
 fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore, txn: anytype) !void {
     const manifest_exists = try readVisibilityManifestTxn(txn);
     const ChunkScan = struct {

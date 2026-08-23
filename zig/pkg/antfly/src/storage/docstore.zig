@@ -383,10 +383,26 @@ pub const DocStore = struct {
     lmdb_user_db_kind: LmdbUserDbKind,
     replay_index_state: std.atomic.Value(u8),
     next_replay_sequence_cached: AtomicU64,
+    // A failed portable-import rollback leaves a durable recovery marker. Once
+    // fenced, this handle must not expose the partial generation or accept
+    // writes that restart recovery would later erase. Reopening constructs a
+    // fresh handle and completes marker recovery before returning it.
+    portable_import_recovery_required: std.atomic.Value(bool) = .init(false),
+    // Directory publication and native generation adoption have a durable
+    // commit point followed by an in-memory schema/catalog rebind. Normal
+    // readers must observe neither an incremental copy nor a new keyspace
+    // through the old runtime schema. Bounded atomic admission remains
+    // substantially cheaper than taking DB's global apply lock on hot reads.
+    // The high bit closes admission and the remaining bits count admitted
+    // transactions. Packing both into one atomic makes reader admission versus
+    // publication closure a single indivisible transition.
+    portable_import_reader_state: std.atomic.Value(usize) = .init(0),
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
     const replay_index_available: u8 = 2;
+    const portable_import_publication_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const portable_import_reader_count_mask: usize = ~portable_import_publication_bit;
 
     const Kind = enum {
         lmdb,
@@ -410,6 +426,7 @@ pub const DocStore = struct {
         probe: ?backend_erased.ProbeTxn = null,
         current_scan: ?backend_erased.CurrentScanTxn = null,
         write: ?backend_erased.WriteTxn = null,
+        portable_import_reader_owner: ?*DocStore = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -427,10 +444,12 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            const reader_owner = self.portable_import_reader_owner;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -444,13 +463,16 @@ pub const DocStore = struct {
                 read.abort();
             }
             self.* = undefined;
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn commit(self: *Txn) !void {
+            const reader_owner = self.portable_import_reader_owner;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -460,6 +482,7 @@ pub const DocStore = struct {
                 return error.ReadOnly;
             }
             self.* = undefined;
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -835,6 +858,7 @@ pub const DocStore = struct {
     }
 
     pub fn sync(self: *DocStore, force: bool) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(force),
             .runtime => try self.runtime_store.sync(force),
@@ -842,6 +866,7 @@ pub const DocStore = struct {
     }
 
     pub fn syncReplayState(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.syncReplayState(),
@@ -849,6 +874,7 @@ pub const DocStore = struct {
     }
 
     pub fn splitRightToDir(self: *DocStore, split_key: []const u8, dest_dir: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -860,6 +886,7 @@ pub const DocStore = struct {
     }
 
     pub fn rewriteLeftInPlace(self: *DocStore, split_key: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -897,6 +924,14 @@ pub const DocStore = struct {
     }
 
     pub fn beginReadTxn(self: *DocStore) !Txn {
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn = try self.beginReadTxnUnchecked();
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    fn beginReadTxnUnchecked(self: *DocStore) !Txn {
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{ .read_only = true });
@@ -922,13 +957,17 @@ pub const DocStore = struct {
     /// requiring write access. LMDB keeps the normal read-only transaction
     /// because its snapshot semantics are cheap.
     pub fn beginProbeTxn(self: *DocStore) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxn(),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn: Txn = switch (self.kind) {
+            .lmdb => try self.beginReadTxnUnchecked(),
             .runtime => .{
                 .alloc = self.alloc,
                 .probe = try self.runtime_store.beginProbe(),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     /// Open a current-tip replay scan transaction for ordered replay walks.
@@ -937,16 +976,21 @@ pub const DocStore = struct {
     /// append-only lanes without widening the point-probe API. LMDB keeps the
     /// normal read-only transaction because its snapshot semantics are cheap.
     pub fn beginCurrentScanTxn(self: *DocStore) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxn(),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn: Txn = switch (self.kind) {
+            .lmdb => try self.beginReadTxnUnchecked(),
             .runtime => .{
                 .alloc = self.alloc,
                 .current_scan = try self.runtime_store.beginCurrentScan(),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{});
@@ -970,6 +1014,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var batch = try self.env.beginBatch();
@@ -989,6 +1034,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.beginBulkIngestSession(),
@@ -996,6 +1042,7 @@ pub const DocStore = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.finishBulkIngestSessionWithOptions(options),
@@ -1003,6 +1050,7 @@ pub const DocStore = struct {
     }
 
     pub fn flushBufferedWritesWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.flushBufferedWritesWithOptions(options),
@@ -1014,6 +1062,72 @@ pub const DocStore = struct {
             .lmdb => {},
             .runtime => self.runtime_store.abortBulkIngestSession(),
         }
+    }
+
+    fn ensurePortableImportOperational(self: *const DocStore) !void {
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn acquirePortableImportReader(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            if (state == portable_import_reader_count_mask) return error.PortableImportReaderLimitReached;
+            state = self.portable_import_reader_state.cmpxchgWeak(state, state + 1, .acquire, .monotonic) orelse break;
+        }
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            self.releasePortableImportReader();
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn releasePortableImportReader(self: *DocStore) void {
+        const previous = self.portable_import_reader_state.fetchSub(1, .release);
+        std.debug.assert(previous & portable_import_reader_count_mask > 0);
+    }
+
+    /// Enter the short reader-visible publication fence. DB's exclusive apply
+    /// lock serializes publishers and ordinary writers; this atomic closes the
+    /// remaining lock-free read path without penalizing reads with a mutex.
+    pub fn beginPortableImportPublication(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            state = self.portable_import_reader_state.cmpxchgWeak(
+                state,
+                state | portable_import_publication_bit,
+                .acq_rel,
+                .acquire,
+            ) orelse break;
+        }
+        while (self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0) {
+            if (builtin.single_threaded or builtin.os.tag == .freestanding) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+
+    pub fn finishPortableImportPublication(self: *DocStore) void {
+        std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
+        self.portable_import_reader_state.store(0, .release);
+    }
+
+    pub fn portableImportPublicationInProgress(self: *const DocStore) bool {
+        return self.portable_import_reader_state.load(.acquire) & portable_import_publication_bit != 0;
+    }
+
+    pub fn requirePortableImportRecovery(self: *DocStore) void {
+        self.portable_import_recovery_required.store(true, .release);
+    }
+
+    pub fn portableImportRecoveryRequired(self: *const DocStore) bool {
+        return self.portable_import_recovery_required.load(.acquire);
     }
 
     pub fn put(self: *DocStore, key: []const u8, value: []const u8) !void {
@@ -1041,6 +1155,20 @@ pub const DocStore = struct {
                 error.NotFound => return error.NotFound,
                 else => return err,
             };
+        return try alloc.dupe(u8, val);
+    }
+
+    /// Privileged point read paired with scanPortableImportRollbackWithContext.
+    /// It keeps recovery-required fencing intact while allowing the publisher
+    /// to consult its durable rollback marker and bounded baseline journal.
+    pub fn getPortableImportRollback(self: *DocStore, alloc: Allocator, key: []const u8) ![]u8 {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
+        defer txn.abort();
+        const val = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
+            else => return err,
+        };
         return try alloc.dupe(u8, val);
     }
 
@@ -1741,6 +1869,22 @@ pub const DocStore = struct {
         callback: ScanWithContextCallback,
     ) !void {
         var txn = try self.beginReadTxn();
+        defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
+
+    /// Privileged scan used only to roll back a publication while ordinary
+    /// readers remain fenced. Recovery-required still blocks this handle.
+    pub fn scanPortableImportRollbackWithContext(
+        self: *DocStore,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
         defer txn.abort();
         try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
     }

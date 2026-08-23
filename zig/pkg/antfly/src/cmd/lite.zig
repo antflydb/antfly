@@ -644,6 +644,8 @@ fn publishRestoreFromSourceFileLocked(
     out_path: []const u8,
 ) !void {
     if (std.mem.endsWith(u8, source_path, ".aflite")) {
+        const json = try restoreResultJsonAlloc(allocator, "snapshot", "aflite", out_path);
+        defer allocator.free(json);
         const tmp_path = try restoreTempPathAlloc(allocator, out_path);
         defer allocator.free(tmp_path);
         try deleteFileIfExists(io, tmp_path);
@@ -654,16 +656,22 @@ fn publishRestoreFromSourceFileLocked(
             deleteFilePath(io, tmp_path) catch {};
             return err;
         };
+        try confirmRestorePublicationDurability(io, out_path);
 
-        const json = try restoreResultJsonAlloc(allocator, "snapshot", "aflite", out_path);
-        defer allocator.free(json);
         writeJsonLine(io, json);
         return;
     }
 
-    const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
-    defer allocator.free(body);
-    try portable_backup.validatePortable(allocator, body);
+    const json = try restoreResultJsonAlloc(allocator, "portable_restore", "afb", out_path);
+    defer allocator.free(json);
+
+    var source_file = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source_file.close(io);
+    const source_stat = try source_file.stat(io);
+    if (source_stat.size > max_afb_file_bytes) return error.StreamTooLong;
 
     const tmp_path = try restoreTempPathAlloc(allocator, out_path);
     defer allocator.free(tmp_path);
@@ -673,17 +681,32 @@ fn publishRestoreFromSourceFileLocked(
     {
         var lite = try LiteDb.create(allocator, tmp_path, true);
         defer lite.close();
-        try lite_restore_staging.importPortableIntoLiteDb(allocator, &lite.db, body);
+        try lite_restore_staging.populateUnpublishedLiteDbFromPortableFile(
+            allocator,
+            &lite.db,
+            io,
+            source_file,
+            source_stat.size,
+        );
     }
 
     renameFilePath(io, tmp_path, out_path) catch |err| {
         deleteFilePath(io, tmp_path) catch {};
         return err;
     };
+    try confirmRestorePublicationDurability(io, out_path);
 
-    const json = try restoreResultJsonAlloc(allocator, "portable_restore", "afb", out_path);
-    defer allocator.free(json);
     writeJsonLine(io, json);
+}
+
+fn confirmRestorePublicationDurability(io: std.Io, path: []const u8) !void {
+    lite_restore_staging.confirmPublishedFileDurability(io, path) catch |err| {
+        std.debug.print(
+            "error: restore was published at {s}, but crash durability could not be confirmed ({s}); inspect the destination and do not retry automatically\n",
+            .{ path, @errorName(err) },
+        );
+        return error.DurabilityOutcomeUnknown;
+    };
 }
 
 fn restoreResultJsonAlloc(
@@ -703,13 +726,6 @@ fn restoreResultJsonAlloc(
     try appendJsonString(allocator, &out, path);
     try out.append(allocator, '}');
     return try out.toOwnedSlice(allocator);
-}
-
-fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, source_path, ".afb")) {
-        return try cli.readFileAlloc(io, allocator, source_path, max_afb_file_bytes);
-    }
-    return error.InvalidArguments;
 }
 
 const PromoteOptions = struct {

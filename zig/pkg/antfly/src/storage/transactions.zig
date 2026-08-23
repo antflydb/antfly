@@ -140,6 +140,14 @@ pub const TxnSummaryPage = struct {
 pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
+    /// The caller has already materialized every intent into `writes` and
+    /// `deletes`. Intent records and locks are still retired atomically, but
+    /// their legacy primary-key mutations must not be applied a second time.
+    /// This is the allocation-free common path for relational commits.
+    skip_all_intent_application: bool = false,
+    /// Selective counterpart used by recovery batches that materialize only a
+    /// subset of intents. Resolution indexes these borrowed keys once, keeping
+    /// filtering linear instead of scanning this list for every intent.
     skip_intent_keys: []const []const u8 = &.{},
     replay: ?ReplayAppend = null,
     expected_intent_revision: ?u64 = null,
@@ -570,6 +578,16 @@ pub const TxnManager = struct {
             };
         }
 
+        if (extra_batch.skip_all_intent_application and extra_batch.skip_intent_keys.len != 0) {
+            return error.InvalidArgument;
+        }
+        var skipped_intent_keys = std.StringHashMapUnmanaged(void).empty;
+        defer skipped_intent_keys.deinit(self.alloc);
+        if (extra_batch.skip_intent_keys.len != 0) {
+            try skipped_intent_keys.ensureTotalCapacity(self.alloc, @intCast(extra_batch.skip_intent_keys.len));
+            for (extra_batch.skip_intent_keys) |key| skipped_intent_keys.putAssumeCapacity(key, {});
+        }
+
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -596,7 +614,7 @@ pub const TxnManager = struct {
                 // Extract user key from intent key:
                 // intents_prefix(20) + txn_id(16) + ':'(1) + user_key
                 const user_key = entry.key[intents_prefix.len + 17 ..];
-                if (containsKey(extra_batch.skip_intent_keys, user_key)) continue;
+                if (extra_batch.skip_all_intent_application or skipped_intent_keys.contains(user_key)) continue;
 
                 if (entry.value.len > 0 and entry.value[0] == 1) {
                     // Delete — also remove the timestamp entry
@@ -1992,13 +2010,6 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
     return try alloc.dupeZ(u8, path);
 }
 
-fn containsKey(keys: []const []const u8, needle: []const u8) bool {
-    for (keys) |key| {
-        if (std.mem.eql(u8, key, needle)) return true;
-    }
-    return false;
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2181,6 +2192,56 @@ test "transaction protocol fences begin prepare snapshot and idempotent resoluti
     });
     try std.testing.expect(!repeated.applied);
     try std.testing.expectEqual(@as(u64, 7), repeated.replay_sequence);
+}
+
+test "transaction resolution supports allocation-free and indexed intent filtering" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-resolution-filtering");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+
+    const skip_all_txn: TxnId = .{ 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2 };
+    try mgr.initTransaction(skip_all_txn, 1_000);
+    try mgr.writeIntents(skip_all_txn, &.{
+        .{ .key = "doc:all-a", .value = "legacy-a" },
+        .{ .key = "doc:all-b", .value = "legacy-b" },
+    }, &.{});
+    _ = try mgr.resolveIntentsWithExtraBatch(skip_all_txn, .committed, 2_000, .{
+        .writes = &.{.{ .key = "materialized:all", .value = "packed" }},
+        .skip_all_intent_application = true,
+    });
+    try std.testing.expectError(error.NotFound, getVisibleDoc(&store, alloc, "doc:all-a"));
+    try std.testing.expectError(error.NotFound, getVisibleDoc(&store, alloc, "doc:all-b"));
+    const materialized = try store.get(alloc, "materialized:all");
+    defer alloc.free(materialized);
+    try std.testing.expectEqualStrings("packed", materialized);
+    try mgr.checkOrdinaryWriteConflict("doc:all-a");
+    try mgr.checkOrdinaryWriteConflict("doc:all-b");
+
+    const selective_txn: TxnId = .{ 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4 };
+    try mgr.initTransaction(selective_txn, 3_000);
+    try mgr.writeIntents(selective_txn, &.{
+        .{ .key = "doc:select-a", .value = "a" },
+        .{ .key = "doc:select-b", .value = "b" },
+        .{ .key = "doc:select-c", .value = "c" },
+    }, &.{});
+    _ = try mgr.resolveIntentsWithExtraBatch(selective_txn, .committed, 4_000, .{
+        .skip_intent_keys = &.{ "doc:select-a", "doc:select-c" },
+    });
+    try std.testing.expectError(error.NotFound, getVisibleDoc(&store, alloc, "doc:select-a"));
+    const selected = try getVisibleDoc(&store, alloc, "doc:select-b");
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("b", selected);
+    try std.testing.expectError(error.NotFound, getVisibleDoc(&store, alloc, "doc:select-c"));
+    try mgr.checkOrdinaryWriteConflict("doc:select-a");
+    try mgr.checkOrdinaryWriteConflict("doc:select-b");
+    try mgr.checkOrdinaryWriteConflict("doc:select-c");
 }
 
 test "idempotent begin upgrades a legacy transaction coordinator role" {

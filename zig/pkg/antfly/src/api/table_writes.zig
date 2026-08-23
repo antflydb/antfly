@@ -23200,6 +23200,10 @@ fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docst
     defer file.close(io);
     const stat = try file.stat(io);
     try portable_backup.importPortableFile(alloc, store, io, file, stat.size);
+    portable_backup.validateCompleteDatabaseImageAlloc(alloc, store) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
 }
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
@@ -24945,6 +24949,34 @@ test "bound table write source backs up and restores a portable local table" {
     });
     defer search_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
+}
+
+test "portable file restore rejects documents without identity coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-source", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/identity-incomplete.afb", .{tmp.sub_path});
+    defer alloc.free(archive_path);
+
+    {
+        var source = try db_mod.DB.open(alloc, source_path, .{ .start_optional_runtimes = false });
+        defer source.close();
+        const key = try internal_keys.documentKeyAlloc(alloc, "doc:missing-identity");
+        defer alloc.free(key);
+        try source.core.store.put(key, "{\"title\":\"reject\"}");
+        try exportPortableBackupFile(alloc, source.core.store, archive_path, null);
+    }
+
+    var target = try db_mod.DB.open(alloc, target_path, .{ .start_optional_runtimes = false });
+    defer target.close();
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        importPortableBackupFile(alloc, target.core.store, archive_path, null),
+    );
 }
 
 test "provisioned table write source backs up and restores a local table" {

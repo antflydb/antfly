@@ -55,6 +55,10 @@ pub const CoreOpenOptions = db_config.CoreOpenOptions;
 pub const PendingWorkStats = struct {
     derived_target_sequence: u64,
     has_async_indexes: bool,
+    portable_import_publication_in_progress: bool = false,
+    portable_import_recovery_required: bool = false,
+    portable_runtime_activation_pending: bool = false,
+    portable_runtime_activation_attempts: u64 = 0,
     enrichment: types.EnrichmentStats,
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
@@ -913,6 +917,10 @@ pub const DBCore = struct {
         try self.index_manager.load(self.store);
     }
 
+    pub fn loadIndexesForRestore(self: *DBCore) !void {
+        try self.index_manager.loadForRestore(self.store);
+    }
+
     pub fn loadIndexesNoBackfill(self: *DBCore) !void {
         try self.index_manager.loadNoBackfill(self.store);
     }
@@ -1708,19 +1716,33 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         for (skip_intent_keys.items) |key| alloc.free(@constCast(key));
         skip_intent_keys.deinit(alloc);
     }
+    var skip_all_intent_application = false;
     if (identity_ctx.relational_base_rows) {
         const mutations = try manager.collectIntentMutations(alloc, txn_id);
         defer {
             for (mutations) |*mutation| mutation.deinit(alloc);
             if (mutations.len > 0) alloc.free(mutations);
         }
+        var requires_selective_filter = false;
+        for (mutations) |mutation| {
+            if (transactionIdentityMetadataKey(mutation.key)) {
+                requires_selective_filter = true;
+                break;
+            }
+        }
+        // Ordinary relational recovery contains only document intents. Avoid
+        // cloning or indexing every key in that common case; mixed internal
+        // metadata transactions retain selective filtering semantics.
+        skip_all_intent_application = mutations.len != 0 and !requires_selective_filter;
         for (mutations) |mutation| {
             if (transactionIdentityMetadataKey(mutation.key)) continue;
-            const skip_key = try alloc.dupe(u8, mutation.key);
-            var skip_key_owned = true;
-            errdefer if (skip_key_owned) alloc.free(skip_key);
-            try skip_intent_keys.append(alloc, skip_key);
-            skip_key_owned = false;
+            if (requires_selective_filter) {
+                const skip_key = try alloc.dupe(u8, mutation.key);
+                var skip_key_owned = true;
+                errdefer if (skip_key_owned) alloc.free(skip_key);
+                try skip_intent_keys.append(alloc, skip_key);
+                skip_key_owned = false;
+            }
 
             const primary_key = try internal_keys.documentKeyAlloc(alloc, mutation.key);
             var primary_key_owned = true;
@@ -1760,7 +1782,10 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             }
         }
     }
-    if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0 and skip_intent_keys.items.len == 0) return .{};
+    if (identity_writes.items.len == 0 and
+        identity_visibility_deletes.items.len == 0 and
+        skip_intent_keys.items.len == 0 and
+        !skip_all_intent_application) return .{};
     const owned_writes = try identity_writes.toOwnedSlice(alloc);
     errdefer {
         for (owned_writes) |item| {
@@ -1780,6 +1805,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     return .{
         .writes = owned_writes,
         .deletes = owned_deletes,
+        .skip_all_intent_application = skip_all_intent_application,
         .skip_intent_keys = owned_skip_intent_keys,
     };
 }

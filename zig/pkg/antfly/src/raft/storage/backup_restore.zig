@@ -507,6 +507,10 @@ fn applyPortableRestore(
         .import_derived_indexes = true,
         .embedding_source_fields = embedding_source_fields,
     });
+    portable_backup.validateCompleteDatabaseImageAlloc(alloc, db.core.store) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
     // Go portable AFBs may contain portable logical artifacts (for example
     // embedding batches) as well as old on-disk index directories. Keep the
     // logical artifacts in the DocStore, but drop runtime index directories so

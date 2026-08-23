@@ -83,12 +83,15 @@ type Capabilities struct {
 // work. The nested maintenance telemetry is intentionally retained as raw JSON
 // because it is operational detail rather than control-plane contract.
 type PendingWorkStatus struct {
-	DerivedTargetSequence uint64          `json:"derived_target_sequence"`
-	HasAsyncIndexes       bool            `json:"has_async_indexes"`
-	Enrichment            json.RawMessage `json:"enrichment"`
-	Resolution            json.RawMessage `json:"resolution"`
-	Promotion             json.RawMessage `json:"promotion"`
-	TextMerge             json.RawMessage `json:"text_merge"`
+	DerivedTargetSequence               uint64          `json:"derived_target_sequence"`
+	HasAsyncIndexes                     bool            `json:"has_async_indexes"`
+	PortableImportPublicationInProgress bool            `json:"portable_import_publication_in_progress"`
+	PortableImportRecoveryRequired      bool            `json:"portable_import_recovery_required"`
+	PortableRuntimeActivationPending    bool            `json:"portable_runtime_activation_pending"`
+	Enrichment                          json.RawMessage `json:"enrichment"`
+	Resolution                          json.RawMessage `json:"resolution"`
+	Promotion                           json.RawMessage `json:"promotion"`
+	TextMerge                           json.RawMessage `json:"text_merge"`
 }
 
 // Status is the typed form of StatusJSON. Stats is retained as raw JSON because

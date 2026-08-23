@@ -203,6 +203,8 @@ pub const ErrorCode = enum(c_int) {
     intent_conflict = 4,
     txn_not_found = 5,
     busy = 6,
+    outcome_unknown = 7,
+    unsupported = 8,
     internal = 255,
 };
 
@@ -215,6 +217,8 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
         @intFromEnum(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
         @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
+        @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
+        @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
         @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -228,7 +232,9 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
         @intFromEnum(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
         @intFromEnum(ErrorCode.txn_not_found) => "the requested transaction was not found",
-        @intFromEnum(ErrorCode.busy) => "the database is temporarily busy or a writer is already active",
+        @intFromEnum(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
+        @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+        @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @intFromEnum(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
@@ -277,7 +283,12 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
+        error.SourceFileChanged,
+        error.PortableImportPublicationInProgress,
+        error.PortableRuntimeActivationPending,
         => .busy,
+        error.FileLocksUnsupported => .unsupported,
+        error.DurabilityOutcomeUnknown => .outcome_unknown,
         else => .internal,
     };
 }

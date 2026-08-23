@@ -286,8 +286,8 @@ pub const DB = struct {
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
-        if (self.owned_lite_backend != null) {
-            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, backup);
+        if (self.owned_lite_backend) |*lite_backend| {
+            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, lite_backend, backup);
             return;
         }
         const target_identity = self.inner.core.identity_namespace;

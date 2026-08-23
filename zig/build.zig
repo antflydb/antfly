@@ -2972,8 +2972,10 @@ pub fn build(b: *std.Build) void {
             "export and import documents round trip",
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
+            "file import reports a busy source without waiting for its writer",
             "file import rejects oversized portable blocks before allocation",
             "document batch round-trip",
+            "file reader detects same-size archive replacement between passes",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

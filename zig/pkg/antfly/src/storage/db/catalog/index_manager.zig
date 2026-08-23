@@ -4071,6 +4071,45 @@ pub const IndexManager = struct {
         try self.loadWithBackfill(store, true, false);
     }
 
+    /// Restore activation deliberately stays single-threaded. Individual
+    /// index-open failures are quarantined by the ordinary sequential loader,
+    /// while avoiding the parallel loader's fallible directory-preparation
+    /// pass after the primary-store generation has already been published.
+    pub fn loadForRestore(self: *IndexManager, store: anytype) !void {
+        // Restore targets are required to be pristine. Make the activation
+        // attempt transactional at the in-memory catalog boundary so a
+        // top-level allocation/backend failure can be retried without
+        // duplicating enrichments, resolvers, or partially opened indexes.
+        self.resetRestoreLoadAttempt();
+        errdefer self.resetRestoreLoadAttempt();
+        const previous_parallelism = self.load_parallelism;
+        defer self.load_parallelism = previous_parallelism;
+        self.load_parallelism = 1;
+        try self.loadWithBackfill(store, true, false);
+    }
+
+    fn resetRestoreLoadAttempt(self: *IndexManager) void {
+        self.releaseFullTextPendingBytes();
+        self.text_merge_scheduler.deinit(self.alloc);
+        self.text_merge_scheduler = .{};
+        for (self.text_indexes.items) |*entry| self.freeTextIndexEntry(entry);
+        for (self.dense_indexes.items) |*entry| self.freeDenseIndexEntry(entry);
+        for (self.sparse_indexes.items) |*entry| self.freeSparseIndexEntry(entry);
+        for (self.graph_indexes.items) |*entry| self.freeGraphIndexEntry(entry);
+        for (self.algebraic_indexes.items) |*entry| self.freeAlgebraicIndexEntry(entry);
+        self.text_indexes.clearRetainingCapacity();
+        self.dense_indexes.clearRetainingCapacity();
+        self.sparse_indexes.clearRetainingCapacity();
+        self.graph_indexes.clearRetainingCapacity();
+        self.algebraic_indexes.clearRetainingCapacity();
+        self.truncateEnrichments(0);
+        self.truncateResolvers(0);
+        self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
+        self.clearIndexLoadStates();
+        self.storeGeneratedEnrichmentTargetCache(false);
+    }
+
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, true);
     }
@@ -17169,6 +17208,11 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
     if (version != 1 and version != 2) return error.UnsupportedIndexCatalogVersion;
 
     const count = try readU32(data, &pos);
+    // Each entry needs two length prefixes, a kind byte, and (since v2) a
+    // coverage generation. Reject impossible counts before allowing an
+    // untrusted catalog to drive an allocation.
+    const minimum_entry_size: usize = 4 + 1 + 4 + (if (version >= 2) @as(usize, 8) else 0);
+    if (@as(usize, count) > (data.len - pos) / minimum_entry_size) return error.InvalidIndexCatalog;
     var configs = try alloc.alloc(types.IndexConfig, count);
     var initialized: usize = 0;
     errdefer {
@@ -17214,6 +17258,26 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
     }
 
     return configs;
+}
+
+/// Validate the durable index catalog without opening index backends or
+/// mutating an IndexManager. Portable restore uses this during isolated
+/// staging so malformed metadata can never fail after publication.
+pub fn validateSerializedCatalog(alloc: Allocator, data: []const u8) !void {
+    const configs = try deserializeCatalog(alloc, data);
+    defer {
+        for (configs) |*cfg| cfg.deinit(alloc);
+        alloc.free(configs);
+    }
+}
+
+test "index catalog rejects impossible entry count before allocation" {
+    var encoded: [12]u8 = undefined;
+    @memcpy(encoded[0..4], "AIDX");
+    std.mem.writeInt(u32, encoded[4..8], 2, .little);
+    std.mem.writeInt(u32, encoded[8..12], std.math.maxInt(u32), .little);
+
+    try std.testing.expectError(error.InvalidIndexCatalog, validateSerializedCatalog(std.testing.allocator, &encoded));
 }
 
 fn appendU32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {

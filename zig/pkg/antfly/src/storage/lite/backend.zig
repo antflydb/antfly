@@ -77,6 +77,7 @@ pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    writer_lock_marker: []const u8 = "",
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -481,6 +482,15 @@ pub const Handle = struct {
         return try self.checkWithCancel(null);
     }
 
+    /// Atomically replaces the native file generation while preserving this
+    /// handle's writer lock and runtime-store object identities.
+    pub fn replaceWithPreparedGeneration(self: *Handle, prepared: *Handle) !native.GenerationPublicationOutcome {
+        if (self.engine != .native_single_file or prepared.engine != .native_single_file) {
+            return error.UnsupportedOperation;
+        }
+        return try self.native_docstore.?.replaceWithPreparedGeneration(prepared.native_docstore.?);
+    }
+
     fn checkWithCancel(self: *Handle, cancel: ?*const maintenance.CancelToken) !CheckReport {
         return switch (self.engine) {
             .bridge_lsm_container => blk: {
@@ -638,6 +648,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
+        .writer_lock_marker = opts.writer_lock_marker,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }

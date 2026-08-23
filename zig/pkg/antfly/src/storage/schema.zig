@@ -273,6 +273,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
 fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
     std.debug.assert(format_version == 11 or format_version == 12 or format_version == 13);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
+    try validateRelationalSchema(alloc, schema);
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
         return error.InvalidSchema;
     }
@@ -403,6 +404,10 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
 /// is independent of the source buffer. Call `freeSchema` to release.
 pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
+    // Persisted schemas are also accepted from portable backups and HA logs.
+    // Validate the complete byte stream before any unchecked legacy decoding
+    // or input-sized allocation so corruption is always a typed error.
+    try validateSerializedSchema(data);
     if (data.len < 4) return error.InvalidFormat;
     if (!std.mem.eql(u8, data[0..4], "ASCH")) return error.InvalidFormat;
 
@@ -876,7 +881,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
-    return .{
+    const result: TableSchema = .{
         .version = version,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
@@ -890,6 +895,236 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
+    errdefer freeSchema(alloc, result);
+    try validateRelationalSchema(alloc, result);
+    return result;
+}
+
+const SchemaValidationCursor = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const @This()) usize {
+        return self.data.len - self.pos;
+    }
+
+    fn ensure(self: *const @This(), len: usize) !void {
+        if (len > self.remaining()) return error.InvalidFormat;
+    }
+
+    fn readU8(self: *@This()) !u8 {
+        try self.ensure(1);
+        const value = self.data[self.pos];
+        self.pos += 1;
+        return value;
+    }
+
+    fn readBool(self: *@This()) !void {
+        switch (try self.readU8()) {
+            0, 1 => {},
+            else => return error.InvalidSchema,
+        }
+    }
+
+    fn readU32(self: *@This()) !u32 {
+        try self.ensure(4);
+        const value = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        return value;
+    }
+
+    fn readU64(self: *@This()) !void {
+        try self.ensure(8);
+        self.pos += 8;
+    }
+
+    fn readStr(self: *@This()) !void {
+        const len = try self.readU32();
+        try self.ensure(len);
+        self.pos += len;
+    }
+
+    fn readOptStr(self: *@This()) !void {
+        switch (try self.readU8()) {
+            0 => {},
+            1 => try self.readStr(),
+            else => return error.InvalidSchema,
+        }
+    }
+
+    fn ensureCount(self: *const @This(), count: u32, minimum_encoded_size: usize) !void {
+        if (@as(usize, count) > self.remaining() / minimum_encoded_size) return error.InvalidFormat;
+    }
+
+    fn finish(self: *const @This()) !void {
+        if (self.pos != self.data.len) return error.InvalidFormat;
+    }
+};
+
+fn validateSerializedSchema(data: []const u8) !void {
+    var cursor: SchemaValidationCursor = .{ .data = data };
+    try cursor.ensure(4);
+    if (!std.mem.eql(u8, data[0..4], "ASCH")) return error.InvalidFormat;
+    cursor.pos = 4;
+
+    const format_version = try cursor.readU32();
+    if (format_version < 1 or format_version > 13) return error.UnsupportedVersion;
+    _ = try cursor.readU32(); // logical schema version
+    try cursor.readStr(); // default type
+    try cursor.readU64(); // TTL duration
+    try cursor.readStr(); // TTL field
+    try cursor.readBool(); // enforce types
+
+    const template_count = try cursor.readU32();
+    const minimum_template_size: usize = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 4 +
+        @as(usize, @intFromBool(format_version >= 7)) * 3 +
+        @as(usize, @intFromBool(format_version >= 9)) +
+        @as(usize, @intFromBool(format_version >= 11));
+    try cursor.ensureCount(template_count, minimum_template_size);
+    for (0..template_count) |_| {
+        try cursor.readStr();
+        try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+        try cursor.readBool();
+        try cursor.readBool();
+        try cursor.readBool();
+        if (format_version >= 9) try cursor.readBool();
+        if (format_version >= 11 and (try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected))
+            return error.InvalidSchema;
+        try cursor.readBool();
+        try cursor.readStr();
+    }
+
+    if (format_version >= 12) {
+        const declared_count = try cursor.readU32();
+        try cursor.ensureCount(declared_count, 15);
+        for (0..declared_count) |_| {
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            inline for (0..4) |_| try cursor.readBool();
+            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readStr();
+        }
+
+        const exact_count = try cursor.readU32();
+        try cursor.ensureCount(exact_count, 19);
+        for (0..exact_count) |_| {
+            try cursor.readStr();
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            inline for (0..4) |_| try cursor.readBool();
+            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readStr();
+        }
+    }
+
+    if (format_version >= 2) {
+        const document_count = try cursor.readU32();
+        var minimum_document_size: usize = 8;
+        if (format_version >= 3) minimum_document_size += 4;
+        if (format_version >= 6) minimum_document_size += 4;
+        if (format_version >= 8) minimum_document_size += 4;
+        try cursor.ensureCount(document_count, minimum_document_size);
+        for (0..document_count) |_| {
+            try cursor.readStr();
+            const field_count = try cursor.readU32();
+            try cursor.ensureCount(field_count, 13);
+            for (0..field_count) |_| {
+                try cursor.readStr();
+                try cursor.readStr();
+                try cursor.readStr();
+                try cursor.readBool();
+            }
+            if (format_version >= 3) {
+                const rule_count = try cursor.readU32();
+                const minimum_rule_size: usize = 8 +
+                    @as(usize, @intFromBool(format_version >= 4)) * 4 +
+                    @as(usize, @intFromBool(format_version >= 5));
+                try cursor.ensureCount(rule_count, minimum_rule_size);
+                for (0..rule_count) |_| {
+                    try cursor.readStr();
+                    if (format_version >= 5) try cursor.readOptStr();
+                    if (format_version >= 4) try cursor.readStr();
+                    const variant_count = try cursor.readU32();
+                    try cursor.ensureCount(variant_count, 9);
+                    for (0..variant_count) |_| {
+                        try cursor.readStr();
+                        try cursor.readStr();
+                        try cursor.readBool();
+                    }
+                }
+            }
+            if (format_version >= 6) {
+                const open_path_count = try cursor.readU32();
+                try cursor.ensureCount(open_path_count, 4);
+                for (0..open_path_count) |_| try cursor.readStr();
+            }
+            if (format_version >= 8) {
+                const infer_path_count = try cursor.readU32();
+                try cursor.ensureCount(infer_path_count, 4);
+                for (0..infer_path_count) |_| try cursor.readStr();
+            }
+        }
+    }
+
+    if (format_version >= 10) {
+        const sort_count = try cursor.readU32();
+        try cursor.ensureCount(sort_count, 5);
+        for (0..sort_count) |_| {
+            try cursor.readStr();
+            try cursor.readBool();
+        }
+    }
+
+    if (format_version >= 13) {
+        switch (try cursor.readU8()) {
+            @intFromEnum(StorageMode.document), @intFromEnum(StorageMode.relational) => {},
+            else => return error.InvalidSchema,
+        }
+        const column_count = try cursor.readU32();
+        try cursor.ensureCount(column_count, 13);
+        for (0..column_count) |_| {
+            try cursor.readStr();
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(RelationalColumnType).len) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readBool();
+            try cursor.readBool();
+            if ((try cursor.readU8()) >= std.meta.fields(RelationalJsonKind).len) return error.InvalidSchema;
+        }
+    }
+    try cursor.finish();
+}
+
+fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    // Document-mode schemas retain derived column capability metadata for
+    // planning, but only relational mode uses this catalog as the physical row
+    // contract and therefore requires uniqueness/encoding invariants.
+    if (schema.storage_mode == .document) return;
+
+    var names = std.StringHashMapUnmanaged(void).empty;
+    defer names.deinit(alloc);
+    var paths = std.StringHashMapUnmanaged(void).empty;
+    defer paths.deinit(alloc);
+    const capacity = std.math.cast(u32, schema.relational_columns.len) orelse return error.InvalidSchema;
+    try names.ensureTotalCapacity(alloc, capacity);
+    try paths.ensureTotalCapacity(alloc, capacity);
+
+    for (schema.relational_columns) |column| {
+        if (column.name.len == 0 or column.path.len == 0 or
+            !std.unicode.utf8ValidateSlice(column.name) or
+            !std.unicode.utf8ValidateSlice(column.path)) return error.InvalidSchema;
+        if ((column.column_type == .json) != column.is_json) return error.InvalidSchema;
+        if (column.is_json != (column.json_kind != .none)) return error.InvalidSchema;
+        if ((try names.getOrPut(alloc, column.name)).found_existing) return error.InvalidSchema;
+        if ((try paths.getOrPut(alloc, column.path)).found_existing) return error.InvalidSchema;
+    }
 }
 
 /// Free a schema returned by deserializeSchema.
@@ -2269,6 +2504,66 @@ test "schema round trips relational storage catalog and reads version 11 default
     defer freeSchema(alloc, loaded_legacy);
     try std.testing.expectEqual(StorageMode.document, loaded_legacy.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), loaded_legacy.relational_columns.len);
+}
+
+test "schema decoder rejects truncated trailing and noncanonical relational data" {
+    const alloc = std.testing.allocator;
+    const columns = [_]RelationalColumn{.{
+        .name = "payload",
+        .path = "payload",
+        .column_type = .json,
+        .is_json = true,
+        .json_kind = .object,
+    }};
+    const encoded = try serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(alloc, encoded[0 .. encoded.len - 1]));
+
+    const trailing = try std.mem.concat(alloc, u8, &.{ encoded, "x" });
+    defer alloc.free(trailing);
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(alloc, trailing));
+
+    const invalid_json_kind = try alloc.dupe(u8, encoded);
+    defer alloc.free(invalid_json_kind);
+    invalid_json_kind[invalid_json_kind.len - 1] = 0xff;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(alloc, invalid_json_kind));
+}
+
+test "schema serialization rejects inconsistent relational column catalogs" {
+    const alloc = std.testing.allocator;
+    const duplicate_names = [_]RelationalColumn{
+        .{ .name = "value", .path = "value", .column_type = .string },
+        .{ .name = "value", .path = "value_copy", .column_type = .string },
+    };
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &duplicate_names,
+    }));
+
+    const duplicate_paths = [_]RelationalColumn{
+        .{ .name = "first", .path = "value", .column_type = .string },
+        .{ .name = "second", .path = "value", .column_type = .string },
+    };
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &duplicate_paths,
+    }));
+
+    const inconsistent_json = [_]RelationalColumn{.{
+        .name = "payload",
+        .path = "payload",
+        .column_type = .json,
+        .is_json = false,
+        .json_kind = .any,
+    }};
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &inconsistent_json,
+    }));
 }
 
 test "schema serialization rejects unsorted or duplicate exact fields" {

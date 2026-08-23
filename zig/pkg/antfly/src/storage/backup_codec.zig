@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
+const Blake3 = std.crypto.hash.Blake3;
 const ArrayList = std.ArrayList;
 
 /// AFB file magic bytes: "ANTFLYB\n"
@@ -292,17 +293,33 @@ pub const SliceReader = struct {
 /// borrowed and may be shared by multiple sequential passes because reads do
 /// not mutate its descriptor offset.
 pub const FileReader = struct {
+    pub const Fingerprint = [Blake3.digest_length]u8;
+
     io: std.Io,
     file: std.Io.File,
     size: u64,
     pos: u64 = 0,
+    hasher: Blake3 = Blake3.init(.{}),
+    completed_pass_fingerprint: ?Fingerprint = null,
+    generation_changed: bool = false,
 
     pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
         return .{ .io = io, .file = file, .size = size };
     }
 
     pub fn reset(self: *FileReader) void {
+        if (self.pos != self.size) {
+            self.generation_changed = true;
+        } else {
+            const fingerprint = self.currentFingerprint();
+            if (self.completed_pass_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint)) self.generation_changed = true;
+            } else {
+                self.completed_pass_fingerprint = fingerprint;
+            }
+        }
         self.pos = 0;
+        self.hasher = Blake3.init(.{});
     }
 
     fn readExact(self: *FileReader, out: []u8) !void {
@@ -310,6 +327,33 @@ pub const FileReader = struct {
         const n = try self.file.readPositionalAll(self.io, out, self.pos);
         if (n != out.len) return error.EndOfStream;
         self.pos += out.len;
+        self.hasher.update(out);
+    }
+
+    fn currentFingerprint(self: *const FileReader) Fingerprint {
+        var fingerprint: Fingerprint = undefined;
+        self.hasher.final(&fingerprint);
+        return fingerprint;
+    }
+
+    /// Returns the fingerprint for a complete pass, rejecting a different
+    /// generation observed by any earlier pass through this reader.
+    pub fn verifiedFingerprint(self: *const FileReader) !Fingerprint {
+        if (self.pos != self.size) return error.EndOfStream;
+        if (self.generation_changed) return error.SourceFileChanged;
+        const fingerprint = self.currentFingerprint();
+        if (self.completed_pass_fingerprint) |expected| {
+            if (!std.mem.eql(u8, &expected, &fingerprint)) return error.SourceFileChanged;
+            return expected;
+        }
+        return fingerprint;
+    }
+
+    /// Verifies that this complete pass read exactly the same file bytes as a
+    /// prior reader, without another file scan or archive-sized allocation.
+    pub fn verifyFingerprint(self: *const FileReader, expected: Fingerprint) !void {
+        const actual = try self.verifiedFingerprint();
+        if (!std.mem.eql(u8, &expected, &actual)) return error.SourceFileChanged;
     }
 
     pub fn readHeader(self: *FileReader) !FileHeader {
@@ -368,6 +412,33 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
     var decomp = std.compress.zstd.Decompress.init(&input, &window_buf, .{});
     return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
+}
+
+test "file reader detects same-size archive replacement between passes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generation.afb", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, "generation-a", 0);
+
+    var reader = FileReader.init(io, file, "generation-a".len);
+    var first: ["generation-a".len]u8 = undefined;
+    try reader.readExact(&first);
+    reader.reset();
+
+    // Preserve the length so metadata-only generation checks cannot provide
+    // the content guarantee on filesystems with coarse timestamp resolution.
+    try file.writePositionalAll(io, "generation-b", 0);
+    var second: ["generation-b".len]u8 = undefined;
+    try reader.readExact(&second);
+    try std.testing.expectError(error.SourceFileChanged, reader.verifiedFingerprint());
 }
 
 // --- Batch Encoding helpers ---
