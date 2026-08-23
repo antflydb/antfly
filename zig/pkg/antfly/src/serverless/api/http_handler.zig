@@ -3276,17 +3276,9 @@ pub const HttpHandler = struct {
                     if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
-                try nodes.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, node.key),
-                    .table = if (node.target_table) |table| try self.alloc.dupe(u8, table) else null,
-                    .depth = node.depth,
-                    .distance = node.total_weight,
-                    .path = if (node.path) |path|
-                        try allocPathNodes(self.alloc, path)
-                    else
-                        null,
-                    .path_edges = null,
-                });
+                var result_node = try graphResultNodeFromTraversalAlloc(self.alloc, node);
+                errdefer result_node.deinit(self.alloc);
+                try nodes.append(self.alloc, result_node);
                 if (nodes.items.len >= collection_limit) {
                     truncated = true;
                     break;
@@ -5596,6 +5588,52 @@ fn allocPathNodes(alloc: Allocator, nodes: []const []const u8) ![]const []const 
         initialized += 1;
     }
     return out;
+}
+
+fn graphResultNodeFromTraversalAlloc(
+    alloc: Allocator,
+    node: graph_traversal.TraversalResult,
+) !graph_query_mod.GraphResultNode {
+    const key = try alloc.dupe(u8, node.key);
+    errdefer alloc.free(key);
+    const table = if (node.target_table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
+    const path = if (node.path) |value| try allocPathNodes(alloc, value) else null;
+    errdefer if (path) |value| freeGraphPath(alloc, value);
+    const path_tables = if (path) |value|
+        try allocPathTablesFromTerminal(alloc, value.len, node.target_table)
+    else
+        null;
+    errdefer if (path_tables) |values| freeOptionalPathTables(alloc, values);
+
+    return .{
+        .key = key,
+        .table = table,
+        .depth = node.depth,
+        .distance = node.total_weight,
+        .path = path,
+        .path_tables = path_tables,
+        .path_edges = null,
+    };
+}
+
+fn allocPathTablesFromTerminal(
+    alloc: Allocator,
+    path_len: usize,
+    terminal_table: ?[]const u8,
+) !?[]const ?[]const u8 {
+    const table = terminal_table orelse return null;
+    if (path_len == 0) return null;
+    const out = try alloc.alloc(?[]const u8, path_len);
+    @memset(out, null);
+    errdefer alloc.free(out);
+    out[path_len - 1] = try alloc.dupe(u8, table);
+    return out;
+}
+
+fn freeOptionalPathTables(alloc: Allocator, tables: []const ?[]const u8) void {
+    for (tables) |table| if (table) |value| alloc.free(value);
+    alloc.free(tables);
 }
 
 fn dupGraphPathAlloc(alloc: Allocator, path: [][]u8) ![][]u8 {
@@ -10640,11 +10678,17 @@ test "serverless public graph reader preserves qualified endpoint identity" {
     const reached = try graph_traversal.traverseWithEdgeReader(alloc, reader, "doc:a", .{
         .max_depth = 2,
         .max_results = 10,
+        .include_paths = true,
     });
     defer graph_traversal.freeOwnedResults(alloc, reached);
     try std.testing.expectEqual(@as(usize, 1), reached.len);
     try std.testing.expectEqualStrings("shared", reached[0].key);
     try std.testing.expectEqualStrings("entities", reached[0].target_table.?);
+    var result_node = try graphResultNodeFromTraversalAlloc(alloc, reached[0]);
+    defer result_node.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", result_node.path.?[0]);
+    try std.testing.expect(result_node.path_tables.?[0] == null);
+    try std.testing.expectEqualStrings("entities", result_node.path_tables.?[1].?);
 
     var path_budget = ServerlessGraphReadBudget{ .cancellation = .none };
     const path_reader = ServerlessPathEdgeReader{ .cached = &cached, .budget = &path_budget };

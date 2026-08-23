@@ -4144,6 +4144,11 @@ fn graphPathToResultNode(
         null;
     const nodes = try dupPath(alloc, path.nodes);
     errdefer freePathArray(alloc, nodes);
+    const node_tables = if (path.node_tables.len > 0)
+        try dupOptionalStrings(alloc, path.node_tables)
+    else
+        null;
+    errdefer if (node_tables) |value| freeOptionalStrings(alloc, value);
     const edges = if (path.edges.len > 0)
         try dupPathEdgesFromGraphPath(alloc, path.edges)
     else
@@ -4157,6 +4162,7 @@ fn graphPathToResultNode(
         path.length,
         path.total_weight,
         nodes,
+        node_tables,
         edges,
     );
 }
@@ -5090,6 +5096,12 @@ fn materializePathStateNode(
     const path_state = state.path_states.items[path_state_id];
     const path = try reconstructPath(alloc, state.path_states.items, path_state_id);
     errdefer freePathArray(alloc, path);
+    const path_tables_raw = try reconstructPathTables(alloc, state.path_states.items, path_state_id);
+    errdefer freeOptionalStrings(alloc, path_tables_raw);
+    const path_tables: ?[]const ?[]const u8 = if (path_tables_raw.len > 0)
+        path_tables_raw
+    else
+        null;
     const path_edges = try reconstructPathEdges(alloc, state.path_states.items, path_state_id);
     errdefer freePathEdges(alloc, path_edges);
     const owned_path_edges: ?[]const graph_query_mod.PathEdgeInfo = if (path_edges.len > 0)
@@ -5106,6 +5118,7 @@ fn materializePathStateNode(
         path_state.depth,
         path_state.distance,
         path,
+        path_tables,
         owned_path_edges,
     );
 }
@@ -6560,6 +6573,7 @@ fn materializeResultNode(
             parent.distance + node.distance,
             null,
             null,
+            null,
         );
     }
 
@@ -6567,6 +6581,12 @@ fn materializeResultNode(
     const path_state = state.path_states.items[id];
     const path = try reconstructPath(alloc, state.path_states.items, id);
     errdefer freePathArray(alloc, path);
+    const path_tables_raw = try reconstructPathTables(alloc, state.path_states.items, id);
+    errdefer freeOptionalStrings(alloc, path_tables_raw);
+    const path_tables: ?[]const ?[]const u8 = if (path_tables_raw.len > 0)
+        path_tables_raw
+    else
+        null;
     const path_edges = try reconstructPathEdges(alloc, state.path_states.items, id);
     errdefer freePathEdges(alloc, path_edges);
     const owned_path_edges: ?[]const graph_query_mod.PathEdgeInfo = if (path_edges.len > 0)
@@ -6583,6 +6603,7 @@ fn materializeResultNode(
         path_state.depth,
         path_state.distance,
         path,
+        path_tables,
         owned_path_edges,
     );
 }
@@ -6647,6 +6668,7 @@ fn initGraphResultNode(
     depth: u32,
     distance: f64,
     path: ?[]const []const u8,
+    path_tables: ?[]const ?[]const u8,
     path_edges: ?[]const graph_query_mod.PathEdgeInfo,
 ) !graph_query_mod.GraphResultNode {
     const owned_key = try alloc.dupe(u8, key);
@@ -6660,6 +6682,7 @@ fn initGraphResultNode(
         .depth = depth,
         .distance = distance,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
     };
 }
@@ -7668,6 +7691,8 @@ fn cloneGraphNode(
     errdefer alloc.free(key);
     const path = if (node.path) |value| try dupPath(alloc, value) else null;
     errdefer if (path) |value| freePathArray(alloc, value);
+    const path_tables = if (node.path_tables) |value| try dupOptionalStrings(alloc, value) else null;
+    errdefer if (path_tables) |value| freeOptionalStrings(alloc, value);
     const path_edges = if (node.path_edges) |value| try dupPathEdges(alloc, value) else null;
     errdefer if (path_edges) |value| freePathEdges(alloc, value);
     const provenance = if (node.provenance) |value| try dupPath(alloc, value) else null;
@@ -7680,6 +7705,7 @@ fn cloneGraphNode(
         .depth = node.depth,
         .distance = node.distance,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
         .provenance = provenance,
         .table = table,
@@ -8854,7 +8880,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
                 try std.testing.expectEqual(@as(?u64, 101), req.identity_read_generation);
                 try std.testing.expectEqualStrings("a", req.frontier[0].key);
                 const nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 1);
-                nodes[0] = try initGraphResultNode(alloc_inner, "z", null, 1, 1, null, null);
+                nodes[0] = try initGraphResultNode(alloc_inner, "z", null, 1, 1, null, null, null);
                 const expansions = try alloc_inner.alloc(GraphExpansion, 1);
                 expansions[0] = .{
                     .frontier_id = req.frontier[0].id,
@@ -9552,6 +9578,7 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 1,
                 null,
                 null,
+                null,
             );
             errdefer nodes[0].deinit(alloc);
 
@@ -9644,6 +9671,35 @@ test "distributed graph traverse routes cross-table frontier by table generation
     try std.testing.expectEqualStrings("entities", results[0].nodes[0].table.?);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("entities", results[0].hits[0].source_table.?);
+}
+
+test "distributed graph path materialization preserves table provenance" {
+    const alloc = std.testing.allocator;
+    var state = QueryState{ .name = try alloc.dupe(u8, "walk") };
+    defer state.deinit(alloc);
+
+    const root = try appendRootPathState(alloc, &state, "doc:a", null);
+    var shared = try initPathState(alloc, "shared", "entities", 1, 1, 1, root, null);
+    var shared_owned = true;
+    errdefer if (shared_owned) shared.deinit(alloc);
+    try state.path_states.append(alloc, shared);
+    shared_owned = false;
+    const shared_id: u32 = @intCast(state.path_states.items.len - 1);
+
+    var target = try initPathState(alloc, "doc:c", "entities", 2, 2, 2, shared_id, null);
+    var target_owned = true;
+    errdefer if (target_owned) target.deinit(alloc);
+    try state.path_states.append(alloc, target);
+    target_owned = false;
+    const target_id: u32 = @intCast(state.path_states.items.len - 1);
+
+    var node = try materializePathStateNode(alloc, &state, target_id);
+    defer node.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), node.path.?.len);
+    try std.testing.expectEqualStrings("doc:a", node.path.?[0]);
+    try std.testing.expect(node.path_tables.?[0] == null);
+    try std.testing.expectEqualStrings("entities", node.path_tables.?[1].?);
+    try std.testing.expectEqualStrings("entities", node.path_tables.?[2].?);
 }
 
 test "distributed graph retries once on topology change and succeeds" {

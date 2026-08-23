@@ -1524,6 +1524,12 @@ pub const GraphCrossRangeModeUnsupportedError = struct {
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
+    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+    operation: []const u8,
+    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
+    mode: []const u8,
+    /// Stable machine-readable constraint that prevents exact cross-range execution.
+    reason: []const u8,
 };
 
 pub const GraphDistinctBudgetExceededError = struct {

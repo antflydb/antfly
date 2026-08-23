@@ -5292,7 +5292,7 @@ fn toOpenApiGraphQueryResult(
         const response: indexes_openapi.LegacyGraphQueryResult = .{
             .kind = "legacy",
             .type = legacyGraphQueryType(query.query_type),
-            .nodes = try toOpenApiGraphNodes(alloc, graph_result),
+            .nodes = try toOpenApiLegacyGraphNodes(alloc, graph_result),
             .paths = try toOpenApiPaths(alloc, graph_result.paths),
             .matches = try toOpenApiLegacyPatternMatches(
                 alloc,
@@ -5364,7 +5364,7 @@ fn toOpenApiLegacyPatternMatches(
     if (graph_result.matches.len == 0) return null;
     const out = try alloc.alloc(indexes_openapi.PatternMatch, graph_result.matches.len);
     for (graph_result.matches, 0..) |match, i| {
-        var bindings: std.json.ArrayHashMap(indexes_openapi.GraphResultNode) = .{};
+        var bindings: std.json.ArrayHashMap(indexes_openapi.LegacyGraphResultNode) = .{};
         errdefer bindings.deinit(alloc);
         for (match.bindings) |binding| {
             try bindings.map.put(alloc, binding.alias, .{
@@ -5413,7 +5413,7 @@ fn toOpenApiGraphRows(
                     binding.node.key,
                     binding.node.table,
                 ),
-                .path = binding.node.path,
+                .path = try toOpenApiGraphNodePath(alloc, binding.node),
                 .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
                 .provenance = binding.node.provenance,
                 .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
@@ -5674,6 +5674,28 @@ fn toOpenApiGraphNodes(
             .depth = @intCast(node.depth),
             .distance = node.distance,
             .document = findGraphDocument(alloc, graph_result.hits, node.key, node.table),
+            .path = try toOpenApiGraphNodePath(alloc, node),
+            .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
+            .provenance = node.provenance,
+            .evidence = try graphNodeEvidenceJsonValue(alloc, node),
+            .edges = null,
+        };
+    }
+    return nodes;
+}
+
+fn toOpenApiLegacyGraphNodes(
+    alloc: std.mem.Allocator,
+    graph_result: db_mod.types.GraphSearchResult,
+) ![]const indexes_openapi.LegacyGraphResultNode {
+    const nodes = try alloc.alloc(indexes_openapi.LegacyGraphResultNode, graph_result.nodes.len);
+    for (graph_result.nodes, 0..) |node, i| {
+        nodes[i] = .{
+            .key = node.key,
+            .table = node.table,
+            .depth = @intCast(node.depth),
+            .distance = node.distance,
+            .document = findGraphDocument(alloc, graph_result.hits, node.key, node.table),
             .path = node.path,
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
@@ -5682,6 +5704,25 @@ fn toOpenApiGraphNodes(
         };
     }
     return nodes;
+}
+
+fn toOpenApiGraphNodePath(
+    alloc: std.mem.Allocator,
+    node: graph_query_mod.GraphResultNode,
+) !?[]const indexes_openapi.GraphPathEndpoint {
+    const path = node.path orelse return null;
+    const tables = node.path_tables;
+    if (tables) |values| {
+        if (values.len != path.len) return error.InvalidRemoteResponse;
+    }
+    const out = try alloc.alloc(indexes_openapi.GraphPathEndpoint, path.len);
+    for (path, 0..) |key, i| {
+        out[i] = .{
+            .key = key,
+            .table = if (tables) |values| values[i] else null,
+        };
+    }
+    return out;
 }
 
 fn findGraphDocument(
@@ -5871,6 +5912,7 @@ test "api query contract preserves algebraic graph path provenance" {
     defer arena_impl.deinit();
     const alloc = arena_impl.allocator();
     const path_nodes: []const []const u8 = &.{ "A", "B", "C" };
+    const path_tables: []const ?[]const u8 = &.{ null, "entities", "entities" };
     const path_edges: []const graph_query_mod.PathEdgeInfo = &.{
         .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2,\"mention_artifact_keys\":[\"m1\",\"m2\"]}" },
         .{ .source = "B", .target = "C", .edge_type = "e", .weight = 3.0 },
@@ -5881,6 +5923,7 @@ test "api query contract preserves algebraic graph path provenance" {
         .depth = 2,
         .distance = 2.0,
         .path = path_nodes,
+        .path_tables = path_tables,
         .path_edges = path_edges,
         .provenance = provenance,
     }};
@@ -5895,6 +5938,7 @@ test "api query contract preserves algebraic graph path provenance" {
 
     const encoded = try toOpenApiGraphNodes(alloc, graph_result);
     defer {
+        if (encoded[0].path) |items| alloc.free(items);
         if (encoded[0].path_edges) |items| alloc.free(items);
         alloc.free(encoded);
     }
@@ -5903,8 +5947,10 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqualStrings("C", encoded[0].key);
     try std.testing.expectEqual(@as(i64, 2), encoded[0].depth.?);
     try std.testing.expectEqual(@as(f64, 2.0), encoded[0].distance.?);
-    try std.testing.expectEqualStrings("A", encoded[0].path.?[0]);
-    try std.testing.expectEqualStrings("C", encoded[0].path.?[2]);
+    try std.testing.expectEqualStrings("A", encoded[0].path.?[0].key);
+    try std.testing.expect(encoded[0].path.?[0].table == null);
+    try std.testing.expectEqualStrings("C", encoded[0].path.?[2].key);
+    try std.testing.expectEqualStrings("entities", encoded[0].path.?[2].table.?);
     try std.testing.expectEqual(@as(usize, 2), encoded[0].path_edges.?.len);
     try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type.?);
     try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight.?);
@@ -5922,6 +5968,11 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
     try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
     try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
+
+    const legacy_encoded = try toOpenApiLegacyGraphNodes(alloc, graph_result);
+    defer alloc.free(legacy_encoded);
+    try std.testing.expectEqualStrings("A", legacy_encoded[0].path.?[0]);
+    try std.testing.expectEqualStrings("C", legacy_encoded[0].path.?[2]);
 }
 
 test "api query contract hydrates equal graph keys from their table namespace" {

@@ -772,13 +772,182 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
-pub fn graphCrossRangeModeUnsupportedBody(alloc: std.mem.Allocator) ![]u8 {
+const GraphCrossRangeDiagnostic = struct {
+    operation: []const u8 = "$request",
+    mode: []const u8 = "graph_queries",
+    reason: []const u8 = "unsupported_mode",
+};
+
+pub fn graphCrossRangeModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    const diagnostic = if (parsed) |value| graphCrossRangeDiagnostic(value.value) else GraphCrossRangeDiagnostic{};
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_cross_range_mode_unsupported",
         .message = "this graph query mode cannot be executed exactly across multiple shards; use a supported canonical graph mode or a single-shard table",
         .retryable = false,
+        .operation = diagnostic.operation,
+        .mode = diagnostic.mode,
+        .reason = diagnostic.reason,
     }, .{});
+}
+
+fn graphCrossRangeDiagnostic(root: std.json.Value) GraphCrossRangeDiagnostic {
+    if (root != .object) return .{};
+    if (root.object.get("expand_strategy")) |value| {
+        if (value != .null) return .{ .reason = "expand_strategy_not_supported" };
+    }
+    if (root.object.get("graph_queries")) |queries| {
+        if (queries == .object) return canonicalCrossRangeDiagnostic(queries.object);
+    }
+    if (root.object.get("graph_searches")) |queries| {
+        if (queries == .object) return legacyCrossRangeDiagnostic(queries.object);
+    }
+    return .{};
+}
+
+fn canonicalCrossRangeDiagnostic(queries: std.json.ObjectMap) GraphCrossRangeDiagnostic {
+    var fallback: ?GraphCrossRangeDiagnostic = null;
+    var it = queries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const operation_name = entry.key_ptr.*;
+        const value = entry.value_ptr.object;
+        const mode = canonicalGraphMode(value) orelse "unknown";
+        if (fallback == null) fallback = .{ .operation = operation_name, .mode = mode };
+        const params = value.get(mode) orelse continue;
+        if (params != .object) continue;
+        if (jsonString(params.object, "direction")) |direction| {
+            if (!std.mem.eql(u8, direction, "out")) return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "direction_must_be_out",
+            };
+        }
+        if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
+            return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "deduplicate_nodes_must_be_true",
+            };
+        }
+        if (params.object.get("start")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "start_selector_not_supported",
+            };
+        }
+    }
+    return fallback orelse .{};
+}
+
+fn legacyCrossRangeDiagnostic(queries: std.json.ObjectMap) GraphCrossRangeDiagnostic {
+    var fallback: ?GraphCrossRangeDiagnostic = null;
+    var it = queries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const operation_name = entry.key_ptr.*;
+        const value = entry.value_ptr.object;
+        const mode = jsonString(value, "type") orelse "unknown";
+        if (fallback == null) fallback = .{ .operation = operation_name, .mode = mode };
+        if (value.get("params")) |params| {
+            if (params == .object) {
+                if (jsonString(params.object, "direction")) |direction| {
+                    if (!std.mem.eql(u8, direction, "out")) return .{
+                        .operation = operation_name,
+                        .mode = mode,
+                        .reason = "direction_must_be_out",
+                    };
+                }
+                if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
+                    .operation = operation_name,
+                    .mode = mode,
+                    .reason = "deduplicate_nodes_must_be_true",
+                };
+            }
+        }
+        if (value.get("start_nodes")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "start_selector_not_supported",
+            };
+        }
+        if (value.get("target_nodes")) |selector| {
+            if (selectorRefUnsupported(selector)) return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "target_selector_not_supported",
+            };
+        }
+        if (value.get("params")) |params| {
+            if (params == .object) {
+                if (std.mem.eql(u8, mode, "neighbors") or std.mem.eql(u8, mode, "traverse")) {
+                    if (jsonString(params.object, "weight_mode")) |weight_mode| {
+                        if (!std.mem.eql(u8, weight_mode, "min_hops")) return .{
+                            .operation = operation_name,
+                            .mode = mode,
+                            .reason = "weight_mode_must_be_min_hops",
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, mode, "shortest_path")) {
+                    if (jsonInteger(params.object, "k")) |k| {
+                        if (k != 1) return .{
+                            .operation = operation_name,
+                            .mode = mode,
+                            .reason = "k_must_equal_one",
+                        };
+                    }
+                }
+            }
+        }
+        if ((std.mem.eql(u8, mode, "shortest_path") or std.mem.eql(u8, mode, "k_shortest_paths")) and
+            value.get("target_nodes") == null)
+        {
+            return .{ .operation = operation_name, .mode = mode, .reason = "target_required" };
+        }
+        if (std.mem.eql(u8, mode, "pattern")) {
+            const pattern = value.get("pattern");
+            if (pattern == null or pattern.? != .array or pattern.?.array.items.len == 0) return .{
+                .operation = operation_name,
+                .mode = mode,
+                .reason = "pattern_required",
+            };
+        }
+    }
+    return fallback orelse .{};
+}
+
+fn canonicalGraphMode(value: std.json.ObjectMap) ?[]const u8 {
+    inline for ([_][]const u8{ "match", "traverse", "shortest_path", "k_shortest_paths" }) |mode| {
+        if (value.get(mode) != null) return mode;
+    }
+    return null;
+}
+
+fn jsonString(value: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const item = value.get(key) orelse return null;
+    return if (item == .string) item.string else null;
+}
+
+fn jsonBool(value: std.json.ObjectMap, key: []const u8) ?bool {
+    const item = value.get(key) orelse return null;
+    return if (item == .bool) item.bool else null;
+}
+
+fn jsonInteger(value: std.json.ObjectMap, key: []const u8) ?i64 {
+    const item = value.get(key) orelse return null;
+    return if (item == .integer) item.integer else null;
+}
+
+fn selectorRefUnsupported(selector: std.json.Value) bool {
+    if (selector != .object) return false;
+    const result_ref = jsonString(selector.object, "result_ref") orelse return false;
+    if (std.mem.eql(u8, result_ref, "$query_results")) return false;
+    return !std.mem.startsWith(u8, result_ref, "$graph_results.") or result_ref.len == "$graph_results.".len;
 }
 
 fn graphMatchOperationCountFromBody(alloc: std.mem.Allocator, body: []const u8) usize {
@@ -983,7 +1152,7 @@ pub fn handleTableQueryRequest(
             },
             error.GraphCrossRangeModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact cross-range execution table={s}", .{table_name});
-                return .{ .status = 422, .body = try graphCrossRangeModeUnsupportedBody(alloc), .json = true };
+                return .{ .status = 422, .body = try graphCrossRangeModeUnsupportedBody(alloc, body), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -3349,7 +3518,7 @@ test "public table query handler maps exact graph execution failures" {
     var cross_range_resp = try handleTableQueryRequest(
         std.testing.allocator,
         "docs",
-        "{\"query\":{\"match_all\":{}}}",
+        "{\"graph_queries\":{\"incoming\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]},\"direction\":\"in\"}}}}",
         null,
         Backend.iface(&kind),
     );
@@ -3367,6 +3536,9 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!cross_range_error.retryable);
+    try std.testing.expectEqualStrings("incoming", cross_range_error.operation);
+    try std.testing.expectEqualStrings("traverse", cross_range_error.mode);
+    try std.testing.expectEqualStrings("direction_must_be_out", cross_range_error.reason);
 
     const legacy_limit_body =
         \\{"graph_searches":{"first":{"type":"pattern"},"neighbors":{"type":"neighbors"},"second":{"type":"pattern"}}}
@@ -3385,6 +3557,80 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
+}
+
+test "cross-range graph diagnostics identify the rejected operation constraint" {
+    const Case = struct {
+        body: []const u8,
+        operation: []const u8,
+        mode: []const u8,
+        reason: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
+            .operation = "$request",
+            .mode = "graph_queries",
+            .reason = "expand_strategy_not_supported",
+        },
+        .{
+            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
+            .operation = "walk",
+            .mode = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"start_nodes\":{\"result_ref\":\"$full_text_results\"}}}}",
+            .operation = "walk",
+            .mode = "traverse",
+            .reason = "start_selector_not_supported",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"start_nodes\":{\"keys\":[\"a\"]},\"target_nodes\":{\"result_ref\":\"$embeddings_results\"}}}}",
+            .operation = "path",
+            .mode = "shortest_path",
+            .reason = "target_selector_not_supported",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"neighbors\",\"params\":{\"weight_mode\":\"min_weight\"}}}}",
+            .operation = "walk",
+            .mode = "neighbors",
+            .reason = "weight_mode_must_be_min_hops",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"target_nodes\":{\"keys\":[\"b\"]},\"params\":{\"k\":2}}}}",
+            .operation = "path",
+            .mode = "shortest_path",
+            .reason = "k_must_equal_one",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\"}}}",
+            .operation = "path",
+            .mode = "shortest_path",
+            .reason = "target_required",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\"}}}",
+            .operation = "match",
+            .mode = "pattern",
+            .reason = "pattern_required",
+        },
+    };
+
+    for (cases) |case| {
+        const body = try graphCrossRangeModeUnsupportedBody(std.testing.allocator, case.body);
+        defer std.testing.allocator.free(body);
+        var parsed = try ant_json.parseFromSlice(
+            metadata_openapi.GraphCrossRangeModeUnsupportedError,
+            std.testing.allocator,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.operation, parsed.value.operation);
+        try std.testing.expectEqualStrings(case.mode, parsed.value.mode);
+        try std.testing.expectEqualStrings(case.reason, parsed.value.reason);
+    }
 }
 
 test "public table query handler maps unsupported exact sort" {

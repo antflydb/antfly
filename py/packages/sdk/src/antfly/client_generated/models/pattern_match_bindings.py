@@ -7,7 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.graph_result_node import GraphResultNode
+    from ..models.legacy_graph_result_node import LegacyGraphResultNode
 
 
 T = TypeVar("T", bound="PatternMatchBindings")
@@ -17,7 +17,7 @@ T = TypeVar("T", bound="PatternMatchBindings")
 class PatternMatchBindings:
     """ """
 
-    additional_properties: dict[str, GraphResultNode] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, LegacyGraphResultNode] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -29,14 +29,14 @@ class PatternMatchBindings:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_result_node import GraphResultNode
+        from ..models.legacy_graph_result_node import LegacyGraphResultNode
 
         d = dict(src_dict)
         pattern_match_bindings = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = GraphResultNode.from_dict(prop_dict)
+            additional_property = LegacyGraphResultNode.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
@@ -47,10 +47,10 @@ class PatternMatchBindings:
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> GraphResultNode:
+    def __getitem__(self, key: str) -> LegacyGraphResultNode:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: GraphResultNode) -> None:
+    def __setitem__(self, key: str, value: LegacyGraphResultNode) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

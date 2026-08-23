@@ -2095,8 +2095,8 @@ pub const GraphResultNode = struct {
     distance: ?f64 = null,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,
-    /// Keys in path from start to this node
-    path: ?[]const []const u8 = null,
+    /// Exact ordered node identities in the path from the start node to this node
+    path: ?[]const GraphPathEndpoint = null,
     /// Edges in path from start to this node
     path_edges: ?[]const PathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
@@ -2638,7 +2638,7 @@ pub const LegacyGraphQueryResult = struct {
     kind: ?[]const u8 = null,
     type: GraphQueryType,
     /// Result nodes. Optional for compatibility with v0.2 responses.
-    nodes: ?[]const GraphResultNode = null,
+    nodes: ?[]const LegacyGraphResultNode = null,
     /// Result paths. Optional for compatibility with v0.2 responses.
     paths: ?[]const Path = null,
     /// Deprecated graph_searches pattern results; use rows for graph_queries.
@@ -2647,6 +2647,30 @@ pub const LegacyGraphQueryResult = struct {
     total: i64,
     /// Query execution time; optional for compatibility with v0.2 responses
     took: ?i64 = null,
+};
+
+/// Deprecated graph_searches node response with an unqualified string path.
+pub const LegacyGraphResultNode = struct {
+    /// Document key
+    key: []const u8,
+    /// Owning table for a cross-table node; omitted for nodes in the queried table
+    table: ?[]const u8 = null,
+    /// Distance from start node
+    depth: ?i64 = null,
+    /// Weighted distance
+    distance: ?f64 = null,
+    /// Full document (if include_documents=true)
+    document: ?std.json.Value = null,
+    /// Deprecated unqualified keys in the path from the start node to this node
+    path: ?[]const []const u8 = null,
+    /// Edges in path from start to this node
+    path_edges: ?[]const PathEdge = null,
+    /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
+    provenance: ?[]const []const u8 = null,
+    /// Parsed evidence envelope for provenance labels and edge metadata
+    evidence: ?std.json.Value = null,
+    /// Connected edges when supplied by the graph executor.
+    edges: ?[]const Edge = null,
 };
 
 /// Configuration for result fusion when combining multiple search indexes.
@@ -2808,7 +2832,7 @@ pub const PatternEdgeStep = struct {
 
 /// Deprecated graph_searches pattern response row.
 pub const PatternMatch = struct {
-    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    bindings: ?std.json.ArrayHashMap(LegacyGraphResultNode) = null,
     path: ?[]const PathEdge = null,
 };
 

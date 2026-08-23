@@ -2982,6 +2982,15 @@ export interface components {
             message: string;
             /** @enum {boolean} */
             retryable: false;
+            /** @description Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint. */
+            operation: string;
+            /** @description Graph operation mode, or `graph_queries` for a request-wide constraint. */
+            mode: string;
+            /**
+             * @description Stable machine-readable constraint that prevents exact cross-range execution.
+             * @enum {string}
+             */
+            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "unsupported_mode";
         };
         GraphMatchOperationLimitExceededError: {
             /**
@@ -12226,8 +12235,8 @@ export interface components {
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Keys in path from start to this node */
-            path?: string[];
+            /** @description Exact ordered node identities in the path from the start node to this node */
+            path?: components["schemas"]["GraphPathEndpoint"][];
             /** @description Edges in path from start to this node */
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
@@ -12318,11 +12327,44 @@ export interface components {
         };
         /**
          * @deprecated
+         * @description Deprecated graph_searches node response with an unqualified string path.
+         */
+        LegacyGraphResultNode: {
+            /** @description Document key */
+            key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
+            /** @description Distance from start node */
+            depth?: number;
+            /**
+             * Format: double
+             * @description Weighted distance
+             */
+            distance?: number;
+            /** @description Full document (if include_documents=true) */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Deprecated unqualified keys in the path from the start node to this node */
+            path?: string[];
+            /** @description Edges in path from start to this node */
+            path_edges?: components["schemas"]["PathEdge"][];
+            /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
+            provenance?: string[];
+            /** @description Parsed evidence envelope for provenance labels and edge metadata */
+            evidence?: {
+                [key: string]: unknown;
+            };
+            /** @description Connected edges when supplied by the graph executor. */
+            edges?: components["schemas"]["Edge"][];
+        };
+        /**
+         * @deprecated
          * @description Deprecated graph_searches pattern response row.
          */
         PatternMatch: {
             bindings?: {
-                [key: string]: components["schemas"]["GraphResultNode"];
+                [key: string]: components["schemas"]["LegacyGraphResultNode"];
             };
             path?: components["schemas"]["PathEdge"][];
         };
@@ -12339,7 +12381,7 @@ export interface components {
             /** @deprecated */
             type: components["schemas"]["GraphQueryType"];
             /** @description Result nodes. Optional for compatibility with v0.2 responses. */
-            nodes?: components["schemas"]["GraphResultNode"][];
+            nodes?: components["schemas"]["LegacyGraphResultNode"][];
             /** @description Result paths. Optional for compatibility with v0.2 responses. */
             paths?: components["schemas"]["Path"][];
             /**

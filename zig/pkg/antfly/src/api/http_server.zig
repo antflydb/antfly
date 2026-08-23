@@ -11375,7 +11375,7 @@ pub const ApiHttpServer = struct {
             ),
             error.GraphCrossRangeModeUnsupported => contextual_operations.jsonWithStatus(
                 422,
-                try public_table_http.graphCrossRangeModeUnsupportedBody(self.alloc),
+                try public_table_http.graphCrossRangeModeUnsupportedBody(self.alloc, body),
                 false,
             ),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),

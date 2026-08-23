@@ -3241,8 +3241,67 @@ components:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
+            $ref: '#/components/schemas/GraphPathEndpoint'
+          description: "Exact ordered node identities in the path from the start node to this node"
+        path_edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PathEdge'
+          description: "Edges in path from start to this node"
+        provenance:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
             type: string
-          description: "Keys in path from start to this node"
+          description: "Algebraic provenance labels folded into this result, when requested by an algebraic graph executor"
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Parsed evidence envelope for provenance labels and edge metadata"
+        edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+          description: "Connected edges when supplied by the graph executor."
+    LegacyGraphResultNode:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated graph_searches node response with an unqualified string path.
+      required:
+        - key
+      properties:
+        key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Document key"
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Owning table for a cross-table node; omitted for nodes in the queried table"
+        depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: "Distance from start node"
+        distance:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: "Weighted distance"
+        document:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Full document (if include_documents=true)"
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Deprecated unqualified keys in the path from the start node to this node"
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3285,7 +3344,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/GraphResultNode'
+            $ref: '#/components/schemas/LegacyGraphResultNode'
         path:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3390,7 +3449,7 @@ components:
         nodes:
           x-go-type-skip-optional-pointer: true
           type: array
-          items: { $ref: '#/components/schemas/GraphResultNode' }
+          items: { $ref: '#/components/schemas/LegacyGraphResultNode' }
           description: Result nodes. Optional for compatibility with v0.2 responses.
         paths:
           x-go-type-skip-optional-pointer: true

@@ -1864,7 +1864,7 @@ components:
     GraphCrossRangeModeUnsupportedError:
       type: object
       additionalProperties: false
-      required: [status, error, message, retryable]
+      required: [status, error, message, retryable, operation, mode, reason]
       properties:
         status:
           type: integer
@@ -1878,6 +1878,26 @@ components:
         retryable:
           type: boolean
           enum: [false]
+        operation:
+          type: string
+          description: Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+        mode:
+          type: string
+          description: Graph operation mode, or `graph_queries` for a request-wide constraint.
+        reason:
+          type: string
+          enum:
+            - expand_strategy_not_supported
+            - direction_must_be_out
+            - deduplicate_nodes_must_be_true
+            - weight_mode_must_be_min_hops
+            - start_selector_not_supported
+            - target_selector_not_supported
+            - target_required
+            - k_must_equal_one
+            - pattern_required
+            - unsupported_mode
+          description: Stable machine-readable constraint that prevents exact cross-range execution.
     GraphMatchOperationLimitExceededError:
       type: object
       additionalProperties: false

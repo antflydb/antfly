@@ -224,6 +224,10 @@ pub const GraphResultNode = struct {
     depth: u32,
     distance: f64,
     path: ?[]const []const u8,
+    /// Table provenance parallel to `path`. Null means every path node belongs
+    /// to the query table. When present, null entries still mean query-table
+    /// nodes and non-null entries are owned table qualifiers.
+    path_tables: ?[]const ?[]const u8 = null,
     path_edges: ?[]const PathEdgeInfo,
     provenance: ?[]const []const u8 = null,
     /// Table the node's document lives in, when an edge reaching it declared a
@@ -238,6 +242,10 @@ pub const GraphResultNode = struct {
         if (self.path) |p| {
             for (p) |s| alloc.free(s);
             alloc.free(p);
+        }
+        if (self.path_tables) |tables| {
+            for (tables) |table| if (table) |value| alloc.free(value);
+            alloc.free(tables);
         }
         if (self.path_edges) |pe| {
             for (pe) |e| {
@@ -357,21 +365,9 @@ pub const GraphQueryEngine = struct {
                     try seen.put(self.alloc, try self.alloc.dupe(u8, tr.key), {});
                 }
 
-                var path_copy: ?[]const []const u8 = null;
-                if (tr.path) |p| {
-                    const duped = try self.alloc.alloc([]const u8, p.len);
-                    for (p, 0..) |s, i| duped[i] = try self.alloc.dupe(u8, s);
-                    path_copy = duped;
-                }
-
-                try all_results.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, tr.key),
-                    .depth = tr.depth,
-                    .distance = tr.total_weight,
-                    .path = path_copy,
-                    .path_edges = null,
-                    .table = if (tr.target_table) |tt| try self.alloc.dupe(u8, tt) else null,
-                });
+                var result_node = try traversalResultNodeAlloc(self.alloc, tr);
+                errdefer result_node.deinit(self.alloc);
+                try all_results.append(self.alloc, result_node);
 
                 if (params.max_results > 0 and all_results.items.len >= params.max_results) break;
             }
@@ -771,6 +767,44 @@ pub fn collectUniqueNodesFromMatches(
     return owned;
 }
 
+fn traversalResultNodeAlloc(
+    alloc: Allocator,
+    result: traversal_mod.TraversalResult,
+) !GraphResultNode {
+    const key = try alloc.dupe(u8, result.key);
+    errdefer alloc.free(key);
+    const table = if (result.target_table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
+    const path = if (result.path) |value| try clonePathNodesAlloc(alloc, value) else null;
+    errdefer if (path) |value| freePathNodeItems(alloc, value, value.len);
+    const path_tables = if (path) |value|
+        try pathTablesFromTerminalAlloc(alloc, value.len, result.target_table)
+    else
+        null;
+    errdefer if (path_tables) |tables| freePathTables(alloc, tables);
+
+    return .{
+        .key = key,
+        .table = table,
+        .depth = result.depth,
+        .distance = result.total_weight,
+        .path = path,
+        .path_tables = path_tables,
+        .path_edges = null,
+    };
+}
+
+fn clonePathNodesAlloc(alloc: Allocator, source: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, source.len);
+    var initialized: usize = 0;
+    errdefer freePathNodeItems(alloc, out, initialized);
+    for (source, 0..) |node, i| {
+        out[i] = try alloc.dupe(u8, node);
+        initialized += 1;
+    }
+    return out;
+}
+
 const AlgebraicPatternPlan = struct {
     params: QueryParams,
     depth: u32,
@@ -1009,6 +1043,11 @@ pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphRes
         path_nodes[i] = try alloc.dupe(u8, n);
         initialized_nodes += 1;
     }
+    const path_tables = if (path.node_tables.len > 0)
+        try clonePathTables(alloc, path.node_tables)
+    else
+        null;
+    errdefer if (path_tables) |tables| freePathTables(alloc, tables);
 
     // Copy path edges
     const path_edges = try alloc.alloc(PathEdgeInfo, path.edges.len);
@@ -1033,8 +1072,42 @@ pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphRes
         .depth = path.length,
         .distance = path.total_weight,
         .path = path_nodes,
+        .path_tables = path_tables,
         .path_edges = path_edges,
     };
+}
+
+fn pathTablesFromTerminalAlloc(
+    alloc: Allocator,
+    path_len: usize,
+    terminal_table: ?[]const u8,
+) !?[]const ?[]const u8 {
+    const table = terminal_table orelse return null;
+    if (path_len == 0) return null;
+    const out = try alloc.alloc(?[]const u8, path_len);
+    @memset(out, null);
+    errdefer alloc.free(out);
+    out[path_len - 1] = try alloc.dupe(u8, table);
+    return out;
+}
+
+fn clonePathTables(alloc: Allocator, source: []const ?[]const u8) ![]const ?[]const u8 {
+    const out = try alloc.alloc(?[]const u8, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |table| if (table) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (source, 0..) |table, i| {
+        out[i] = if (table) |value| try alloc.dupe(u8, value) else null;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freePathTables(alloc: Allocator, tables: []const ?[]const u8) void {
+    for (tables) |table| if (table) |value| alloc.free(value);
+    alloc.free(tables);
 }
 
 fn pathEdgeInfoFromPathEdge(alloc: Allocator, edge: paths_mod.PathEdge) !PathEdgeInfo {

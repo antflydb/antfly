@@ -17912,11 +17912,15 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"doc:a"},{"key":"shared","table":"entities"}],"edges":[],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"doc:a"},{"key":"shared","table":"entities"}]}],"paths":[{"nodes":[{"key":"doc:a"},{"key":"shared","table":"entities"}],"edges":[],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].path.?[0]);
+    try std.testing.expect(result.graph_results[0].nodes[0].path_tables.?[0] == null);
+    try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].path_tables.?[1].?);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
     try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
@@ -17937,7 +17941,8 @@ fn parseRemoteGraphResults(
     while (it.next()) |entry| {
         const result_value = entry.value_ptr.*;
         const ResultView = struct {
-            nodes: ?[]const indexes_openapi.GraphResultNode = null,
+            canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
+            legacy_nodes: ?[]const indexes_openapi.LegacyGraphResultNode = null,
             canonical_paths: ?[]const indexes_openapi.GraphPath = null,
             legacy_paths: ?[]const indexes_openapi.Path = null,
             rows: ?[]const indexes_openapi.GraphResultRow = null,
@@ -17946,7 +17951,7 @@ fn parseRemoteGraphResults(
         };
         const view: ResultView = switch (result_value) {
             .graph_nodes_result => |result| .{
-                .nodes = result.nodes,
+                .canonical_nodes = result.nodes,
                 .canonical_paths = result.paths,
                 .truncated = result.stats.truncated,
             },
@@ -17959,12 +17964,14 @@ fn parseRemoteGraphResults(
                 .truncated = result.stats.truncated,
             },
             .legacy_graph_query_result => |result| .{
-                .nodes = result.nodes,
+                .legacy_nodes = result.nodes,
                 .legacy_paths = result.paths,
             },
         };
-        var parsed_nodes = if (view.nodes) |nodes_value|
+        var parsed_nodes = if (view.canonical_nodes) |nodes_value|
             try parseRemoteGraphNodes(alloc, nodes_value)
+        else if (view.legacy_nodes) |nodes_value|
+            try parseRemoteLegacyGraphNodes(alloc, nodes_value)
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
@@ -18096,10 +18103,113 @@ fn parseRemoteGraphNodes(
     };
 }
 
+fn parseRemoteLegacyGraphNodes(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.LegacyGraphResultNode,
+) !ParsedRemoteGraphNodes {
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (nodes[0..initialized]) |*node| node.deinit(alloc);
+        alloc.free(nodes);
+    }
+    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (hits.items) |*hit| hit.deinit(alloc);
+        hits.deinit(alloc);
+    }
+
+    for (value, 0..) |item, i| {
+        nodes[i] = try parseRemoteLegacyGraphNodeWithKey(alloc, item.key, item);
+        initialized += 1;
+        if (item.document) |document| {
+            try appendRemoteGraphDocumentHit(alloc, &hits, item.key, item.table, document);
+        }
+    }
+    return .{
+        .nodes = nodes,
+        .hits = try hits.toOwnedSlice(alloc),
+    };
+}
+
+const OwnedRemoteGraphNodePath = struct {
+    nodes: [][]const u8,
+    tables: ?[]const ?[]const u8,
+
+    fn deinit(self: OwnedRemoteGraphNodePath, alloc: std.mem.Allocator) void {
+        freeRemoteGraphNodePath(alloc, self.nodes);
+        if (self.tables) |tables| {
+            for (tables) |table| if (table) |value| alloc.free(value);
+            if (tables.len > 0) alloc.free(tables);
+        }
+    }
+};
+
+fn cloneRemoteCanonicalGraphNodePath(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathEndpoint,
+) !OwnedRemoteGraphNodePath {
+    const nodes = try alloc.alloc([]const u8, value.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        if (nodes.len > 0) alloc.free(nodes);
+    }
+    const tables = try alloc.alloc(?[]const u8, value.len);
+    @memset(tables, null);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (tables[0..initialized_tables]) |table| if (table) |item| alloc.free(item);
+        if (tables.len > 0) alloc.free(tables);
+    }
+    var has_qualified_identity = false;
+    for (value, 0..) |endpoint, i| {
+        nodes[i] = try alloc.dupe(u8, endpoint.key);
+        initialized_nodes += 1;
+        tables[i] = if (endpoint.table) |table| blk: {
+            has_qualified_identity = true;
+            break :blk try alloc.dupe(u8, table);
+        } else null;
+        initialized_tables += 1;
+    }
+    if (!has_qualified_identity) {
+        if (tables.len > 0) alloc.free(tables);
+        return .{ .nodes = nodes, .tables = null };
+    }
+    return .{ .nodes = nodes, .tables = tables };
+}
+
 fn parseRemoteGraphNodeWithKey(
     alloc: std.mem.Allocator,
     key: []const u8,
     item: indexes_openapi.GraphResultNode,
+) !graph_query_mod.GraphResultNode {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
+    errdefer if (owned_table) |table| alloc.free(table);
+    const owned_path = if (item.path) |value| try cloneRemoteCanonicalGraphNodePath(alloc, value) else null;
+    errdefer if (owned_path) |value| value.deinit(alloc);
+    const path_edges = if (item.path_edges) |value| try cloneRemoteGraphNodePathEdges(alloc, value) else null;
+    errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
+    const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
+    errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
+    return .{
+        .key = owned_key,
+        .table = owned_table,
+        .depth = @intCast(item.depth orelse 0),
+        .distance = item.distance orelse 0,
+        .path = if (owned_path) |value| value.nodes else null,
+        .path_tables = if (owned_path) |value| value.tables else null,
+        .path_edges = path_edges,
+        .provenance = provenance,
+    };
+}
+
+fn parseRemoteLegacyGraphNodeWithKey(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    item: indexes_openapi.LegacyGraphResultNode,
 ) !graph_query_mod.GraphResultNode {
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);

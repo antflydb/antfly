@@ -1346,6 +1346,8 @@ fn cloneGraphResultNode(
     errdefer if (table) |value| alloc.free(value);
     const path = if (source.path) |items| try cloneStringSlice(alloc, items) else null;
     errdefer if (path) |items| freeStringSlice(alloc, items);
+    const path_tables = if (source.path_tables) |items| try cloneOptionalStringSlice(alloc, items) else null;
+    errdefer if (path_tables) |items| freeOptionalStringSlice(alloc, items);
     const path_edges = if (source.path_edges) |items|
         try clonePathEdges(graph_query_mod.PathEdgeInfo, alloc, items)
     else
@@ -1362,6 +1364,7 @@ fn cloneGraphResultNode(
         .depth = source.depth,
         .distance = source.distance,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
         .provenance = provenance,
         .table = table,

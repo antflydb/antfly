@@ -118,6 +118,7 @@ pub const LegacyGraphDocumentQuery = types.LegacyGraphDocumentQuery;
 pub const LegacyGraphNodeSelector = types.LegacyGraphNodeSelector;
 pub const LegacyGraphQuery = types.LegacyGraphQuery;
 pub const LegacyGraphQueryResult = types.LegacyGraphQueryResult;
+pub const LegacyGraphResultNode = types.LegacyGraphResultNode;
 pub const MergeConfig = types.MergeConfig;
 pub const MergeStrategy = types.MergeStrategy;
 pub const NodeFilter = types.NodeFilter;

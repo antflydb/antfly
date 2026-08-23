@@ -334,6 +334,7 @@ from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
 from .graph_cross_range_mode_unsupported_error import GraphCrossRangeModeUnsupportedError
 from .graph_cross_range_mode_unsupported_error_error import GraphCrossRangeModeUnsupportedErrorError
+from .graph_cross_range_mode_unsupported_error_reason import GraphCrossRangeModeUnsupportedErrorReason
 from .graph_cross_range_mode_unsupported_error_status import GraphCrossRangeModeUnsupportedErrorStatus
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
@@ -619,6 +620,9 @@ from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
 from .legacy_graph_query_result import LegacyGraphQueryResult
 from .legacy_graph_query_result_kind import LegacyGraphQueryResultKind
+from .legacy_graph_result_node import LegacyGraphResultNode
+from .legacy_graph_result_node_document import LegacyGraphResultNodeDocument
+from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -1235,6 +1239,7 @@ __all__ = (
     "GraphCountAggregate",
     "GraphCrossRangeModeUnsupportedError",
     "GraphCrossRangeModeUnsupportedErrorError",
+    "GraphCrossRangeModeUnsupportedErrorReason",
     "GraphCrossRangeModeUnsupportedErrorStatus",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorError",
@@ -1518,6 +1523,9 @@ __all__ = (
     "LegacyGraphQuery",
     "LegacyGraphQueryResult",
     "LegacyGraphQueryResultKind",
+    "LegacyGraphResultNode",
+    "LegacyGraphResultNodeDocument",
+    "LegacyGraphResultNodeEvidence",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",

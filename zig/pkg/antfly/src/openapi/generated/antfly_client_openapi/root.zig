@@ -431,6 +431,7 @@ pub const LegacyGraphDocumentQuery = types.LegacyGraphDocumentQuery;
 pub const LegacyGraphNodeSelector = types.LegacyGraphNodeSelector;
 pub const LegacyGraphQuery = types.LegacyGraphQuery;
 pub const LegacyGraphQueryResult = types.LegacyGraphQueryResult;
+pub const LegacyGraphResultNode = types.LegacyGraphResultNode;
 pub const LinearMergePageStatus = types.LinearMergePageStatus;
 pub const LinearMergeRequest = types.LinearMergeRequest;
 pub const LinearMergeResult = types.LinearMergeResult;

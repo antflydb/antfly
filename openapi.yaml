@@ -8319,6 +8319,9 @@ components:
         - error
         - message
         - retryable
+        - operation
+        - mode
+        - reason
       properties:
         status:
           type: integer
@@ -8335,6 +8338,27 @@ components:
           type: boolean
           enum:
             - false
+        operation:
+          type: string
+          description: Named graph operation that cannot execute exactly, or `$request` for a request-wide
+            constraint.
+        mode:
+          type: string
+          description: Graph operation mode, or `graph_queries` for a request-wide constraint.
+        reason:
+          type: string
+          enum:
+            - expand_strategy_not_supported
+            - direction_must_be_out
+            - deduplicate_nodes_must_be_true
+            - weight_mode_must_be_min_hops
+            - start_selector_not_supported
+            - target_selector_not_supported
+            - target_required
+            - k_must_equal_one
+            - pattern_required
+            - unsupported_mode
+          description: Stable machine-readable constraint that prevents exact cross-range execution.
     GraphMatchOperationLimitExceededError:
       type: object
       additionalProperties: false
@@ -23209,8 +23233,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
-            type: string
-          description: Keys in path from start to this node
+            $ref: '#/components/schemas/GraphPathEndpoint'
+          description: Exact ordered node identities in the path from the start node to this node
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -23384,6 +23408,66 @@ components:
           format: int64
           x-go-type: time.Duration
           description: Query execution time.
+    LegacyGraphResultNode:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      deprecated: true
+      description: Deprecated graph_searches node response with an unqualified string path.
+      required:
+        - key
+      properties:
+        key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Document key
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Owning table for a cross-table node; omitted for nodes in the queried table
+        depth:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          description: Distance from start node
+        distance:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: Weighted distance
+        document:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Full document (if include_documents=true)
+        path:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Deprecated unqualified keys in the path from the start node to this node
+        path_edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/PathEdge'
+          description: Edges in path from start to this node
+        provenance:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: Algebraic provenance labels folded into this result, when requested by an algebraic
+            graph executor
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Parsed evidence envelope for provenance labels and edge metadata
+        edges:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+          description: Connected edges when supplied by the graph executor.
     PatternMatch:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -23394,7 +23478,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/GraphResultNode'
+            $ref: '#/components/schemas/LegacyGraphResultNode'
         path:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -23423,7 +23507,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
-            $ref: '#/components/schemas/GraphResultNode'
+            $ref: '#/components/schemas/LegacyGraphResultNode'
           description: Result nodes. Optional for compatibility with v0.2 responses.
         paths:
           x-go-type-skip-optional-pointer: true

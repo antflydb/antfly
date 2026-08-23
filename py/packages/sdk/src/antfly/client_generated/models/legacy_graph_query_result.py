@@ -10,7 +10,7 @@ from ..models.legacy_graph_query_result_kind import LegacyGraphQueryResultKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.graph_result_node import GraphResultNode
+    from ..models.legacy_graph_result_node import LegacyGraphResultNode
     from ..models.path import Path
     from ..models.pattern_match import PatternMatch
 
@@ -27,7 +27,7 @@ class LegacyGraphQueryResult:
         total (int): Deprecated graph_searches result count; use stats or a named count aggregate.
         kind (LegacyGraphQueryResultKind | Unset): Stable discriminator emitted by current servers. Optional only so
             current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
-        nodes (list[GraphResultNode] | Unset): Result nodes. Optional for compatibility with v0.2 responses.
+        nodes (list[LegacyGraphResultNode] | Unset): Result nodes. Optional for compatibility with v0.2 responses.
         paths (list[Path] | Unset): Result paths. Optional for compatibility with v0.2 responses.
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
         took (int | Unset): Query execution time; optional for compatibility with v0.2 responses
@@ -36,7 +36,7 @@ class LegacyGraphQueryResult:
     type_: GraphQueryType
     total: int
     kind: LegacyGraphQueryResultKind | Unset = UNSET
-    nodes: list[GraphResultNode] | Unset = UNSET
+    nodes: list[LegacyGraphResultNode] | Unset = UNSET
     paths: list[Path] | Unset = UNSET
     matches: list[PatternMatch] | Unset = UNSET
     took: int | Unset = UNSET
@@ -96,7 +96,7 @@ class LegacyGraphQueryResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_result_node import GraphResultNode
+        from ..models.legacy_graph_result_node import LegacyGraphResultNode
         from ..models.path import Path
         from ..models.pattern_match import PatternMatch
 
@@ -113,11 +113,11 @@ class LegacyGraphQueryResult:
             kind = LegacyGraphQueryResultKind(_kind)
 
         _nodes = d.pop("nodes", UNSET)
-        nodes: list[GraphResultNode] | Unset = UNSET
+        nodes: list[LegacyGraphResultNode] | Unset = UNSET
         if _nodes is not UNSET:
             nodes = []
             for nodes_item_data in _nodes:
-                nodes_item = GraphResultNode.from_dict(nodes_item_data)
+                nodes_item = LegacyGraphResultNode.from_dict(nodes_item_data)
 
                 nodes.append(nodes_item)
 
