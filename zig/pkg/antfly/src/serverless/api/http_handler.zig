@@ -756,7 +756,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, .none);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, status.graph_metrics_supported, .none);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("table index list encode failed table={s} err={}", .{ table_name, err });
@@ -774,7 +774,7 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, .none);
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, status.graph_metrics_supported, .none);
         defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
         const body = (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
@@ -791,6 +791,7 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         indexes_json: []const u8,
         only_index_name: ?[]const u8,
+        publication_enabled: bool,
         cancellation: CancellationToken,
     ) ![]ServerlessGraphMetricStatus {
         try cancellation.check();
@@ -840,6 +841,7 @@ pub const HttpHandler = struct {
                     .metric_name = owned_metric_name,
                     .kind = config.kind,
                     .config_fingerprint = build_mod.lake_graph_metric.configFingerprint(config),
+                    .state = if (publication_enabled) .pending else .unsupported,
                 };
                 index_name_moved = true;
                 metric_name_moved = true;
@@ -870,8 +872,9 @@ pub const HttpHandler = struct {
                             else
                                 false;
                             const current_policy = metric_ref.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
-                            status.state = if (!valid_identity or !valid_source or !current_policy)
-                                .stale
+                            const current_format = metric_ref.metadata_version == graph_metric_segment_mod.wire_version;
+                            status.state = if (!valid_identity or !valid_source or !current_policy or !current_format)
+                                if (publication_enabled) .stale else .unsupported
                             else switch (metric_ref.graph_metric_materialization_state) {
                                 .ready => .ready,
                                 .rejected => .rejected,
@@ -886,7 +889,7 @@ pub const HttpHandler = struct {
                         // metadata. Report them as stale and let the normal
                         // head-republish path upgrade them; status reads must
                         // never scan user-sized score payloads.
-                        status.state = .stale;
+                        status.state = if (publication_enabled) .stale else .unsupported;
                     }
                 }
                 statuses[initialized] = status;
@@ -4953,6 +4956,8 @@ pub const HttpHandler = struct {
         };
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) return error.Backpressured;
+        request.cancellation.check() catch return error.Canceled;
+        try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
@@ -4982,7 +4987,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, request.cancellation) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -4995,46 +5000,50 @@ pub const HttpHandler = struct {
         };
     }
 
+    fn preflightPublicTableBatchSyncLevel(
+        self: *HttpHandler,
+        sync_level: db_types.SyncLevel,
+        status: catalog_types.BuildStatus,
+    ) public_table_http.TableApi.ExecuteBatchError!void {
+        const requires_background_materialization =
+            status.enrichment_enabled or
+            status.chunk_preview_enabled or
+            status.chunk_embeddings_enabled or
+            status.rerank_terms_enabled;
+        switch (sync_level) {
+            .propose, .write, .full_text => {},
+            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
+                return error.UnsupportedSyncLevel;
+            },
+        }
+        if (sync_level != .full_index) return;
+        if (status.graph_metrics_configured != 0 and !status.graph_metrics_supported) {
+            return error.GraphMetricFeatureNotEnabled;
+        }
+        if (status.graph_metrics_rejected != 0) return error.GraphMetricMaterializationRejected;
+    }
+
     fn enforcePublicTableBatchSyncLevel(
         self: *HttpHandler,
         table_name: []const u8,
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
-        status_before_write: catalog_types.BuildStatus,
         cancellation: CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
-        const requires_background_materialization =
-            status_before_write.enrichment_enabled or
-            status_before_write.chunk_preview_enabled or
-            status_before_write.chunk_embeddings_enabled or
-            status_before_write.rerank_terms_enabled;
-
         switch (sync_level) {
             .propose, .write => return,
-            .full_text => {},
-            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
-                return error.UnsupportedSyncLevel;
-            },
+            .full_text, .enrichments, .full_index => {},
         }
-        if (sync_level == .full_index and status_before_write.graph_metrics_configured != 0 and
-            !status_before_write.graph_metrics_supported)
-        {
-            return error.UnsupportedSyncLevel;
-        }
-        if (sync_level == .full_index and status_before_write.graph_metrics_rejected != 0) {
-            return error.GraphMetricMaterializationRejected;
-        }
-
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
         while (true) {
-            cancellation.check() catch return error.Canceled;
+            cancellation.check() catch return error.CommittedPending;
             const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
-                error.NamespaceNotFound => return error.NotFound,
+                error.NamespaceNotFound => return error.CommittedRepairRequired,
                 error.HeadChanged => null,
                 else => {
                     std.log.err("serverless public table batch build failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
+                    return error.CommittedRepairRequired;
                 },
             };
             if (build_result) |build| {
@@ -5045,20 +5054,20 @@ pub const HttpHandler = struct {
             if (self.runtime_metrics) |runtime| {
                 _ = runtime.runOnce() catch |err| {
                     std.log.err("serverless public table batch maintenance run failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
+                    return error.CommittedRepairRequired;
                 };
             }
 
             var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
-                error.NamespaceNotFound => return error.NotFound,
+                error.NamespaceNotFound => return error.CommittedRepairRequired,
                 else => {
                     std.log.err("serverless public table batch post-build status failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
+                    return error.CommittedRepairRequired;
                 },
             };
             defer status.deinit(self.alloc);
 
-            if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.GraphMetricMaterializationRejected;
+            if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.CommittedGraphMetricMaterializationRejected;
             if (tableSyncLevelSatisfied(sync_level, end_lsn, status)) return;
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) {
                 std.log.err(
@@ -5080,7 +5089,7 @@ pub const HttpHandler = struct {
                         status.enrichment_active_stage,
                     },
                 );
-                return error.UnsupportedSyncLevel;
+                return error.CommittedPending;
             }
 
             sleepNs(10 * std.time.ns_per_ms);
@@ -5164,7 +5173,14 @@ pub const HttpHandler = struct {
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotConfigured => return error.NotFound,
-            error.MetricNotReady => return error.IndexRebuilding,
+            error.MetricNotReady => {
+                var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
+                defer status.deinit(self.alloc);
+                if (status.graph_metrics_configured != 0 and !status.graph_metrics_supported) {
+                    return error.GraphMetricFeatureNotEnabled;
+                }
+                return error.IndexRebuilding;
+            },
             error.InvalidGraphMetricNodeId => return error.InvalidQueryRequest,
             error.GraphMetricPolicyStale => return error.IndexRebuilding,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
@@ -5244,7 +5260,7 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, request.cancellation) catch |err| switch (err) {
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, status.graph_metrics_supported, request.cancellation) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => return error.InternalFailure,
         };
@@ -5265,7 +5281,7 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, request.cancellation) catch |err| switch (err) {
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, status.graph_metrics_supported, request.cancellation) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => return error.InternalFailure,
         };
@@ -6406,6 +6422,7 @@ const ServerlessIndexStatus = struct {
 };
 
 const GraphMetricMaterializationState = enum {
+    unsupported,
     pending,
     ready,
     rejected,
@@ -6680,6 +6697,9 @@ fn appendServerlessIndexStatusJson(
             );
             if (metric.rejection_reason != .none) {
                 try out.print(alloc, ",\"rejection_reason\":\"{s}\"", .{@tagName(metric.rejection_reason)});
+            }
+            if (metric.state == .unsupported) {
+                try out.appendSlice(alloc, ",\"unavailable_reason\":\"graph_metric_publication_not_enabled\",\"retryable\":false");
             }
             try out.append(alloc, '}');
         }
@@ -10338,6 +10358,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer unsupported.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
+    try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
 }
 
 test "serverless full_index sync waits for enrichment and index publication" {
@@ -10406,6 +10427,25 @@ test "serverless full_index sync waits for enrichment and index publication" {
 
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));
+}
+
+test "serverless full_index graph metric preflight fails before commit" {
+    var status = readyServerlessBuildStatusForSyncTest();
+    status.graph_metrics_configured = 1;
+    status.graph_metrics_supported = false;
+    var handler: HttpHandler = undefined;
+    try std.testing.expectError(
+        error.GraphMetricFeatureNotEnabled,
+        handler.preflightPublicTableBatchSyncLevel(.full_index, status),
+    );
+    try handler.preflightPublicTableBatchSyncLevel(.write, status);
+
+    status.graph_metrics_supported = true;
+    status.graph_metrics_rejected = 1;
+    try std.testing.expectError(
+        error.GraphMetricMaterializationRejected,
+        handler.preflightPublicTableBatchSyncLevel(.full_index, status),
+    );
 }
 
 fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
@@ -10523,6 +10563,34 @@ test "serverless graph index status exposes rejected metric policy and blocker" 
     try std.testing.expectEqualStrings("rejected", metric.get("state").?.string);
     try std.testing.expectEqualStrings("build_budget_exceeded", metric.get("rejection_reason").?.string);
     try std.testing.expectEqualStrings("0000000000000022", metric.get("materializer_fingerprint").?.string);
+}
+
+test "serverless graph index status exposes disabled publication as terminal" {
+    const alloc = std.testing.allocator;
+    const status = readyServerlessBuildStatusForSyncTest();
+    var metric_status = ServerlessGraphMetricStatus{
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .kind = .pagerank,
+        .state = .unsupported,
+        .config_fingerprint = 0x11,
+    };
+    defer metric_status.deinit(alloc);
+    const metric_statuses = [_]ServerlessGraphMetricStatus{metric_status};
+    const encoded = (try encodeServerlessSingleIndexWithGraphMetricsAlloc(
+        alloc,
+        "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"kind\":\"pagerank\"}}}}",
+        "graph_idx",
+        status,
+        &metric_statuses,
+    )).?;
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const metric = parsed.value.object.get("status").?.object.get("graph_metrics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("unsupported", metric.get("state").?.string);
+    try std.testing.expectEqualStrings("graph_metric_publication_not_enabled", metric.get("unavailable_reason").?.string);
+    try std.testing.expect(!metric.get("retryable").?.bool);
 }
 
 test "http handler serves published graph query endpoints" {

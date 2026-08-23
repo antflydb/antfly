@@ -71,6 +71,7 @@ pub const TableApi = struct {
     pub const ExecuteBatchError = error{
         InvalidBatchRequest,
         UnsupportedSyncLevel,
+        GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
@@ -83,6 +84,7 @@ pub const TableApi = struct {
         OutcomeUnknown,
         CommittedPending,
         CommittedRepairRequired,
+        CommittedGraphMetricMaterializationRejected,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
@@ -108,6 +110,7 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         GraphMetricGlobalMaterializationRequired,
+        GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         QueryCandidateBudgetExceeded,
         HierarchyCursorStale,
@@ -777,6 +780,14 @@ pub fn graphMetricMaterializationRejectedBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphMetricFeatureNotEnabledBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_feature_not_enabled",
+        .message = "graph metric publication is not enabled for this serverless deployment; an operator must complete the manifest writer rollout before graph metric queries or full_index synchronization can be used",
+        .retryable = false,
+    }, .{});
+}
+
 pub fn graphMetricMaterializationRejectedBodyWithContext(
     alloc: std.mem.Allocator,
     graph_index_name: []const u8,
@@ -842,6 +853,20 @@ test "serverless graph metric build-budget rejection is actionable and non-retry
     try std.testing.expectEqualStrings("graph_idx", contextual_parsed.value.graph_index_name);
     try std.testing.expectEqualStrings("pagerank", contextual_parsed.value.metric_name);
     try std.testing.expectEqualStrings("0000000000001234", contextual_parsed.value.materializer_fingerprint);
+}
+
+test "serverless graph metric rollout rejection is explicit and non-retryable" {
+    const encoded = try graphMetricFeatureNotEnabledBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_feature_not_enabled", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "manifest writer rollout") != null);
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "public table query maps multi-shard graph metric rejection" {
@@ -936,6 +961,11 @@ pub fn handleTableBatch(
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
+        error.GraphMetricFeatureNotEnabled => return .{
+            .status = 422,
+            .body = try graphMetricFeatureNotEnabledBody(alloc),
+            .json = true,
+        },
         error.GraphMetricMaterializationRejected => return .{
             .status = 422,
             .body = try graphMetricMaterializationRejectedBody(alloc),
@@ -969,6 +999,11 @@ pub fn handleTableBatch(
         error.CommittedRepairRequired => return .{
             .status = 202,
             .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_repair_required")),
+            .json = true,
+        },
+        error.CommittedGraphMetricMaterializationRejected => return .{
+            .status = 202,
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_graph_metric_materialization_rejected")),
             .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
@@ -1117,6 +1152,10 @@ pub fn handleTableQueryRequest(
             error.GraphMetricGlobalMaterializationRequired => {
                 std.log.info("public table query requires global graph metric materialization table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMetricGlobalMaterializationRequiredBody(alloc), .json = true };
+            },
+            error.GraphMetricFeatureNotEnabled => {
+                std.log.info("public table query graph metric publication is not enabled table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricFeatureNotEnabledBody(alloc), .json = true };
             },
             error.GraphMetricMaterializationRejected => {
                 std.log.info("public table query graph metric materialization rejected table={s}", .{table_name});

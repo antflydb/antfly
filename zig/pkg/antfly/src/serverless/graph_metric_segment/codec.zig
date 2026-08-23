@@ -20,18 +20,22 @@ const graph_mod = @import("../../graph/graph.zig");
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
-pub const wire_version: u16 = 5;
+pub const wire_version: u16 = 6;
 const fixed_header_len_v1 = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const fixed_header_len_v2 = fixed_header_len_v1 + 2;
 const fixed_header_len = fixed_header_len_v2 + 8;
 const routing_magic = "AFGR";
+const top_tier_magic = "AFTK";
 pub const routing_trailer_len: usize = 8;
 pub const score_block_entries: usize = 1024;
-pub const max_routing_bytes: usize = 8 * 1024 * 1024;
+pub const max_persisted_top_entries: usize = 1024;
+pub const max_routing_bytes: usize = 16 * 1024 * 1024;
 pub const max_score_node_id_bytes: usize = 4096;
 const routing_header_len = routing_magic.len + @sizeOf(u32);
 const routing_entry_fixed_len_v4 = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32);
 const routing_entry_fixed_len = routing_entry_fixed_len_v4 + std.crypto.hash.sha2.Sha256.digest_length;
+const top_tier_header_len = top_tier_magic.len + @sizeOf(u32);
+const top_tier_entry_fixed_len = @sizeOf(u32) + @sizeOf(u64);
 
 pub const Header = struct {
     version: u16,
@@ -63,6 +67,11 @@ pub const RoutingEntry = struct {
     checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0),
 };
 
+pub const PersistedTopScore = struct {
+    node_id: []const u8,
+    value: f64,
+};
+
 pub const ArtifactIntegrity = struct {
     control_len: u32,
     routing_footer_len: u32,
@@ -72,10 +81,12 @@ pub const ArtifactIntegrity = struct {
 
 pub const RoutingIndex = struct {
     entries: []RoutingEntry,
+    top_scores: []PersistedTopScore,
     footer_offset: u64,
 
     pub fn deinit(self: *RoutingIndex, alloc: Allocator) void {
         alloc.free(self.entries);
+        alloc.free(self.top_scores);
         self.* = undefined;
     }
 
@@ -264,10 +275,31 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
         entry.* = .{ .first_node_id = first_node_id, .offset = offset, .len = len_u32, .checksum = checksum };
         previous_end = end;
     }
+    const top_scores = if (segment_version >= 6) blk: {
+        if (!std.mem.eql(u8, try take(footer, &pos, top_tier_magic.len), top_tier_magic)) return error.InvalidGraphMetricSegment;
+        const top_count = try readInt(u32, footer, &pos);
+        if (top_count > max_persisted_top_entries) return error.InvalidGraphMetricSegment;
+        const decoded = try alloc.alloc(PersistedTopScore, top_count);
+        errdefer alloc.free(decoded);
+        for (decoded, 0..) |*score, score_index| {
+            if (score_index % 256 == 0) try cancellation.check();
+            const node_id_len = try readInt(u32, footer, &pos);
+            if (node_id_len == 0 or node_id_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
+            const value: f64 = @bitCast(try readInt(u64, footer, &pos));
+            if (!std.math.isFinite(value)) return error.InvalidGraphMetricSegment;
+            const node_id = try take(footer, &pos, node_id_len);
+            if (score_index > 0 and !topScoreRanksBefore(decoded[score_index - 1], .{ .node_id = node_id, .value = value })) {
+                return error.InvalidGraphMetricSegment;
+            }
+            score.* = .{ .node_id = node_id, .value = value };
+        }
+        break :blk decoded;
+    } else try alloc.alloc(PersistedTopScore, 0);
+    errdefer alloc.free(top_scores);
     if (pos + routing_trailer_len != footer.len) return error.InvalidGraphMetricSegment;
     if (entries.len > 0 and previous_end.? != footer_offset) return error.InvalidGraphMetricSegment;
     try cancellation.check();
-    return .{ .entries = entries, .footer_offset = footer_offset };
+    return .{ .entries = entries, .top_scores = top_scores, .footer_offset = footer_offset };
 }
 
 pub fn artifactIntegrity(segment: types.Segment, payload: []const u8) !ArtifactIntegrity {
@@ -477,6 +509,17 @@ pub fn encodeAllocWithCancellation(alloc: Allocator, segment: types.Segment, can
         block_offset += block_len;
     }
     std.debug.assert(block_offset == footer_offset);
+    putBytes(data, &pos, top_tier_magic);
+    var top_storage: [max_persisted_top_entries]usize = undefined;
+    const top_indexes = selectTopScoreIndexes(segment.scores, &top_storage);
+    putInt(u32, data, &pos, @intCast(top_indexes.len));
+    for (top_indexes, 0..) |top_index, index| {
+        if (index % 256 == 0) try cancellation.check();
+        const score = segment.scores[top_index];
+        putInt(u32, data, &pos, @intCast(score.node_id.len));
+        putInt(u64, data, &pos, @bitCast(score.value));
+        putBytes(data, &pos, score.node_id);
+    }
     putInt(u64, data, &pos, @intCast(pos + routing_trailer_len - footer_offset));
     std.debug.assert(pos == data.len);
     try cancellation.check();
@@ -640,12 +683,75 @@ fn scoreBlockCount(score_count: usize) usize {
     return score_count / score_block_entries + @intFromBool(score_count % score_block_entries != 0);
 }
 
+fn topScoreRanksBefore(a: PersistedTopScore, b: PersistedTopScore) bool {
+    if (a.value != b.value) return a.value > b.value;
+    return std.mem.order(u8, a.node_id, b.node_id) == .lt;
+}
+
+fn scoreIndexRanksBefore(scores: []const types.Score, a: usize, b: usize) bool {
+    return topScoreRanksBefore(
+        .{ .node_id = scores[a].node_id, .value = scores[a].value },
+        .{ .node_id = scores[b].node_id, .value = scores[b].value },
+    );
+}
+
+fn siftWorstScoreUp(scores: []const types.Score, heap: []usize, start: usize) void {
+    var child = start;
+    while (child > 0) {
+        const parent = (child - 1) / 2;
+        if (!scoreIndexRanksBefore(scores, heap[parent], heap[child])) break;
+        std.mem.swap(usize, &heap[parent], &heap[child]);
+        child = parent;
+    }
+}
+
+fn siftWorstScoreDown(scores: []const types.Score, heap: []usize, start: usize) void {
+    var parent = start;
+    while (true) {
+        const left = parent * 2 + 1;
+        if (left >= heap.len) return;
+        const right = left + 1;
+        var worse_child = left;
+        if (right < heap.len and scoreIndexRanksBefore(scores, heap[left], heap[right])) worse_child = right;
+        if (!scoreIndexRanksBefore(scores, heap[parent], heap[worse_child])) return;
+        std.mem.swap(usize, &heap[parent], &heap[worse_child]);
+        parent = worse_child;
+    }
+}
+
+fn selectTopScoreIndexes(scores: []const types.Score, storage: *[max_persisted_top_entries]usize) []usize {
+    const target = @min(scores.len, max_persisted_top_entries);
+    var heap_len: usize = 0;
+    for (scores, 0..) |_, score_index| {
+        if (heap_len < target) {
+            storage[heap_len] = score_index;
+            siftWorstScoreUp(scores, storage[0 .. heap_len + 1], heap_len);
+            heap_len += 1;
+        } else if (target > 0 and scoreIndexRanksBefore(scores, score_index, storage[0])) {
+            storage[0] = score_index;
+            siftWorstScoreDown(scores, storage[0..heap_len], 0);
+        }
+    }
+    var remaining = heap_len;
+    while (remaining > 1) {
+        std.mem.swap(usize, &storage[0], &storage[remaining - 1]);
+        remaining -= 1;
+        siftWorstScoreDown(scores, storage[0..remaining], 0);
+    }
+    return storage[0..heap_len];
+}
+
 fn routingEncodedSize(scores: []const types.Score) !usize {
-    var size: usize = routing_header_len + routing_trailer_len;
+    var size: usize = routing_header_len + top_tier_header_len + routing_trailer_len;
     var score_index: usize = 0;
     while (score_index < scores.len) : (score_index += score_block_entries) {
         size = std.math.add(usize, size, routing_entry_fixed_len) catch return error.GraphMetricSegmentTooLarge;
         size = std.math.add(usize, size, scores[score_index].node_id.len) catch return error.GraphMetricSegmentTooLarge;
+    }
+    var top_storage: [max_persisted_top_entries]usize = undefined;
+    for (selectTopScoreIndexes(scores, &top_storage)) |ranked_index| {
+        size = std.math.add(usize, size, top_tier_entry_fixed_len) catch return error.GraphMetricSegmentTooLarge;
+        size = std.math.add(usize, size, scores[ranked_index].node_id.len) catch return error.GraphMetricSegmentTooLarge;
     }
     if (size > max_routing_bytes) return error.GraphMetricSegmentTooLarge;
     return size;
@@ -703,6 +809,22 @@ fn validateRoutingFooter(data: []const u8, footer_offset: usize, scores: []const
             if (!std.mem.eql(u8, &actual_checksum, &encoded_checksum)) return error.InvalidGraphMetricSegment;
         }
         expected_offset += block_len;
+    }
+    if (version >= 6) {
+        if (!std.mem.eql(u8, try take(footer, &pos, top_tier_magic.len), top_tier_magic)) return error.InvalidGraphMetricSegment;
+        var top_storage: [max_persisted_top_entries]usize = undefined;
+        const expected_top = selectTopScoreIndexes(scores, &top_storage);
+        if (try readInt(u32, footer, &pos) != expected_top.len) return error.InvalidGraphMetricSegment;
+        for (expected_top, 0..) |score_index, index| {
+            if (index % 256 == 0) try cancellation.check();
+            const score = scores[score_index];
+            const node_id_len = try readInt(u32, footer, &pos);
+            const value_bits = try readInt(u64, footer, &pos);
+            const node_id = try take(footer, &pos, node_id_len);
+            if (!std.mem.eql(u8, node_id, score.node_id) or value_bits != @as(u64, @bitCast(score.value))) {
+                return error.InvalidGraphMetricSegment;
+            }
+        }
     }
     if (expected_offset != footer_offset or pos + routing_trailer_len != footer.len) return error.InvalidGraphMetricSegment;
     try cancellation.check();
@@ -802,6 +924,10 @@ test "serverless graph metric routing resolves exact scores without decoding the
     var routing = try decodeRoutingIndexAlloc(alloc, encoded[footer_offset..], encoded.len);
     defer routing.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), routing.entries.len);
+    try std.testing.expectEqual(max_persisted_top_entries, routing.top_scores.len);
+    try std.testing.expectEqualStrings("node:1024", routing.top_scores[0].node_id);
+    try std.testing.expectEqual(@as(f64, 1024), routing.top_scores[0].value);
+    try std.testing.expectEqualStrings("node:0001", routing.top_scores[routing.top_scores.len - 1].node_id);
     try std.testing.expectEqual(control.score_data_offset, routing.entries[0].offset);
     const entry = routing.find("node:1024").?;
     try std.testing.expectEqual(@as(?f64, 1024), try scoreFromBlockWithCancellation(
@@ -819,6 +945,12 @@ test "serverless graph metric routing resolves exact scores without decoding the
     defer alloc.free(corrupted);
     corrupted[@as(usize, @intCast(entry.offset)) + @sizeOf(u32)] ^= 0x01;
     try std.testing.expectError(error.InvalidGraphMetricSegment, decodeAlloc(alloc, corrupted));
+
+    const corrupted_top = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupted_top);
+    const top_offset = footer_offset + std.mem.indexOf(u8, corrupted_top[footer_offset..], top_tier_magic).?;
+    corrupted_top[top_offset + top_tier_magic.len + @sizeOf(u32) + @sizeOf(u32)] ^= 0x01;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, decodeAlloc(alloc, corrupted_top));
 }
 
 test "serverless graph metric segment round trips terminal materialization rejection" {

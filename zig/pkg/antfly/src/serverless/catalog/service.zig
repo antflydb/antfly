@@ -80,7 +80,7 @@ fn graphMetricReadinessAlloc(alloc: Allocator, manifest: ?manifest_mod.Manifest,
                 artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
                 break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
             } else null;
-            const current_artifact = artifact.metadata_version >= 5 and
+            const current_artifact = artifact.metadata_version == graph_metric_segment.wire_version and
                 artifact.graph_metric_control_len != 0 and
                 artifact.graph_metric_routing_footer_len != 0 and
                 artifact.materializer_fingerprint == current and
@@ -132,7 +132,7 @@ test "serverless catalog schedules idle graph metric policy upgrades from manife
     try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
     const specs = try graph_metric_config.parseIndexSpecsAlloc(std.testing.allocator, indexes_json);
     defer graph_metric_config.freeIndexSpecs(std.testing.allocator, specs);
-    artifacts[1].metadata_version = 5;
+    artifacts[1].metadata_version = graph_metric_segment.wire_version;
     artifacts[1].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
     artifacts[1].graph_metric_control_len = 1;
     artifacts[1].graph_metric_routing_footer_len = 1;

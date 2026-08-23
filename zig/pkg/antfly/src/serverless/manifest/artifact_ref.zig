@@ -19,6 +19,9 @@
 /// metric artifact references are present.
 pub const graph_metric_min_manifest_wire_version: u16 = 15;
 pub const graph_metric_range_integrity_manifest_wire_version: u16 = 16;
+/// First manifest version whose readers understand graph-metric segment v6's
+/// authenticated, score-ranked footer tier.
+pub const graph_metric_top_tier_manifest_wire_version: u16 = 17;
 
 pub const GraphMetricMaterializationState = enum(u8) {
     ready = 0,
