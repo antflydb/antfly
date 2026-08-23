@@ -73,6 +73,11 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .mutable_idle_flush_min_bytes = 1024 * 1024,
     .mutable_idle_flush_max_age_ns = durable_lsm_idle_flush_max_age_ns,
     .bulk_ingest_flush_threshold_bytes_multiplier = 2,
+    // A bulk current scan transfers the mutable epoch into the immutable set
+    // instead of cloning it. The pinned epoch remains query-stable while the
+    // existing background flusher publishes it, so foreground writes retain
+    // the normal 32 MiB direct-ingest amortization.
+    .bulk_ingest_current_scan_clone_max_bytes = 0,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
@@ -153,6 +158,11 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
 pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 128 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 128 * 1024 * 1024,
+    // HBC replay repeatedly scans its structural namespaces while bulk writes
+    // are active. Transfer those mutable epochs into the pinned immutable set
+    // instead of cloning large node/value maps for every scan; the normal
+    // background flush path preserves ordering and bounded memory.
+    .bulk_ingest_current_scan_clone_max_bytes = 0,
     // HBC updates are substantially larger and burstier than document/index
     // metadata. Retain useful batching without allowing a quiet index to pin
     // its WAL indefinitely.
@@ -508,6 +518,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.flush_threshold);
     try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), opts.dense_lsm_options.flush_threshold_bytes);
     try std.testing.expectEqual(opts.dense_lsm_options.flush_threshold_bytes, opts.dense_lsm_options.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 0), opts.dense_lsm_options.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(dense_idle_flush_after_ns, opts.dense_lsm_options.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(dense_idle_flush_min_bytes, opts.dense_lsm_options.mutable_idle_flush_min_bytes);
     try std.testing.expectEqual(durable_lsm_idle_flush_max_age_ns, opts.dense_lsm_options.mutable_idle_flush_max_age_ns);
@@ -564,6 +575,7 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 0), primary_opts.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);
     try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), primary_opts.mutable_idle_flush_max_age_ns);

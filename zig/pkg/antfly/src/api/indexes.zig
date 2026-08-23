@@ -3186,6 +3186,14 @@ fn appendAppliedSequenceStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnma
     try appendIntValue(alloc, out, stats.flushed_indexes);
     try out.appendSlice(alloc, ",\"sync_ns\":");
     try appendIntValue(alloc, out, stats.sync_ns);
+    try out.appendSlice(alloc, ",\"posting_publish_ns\":");
+    try appendIntValue(alloc, out, stats.posting_publish_ns);
+    try out.appendSlice(alloc, ",\"projection_metadata_ns\":");
+    try appendIntValue(alloc, out, stats.projection_metadata_ns);
+    try out.appendSlice(alloc, ",\"checkpoint_file_ns\":");
+    try appendIntValue(alloc, out, stats.checkpoint_file_ns);
+    try out.appendSlice(alloc, ",\"status_snapshot_ns\":");
+    try appendIntValue(alloc, out, stats.status_snapshot_ns);
     try out.appendSlice(alloc, ",\"save_ns\":");
     try appendIntValue(alloc, out, stats.save_ns);
     try out.appendSlice(alloc, ",\"flush_ns\":");

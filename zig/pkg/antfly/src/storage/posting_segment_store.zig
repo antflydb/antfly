@@ -20,6 +20,8 @@ const posting_segment = vectorindex.posting_segment;
 const posting_wal = vectorindex.posting_wal;
 
 const current_name = "CURRENT";
+pub const authority_name = "AUTHORITY";
+pub const authority_value = "antfly-hbc-native-v1\n";
 const max_control_bytes = posting_wal.Checkpoint.encoded_len;
 const max_wal_bytes: usize = 512 * 1024 * 1024;
 const max_segment_bytes: usize = if (@sizeOf(usize) >= 8) 4 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
@@ -191,6 +193,12 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.alloc.free(self.root_dir);
         self.* = undefined;
+    }
+
+    pub fn markAuthoritative(self: *Store) !void {
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, authority_name });
+        defer self.alloc.free(path);
+        try atomicReplace(self.alloc, self.storage, path, authority_value);
     }
 
     pub fn appendBatch(self: *Store, batch_id: u64, records: []const BatchRecord, covered_source_sequence: u64) !void {

@@ -569,6 +569,123 @@ fn getBatchVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: [
     return try self.getVectorScratch(txn, vector_id, scratch);
 }
 
+fn splitWorkspaceContains(self: anytype, vector_id: u64) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "bulkSplitVectorWorkspaceContains")) {
+        return self.bulkSplitVectorWorkspaceContains(vector_id);
+    }
+    return false;
+}
+
+fn loadSplitWorkspaceVector(self: anytype, vector_id: u64, out: []f32) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "bulkSplitVectorWorkspaceLookup")) {
+        return self.bulkSplitVectorWorkspaceLookup(vector_id, out);
+    }
+    return false;
+}
+
+fn noteSplitWorkspaceLeafPayloadCoverage(self: anytype, member_ids: []const u64) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "noteBulkSplitLeafPayloadCoverage")) {
+        self.noteBulkSplitLeafPayloadCoverage(member_ids);
+    }
+}
+
+fn copyNonQuantizedLeafPayloadPrefix(
+    self: anytype,
+    txn: anytype,
+    leaf_id: u64,
+    leaf_member_count: usize,
+    vectors: []f32,
+) !?usize {
+    const Copier = struct {
+        fn copy(index: anytype, set: *const proto.NonQuantizedVectorSet, max_count: usize, out: []f32) ?usize {
+            const set_dims: usize = @intCast(set.vectors.dims);
+            const count: usize = @intCast(set.vectors.count);
+            const floats = std.math.mul(usize, count, set_dims) catch return null;
+            if (set_dims != index.config.dims or count > max_count or
+                set.vectors.data.len != floats or out.len < floats) return null;
+            @memcpy(out[0..floats], set.vectors.data);
+            return count;
+        }
+    };
+
+    if (self.getCachedQuantizedPtr(leaf_id)) |cached| switch (cached.*) {
+        .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
+        .rabit => {},
+    };
+
+    var key_buf: [10]u8 = undefined;
+    const encoded = self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, leaf_id)) catch return null;
+    var decoded = proto.NonQuantizedVectorSet.decode(self.alloc, encoded) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer decoded.deinit(self.alloc);
+    return Copier.copy(self, &decoded, leaf_member_count, vectors);
+}
+
+/// Reconstruct an append-only oversized leaf from its last durable nonquant
+/// payload plus the vectors owned by the current mutation session. Leaf members
+/// are append ordered, so an all-delta suffix identifies the exact boundary
+/// covered by the old payload. This keeps tree mutation on HBC-native data and
+/// avoids fetching every old leaf member from the primary document LSM merely
+/// to split the leaf. Any ambiguous ordering or stale/missing payload falls
+/// back to the ordinary exact-vector loader.
+fn loadAppendedLeafVectorsFromNonQuantizedPayload(
+    self: anytype,
+    txn: anytype,
+    leaf: *const types.Node,
+    vectors: []f32,
+    options: anytype,
+) !bool {
+    // Inspect the payload that belongs to the pre-mutation leaf. The enlarged
+    // leaf can cross the RaBit threshold even though its durable predecessor
+    // still has the exact nonquantized prefix needed for this split.
+    if (!self.config.use_quantization or !leaf.is_leaf) return false;
+    const lookup = batchVectorLookup(options);
+    const dims: usize = @intCast(self.config.dims);
+    if (vectors.len < leaf.members.len * dims or leaf.members.len == 0) return false;
+
+    var suffix_start = leaf.members.len;
+    while (suffix_start > 0) {
+        const member_id = leaf.members[suffix_start - 1];
+        const in_current_batch = if (lookup) |batch| batch.get(member_id) != null else false;
+        if (!in_current_batch and !splitWorkspaceContains(self, member_id)) break;
+        suffix_start -= 1;
+    }
+    if (suffix_start == leaf.members.len) return false;
+
+    const persisted_count = try copyNonQuantizedLeafPayloadPrefix(
+        self,
+        txn,
+        leaf.id,
+        leaf.members.len,
+        vectors,
+    ) orelse return false;
+    if (suffix_start > persisted_count) return false;
+
+    // A current-batch member inside the persisted prefix means this is an
+    // update/replacement rather than a pure append. The adapter clears its
+    // persistent split delta before any batch that is not known-new.
+    for (leaf.members[0..persisted_count]) |member_id| {
+        const in_current_batch = if (lookup) |batch| batch.get(member_id) != null else false;
+        if (in_current_batch) return false;
+    }
+
+    for (leaf.members[persisted_count..], persisted_count..) |member_id, member_index| {
+        const transformed = vectors[member_index * dims ..][0..dims];
+        if (lookup) |batch| if (batch.get(member_id)) |original| {
+            if (original.len != dims) return error.InvalidVectorDimensions;
+            _ = self.transformVector(original, transformed);
+            continue;
+        };
+        if (!loadSplitWorkspaceVector(self, member_id, transformed)) return false;
+    }
+    return true;
+}
+
 fn shouldDeferQuantizedRebuildToBulkFinish(self: anytype, options: hbc_runtime.BatchInsertOptions) bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldDeferQuantizedRebuildToBulkFinish")) {
@@ -979,6 +1096,10 @@ fn saveLeafNodeBodyWithKnownVectors(
 
     try savePackedNodeValue(self, txn, node);
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
+    // Only an exact nonquantized payload can replace the rolling split
+    // workspace. RaBit state is query-complete but cannot reconstruct the
+    // source vectors required by a later structural split.
+    if (usesNonQuantizedPayload(node)) noteSplitWorkspaceLeafPayloadCoverage(self, node.members);
     clearDeferredQuantizedNode(self, node.id);
     try self.cacheNode(node);
 }
@@ -5156,7 +5277,9 @@ fn rebuildOversizedLeafAsSubtree(
     }
 
     const vector_load_start = now_fn();
-    try loadTransformedVectorIdsIntoMatrix(self, txn, leaf.members, matrix, options);
+    if (!try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, matrix, options)) {
+        try loadTransformedVectorIdsIntoMatrix(self, txn, leaf.members, matrix, options);
+    }
     self.write_profile.split_leaf_vector_load_ns += elapsed_fn(vector_load_start);
 
     const metadata = try self.alloc.alloc(?[]const u8, count);
@@ -5272,17 +5395,19 @@ pub fn splitLeafWithOptions(
     const vec_data = try self.alloc.alloc(f32, matrix_floats);
     defer self.alloc.free(vec_data);
     const vector_load_start = now_fn();
-    var used_cached_nonquant = false;
-    _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), count) catch null;
-    if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-        switch (cached.*) {
-            .nonquant => |*set| {
-                if (set.vectors.dims == dims and set.vectors.count == count and set.vectors.data.len >= count * dims) {
-                    @memcpy(vec_data, set.vectors.data[0 .. count * dims]);
-                    used_cached_nonquant = true;
-                }
-            },
-            .rabit => {},
+    var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, vec_data, options);
+    if (!used_cached_nonquant) {
+        _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), count) catch null;
+        if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
+            switch (cached.*) {
+                .nonquant => |*set| {
+                    if (set.vectors.dims == dims and set.vectors.count == count and set.vectors.data.len >= count * dims) {
+                        @memcpy(vec_data, set.vectors.data[0 .. count * dims]);
+                        used_cached_nonquant = true;
+                    }
+                },
+                .rabit => {},
+            }
         }
     }
     if (!used_cached_nonquant) {
@@ -5477,17 +5602,19 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
     defer self.alloc.free(transformed_scratch);
 
     const vector_load_start = now_fn();
-    var used_cached_nonquant = false;
-    _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len) catch null;
-    if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-        switch (cached.*) {
-            .nonquant => |*set| {
-                if (set.vectors.dims == dims and set.vectors.count == leaf.members.len and set.vectors.data.len >= leaf.members.len * dims) {
-                    @memcpy(dense_vectors, set.vectors.data[0 .. leaf.members.len * dims]);
-                    used_cached_nonquant = true;
-                }
-            },
-            .rabit => {},
+    var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, dense_vectors, options);
+    if (!used_cached_nonquant) {
+        _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len) catch null;
+        if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
+            switch (cached.*) {
+                .nonquant => |*set| {
+                    if (set.vectors.dims == dims and set.vectors.count == leaf.members.len and set.vectors.data.len >= leaf.members.len * dims) {
+                        @memcpy(dense_vectors, set.vectors.data[0 .. leaf.members.len * dims]);
+                        used_cached_nonquant = true;
+                    }
+                },
+                .rabit => {},
+            }
         }
     }
     if (!used_cached_nonquant) {
@@ -7153,6 +7280,7 @@ pub fn refreshQuantizedWithOptions(
 
     if (node.is_leaf) {
         try posting.PostingStore.refreshQuantizedPayload(self, txn, node, vectors, now_fn, elapsed_fn);
+        if (usesNonQuantizedPayload(node)) noteSplitWorkspaceLeafPayloadCoverage(self, node.members);
         return;
     }
 

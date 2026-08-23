@@ -193,7 +193,7 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
         return false;
     };
     defer grant.complete();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -241,7 +241,7 @@ pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendTy
         return false;
     };
     defer grant.complete();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -275,7 +275,7 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         return false;
     };
     defer grant.complete();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -435,7 +435,7 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
 
     backend.remembered_compaction = null;
     backend.compaction_scheduler.noteRememberedHit();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -518,8 +518,26 @@ pub fn sortRuns(runs: []Run) void {
 }
 
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+    return try compactPlanAtWithForegroundPolicy(BackendType, backend, plan, false);
+}
+
+fn compactPlanAtOptionalMaintenance(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+    return try compactPlanAtWithForegroundPolicy(BackendType, backend, plan, true);
+}
+
+fn compactPlanAtWithForegroundPolicy(
+    comptime BackendType: type,
+    backend: *BackendType,
+    plan: CompactionPlan,
+    yield_for_foreground_queries: bool,
+) !void {
     if (comptime supportsUnlockedBackendCompaction(BackendType)) {
-        try compactPlanAtWithUnlockedBuild(BackendType, backend, plan);
+        try compactPlanAtWithUnlockedBuild(
+            BackendType,
+            backend,
+            plan,
+            yield_for_foreground_queries,
+        );
         return;
     }
     try compactPlanAtLockedOnly(BackendType, backend, plan);
@@ -632,7 +650,12 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     obsolete_runs = .empty;
 }
 
-fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+fn compactPlanAtWithUnlockedBuild(
+    comptime BackendType: type,
+    backend: *BackendType,
+    plan: CompactionPlan,
+    yield_for_foreground_queries: bool,
+) !void {
     if (plan.source_len == 0) return;
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
 
@@ -672,6 +695,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         plan.output_level,
         reserved_run_id_start,
         reserved_run_id_end,
+        yield_for_foreground_queries,
     ) catch |err| blk: {
         build_err = err;
         break :blk .empty;
@@ -759,6 +783,7 @@ fn buildCompactedRunsFromSnapshots(
     output_level: u32,
     reserved_run_id_start: u64,
     reserved_run_id_end: u64,
+    yield_for_foreground_queries: bool,
 ) !std.ArrayListUnmanaged(Run) {
     const BuildBackend = struct {
         allocator: std.mem.Allocator,
@@ -775,7 +800,13 @@ fn buildCompactedRunsFromSnapshots(
         .next_run_id = reserved_run_id_start,
     };
     const runs = if (backend.root_dir != null)
-        try makePersistedRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level)
+        try makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+            BuildBackend,
+            &build_backend,
+            selected,
+            output_level,
+            yield_for_foreground_queries,
+        )
     else
         try makeStateRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level);
     errdefer {
@@ -2037,6 +2068,22 @@ fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendTy
 }
 
 pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
+    return try makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+        BackendType,
+        backend,
+        window_runs,
+        output_level,
+        false,
+    );
+}
+
+fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+    comptime BackendType: type,
+    backend: *BackendType,
+    window_runs: []const *Run,
+    output_level: u32,
+    yield_for_foreground_queries: bool,
+) !std.ArrayListUnmanaged(Run) {
     const allocator = backend.allocator;
     const expected_entries = countRunPtrEntries(window_runs);
 
@@ -2067,6 +2114,11 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
     defer heap.deinit();
 
     while (heap.peekSource()) |winner_source| {
+        if (yield_for_foreground_queries and consumed_entries % 256 == 0) {
+            if (backend.options.resource_manager) |manager| {
+                manager.yieldOptionalMaintenanceForForegroundQuery();
+            }
+        }
         const winner = (try cursors[winner_source].currentEntry()) orelse return error.InvalidTableFile;
         const entry_bytes = tableEntryLogicalBytes(winner);
         if (output_active) {

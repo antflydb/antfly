@@ -314,6 +314,10 @@ pub const Options = struct {
     recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
+    // Optional lower logical-byte floor for already-coalesced direct bulk
+    // transactions. Zero preserves the ordinary base flush threshold. This is
+    // intentionally independent of the larger mutable bulk flush multiplier.
+    direct_bulk_ingest_min_bytes: u64 = 0,
     compact_threshold_runs: usize = 4,
     l0_overlap_compact_threshold_runs: usize = 4,
     l0_soft_limit_runs: usize = 0,
@@ -415,6 +419,8 @@ pub const IoRuntime = storage_io.RuntimeKind;
 pub const Storage = storage_io.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const NativeStorageStats = storage_io.NativeStorageStats;
+pub const NativeStorage = storage_io.NativeStorage;
+pub const NativeStorageLease = storage_io.NativeStorage.Lease;
 pub const Cache = cache_mod.Cache;
 pub const CacheStats = cache_mod.Stats;
 pub const CacheKindStats = cache_mod.KindStats;
@@ -2045,6 +2051,14 @@ pub const Backend = struct {
         return owner.snapshotStats();
     }
 
+    /// Retains the internally-created native storage after this LSM backend is
+    /// closed. Backends using a caller-owned Storage return null; that caller
+    /// already owns the required lifetime.
+    pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
+        const owner = self.storage_owner orelse return null;
+        return try owner.acquireLease();
+    }
+
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
         return self.cached_maintenance_hint.load(.monotonic);
     }
@@ -2411,7 +2425,8 @@ pub const Backend = struct {
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
             const defer_soft_compaction = if (self.options.resource_manager) |manager|
-                manager.shouldDeferSoftCompactionForDerivedReplay()
+                manager.shouldDeferSoftCompactionForDerivedReplay() or
+                    manager.shouldDeferOptionalMaintenanceForForegroundQuery()
             else
                 false;
             if (!defer_soft_compaction) {
@@ -3374,8 +3389,18 @@ pub const Backend = struct {
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return true;
+        // Direct-ingested runs are newer than every pending memtable, while
+        // readers intentionally consult mutable/immutable state before runs.
+        // Publish all older immutable epochs first so tier priority cannot let
+        // an older value shadow the new direct run. This is foreground work
+        // replacing an even more expensive mutable fallback, so it is not
+        // charged to the background maintenance-step budget.
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
         if (self.activeImmutableMemtableCount() != 0) return false;
+        if (self.mutable.entries.items.len == 0) return true;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
         errdefer sorted.deinit(self.allocator);
@@ -3384,6 +3409,25 @@ pub const Backend = struct {
         sorted.deinit(self.allocator);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return true;
+    }
+
+    /// Publish every older immutable epoch, then fold the current transaction
+    /// into the older mutable epoch and publish the combined state as one run.
+    /// Commit serialization supplies the epoch order; merging before sorting
+    /// preserves last-write-wins without manufacturing a small run for the old
+    /// mutable state followed immediately by another run for the new batch.
+    pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
+        if (!self.options.direct_bulk_ingest) return false;
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
+        if (self.activeImmutableMemtableCount() != 0) return false;
+
+        self.invalidateMutableReadSnapshot();
+        try state_mod.applyMutableMoveToMutable(&self.mutable, self.allocator, incoming);
+        return try self.directIngestMutableAtBulkFinishIfPossible();
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
@@ -3854,15 +3898,13 @@ pub const Backend = struct {
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
-        return self.stateMeetsBulkFlushThreshold(state);
+        return self.stateMeetsDirectBulkIngestThreshold(state);
     }
 
     pub fn shouldDirectIngestBulkMutable(self: *const Backend, mutable: *const ActiveMemTable) bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
-        if (byte_threshold > 0) return stateMeetsByteFlushThreshold(mutable, byte_threshold);
-        return mutable.entries.items.len >= self.effectiveFlushThreshold();
+        return self.stateMeetsDirectBulkIngestThreshold(mutable);
     }
 
     pub fn persistManifest(self: *Backend) !void {
@@ -4973,10 +5015,27 @@ pub const Backend = struct {
         return std.math.mul(u64, self.options.flush_threshold_bytes, multiplier) catch std.math.maxInt(u64);
     }
 
-    fn stateMeetsBulkFlushThreshold(self: *const Backend, state: *const State) bool {
-        const byte_threshold = self.effectiveFlushThresholdBytes();
-        if (byte_threshold > 0) return stateMeetsByteFlushThreshold(state, byte_threshold);
-        return state.entries.items.len >= self.effectiveFlushThreshold();
+    fn stateMeetsDirectBulkIngestThreshold(self: *const Backend, state: anytype) bool {
+        // A committed bulk transaction is already the coalesced unit of work.
+        // The bulk flush multiplier exists to amortize mutable flushes; applying
+        // it again here made normal concurrent batches miss direct ingest and
+        // recreate the mutable-copy hot path.
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
+        if (byte_threshold > 0 and stateMeetsByteFlushThreshold(state, byte_threshold)) return true;
+        // Snapshot publication is also a hard reason to bypass mutable state.
+        // Vector-heavy values can reach their allocator-backed snapshot bound
+        // before their encoded logical bytes reach the flush threshold.
+        if (self.options.read_snapshot_rotate_mutable_bytes > 0 and
+            estimateStateBytes(state) >= self.options.read_snapshot_rotate_mutable_bytes) return true;
+        if (byte_threshold > 0) return false;
+        return state.entries.items.len >= @max(@as(usize, 1), self.options.flush_threshold);
+    }
+
+    fn directBulkIngestLogicalThresholdBytes(self: *const Backend) u64 {
+        return if (self.options.direct_bulk_ingest_min_bytes > 0)
+            self.options.direct_bulk_ingest_min_bytes
+        else
+            self.options.flush_threshold_bytes;
     }
 
     fn shouldFlushMutable(self: *const Backend) bool {
@@ -5545,21 +5604,20 @@ pub const Backend = struct {
     }
 
     pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
-        if (self.mutable.entries.items.len == 0) return false;
-        if (self.active_bulk_ingest_batches <= 1) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
+        const has_mutable = self.mutable.entries.items.len != 0;
+        const has_immutable = self.activeImmutableMemtableCount() != 0;
+        if (!has_mutable and !has_immutable) return false;
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
         if (byte_threshold > 0) {
             const logical_bytes = estimateStateLogicalBytes(&self.mutable) +| estimateStateLogicalBytes(incoming);
             if (logical_bytes >= byte_threshold) return true;
-            const memory_threshold = std.math.mul(
-                u64,
-                byte_threshold,
-                mutable_memory_guard_multiplier,
-            ) catch std.math.maxInt(u64);
+            const guard_threshold = std.math.mul(u64, byte_threshold, mutable_memory_guard_multiplier) catch std.math.maxInt(u64);
+            const snapshot_threshold = self.options.read_snapshot_rotate_mutable_bytes;
+            const memory_threshold = if (snapshot_threshold > 0) @min(guard_threshold, snapshot_threshold) else guard_threshold;
             return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= memory_threshold;
         }
-        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+        if (self.active_bulk_ingest_batches <= 1 and !has_immutable) return false;
+        return self.mutable.entries.items.len + incoming.entries.items.len >= @max(@as(usize, 1), self.options.flush_threshold);
     }
 
     fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
@@ -9378,6 +9436,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
         .bulk_ingest_flush_threshold_multiplier = 4,
+        .direct_bulk_ingest = false,
     });
     defer backend.close();
 
@@ -9498,8 +9557,8 @@ test "lsm runtime bulk append after put preserves write order" {
 
 test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
     var backend = Backend.init(std.testing.allocator, .{
-        .flush_threshold = 1,
-        .bulk_ingest_flush_threshold_multiplier = 4,
+        .flush_threshold = 4,
+        .bulk_ingest_flush_threshold_multiplier = 2,
     });
     defer backend.close();
 
@@ -9531,14 +9590,51 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_attempts);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_fallback_below_threshold);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("F", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:f"));
+}
+
+test "lsm backend direct bulk ingest publishes older immutable epoch first" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 2,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.commit();
+    }
+    try backend.rotateMutableToImmutable();
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
 }
 
 test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
@@ -10157,6 +10253,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
         .flush_threshold = 1000,
         .flush_threshold_bytes = 256,
         .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .direct_bulk_ingest = false,
         .storage = storage.storage(),
     });
     defer backend.close();
@@ -10181,6 +10278,67 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
     try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
+}
+
+test "lsm backend direct bulk ingest uses base byte threshold" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-bulk-byte-threshold", .{
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+        .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 300;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest honors configured coalesced minimum" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold_bytes = 1024,
+        .read_snapshot_rotate_mutable_bytes = 0,
+        .direct_bulk_ingest_min_bytes = 64,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 100;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest precedes mutable snapshot rotation" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-before-snapshot-rotation", .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .read_snapshot_rotate_mutable_bytes = 1,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", "A");
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.read_snapshot_mutable_rotations);
 }
 
 test "lsm backend write pressure compacts hard L0 debt" {
@@ -10407,6 +10565,45 @@ test "lsm backend defers soft compaction behind latency-sensitive derived replay
     sleepForTest(550 * std.time.ns_per_ms);
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
+test "lsm backend foreground query defers soft but not hard pressure compaction" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    manager.beginForegroundQuery();
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    // Crossing the hard bound must retain the existing minimum-progress
+    // escape even while a query is active.
+    backend.options.l0_hard_limit_runs = 1;
+    platform.sync.lockYielding(&backend.mu);
+    {
+        defer backend.mu.unlock();
+        try backend.enforceWritePressure();
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    manager.finishForegroundQuery();
 }
 
 test "lsm backend public maintenance mutators serialize on backend mutex" {

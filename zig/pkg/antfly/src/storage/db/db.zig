@@ -997,6 +997,10 @@ const AppliedSequenceContentionStats = struct {
     flush_calls: AtomicU64 = .init(0),
     flushed_indexes: AtomicU64 = .init(0),
     sync_ns: AtomicU64 = .init(0),
+    posting_publish_ns: AtomicU64 = .init(0),
+    projection_metadata_ns: AtomicU64 = .init(0),
+    checkpoint_file_ns: AtomicU64 = .init(0),
+    status_snapshot_ns: AtomicU64 = .init(0),
     save_ns: AtomicU64 = .init(0),
     flush_ns: AtomicU64 = .init(0),
     max_flush_ns: AtomicU64 = .init(0),
@@ -1009,6 +1013,10 @@ const AppliedSequenceContentionStats = struct {
             .flush_calls = self.flush_calls.load(.monotonic),
             .flushed_indexes = self.flushed_indexes.load(.monotonic),
             .sync_ns = self.sync_ns.load(.monotonic),
+            .posting_publish_ns = self.posting_publish_ns.load(.monotonic),
+            .projection_metadata_ns = self.projection_metadata_ns.load(.monotonic),
+            .checkpoint_file_ns = self.checkpoint_file_ns.load(.monotonic),
+            .status_snapshot_ns = self.status_snapshot_ns.load(.monotonic),
             .save_ns = self.save_ns.load(.monotonic),
             .flush_ns = self.flush_ns.load(.monotonic),
             .max_flush_ns = self.max_flush_ns.load(.monotonic),
@@ -4353,6 +4361,18 @@ pub const DB = struct {
             self.async_context.sparse_compaction_runtime = null;
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
+        }
+        if (executor_ready and self.open_mode.allowsIndexWorkers()) {
+            // The executor has published its final HBC coverage. Mirror the
+            // human-facing lifecycle/status view once at graceful shutdown;
+            // a failure cannot invalidate the authoritative posting WAL and
+            // will be repaired from it on the next open.
+            self.saveAllLiveIndexStatusSnapshots(self.alloc) catch |err| {
+                std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
+            };
+            self.core.syncStore(true) catch |err| {
+                std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
+            };
         }
         self.core.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
@@ -17988,6 +18008,10 @@ pub const DB = struct {
         try self.drainScheduledTextMerges();
         try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         _ = try self.runDensePostingMaintenanceForIdle();
+        // Dense WAL coverage is the hot-path applied watermark. Persist the
+        // human-facing catalog snapshot once at an explicit idle boundary,
+        // then let the normal LSM idle drain include this small control write.
+        try self.saveAllLiveIndexStatusSnapshots(self.alloc);
         _ = try self.runLsmMaintenanceUntilIdle();
     }
 
@@ -22054,6 +22078,8 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var generation_ns: u64 = 0;
@@ -36069,12 +36095,12 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
         .dense_bulk_session_scope = .external,
     };
     for (managed_indexes) |index_ref| {
-        const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        const applied = try loadManagedAppliedSequenceContext(
             ctx.alloc,
-            ctx.index_manager.checkpointIo(),
+            ctx.index_manager,
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
-            index_ref.name,
+            index_ref,
         );
         const target_sequence = try ctx.replay_source.latestMatchingSequence(
             ctx.alloc,
@@ -36120,6 +36146,32 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     }
     try saveAppliedSequencesBatchContext(ctx, updates.items);
     try truncateReplayJournalIfSafeContext(ctx);
+}
+
+fn loadManagedAppliedSequenceContext(
+    alloc: Allocator,
+    index_manager: *const index_manager_mod.IndexManager,
+    store: anytype,
+    applied_sequence_checkpoint_path: ?[]const u8,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !u64 {
+    // A WAL-authoritative dense index carries its exact durable replay
+    // boundary in the posting checkpoint/WAL commit stream. The projection
+    // metadata accessor overlays that boundary on the rarer lifecycle fields.
+    if (index_ref.kind == .dense_vector and
+        index_manager.densePostingWalAuthoritativeByName(index_ref.name))
+    {
+        const checkpoint = index_manager.denseProjectionCheckpointMetadata(index_ref.name) orelse
+            return error.InvalidDerivedApplyState;
+        return checkpoint.applied_sequence;
+    }
+    return try apply_state.loadAppliedSequenceWithCheckpoint(
+        alloc,
+        index_manager.checkpointIo(),
+        store,
+        applied_sequence_checkpoint_path,
+        index_ref.name,
+    );
 }
 
 fn canAdvanceDerivedReplayTargetContext(
@@ -36280,29 +36332,79 @@ fn saveAppliedSequencesBatchContext(
             &async_ctx.stats.applied_sequence_mutex,
         );
         defer seq_lock.unlock();
-        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, async_ctx);
+    }
+    return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, null);
+}
+
+fn saveAppliedSequencesBatchLockedContext(
+    ctx: *const BatchExecutionContext,
+    enriched_updates: []const apply_state.AppliedSequenceUpdate,
+    async_ctx: ?*AsyncContext,
+) !void {
+    var generic_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
+    defer generic_updates.deinit(ctx.alloc);
+    try generic_updates.ensureTotalCapacity(ctx.alloc, enriched_updates.len);
+    for (enriched_updates) |update| {
+        if (ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name)) {
+            try ctx.index_manager.persistDensePostingSidecarByName(update.index_name, update.sequence);
+        } else {
+            generic_updates.appendAssumeCapacity(update);
+        }
+    }
+    if (generic_updates.items.len == 0) {
+        if (async_ctx) |active_async_ctx| {
+            var lifecycle_completed = false;
+            for (enriched_updates) |update| {
+                lifecycle_completed = try finalizeCoveredDenseProjectionCheckpoint(
+                    active_async_ctx,
+                    update.index_name,
+                    update.sequence,
+                ) or lifecycle_completed;
+            }
+            if (lifecycle_completed) try DB.saveIndexStatusSnapshots(
+                ctx.alloc,
+                ctx.store,
+                ctx.index_manager,
+                enriched_updates,
+            );
+        }
+        return;
+    }
+    if (async_ctx) |active_async_ctx| {
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
             ctx.index_manager.checkpointIo(),
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
-            enriched_updates,
+            generic_updates.items,
         );
-        for (enriched_updates) |update| _ = try finalizeCoveredDenseProjectionCheckpoint(async_ctx, update.index_name, update.sequence);
-        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        var authoritative_lifecycle_completed = false;
+        for (enriched_updates) |update| {
+            const completed_now = try finalizeCoveredDenseProjectionCheckpoint(active_async_ctx, update.index_name, update.sequence);
+            authoritative_lifecycle_completed = authoritative_lifecycle_completed or
+                (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
+        }
+        try DB.saveIndexStatusSnapshots(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            if (authoritative_lifecycle_completed) enriched_updates else generic_updates.items,
+        );
         return;
     }
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
+        generic_updates.items,
     );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
 }
 
 fn appliedSequenceUpdatesWithConfigHashes(
@@ -40838,12 +40940,12 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
 
     var min_applied: u64 = std.math.maxInt(u64);
     for (managed_indexes) |index_ref| {
-        const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        const applied = try loadManagedAppliedSequenceContext(
             ctx.alloc,
-            ctx.index_manager.checkpointIo(),
+            ctx.index_manager,
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
-            index_ref.name,
+            index_ref,
         );
         min_applied = @min(min_applied, applied);
     }
@@ -42466,12 +42568,12 @@ fn replayRangeHasManagedIndexApplicableRecord(
 
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+    const persisted_applied = try loadManagedAppliedSequenceContext(
         ctx.alloc,
-        ctx.index_manager.checkpointIo(),
+        ctx.index_manager,
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
-        index_ref.name,
+        index_ref,
     );
     if (persisted_applied >= target_sequence) return true;
 
@@ -43438,6 +43540,10 @@ fn flushFinishedDenseAppliedSequenceLocked(
 
     const flush_start_ns = monotonicTimeNs();
     const save_start_ns = monotonicTimeNs();
+    var posting_publish_ns: u64 = 0;
+    var projection_metadata_ns: u64 = 0;
+    var checkpoint_file_ns: u64 = 0;
+    var status_snapshot_ns: u64 = 0;
     // Checkpointing managed projection effects reaches into live index
     // backends. Hold a shared apply lease so concurrent persistence remains
     // parallel while catalog replacement's exclusive lease cannot retire a
@@ -43451,17 +43557,39 @@ fn flushFinishedDenseAppliedSequenceLocked(
         }};
         const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
         defer ctx.alloc.free(enriched_updates);
-        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try apply_state.saveAppliedSequencesWithCheckpoint(
-            ctx.alloc,
-            ctx.index_manager.checkpointIo(),
-            ctx.store,
-            ctx.applied_sequence_checkpoint_path,
-            enriched_updates,
-        );
-        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
-        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        const hbc_authoritative = ctx.index_manager.densePostingWalAuthoritativeByName(pending.owned_name);
+        if (hbc_authoritative) {
+            // The posting WAL commit footer is the dense applied watermark.
+            // Persist the captured mutation and publish its immutable query
+            // generation, but do not rewrite the generic checkpoint or source
+            // LSM status row for every replay window.
+            const posting_started = monotonicTimeNs();
+            try ctx.index_manager.persistDensePostingSidecarByName(pending.owned_name, pending.sequence);
+            posting_publish_ns +|= elapsedSince(posting_started);
+        } else {
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
+            const posting_started = monotonicTimeNs();
+            try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+            posting_publish_ns +|= elapsedSince(posting_started);
+            const checkpoint_started = monotonicTimeNs();
+            try apply_state.saveAppliedSequencesWithCheckpoint(
+                ctx.alloc,
+                ctx.index_manager.checkpointIo(),
+                ctx.store,
+                ctx.applied_sequence_checkpoint_path,
+                enriched_updates,
+            );
+            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
+        }
+        const lifecycle_completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
+        lifecycle_completed.* = lifecycle_completed_now or lifecycle_completed.*;
+        if (!hbc_authoritative or lifecycle_completed_now) {
+            const status_started = monotonicTimeNs();
+            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+            status_snapshot_ns +|= elapsedSince(status_started);
+        }
         break :blk elapsedSince(save_start_ns);
     };
 
@@ -43469,6 +43597,10 @@ fn flushFinishedDenseAppliedSequenceLocked(
     const flush_ns = elapsedSince(flush_start_ns);
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(1, .monotonic);
+    _ = ctx.stats.applied_sequence.posting_publish_ns.fetchAdd(posting_publish_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.projection_metadata_ns.fetchAdd(projection_metadata_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.checkpoint_file_ns.fetchAdd(checkpoint_file_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.status_snapshot_ns.fetchAdd(status_snapshot_ns, .monotonic);
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);
@@ -43498,6 +43630,10 @@ fn flushPendingAppliedSequencesLocked(
     const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates.items);
     defer ctx.alloc.free(enriched_updates);
     const sync_ns: u64 = 0;
+    var posting_publish_ns: u64 = 0;
+    var projection_metadata_ns: u64 = 0;
+    var checkpoint_file_ns: u64 = 0;
+    var status_snapshot_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
     // Keep the complete metadata/checkpoint/status transaction on one stable
@@ -43506,19 +43642,52 @@ fn flushPendingAppliedSequencesLocked(
     const save_ns = blk: {
         ctx.apply_mutex.lockShared();
         defer ctx.apply_mutex.unlockShared();
-        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-        try apply_state.saveAppliedSequencesWithCheckpoint(
-            ctx.alloc,
-            ctx.index_manager.checkpointIo(),
-            ctx.store,
-            ctx.applied_sequence_checkpoint_path,
-            enriched_updates,
-        );
+        var generic_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
+        defer generic_updates.deinit(ctx.alloc);
+        try generic_updates.ensureTotalCapacity(ctx.alloc, enriched_updates.len);
         for (enriched_updates) |update| {
-            lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
+            if (ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name)) {
+                const posting_started = monotonicTimeNs();
+                try ctx.index_manager.persistDensePostingSidecarByName(update.index_name, update.sequence);
+                posting_publish_ns +|= elapsedSince(posting_started);
+            } else {
+                generic_updates.appendAssumeCapacity(update);
+            }
         }
-        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        if (generic_updates.items.len > 0) {
+            const metadata_started = monotonicTimeNs();
+            try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+            projection_metadata_ns +|= elapsedSince(metadata_started);
+            const posting_started = monotonicTimeNs();
+            try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
+            posting_publish_ns +|= elapsedSince(posting_started);
+            const checkpoint_started = monotonicTimeNs();
+            try apply_state.saveAppliedSequencesWithCheckpoint(
+                ctx.alloc,
+                ctx.index_manager.checkpointIo(),
+                ctx.store,
+                ctx.applied_sequence_checkpoint_path,
+                generic_updates.items,
+            );
+            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
+        }
+        var authoritative_lifecycle_completed = false;
+        for (enriched_updates) |update| {
+            const completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence);
+            lifecycle_completed.* = completed_now or lifecycle_completed.*;
+            authoritative_lifecycle_completed = authoritative_lifecycle_completed or
+                (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
+        }
+        if (generic_updates.items.len > 0) {
+            const status_started = monotonicTimeNs();
+            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
+            status_snapshot_ns +|= elapsedSince(status_started);
+        }
+        if (authoritative_lifecycle_completed) {
+            const status_started = monotonicTimeNs();
+            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+            status_snapshot_ns +|= elapsedSince(status_started);
+        }
         break :blk elapsedSince(save_start_ns);
     };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
@@ -43527,6 +43696,10 @@ fn flushPendingAppliedSequencesLocked(
     _ = ctx.stats.applied_sequence.flush_calls.fetchAdd(1, .monotonic);
     _ = ctx.stats.applied_sequence.flushed_indexes.fetchAdd(@intCast(updates.items.len), .monotonic);
     _ = ctx.stats.applied_sequence.sync_ns.fetchAdd(sync_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.posting_publish_ns.fetchAdd(posting_publish_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.projection_metadata_ns.fetchAdd(projection_metadata_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.checkpoint_file_ns.fetchAdd(checkpoint_file_ns, .monotonic);
+    _ = ctx.stats.applied_sequence.status_snapshot_ns.fetchAdd(status_snapshot_ns, .monotonic);
     _ = ctx.stats.applied_sequence.save_ns.fetchAdd(save_ns, .monotonic);
     _ = ctx.stats.applied_sequence.flush_ns.fetchAdd(flush_ns, .monotonic);
     atomicMaxU64(&ctx.stats.applied_sequence.max_flush_ns, flush_ns);

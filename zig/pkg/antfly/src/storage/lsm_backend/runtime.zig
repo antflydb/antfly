@@ -3555,7 +3555,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
+                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+            {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
@@ -3623,15 +3625,20 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and
+            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
                 @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
-                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+                @hasDecl(BackendType, "directIngestCombinedMutable"))
             {
-                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
+                const sort_start_ns = platform_time.monotonicNs();
+                if (!try self.backend.directIngestCombinedMutable(&self.mutable)) {
                     if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
                     return false;
                 }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, elapsedNs(sort_start_ns));
+                notePotentialMaintenanceDebtLocked(self.backend);
+                return true;
             }
             if (self.backend.mutable.entries.items.len != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
@@ -6339,7 +6346,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
+                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+            {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
@@ -6407,15 +6416,20 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and
+            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
                 @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
-                @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
+                @hasDecl(BackendType, "directIngestCombinedMutable"))
             {
-                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
+                const sort_start_ns = platform_time.monotonicNs();
+                if (!try self.backend.directIngestCombinedMutable(&self.mutable)) {
                     if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
                     return false;
                 }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, elapsedNs(sort_start_ns));
+                notePotentialMaintenanceDebtLocked(self.backend);
+                return true;
             }
             if (self.backend.mutable.entries.items.len != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();

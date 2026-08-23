@@ -3524,8 +3524,15 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
         } else return null;
         const checkpoint = entry.index.projectionCheckpointMetadata();
+        const applied_sequence = if (entry.index.experimentalPostingWalAuthoritative())
+            // Once authority is sticky, an absent live HBC generation is an
+            // invalid state. Falling back to the older compatibility mirror
+            // could authorize replay-journal truncation past missing postings.
+            entry.index.experimentalPostingDurableAppliedSequence() orelse return null
+        else
+            checkpoint.applied_sequence;
         return .{
-            .applied_sequence = checkpoint.applied_sequence,
+            .applied_sequence = applied_sequence,
             .status = switch (checkpoint.status) {
                 @intFromEnum(apply_state.ProjectionStatus.clean) => .clean,
                 @intFromEnum(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
@@ -3536,6 +3543,16 @@ pub const IndexManager = struct {
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         };
+    }
+
+    pub fn densePostingWalAuthoritativeByName(
+        self: *const IndexManager,
+        index_name: []const u8,
+    ) bool {
+        const entry = for (self.dense_indexes.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
+        } else return false;
+        return entry.index.experimentalPostingWalAuthoritative();
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *const IndexManager) lsm_backend_mod.NativeStorageStats {
@@ -4022,6 +4039,9 @@ pub const IndexManager = struct {
             // before posting maintenance so traversals stop tripping on it.
             if (try entry.index.maybeRepairTreeLinks(dense_link_repair_max_nodes)) |link_repair| {
                 total_steps += @intCast(link_repair.repaired());
+            }
+            if (try entry.index.requestExperimentalPostingCheckpointForIdle()) {
+                total_steps += 1;
             }
             const backlog = try entry.index.postingBacklogStats();
             if (!backlog.needsRepair()) continue;
@@ -10629,7 +10649,10 @@ pub const IndexManager = struct {
                             return error.PostingWalMutationStoreRequiresRebuild;
                         };
                         if (posting_sequence > applied_sequence) {
-                            std.log.warn("dense posting WAL recovered prepared-ahead generation index={s} applied_sequence={} posting_sequence={}", .{
+                            // The generic applied checkpoint is now a
+                            // compatibility/lifecycle mirror. Authoritative
+                            // HBC coverage normally advances ahead of it.
+                            std.log.info("dense posting WAL recovered authoritative coverage ahead of compatibility mirror index={s} mirror_sequence={} posting_sequence={}", .{
                                 cfg.name,
                                 applied_sequence,
                                 posting_sequence,
@@ -14859,9 +14882,12 @@ pub const IndexManager = struct {
 
     fn denseHbcBatchOptions(batch_options: StoreBatchOptions, all_vector_ids_new: bool, skip_vector_store: bool) hbc_mod.BatchInsertOptions {
         const bulk_ingest = batch_options.mode == .bulk_ingest;
-        const bulk_new_vectors = bulk_ingest and all_vector_ids_new;
         return .{
-            .assume_absent_ids = bulk_new_vectors,
+            // ID assignment is the authority for absence. Streaming replay
+            // can prove a vector new even when its storage batch does not use
+            // the offline bulk-ingest enum; retaining that fact is safe and
+            // lets HBC keep an append-only native delta across replay windows.
+            .assume_absent_ids = all_vector_ids_new,
             .centroid_only_routing = bulk_ingest,
             .allow_quantized_routing = bulk_ingest,
             .coalesce_leaf_writes = bulk_ingest and hbcCoalesceBulkWritesEnabled(),
@@ -26774,6 +26800,15 @@ test "dense hbc batch options store vectors when no external loader can serve sk
     try std.testing.expect(!opts.defer_leaf_splits_to_bulk_finish);
     try std.testing.expectEqual(@as(usize, 0), opts.bulk_rebuild_leaf_min_members);
     try std.testing.expect(!opts.skip_vector_store);
+}
+
+test "dense hbc batch options preserve known-new ids outside offline bulk mode" {
+    const opts = IndexManager.denseHbcBatchOptions(.{ .mode = .default }, true, true);
+    try std.testing.expect(opts.assume_absent_ids);
+    try std.testing.expect(!opts.bulk_ingest);
+    try std.testing.expect(!opts.centroid_only_routing);
+    try std.testing.expect(!opts.defer_quantized_rebuild);
+    try std.testing.expect(opts.skip_vector_store);
 }
 
 test "authoritative posting capture starts inside an existing replay session" {

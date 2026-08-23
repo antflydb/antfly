@@ -28,6 +28,8 @@ const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
 const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
+const foreground_query_maintenance_quiet_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_query_compaction_yield_max_ns: u64 = 2 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -488,6 +490,8 @@ pub const ResourceManager = struct {
     pressure_change: PressureChange = .{},
     latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
     latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_query_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -559,6 +563,41 @@ pub const ResourceManager = struct {
     pub fn shouldDeferSoftCompactionForDerivedReplay(self: *const ResourceManager) bool {
         if (self.latency_sensitive_derived_replay_sessions.load(.acquire) != 0) return true;
         return platform_time.monotonicNs() < self.latency_sensitive_derived_replay_quiet_until_ns.load(.acquire);
+    }
+
+    /// Foreground searches share storage bandwidth with LSM compaction and
+    /// whole-HBC checkpoint construction. Optional maintenance yields while a
+    /// query is active and for a short coalescing interval afterward. Hard WAL
+    /// and write-pressure work deliberately does not consult this signal.
+    pub fn beginForegroundQuery(self: *ResourceManager) void {
+        _ = self.foreground_query_sessions.fetchAdd(1, .release);
+    }
+
+    pub fn finishForegroundQuery(self: *ResourceManager) void {
+        const previous = self.foreground_query_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            self.foreground_query_quiet_until_ns.store(
+                platform_time.monotonicNs() +| foreground_query_maintenance_quiet_ns,
+                .release,
+            );
+        }
+    }
+
+    pub fn shouldDeferOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) bool {
+        if (self.foreground_query_sessions.load(.acquire) != 0) return true;
+        return platform_time.monotonicNs() < self.foreground_query_quiet_until_ns.load(.acquire);
+    }
+
+    /// Soft compaction builders call this at bounded work intervals. Each
+    /// pause is capped: a compaction selected before hard pressure developed
+    /// must continue making progress even under a sustained query stream.
+    pub fn yieldOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) void {
+        const deadline_ns = platform_time.monotonicNs() +| foreground_query_compaction_yield_max_ns;
+        while (self.shouldDeferOptionalMaintenanceForForegroundQuery()) {
+            if (platform_time.monotonicNs() >= deadline_ns) return;
+            platform_time.yieldBriefly();
+        }
     }
 
     pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
@@ -1903,6 +1942,22 @@ test "latency-sensitive derived replay defers only optional background work" {
     try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
     manager.latency_sensitive_derived_replay_quiet_until_ns.store(0, .release);
     try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+}
+
+test "foreground queries defer optional maintenance through a short quiet window" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    manager.beginForegroundQuery();
+    manager.beginForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundQuery());
+    manager.foreground_query_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundQuery());
 }
 
 test "resource manager background deferral follows slice policy" {

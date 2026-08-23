@@ -1043,6 +1043,88 @@ cache-inclusive RSS peak (1.87 GB). Reopened recall was 0.9759 in both cold and
 warm passes; as with the earlier control, the live-to-reopened change is not
 specific to the segment reader.
 
+## Whole-tree native HBC generation
+
+The posting-only phase proved the WAL, recovery, query-generation lease, and
+atomic publication protocol, but it was not the intended final experiment.
+Keeping topology, node ranges, quantized payloads, result metadata, and the
+vector-to-leaf directory in the generic HBC LSM retained its mutable-snapshot
+copies and compaction work. The current format therefore extends the same
+checksummed generation and WAL transaction across every query-facing HBC
+namespace:
+
+- packed tree nodes and topology;
+- quantized and non-quantized leaf payloads;
+- postings and node ranges;
+- vector-to-leaf mappings and result metadata; and
+- index metadata including `covered_source_sequence`.
+
+An immutable generation is mmap-backed. Committed WAL transactions form an
+in-memory delta over that base and publish as a single leased query generation.
+A background checkpoint folds a pinned base plus a bounded WAL prefix into a
+new segment, fsyncs it, establishes the next WAL, and atomically replaces
+`CURRENT`. The sticky `AUTHORITY` marker makes recovery fail closed: after the
+first complete native generation, Antfly never reopens the legacy HBC LSM or
+silently treats its older rows as authoritative. The LSM backend and its native
+storage owner are detached after activation; only the shared filesystem lease
+needed by the segment/WAL store remains.
+
+Source documents and their exact embeddings deliberately remain in the
+primary LSM in this experiment. Approximate tree traversal is entirely native,
+while the existing boundary-rerank policy still loads exact source embeddings
+for its final candidates. Moving or sharing those source artifacts is a
+separate ownership/migration decision and was explicitly deferred.
+
+The first whole-tree public 50K lifecycle completed in 46.98 seconds (44.75
+seconds insert plus 2.24 seconds catch-up). Live recall/NDCG was
+0.9867/0.9888, with serial p50/p95/p99 of 2.7/5.4/12.1 ms; after graceful
+restart it was 0.9870/0.9891 and 2.7/3.7/12.7 ms. Peak load RSS was 1.45 GB and
+the complete HBC generation was about 20 MB. No dedicated HBC LSM remained.
+
+The first whole-tree public 1M lifecycle completed in 1,859.94 seconds
+(1,831.22 seconds insert plus 28.71 seconds catch-up). All rows were visible.
+Live recall/NDCG was 0.9868/0.9888 and restart was 0.9869/0.9889. Peak valid
+throughput was 87.3 QPS live and 68.4 QPS after restart at concurrency 20.
+Serial live p50/p95/p99 was 36.1/653.2/682.9 ms; restart was
+39.3/578.8/608.1 ms. Load RSS peaked at 2.78 GB. Native HBC durability occupied
+about 236 MB of segment and 48 MB of WAL. Startup selected native authority at
+sequence 10001 without replaying an HBC LSM; public write readiness was about
+9.6 seconds.
+
+The 1M query profile explains the remaining cold tail: native approximate HBC
+traversal is active, but exact boundary rerank reads source embeddings from the
+primary LSM, where block decode and `pread` dominate. The ingestion profile
+also moved cleanly across the ownership boundary: primary dense-vector loading,
+source point-run publication, and primary compaction dominate; generic HBC LSM
+scans do not. This is useful separation rather than a claim that the primary
+LSM is already optimal.
+
+Large deferred leaf splits initially reloaded exact source vectors even though
+the current replay transaction already owned them. The optimized path keeps a
+resource-charged rolling append delta, merges it with the immutable leaf's
+native non-quantized payload when exact reconstruction is possible, and retains
+entries until bounded ring eviction. Updates/replacements conservatively clear
+the append-only proof and fall back to the source loader. RaBit payloads are not
+exact-reconstructable, so an older leaf prefix still comes from the primary
+source while the rolling delta prevents newly appended members from being read
+again. The ring is capped at 256 MB. Its constant-cardinality hash index uses
+pre-reserved replacement windows and periodic in-place rebuilds so tombstones
+cannot cause unbounded capacity growth. Deterministic churn tests require map
+cardinality, slot ownership, fallback bounds, and resource charges to stay
+exact. This optimization changes neither tree construction nor recall policy.
+
+After bounding hash replacement churn and fixing deferred-node publication so
+the bulk boundary cannot re-stage and discard its own writes, a fresh public
+50K qualification completed in 42.16 seconds (39.92 seconds insert plus 2.24
+seconds catch-up). Live recall/NDCG was 0.9860/0.9882 with serial
+p50/p95/p99 of 2.8/5.3/13.2 ms and 1,018 QPS peak. Restart selected native
+authority at sequence 501; recall/NDCG was 0.9866/0.9887, serial latency was
+2.8/5.1/15.0 ms, and peak throughput was 1,114 QPS. Load-only peak RSS/demand
+was 1.63/1.25 GB. The complete live-plus-restart sweep peaked at 2.04 GB RSS
+during high-concurrency queries, not ingestion. The final primary LSM reported
+253 MB of cumulative mutable snapshot copying; the detached HBC store reported
+no generic LSM scan or compaction work.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

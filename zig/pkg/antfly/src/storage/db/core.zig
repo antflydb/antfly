@@ -839,6 +839,13 @@ pub const DBCore = struct {
         else
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+                try self.index_manager.persistDensePostingSidecarByName(index_name, sequence);
+                // The posting checkpoint/WAL commit boundary is the durable
+                // dense applied sequence. Lifecycle metadata is persisted only
+                // when status/generation/config identity changes.
+                return;
+            }
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
                 .applied_sequence = sequence,
                 .status = checkpoint.status,
