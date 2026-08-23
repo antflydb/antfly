@@ -93,11 +93,11 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return fmt.Errorf("isolate former primary: StatefulSet %s is not controlled by AntflyCluster UID %s", statefulSet.Name, cluster.UID)
 		}
 		if action.AdminJobPhase == "" || action.AdminJobPhase == haAdminJobPhaseWaitingDependency {
-			var initialPods corev1.PodList
-			if err := reader.List(ctx, &initialPods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+			initialPods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet)
+			if err != nil {
 				return fmt.Errorf("isolate former primary: list initial runtime pods: %w", err)
 			}
-			receipt, err := newHAPhysicalIsolationIntentReceipt(cluster, action, statefulSet, &initialPods, lease, scope)
+			receipt, err := newHAPhysicalIsolationIntentReceipt(cluster, action, statefulSet, initialPods, lease, scope)
 			if err != nil {
 				return err
 			}
@@ -137,11 +137,14 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			if err := r.Patch(ctx, statefulSet, patch); err != nil {
 				return fmt.Errorf("isolate former primary: hold StatefulSet at zero: %w", err)
 			}
-			return nil
+			// Stop this reconciliation after the irreversible workload mutation.
+			// Continuing through admin execution and a broad status write only
+			// increases the conflict window before the watchdog barrier can start.
+			return errHAStatusCheckpointed
 		}
 
-		var pods corev1.PodList
-		if err := reader.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+		pods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet)
+		if err != nil {
 			return fmt.Errorf("isolate former primary: list runtime pods: %w", err)
 		}
 		absenceProven := true
@@ -209,7 +212,7 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return nil
 		}
 		if receipt.ObservedAt == nil {
-			if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, &pods) {
+			if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
 				return nil
 			}
 			// Checkpoint the first post-watchdog-bound topology observation and
@@ -234,10 +237,10 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			}
 			return errHAStatusCheckpointed
 		}
-		if err := validateRecordedPhysicalIsolationObservation(action, statefulSet, lease, &pods, absenceProven); err != nil {
+		if err := validateRecordedPhysicalIsolationObservation(action, statefulSet, lease, pods, absenceProven); err != nil {
 			return err
 		}
-		if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, &pods) {
+		if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
 			return nil
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded {
@@ -278,6 +281,30 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		return errHAStatusCheckpointed
 	}
 	return nil
+}
+
+// listStatefulSetPodsForPhysicalIsolation discovers old-writer processes by
+// immutable controller ownership, not mutable workload labels. A partition or
+// fault injector can change a Pod label and remove it from the StatefulSet's
+// selector while the same container remains alive. Missing that Pod here would
+// make a label mutation look like physical process absence.
+func listStatefulSetPodsForPhysicalIsolation(ctx context.Context, reader client.Reader, statefulSet *appsv1.StatefulSet) (*corev1.PodList, error) {
+	if reader == nil || statefulSet == nil || statefulSet.UID == "" || statefulSet.Namespace == "" {
+		return nil, fmt.Errorf("StatefulSet namespace and UID are required")
+	}
+	var namespacePods corev1.PodList
+	if err := reader.List(ctx, &namespacePods, client.InNamespace(statefulSet.Namespace)); err != nil {
+		return nil, err
+	}
+	owned := &corev1.PodList{ListMeta: namespacePods.ListMeta}
+	for i := range namespacePods.Items {
+		pod := &namespacePods.Items[i]
+		owner := metav1.GetControllerOf(pod)
+		if owner != nil && owner.UID == statefulSet.UID {
+			owned.Items = append(owned.Items, *pod.DeepCopy())
+		}
+	}
+	return owned, nil
 }
 
 func newHAPhysicalIsolationIntentReceipt(
@@ -340,6 +367,9 @@ func newHAPhysicalIsolationIntentReceipt(
 		WatchdogMaxFenceLatencyMS:         watchdogMaxFenceLatencyMS,
 	}
 	receipt.WatchdogProof = haBindPhysicalIsolationWatchdogProof(cluster, action, pods, receipt)
+	if receipt.WatchdogProof == nil {
+		return nil, fmt.Errorf("isolate former primary: exact pre-transfer runtime watchdog proof is unavailable")
+	}
 	return receipt, nil
 }
 

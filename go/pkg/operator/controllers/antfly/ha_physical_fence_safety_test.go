@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +128,47 @@ func TestReconcilePhysicalIsolationForceDeletedOrphanWithoutWatchdogProofFailsCl
 	got := cluster.Status.HAStatus.PlannedActions[0]
 	if got.AdminJobPhase != haAdminJobPhaseRunning || got.PhysicalIsolationReceipt.ObservedAt != nil || got.CompletedAt != nil {
 		t.Fatalf("force-deleted orphan was treated as isolated without watchdog proof: %#v", got)
+	}
+}
+
+// The irreversible intent must contain all evidence needed after the old Pod
+// is gone. Publishing a partial receipt and then scaling to zero creates a
+// permanent failover deadlock because the process identity cannot be recovered.
+func TestReconcilePhysicalIsolationRefusesIntentWithoutExactWatchdogProof(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	action.AdminJobName = ""
+	action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+	action.CompletedAt = nil
+	action.PhysicalIsolationReceipt = nil
+	cluster.Status.HAStatus.PrimaryWatchdogProof = nil
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+
+	sts, lease := currentPhysicalIsolationObjects(cluster, now)
+	one := int32(1)
+	sts.Spec.Replicas = &one
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 1, CurrentReplicas: 1, ReadyReplicas: 1}
+	reconciler := testHAReconciler(t, cluster, sts, lease)
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-current"}
+	reconciler.Now = func() time.Time { return now }
+
+	err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster)
+	if err == nil || !strings.Contains(err.Error(), "exact pre-transfer runtime watchdog proof is unavailable") {
+		t.Fatalf("partial irreversible intent was not rejected: %v", err)
+	}
+	storedSTS := &appsv1.StatefulSet{}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Name: sts.Name, Namespace: sts.Namespace}, storedSTS); err != nil {
+		t.Fatalf("read StatefulSet after rejected intent: %v", err)
+	}
+	if storedSTS.Spec.Replicas == nil || *storedSTS.Spec.Replicas != 1 {
+		t.Fatalf("old writer was scaled without a complete intent receipt: %#v", storedSTS.Spec.Replicas)
+	}
+	storedCluster := &antflyv1.AntflyCluster{}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, storedCluster); err != nil {
+		t.Fatalf("read cluster after rejected intent: %v", err)
+	}
+	if storedCluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt != nil {
+		t.Fatalf("partial physical-isolation receipt was persisted: %#v", storedCluster.Status.HAStatus.PlannedActions[0])
 	}
 }
 

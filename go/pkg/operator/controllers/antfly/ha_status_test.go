@@ -4147,10 +4147,17 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	sts.Generation = 1
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              cluster.Name + "-standalone-0",
-			Namespace:         cluster.Namespace,
-			UID:               types.UID("former-primary-pod-uid"),
-			Labels:            serviceSelectorLabels(cluster.Name, "standalone"),
+			Name:      cluster.Name + "-standalone-0",
+			Namespace: cluster.Namespace,
+			UID:       types.UID("former-primary-pod-uid"),
+			// Deliberately remove the Pod from the StatefulSet selector. Physical
+			// isolation must discover a still-live writer through immutable owner
+			// identity even when a partition injector poisons mutable labels.
+			Labels: serviceSelectorLabels(cluster.Name+"-missing", "standalone"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "StatefulSet", Name: sts.Name,
+				UID: sts.UID, Controller: ptr.To(true),
+			}},
 			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
 			Finalizers:        []string{"test.antfly.io/keep-terminating"},
 		},
@@ -4177,8 +4184,12 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 	if beforeScale.Spec.Replicas == nil || *beforeScale.Spec.Replicas != 1 {
 		t.Fatalf("old writer was scaled before the durable intent checkpoint: %#v", beforeScale.Spec.Replicas)
 	}
-	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
-		t.Fatalf("start physical isolation after persisted intent: %v", err)
+	intent := cluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt
+	if intent == nil || intent.WatchdogProof == nil || len(intent.InitialOldPods) != 1 || intent.InitialOldPods[0].UID != string(pod.UID) {
+		t.Fatalf("physical-isolation intent did not bind the label-poisoned old process: %#v", intent)
+	}
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
+		t.Fatalf("physical isolation did not force an immediate reconciliation checkpoint: %v", err)
 	}
 	observedSTS := &appsv1.StatefulSet{}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(sts), observedSTS); err != nil {
