@@ -8671,6 +8671,38 @@ fn parseGraphMetricRerankAlloc(
     };
 }
 
+/// Parse only graph-metric extensions without invoking semantic embedding or
+/// the general search normalizer. Serverless serving uses this to compose
+/// immutable metric artifacts with its independent lake search planner.
+pub const OwnedGraphMetricRequests = struct {
+    queries: []const db_mod.types.NamedGraphMetricQuery = &.{},
+    rerank: ?db_mod.types.GraphMetricRerank = null,
+
+    pub fn deinit(self: *OwnedGraphMetricRequests, alloc: std.mem.Allocator) void {
+        freeNamedGraphMetricQueries(alloc, self.queries);
+        if (self.rerank) |rerank| {
+            alloc.free(@constCast(rerank.index_name));
+            alloc.free(@constCast(rerank.metric_name));
+        }
+        self.* = undefined;
+    }
+};
+
+pub fn parseGraphMetricRequestsAlloc(alloc: std.mem.Allocator, body: []const u8) !OwnedGraphMetricRequests {
+    if (body.len == 0) return error.InvalidQueryRequest;
+    var parsed = ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    const queries = try parseGraphMetricQueriesAlloc(alloc, body);
+    errdefer freeNamedGraphMetricQueries(alloc, queries);
+    return .{
+        .queries = queries,
+        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank),
+    };
+}
+
 fn parseRequiredStringField(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
     const value = object.get(field) orelse return error.InvalidQueryRequest;
     if (value != .string) return error.InvalidQueryRequest;

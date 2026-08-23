@@ -28,6 +28,7 @@ pub const ArtifactKind = enum(u8) {
     row_fragment_stats = 10,
     algebraic_segment = 11,
     external_base_source = 12,
+    graph_metric_segment = 13,
 };
 
 pub const ArtifactRef = struct {
@@ -41,4 +42,5 @@ pub const ArtifactRef = struct {
 test "manifest artifact kinds include lake-native artifacts" {
     try @import("std").testing.expectEqual(@as(u8, 9), @intFromEnum(ArtifactKind.row_fragment));
     try @import("std").testing.expectEqual(@as(u8, 11), @intFromEnum(ArtifactKind.algebraic_segment));
+    try @import("std").testing.expectEqual(@as(u8, 13), @intFromEnum(ArtifactKind.graph_metric_segment));
 }

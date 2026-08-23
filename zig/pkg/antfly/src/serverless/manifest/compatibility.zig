@@ -51,7 +51,7 @@ pub fn checkLakeBaseSource(
             .row_fragment_stats => report.row_fragment_stats_count += 1,
             .algebraic_segment => report.algebraic_segment_count += 1,
             .external_base_source => report.external_metadata_count += 1,
-            .text_segment, .vector_segment, .sparse_segment, .graph_segment => report.sidecar_count += 1,
+            .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => report.sidecar_count += 1,
             .doc_values, .stored_fields, .mutation_segment, .document_segment => {},
         }
     }

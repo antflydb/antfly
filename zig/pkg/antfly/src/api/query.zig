@@ -29,6 +29,7 @@ pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
+pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;

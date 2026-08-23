@@ -65,6 +65,7 @@ const managed_embedder = @import("../../inference/managed_embedder.zig");
 const scraping = @import("antfly_scraping");
 const platform_time = @import("antfly_platform").time;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_segment_mod = @import("../graph_metric_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const query_execution = @import("query_execution.zig");
 const json_helpers = @import("../../api/json_helpers.zig");
@@ -2641,7 +2642,9 @@ pub const HttpHandler = struct {
         }) catch return null;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_searches == null) return null;
+        var metric_requests = try query_api.parseGraphMetricRequestsAlloc(self.alloc, body);
+        defer metric_requests.deinit(self.alloc);
+        if (request.graph_searches == null and metric_requests.queries.len == 0 and metric_requests.rerank == null) return null;
 
         if (request.aggregations != null or
             request.analyses != null or
@@ -2669,6 +2672,8 @@ pub const HttpHandler = struct {
             .count_only = request.count == true,
             .profile = request.profile == true,
             .graph_queries = graph_queries,
+            .graph_metric_queries = metric_requests.queries,
+            .graph_metric_rerank = metric_requests.rerank,
             .limit = if (request.limit) |limit| std.math.cast(u32, limit) orelse 10 else 10,
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
@@ -2746,10 +2751,23 @@ pub const HttpHandler = struct {
             session.setCancellation(cancellation);
         }
 
+        var graph_metric_rerank_status: ?db_types.GraphMetricStatus = null;
+        defer if (graph_metric_rerank_status) |*status| status.deinit(self.alloc);
+        if (metric_requests.rerank) |rerank| {
+            if (!requestHasSearchInputs(request) or req.count_only) return error.UnsupportedQueryRequest;
+            graph_metric_rerank_status = try self.applyPublicGraphMetricRerank(&session, search_hits, rerank);
+        }
+
         const results = try self.executePublicGraphQueriesAlloc(&session, graph_queries, initial_sets.items);
         defer {
             for (results) |*result| result.deinit(self.alloc);
             if (results.len > 0) self.alloc.free(results);
+        }
+
+        const metric_results = try self.executePublicGraphMetricQueriesAlloc(&session, metric_requests.queries);
+        defer {
+            for (metric_results) |*metric_result| metric_result.deinit(self.alloc);
+            if (metric_results.len > 0) self.alloc.free(metric_results);
         }
 
         const result: db_types.SearchResult = .{
@@ -2757,6 +2775,8 @@ pub const HttpHandler = struct {
             .hits = search_hits,
             .total_hits = search_total_hits,
             .graph_results = results,
+            .graph_metric_results = metric_results,
+            .graph_metric_rerank_status = graph_metric_rerank_status,
         };
 
         var response = try query_api.encodeQueryResponses(
@@ -2768,6 +2788,280 @@ pub const HttpHandler = struct {
         );
         defer response.deinit(self.alloc);
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
+    }
+
+    fn executePublicGraphMetricQueriesAlloc(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        queries: []const db_types.NamedGraphMetricQuery,
+    ) ![]db_types.GraphMetricResult {
+        const results = try self.alloc.alloc(db_types.GraphMetricResult, queries.len);
+        errdefer self.alloc.free(results);
+        var initialized: usize = 0;
+        errdefer for (results[0..initialized]) |*result| result.deinit(self.alloc);
+        for (queries, 0..) |named, i| {
+            try session.checkCancellation();
+            var metric = try query_mod.graphMetricTopAlloc(self.alloc, session, named.query.index_name, named.query.metric_name, named.query.top_k);
+            defer metric.deinit(self.alloc);
+            const scores = try self.alloc.alloc(db_types.GraphMetricScore, metric.scores.len);
+            errdefer self.alloc.free(scores);
+            var initialized_scores: usize = 0;
+            errdefer for (scores[0..initialized_scores]) |*score| score.deinit(self.alloc);
+            for (metric.scores, 0..) |score, score_index| {
+                scores[score_index] = .{ .node = try self.alloc.dupe(u8, score.node_id), .score = score.value };
+                initialized_scores += 1;
+            }
+            const name = try self.alloc.dupe(u8, named.name);
+            errdefer self.alloc.free(name);
+            const index_name = try self.alloc.dupe(u8, named.query.index_name);
+            errdefer self.alloc.free(index_name);
+            const metric_name = try self.alloc.dupe(u8, named.query.metric_name);
+            errdefer self.alloc.free(metric_name);
+            var status = try self.graphMetricStatusAlloc(
+                session,
+                named.query.metric_name,
+                metric.config_fingerprint,
+                metric.edge_filter,
+                metric.converged,
+                metric.iterations_completed,
+                metric.delta,
+            );
+            errdefer status.deinit(self.alloc);
+            results[i] = .{
+                .name = name,
+                .index_name = index_name,
+                .metric_name = metric_name,
+                .scores = scores,
+                .status = status,
+            };
+            initialized += 1;
+        }
+        return results;
+    }
+
+    fn applyPublicGraphMetricShape(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        query: graph_query_mod.GraphQuery,
+        result: *db_types.GraphSearchResult,
+    ) !void {
+        try graph_query_mod.validateGraphMetricQueryShape(query);
+        var dependency_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var dependency_count: usize = 0;
+        for (query.metrics) |metric| appendUniqueMetricDependency(&dependency_names, &dependency_count, metric.name);
+        for (query.order_by) |order| appendUniqueMetricDependency(&dependency_names, &dependency_count, order.name);
+        for (query.where_metric) |filter| appendUniqueMetricDependency(&dependency_names, &dependency_count, filter.name);
+        if (dependency_count == 0) return;
+
+        const loaded = try self.alloc.alloc(graph_metric_segment_mod.Segment, dependency_count);
+        defer self.alloc.free(loaded);
+        var loaded_count: usize = 0;
+        defer for (loaded[0..loaded_count]) |*segment| segment.deinit(self.alloc);
+        for (dependency_names[0..dependency_count], 0..) |metric_name, i| {
+            loaded[i] = try query_mod.openGraphMetricAlloc(self.alloc, session, query.index_name, metric_name);
+            loaded_count += 1;
+        }
+
+        const statuses = try self.alloc.alloc(db_types.GraphMetricStatus, dependency_count);
+        var initialized_statuses: usize = 0;
+        var statuses_owned = true;
+        errdefer if (statuses_owned) {
+            for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
+            self.alloc.free(statuses);
+        };
+        for (loaded, dependency_names[0..dependency_count], 0..) |segment, metric_name, i| {
+            statuses[i] = try self.graphMetricStatusAlloc(session, metric_name, segment.config_fingerprint, segment.edge_filter, segment.converged, segment.iterations_completed, segment.delta);
+            initialized_statuses += 1;
+        }
+
+        for (result.nodes) |*node| {
+            const values = try self.alloc.alloc(graph_query_mod.GraphMetricValue, dependency_count);
+            var initialized_values: usize = 0;
+            errdefer {
+                for (values[0..initialized_values]) |*value| value.deinit(self.alloc);
+                self.alloc.free(values);
+            }
+            for (loaded, statuses, 0..) |segment, status, i| {
+                values[i] = .{ .name = status.name, .score = segment.score(node.key), .name_owned = false };
+                initialized_values += 1;
+            }
+            node.metrics = values;
+        }
+        result.metric_status = statuses;
+        statuses_owned = false;
+
+        if (query.where_metric.len > 0) try self.filterPublicGraphMetricNodes(query.where_metric, result);
+        if (query.order_by.len > 0) try self.orderPublicGraphMetricNodes(query.order_by, result.nodes);
+        if (graphMetricPostProcessingNeeded(query) and query.params.max_results > 0 and result.nodes.len > query.params.max_results) {
+            const keep_count: usize = @intCast(query.params.max_results);
+            const kept = try self.alloc.dupe(graph_query_mod.GraphResultNode, result.nodes[0..keep_count]);
+            for (result.nodes[keep_count..]) |*node| node.deinit(self.alloc);
+            self.alloc.free(result.nodes);
+            result.nodes = kept;
+        }
+        try self.retainPublicGraphMetricProjection(query.metrics, result.nodes);
+        try self.rebuildPublicGraphHitsFromNodes(result);
+    }
+
+    fn filterPublicGraphMetricNodes(self: *HttpHandler, filters: []const graph_query_mod.GraphMetricFilter, result: *db_types.GraphSearchResult) !void {
+        const keep = try self.alloc.alloc(bool, result.nodes.len);
+        defer self.alloc.free(keep);
+        var keep_count: usize = 0;
+        for (result.nodes, 0..) |node, i| {
+            keep[i] = publicGraphNodePassesMetricFilters(node, filters);
+            if (keep[i]) keep_count += 1;
+        }
+        const filtered = try self.alloc.alloc(graph_query_mod.GraphResultNode, keep_count);
+        var out: usize = 0;
+        for (result.nodes, 0..) |*node, i| {
+            if (keep[i]) {
+                filtered[out] = node.*;
+                out += 1;
+            } else node.deinit(self.alloc);
+        }
+        self.alloc.free(result.nodes);
+        result.nodes = filtered;
+    }
+
+    fn orderPublicGraphMetricNodes(self: *HttpHandler, orders: []const graph_query_mod.GraphMetricOrder, nodes: []graph_query_mod.GraphResultNode) !void {
+        const IndexedNode = struct { node: graph_query_mod.GraphResultNode, original_index: usize };
+        const Context = struct { orders: []const graph_query_mod.GraphMetricOrder };
+        const less = struct {
+            fn lessThan(context: Context, a: IndexedNode, b: IndexedNode) bool {
+                for (context.orders) |order| {
+                    const left = publicGraphNodeMetric(a.node, order.name);
+                    const right = publicGraphNodeMetric(b.node, order.name);
+                    if (left == null and right == null) continue;
+                    if (left == null) return order.nulls == .first;
+                    if (right == null) return order.nulls != .first;
+                    if (left.? == right.?) continue;
+                    return if (order.direction == .desc) left.? > right.? else left.? < right.?;
+                }
+                return a.original_index < b.original_index;
+            }
+        }.lessThan;
+        const indexed = try self.alloc.alloc(IndexedNode, nodes.len);
+        defer self.alloc.free(indexed);
+        for (nodes, 0..) |node, i| indexed[i] = .{ .node = node, .original_index = i };
+        std.mem.sort(IndexedNode, indexed, Context{ .orders = orders }, less);
+        for (indexed, 0..) |item, i| nodes[i] = item.node;
+    }
+
+    fn retainPublicGraphMetricProjection(self: *HttpHandler, projected: []const graph_query_mod.GraphMetricRead, nodes: []graph_query_mod.GraphResultNode) !void {
+        for (nodes) |*node| {
+            var keep_count: usize = 0;
+            for (node.metrics) |metric| if (metricNameProjected(projected, metric.name)) {
+                keep_count += 1;
+            };
+            const kept = try self.alloc.alloc(graph_query_mod.GraphMetricValue, keep_count);
+            var out: usize = 0;
+            for (node.metrics) |*metric| {
+                if (metricNameProjected(projected, metric.name)) {
+                    kept[out] = metric.*;
+                    out += 1;
+                } else metric.deinit(self.alloc);
+            }
+            self.alloc.free(node.metrics);
+            node.metrics = kept;
+        }
+    }
+
+    fn rebuildPublicGraphHitsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
+        for (result.hits) |*hit| hit.deinit(self.alloc);
+        if (result.hits.len > 0) self.alloc.free(result.hits);
+        result.hits = &.{};
+        const hits = try self.alloc.alloc(db_types.SearchHit, result.nodes.len);
+        errdefer self.alloc.free(hits);
+        var initialized: usize = 0;
+        errdefer for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
+        for (result.nodes, 0..) |node, i| {
+            hits[i] = .{ .id = try self.alloc.dupe(u8, node.key), .score = clampGraphMetricScore(node.distance), .stored_data = null };
+            initialized += 1;
+        }
+        result.hits = hits;
+        result.total_hits = @intCast(result.nodes.len);
+    }
+
+    fn applyPublicGraphMetricRerank(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        hits: []db_types.SearchHit,
+        rerank: db_types.GraphMetricRerank,
+    ) !db_types.GraphMetricStatus {
+        var metric = try query_mod.openGraphMetricAlloc(self.alloc, session, rerank.index_name, rerank.metric_name);
+        defer metric.deinit(self.alloc);
+        for (hits) |*hit| {
+            try session.checkCancellation();
+            const metric_score = metric.score(hit.id);
+            const metric_score_used = metric_score orelse rerank.missing_score;
+            const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0;
+            const final_score = clampGraphMetricScore(rerank.base_weight * base_score + rerank.weight * metric_score_used);
+            const index_name = try self.alloc.dupe(u8, rerank.index_name);
+            errdefer self.alloc.free(index_name);
+            const metric_name = try self.alloc.dupe(u8, rerank.metric_name);
+            if (hit.score_details) |*old| old.deinit(self.alloc);
+            hit.score_details = .{
+                .index_name = index_name,
+                .metric_name = metric_name,
+                .base_score = base_score,
+                .base_weight = rerank.base_weight,
+                .metric_score = metric_score,
+                .metric_score_used = metric_score_used,
+                .metric_weight = rerank.weight,
+                .missing_score_used = metric_score == null,
+                .final_score = final_score,
+                .published_generation = session.manifest.version,
+            };
+            hit.score = final_score;
+        }
+        std.mem.sort(db_types.SearchHit, hits, {}, struct {
+            fn lessThan(_: void, a: db_types.SearchHit, b: db_types.SearchHit) bool {
+                const a_score = a.score orelse 0;
+                const b_score = b.score orelse 0;
+                if (a_score == b_score) return std.mem.lessThan(u8, a.id, b.id);
+                return a_score > b_score;
+            }
+        }.lessThan);
+        return try self.graphMetricStatusAlloc(
+            session,
+            rerank.metric_name,
+            metric.config_fingerprint,
+            metric.edge_filter,
+            metric.converged,
+            metric.iterations_completed,
+            metric.delta,
+        );
+    }
+
+    fn graphMetricStatusAlloc(
+        self: *HttpHandler,
+        session: *const query_mod.QuerySession,
+        metric_name: []const u8,
+        config_fingerprint: u64,
+        edge_filter: graph_mod.GraphMetricEdgeFilter,
+        converged: bool,
+        iterations_completed: u32,
+        delta: f64,
+    ) !db_types.GraphMetricStatus {
+        const name = try self.alloc.dupe(u8, metric_name);
+        errdefer self.alloc.free(name);
+        const owned_filter = try edge_filter.cloneAlloc(self.alloc);
+        return .{
+            .name = name,
+            .state = .fresh,
+            .phase = .complete,
+            .edge_filter = owned_filter,
+            .metadata_version = @import("../graph_metric_segment/mod.zig").wire_version,
+            .config_fingerprint = config_fingerprint,
+            .published_generation = session.manifest.version,
+            .edge_generation = session.manifest.version,
+            .target_edge_generation = session.manifest.version,
+            .progress = 1,
+            .converged = converged,
+            .iterations_completed = iterations_completed,
+            .delta = delta,
+            .computed_at_ms = @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+        };
     }
 
     fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
@@ -3095,13 +3389,16 @@ pub const HttpHandler = struct {
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
     ) !db_types.GraphSearchResult {
-        return switch (named_query.query.query_type) {
+        var result = try switch (named_query.query.query_type) {
             .neighbors => try self.executePublicNeighborsQueryAlloc(session, named_query, available_sets),
             .traverse => try self.executePublicTraverseQueryAlloc(session, named_query, available_sets),
             .shortest_path => try self.executePublicShortestPathQueryAlloc(session, named_query, available_sets),
             .pattern => try self.executePublicPatternQueryAlloc(session, named_query, available_sets),
             else => error.UnsupportedQueryRequest,
         };
+        errdefer result.deinit(self.alloc);
+        try self.applyPublicGraphMetricShape(session, named_query.query, &result);
+        return result;
     }
 
     fn executePublicNeighborsQueryAlloc(
@@ -3137,11 +3434,14 @@ pub const HttpHandler = struct {
                 .doc_id = try self.alloc.dupe(u8, start_key),
                 .direction = toServerlessGraphDirection(named_query.query.params.direction),
                 .edge_types = try dupFieldsAlloc(self.alloc, named_query.query.params.edge_types),
-                .limit = named_query.query.params.max_results,
+                .limit = if (graphMetricPostProcessingNeeded(named_query.query)) graph_query_mod.graph_metric_candidate_limit + 1 else named_query.query.params.max_results,
             };
             defer req.deinit(self.alloc);
 
-            const neighbors = try query_mod.graphNeighborsAlloc(self.alloc, session, req);
+            const neighbors = if (graphMetricPostProcessingNeeded(named_query.query))
+                try query_mod.graph_reader.neighborsWithLimitsAlloc(self.alloc, session, req, .{ .max_limit = graph_query_mod.graph_metric_candidate_limit + 1 })
+            else
+                try query_mod.graphNeighborsAlloc(self.alloc, session, req);
             defer query_mod.freeGraphNeighbors(self.alloc, neighbors);
 
             for (neighbors) |neighbor| {
@@ -3172,6 +3472,7 @@ pub const HttpHandler = struct {
                     .score = neighbor.weight,
                     .stored_data = null,
                 });
+                if (nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
             }
         }
 
@@ -3218,12 +3519,15 @@ pub const HttpHandler = struct {
                 .direction = toServerlessGraphDirection(named_query.query.params.direction),
                 .edge_types = try dupFieldsAlloc(self.alloc, named_query.query.params.edge_types),
                 .max_depth = named_query.query.params.max_depth,
-                .limit = named_query.query.params.max_results,
+                .limit = if (graphMetricPostProcessingNeeded(named_query.query)) graph_query_mod.graph_metric_candidate_limit + 1 else named_query.query.params.max_results,
                 .include_start = false,
             };
             defer req.deinit(self.alloc);
 
-            const traversal_nodes = try query_mod.graphTraverseAlloc(self.alloc, session, req);
+            const traversal_nodes = if (graphMetricPostProcessingNeeded(named_query.query))
+                try query_mod.graph_reader.traverseWithLimitsAlloc(self.alloc, session, req, .{ .max_limit = graph_query_mod.graph_metric_candidate_limit + 1, .max_nodes_visited = graph_query_mod.graph_metric_candidate_limit + 1 })
+            else
+                try query_mod.graphTraverseAlloc(self.alloc, session, req);
             defer query_mod.freeGraphTraversalNodes(self.alloc, traversal_nodes);
 
             for (traversal_nodes) |node| {
@@ -3254,6 +3558,7 @@ pub const HttpHandler = struct {
                     .score = @floatCast(traversalDistance(node)),
                     .stored_data = null,
                 });
+                if (nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
             }
         }
 
@@ -4586,15 +4891,23 @@ pub const HttpHandler = struct {
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
-            error.FileNotFound => return error.NotFound,
+            error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
-            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.QueryCandidateBudgetExceeded,
+            error.GraphMetricQueryBudgetExceeded,
+            error.GraphNeighborQueryBudgetExceeded,
+            error.GraphTraversalQueryBudgetExceeded,
+            => return error.QueryCandidateBudgetExceeded,
+            error.MetricStale,
+            error.InvalidGraphMetricSegment,
+            error.UnsupportedGraphMetricSegmentVersion,
+            => return error.InvalidManifest,
             error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -5018,6 +5331,49 @@ fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
         request.semantic_search != null or
         request.filter_query != null or
         request.exclusion_query != null;
+}
+
+fn graphMetricPostProcessingNeeded(query: graph_query_mod.GraphQuery) bool {
+    return query.where_metric.len > 0 or query.order_by.len > 0;
+}
+
+fn appendUniqueMetricDependency(names: *[graph_query_mod.graph_metric_dependency_limit][]const u8, count: *usize, name: []const u8) void {
+    for (names[0..count.*]) |existing| if (std.mem.eql(u8, existing, name)) return;
+    std.debug.assert(count.* < names.len);
+    names[count.*] = name;
+    count.* += 1;
+}
+
+fn publicGraphNodeMetric(node: graph_query_mod.GraphResultNode, name: []const u8) ?f64 {
+    for (node.metrics) |metric| if (std.mem.eql(u8, metric.name, name)) return metric.score;
+    return null;
+}
+
+fn publicGraphNodePassesMetricFilters(node: graph_query_mod.GraphResultNode, filters: []const graph_query_mod.GraphMetricFilter) bool {
+    for (filters) |filter| {
+        const score = publicGraphNodeMetric(node, filter.name) orelse return false;
+        const matches = switch (filter.op) {
+            .gt => score > filter.value,
+            .gte => score >= filter.value,
+            .lt => score < filter.value,
+            .lte => score <= filter.value,
+            .eq => score == filter.value,
+            .neq => score != filter.value,
+        };
+        if (!matches) return false;
+    }
+    return true;
+}
+
+fn metricNameProjected(projected: []const graph_query_mod.GraphMetricRead, name: []const u8) bool {
+    for (projected) |metric| if (std.mem.eql(u8, metric.name, name)) return true;
+    return false;
+}
+
+fn clampGraphMetricScore(value: f64) f32 {
+    if (std.math.isNan(value)) return 0;
+    const max = std.math.floatMax(f32);
+    return @floatCast(std.math.clamp(value, -max, max));
 }
 
 fn firstEdgeType(edge_types: ?[]const []const u8) ?[]const u8 {

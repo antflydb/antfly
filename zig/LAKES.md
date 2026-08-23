@@ -111,6 +111,21 @@ The mapping is direct:
   artifact before manifest publication.
 - Antfly text, vector, sparse, graph, and algebraic accelerators map to
   serverless artifacts.
+- Graph metrics map to immutable `graph_metric_segment` artifacts derived from
+  one named graph artifact. Each metric payload records the source graph's
+  content address, checksum, configuration fingerprint, edge filter, convergence
+  metadata, and a node-sorted score vector. Query sessions reject a metric when
+  that source identity does not match the graph artifact pinned by the same
+  manifest, so published scores cannot be mixed across generations. Manifest
+  v13 adds the artifact kind while continuing to decode v12 manifests.
+- Metric materialization uses storage-independent, cancellation-aware bounded
+  kernels for degree, PageRank, eigenvector centrality, and both HITS vectors.
+  The build call itself is synchronous and deterministic; deployments schedule
+  it through the existing `std.Io`/backend build runtime rather than creating
+  raw threads. Public serverless queries support direct top-K metric reads,
+  graph-metric reranking with score details, and traversal projection/filter/
+  ordering with the same bounded full-candidate-before-limit semantics as the
+  embedded graph engine.
 - Query execution pins one manifest version before reading artifacts, matching
   the lake requirement that each query bind one immutable snapshot.
 - Artifact range reads and cache blocks map to Parquet footer, column-chunk,

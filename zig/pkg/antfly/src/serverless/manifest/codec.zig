@@ -21,7 +21,7 @@ const manifest_types = @import("types.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 12;
+pub const wire_version: u16 = 13;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -410,7 +410,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -744,7 +744,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     for (0..artifact_count) |idx| {
         const min_artifact_header_len: usize = if (version >= 9) 1 + 4 + 4 + 8 + 4 else 1 + 4 + 8 + 4;
         if (pos + min_artifact_header_len > data.len) return error.InvalidManifest;
-        const kind: manifest_types.ArtifactKind = @enumFromInt(data[pos]);
+        const kind = std.enums.fromInt(manifest_types.ArtifactKind, data[pos]) orelse return error.InvalidManifest;
         pos += 1;
         const name_len = if (version >= 9) blk: {
             const value = std.mem.readInt(u32, data[pos..][0..4], .little);
@@ -953,7 +953,7 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
     return descriptor;
 }
 
-test "manifest codec round-trips deterministically" {
+test "serverless manifest codec round-trips deterministically" {
     const alloc = std.testing.allocator;
     var manifest = manifest_types.Manifest{
         .namespace = try alloc.dupe(u8, "products"),
@@ -972,7 +972,7 @@ test "manifest codec round-trips deterministically" {
             .published_search_sources = try search_sources.defaultPublishedSearchSourcesAlloc(alloc),
             .derived_outputs = try search_sources.defaultMaterializedDerivedOutputsAlloc(alloc),
         },
-        .artifacts = try alloc.alloc(manifest_types.ArtifactRef, 4),
+        .artifacts = try alloc.alloc(manifest_types.ArtifactRef, 5),
     };
     defer manifest.deinit(alloc);
 
@@ -1001,6 +1001,13 @@ test "manifest codec round-trips deterministically" {
         .byte_len = 512,
         .checksum = try alloc.dupe(u8, "sha256:graph"),
     };
+    manifest.artifacts[4] = .{
+        .kind = .graph_metric_segment,
+        .name = try alloc.dupe(u8, "5:graph8:pagerank"),
+        .artifact_id = try alloc.dupe(u8, "metric-0001"),
+        .byte_len = 256,
+        .checksum = try alloc.dupe(u8, "sha256:metric"),
+    };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
     defer alloc.free(encoded_a);
@@ -1022,14 +1029,23 @@ test "manifest codec round-trips deterministically" {
     try std.testing.expectEqualStrings(search_sources.default_chunk_preview_output_name, decoded.stats.derived_outputs.findByKind(.chunk_preview).?.name);
     try std.testing.expectEqualStrings(search_sources.default_chunk_embeddings_output_name, decoded.stats.derived_outputs.findByKind(.chunk_embeddings).?.name);
     try std.testing.expectEqualStrings(search_sources.default_rerank_terms_output_name, decoded.stats.derived_outputs.findByKind(.rerank_terms).?.name);
-    try std.testing.expectEqual(@as(usize, 4), decoded.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 5), decoded.artifacts.len);
     try std.testing.expectEqual(manifest_types.ArtifactKind.text_segment, decoded.artifacts[0].kind);
     try std.testing.expectEqualStrings("vec-0001", decoded.artifacts[1].artifact_id);
     try std.testing.expectEqual(manifest_types.ArtifactKind.sparse_segment, decoded.artifacts[2].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
+    try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded.artifacts[4].kind);
+
+    // v13 only adds an artifact tag; the v12 layout remains readable.
+    const encoded_v12 = try alloc.dupe(u8, encoded_a);
+    defer alloc.free(encoded_v12);
+    std.mem.writeInt(u16, encoded_v12[4..6], 12, .little);
+    var decoded_v12 = try decodeAlloc(alloc, encoded_v12);
+    defer decoded_v12.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), decoded_v12.artifacts.len);
 }
 
-test "manifest codec round-trips optional lake base source" {
+test "serverless manifest codec round-trips optional lake base source" {
     const alloc = std.testing.allocator;
     var manifest = manifest_types.Manifest{
         .namespace = try alloc.dupe(u8, "events"),
@@ -1074,13 +1090,13 @@ test "manifest codec round-trips optional lake base source" {
     try std.testing.expectEqualStrings("external-files-0001", decoded.artifacts[0].artifact_id);
 }
 
-test "manifest codec rejects bad magic" {
+test "serverless manifest codec rejects bad magic" {
     const alloc = std.testing.allocator;
     const bad = [_]u8{ 'B', 'A', 'D', '!', 1, 0 };
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, &bad));
 }
 
-test "lake manifest base source decoder rejects forged string-list counts before allocation" {
+test "serverless lake manifest base source decoder rejects forged string-list counts before allocation" {
     const alloc = std.testing.allocator;
     var encoded = [_]u8{0} ** 13;
     encoded[0] = @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments);
