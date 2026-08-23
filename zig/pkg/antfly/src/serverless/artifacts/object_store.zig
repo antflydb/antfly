@@ -211,6 +211,7 @@ pub const ObjectStore = struct {
         var result = self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
+            .checksum_sha256_hex = if (self.gcs_client != null) checksum else null,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err);
         defer result.deinit(self.client.allocator);

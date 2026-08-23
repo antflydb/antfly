@@ -34,6 +34,14 @@ pub const Provenance = struct {
     published_generation: u64 = 0,
     edge_generation: u64 = 0,
     computed_at_ms: u64 = 0,
+
+    pub fn validate(self: Provenance) !void {
+        if (self.published_generation == 0 or self.edge_generation == 0 or self.computed_at_ms == 0 or
+            self.edge_generation > self.published_generation)
+        {
+            return error.InvalidGraphMetricProvenance;
+        }
+    }
 };
 
 pub const BuildOptions = struct {
@@ -97,6 +105,7 @@ pub fn buildFromGraphPayloadAlloc(alloc: Allocator, graph_payload: []const u8, o
 }
 
 pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, graph_payload: []const u8, options: BuildOptions) !artifact_ref.ArtifactRef {
+    try options.provenance.validate();
     var built = try buildFromGraphPayloadAlloc(alloc, graph_payload, options);
     defer built.deinit(alloc);
     var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
@@ -116,6 +125,7 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
         .published_generation = built.artifact.published_generation,
         .edge_generation = built.artifact.edge_generation,
         .computed_at_ms = built.artifact.computed_at_ms,
+        .materializer_fingerprint = built.artifact.materializer_fingerprint,
     };
 }
 
@@ -152,6 +162,7 @@ pub fn publishManyFromGraphArtifactAlloc(
     configs: []const graph_mod.GraphMetricConfig,
     cancellation: CancellationToken,
     limits: Limits,
+    provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
     var batch_budget = graph_metric_policy.Budget{ .limits = limits };
     return publishManyFromGraphArtifactWithBudgetAlloc(
@@ -163,6 +174,7 @@ pub fn publishManyFromGraphArtifactAlloc(
         cancellation,
         limits,
         &batch_budget,
+        provenance,
     );
 }
 
@@ -178,6 +190,7 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
     cancellation: CancellationToken,
     limits: Limits,
     batch_budget: *graph_metric_policy.Budget,
+    provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
@@ -194,7 +207,7 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
         limits,
         batch_budget,
         &prepared,
-        .{},
+        provenance,
     );
 }
 
@@ -246,6 +259,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
     provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
+    try provenance.validate();
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
     if (!prepared.identifies(source_graph)) return error.ArtifactIntegrityMismatch;
 
@@ -353,6 +367,7 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
         .published_generation = built.artifact.published_generation,
         .edge_generation = built.artifact.edge_generation,
         .computed_at_ms = built.artifact.computed_at_ms,
+        .materializer_fingerprint = built.artifact.materializer_fingerprint,
     };
 }
 
@@ -380,6 +395,7 @@ pub fn publishRejectedManyAlloc(
     limits: Limits,
     provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
+    try provenance.validate();
     try graph_metric_policy.validateConfigs(configs, limits);
     const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
     var initialized: usize = 0;
@@ -428,6 +444,7 @@ fn publishRejectedAlloc(
         .published_generation = provenance.published_generation,
         .edge_generation = provenance.edge_generation,
         .computed_at_ms = provenance.computed_at_ms,
+        .materializer_fingerprint = segment.materializer_fingerprint,
     };
 }
 
@@ -667,6 +684,7 @@ fn encodeMetricResultAlloc(
         .published_generation = options.provenance.published_generation,
         .edge_generation = options.provenance.edge_generation,
         .computed_at_ms = options.provenance.computed_at_ms,
+        .materializer_fingerprint = segment.materializer_fingerprint,
     } };
 }
 
@@ -870,7 +888,7 @@ test "serverless lake graph metrics persist a budget rejection with exact proven
         .checksum = source_metadata.checksum,
     };
     const configs = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_nodes = 1 });
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_nodes = 1 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -975,7 +993,7 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
     };
     // 300 kernel work items plus one source-node/edge projection pass.
     const limits = Limits{ .max_work_items = 303, .max_total_work_items = 303 };
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits);
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -1018,7 +1036,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     };
     // One PageRank consumes 300 kernel work items plus three projection
     // items; the table-wide budget admits the first and rejects the second.
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 303, .max_total_work_items = 303 });
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 303, .max_total_work_items = 303 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -1049,7 +1067,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         shared_budget.limits,
         &shared_budget,
         &prepared,
-        .{},
+        .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 },
     );
     defer {
         for (first_index) |ref| freeArtifactRef(alloc, ref);
@@ -1065,7 +1083,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         shared_budget.limits,
         &shared_budget,
         &prepared,
-        .{},
+        .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 },
     );
     defer {
         for (second_index) |ref| freeArtifactRef(alloc, ref);

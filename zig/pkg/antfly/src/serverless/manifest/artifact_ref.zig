@@ -43,6 +43,10 @@ pub const ArtifactRef = struct {
     published_generation: u64 = 0,
     edge_generation: u64 = 0,
     computed_at_ms: u64 = 0,
+    /// Artifact-producing policy identity. Graph-metric refs persist this so
+    /// catalog scheduling can detect stale materializations without fetching
+    /// the object payload. Zero denotes a pre-v15 manifest.
+    materializer_fingerprint: u64 = 0,
 };
 
 test "manifest artifact kinds include lake-native artifacts" {

@@ -2474,6 +2474,7 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
         .published_generation = artifact.published_generation,
         .edge_generation = artifact.edge_generation,
         .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
     };
 }
 
@@ -3524,7 +3525,12 @@ fn buildGraphMetricArtifactRefsAlloc(
                 const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
                 defer alloc.free(artifact_name);
                 const metric_index = findNamedArtifactIndex(current.?, .graph_metric_segment, artifact_name) orelse unreachable;
-                refs.appendAssumeCapacity(try cloneArtifactRefAlloc(alloc, current.?.artifacts[metric_index]));
+                var cloned = try cloneArtifactRefAlloc(alloc, current.?.artifacts[metric_index]);
+                if (cloned.published_generation == 0) cloned.published_generation = provenance.published_generation;
+                if (cloned.edge_generation == 0) cloned.edge_generation = provenance.edge_generation;
+                if (cloned.computed_at_ms == 0) cloned.computed_at_ms = provenance.computed_at_ms;
+                if (cloned.materializer_fingerprint == 0) cloned.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
+                refs.appendAssumeCapacity(cloned);
             }
             continue;
         }
@@ -3604,9 +3610,9 @@ fn buildGraphMetricArtifactRefsAlloc(
                 for (built) |*ref| {
                     const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, ref.name) orelse continue;
                     const previous_metric = manifest.artifacts[metric_index];
-                    ref.published_generation = previous_metric.published_generation;
-                    ref.edge_generation = previous_metric.edge_generation;
-                    ref.computed_at_ms = previous_metric.computed_at_ms;
+                    if (previous_metric.published_generation != 0) ref.published_generation = previous_metric.published_generation;
+                    if (previous_metric.edge_generation != 0) ref.edge_generation = previous_metric.edge_generation;
+                    if (previous_metric.computed_at_ms != 0) ref.computed_at_ms = previous_metric.computed_at_ms;
                 }
             }
         }
@@ -5519,6 +5525,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     try std.testing.expectEqual(graph_metric_segment_mod.wire_version, first_metric.metadata_version);
     try std.testing.expectEqual(@as(u64, 1), first_metric.published_generation);
     try std.testing.expectEqual(@as(u64, 1), first_metric.edge_generation);
+    try std.testing.expectEqual(lake_graph_metric.materializerFingerprint(.{}), first_metric.materializer_fingerprint);
     try std.testing.expect(findNamedArtifactIndex(first, .graph_metric_segment, "9:graph_idx6:degree") != null);
     try artifact_store.delete(first_metric.artifact_id);
 
@@ -5561,6 +5568,16 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     try std.testing.expect(!std.mem.eql(u8, second_metric.artifact_id, third_metric.artifact_id));
     try std.testing.expectEqual(@as(u64, 3), third_metric.published_generation);
     try std.testing.expectEqual(@as(u64, 3), third_metric.edge_generation);
+
+    var runtime = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer runtime.deinit();
+    var session = try runtime.openHeadSession("docs");
+    defer session.deinit();
+    var top = try query_mod.graphMetricTopAlloc(alloc, &session, "graph_idx", "rank", 2);
+    defer top.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), top.scores.len);
+    try std.testing.expect(top.scores[0].value >= top.scores[1].value);
+    try std.testing.expectEqual(@as(u64, 3), top.published_generation);
 
     const payload = try artifact_store.getVerifiedAllocWithCancellationUsingAllocator(alloc, third_metric.artifact_id, third_metric.byte_len, third_metric.checksum, .none);
     defer alloc.free(payload);

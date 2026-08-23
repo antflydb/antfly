@@ -843,7 +843,6 @@ pub const HttpHandler = struct {
                 errdefer if (!status_moved) status.deinit(self.alloc);
 
                 if (maybe_session) |*session| {
-                    status.published_generation = session.manifest.version;
                     const graph_index = session.findNamedArtifactIndex(.graph_segment, spec.index_name);
                     const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(self.alloc, spec.index_name, config.name);
                     defer self.alloc.free(artifact_name);
@@ -855,6 +854,13 @@ pub const HttpHandler = struct {
                             session.verifyArtifact(metric_index.?) catch break :blk false;
                             break :blk true;
                         };
+                        if (verified) {
+                            status.published_generation = if (metric_ref.published_generation != 0)
+                                metric_ref.published_generation
+                            else
+                                session.manifest.version;
+                            status.materializer_fingerprint = metric_ref.materializer_fingerprint;
+                        }
                         const prefix_len = try graph_metric_segment_mod.headerProbeLen(
                             metric_ref.byte_len,
                             spec.index_name,
@@ -5099,6 +5105,7 @@ pub const HttpHandler = struct {
     }
 
     fn fullIndexSyncSatisfied(status: catalog_types.BuildStatus) bool {
+        if (status.head_republish_recommended or status.pending_materialization_rebuild) return false;
         if (!status.enrichment_complete) return false;
         if (!fullTextSyncSatisfied(status)) return false;
         if (status.artifact_actions.dense_vector == .rebuild) return false;
@@ -5140,7 +5147,8 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
-            error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady => return error.NotFound,
+            error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady, error.MetricNotConfigured => return error.NotFound,
+            error.InvalidGraphMetricNodeId => return error.InvalidQueryRequest,
             error.GraphMetricPolicyStale => return error.IndexRebuilding,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,

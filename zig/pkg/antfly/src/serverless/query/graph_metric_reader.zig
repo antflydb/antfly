@@ -127,6 +127,7 @@ pub const PointScoresResult = struct {
 
 const BorrowedScore = struct { node_id: []const u8, value: f64 };
 const TopQueue = std.PriorityQueue(BorrowedScore, void, compareWorstFirst);
+const OwnedTopQueue = std.PriorityQueue(Score, void, compareOwnedWorstFirst);
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
 const max_score_range_requests: usize = 32;
 const coalesced_score_window_bytes: u64 = 8 * 1024 * 1024;
@@ -306,10 +307,10 @@ pub fn scoresAlloc(
         .iterations_completed = control.header.iterations_completed,
         .delta = control.header.delta,
         .edge_filter = edge_filter,
-        .metadata_version = if (metric_artifact.metadata_version != 0) metric_artifact.metadata_version else control.header.version,
+        .metadata_version = control.header.version,
         .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
         .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
-        .computed_at_ms = if (metric_artifact.metadata_version != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+        .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
     };
 }
 
@@ -360,6 +361,117 @@ pub fn topAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_inde
 
 pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, top_k: usize, limits: Limits) !Result {
     if (top_k > limits.max_top_k or limits.max_top_k == 0 or limits.max_scores_scanned == 0 or limits.max_result_bytes == 0) return error.GraphMetricQueryBudgetExceeded;
+
+    clearLastRejectionDiagnostic();
+    try session.checkCancellation();
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
+    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    const config = findConfig(specs, graph_index_name, metric_name) orelse return error.MetricNotConfigured;
+    const graph_index = session.findNamedArtifactIndex(.graph_segment, graph_index_name) orelse return error.GraphSegmentNotFound;
+    const graph_artifact = session.artifactRef(graph_index).?;
+    const artifact_name = try metric_segment.artifactNameAlloc(alloc, graph_index_name, metric_name);
+    defer alloc.free(artifact_name);
+    const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name) orelse return error.MetricNotReady;
+    const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
+    try session.verifyArtifact(metric_index);
+
+    const control_len = try metric_segment.controlProbeLen(
+        metric_artifact.byte_len,
+        graph_index_name,
+        metric_name,
+        graph_artifact.artifact_id,
+        graph_artifact.checksum,
+        config.edge_filter,
+    );
+    const control_bytes = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_control_block_id, 0, control_len);
+    defer alloc.free(control_bytes);
+    const control = try metric_segment.decodeControl(control_bytes, config.edge_filter);
+    try validateControl(control.header, graph_index_name, metric_name, graph_artifact, config);
+    if (control.header.materialization_state == .rejected) {
+        recordRejectionDiagnostic(control.header);
+        return error.GraphMetricMaterializationRejected;
+    }
+    if (control.score_count > limits.max_scores_scanned) return error.GraphMetricQueryBudgetExceeded;
+
+    // Preserve rolling-upgrade support for the old contiguous vector layout.
+    // Current v4 artifacts stream score blocks and retain only top_k node ids.
+    if (control.header.version < 4) return try topLegacyWithLimitsAlloc(alloc, session, graph_index_name, metric_name, top_k, limits);
+    if (metric_artifact.byte_len < metric_segment.routing_trailer_len) return error.InvalidGraphMetricSegment;
+    const trailer_offset = metric_artifact.byte_len - metric_segment.routing_trailer_len;
+    const trailer = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_routing_block_id, trailer_offset, metric_segment.routing_trailer_len);
+    defer alloc.free(trailer);
+    const footer_len = try metric_segment.routingFooterLenFromTrailer(metric_artifact.byte_len, trailer);
+    const footer_offset = metric_artifact.byte_len - footer_len;
+    const footer = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_routing_block_id, footer_offset, footer_len);
+    defer alloc.free(footer);
+    var routing = try metric_segment.decodeRoutingIndexWithCancellationAlloc(alloc, footer, metric_artifact.byte_len, session.cancellation);
+    defer routing.deinit(alloc);
+    const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
+        @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
+    if (routing.entries.len != expected_blocks or routing.footer_offset != footer_offset or
+        (routing.entries.len == 0 and routing.footer_offset != control.score_data_offset) or
+        (routing.entries.len > 0 and routing.entries[0].offset != control.score_data_offset))
+    {
+        return error.InvalidGraphMetricSegment;
+    }
+
+    var selected = OwnedTopQueue.empty;
+    defer selected.deinit(alloc);
+    var selected_owned = true;
+    defer if (selected_owned) for (selected.items) |*item| item.deinit(alloc);
+    try selected.ensureTotalCapacityPrecise(alloc, @min(top_k, @as(usize, control.score_count)));
+    var selected_bytes: usize = 0;
+    for (routing.entries, 0..) |entry, block_index| {
+        try session.checkCancellation();
+        const payload = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_score_block_id, entry.offset, entry.len);
+        defer alloc.free(payload);
+        const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(payload, session.cancellation);
+        const expected_score_count = if (block_index + 1 < routing.entries.len)
+            metric_segment.score_block_entries
+        else
+            @as(usize, control.score_count) - block_index * metric_segment.score_block_entries;
+        if (decoded_block.len != expected_score_count or
+            (decoded_block.len > 0 and !std.mem.eql(u8, decoded_block.scores[0].node_id, entry.first_node_id)))
+        {
+            return error.InvalidGraphMetricSegment;
+        }
+        for (decoded_block.scores) |candidate| {
+            const borrowed = BorrowedScore{ .node_id = candidate.node_id, .value = candidate.value };
+            const should_insert = selected.count() < top_k or
+                (top_k > 0 and scoreOrder(borrowed, borrowedFromOwned(selected.peek().?)) == .lt);
+            if (!should_insert) continue;
+            const owned_node_id = try alloc.dupe(u8, candidate.node_id);
+            errdefer alloc.free(owned_node_id);
+            if (selected.count() == top_k) {
+                var removed = selected.pop().?;
+                selected_bytes -= @sizeOf(Score) + removed.node_id.len;
+                removed.deinit(alloc);
+            }
+            selected_bytes = std.math.add(usize, selected_bytes, @sizeOf(Score) + owned_node_id.len) catch return error.GraphMetricQueryBudgetExceeded;
+            if (selected_bytes > limits.max_result_bytes) return error.GraphMetricQueryBudgetExceeded;
+            try selected.push(alloc, .{ .node_id = owned_node_id, .value = candidate.value });
+        }
+    }
+    std.mem.sort(Score, selected.items, {}, lessOwnedScore);
+    var edge_filter = try config.edge_filter.cloneAlloc(alloc);
+    errdefer edge_filter.deinit(alloc);
+    const scores = try alloc.dupe(Score, selected.items);
+    selected_owned = false;
+    return .{
+        .scores = scores,
+        .config_fingerprint = control.header.config_fingerprint,
+        .converged = control.header.converged,
+        .iterations_completed = control.header.iterations_completed,
+        .delta = control.header.delta,
+        .edge_filter = edge_filter,
+        .metadata_version = control.header.version,
+        .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
+        .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
+        .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+    };
+}
+
+fn topLegacyWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, top_k: usize, limits: Limits) !Result {
     var loaded = try loadVerifiedAlloc(alloc, session, graph_index_name, metric_name);
     defer loaded.deinit(alloc);
     if (loaded.scores.len > limits.max_scores_scanned) return error.GraphMetricQueryBudgetExceeded;
@@ -442,10 +554,11 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     var segment = try metric_segment.decodeAllocWithCancellation(alloc, payload, session.cancellation);
     errdefer segment.deinit(alloc);
     const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
-    segment.metadata_version = if (metric_artifact.metadata_version != 0) metric_artifact.metadata_version else segment.metadata_version;
+    // The authenticated payload owns its schema version. Manifest provenance
+    // is optional and must not override the decoded wire contract.
     segment.published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version;
     segment.edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version;
-    segment.computed_at_ms = if (metric_artifact.metadata_version != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms);
+    segment.computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms);
     if (!std.mem.eql(u8, segment.graph_index_name, graph_index_name) or !std.mem.eql(u8, segment.metric_name, metric_name)) return error.InvalidGraphMetricSegment;
     if (segment.kind != config.kind or segment.config_fingerprint != lake_graph_metric.configFingerprint(config) or
         !segment.edge_filter.equivalent(config.edge_filter)) return error.MetricStale;
@@ -564,4 +677,16 @@ fn compareWorstFirst(_: void, a: BorrowedScore, b: BorrowedScore) std.math.Order
 }
 fn lessScore(_: void, a: BorrowedScore, b: BorrowedScore) bool {
     return scoreOrder(a, b) == .lt;
+}
+
+fn borrowedFromOwned(score: Score) BorrowedScore {
+    return .{ .node_id = score.node_id, .value = score.value };
+}
+
+fn compareOwnedWorstFirst(_: void, a: Score, b: Score) std.math.Order {
+    return scoreOrder(borrowedFromOwned(b), borrowedFromOwned(a));
+}
+
+fn lessOwnedScore(_: void, a: Score, b: Score) bool {
+    return scoreOrder(borrowedFromOwned(a), borrowedFromOwned(b)) == .lt;
 }

@@ -26,6 +26,9 @@ const query_mod = @import("../query/mod.zig");
 const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
+const graph_metric_policy = @import("../build/graph_metric_policy.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
+const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
 const impact_planner = @import("../build/impact_planner.zig");
 const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
@@ -43,6 +46,47 @@ const PublicationPlanPurpose = enum {
     status,
     publication,
 };
+
+fn graphMetricMaterializationStaleAlloc(alloc: Allocator, manifest: manifest_mod.Manifest, indexes_json: []const u8) !bool {
+    const current = graph_metric_policy.materializerFingerprint(.{});
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    for (specs) |spec| {
+        for (spec.configs) |config| {
+            const name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+            defer alloc.free(name);
+            const artifact = findManifestNamedArtifact(manifest, .graph_metric_segment, name) orelse return true;
+            if (artifact.materializer_fingerprint != current) return true;
+        }
+    }
+    return false;
+}
+
+test "serverless catalog schedules idle graph metric policy upgrades from manifest metadata" {
+    var artifacts = [_]manifest_mod.ArtifactRef{.{
+        .kind = .graph_metric_segment,
+        .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .byte_len = 1,
+        .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .materializer_fingerprint = 0,
+    }};
+    var manifest = manifest_mod.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &artifacts,
+    };
+    const indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    artifacts[0].name = "9:graph_idx4:rank";
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    artifacts[0].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    try std.testing.expect(!try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    manifest.artifacts = manifest.artifacts[0..0];
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+}
 
 fn ensureSchemaWritesAllowedAlloc(alloc: Allocator, schema_json: []const u8) !void {
     var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return;
@@ -803,6 +847,7 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
+                metadata_republish.graph_metric_policy_changed = try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,

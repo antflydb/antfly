@@ -31,6 +31,7 @@ pub const PublishedArtifact = struct {
     published_generation: u64 = 0,
     edge_generation: u64 = 0,
     computed_at_ms: u64 = 0,
+    materializer_fingerprint: u64 = 0,
 };
 
 pub const Plan = struct {
@@ -197,6 +198,7 @@ fn cloneArtifactRef(
         .published_generation = artifact.published_generation,
         .edge_generation = artifact.edge_generation,
         .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
     };
 }
 
@@ -222,6 +224,7 @@ fn cloneAppendedArtifactsAlloc(
             .published_generation = artifact.published_generation,
             .edge_generation = artifact.edge_generation,
             .computed_at_ms = artifact.computed_at_ms,
+            .materializer_fingerprint = artifact.materializer_fingerprint,
         });
         initialized += 1;
     }
@@ -235,6 +238,7 @@ fn cloneAppendedArtifactsAlloc(
             .published_generation = artifact.published_generation,
             .edge_generation = artifact.edge_generation,
             .computed_at_ms = artifact.computed_at_ms,
+            .materializer_fingerprint = artifact.materializer_fingerprint,
         });
         initialized += 1;
     }

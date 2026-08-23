@@ -124,6 +124,7 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
         .published_generation = artifact.published_generation,
         .edge_generation = artifact.edge_generation,
         .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
     };
 }
 

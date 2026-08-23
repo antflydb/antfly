@@ -21,7 +21,7 @@ const manifest_types = @import("types.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 14;
+pub const wire_version: u16 = 15;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -145,7 +145,7 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 }
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
-    return 1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+    return 1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + 8 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
 fn publishedSearchSourceEncodedSize(source: search_sources.SearchSourceDescriptor) usize {
@@ -343,6 +343,8 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         pos += 8;
         std.mem.writeInt(u64, buf[pos..][0..8], artifact.computed_at_ms, .little);
         pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
+        pos += 8;
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
         pos += artifact.name.len;
         @memcpy(buf[pos..][0..artifact.artifact_id.len], artifact.artifact_id);
@@ -418,7 +420,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != 13 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != 13 and version != 14 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -750,7 +752,9 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     }
 
     for (0..artifact_count) |idx| {
-        const min_artifact_header_len: usize = if (version >= 14)
+        const min_artifact_header_len: usize = if (version >= 15)
+            1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + 8
+        else if (version >= 14)
             1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8
         else if (version >= 9)
             1 + 4 + 4 + 8 + 4
@@ -790,6 +794,11 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             pos += 8;
             break :blk value;
         } else 0;
+        const materializer_fingerprint = if (version >= 15) blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        } else 0;
 
         if (pos + name_len + artifact_id_len + checksum_len > data.len) return error.InvalidManifest;
         const name = if (name_len > 0) try alloc.dupe(u8, data[pos .. pos + name_len]) else &.{};
@@ -811,6 +820,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .published_generation = published_generation,
             .edge_generation = edge_generation,
             .computed_at_ms = computed_at_ms,
+            .materializer_fingerprint = materializer_fingerprint,
         };
         initialized += 1;
     }
@@ -1048,6 +1058,7 @@ test "serverless manifest codec round-trips deterministically" {
         .published_generation = 40,
         .edge_generation = 39,
         .computed_at_ms = 123,
+        .materializer_fingerprint = 0x1234,
     };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
@@ -1080,25 +1091,48 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(@as(u64, 40), decoded.artifacts[4].published_generation);
     try std.testing.expectEqual(@as(u64, 39), decoded.artifacts[4].edge_generation);
     try std.testing.expectEqual(@as(u64, 123), decoded.artifacts[4].computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 0x1234), decoded.artifacts[4].materializer_fingerprint);
 
-    // v14 adds fixed provenance fields per artifact; compact them out to
-    // exercise the still-supported v13 layout.
+    // v15 adds the materializer fingerprint. Compact it out first to exercise
+    // the still-supported v14 layout, then compact provenance for v13.
+    const materializer_bytes: usize = 8;
     const provenance_bytes: usize = 2 + 8 + 8 + 8;
     var current_artifact_bytes: usize = 0;
     for (manifest.artifacts) |artifact| current_artifact_bytes += artifactEncodedSize(artifact);
     const prefix_len = encoded_a.len - current_artifact_bytes;
-    const encoded_v13 = try alloc.alloc(u8, encoded_a.len - provenance_bytes * manifest.artifacts.len);
-    defer alloc.free(encoded_v13);
-    @memcpy(encoded_v13[0..prefix_len], encoded_a[0..prefix_len]);
+    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len);
+    defer alloc.free(encoded_v14);
+    @memcpy(encoded_v14[0..prefix_len], encoded_a[0..prefix_len]);
     var src_pos = prefix_len;
     var dst_pos = prefix_len;
     const artifact_header_bytes: usize = 1 + 4 + 4 + 8 + 4;
     for (manifest.artifacts) |artifact| {
-        @memcpy(encoded_v13[dst_pos..][0..artifact_header_bytes], encoded_a[src_pos..][0..artifact_header_bytes]);
+        const retained_header_bytes = artifact_header_bytes + provenance_bytes;
+        @memcpy(encoded_v14[dst_pos..][0..retained_header_bytes], encoded_a[src_pos..][0..retained_header_bytes]);
+        src_pos += retained_header_bytes + materializer_bytes;
+        dst_pos += retained_header_bytes;
+        const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+        @memcpy(encoded_v14[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);
+        src_pos += payload_len;
+        dst_pos += payload_len;
+    }
+    std.mem.writeInt(u16, encoded_v14[4..6], 14, .little);
+    var decoded_v14 = try decodeAlloc(alloc, encoded_v14);
+    defer decoded_v14.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 123), decoded_v14.artifacts[4].computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), decoded_v14.artifacts[4].materializer_fingerprint);
+
+    const encoded_v13 = try alloc.alloc(u8, encoded_v14.len - provenance_bytes * manifest.artifacts.len);
+    defer alloc.free(encoded_v13);
+    @memcpy(encoded_v13[0..prefix_len], encoded_v14[0..prefix_len]);
+    src_pos = prefix_len;
+    dst_pos = prefix_len;
+    for (manifest.artifacts) |artifact| {
+        @memcpy(encoded_v13[dst_pos..][0..artifact_header_bytes], encoded_v14[src_pos..][0..artifact_header_bytes]);
         src_pos += artifact_header_bytes + provenance_bytes;
         dst_pos += artifact_header_bytes;
         const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
-        @memcpy(encoded_v13[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);
+        @memcpy(encoded_v13[dst_pos..][0..payload_len], encoded_v14[src_pos..][0..payload_len]);
         src_pos += payload_len;
         dst_pos += payload_len;
     }

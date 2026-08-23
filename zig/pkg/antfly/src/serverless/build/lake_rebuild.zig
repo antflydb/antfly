@@ -523,6 +523,7 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     inventory: external_source.Inventory,
     table: TableIndexDefinition,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
+    provenance: lake_graph_metric.Provenance,
 ) !ReconciledManifest {
     return try reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
         alloc,
@@ -533,6 +534,7 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
         table,
         published_declarations,
         .none,
+        provenance,
     );
 }
 
@@ -545,7 +547,9 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
     table: TableIndexDefinition,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     cancellation: CancellationToken,
+    provenance: lake_graph_metric.Provenance,
 ) !ReconciledManifest {
+    try provenance.validate();
     try cancellation.check();
     var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, table);
     defer desired.deinit(alloc);
@@ -568,7 +572,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
 
     var reconciled = try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
     defer reconciled.deinit(alloc);
-    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations, cancellation);
+    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations, cancellation, provenance);
 }
 
 fn appendExternalGraphMetricDeclarationsAlloc(
@@ -578,6 +582,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     base_declarations: []const sidecar_manifest.DeclaredArtifact,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     cancellation: CancellationToken,
+    provenance: lake_graph_metric.Provenance,
 ) !ReconciledManifest {
     try cancellation.check();
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
@@ -630,7 +635,12 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
                 defer alloc.free(metric_name);
                 const existing = findDeclaration(published_declarations, metric_name) orelse unreachable;
-                declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, existing));
+                var cloned = try cloneDeclarationAlloc(alloc, existing);
+                if (cloned.artifact.published_generation == 0) cloned.artifact.published_generation = provenance.published_generation;
+                if (cloned.artifact.edge_generation == 0) cloned.artifact.edge_generation = provenance.edge_generation;
+                if (cloned.artifact.computed_at_ms == 0) cloned.artifact.computed_at_ms = provenance.computed_at_ms;
+                if (cloned.artifact.materializer_fingerprint == 0) cloned.artifact.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
+                declarations.appendAssumeCapacity(cloned);
             }
             continue;
         }
@@ -649,7 +659,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 cancellation,
                 .build_budget_exceeded,
                 graph_metric_limits,
-                .{},
+                provenance,
             );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_declaration.artifact)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
@@ -670,7 +680,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                         cancellation,
                         .build_budget_exceeded,
                         graph_metric_limits,
-                        .{},
+                        provenance,
                     ),
                     else => return err,
                 };
@@ -685,7 +695,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 graph_metric_limits,
                 &graph_metric_budget,
                 &prepared_graph.?,
-                .{},
+                provenance,
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,
@@ -696,7 +706,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                     cancellation,
                     .build_budget_exceeded,
                     graph_metric_limits,
-                    .{},
+                    provenance,
                 ),
                 else => return err,
             };
@@ -2004,6 +2014,7 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_artifact.ArtifactR
         .published_generation = artifact.published_generation,
         .edge_generation = artifact.edge_generation,
         .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
     };
 }
 
@@ -2869,6 +2880,7 @@ test "lake rebuild reconciles resolved external sidecars end to end" {
             .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}",
         },
         &.{},
+        .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 },
     );
     defer reconciled.deinit(alloc);
 
