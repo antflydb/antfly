@@ -16,6 +16,7 @@ const std = @import("std");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
+const file_mod = @import("sim_io_file.zig");
 const task_mod = @import("sim_io_task.zig");
 const transition = @import("transition.zig");
 
@@ -75,6 +76,7 @@ pub const supported_capabilities = CapabilitySet.of(&.{
     .task_scheduling,
     .synchronization,
     .sleep,
+    .files,
 });
 
 pub const Metadata = struct {
@@ -139,12 +141,16 @@ pub const ViolationOperation = enum {
     directory_access,
     directory_close,
     directory_read,
+    directory_symbolic_link,
+    directory_hard_link,
     directory_set_timestamps,
     file_close,
     file_is_tty,
     file_enable_ansi,
     file_supports_ansi,
     file_set_timestamps,
+    file_write_file,
+    file_hard_link,
     file_unlock,
     memory_map_destroy,
     memory_map_set_length,
@@ -174,12 +180,16 @@ pub const Config = struct {
     thread_cpu_ns: i64 = 0,
     task_allocator: std.mem.Allocator = std.heap.page_allocator,
     tasks: task_mod.Config = .{},
+    file_allocator: std.mem.Allocator = std.heap.page_allocator,
+    files: file_mod.Config = .{},
 };
 
 pub const InitError = error{
+    OutOfMemory,
     UnsupportedSimIoCapabilities,
     SimIoStackTooSmall,
     InvalidSimIoTaskLimit,
+    InvalidSimIoFileHandleLimit,
 };
 
 pub const SimIo = struct {
@@ -194,11 +204,17 @@ pub const SimIo = struct {
     violation_count: u64 = 0,
     first_violation: ?CapabilityViolation = null,
     tasks: task_mod.Kernel,
+    files: file_mod.FileSystem,
 
     pub fn init(config: Config) InitError!SimIo {
         if (!supported_capabilities.containsAll(config.required)) {
             return error.UnsupportedSimIoCapabilities;
         }
+        var files = file_mod.FileSystem.init(config.file_allocator, config.files) catch |err| switch (err) {
+            error.InvalidSimIoFileHandleLimit => return error.InvalidSimIoFileHandleLimit,
+            else => return error.OutOfMemory,
+        };
+        errdefer files.deinit();
         return .{
             .prng = std.Random.DefaultPrng.init(config.seed),
             .monotonic_ns = config.monotonic_ns,
@@ -206,11 +222,13 @@ pub const SimIo = struct {
             .process_cpu_ns = config.process_cpu_ns,
             .thread_cpu_ns = config.thread_cpu_ns,
             .tasks = try task_mod.Kernel.init(config.task_allocator, config.tasks),
+            .files = files,
         };
     }
 
     pub fn deinit(self: *SimIo) void {
         self.tasks.deinit();
+        self.files.deinit();
         self.* = undefined;
     }
 
@@ -383,9 +401,30 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     self.tasks.futexWake(ptr, max_waiters) catch self.latch(.futex_wake);
 }
 
-fn operate(userdata: ?*anyopaque, _: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-    state(userdata).latch(.operation_batch);
-    return error.Canceled;
+fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    const self = state(userdata);
+    return switch (operation) {
+        .file_read_streaming => |request| .{
+            .file_read_streaming = self.files.readStreaming(request.file, request.data),
+        },
+        .file_write_streaming => |request| .{
+            .file_write_streaming = self.files.writeStreaming(
+                request.file,
+                request.header,
+                request.data,
+                request.splat,
+                self.realtime_ns,
+            ),
+        },
+        .net_receive => {
+            self.latch(.operation_batch);
+            return .{ .net_receive = .{ error.NetworkDown, 0 } };
+        },
+        .device_io_control => {
+            self.latch(.operation_batch);
+            return error.Canceled;
+        },
+    };
 }
 
 fn batchAwaitAsync(userdata: ?*anyopaque, _: *std.Io.Batch) std.Io.Cancelable!void {
@@ -402,70 +441,250 @@ fn batchCancel(userdata: ?*anyopaque, _: *std.Io.Batch) void {
     state(userdata).latch(.operation_batch);
 }
 
-fn dirAccess(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.AccessOptions) std.Io.Dir.AccessError!void {
-    state(userdata).latch(.directory_access);
-    return error.FileNotFound;
+fn dirCreateDir(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, permissions: std.Io.Dir.Permissions) std.Io.Dir.CreateDirError!void {
+    const self = state(userdata);
+    return self.files.createDir(dir, sub_path, permissions, self.realtime_ns);
 }
 
-fn dirClose(userdata: ?*anyopaque, _: []const std.Io.Dir) void {
-    state(userdata).latch(.directory_close);
+fn dirCreateDirPath(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, permissions: std.Io.Dir.Permissions) std.Io.Dir.CreateDirPathError!std.Io.Dir.CreatePathStatus {
+    const self = state(userdata);
+    return self.files.createDirPath(dir, sub_path, permissions, self.realtime_ns);
 }
 
-fn dirRead(userdata: ?*anyopaque, _: *std.Io.Dir.Reader, _: []std.Io.Dir.Entry) std.Io.Dir.Reader.Error!usize {
-    state(userdata).latch(.directory_read);
+fn dirCreateDirPathOpen(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, permissions: std.Io.Dir.Permissions, options: std.Io.Dir.OpenOptions) std.Io.Dir.CreateDirPathOpenError!std.Io.Dir {
+    const self = state(userdata);
+    _ = self.files.createDirPath(dir, sub_path, permissions, self.realtime_ns) catch |err|
+        return @errorCast(err);
+    return self.files.openDir(dir, sub_path, options) catch |err| return @errorCast(err);
+}
+
+fn dirOpenDir(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+    return state(userdata).files.openDir(dir, sub_path, options);
+}
+
+fn dirStat(userdata: ?*anyopaque, dir: std.Io.Dir) std.Io.Dir.StatError!std.Io.Dir.Stat {
+    return state(userdata).files.statDir(dir);
+}
+
+fn dirStatFile(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, _: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+    return state(userdata).files.statFileAt(dir, sub_path);
+}
+
+fn dirAccess(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, _: std.Io.Dir.AccessOptions) std.Io.Dir.AccessError!void {
+    return state(userdata).files.access(dir, sub_path);
+}
+
+fn dirCreateFile(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File {
+    const self = state(userdata);
+    return self.files.createFile(dir, sub_path, options, self.realtime_ns);
+}
+
+fn dirOpenFile(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+    return state(userdata).files.openFile(dir, sub_path, options);
+}
+
+fn dirClose(userdata: ?*anyopaque, dirs: []const std.Io.Dir) void {
+    const self = state(userdata);
+    if (!self.files.closeDirs(dirs)) self.latch(.directory_close);
+}
+
+fn dirCreateFileAtomic(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.CreateFileAtomicOptions) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
+    const self = state(userdata);
+    return self.files.createFileAtomic(dir, sub_path, options, self.realtime_ns);
+}
+
+fn dirRead(userdata: ?*anyopaque, reader: *std.Io.Dir.Reader, entries: []std.Io.Dir.Entry) std.Io.Dir.Reader.Error!usize {
+    return state(userdata).files.readDir(reader, entries);
+}
+
+fn dirRealPath(userdata: ?*anyopaque, dir: std.Io.Dir, out: []u8) std.Io.Dir.RealPathError!usize {
+    return state(userdata).files.realPathDir(dir, out);
+}
+
+fn dirRealPathFile(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, out: []u8) std.Io.Dir.RealPathFileError!usize {
+    return state(userdata).files.realPathAt(dir, sub_path, out);
+}
+
+fn dirDeleteFile(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8) std.Io.Dir.DeleteFileError!void {
+    return state(userdata).files.deleteFile(dir, sub_path);
+}
+
+fn dirDeleteDir(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8) std.Io.Dir.DeleteDirError!void {
+    return state(userdata).files.deleteDir(dir, sub_path);
+}
+
+fn dirRename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_sub_path: []const u8, new_dir: std.Io.Dir, new_sub_path: []const u8) std.Io.Dir.RenameError!void {
+    return state(userdata).files.rename(old_dir, old_sub_path, new_dir, new_sub_path, false) catch |err|
+        return @errorCast(err);
+}
+
+fn dirRenamePreserve(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_sub_path: []const u8, new_dir: std.Io.Dir, new_sub_path: []const u8) std.Io.Dir.RenamePreserveError!void {
+    return state(userdata).files.rename(old_dir, old_sub_path, new_dir, new_sub_path, true) catch |err|
+        return @errorCast(err);
+}
+
+fn dirSymLink(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []const u8, _: std.Io.Dir.SymLinkFlags) std.Io.Dir.SymLinkError!void {
+    state(userdata).latch(.directory_symbolic_link);
     return error.AccessDenied;
 }
 
-fn dirSetTimestamps(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.SetTimestampsOptions) std.Io.Dir.SetTimestampsError!void {
-    state(userdata).latch(.directory_set_timestamps);
+fn dirReadLink(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []u8) std.Io.Dir.ReadLinkError!usize {
+    state(userdata).latch(.directory_symbolic_link);
     return error.AccessDenied;
 }
 
-fn fileClose(userdata: ?*anyopaque, _: []const std.Io.File) void {
-    state(userdata).latch(.file_close);
+fn dirSetOwner(userdata: ?*anyopaque, dir: std.Io.Dir, _: ?std.Io.File.Uid, _: ?std.Io.File.Gid) std.Io.Dir.SetOwnerError!void {
+    _ = state(userdata).files.statDir(dir) catch return error.AccessDenied;
 }
 
-fn fileIsTty(userdata: ?*anyopaque, _: std.Io.File) std.Io.Cancelable!bool {
-    state(userdata).latch(.file_is_tty);
-    return error.Canceled;
+fn dirSetFileOwner(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, _: ?std.Io.File.Uid, _: ?std.Io.File.Gid, _: std.Io.Dir.SetFileOwnerOptions) std.Io.Dir.SetFileOwnerError!void {
+    _ = state(userdata).files.statFileAt(dir, sub_path) catch |err| return switch (err) {
+        error.FileNotFound => error.FileNotFound,
+        error.NameTooLong => error.NameTooLong,
+        else => error.AccessDenied,
+    };
 }
 
-fn fileEnableAnsi(userdata: ?*anyopaque, _: std.Io.File) std.Io.File.EnableAnsiEscapeCodesError!void {
-    state(userdata).latch(.file_enable_ansi);
+fn dirSetPermissions(userdata: ?*anyopaque, dir: std.Io.Dir, permissions: std.Io.Dir.Permissions) std.Io.Dir.SetPermissionsError!void {
+    const self = state(userdata);
+    return self.files.setDirPermissions(dir, permissions, self.realtime_ns);
+}
+
+fn dirSetFilePermissions(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, permissions: std.Io.File.Permissions, _: std.Io.Dir.SetFilePermissionsOptions) std.Io.Dir.SetFilePermissionsError!void {
+    const self = state(userdata);
+    return self.files.setPermissionsAt(dir, sub_path, permissions, self.realtime_ns);
+}
+
+fn dirSetTimestamps(userdata: ?*anyopaque, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.SetTimestampsOptions) std.Io.Dir.SetTimestampsError!void {
+    const self = state(userdata);
+    return self.files.setTimestampsAt(dir, sub_path, options, self.realtime_ns);
+}
+
+fn dirHardLink(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.HardLinkOptions) std.Io.Dir.HardLinkError!void {
+    state(userdata).latch(.directory_hard_link);
+    return error.OperationUnsupported;
+}
+
+fn fileStat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+    return state(userdata).files.statFile(file);
+}
+
+fn fileLength(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.LengthError!u64 {
+    return state(userdata).files.fileLength(file);
+}
+
+fn fileClose(userdata: ?*anyopaque, files: []const std.Io.File) void {
+    const self = state(userdata);
+    if (!self.files.closeFiles(files)) self.latch(.file_close);
+}
+
+fn fileWritePositional(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+    const self = state(userdata);
+    return self.files.writePositional(file, header, data, splat, offset, self.realtime_ns);
+}
+
+fn fileWriteFileStreaming(userdata: ?*anyopaque, _: std.Io.File, _: []const u8, _: *std.Io.File.Reader, _: std.Io.Limit) std.Io.File.Writer.WriteFileError!usize {
+    state(userdata).latch(.file_write_file);
+    return error.Unimplemented;
+}
+
+fn fileWriteFilePositional(userdata: ?*anyopaque, _: std.Io.File, _: []const u8, _: *std.Io.File.Reader, _: std.Io.Limit, _: u64) std.Io.File.WriteFilePositionalError!usize {
+    state(userdata).latch(.file_write_file);
+    return error.Unimplemented;
+}
+
+fn fileReadPositional(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+    return state(userdata).files.readPositional(file, data, offset);
+}
+
+fn fileSeekBy(userdata: ?*anyopaque, file: std.Io.File, relative_offset: i64) std.Io.File.SeekError!void {
+    return state(userdata).files.seekBy(file, relative_offset);
+}
+
+fn fileSeekTo(userdata: ?*anyopaque, file: std.Io.File, absolute_offset: u64) std.Io.File.SeekError!void {
+    return state(userdata).files.seekTo(file, absolute_offset);
+}
+
+fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+    return state(userdata).files.syncFile(file);
+}
+
+fn fileSetLength(userdata: ?*anyopaque, file: std.Io.File, length: u64) std.Io.File.SetLengthError!void {
+    const self = state(userdata);
+    return self.files.setLength(file, length, self.realtime_ns);
+}
+
+fn fileIsTty(_: ?*anyopaque, _: std.Io.File) std.Io.Cancelable!bool {
+    return false;
+}
+
+fn fileEnableAnsi(_: ?*anyopaque, _: std.Io.File) std.Io.File.EnableAnsiEscapeCodesError!void {
     return error.NotTerminalDevice;
 }
 
-fn fileSupportsAnsi(userdata: ?*anyopaque, _: std.Io.File) std.Io.Cancelable!bool {
-    state(userdata).latch(.file_supports_ansi);
-    return error.Canceled;
+fn fileSupportsAnsi(_: ?*anyopaque, _: std.Io.File) std.Io.Cancelable!bool {
+    return false;
 }
 
-fn fileSetTimestamps(userdata: ?*anyopaque, _: std.Io.File, _: std.Io.File.SetTimestampsOptions) std.Io.File.SetTimestampsError!void {
-    state(userdata).latch(.file_set_timestamps);
-    return error.AccessDenied;
+fn fileSetOwner(userdata: ?*anyopaque, file: std.Io.File, _: ?std.Io.File.Uid, _: ?std.Io.File.Gid) std.Io.File.SetOwnerError!void {
+    _ = state(userdata).files.statFile(file) catch return error.AccessDenied;
 }
 
-fn fileUnlock(userdata: ?*anyopaque, _: std.Io.File) void {
-    state(userdata).latch(.file_unlock);
+fn fileSetPermissions(userdata: ?*anyopaque, file: std.Io.File, permissions: std.Io.File.Permissions) std.Io.File.SetPermissionsError!void {
+    const self = state(userdata);
+    return self.files.setFilePermissions(file, permissions, self.realtime_ns);
 }
 
-fn memoryMapDestroy(userdata: ?*anyopaque, _: *std.Io.File.MemoryMap) void {
-    state(userdata).latch(.memory_map_destroy);
+fn fileSetTimestamps(userdata: ?*anyopaque, file: std.Io.File, options: std.Io.File.SetTimestampsOptions) std.Io.File.SetTimestampsError!void {
+    const self = state(userdata);
+    return self.files.setFileTimestamps(file, options, self.realtime_ns);
 }
 
-fn memoryMapSetLength(userdata: ?*anyopaque, _: *std.Io.File.MemoryMap, _: usize) std.Io.File.MemoryMap.SetLengthError!void {
-    state(userdata).latch(.memory_map_set_length);
-    return error.AccessDenied;
+fn fileLock(userdata: ?*anyopaque, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!void {
+    if (!try state(userdata).files.tryLock(file, lock)) return error.FileLocksUnsupported;
 }
 
-fn memoryMapRead(userdata: ?*anyopaque, _: *std.Io.File.MemoryMap) std.Io.File.ReadPositionalError!void {
-    state(userdata).latch(.memory_map_read);
-    return error.AccessDenied;
+fn fileTryLock(userdata: ?*anyopaque, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!bool {
+    return state(userdata).files.tryLock(file, lock);
 }
 
-fn memoryMapWrite(userdata: ?*anyopaque, _: *std.Io.File.MemoryMap) std.Io.File.WritePositionalError!void {
-    state(userdata).latch(.memory_map_write);
-    return error.AccessDenied;
+fn fileUnlock(userdata: ?*anyopaque, file: std.Io.File) void {
+    const self = state(userdata);
+    if (!self.files.unlock(file)) self.latch(.file_unlock);
+}
+
+fn fileDowngradeLock(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.DowngradeLockError!void {
+    return state(userdata).files.downgradeLock(file);
+}
+
+fn fileRealPath(userdata: ?*anyopaque, file: std.Io.File, out: []u8) std.Io.File.RealPathError!usize {
+    return state(userdata).files.realPathFile(file, out);
+}
+
+fn fileHardLink(userdata: ?*anyopaque, _: std.Io.File, _: std.Io.Dir, _: []const u8, _: std.Io.File.HardLinkOptions) std.Io.File.HardLinkError!void {
+    state(userdata).latch(.file_hard_link);
+    return error.OperationUnsupported;
+}
+
+fn memoryMapCreate(userdata: ?*anyopaque, file: std.Io.File, options: std.Io.File.MemoryMap.CreateOptions) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
+    return state(userdata).files.createMemoryMap(file, options);
+}
+
+fn memoryMapDestroy(userdata: ?*anyopaque, map: *std.Io.File.MemoryMap) void {
+    state(userdata).files.destroyMemoryMap(map);
+}
+
+fn memoryMapSetLength(userdata: ?*anyopaque, map: *std.Io.File.MemoryMap, len: usize) std.Io.File.MemoryMap.SetLengthError!void {
+    return state(userdata).files.setMemoryMapLength(map, len);
+}
+
+fn memoryMapRead(userdata: ?*anyopaque, map: *std.Io.File.MemoryMap) std.Io.File.ReadPositionalError!void {
+    return state(userdata).files.readMemoryMap(map);
+}
+
+fn memoryMapWrite(userdata: ?*anyopaque, map: *std.Io.File.MemoryMap) std.Io.File.WritePositionalError!void {
+    const self = state(userdata);
+    return self.files.writeMemoryMap(map, self.realtime_ns);
 }
 
 fn lockStderr(userdata: ?*anyopaque, _: ?std.Io.Terminal.Mode) std.Io.Cancelable!std.Io.LockedStderr {
@@ -660,16 +879,56 @@ const vtable: std.Io.VTable = blk: {
     result.batchAwaitAsync = batchAwaitAsync;
     result.batchAwaitConcurrent = batchAwaitConcurrent;
     result.batchCancel = batchCancel;
+    result.dirCreateDir = dirCreateDir;
+    result.dirCreateDirPath = dirCreateDirPath;
+    result.dirCreateDirPathOpen = dirCreateDirPathOpen;
+    result.dirOpenDir = dirOpenDir;
+    result.dirStat = dirStat;
+    result.dirStatFile = dirStatFile;
     result.dirAccess = dirAccess;
+    result.dirCreateFile = dirCreateFile;
+    result.dirCreateFileAtomic = dirCreateFileAtomic;
+    result.dirOpenFile = dirOpenFile;
     result.dirClose = dirClose;
     result.dirRead = dirRead;
+    result.dirRealPath = dirRealPath;
+    result.dirRealPathFile = dirRealPathFile;
+    result.dirDeleteFile = dirDeleteFile;
+    result.dirDeleteDir = dirDeleteDir;
+    result.dirRename = dirRename;
+    result.dirRenamePreserve = dirRenamePreserve;
+    result.dirSymLink = dirSymLink;
+    result.dirReadLink = dirReadLink;
+    result.dirSetOwner = dirSetOwner;
+    result.dirSetFileOwner = dirSetFileOwner;
+    result.dirSetPermissions = dirSetPermissions;
+    result.dirSetFilePermissions = dirSetFilePermissions;
     result.dirSetTimestamps = dirSetTimestamps;
+    result.dirHardLink = dirHardLink;
+    result.fileStat = fileStat;
+    result.fileLength = fileLength;
     result.fileClose = fileClose;
+    result.fileWritePositional = fileWritePositional;
+    result.fileWriteFileStreaming = fileWriteFileStreaming;
+    result.fileWriteFilePositional = fileWriteFilePositional;
+    result.fileReadPositional = fileReadPositional;
+    result.fileSeekBy = fileSeekBy;
+    result.fileSeekTo = fileSeekTo;
+    result.fileSync = fileSync;
     result.fileIsTty = fileIsTty;
     result.fileEnableAnsiEscapeCodes = fileEnableAnsi;
     result.fileSupportsAnsiEscapeCodes = fileSupportsAnsi;
+    result.fileSetLength = fileSetLength;
+    result.fileSetOwner = fileSetOwner;
+    result.fileSetPermissions = fileSetPermissions;
     result.fileSetTimestamps = fileSetTimestamps;
+    result.fileLock = fileLock;
+    result.fileTryLock = fileTryLock;
     result.fileUnlock = fileUnlock;
+    result.fileDowngradeLock = fileDowngradeLock;
+    result.fileRealPath = fileRealPath;
+    result.fileHardLink = fileHardLink;
+    result.fileMemoryMapCreate = memoryMapCreate;
     result.fileMemoryMapDestroy = memoryMapDestroy;
     result.fileMemoryMapSetLength = memoryMapSetLength;
     result.fileMemoryMapRead = memoryMapRead;
@@ -691,14 +950,14 @@ const vtable: std.Io.VTable = blk: {
 };
 
 test "SimIo capability construction fails before exposing unsupported services" {
-    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy }));
+    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files }));
     try std.testing.expectError(
         error.UnsupportedSimIoCapabilities,
-        SimIo.init(.{ .required = .of(&.{.files}) }),
+        SimIo.init(.{ .required = .of(&.{.sockets}) }),
     );
     try std.testing.expectEqual(
-        CapabilitySet.of(&.{ .files, .sockets }).bits,
-        SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets })).bits,
+        CapabilitySet.of(&.{ .sockets, .processes }).bits,
+        SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes })).bits,
     );
 }
 
@@ -745,7 +1004,12 @@ test "SimIo unsupported operations latch a deterministic harness violation" {
         error.FileNotFound,
         std.Io.Dir.cwd().access(io, "must-not-touch-host", .{}),
     );
-    try std.testing.expectEqual(ViolationOperation.directory_access, sim.firstCapabilityViolation().?.operation);
+    try sim.ensureNoCapabilityViolation();
+    try std.testing.expectError(
+        error.AccessDenied,
+        std.Io.Dir.cwd().symLink(io, "target", "unsupported", .{}),
+    );
+    try std.testing.expectEqual(ViolationOperation.directory_symbolic_link, sim.firstCapabilityViolation().?.operation);
     try std.testing.expectError(error.SimIoCapabilityViolation, sim.ensureNoCapabilityViolation());
 
     sim.clearCapabilityViolation();
@@ -991,5 +1255,91 @@ test "SimIo runs std.Io mutex queue and select on the futex kernel" {
     try std.testing.expect(shared.done);
     try std.testing.expectEqual(@as(u32, 2), shared.protected_value);
     try std.testing.expectEqual(@as(u32, 30), shared.selected_sum);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo core modeled files execute through std.Io and survive only durable syncs" {
+    var sim = try SimIo.init(.{});
+    defer sim.deinit();
+    const io = sim.io();
+
+    try std.testing.expectEqual(
+        std.Io.Dir.CreatePathStatus.created,
+        try std.Io.Dir.cwd().createDirPathStatus(io, "state", .default_dir),
+    );
+    var file = try std.Io.Dir.cwd().createFile(io, "state/wal", .{ .read = true });
+    try file.writeStreamingAll(io, "old");
+    try file.sync(io);
+    file.close(io);
+    try sim.files.syncNamespace();
+
+    file = try std.Io.Dir.cwd().openFile(io, "state/wal", .{ .mode = .read_write });
+    try file.writePositionalAll(io, "new", 0);
+    sim.files.faults.drop_next_sync = true;
+    try file.sync(io);
+    try sim.files.crash();
+
+    file = try std.Io.Dir.cwd().openFile(io, "state/wal", .{});
+    defer file.close(io);
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try file.readPositionalAll(io, &bytes, 0));
+    try std.testing.expectEqualStrings("old", &bytes);
+    try std.testing.expectEqual(@as(u64, 3), try file.length(io));
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo modeled file surface supports deterministic iteration atomic replace locks and mappings" {
+    var sim = try SimIo.init(.{ .required = .of(&.{.files}) });
+    defer sim.deinit();
+    const io = sim.io();
+
+    try std.Io.Dir.cwd().createDirPath(io, "tree/nested");
+    var alpha = try std.Io.Dir.cwd().createFile(io, "tree/alpha", .{ .read = true });
+    try alpha.writeStreamingAll(io, "alpha");
+    alpha.close(io);
+    var beta = try std.Io.Dir.cwd().createFile(io, "tree/beta", .{ .read = true });
+    beta.close(io);
+
+    var tree = try std.Io.Dir.cwd().openDir(io, "tree", .{ .iterate = true });
+    var iterator = tree.iterate();
+    try std.testing.expectEqualStrings("alpha", (try iterator.next(io)).?.name);
+    try std.testing.expectEqualStrings("beta", (try iterator.next(io)).?.name);
+    try std.testing.expectEqualStrings("nested", (try iterator.next(io)).?.name);
+    try std.testing.expect((try iterator.next(io)) == null);
+    tree.close(io);
+
+    try std.Io.Dir.cwd().rename("tree", std.Io.Dir.cwd(), "moved", io);
+    alpha = try std.Io.Dir.cwd().openFile(io, "moved/alpha", .{ .mode = .read_write });
+    defer alpha.close(io);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try alpha.realPath(io, &path_buffer);
+    try std.testing.expectEqualStrings("/moved/alpha", path_buffer[0..path_len]);
+    try alpha.setPermissions(io, .default_file);
+    try alpha.setTimestamps(io, .{ .modify_timestamp = .now });
+
+    try std.testing.expect(try alpha.tryLock(io, .exclusive));
+    alpha.downgradeLock(io) catch unreachable;
+    alpha.unlock(io);
+
+    var map = try alpha.createMemoryMap(io, .{ .len = 5 });
+    defer map.destroy(io);
+    @memcpy(map.memory, "ALPHA");
+    try map.write(io);
+    try map.setLength(io, 6);
+    map.memory[5] = '!';
+    try map.write(io);
+    var mapped_bytes: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try alpha.readPositionalAll(io, &mapped_bytes, 0));
+    try std.testing.expectEqualStrings("ALPHA!", &mapped_bytes);
+
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, "moved/published", .{});
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, "ready");
+    try atomic.link(io);
+    var published = try std.Io.Dir.cwd().openFile(io, "moved/published", .{});
+    defer published.close(io);
+    var published_bytes: [5]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 5), try published.readPositionalAll(io, &published_bytes, 0));
+    try std.testing.expectEqualStrings("ready", &published_bytes);
     try sim.ensureNoCapabilityViolation();
 }

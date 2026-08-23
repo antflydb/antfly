@@ -2533,7 +2533,7 @@ Implementation order:
 #### SimIo implementation progress (2026-08-22)
 
 The fail-closed shell and fiber task kernel are implemented in
-`lib/vopr/src/sim_io.zig` and `sim_io_task.zig`. Construction performs
+`lib/vopr/src/sim_io.zig` and `lib/vopr/src/sim_io_task.zig`. Construction performs
 capability preflight; the complete Zig 0.16 vtable is based only on
 `std.Io.failing`; infallible unsupported paths latch a harness violation; and a
 conformance test proves that no vtable entry aliases `std.Io.Threaded`.
@@ -2548,9 +2548,21 @@ identity contains a pointer. The focused scenario records a real `std.Io`
 fiber history and exact-replays it 100 times from a clean world. These tests run
 through `zig build vopr-test` in Debug and ReleaseSafe.
 
-Modeled files, sockets, registered processes/resources, instrumentation,
-counterfactual tooling, and the five domain scenarios remain required work;
-the partial capability set does not advertise them.
+The first modeled-file capability is implemented in
+`lib/vopr/src/sim_io_file.zig`. It uses virtual integer handles only and covers
+deterministically ordered directory iteration, recursive directory rename,
+positional and streaming reads/writes, atomic publication, locks, mappings,
+metadata, descriptor/capacity limits, partial I/O, file-data sync, separate
+namespace sync, dropped sync, and reconstruction from durable state after a
+crash. The conformance test exercises that surface through ordinary `std.Io`
+directory, file, atomic-file, lock, and memory-map APIs. Symlinks, hard links,
+and optimized file-to-file transfer deliberately fail closed and latch a
+harness capability violation; no operation delegates to a host filesystem.
+
+Virtual sockets, registered processes/resources, richer storage corruption and
+completion-order faults, instrumentation, counterfactual tooling, and the five
+domain scenarios remain required work; the partial capability set does not
+advertise those capabilities.
 
 ## Risks and Mitigations
 
