@@ -10187,7 +10187,15 @@ pub fn build(b: *std.Build) void {
                 .sanitize_thread = sanitize_thread,
                 .pic = if (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query) true else null,
             });
-            production_antfly_imports.configureStorageSources(
+            // The focused CAPI tests own their DB directly and pass it through
+            // this test-only provider's opaque ABI. Compile both sides with the
+            // same hermetic options so their private DB layout stays identical.
+            // Shipped runtime units continue to use production options.
+            const role_imports = if (unit == .local_query)
+                antfly_imports
+            else
+                production_antfly_imports;
+            role_imports.configureStorageSources(
                 b,
                 role_mod,
                 false,
