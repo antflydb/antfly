@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,7 +94,11 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return fmt.Errorf("isolate former primary: StatefulSet %s is not controlled by AntflyCluster UID %s", statefulSet.Name, cluster.UID)
 		}
 		if action.AdminJobPhase == "" || action.AdminJobPhase == haAdminJobPhaseWaitingDependency {
-			initialPods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet)
+			proofPodUID := ""
+			if cluster.Status.HAStatus.PrimaryWatchdogProof != nil {
+				proofPodUID = cluster.Status.HAStatus.PrimaryWatchdogProof.PodUID
+			}
+			initialPods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet, proofPodUID)
 			if err != nil {
 				return fmt.Errorf("isolate former primary: list initial runtime pods: %w", err)
 			}
@@ -143,7 +148,11 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return errHAStatusCheckpointed
 		}
 
-		pods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet)
+		proofPodUID := ""
+		if action.PhysicalIsolationReceipt != nil && action.PhysicalIsolationReceipt.WatchdogProof != nil {
+			proofPodUID = action.PhysicalIsolationReceipt.WatchdogProof.PodUID
+		}
+		pods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet, proofPodUID)
 		if err != nil {
 			return fmt.Errorf("isolate former primary: list runtime pods: %w", err)
 		}
@@ -284,11 +293,12 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 }
 
 // listStatefulSetPodsForPhysicalIsolation discovers old-writer processes by
-// immutable controller ownership, not mutable workload labels. A partition or
-// fault injector can change a Pod label and remove it from the StatefulSet's
-// selector while the same container remains alive. Missing that Pod here would
-// make a label mutation look like physical process absence.
-func listStatefulSetPodsForPhysicalIsolation(ctx context.Context, reader client.Reader, statefulSet *appsv1.StatefulSet) (*corev1.PodList, error) {
+// controller ownership and by the exact runtime-attested Pod UID. StatefulSet
+// ownership is not durable across a selector-label mutation: the controller
+// can orphan the still-running Pod. The proof UID plus the stable ordinal Pod
+// name preserves process identity across that orphaning without trusting the
+// mutable Service selector.
+func listStatefulSetPodsForPhysicalIsolation(ctx context.Context, reader client.Reader, statefulSet *appsv1.StatefulSet, proofPodUID string) (*corev1.PodList, error) {
 	if reader == nil || statefulSet == nil || statefulSet.UID == "" || statefulSet.Namespace == "" {
 		return nil, fmt.Errorf("StatefulSet namespace and UID are required")
 	}
@@ -300,11 +310,23 @@ func listStatefulSetPodsForPhysicalIsolation(ctx context.Context, reader client.
 	for i := range namespacePods.Items {
 		pod := &namespacePods.Items[i]
 		owner := metav1.GetControllerOf(pod)
-		if owner != nil && owner.UID == statefulSet.UID {
+		ownedByStatefulSet := owner != nil && owner.UID == statefulSet.UID
+		proofBoundOrphan := string(pod.UID) == strings.TrimSpace(proofPodUID) && statefulSetOrdinalPodName(statefulSet.Name, pod.Name)
+		if ownedByStatefulSet || proofBoundOrphan {
 			owned.Items = append(owned.Items, *pod.DeepCopy())
 		}
 	}
 	return owned, nil
+}
+
+func statefulSetOrdinalPodName(statefulSetName, podName string) bool {
+	prefix := strings.TrimSpace(statefulSetName) + "-"
+	if prefix == "-" || !strings.HasPrefix(podName, prefix) {
+		return false
+	}
+	ordinalText := strings.TrimPrefix(podName, prefix)
+	ordinal, err := strconv.Atoi(ordinalText)
+	return err == nil && ordinal >= 0 && strconv.Itoa(ordinal) == ordinalText
 }
 
 func newHAPhysicalIsolationIntentReceipt(

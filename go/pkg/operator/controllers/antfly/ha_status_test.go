@@ -4150,14 +4150,11 @@ func TestReconcileHAFormerPrimaryIsolationStopsOldWriterBeforeCandidateFence(t *
 			Name:      cluster.Name + "-standalone-0",
 			Namespace: cluster.Namespace,
 			UID:       types.UID("former-primary-pod-uid"),
-			// Deliberately remove the Pod from the StatefulSet selector. Physical
-			// isolation must discover a still-live writer through immutable owner
-			// identity even when a partition injector poisons mutable labels.
-			Labels: serviceSelectorLabels(cluster.Name+"-missing", "standalone"),
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "StatefulSet", Name: sts.Name,
-				UID: sts.UID, Controller: ptr.To(true),
-			}},
+			// Deliberately model the live StatefulSet behavior after its selector
+			// label is poisoned: the controller orphans the still-running Pod.
+			// Physical isolation must recover it through the exact runtime-attested
+			// Pod UID and stable ordinal name, not mutable labels or ownership.
+			Labels:            serviceSelectorLabels(cluster.Name+"-missing", "standalone"),
 			DeletionTimestamp: ptr.To(metav1.NewTime(now)),
 			Finalizers:        []string{"test.antfly.io/keep-terminating"},
 		},
