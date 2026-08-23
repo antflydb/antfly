@@ -709,6 +709,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
+            error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -807,6 +808,7 @@ pub const HttpHandler = struct {
         const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(self.alloc, table.indexes_json, index_name, expanded_index_json);
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -832,6 +834,7 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -2988,19 +2991,41 @@ pub const HttpHandler = struct {
     }
 
     fn rebuildPublicGraphHitsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
-        for (result.hits) |*hit| hit.deinit(self.alloc);
-        if (result.hits.len > 0) self.alloc.free(result.hits);
-        result.hits = &.{};
         const hits = try self.alloc.alloc(db_types.SearchHit, result.nodes.len);
-        errdefer self.alloc.free(hits);
+        errdefer if (hits.len > 0) self.alloc.free(hits);
         var initialized: usize = 0;
         errdefer for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
         for (result.nodes, 0..) |node, i| {
-            hits[i] = .{ .id = try self.alloc.dupe(u8, node.key), .score = clampGraphMetricScore(node.distance), .stored_data = null };
+            if (findPublicGraphHit(result.hits, node)) |existing| {
+                hits[i] = try existing.clone(self.alloc);
+                hits[i].score = clampGraphMetricScore(node.distance);
+            } else {
+                hits[i] = try newPublicGraphHitAlloc(self.alloc, node);
+            }
             initialized += 1;
         }
+        for (result.hits) |*hit| hit.deinit(self.alloc);
+        if (result.hits.len > 0) self.alloc.free(result.hits);
         result.hits = hits;
-        result.total_hits = @intCast(result.nodes.len);
+        // Pattern-query totals count matches, while traversal totals count
+        // result nodes. Metric filtering/sorting applies to nodes only.
+        if (result.matches.len == 0) result.total_hits = @intCast(result.nodes.len);
+    }
+
+    fn findPublicGraphHit(hits: []const db_types.SearchHit, node: graph_query_mod.GraphResultNode) ?db_types.SearchHit {
+        for (hits) |hit| {
+            if (!std.mem.eql(u8, hit.id, node.key)) continue;
+            if (hit.source_table == null and node.table == null) return hit;
+            if (hit.source_table != null and node.table != null and std.mem.eql(u8, hit.source_table.?, node.table.?)) return hit;
+        }
+        return null;
+    }
+
+    fn newPublicGraphHitAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !db_types.SearchHit {
+        const id = try alloc.dupe(u8, node.key);
+        errdefer alloc.free(id);
+        const source_table = if (node.table) |table| try alloc.dupe(u8, table) else null;
+        return .{ .id = id, .source_table = source_table, .score = clampGraphMetricScore(node.distance) };
     }
 
     fn applyPublicGraphMetricRerank(
@@ -5093,7 +5118,7 @@ pub const HttpHandler = struct {
         const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
-            error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
+            error.UnsupportedCreateTableRequest, error.UnsupportedGraphMetricRefreshMode, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
         request.ensureActive() catch |err| switch (err) {
@@ -6534,6 +6559,11 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         error.OutOfMemory => return err,
         else => return error.InvalidTableIndexMetadata,
     };
+    const graph_metric_specs = build_mod.graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory, error.UnsupportedGraphMetricRefreshMode => return err,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    defer build_mod.graph_metric_config.freeIndexSpecs(alloc, graph_metric_specs);
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -9024,6 +9054,35 @@ test "serverless index catalog validation rejects malformed configs" {
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
+    try std.testing.expectError(error.UnsupportedGraphMetricRefreshMode, validateServerlessIndexCatalog(alloc,
+        \\{"relations":{"type":"graph","metrics":{"rank":{"kind":"pagerank","refresh":"manual"}}}}
+    ));
+}
+
+test "serverless graph metric node post-processing preserves hydrated hits and pattern totals" {
+    const alloc = std.testing.allocator;
+    var handler: HttpHandler = undefined;
+    handler.alloc = alloc;
+
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    nodes[0] = .{ .key = try alloc.dupe(u8, "doc-a"), .depth = 0, .distance = 0.75, .path = null, .path_edges = null };
+    const hits = try alloc.alloc(db_types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc-a"), .stored_data = try alloc.dupe(u8, "{\"title\":\"kept\"}") };
+    const matches = try alloc.alloc(db_types.GraphPatternMatch, 1);
+    matches[0] = .{ .bindings = &.{}, .path = &.{} };
+    var result = db_types.GraphSearchResult{
+        .name = try alloc.dupe(u8, "pattern"),
+        .nodes = nodes,
+        .matches = matches,
+        .hits = hits,
+        .total_hits = 7,
+    };
+    defer result.deinit(alloc);
+
+    try handler.rebuildPublicGraphHitsFromNodes(&result);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"title\":\"kept\"}", result.hits[0].stored_data.?);
+    try std.testing.expectEqual(@as(u32, 7), result.total_hits);
 }
 
 test "http handler serves the table public lifecycle and consistency routes" {

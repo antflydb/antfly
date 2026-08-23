@@ -107,7 +107,9 @@ fn parseMetricConfigsAlloc(alloc: Allocator, index: std.json.Value) ![]graph_mod
         const refresh = if (object.get("refresh")) |value| blk: {
             if (value != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, value.string, "background")) break :blk graph_mod.GraphMetricRefreshMode.background;
-            if (std.mem.eql(u8, value.string, "manual")) break :blk graph_mod.GraphMetricRefreshMode.manual;
+            // Serverless publication has no synchronous refresh endpoint. Do
+            // not accept a mode whose operational contract cannot be honored.
+            if (std.mem.eql(u8, value.string, "manual")) return error.UnsupportedGraphMetricRefreshMode;
             return error.InvalidIndexConfig;
         } else .background;
         const damping = if (object.get("damping")) |value| try numberAsF64(value) else 0.85;
@@ -218,4 +220,10 @@ test "serverless graph metric configs are deterministic and honor disabled metri
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationRunner.run, .{
         "{\"graph\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"edge_filter\":{\"types\":[\"cites\",\"mentions\"]}}}}}",
     });
+}
+
+test "serverless graph metric configs reject manual refresh" {
+    try std.testing.expectError(error.UnsupportedGraphMetricRefreshMode, parseIndexSpecsAlloc(std.testing.allocator,
+        \\{"graph":{"type":"graph","metrics":{"rank":{"kind":"pagerank","refresh":"manual"}}}}
+    ));
 }

@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const api_mod = @import("../api/mod.zig");
 const build_mod = @import("../build/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
@@ -102,13 +103,18 @@ pub const ManagedRuntime = struct {
     }
 
     pub fn runOnce(self: *ManagedRuntime) !RuntimeRunStats {
+        return try self.runOnceWithCancellation(.none);
+    }
+
+    fn runOnceWithCancellation(self: *ManagedRuntime, cancellation: CancellationToken) !RuntimeRunStats {
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return RuntimeRunStats{};
+        try cancellation.check();
         lockAtomic(&self.run_mu);
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
-            const publish_stats = try self.publisher.runOnce();
+            const publish_stats = try self.publisher.runOnceWithCancellation(cancellation);
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
         }
@@ -117,6 +123,7 @@ pub const ManagedRuntime = struct {
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
+            try cancellation.check();
             const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -254,8 +261,9 @@ pub const ManagedRuntime = struct {
     }
 
     fn runLoop(self: *ManagedRuntime) void {
+        const cancellation = CancellationToken.fromAtomic(&self.stop_requested);
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch RuntimeRunStats{};
+            _ = self.runOnceWithCancellation(cancellation) catch RuntimeRunStats{};
             sleepMs(@max(self.cfg.tick_interval_ms, 1));
         }
     }

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
@@ -234,6 +235,17 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
     ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanWithCancellation(namespace, vector_metric, plan, .none);
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanWithCancellation(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        cancellation: CancellationToken,
+    ) !BuildResult {
+        try cancellation.check();
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -259,7 +271,7 @@ pub const Builder = struct {
                 return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
-                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan);
+                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan, cancellation);
             }
             return .{
                 .namespace = try self.alloc.dupe(u8, namespace),
@@ -366,7 +378,7 @@ pub const Builder = struct {
         else
             try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
         defer graph_metric_config.freeIndexSpecs(self.alloc, graph_metric_specs);
-        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current_manifest, graph_refs, graph_metric_specs);
+        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current_manifest, graph_refs, graph_metric_specs, cancellation);
         defer freeArtifactRefs(self.alloc, graph_metric_refs);
         const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
         defer self.alloc.free(published_graph_refs);
@@ -491,7 +503,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        });
+        }, .none);
     }
 
     fn republishHeadWithPlan(
@@ -500,7 +512,9 @@ pub const Builder = struct {
         current_head: u64,
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
+        cancellation: CancellationToken,
     ) !BuildResult {
+        try cancellation.check();
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -611,7 +625,7 @@ pub const Builder = struct {
         else
             try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
         defer graph_metric_config.freeIndexSpecs(self.alloc, graph_metric_specs);
-        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current, graph_refs, graph_metric_specs);
+        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current, graph_refs, graph_metric_specs, cancellation);
         defer freeArtifactRefs(self.alloc, graph_metric_refs);
         const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
         defer self.alloc.free(published_graph_refs);
@@ -3417,6 +3431,7 @@ fn buildGraphMetricArtifactRefsAlloc(
     current: ?manifest_mod.Manifest,
     graph_refs: []const manifest_mod.ArtifactRef,
     specs: []const graph_metric_config.IndexSpec,
+    cancellation: CancellationToken,
 ) ![]manifest_mod.ArtifactRef {
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer {
@@ -3424,11 +3439,31 @@ fn buildGraphMetricArtifactRefsAlloc(
         refs.deinit(alloc);
     }
 
+    const previous_specs = if (current) |manifest|
+        graph_metric_config.parseIndexSpecsAlloc(alloc, manifest.stats.indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try alloc.alloc(graph_metric_config.IndexSpec, 0),
+        }
+    else
+        try alloc.alloc(graph_metric_config.IndexSpec, 0);
+    defer graph_metric_config.freeIndexSpecs(alloc, previous_specs);
+
     for (specs) |spec| {
+        try cancellation.check();
         const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
         var reusable = current != null;
         if (current) |manifest| {
+            const previous_graph_ref = findArtifactRefByName(manifest.artifacts, .graph_segment, spec.index_name);
+            if (previous_graph_ref == null or !artifactRefsIdentifySamePayload(previous_graph_ref.?, graph_ref)) reusable = false;
             for (spec.configs) |config| {
+                const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, config.name) orelse {
+                    reusable = false;
+                    break;
+                };
+                if (lake_graph_metric.configFingerprint(previous_config) != lake_graph_metric.configFingerprint(config)) {
+                    reusable = false;
+                    break;
+                }
                 const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
                 defer alloc.free(artifact_name);
                 const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name) orelse {
@@ -3436,22 +3471,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                     break;
                 };
                 const metric_ref = manifest.artifacts[metric_index];
-                const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
-                    alloc,
-                    metric_ref.artifact_id,
-                    metric_ref.byte_len,
-                    metric_ref.checksum,
-                    .none,
-                );
-                defer alloc.free(payload);
-                var segment = try graph_metric_segment_mod.decodeAlloc(alloc, payload);
-                defer segment.deinit(alloc);
-                if (!std.mem.eql(u8, segment.graph_index_name, spec.index_name) or
-                    !std.mem.eql(u8, segment.metric_name, config.name) or
-                    !std.mem.eql(u8, segment.source_graph_artifact_id, graph_ref.artifact_id) or
-                    !std.mem.eql(u8, segment.source_graph_checksum, graph_ref.checksum) or
-                    segment.config_fingerprint != lake_graph_metric.configFingerprint(config))
-                {
+                if (!try artifactRefExists(alloc, artifacts, metric_ref, cancellation)) {
                     reusable = false;
                     break;
                 }
@@ -3469,20 +3489,62 @@ fn buildGraphMetricArtifactRefsAlloc(
             continue;
         }
 
-        const built = try lake_graph_metric.publishManyFromGraphArtifactAlloc(
+        const built = lake_graph_metric.publishManyFromGraphArtifactAlloc(
             alloc,
             artifacts,
             spec.index_name,
             graph_ref,
             spec.configs,
-            .none,
+            cancellation,
             .{},
-        );
+        ) catch |err| switch (err) {
+            // Metrics are derived, optional sidecars. A configured work budget
+            // protects the publisher; exceeding it must not wedge base data.
+            error.GraphMetricBuildBudgetExceeded => {
+                std.log.warn("serverless graph metrics skipped after exceeding build budget index={s}", .{spec.index_name});
+                continue;
+            },
+            else => return err,
+        };
         defer alloc.free(built);
         try refs.ensureUnusedCapacity(alloc, built.len);
         for (built) |ref| refs.appendAssumeCapacity(ref);
     }
     return try refs.toOwnedSlice(alloc);
+}
+
+fn findGraphMetricConfig(
+    specs: []const graph_metric_config.IndexSpec,
+    index_name: []const u8,
+    metric_name: []const u8,
+) ?@import("../../graph/graph.zig").GraphMetricConfig {
+    for (specs) |spec| {
+        if (!std.mem.eql(u8, spec.index_name, index_name)) continue;
+        for (spec.configs) |config| if (std.mem.eql(u8, config.name, metric_name)) return config;
+    }
+    return null;
+}
+
+fn artifactRefsIdentifySamePayload(lhs: manifest_mod.ArtifactRef, rhs: manifest_mod.ArtifactRef) bool {
+    return lhs.byte_len == rhs.byte_len and
+        std.mem.eql(u8, lhs.artifact_id, rhs.artifact_id) and
+        std.mem.eql(u8, lhs.checksum, rhs.checksum);
+}
+
+fn artifactRefExists(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    ref: manifest_mod.ArtifactRef,
+    cancellation: CancellationToken,
+) !bool {
+    var metadata = artifacts.statWithCancellationUsingAllocator(alloc, ref.artifact_id, cancellation) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId => return false,
+        else => return err,
+    };
+    defer metadata.deinit(alloc);
+    return metadata.byte_len == ref.byte_len and
+        std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) and
+        std.mem.eql(u8, metadata.checksum, ref.checksum);
 }
 
 fn namedArtifactActionForName(
@@ -5332,6 +5394,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const first_graph = first.artifacts[findNamedArtifactIndex(first, .graph_segment, "graph_idx").?];
     const first_metric = first.artifacts[findNamedArtifactIndex(first, .graph_metric_segment, metric_name).?];
     try std.testing.expect(findNamedArtifactIndex(first, .graph_metric_segment, "9:graph_idx6:degree") != null);
+    try artifact_store.delete(first_metric.artifact_id);
 
     const unchanged_graph_mutation = try api_codec.encodeMutationAlloc(alloc, .{
         .kind = .upsert,
@@ -5348,6 +5411,8 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const second_metric = second.artifacts[findNamedArtifactIndex(second, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqualStrings(first_graph.artifact_id, second_graph.artifact_id);
     try std.testing.expectEqualStrings(first_metric.artifact_id, second_metric.artifact_id);
+    var restored_metric = try artifact_store.stat(second_metric.artifact_id);
+    restored_metric.deinit(alloc);
 
     const changed_graph_mutation = try api_codec.encodeMutationAlloc(alloc, .{
         .kind = .upsert,
@@ -5371,6 +5436,24 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings(third_graph.artifact_id, decoded.source_graph_artifact_id);
     try std.testing.expectEqualStrings(third_graph.checksum, decoded.source_graph_checksum);
+
+    const updated_indexes_json = try alloc.dupe(u8,
+        \\{"graph_idx":{"type":"graph","metrics":{"degree":{"kind":"degree"},"rank":{"kind":"pagerank","max_iterations":40}}}}
+    );
+    defer alloc.free(updated_indexes_json);
+    var fourth_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, .{
+        .targets = plan.targets,
+        .table_definition = .{ .indexes_json = updated_indexes_json },
+        .metadata_republish = .{ .artifact_families_changed = true },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .reuse, .sparse_vector = .reuse, .graph = .reuse },
+    });
+    defer fourth_result.deinit(alloc);
+    var fourth = try manifest_store.getAlloc("docs", 4);
+    defer fourth.deinit(alloc);
+    const fourth_graph = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_segment, "graph_idx").?];
+    const fourth_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, metric_name).?];
+    try std.testing.expectEqualStrings(third_graph.artifact_id, fourth_graph.artifact_id);
+    try std.testing.expect(!std.mem.eql(u8, third_metric.artifact_id, fourth_metric.artifact_id));
 }
 
 test "builder reuses graph artifact when wal updates do not change graph projection" {

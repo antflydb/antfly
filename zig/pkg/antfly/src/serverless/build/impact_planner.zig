@@ -43,6 +43,7 @@ pub const ArtifactImpactPlan = struct {
     rebuild_dense_vector: bool = false,
     rebuild_sparse_vector: bool = false,
     rebuild_graph: bool = false,
+    rebuild_graph_metrics: bool = false,
     republish_full_text_from_head: bool = false,
     republish_dense_vector_from_head: bool = false,
     republish_sparse_vector_from_head: bool = false,
@@ -58,6 +59,7 @@ pub const ArtifactImpactPlan = struct {
             self.rebuild_dense_vector or
             self.rebuild_sparse_vector or
             self.rebuild_graph or
+            self.rebuild_graph_metrics or
             self.rebuild_chunk_preview or
             self.rebuild_chunk_embeddings or
             self.rebuild_rerank_terms or
@@ -70,6 +72,7 @@ pub const ArtifactImpactPlan = struct {
             self.republish_dense_vector_from_head or
             self.republish_sparse_vector_from_head or
             self.republish_graph_from_head or
+            self.rebuild_graph_metrics or
             self.rebuild_chunk_preview or
             self.rebuild_rerank_terms;
     }
@@ -106,6 +109,9 @@ pub fn planAlloc(alloc: std.mem.Allocator, input: PlanInput) !ArtifactImpactPlan
     if (try familyChanged(before_indexes.value, after_indexes.value, .graph)) {
         plan.rebuild_graph = true;
         plan.republish_graph_from_head = true;
+    }
+    if (try graphMetricsChanged(before_indexes.value, after_indexes.value)) {
+        plan.rebuild_graph_metrics = true;
     }
 
     const lexical_sparse_changed =
@@ -179,7 +185,7 @@ fn familyChanged(before: std.json.Value, after: std.json.Value, family: Artifact
         if (classifyIndexFamily(entry.value_ptr.*) != family) continue;
         const after_value = after_object.get(entry.key_ptr.*) orelse return true;
         if (classifyIndexFamily(after_value) != family) return true;
-        if (!jsonValueEql(entry.value_ptr.*, after_value)) return true;
+        if (!indexConfigEql(entry.value_ptr.*, after_value, family)) return true;
     }
 
     var after_it = after_object.iterator();
@@ -190,6 +196,50 @@ fn familyChanged(before: std.json.Value, after: std.json.Value, family: Artifact
     }
 
     return false;
+}
+
+fn graphMetricsChanged(before: std.json.Value, after: std.json.Value) !bool {
+    const before_object = switch (before) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const after_object = switch (after) {
+        .object => |value| value,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    var it = before_object.iterator();
+    while (it.next()) |entry| {
+        if (classifyIndexFamily(entry.value_ptr.*) != .graph) continue;
+        const after_value = after_object.get(entry.key_ptr.*) orelse continue;
+        if (classifyIndexFamily(after_value) != .graph) continue;
+        const before_metrics = entry.value_ptr.*.object.get("metrics") orelse .null;
+        const after_metrics = after_value.object.get("metrics") orelse .null;
+        if (!jsonValueEql(before_metrics, after_metrics)) return true;
+    }
+    return false;
+}
+
+fn indexConfigEql(lhs: std.json.Value, rhs: std.json.Value, family: ArtifactFamily) bool {
+    if (family != .graph) return jsonValueEql(lhs, rhs);
+    return jsonObjectEqlIgnoringField(lhs, rhs, "metrics");
+}
+
+fn jsonObjectEqlIgnoringField(lhs: std.json.Value, rhs: std.json.Value, ignored: []const u8) bool {
+    if (lhs != .object or rhs != .object) return false;
+    var lhs_count: usize = 0;
+    var lhs_it = lhs.object.iterator();
+    while (lhs_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, ignored)) continue;
+        lhs_count += 1;
+        const other = rhs.object.get(entry.key_ptr.*) orelse return false;
+        if (!jsonValueEql(entry.value_ptr.*, other)) return false;
+    }
+    var rhs_count: usize = 0;
+    var rhs_it = rhs.object.iterator();
+    while (rhs_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, ignored)) rhs_count += 1;
+    }
+    return lhs_count == rhs_count;
 }
 
 fn classifyIndexFamily(value: std.json.Value) ?ArtifactFamily {
@@ -260,8 +310,7 @@ test "impact planner flags schema migration as full text rebuild only" {
 test "impact planner flags added dense, sparse, and graph indexes independently" {
     const plan = try planAlloc(std.testing.allocator, .{
         .before_indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
-        .after_indexes_json =
-            "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"graph_idx\":{\"type\":\"graph\"}}",
+        .after_indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"graph_idx\":{\"type\":\"graph\"}}",
     });
     try std.testing.expect(plan.rebuild_dense_vector);
     try std.testing.expect(plan.rebuild_sparse_vector);
@@ -306,4 +355,14 @@ test "impact planner is stable for semantically equal index json with reordered 
         .after_indexes_json = "{\"dense_idx\":{\"dimension\":3,\"field\":\"body\",\"type\":\"embeddings\"}}",
     });
     try std.testing.expect(!plan.any());
+}
+
+test "serverless impact planner rebuilds graph metrics without rebuilding graph topology" {
+    const plan = try planAlloc(std.testing.allocator, .{
+        .before_indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"edge_types\":[\"cites\"],\"metrics\":{\"pagerank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}",
+        .after_indexes_json = "{\"graph_idx\":{\"metrics\":{\"pagerank\":{\"max_iterations\":40,\"kind\":\"pagerank\"}},\"edge_types\":[\"cites\"],\"type\":\"graph\"}}",
+    });
+    try std.testing.expect(!plan.rebuild_graph);
+    try std.testing.expect(plan.rebuild_graph_metrics);
+    try std.testing.expect(plan.requiresHeadRepublish());
 }

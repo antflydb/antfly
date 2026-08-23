@@ -451,7 +451,7 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
     const graph_names = try listGraphIndexNamesAlloc(alloc, index_root);
     defer freeOwnedStrings(alloc, graph_names);
     for (graph_names) |graph_name| {
-        const config_json = try indexConfigJsonAlloc(alloc, index_root, graph_name);
+        const config_json = try graphIndexConfigJsonAlloc(alloc, index_root, graph_name);
         defer alloc.free(config_json);
         const graph_column = try configuredColumnOrDefaultAlloc(alloc, index_root, graph_name, "graph_edges");
         defer alloc.free(graph_column);
@@ -567,21 +567,10 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 reusable = false;
                 break;
             }
-            const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
-                alloc,
-                existing.artifact.artifact_id,
-                existing.artifact.byte_len,
-                existing.artifact.checksum,
-                .none,
-            );
-            defer alloc.free(payload);
-            var segment = try graph_metric_segment.decodeAlloc(alloc, payload);
-            defer segment.deinit(alloc);
-            if (!std.mem.eql(u8, segment.graph_index_name, spec.index_name) or
-                !std.mem.eql(u8, segment.metric_name, config.name) or
-                !std.mem.eql(u8, segment.source_graph_artifact_id, graph_declaration.artifact.artifact_id) or
-                !std.mem.eql(u8, segment.source_graph_checksum, graph_declaration.artifact.checksum) or
-                segment.config_fingerprint != lake_graph_metric.configFingerprint(config))
+            const expected_hash = try graphMetricBindingHashAlloc(alloc, config, graph_declaration.artifact.artifact_id);
+            defer alloc.free(expected_hash);
+            if (!std.mem.eql(u8, existing.binding.index_config_hash, expected_hash) or
+                !try artifactRefExists(alloc, artifacts, existing.artifact))
             {
                 reusable = false;
                 break;
@@ -599,7 +588,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             continue;
         }
 
-        const built = try lake_graph_metric.publishManyFromGraphArtifactAlloc(
+        const built = lake_graph_metric.publishManyFromGraphArtifactAlloc(
             alloc,
             artifacts,
             spec.index_name,
@@ -607,7 +596,15 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             spec.configs,
             .none,
             .{},
-        );
+        ) catch |err| switch (err) {
+            // A derived metric exceeding its explicit work budget must not
+            // prevent publishing the table and its graph topology.
+            error.GraphMetricBuildBudgetExceeded => {
+                std.log.warn("serverless lake graph metrics skipped after exceeding build budget index={s}", .{spec.index_name});
+                continue;
+            },
+            else => return err,
+        };
         defer {
             for (built) |artifact| lake_graph_metric.freeArtifactRef(alloc, artifact);
             alloc.free(built);
@@ -647,11 +644,7 @@ fn graphMetricDeclarationAlloc(
     var binding = try cloneBindingAlloc(alloc, graph_declaration.binding);
     errdefer freeOwnedBinding(alloc, binding);
     binding.sidecar_kind = .graph_metric;
-    const metric_config_hash = try std.fmt.allocPrint(
-        alloc,
-        "graph-metric-v1:{x}:{s}",
-        .{ lake_graph_metric.configFingerprint(config), graph_declaration.artifact.artifact_id },
-    );
+    const metric_config_hash = try graphMetricBindingHashAlloc(alloc, config, graph_declaration.artifact.artifact_id);
     alloc.free(binding.index_config_hash);
     binding.index_config_hash = metric_config_hash;
     const owned_artifact = try cloneArtifactRefAlloc(alloc, artifact);
@@ -1252,6 +1245,50 @@ fn indexConfigJsonAlloc(
 ) ![]u8 {
     const value = index_root.get(index_name) orelse return try alloc.dupe(u8, "{}");
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+}
+
+fn graphIndexConfigJsonAlloc(
+    alloc: Allocator,
+    index_root: std.json.ObjectMap,
+    index_name: []const u8,
+) ![]u8 {
+    const value = index_root.get(index_name) orelse return try alloc.dupe(u8, "{}");
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    var topology = std.json.ObjectMap.empty;
+    defer topology.deinit(alloc);
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "metrics")) continue;
+        try topology.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(std.json.Value{ .object = topology }, .{})});
+}
+
+fn graphMetricBindingHashAlloc(
+    alloc: Allocator,
+    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    graph_artifact_id: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "graph-metric-v1:{x}:{s}",
+        .{ lake_graph_metric.configFingerprint(config), graph_artifact_id },
+    );
+}
+
+fn artifactRefExists(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    ref: manifest_artifact.ArtifactRef,
+) !bool {
+    var metadata = artifacts.statWithCancellationUsingAllocator(alloc, ref.artifact_id, .none) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId => return false,
+        else => return err,
+    };
+    defer metadata.deinit(alloc);
+    return metadata.byte_len == ref.byte_len and
+        std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) and
+        std.mem.eql(u8, metadata.checksum, ref.checksum);
 }
 
 fn indexConfigHashAlloc(
@@ -2160,6 +2197,30 @@ test "lake rebuild desired artifacts derive from table index metadata" {
     try std.testing.expectEqual(BuilderKind.vector, operations.find("semantic_idx").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.sparse, operations.find("sparse_idx").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.graph, operations.find("graph_idx").?.builder_kind.?);
+}
+
+test "serverless lake graph topology binding ignores metric-only config changes" {
+    const alloc = std.testing.allocator;
+    const source: LakeSourceSnapshot = .{
+        .source_kind = .external_parquet,
+        .source_id = "events",
+        .snapshot_id = "parquet-21",
+        .schema_fingerprint = "schema-v4",
+    };
+    var before = try desiredArtifactsFromTableDefinitionAlloc(alloc, source, .{
+        .table_name = "events",
+        .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}",
+    });
+    defer before.deinit(alloc);
+    var after = try desiredArtifactsFromTableDefinitionAlloc(alloc, source, .{
+        .table_name = "events",
+        .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}",
+    });
+    defer after.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        before.find("graph_idx").?.binding.index_config_hash,
+        after.find("graph_idx").?.binding.index_config_hash,
+    );
 }
 
 test "lake rebuild desired artifacts bind resolved external inventory identity" {

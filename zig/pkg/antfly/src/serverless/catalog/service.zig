@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -664,13 +665,22 @@ pub const CatalogService = struct {
     }
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
+        return try self.buildNamespaceWithCancellation(namespace, .none);
+    }
+
+    pub fn buildNamespaceWithCancellation(
+        self: *CatalogService,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+    ) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlan(
+        return try self.builder.publishNamespaceWithMetricAndPlanWithCancellation(
             namespace,
             policy.vector_distance_metric,
             plan,
+            cancellation,
         );
     }
 
@@ -1505,7 +1515,7 @@ fn planNamedIndexActionsAlloc(
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         const action: publication_plan.ArtifactAction = blk: {
             if (before_object.get(entry.key_ptr.*)) |before_value| {
-                if (isNamedIndexKindValue(before_value, kind) and jsonValueEql(entry.value_ptr.*, before_value)) {
+                if (isNamedIndexKindValue(before_value, kind) and namedIndexConfigEql(entry.value_ptr.*, before_value, kind)) {
                     break :blk .reuse;
                 }
             }
@@ -1612,7 +1622,7 @@ fn findEquivalentRenamedIndexName(
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        if (!jsonValueEql(entry.value_ptr.*, target_value)) continue;
+        if (!namedIndexConfigEql(entry.value_ptr.*, target_value, kind)) continue;
         if (match != null) return null;
         match = entry.key_ptr.*;
     }
@@ -1783,6 +1793,38 @@ fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
             break :blk true;
         },
     };
+}
+
+fn namedIndexConfigEql(lhs: std.json.Value, rhs: std.json.Value, kind: NamedSearchSourceKind) bool {
+    if (kind != .graph) return jsonValueEql(lhs, rhs);
+    if (lhs != .object or rhs != .object) return false;
+    var lhs_count: usize = 0;
+    var lhs_it = lhs.object.iterator();
+    while (lhs_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "metrics")) continue;
+        lhs_count += 1;
+        const other = rhs.object.get(entry.key_ptr.*) orelse return false;
+        if (!jsonValueEql(entry.value_ptr.*, other)) return false;
+    }
+    var rhs_count: usize = 0;
+    var rhs_it = rhs.object.iterator();
+    while (rhs_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "metrics")) rhs_count += 1;
+    }
+    return lhs_count == rhs_count;
+}
+
+test "serverless named graph planning reuses topology for metric-only changes" {
+    const actions = try planNamedIndexActionsAlloc(
+        std.testing.allocator,
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}",
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}",
+        .graph,
+        1,
+    );
+    defer freeNamedArtifactActions(std.testing.allocator, actions);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, actions[0].action);
 }
 
 fn publishedSearchSourcesMatch(
