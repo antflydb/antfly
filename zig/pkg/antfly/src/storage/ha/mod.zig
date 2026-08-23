@@ -44,6 +44,7 @@ pub const admin = @import("admin.zig");
 pub const admin_exec = @import("admin_exec.zig");
 pub const operator = @import("operator.zig");
 pub const chaos = @import("chaos.zig");
+pub const vopr = @import("vopr.zig");
 pub const metrics = @import("metrics.zig");
 pub const validation = @import("validation.zig");
 pub const admin_cli = @import("admin_cli.zig");
@@ -90,6 +91,7 @@ test {
     _ = admin_exec;
     _ = operator;
     _ = chaos;
+    _ = vopr;
     _ = metrics;
     _ = validation;
     _ = admin_cli;

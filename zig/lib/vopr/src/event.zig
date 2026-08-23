@@ -23,6 +23,7 @@ pub const Sink = struct {
     events: std.ArrayListUnmanaged(Event) = .empty,
 
     pub fn deinit(self: *Sink, allocator: std.mem.Allocator) void {
+        for (self.events.items) |value| allocator.free(value.name);
         self.events.deinit(allocator);
         self.* = .{};
     }
@@ -30,7 +31,11 @@ pub const Sink = struct {
     pub fn emit(self: *Sink, allocator: std.mem.Allocator, value: Event) !void {
         if (value.id == 0) return error.InvalidEventId;
         if (value.name.len == 0) return error.EmptyEventName;
-        try self.events.append(allocator, value);
+        const name = try allocator.dupe(u8, value.name);
+        errdefer allocator.free(name);
+        var owned = value;
+        owned.name = name;
+        try self.events.append(allocator, owned);
     }
 
     pub fn emitNamed(self: *Sink, allocator: std.mem.Allocator, kind: Kind, name: []const u8, payload_digest: u64) !void {
@@ -42,4 +47,13 @@ test "event IDs are stable and namespaced" {
     const value = Event.named(.state_change, "toy.changed", 4);
     try std.testing.expectEqual(ids.stable("event", "toy.changed"), value.id);
     try std.testing.expect(value.id != ids.stable("transition", "toy.changed"));
+}
+
+test "event sink owns emitted names until deinit" {
+    var sink = Sink{};
+    defer sink.deinit(std.testing.allocator);
+    var name = [_]u8{ 'n', 'o', 'd', 'e' };
+    try sink.emitNamed(std.testing.allocator, .fault_stopped, &name, 0);
+    @memset(&name, 'x');
+    try std.testing.expectEqualStrings("node", sink.events.items[0].name);
 }

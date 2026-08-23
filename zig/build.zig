@@ -4161,6 +4161,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_ha_chaos_tests = addFilteredTestRunArtifact(b, lib_ha_chaos_tests);
     const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
+    const lib_ha_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"HA VOPR"},
+    });
+    const run_lib_ha_vopr_tests = addFilteredTestRunArtifact(b, lib_ha_vopr_tests);
+    const lib_ha_vopr_test_step = b.step("ha-vopr-test", "Run replayable HA lifecycle VOPR campaigns");
+    lib_ha_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     const lib_ha_compat_default_filters = [_][]const u8{
         "storage.ha compat decodes v1 replication record fixture",
         "storage.ha compat keeps v1 replication record encoding stable",
@@ -6804,6 +6811,7 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
     sim_test_step.dependOn(&run_lib_raft_vopr_tests.step);
+    sim_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
     sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
@@ -6820,6 +6828,7 @@ pub fn build(b: *std.Build) void {
     chaos_progress_tail = chainLabeledRun(b, lib_raft_vopr_tests, "raft-vopr-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");

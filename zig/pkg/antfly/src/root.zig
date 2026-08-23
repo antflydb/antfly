@@ -161,6 +161,7 @@ pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
 pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const ha = @import("storage/ha/mod.zig");
+pub const ha_vopr = @import("storage/ha/vopr.zig");
 pub const wal = @import("storage/wal.zig");
 pub const persistent = @import("storage/persistent.zig");
 pub const docstore = @import("storage/docstore.zig");
@@ -319,6 +320,7 @@ test {
     _ = lmdb_engine;
     _ = hbc;
     _ = ha;
+    _ = ha_vopr;
     _ = wal;
     _ = persistent;
     _ = docstore;

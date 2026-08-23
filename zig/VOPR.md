@@ -31,6 +31,9 @@ means the behavior has an executable test or command path.
 | Formal sidecars and causal triage | transaction/Raft `sim-tla` dispatch and `causal.zig`/`sim-explain` | `zig build transaction-vopr-test sim-meta-test` |
 | Metadata replay stability across build modes | A dedicated 100-consecutive-replay acceptance test | `zig build metadata-vopr-replay-stability-test` and the same command with `-Doptimize=ReleaseSafe` |
 | Distributed acknowledged-data durability | Real public API, split, partition/restart, modeled device crash/recovery, merge, and reference model | `zig build lib-metadata-vopr-data-test` |
+| Per-group Raft scheduling and durability interleavings | Real `RawNode` cluster with selected delivery/drop, deferred persistence/apply, restart, partition, proposal, and compaction transitions | `zig build raft-vopr-test` in Debug and ReleaseSafe |
+| Storage differential and real-backend campaigns | C-versus-Zig LMDB, memory-versus-real-LSM, generated maintenance, crash recovery, and typed storage faults | `zig build lmdb-vopr-test lsm-vopr-test` in Debug and ReleaseSafe |
+| HA crash, replication, fencing, promotion, retention, and rejoin lifecycle | Real primary/standby logs and progress WALs, slot store, fence store, promotion and rejoin assessment under generated and scripted histories | `zig build ha-vopr-test ha-chaos-test` in Debug and ReleaseSafe |
 
 The reusable package is Antfly-independent. The physical distributed-data
 shell is intentionally an integration differential: its generated plan is
@@ -1327,8 +1330,14 @@ final-state oracle become essential here.
 
 ### HA
 
-Status: planned migration. Existing HA and chaos suites remain required gates
-and seed material; they are not replaced or de-scoped by the metadata slice.
+Status: implemented. `storage/ha/vopr.zig` drives the real primary, standby,
+replication log, progress WAL, slot store, fence store, promotion, retention,
+and former-primary rejoin primitives. Generated histories exact-replay from
+clean worlds; scripted histories guarantee the receive/apply/report crash
+windows, base-backup restart pin, lag-expiry/reseed path, and partitioned
+unfenced-rejection/fenced-promotion/rejoin path. The focused HA chaos matrix
+remains a required complementary gate and seed source rather than being
+replaced by the common runner.
 
 Convert crash-phase, standby, fencing, reseed, timeline, retention, and
 promotion tests into commands and properties. Node and storage faults then use
@@ -1400,7 +1409,7 @@ pkg/antfly/src/sim/
     wal/               # planned promoted-fixture namespace
     lmdb/              # promoted-fixture namespace
     lsm/               # promoted-fixture namespace
-    ha/                # planned migration namespace
+    ha/                # promoted-fixture namespace
   scenarios/           # planned registry/consolidation; adapters may stay by domain
     metadata.zig
     raft.zig
@@ -1413,6 +1422,9 @@ pkg/antfly/src/metadata/
   sim_harness.zig # metadata and distributed-data scenario adapters
 pkg/antfly/src/storage/
   wal_vopr.zig
+  lmdb_vopr.zig
+  lsm_vopr.zig
+  ha/vopr.zig
   transaction_vopr.zig
   vopr_durable_job_lane.zig # Antfly Job -> generic VOPR Executor adapter
 ```
@@ -1425,15 +1437,16 @@ cleaner dependency direction. The stable rule is:
 - production code only depends on narrow runtime, clock, entropy, transport,
   and storage interfaces, never on the explorer or `SchedulerPort`
 
-HA remains a forward migration target, not removed scope. Raft now wraps
-the real `RawNode` cluster with independent message, persistence, apply,
-restart, partition, proposal, and compaction choices. LMDB now wraps the
-existing C-versus-Zig action union and crash publication oracle. LSM now runs a
+Raft wraps the real `RawNode` cluster with independent message, persistence,
+apply, restart, partition, proposal, and compaction choices. LMDB wraps the
+existing C-versus-Zig action union and crash publication oracle. LSM runs a
 live real backend against the memory oracle with generated KV operations,
 explicit compaction/maintenance, crash recovery, and modeled storage faults.
-The remaining focused suites keep their existing runners and oracles until they
-reach exact replay parity, then join the same scenario registry and fixture
-policy.
+HA wraps the real durable replication lifecycle with independent replication,
+apply, progress, crash, partition, retention, backup, fencing, promotion, and
+rejoin choices. The remaining focused suites keep their existing runners and
+oracles as complementary specialization gates while their action unions gain
+common artifact and CLI parity.
 
 The CLI is a standalone command surface, not additional behavior in Antfly's
 ordinary unit-test runner. Its scenario implementations intentionally use
@@ -2136,6 +2149,17 @@ and consume these artifacts. The focused `transaction-vopr-test` validates the
 sidecar shape, and the emitted five-event commit history passes the real
 `make tla-trace-txn` segmentation and TLC refinement pipeline against
 `TraceAntflyTransaction.tla`.
+
+The HA lifecycle now uses the same workflow as well. Its scenario owns fresh
+durable primary/standby/fence worlds, records every selected fault lifecycle,
+and continuously checks ordered standby progress, applied-prefix consistency,
+remote-apply acknowledgement soundness, backup-slot restart preservation,
+durable fencing, monotonic promotion identity, and safe former-primary rejoin.
+Three scripted histories make the critical crash, retention, and promotion
+paths non-probabilistic, while seeded histories broaden ordering coverage and
+must replay exactly. `ha-vopr-test` is part of `sim-test` and the bounded
+`chaos-test` aggregate; `ha-chaos-test` remains green as the deeper focused
+matrix.
 
 Phase 4's stated exit condition is now met, including split-to-merge
 composition and generated/replayable fault-plan choices. The physical
