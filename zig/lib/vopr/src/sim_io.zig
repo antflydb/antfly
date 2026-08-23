@@ -17,6 +17,7 @@ const event = @import("event.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
 const file_mod = @import("sim_io_file.zig");
+const instrumentation_mod = @import("sim_io_instrumentation.zig");
 const net_mod = @import("sim_io_net.zig");
 const process_mod = @import("sim_io_process.zig");
 const task_mod = @import("sim_io_task.zig");
@@ -82,6 +83,7 @@ pub const supported_capabilities = CapabilitySet.of(&.{
     .sockets,
     .processes,
     .resources,
+    .instrumentation,
 });
 
 pub const Metadata = struct {
@@ -193,6 +195,8 @@ pub const Config = struct {
     network: net_mod.Config = .{},
     process_allocator: std.mem.Allocator = std.heap.page_allocator,
     processes: process_mod.Config = .{},
+    instrumentation_allocator: std.mem.Allocator = std.heap.page_allocator,
+    instrumentation: instrumentation_mod.Config = .{},
 };
 
 pub const InitError = error{
@@ -223,11 +227,14 @@ pub const SimIo = struct {
     files: file_mod.FileSystem,
     network: net_mod.Network,
     processes: process_mod.Table,
+    instrumentation: instrumentation_mod.Instrumentation,
 
     pub fn init(config: Config) InitError!SimIo {
         if (!supported_capabilities.containsAll(config.required)) {
             return error.UnsupportedSimIoCapabilities;
         }
+        if (config.required.contains(.instrumentation) and !config.instrumentation.enabled)
+            return error.UnsupportedSimIoCapabilities;
         var files = file_mod.FileSystem.init(config.file_allocator, config.files) catch |err| switch (err) {
             error.InvalidSimIoFileHandleLimit => return error.InvalidSimIoFileHandleLimit,
             else => return error.OutOfMemory,
@@ -254,6 +261,7 @@ pub const SimIo = struct {
             .files = files,
             .network = network,
             .processes = processes,
+            .instrumentation = .init(config.instrumentation_allocator, config.instrumentation),
         };
     }
 
@@ -262,6 +270,7 @@ pub const SimIo = struct {
         self.files.deinit();
         self.network.deinit();
         self.processes.deinit();
+        self.instrumentation.deinit();
         self.* = undefined;
     }
 
@@ -273,6 +282,26 @@ pub const SimIo = struct {
     pub fn scheduler(self: *SimIo) runtime_mod.SchedulerPort {
         self.bindNetwork();
         return .{ .ptr = self, .vtable = &scheduler_vtable };
+    }
+
+    pub fn safepoint(self: *SimIo, stable_id: ids.StableId) std.Io.Cancelable!void {
+        return self.instrumentation.safepoint(&self.tasks, stable_id);
+    }
+
+    pub fn artifactIds(self: *const SimIo) [4]ids.StableId {
+        var result = artifactBackendIds();
+        const old_instrumentation = ids.derive("sim-io-instrumentation", ids.stable("sim-io", "safepoints"), 0);
+        const new_instrumentation = ids.derive(
+            "sim-io-instrumentation",
+            ids.stable("sim-io", "safepoints"),
+            self.instrumentation.config.map_digest,
+        );
+        for (&result) |*value| if (value.* == old_instrumentation) {
+            value.* = new_instrumentation;
+            break;
+        };
+        ids.sort(&result);
+        return result;
     }
 
     pub fn require(required: CapabilitySet) InitError!void {
@@ -1178,9 +1207,14 @@ test "SimIo capability construction fails before exposing unsupported services" 
         SimIo.init(.{ .required = .of(&.{.instrumentation}) }),
     );
     try std.testing.expectEqual(
-        CapabilitySet.of(&.{.instrumentation}).bits,
+        @as(u64, 0),
         SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes, .resources, .instrumentation })).bits,
     );
+    var instrumented = try SimIo.init(.{
+        .required = .of(&.{.instrumentation}),
+        .instrumentation = .{ .enabled = true, .map_digest = 17 },
+    });
+    instrumented.deinit();
 }
 
 test "SimIo clocks and entropy are deterministic and host independent" {
@@ -1748,4 +1782,50 @@ test "SimIo resource capability enforces file socket and storage quotas" {
     pair[0].close(io);
     pair[1].close(io);
     try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo stable safepoints yield and produce canonical instrumentation feedback" {
+    const Shared = struct {
+        const point_a = ids.stable("safepoint", "test.cpu.a");
+        const point_b = ids.stable("safepoint", "test.cpu.b");
+        sim: *SimIo,
+        completed: u32 = 0,
+
+        fn worker(self: *@This()) void {
+            self.sim.safepoint(point_a) catch unreachable;
+            self.sim.safepoint(point_b) catch unreachable;
+            self.completed += 1;
+        }
+    };
+    var sim = try SimIo.init(.{
+        .required = .of(&.{ .task_scheduling, .instrumentation }),
+        .instrumentation = .{ .enabled = true, .map_digest = 0x51de },
+    });
+    defer sim.deinit();
+    const io = sim.io();
+    var shared: Shared = .{ .sim = &sim };
+    _ = io.async(Shared.worker, .{&shared});
+    _ = io.async(Shared.worker, .{&shared});
+
+    const scheduler = sim.scheduler();
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    var scheduling_choices: usize = 0;
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        if (enabled.items.items.len > 1) scheduling_choices += 1;
+        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(u32, 2), shared.completed);
+    try std.testing.expect(scheduling_choices >= 2);
+    try std.testing.expectEqual(@as(u64, 2), sim.instrumentation.count(Shared.point_a));
+    try std.testing.expectEqual(@as(u64, 2), sim.instrumentation.count(Shared.point_b));
+    const feedback = try sim.instrumentation.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(feedback);
+    try std.testing.expectEqual(@as(usize, 2), feedback.len);
+    try std.testing.expect(!std.mem.eql(u64, &sim.artifactIds(), &artifactBackendIds()));
 }

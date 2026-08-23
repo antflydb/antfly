@@ -401,6 +401,18 @@ pub const Kernel = struct {
         try task.checkCancel();
     }
 
+    /// Cooperatively expose a stable preemption boundary inside CPU-bound
+    /// product code. The current task becomes runnable again, so resumption is
+    /// selected and recorded by the ordinary scheduler.
+    pub fn yieldCurrentTask(self: *Kernel) !void {
+        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        try task.checkCancel();
+        task.status = .runnable;
+        task.resume_generation +|= 1;
+        self.yieldCurrent(task);
+        try task.checkCancel();
+    }
+
     pub fn futexWait(self: *Kernel, ptr: *const u32, expected: u32, sleep_info: ?Sleep, uncancelable: bool) !void {
         if (@atomicLoad(u32, ptr, .seq_cst) != expected) return;
         _ = try self.ensureFutexIdentity(ptr);

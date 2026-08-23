@@ -2585,9 +2585,18 @@ suspended start/resume/wait, unknown-program rejection, CPU exhaustion, file
 descriptor exhaustion, storage-full behavior, and socket quota exhaustion.
 Image replacement and cwd mutation remain explicit fail-closed operations.
 
+Stable optional safepoints and instrumentation feedback are implemented in
+`lib/vopr/src/sim_io_instrumentation.zig`. A hit increments a canonical stable
+ID counter and, when enabled, yields the current fiber back to the normal VOPR
+scheduler; the subsequent resume is therefore an ordinary recorded choice.
+Instrumentation is opt-in at construction, its map digest is part of the
+instance backend IDs, and capability preflight rejects a scenario that requires
+instrumentation while it is disabled. Sorted hit snapshots are secondary search
+feedback and do not alter an artifact that does not select those safepoints.
+
 Richer storage corruption and completion-order faults, datagram networking,
-instrumentation, counterfactual tooling, and the five domain scenarios remain
-required work; the partial capability set does not advertise instrumentation.
+counterfactual tooling, multiverse debugging, time-travel collectors, and the
+five domain scenarios remain required work.
 
 ## Risks and Mitigations
 
