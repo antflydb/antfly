@@ -97,12 +97,18 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     var wal = wal_impl.walStore();
     defer wal.deinit();
     faults.commitNextPutThenFail(error.Timeout);
-    try std.testing.expectError(error.Timeout, wal.append("docs", 20, "mutation"));
+    try std.testing.expectError(error.Timeout, wal.appendIdempotent("docs", 20, "mutation", "request-1"));
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 20, "mutation", "request-1"));
+    try std.testing.expectError(
+        error.WalIdempotencyConflict,
+        wal.appendIdempotent("docs", 20, "different", "request-1"),
+    );
     const records = try wal.readFromAlloc("docs", 1);
     defer wal_types.freeRecords(alloc, records);
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqual(@as(u64, 1), records[0].lsn);
     try std.testing.expectEqualStrings("mutation", records[0].payload);
+    try std.testing.expectEqualStrings("request-1", records[0].operation_id.?);
 
     var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(
         alloc,

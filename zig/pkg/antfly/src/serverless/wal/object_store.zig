@@ -162,10 +162,64 @@ pub const ObjectStore = struct {
             if (value.etag) |etag| self.alloc.free(etag);
         };
 
-        const next_lsn: u64 = if (current) |value| lastLsn(value.body) + 1 else 1;
+        const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
         const encoded = try encodeRecordAlloc(self.alloc, next_lsn, timestamp_ns, payload);
         defer self.alloc.free(encoded);
 
+        const combined = if (current) |value|
+            try std.mem.concat(self.alloc, u8, &.{ value.body, encoded })
+        else
+            try self.alloc.dupe(u8, encoded);
+        defer self.alloc.free(combined);
+
+        var result = try self.client.putObject(self.bucket, key, combined, .{
+            .content_type = "application/octet-stream",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |value| value.etag else null,
+        });
+        defer result.deinit(self.alloc);
+        return next_lsn;
+    }
+
+    pub fn appendIdempotent(
+        self: *ObjectStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+    ) !u64 {
+        if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
+            return error.InvalidWalOperationId;
+        if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const key = try logKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        var current = try self.tryReadLog(self.alloc, key);
+        defer if (current) |*value| {
+            self.alloc.free(value.body);
+            if (value.etag) |etag| self.alloc.free(etag);
+        };
+
+        if (current) |value| {
+            if (try findOperation(value.body, operation_id)) |existing| {
+                if (existing.timestamp_ns != timestamp_ns or !std.mem.eql(u8, existing.payload, payload))
+                    return error.WalIdempotencyConflict;
+                return existing.lsn;
+            }
+        }
+
+        const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
+        const encoded = try encodeIdempotentRecordAlloc(
+            self.alloc,
+            next_lsn,
+            timestamp_ns,
+            payload,
+            operation_id,
+        );
+        defer self.alloc.free(encoded);
         const combined = if (current) |value|
             try std.mem.concat(self.alloc, u8, &.{ value.body, encoded })
         else
@@ -201,7 +255,7 @@ pub const ObjectStore = struct {
             else => return err,
         };
         defer result.deinit(self.alloc);
-        return lastLsn(result.body);
+        return try lastLsn(result.body);
     }
 
     pub fn truncatePrefix(self: *ObjectStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
@@ -237,6 +291,10 @@ pub const ObjectStore = struct {
                 .lsn = record.lsn,
                 .timestamp_ns = record.timestamp_ns,
                 .payload = try self.alloc.dupe(u8, record.payload),
+                .operation_id = if (record.operation_id) |operation_id|
+                    try self.alloc.dupe(u8, operation_id)
+                else
+                    null,
             });
         }
 
@@ -277,6 +335,7 @@ pub const ObjectStore = struct {
     const vtable: wal_store.WalStore.VTable = .{
         .deinit = erasedDeinit,
         .append = erasedAppend,
+        .append_idempotent = erasedAppendIdempotent,
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
@@ -290,6 +349,17 @@ pub const ObjectStore = struct {
     fn erasedAppend(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.append(namespace, timestamp_ns, payload);
+    }
+
+    fn erasedAppendIdempotent(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+    ) !u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
     }
 
     fn erasedReadFromAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
@@ -309,6 +379,10 @@ pub const ObjectStore = struct {
 };
 
 fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payload: []const u8) ![]u8 {
+    // The high length bit identifies records carrying an operation ID. Keep
+    // newly written legacy records below that boundary so both encodings are
+    // unambiguous to the shared parser.
+    if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
     const buf = try alloc.alloc(u8, 8 + 8 + 4 + payload.len);
     var pos: usize = 0;
     std.mem.writeInt(u64, buf[pos..][0..8], lsn, .little);
@@ -321,15 +395,87 @@ fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payl
     return buf;
 }
 
+const idempotent_record_flag: u32 = @as(u32, 1) << 31;
+const idempotent_payload_max: usize = idempotent_record_flag - 1;
+
+fn encodeIdempotentRecordAlloc(
+    alloc: std.mem.Allocator,
+    lsn: u64,
+    timestamp_ns: u64,
+    payload: []const u8,
+    operation_id: []const u8,
+) ![]u8 {
+    if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
+    if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
+        return error.InvalidWalOperationId;
+    const buf = try alloc.alloc(u8, 8 + 8 + 4 + 2 + operation_id.len + payload.len);
+    var pos: usize = 0;
+    std.mem.writeInt(u64, buf[pos..][0..8], lsn, .little);
+    pos += 8;
+    std.mem.writeInt(u64, buf[pos..][0..8], timestamp_ns, .little);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], idempotent_record_flag | @as(u32, @intCast(payload.len)), .little);
+    pos += 4;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(operation_id.len), .little);
+    pos += 2;
+    @memcpy(buf[pos..][0..operation_id.len], operation_id);
+    pos += operation_id.len;
+    @memcpy(buf[pos..][0..payload.len], payload);
+    return buf;
+}
+
 fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Record) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     for (records) |record| {
-        const encoded = try encodeRecordAlloc(alloc, record.lsn, record.timestamp_ns, record.payload);
+        const encoded = if (record.operation_id) |operation_id|
+            try encodeIdempotentRecordAlloc(alloc, record.lsn, record.timestamp_ns, record.payload, operation_id)
+        else
+            try encodeRecordAlloc(alloc, record.lsn, record.timestamp_ns, record.payload);
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+const ParsedRecord = struct {
+    lsn: u64,
+    timestamp_ns: u64,
+    payload: []const u8,
+    operation_id: ?[]const u8,
+    next_cursor: usize,
+};
+
+fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
+    var cursor = start;
+    if (cursor + 8 + 8 + 4 > raw.len) return error.InvalidWal;
+    const lsn = std.mem.readInt(u64, raw[cursor..][0..8], .little);
+    cursor += 8;
+    const timestamp_ns = std.mem.readInt(u64, raw[cursor..][0..8], .little);
+    cursor += 8;
+    const length_tag = std.mem.readInt(u32, raw[cursor..][0..4], .little);
+    cursor += 4;
+    const idempotent = length_tag & idempotent_record_flag != 0;
+    const payload_len: usize = @intCast(length_tag & ~idempotent_record_flag);
+    var operation_id: ?[]const u8 = null;
+    if (idempotent) {
+        if (cursor + 2 > raw.len) return error.InvalidWal;
+        const operation_id_len = std.mem.readInt(u16, raw[cursor..][0..2], .little);
+        cursor += 2;
+        if (operation_id_len == 0 or cursor + operation_id_len > raw.len) return error.InvalidWal;
+        operation_id = raw[cursor .. cursor + operation_id_len];
+        cursor += operation_id_len;
+    }
+    if (cursor + payload_len > raw.len) return error.InvalidWal;
+    const payload = raw[cursor .. cursor + payload_len];
+    cursor += payload_len;
+    return .{
+        .lsn = lsn,
+        .timestamp_ns = timestamp_ns,
+        .payload = payload,
+        .operation_id = operation_id,
+        .next_cursor = cursor,
+    };
 }
 
 fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: u64) ![]wal_types.Record {
@@ -341,37 +487,45 @@ fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: 
     }
 
     while (cursor < raw.len) {
-        if (cursor + 8 + 8 + 4 > raw.len) return error.InvalidWal;
-        const lsn = std.mem.readInt(u64, raw[cursor..][0..8], .little);
-        cursor += 8;
-        const timestamp_ns = std.mem.readInt(u64, raw[cursor..][0..8], .little);
-        cursor += 8;
-        const payload_len = std.mem.readInt(u32, raw[cursor..][0..4], .little);
-        cursor += 4;
-        if (cursor + payload_len > raw.len) return error.InvalidWal;
-        if (lsn >= start_lsn) {
+        const parsed = try parseRecord(raw, cursor);
+        if (parsed.lsn >= start_lsn) {
             try out.append(alloc, .{
-                .lsn = lsn,
-                .timestamp_ns = timestamp_ns,
-                .payload = try alloc.dupe(u8, raw[cursor .. cursor + payload_len]),
+                .lsn = parsed.lsn,
+                .timestamp_ns = parsed.timestamp_ns,
+                .payload = try alloc.dupe(u8, parsed.payload),
+                .operation_id = if (parsed.operation_id) |operation_id|
+                    try alloc.dupe(u8, operation_id)
+                else
+                    null,
             });
         }
-        cursor += payload_len;
+        cursor = parsed.next_cursor;
     }
 
     return try out.toOwnedSlice(alloc);
 }
 
-fn lastLsn(raw: []const u8) u64 {
+fn lastLsn(raw: []const u8) !u64 {
     var cursor: usize = 0;
     var latest: u64 = 0;
-    while (cursor + 8 + 8 + 4 <= raw.len) {
-        latest = std.mem.readInt(u64, raw[cursor..][0..8], .little);
-        cursor += 8 + 8;
-        const payload_len = std.mem.readInt(u32, raw[cursor..][0..4], .little);
-        cursor += 4 + payload_len;
+    while (cursor < raw.len) {
+        const parsed = try parseRecord(raw, cursor);
+        latest = parsed.lsn;
+        cursor = parsed.next_cursor;
     }
     return latest;
+}
+
+fn findOperation(raw: []const u8, operation_id: []const u8) !?ParsedRecord {
+    var cursor: usize = 0;
+    while (cursor < raw.len) {
+        const parsed = try parseRecord(raw, cursor);
+        if (parsed.operation_id) |candidate| {
+            if (std.mem.eql(u8, candidate, operation_id)) return parsed;
+        }
+        cursor = parsed.next_cursor;
+    }
+    return null;
 }
 
 fn logKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {

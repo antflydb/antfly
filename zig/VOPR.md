@@ -796,19 +796,26 @@ the same owner protocol and add service-specific teardown-order properties.
 Real WAL, catalog, manifest, artifact, and progress-store operations now run
 over the reusable `ScriptedFaultClient`, covering partial committed transfer,
 delayed visibility, duplicate completion, timeout-after-commit, cancellation,
-retry, publication, reconciliation, and client crash. Next, reuse this provider
-in the full backup/restore workflow and decide whether WAL append needs an
-operation identity: today callers must reconcile a timeout-after-commit before
-retry because a blind append retry can create a second LSN.
+retry, publication, reconciliation, and client crash. Object-backed WAL append
+now also accepts a durable caller-supplied operation identity: retry after an
+ambiguous timeout returns the original LSN, conflicting reuse fails closed,
+and the identity survives read and truncation. Stores that cannot uphold the
+contract reject idempotent append instead of silently degrading it. Next,
+reuse `ScriptedFaultClient` in the full backup/restore workflow.
 
 ### 5. Admission and Resource Pressure
 
-The production resource manager now runs under a replayable contention schedule
-that proves hard-limit denial, idempotent release, accounting, and capacity
-recovery. `VoprIo` independently enforces task, CPU, allocator, file, socket,
-storage, and queue limits, and the DataServer covers socket admission. Next,
-compose multiple limits in one production request, cancel it at every admitted
-edge, prove reservation return, and add priority/minimum-progress campaigns.
+The production resource manager now runs under replayable contention schedules
+that prove hard-limit denial, idempotent release, accounting, and capacity
+recovery. A composed production request acquires foreground admission, a
+multi-slice batch, and scratch memory; cancellation at each admitted edge
+returns every reservation. Priority campaigns prove that background soft
+pressure does not block unrelated foreground work and that bounded oversized
+single-work admission provides exactly one minimum-progress grant while
+rejecting a concurrent contender. `VoprIo` independently enforces task, CPU,
+allocator, file, socket, storage, and queue limits, and the DataServer covers
+socket admission. Continue composing these policies into deeper DataServer
+request microsteps as those seams are added.
 
 ### 6. Hard Antithesis-Class Tooling and Search Quality
 
