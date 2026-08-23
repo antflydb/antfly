@@ -59,7 +59,8 @@ class GraphKShortestPaths:
             deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
             Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
             Alias-to-alias predicates belong in GraphMatch.where.
-        include_documents (bool | Unset): Include stored documents on nodes returned with each path. Default: False.
+        include_documents (bool | Unset): Include stored documents on each terminal result node returned alongside its
+            path. Default: False.
         fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
     """
 

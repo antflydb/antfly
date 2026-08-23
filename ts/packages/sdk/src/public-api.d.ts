@@ -12028,7 +12028,7 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
-             * @description Include stored documents on nodes returned with the path.
+             * @description Include stored documents on terminal result nodes returned alongside the path.
              * @default false
              */
             include_documents?: boolean;
@@ -12056,7 +12056,7 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
-             * @description Include stored documents on nodes returned with each path.
+             * @description Include stored documents on each terminal result node returned alongside its path.
              * @default false
              */
             include_documents?: boolean;
@@ -12311,14 +12311,14 @@ export interface components {
             total_weight: number;
             length: number;
         };
-        /** @description Nodes and any materialized paths from a canonical traversal or path query. */
+        /** @description Composable result nodes and any materialized paths from a canonical traversal or path query. */
         GraphNodesResult: {
             /**
              * @description Stable discriminator for the graph result shape.
              * @enum {string}
              */
             kind: "nodes";
-            /** @description Result nodes. */
+            /** @description Traversal result nodes. Path operations emit one terminal result node per returned path; inspect paths[].nodes for complete path membership. */
             nodes: components["schemas"]["GraphResultNode"][];
             /** @description Materialized result paths; empty when paths were not requested or produced. */
             paths: components["schemas"]["GraphPath"][];

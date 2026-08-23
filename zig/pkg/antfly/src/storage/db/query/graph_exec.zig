@@ -141,6 +141,12 @@ pub const NonPatternQueryExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror!?[]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -199,6 +205,12 @@ pub const SearchGraphExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror!?[]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1486,17 +1498,13 @@ pub fn executeSingleNonPatternQueryWithSets(
     const start = @min(req.offset, total_hits);
     const end = @min(start + req.limit, total_hits);
 
-    var hits = try alloc.alloc(types.SearchHit, end - start);
-    var initialized: usize = 0;
-    errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-        alloc.free(hits);
-    }
-
-    for (graph_result.nodes[@intCast(start)..@intCast(end)], 0..) |node, i| {
-        hits[i] = try buildGraphNodeHit(alloc, req, named.query, node, executor);
-        initialized += 1;
-    }
+    const hits = try buildGraphNodeHits(
+        alloc,
+        req,
+        named.query,
+        graph_result.nodes[@intCast(start)..@intCast(end)],
+        executor,
+    );
 
     const name = try alloc.dupe(u8, named.name);
     const nodes = graph_result.nodes;
@@ -1533,19 +1541,7 @@ fn buildPathGraphSearchResult(
         initialized_nodes += 1;
     }
 
-    const hits = if (nodes.len > 0)
-        try alloc.alloc(types.SearchHit, nodes.len)
-    else
-        @constCast((&[_]types.SearchHit{})[0..]);
-    var initialized_hits: usize = 0;
-    errdefer {
-        for (hits[0..initialized_hits]) |*hit| hit.deinit(alloc);
-        if (hits.len > 0) alloc.free(hits);
-    }
-    for (nodes, 0..) |node, i| {
-        hits[i] = try buildGraphNodeHit(alloc, req, named.query, node, executor);
-        initialized_hits += 1;
-    }
+    const hits = try buildGraphNodeHits(alloc, req, named.query, nodes, executor);
 
     const name = try alloc.dupe(u8, named.name);
     return .{
@@ -1636,17 +1632,13 @@ fn executeResolvedSearchGraph(
     const start = @min(req.offset, total_hits);
     const end = @min(start + req.limit, total_hits);
 
-    var hits = try alloc.alloc(types.SearchHit, end - start);
-    var initialized: usize = 0;
-    errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-        alloc.free(hits);
-    }
-
-    for (result.nodes[@intCast(start)..@intCast(end)], 0..) |node, i| {
-        hits[i] = try buildGraphNodeHit(alloc, req, graph_query, node, executor);
-        initialized += 1;
-    }
+    const hits = try buildGraphNodeHits(
+        alloc,
+        req,
+        graph_query,
+        result.nodes[@intCast(start)..@intCast(end)],
+        executor,
+    );
 
     return .{
         .alloc = alloc,
@@ -1686,34 +1678,85 @@ pub fn executeSearchGraph(
     return try executeResolvedSearchGraph(alloc, req, graph_query, start_keys, target_keys, executor);
 }
 
-fn buildGraphNodeHit(
+fn buildGraphNodeHits(
     alloc: Allocator,
     req: types.SearchRequest,
     graph_query: graph_query_mod.GraphQuery,
-    node: graph_query_mod.GraphResultNode,
+    nodes: []const graph_query_mod.GraphResultNode,
     executor: anytype,
-) !types.SearchHit {
-    const stored_data = if (graph_query.include_documents)
-        try executor.load_projected_document(executor.ctx, alloc, req, node.key)
-    else
-        null;
-    errdefer if (stored_data) |stored| alloc.free(stored);
+) ![]types.SearchHit {
+    const documents = if (graph_query.include_documents) blk: {
+        var projection_req = req;
+        projection_req.fields = graph_query.fields;
+        projection_req.include_all_fields = graph_query.include_all_fields;
+        // Graph results are serialized directly; unlike retrieval hits, there is
+        // no later projection stage that can safely consume deferred raw bytes.
+        projection_req.defer_stored_projection = false;
 
-    const id = try alloc.dupe(u8, node.key);
-    errdefer alloc.free(id);
-    const doc_ordinal = try lookupDocOrdinalForGraphHit(
-        alloc,
-        executor.ctx,
-        executor.lookup_doc_ordinal,
-        node.key,
-        req.identity_read_generation,
-    );
-    return .{
-        .id = id,
-        .doc_ordinal = doc_ordinal,
-        .score = @floatCast(node.distance),
-        .stored_data = stored_data,
-    };
+        const keys = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(keys);
+        for (nodes, 0..) |node, i| keys[i] = node.key;
+
+        if (executor.load_projected_documents) |load_many| {
+            const loaded = try load_many(executor.ctx, alloc, projection_req, keys);
+            if (loaded.len != nodes.len) {
+                freeOptionalOwnedBytes(alloc, loaded);
+                return error.InvalidQueryResult;
+            }
+            break :blk loaded;
+        }
+
+        const loaded = try alloc.alloc(?[]u8, nodes.len);
+        @memset(loaded, null);
+        var initialized: usize = 0;
+        errdefer {
+            for (loaded[0..initialized]) |stored| if (stored) |bytes| alloc.free(bytes);
+            alloc.free(loaded);
+        }
+        for (keys, 0..) |key, i| {
+            loaded[i] = try executor.load_projected_document(executor.ctx, alloc, projection_req, key);
+            initialized += 1;
+        }
+        break :blk loaded;
+    } else null;
+    defer if (documents) |loaded| freeOptionalOwnedBytes(alloc, loaded);
+
+    const hits = try alloc.alloc(types.SearchHit, nodes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    for (nodes, 0..) |node, i| {
+        const stored_data = if (documents) |loaded| blk: {
+            const stored = loaded[i];
+            loaded[i] = null;
+            break :blk stored;
+        } else null;
+        errdefer if (stored_data) |stored| alloc.free(stored);
+        const id = try alloc.dupe(u8, node.key);
+        errdefer alloc.free(id);
+        const doc_ordinal = try lookupDocOrdinalForGraphHit(
+            alloc,
+            executor.ctx,
+            executor.lookup_doc_ordinal,
+            node.key,
+            req.identity_read_generation,
+        );
+        hits[i] = .{
+            .id = id,
+            .doc_ordinal = doc_ordinal,
+            .score = @floatCast(node.distance),
+            .stored_data = stored_data,
+        };
+        initialized += 1;
+    }
+    return hits;
+}
+
+fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
+    for (values) |stored| if (stored) |bytes| alloc.free(bytes);
+    if (values.len > 0) alloc.free(values);
 }
 
 fn buildPatternDocumentHits(
@@ -4695,7 +4738,8 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     const alloc = std.testing.allocator;
 
     const Harness = struct {
-        loaded: bool = false,
+        batch_loaded: bool = false,
+        singular_loaded: bool = false,
         seen_generation: ?u64 = null,
 
         fn findShortestPath(
@@ -4751,10 +4795,31 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             key: []const u8,
         ) anyerror!?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.loaded = true;
-            try std.testing.expect(!req.include_stored);
+            self.singular_loaded = true;
+            _ = req;
             try std.testing.expectEqualStrings("doc:child", key);
-            return try alloc_inner.dupe(u8, "{\"title\":\"child\",\"body\":\"details about the architecture\"}");
+            return try alloc_inner.dupe(u8, "{\"unexpected\":true}");
+        }
+
+        fn loadProjectedDocuments(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.batch_loaded = true;
+            try std.testing.expect(!req.include_all_fields);
+            try std.testing.expect(!req.defer_stored_projection);
+            try std.testing.expectEqual(@as(usize, 1), req.fields.len);
+            try std.testing.expectEqualStrings("title", req.fields[0]);
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:child", keys[0]);
+
+            const loaded = try alloc_inner.alloc(?[]u8, keys.len);
+            errdefer alloc_inner.free(loaded);
+            loaded[0] = try alloc_inner.dupe(u8, "{\"title\":\"child\"}");
+            return loaded;
         }
 
         fn lookupOrdinal(
@@ -4779,11 +4844,16 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             .start_nodes = .{ .keys = &.{"doc:root"} },
             .params = .{},
             .include_documents = true,
+            .fields = &.{"title"},
+            .include_all_fields = false,
         },
     };
 
     var result = try executeSingleNonPatternQueryWithSets(alloc, .{
         .include_stored = false,
+        .fields = &.{"body"},
+        .include_all_fields = false,
+        .defer_stored_projection = true,
         .limit = 10,
         .identity_read_generation = 42,
     }, &named, &.{}, .{
@@ -4792,17 +4862,19 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
         .find_k_shortest_paths = Harness.findKShortestPaths,
         .execute_graph_query = Harness.executeGraphQuery,
         .load_projected_document = Harness.loadProjectedDocument,
+        .load_projected_documents = Harness.loadProjectedDocuments,
         .lookup_doc_ordinal = Harness.lookupOrdinal,
     });
     defer result.deinit(alloc);
 
-    try std.testing.expect(harness.loaded);
+    try std.testing.expect(harness.batch_loaded);
+    try std.testing.expect(!harness.singular_loaded);
     try std.testing.expectEqual(@as(?u64, 42), harness.seen_generation);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:child", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
     try std.testing.expect(result.hits[0].stored_data != null);
-    try std.testing.expectEqualStrings("{\"title\":\"child\",\"body\":\"details about the architecture\"}", result.hits[0].stored_data.?);
+    try std.testing.expectEqualStrings("{\"title\":\"child\"}", result.hits[0].stored_data.?);
 }
 
 test "stateful path results materialize endpoint nodes for result refs" {

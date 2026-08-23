@@ -2934,7 +2934,7 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Include stored documents on nodes returned with the path.
+          description: Include stored documents on terminal result nodes returned alongside the path.
         fields:
           type: array
           items: { type: string }
@@ -2971,7 +2971,7 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Include stored documents on nodes returned with each path.
+          description: Include stored documents on each terminal result node returned alongside its path.
         fields:
           type: array
           items: { type: string }
@@ -3410,7 +3410,7 @@ components:
       type: object
       additionalProperties: false
       required: [kind, nodes, paths, stats, took]
-      description: Nodes and any materialized paths from a canonical traversal or path query.
+      description: Composable result nodes and any materialized paths from a canonical traversal or path query.
       properties:
         kind:
           type: string
@@ -3419,7 +3419,9 @@ components:
         nodes:
           type: array
           items: { $ref: '#/components/schemas/GraphResultNode' }
-          description: Result nodes.
+          description: >-
+            Traversal result nodes. Path operations emit one terminal result node
+            per returned path; inspect paths[].nodes for complete path membership.
         paths:
           x-go-type-skip-optional-pointer: true
           type: array

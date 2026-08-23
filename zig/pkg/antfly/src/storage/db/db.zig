@@ -25088,6 +25088,7 @@ pub const DB = struct {
             else
                 executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .filter_keys = filterGraphKeysCallback,
         });
@@ -25167,6 +25168,7 @@ pub const DB = struct {
                 else
                     executeGraphQueryCallback,
                 .load_projected_document = loadProjectedSearchDocumentCallback,
+                .load_projected_documents = loadProjectedSearchDocumentManyCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
                 .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
                 .filter_keys = filterGraphKeysCallback,
@@ -25976,6 +25978,7 @@ pub const DB = struct {
             else
                 executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .filter_keys = filterGraphKeysCallback,

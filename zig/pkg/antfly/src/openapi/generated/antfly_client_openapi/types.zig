@@ -4856,7 +4856,7 @@ pub const GraphKShortestPaths = struct {
     weight_mode: ?PathWeightMode = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
-    /// Include stored documents on nodes returned with each path.
+    /// Include stored documents on each terminal result node returned alongside its path.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
@@ -4976,11 +4976,11 @@ pub const GraphNodeSelector = union(enum) {
     }
 };
 
-/// Nodes and any materialized paths from a canonical traversal or path query.
+/// Composable result nodes and any materialized paths from a canonical traversal or path query.
 pub const GraphNodesResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
-    /// Result nodes.
+    /// Traversal result nodes. Path operations emit one terminal result node per returned path; inspect paths[].nodes for complete path membership.
     nodes: []const GraphResultNode,
     /// Materialized result paths; empty when paths were not requested or produced.
     paths: []const GraphPath,
@@ -5352,7 +5352,7 @@ pub const GraphShortestPath = struct {
     weight_mode: ?PathWeightMode = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
-    /// Include stored documents on nodes returned with the path.
+    /// Include stored documents on terminal result nodes returned alongside the path.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
