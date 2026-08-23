@@ -2888,6 +2888,24 @@ components:
         table:
           type: string
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query table.
+    GraphPath:
+      type: object
+      additionalProperties: false
+      required: [nodes, edges, total_weight, length]
+      description: An ordered canonical graph path with table-qualified node identities.
+      properties:
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/GraphPathEndpoint' }
+          description: Ordered node identities. Table is omitted for nodes in the query table.
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/PathEdge' }
+        total_weight:
+          type: number
+          format: double
+        length:
+          type: integer
     GraphShortestPath:
       type: object
       additionalProperties: false
@@ -3343,7 +3361,7 @@ components:
         paths:
           x-go-type-skip-optional-pointer: true
           type: array
-          items: { $ref: '#/components/schemas/Path' }
+          items: { $ref: '#/components/schemas/GraphPath' }
           description: Materialized result paths; empty when paths were not requested or produced.
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
         took:

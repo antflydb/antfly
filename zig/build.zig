@@ -3736,6 +3736,7 @@ pub fn build(b: *std.Build) void {
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
         "retrieval agent supports roots tree search",
+        "annotate tree document prefers graph path branch metadata",
         "retrieval agent isolates query predicates while applying accumulated filters",
         "retrieval agent installs canonical mandatory predicates once",
         "retrieval agent authenticated row filter conjoins generated filter",
@@ -3777,6 +3778,7 @@ pub fn build(b: *std.Build) void {
         "pattern response omits paths unless requested",
         "graph aggregate response preserves exact decimal counts",
         "graph aggregate response fails closed on missing or inexact results",
+        "canonical graph paths preserve table-qualified node identities",
         "generated graph result union decodes pre-discriminator legacy responses",
         "deprecated graph searches share canonical name admission",
         "api query contract preflight summarizes query lanes and result refs",
@@ -3813,7 +3815,9 @@ pub fn build(b: *std.Build) void {
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
         "authenticated single-group graph queries require distributed coordination",
+        "unsupported cross-range graph modes fail closed",
         "parseRemoteSearchResult preserves typed graph rows and hydrated documents",
+        "parseRemoteSearchResult preserves canonical graph path table identities",
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{

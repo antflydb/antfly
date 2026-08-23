@@ -332,6 +332,9 @@ from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
+from .graph_cross_range_mode_unsupported_error import GraphCrossRangeModeUnsupportedError
+from .graph_cross_range_mode_unsupported_error_error import GraphCrossRangeModeUnsupportedErrorError
+from .graph_cross_range_mode_unsupported_error_status import GraphCrossRangeModeUnsupportedErrorStatus
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
 from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
@@ -383,6 +386,7 @@ from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
 from .graph_optional_match_nodes import GraphOptionalMatchNodes
+from .graph_path import GraphPath
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
@@ -1229,6 +1233,9 @@ __all__ = (
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphCountAggregate",
+    "GraphCrossRangeModeUnsupportedError",
+    "GraphCrossRangeModeUnsupportedErrorError",
+    "GraphCrossRangeModeUnsupportedErrorStatus",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorError",
     "GraphDistinctBudgetExceededErrorStatus",
@@ -1280,6 +1287,7 @@ __all__ = (
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
     "GraphOptionalMatchNodes",
+    "GraphPath",
     "GraphPathEndpoint",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",

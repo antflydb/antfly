@@ -3078,6 +3078,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        try rejectUnsupportedCrossRangeGraphMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
@@ -4129,6 +4130,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        try rejectUnsupportedCrossRangeGraphMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -6725,6 +6727,19 @@ fn requiresDistributedGraphCoordinator(
             req.graph_table_read_authorizer != null or
             distributed_graph.requiresCompleteMatchAnchors(req) or
             graphRequestHasQualifiedIdentity(req));
+}
+
+/// Graph results cannot be merged from independently evaluated shard-local
+/// traversals: limits, deduplication, path selection, and MATCH bindings are
+/// global semantics. Keep unsupported modes available for a single local
+/// group, but fail closed once correctness requires cross-range execution.
+fn rejectUnsupportedCrossRangeGraphMode(
+    group_count: usize,
+    req: db_mod.types.SearchRequest,
+) !void {
+    if (group_count > 1 and req.graph_queries.len > 0 and !distributed_graph.supportsCrossRange(req)) {
+        return error.GraphCrossRangeModeUnsupported;
+    }
 }
 
 fn graphRequestHasQualifiedIdentity(req: db_mod.types.SearchRequest) bool {
@@ -17894,6 +17909,19 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
     try std.testing.expectEqualStrings("Ada", document.value.object.get("title").?.string);
 }
 
+test "parseRemoteSearchResult preserves canonical graph path table identities" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"doc:a"},{"key":"shared","table":"entities"}],"edges":[],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
+    try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
+}
+
 fn parseRemoteGraphResults(
     alloc: std.mem.Allocator,
     value: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult),
@@ -17910,7 +17938,8 @@ fn parseRemoteGraphResults(
         const result_value = entry.value_ptr.*;
         const ResultView = struct {
             nodes: ?[]const indexes_openapi.GraphResultNode = null,
-            paths: ?[]const indexes_openapi.Path = null,
+            canonical_paths: ?[]const indexes_openapi.GraphPath = null,
+            legacy_paths: ?[]const indexes_openapi.Path = null,
             rows: ?[]const indexes_openapi.GraphResultRow = null,
             aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
             truncated: bool = false,
@@ -17918,7 +17947,7 @@ fn parseRemoteGraphResults(
         const view: ResultView = switch (result_value) {
             .graph_nodes_result => |result| .{
                 .nodes = result.nodes,
-                .paths = result.paths,
+                .canonical_paths = result.paths,
                 .truncated = result.stats.truncated,
             },
             .graph_bindings_result => |result| .{
@@ -17931,7 +17960,7 @@ fn parseRemoteGraphResults(
             },
             .legacy_graph_query_result => |result| .{
                 .nodes = result.nodes,
-                .paths = result.paths,
+                .legacy_paths = result.paths,
             },
         };
         var parsed_nodes = if (view.nodes) |nodes_value|
@@ -17944,8 +17973,10 @@ fn parseRemoteGraphResults(
         else
             ParsedRemoteGraphMatches{};
         errdefer parsed_matches.deinit(alloc);
-        const paths: []graph_paths.Path = if (view.paths) |paths_value|
-            try parseRemoteGraphPaths(alloc, paths_value)
+        const paths: []graph_paths.Path = if (view.canonical_paths) |paths_value|
+            try parseRemoteCanonicalGraphPaths(alloc, paths_value)
+        else if (view.legacy_paths) |paths_value|
+            try parseRemoteLegacyGraphPaths(alloc, paths_value)
         else
             @constCast((&[_]graph_paths.Path{})[0..]);
         errdefer {
@@ -18277,7 +18308,7 @@ fn freeRemoteGraphNodePathEdges(alloc: std.mem.Allocator, edges: []const graph_q
     freeRemoteGraphNodePathEdgeItems(alloc, edges, edges.len);
 }
 
-fn parseRemoteGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openapi.Path) ![]graph_paths.Path {
+fn parseRemoteLegacyGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openapi.Path) ![]graph_paths.Path {
     const paths = try alloc.alloc(graph_paths.Path, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18294,6 +18325,73 @@ fn parseRemoteGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openap
         initialized += 1;
     }
     return paths;
+}
+
+fn parseRemoteCanonicalGraphPaths(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPath,
+) ![]graph_paths.Path {
+    const paths = try alloc.alloc(graph_paths.Path, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (paths[0..initialized]) |path| graph_paths.freePath(alloc, path);
+        alloc.free(paths);
+    }
+    for (value, 0..) |item, i| {
+        paths[i] = try parseRemoteCanonicalGraphPath(alloc, item);
+        initialized += 1;
+    }
+    return paths;
+}
+
+fn parseRemoteCanonicalGraphPath(
+    alloc: std.mem.Allocator,
+    item: indexes_openapi.GraphPath,
+) !graph_paths.Path {
+    const nodes = try alloc.alloc([]const u8, item.nodes.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
+    const has_qualified_node = for (item.nodes) |node| {
+        if (node.table != null) break true;
+    } else false;
+    const node_tables: []?[]const u8 = if (has_qualified_node)
+        try alloc.alloc(?[]const u8, item.nodes.len)
+    else
+        @constCast((&[_]?[]const u8{})[0..]);
+    if (node_tables.len > 0) @memset(node_tables, null);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (node_tables[0..initialized_tables]) |table| if (table) |value| alloc.free(value);
+        if (node_tables.len > 0) alloc.free(node_tables);
+    }
+    for (item.nodes, 0..) |node, i| {
+        nodes[i] = try alloc.dupe(u8, node.key);
+        initialized_nodes += 1;
+        if (has_qualified_node) {
+            node_tables[i] = if (node.table) |table| try alloc.dupe(u8, table) else null;
+            initialized_tables += 1;
+        }
+    }
+    const edges = try parseRemotePathEdges(alloc, item.edges);
+    errdefer {
+        for (edges) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
+    return .{
+        .nodes = nodes,
+        .node_tables = node_tables,
+        .edges = edges,
+        .total_weight = item.total_weight,
+        .length = std.math.cast(u32, item.length) orelse return error.InvalidQueryRequest,
+    };
 }
 
 fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.PathEdge) ![]graph_paths.PathEdge {
@@ -25834,6 +25932,23 @@ test "authenticated single-group graph queries require distributed coordination"
     req.graph_table_read_authorizer = null;
     try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
+}
+
+test "unsupported cross-range graph modes fail closed" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{ .direction = .both },
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    try rejectUnsupportedCrossRangeGraphMode(1, req);
+    try std.testing.expectError(error.GraphCrossRangeModeUnsupported, rejectUnsupportedCrossRangeGraphMode(2, req));
+    try rejectUnsupportedCrossRangeGraphMode(2, .{});
 }
 
 test "qualified graph endpoint requires coordination for a single source group" {

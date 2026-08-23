@@ -20,6 +20,10 @@ pub const Edge = struct {
     neighbor_id: []u8,
     edge_type: []u8,
     weight: f32,
+    /// Index into Segment.neighbor_tables. Null means the segment's source
+    /// table. Keeping this dictionary encoded avoids repeating a table name on
+    /// every cross-table edge.
+    neighbor_table_id: ?u32 = null,
 
     pub fn deinit(self: *Edge, alloc: Allocator) void {
         alloc.free(self.neighbor_id);
@@ -44,12 +48,21 @@ pub const Adjacency = struct {
 };
 
 pub const Segment = struct {
+    neighbor_tables: [][]u8 = &.{},
     adjacencies: []Adjacency,
 
     pub fn deinit(self: *Segment, alloc: Allocator) void {
+        for (self.neighbor_tables) |table| alloc.free(table);
+        if (self.neighbor_tables.len > 0) alloc.free(self.neighbor_tables);
         for (self.adjacencies) |*adjacency| adjacency.deinit(alloc);
         alloc.free(self.adjacencies);
         self.* = undefined;
+    }
+
+    pub fn neighborTable(self: Segment, edge: Edge) ?[]const u8 {
+        const table_id = edge.neighbor_table_id orelse return null;
+        if (table_id >= self.neighbor_tables.len) return null;
+        return self.neighbor_tables[table_id];
     }
 };
 

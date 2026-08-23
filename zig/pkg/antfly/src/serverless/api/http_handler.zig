@@ -3233,12 +3233,8 @@ pub const HttpHandler = struct {
             for (nodes.items) |*node| node.deinit(self.alloc);
             nodes.deinit(self.alloc);
         }
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer {
-            var it = seen.keyIterator();
-            while (it.next()) |key| self.alloc.free(key.*);
-            seen.deinit(self.alloc);
-        }
+        var seen = graph_node_identity.Map(void){};
+        defer seen.deinit(self.alloc);
 
         const result_limit = named_query.query.params.max_results;
         const bounded = result_limit > 0;
@@ -3277,16 +3273,12 @@ pub const HttpHandler = struct {
 
             for (traversal_nodes) |node| {
                 if (named_query.query.params.deduplicate) {
-                    const seen_key = try self.alloc.dupe(u8, node.key);
-                    const gop = try seen.getOrPut(self.alloc, seen_key);
-                    if (gop.found_existing) {
-                        self.alloc.free(seen_key);
-                        continue;
-                    }
+                    if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
                 try nodes.append(self.alloc, .{
                     .key = try self.alloc.dupe(u8, node.key),
+                    .table = if (node.target_table) |table| try self.alloc.dupe(u8, table) else null,
                     .depth = node.depth,
                     .distance = node.total_weight,
                     .path = if (node.path) |path|
@@ -3369,7 +3361,7 @@ pub const HttpHandler = struct {
         defer freeOwnedKeySlice(self.alloc, target_keys);
 
         const cached = try request_cache.graphSegment(named_query.query.index_name);
-        const edge_reader = ServerlessTraversalEdgeReader{ .cached = cached, .budget = request_graph_read_budget };
+        const edge_reader = ServerlessPathEdgeReader{ .cached = cached, .budget = request_graph_read_budget };
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
             .documents = request_cache,
@@ -3688,6 +3680,7 @@ pub const HttpHandler = struct {
                     .alias = try self.alloc.dupe(u8, binding.alias),
                     .node = .{
                         .key = try self.alloc.dupe(u8, binding.key),
+                        .table = if (binding.table) |table| try self.alloc.dupe(u8, table) else null,
                         .depth = binding.depth,
                         .distance = @floatFromInt(binding.depth),
                         .path = null,
@@ -3766,6 +3759,9 @@ pub const HttpHandler = struct {
 
         for (matches) |match| {
             for (match.bindings) |binding| {
+                // SearchHit has no table identity. Returning a qualified
+                // binding here would alias it into the source table.
+                if (binding.node.table != null) continue;
                 if (seen.contains(binding.node.key)) continue;
                 try seen.put(self.alloc, try self.alloc.dupe(u8, binding.node.key), {});
                 const body = if (query.include_documents)
@@ -3796,18 +3792,20 @@ pub const HttpHandler = struct {
         request_cache: *PublicGraphRequestCache,
     ) ![]db_types.SearchHit {
         if (!query.include_documents) return try self.alloc.alloc(db_types.SearchHit, 0);
-        const hits = try self.alloc.alloc(db_types.SearchHit, nodes.len);
-        var initialized: usize = 0;
+        var hits = std.ArrayListUnmanaged(db_types.SearchHit).empty;
         errdefer {
-            for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
-            if (hits.len > 0) self.alloc.free(hits);
+            for (hits.items) |*hit| hit.deinit(self.alloc);
+            hits.deinit(self.alloc);
         }
         const projected_fields = if (!query.include_all_fields)
             try dupFieldsAlloc(self.alloc, query.fields)
         else
             null;
         defer freeFields(self.alloc, projected_fields);
-        for (nodes, 0..) |node, i| {
+        for (nodes) |node| {
+            // Qualified identities are represented in graph nodes. The
+            // table-local SearchHit compatibility view cannot carry them.
+            if (node.table != null) continue;
             const stored_data = if (try request_cache.documentBody(node.key)) |body|
                 if (query.include_all_fields)
                     try self.alloc.dupe(u8, body)
@@ -3816,14 +3814,13 @@ pub const HttpHandler = struct {
             else
                 null;
             errdefer if (stored_data) |body| self.alloc.free(body);
-            hits[i] = .{
+            try hits.append(self.alloc, .{
                 .id = try self.alloc.dupe(u8, node.key),
                 .score = @floatCast(node.distance),
                 .stored_data = stored_data,
-            };
-            initialized += 1;
+            });
         }
-        return hits;
+        return try hits.toOwnedSlice(self.alloc);
     }
 
     fn queryGraphNeighborsResponse(self: *HttpHandler, session: *query_mod.QuerySession, namespace: []const u8, req: query_mod.GraphNeighborsRequest) !HttpResponse {
@@ -5189,7 +5186,29 @@ const ServerlessTraversalEdgeReader = struct {
         key: []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
-        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction);
+        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, true);
+    }
+
+    pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
+        for (edges) |edge| freeOwnedGraphEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+};
+
+/// Canonical serverless path selectors are table-local. A qualified edge is a
+/// valid terminal result for traversal and MATCH, but it cannot satisfy or be
+/// expanded as an unqualified local path endpoint.
+const ServerlessPathEdgeReader = struct {
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+
+    pub fn getEdges(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, false);
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -5210,7 +5229,7 @@ const ServerlessPatternEdgeReader = struct {
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
-        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, table, key, edge_types, direction);
+        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, table, key, edge_types, direction, true);
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -5243,6 +5262,7 @@ const ServerlessPatternEdgeReader = struct {
                     probe.target,
                     edge.edge_type,
                     edge.weight,
+                    self.cached.segment.neighborTable(edge),
                 );
                 break;
             }
@@ -5264,6 +5284,7 @@ fn allocPublicSegmentEdges(
     key: []const u8,
     edge_types: []const []const u8,
     direction: graph_mod.EdgeDirection,
+    include_qualified_targets: bool,
 ) ![]graph_mod.Edge {
     // Serverless snapshots contain one table-local graph segment. Never alias a
     // cross-table identity into that local key space.
@@ -5276,6 +5297,7 @@ fn allocPublicSegmentEdges(
 
     var edge_count: usize = 0;
     if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
+        if (!include_qualified_targets and edge.neighbor_table_id != null) continue;
         if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
     };
     if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
@@ -5290,6 +5312,7 @@ fn allocPublicSegmentEdges(
     }
     if (direction == .out or direction == .both) {
         for (adjacency.out_edges) |edge| {
+            if (!include_qualified_targets and edge.neighbor_table_id != null) continue;
             if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
             edges[initialized] = try clonePublicSegmentEdge(
                 alloc,
@@ -5297,6 +5320,7 @@ fn allocPublicSegmentEdges(
                 edge.neighbor_id,
                 edge.edge_type,
                 edge.weight,
+                cached.segment.neighborTable(edge),
             );
             initialized += 1;
         }
@@ -5310,6 +5334,7 @@ fn allocPublicSegmentEdges(
                 adjacency.node_id,
                 edge.edge_type,
                 edge.weight,
+                null,
             );
             initialized += 1;
         }
@@ -5323,6 +5348,7 @@ fn clonePublicSegmentEdge(
     target_value: []const u8,
     edge_type_value: []const u8,
     weight: f32,
+    target_table: ?[]const u8,
 ) !graph_mod.Edge {
     const source = try alloc.dupe(u8, source_value);
     errdefer alloc.free(source);
@@ -5330,6 +5356,11 @@ fn clonePublicSegmentEdge(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge_type_value);
     errdefer alloc.free(edge_type);
+    const metadata: []const u8 = if (target_table) |table|
+        try std.json.Stringify.valueAlloc(alloc, .{ .target_table = table }, .{})
+    else
+        &.{};
+    errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
@@ -5337,7 +5368,7 @@ fn clonePublicSegmentEdge(
         .weight = weight,
         .created_at = 0,
         .updated_at = 0,
-        .metadata = &.{},
+        .metadata = metadata,
     };
 }
 
@@ -10575,6 +10606,57 @@ test "serverless public graph reader shares weighted traversal and k shortest se
     try std.testing.expectEqual(@as(usize, 2), reached.len);
     try std.testing.expectEqualStrings("c", reached[0].key);
     try std.testing.expectEqualStrings("d", reached[1].key);
+}
+
+test "serverless public graph reader preserves qualified endpoint identity" {
+    const alloc = std.testing.allocator;
+    var segment = graph_segment_mod.Segment{
+        .neighbor_tables = try alloc.alloc([]u8, 1),
+        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    };
+    segment.neighbor_tables[0] = try alloc.dupe(u8, "entities");
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "doc:a"),
+        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "shared"),
+        .edge_type = try alloc.dupe(u8, "mentions"),
+        .weight = 1,
+        .neighbor_table_id = 0,
+    };
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const cached = CachedPublicGraphSegment{
+        .index_name = @constCast("g"),
+        .segment = segment,
+        .adjacency_index = adjacency_index,
+    };
+    var budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const reader = ServerlessTraversalEdgeReader{ .cached = &cached, .budget = &budget };
+    const reached = try graph_traversal.traverseWithEdgeReader(alloc, reader, "doc:a", .{
+        .max_depth = 2,
+        .max_results = 10,
+    });
+    defer graph_traversal.freeOwnedResults(alloc, reached);
+    try std.testing.expectEqual(@as(usize, 1), reached.len);
+    try std.testing.expectEqualStrings("shared", reached[0].key);
+    try std.testing.expectEqualStrings("entities", reached[0].target_table.?);
+
+    var path_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const path_reader = ServerlessPathEdgeReader{ .cached = &cached, .budget = &path_budget };
+    const qualified_path = try graph_paths.findShortestPathWithEdgeReader(
+        alloc,
+        path_reader,
+        "doc:a",
+        "shared",
+        .{},
+    );
+    defer if (qualified_path) |path| graph_paths.freePath(alloc, path);
+    try std.testing.expect(qualified_path == null);
 }
 
 test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {

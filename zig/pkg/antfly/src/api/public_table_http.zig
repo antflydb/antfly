@@ -112,6 +112,7 @@ pub const TableApi = struct {
         GraphDistinctBudgetExceeded,
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
+        GraphCrossRangeModeUnsupported,
         HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
@@ -771,6 +772,15 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphCrossRangeModeUnsupportedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_cross_range_mode_unsupported",
+        .message = "this graph query mode cannot be executed exactly across multiple shards; use a supported canonical graph mode or a single-shard table",
+        .retryable = false,
+    }, .{});
+}
+
 fn graphMatchOperationCountFromBody(alloc: std.mem.Allocator, body: []const u8) usize {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return graph_query_mod.max_match_queries_per_request + 1;
     defer parsed.deinit();
@@ -970,6 +980,10 @@ pub fn handleTableQueryRequest(
             error.GraphMatchOperationLimitExceeded => {
                 std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
+            },
+            error.GraphCrossRangeModeUnsupported => {
+                std.log.warn("public table graph mode lacks exact cross-range execution table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphCrossRangeModeUnsupportedBody(alloc), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -3212,7 +3226,7 @@ test "public table query handler maps candidate budget exhaustion" {
 }
 
 test "public table query handler maps exact graph execution failures" {
-    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit };
+    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, cross_range_mode };
     const Backend = struct {
         fn iface(kind: *Kind) TableApi {
             return .{
@@ -3245,6 +3259,7 @@ test "public table query handler maps exact graph execution failures" {
                 .distinct_budget => error.GraphDistinctBudgetExceeded,
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
+                .cross_range_mode => error.GraphCrossRangeModeUnsupported,
             };
         }
     };
@@ -3329,6 +3344,29 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expect(!limit_error.retryable);
     try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
     try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
+
+    kind = .cross_range_mode;
+    var cross_range_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer cross_range_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), cross_range_resp.status);
+    var cross_range = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        cross_range_resp.body,
+        .{},
+    );
+    defer cross_range.deinit();
+    const cross_range_error = switch (cross_range.value) {
+        .graph_cross_range_mode_unsupported_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!cross_range_error.retryable);
 
     const legacy_limit_body =
         \\{"graph_searches":{"first":{"type":"pattern"},"neighbors":{"type":"neighbors"},"second":{"type":"pattern"}}}

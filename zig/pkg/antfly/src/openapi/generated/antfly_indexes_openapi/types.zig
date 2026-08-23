@@ -1825,7 +1825,7 @@ pub const GraphNodesResult = struct {
     /// Result nodes.
     nodes: []const GraphResultNode,
     /// Materialized result paths; empty when paths were not requested or produced.
-    paths: []const Path,
+    paths: []const GraphPath,
     stats: GraphQueryStats,
     /// Query execution time.
     took: i64,
@@ -1845,6 +1845,15 @@ pub const GraphOptionalMatch = struct {
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
+};
+
+/// An ordered canonical graph path with table-qualified node identities.
+pub const GraphPath = struct {
+    /// Ordered node identities. Table is omitted for nodes in the query table.
+    nodes: []const GraphPathEndpoint,
+    edges: []const PathEdge,
+    total_weight: f64,
+    length: i64,
 };
 
 pub const GraphPathEndpoint = struct {

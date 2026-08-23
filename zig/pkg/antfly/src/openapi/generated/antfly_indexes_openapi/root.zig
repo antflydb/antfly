@@ -87,6 +87,7 @@ pub const GraphNodesResult = types.GraphNodesResult;
 pub const GraphNotEqualPredicate = types.GraphNotEqualPredicate;
 pub const GraphNotExistsPattern = types.GraphNotExistsPattern;
 pub const GraphOptionalMatch = types.GraphOptionalMatch;
+pub const GraphPath = types.GraphPath;
 pub const GraphPathEndpoint = types.GraphPathEndpoint;
 pub const GraphQuery = types.GraphQuery;
 pub const GraphQueryParams = types.GraphQueryParams;

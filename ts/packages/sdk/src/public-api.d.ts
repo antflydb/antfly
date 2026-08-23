@@ -2968,6 +2968,21 @@ export interface components {
             /** @enum {boolean} */
             retryable: false;
         };
+        GraphCrossRangeModeUnsupportedError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_cross_range_mode_unsupported";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         GraphMatchOperationLimitExceededError: {
             /**
              * Format: int32
@@ -2993,7 +3008,7 @@ export interface components {
              */
             actual: number;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphCrossRangeModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -12274,6 +12289,15 @@ export interface components {
              */
             took: number;
         };
+        /** @description An ordered canonical graph path with table-qualified node identities. */
+        GraphPath: {
+            /** @description Ordered node identities. Table is omitted for nodes in the query table. */
+            nodes: components["schemas"]["GraphPathEndpoint"][];
+            edges: components["schemas"]["PathEdge"][];
+            /** Format: double */
+            total_weight: number;
+            length: number;
+        };
         /** @description Nodes and any materialized paths from a canonical traversal or path query. */
         GraphNodesResult: {
             /**
@@ -12284,7 +12308,7 @@ export interface components {
             /** @description Result nodes. */
             nodes: components["schemas"]["GraphResultNode"][];
             /** @description Materialized result paths; empty when paths were not requested or produced. */
-            paths: components["schemas"]["Path"][];
+            paths: components["schemas"]["GraphPath"][];
             stats: components["schemas"]["GraphQueryStats"];
             /**
              * Format: int64

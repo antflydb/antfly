@@ -201,6 +201,10 @@ pub fn resolveGraphSelectorAlloc(
                         if (duped.len > 0) alloc.free(duped);
                     }
                     for (graph_result.nodes[0..count], 0..) |node, i| {
+                        // The serverless snapshot resolver is table-local. A
+                        // qualified result must never be reinterpreted as a
+                        // source-table key by a downstream query.
+                        if (node.table != null) return error.UnsupportedQueryRequest;
                         duped[i] = try alloc.dupe(u8, node.key);
                         initialized += 1;
                     }
@@ -240,7 +244,12 @@ fn resolveMatchBindingKeysAlloc(
 
     for (matches) |match| {
         for (match.bindings) |binding| {
-            if (!std.mem.eql(u8, binding.alias, alias) or seen.contains(binding.node.key)) continue;
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            // This selector feeds a table-local query. Validate provenance
+            // before key-only deduplication so a qualified identity cannot be
+            // hidden by an earlier local binding with the same key.
+            if (binding.node.table != null) return error.UnsupportedQueryRequest;
+            if (seen.contains(binding.node.key)) continue;
             const key = try alloc.dupe(u8, binding.node.key);
             errdefer alloc.free(key);
             try seen.put(alloc, key, {});
@@ -358,6 +367,44 @@ pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
     }
     try std.testing.expectEqual(@as(usize, 1), path_keys.len);
     try std.testing.expectEqualStrings("doc:path-target", path_keys[0]);
+
+    result_nodes[0].table = "entities";
+    try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
+        alloc,
+        "docs",
+        .{ .result_ref = .{ .ref = "$graph_results.path" } },
+        &graph_sets,
+    ));
+
+    var local_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("n"),
+        .node = .{
+            .key = @constCast("shared"),
+            .depth = 0,
+            .distance = 0,
+            .path = null,
+            .path_edges = null,
+        },
+    }};
+    var qualified_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("n"),
+        .node = .{
+            .key = @constCast("shared"),
+            .table = @constCast("entities"),
+            .depth = 0,
+            .distance = 0,
+            .path = null,
+            .path_edges = null,
+        },
+    }};
+    const matches = [_]db_mod.types.GraphPatternMatch{
+        .{ .bindings = &local_bindings, .path = &.{} },
+        .{ .bindings = &qualified_bindings, .path = &.{} },
+    };
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        resolveMatchBindingKeysAlloc(alloc, &matches, "n", 0),
+    );
 }
 
 fn resultSetMayBeIncompleteForUnboundedRef(set: anytype) bool {

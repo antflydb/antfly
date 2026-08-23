@@ -33,7 +33,7 @@ const AgentStep = metadata_openapi.AgentStep;
 const QueryHit = metadata_openapi.QueryHit;
 const QueryRequest = metadata_openapi.QueryRequest;
 const QueryResponses = metadata_openapi.QueryResponses;
-const GraphPath = indexes_openapi.Path;
+const GraphPath = indexes_openapi.GraphPath;
 const RetrievalAgentRequest = metadata_openapi.RetrievalAgentRequest;
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
@@ -6180,42 +6180,26 @@ fn annotateTreeDocument(
     try tree_meta.put(alloc, "search", .{ .string = try alloc.dupe(u8, search_name) });
     const depth = node.depth orelse 0;
     if (node.depth) |node_depth| try tree_meta.put(alloc, "depth", .{ .integer = @intCast(node_depth) });
-    const node_path = bestTreePathPrefixForNode(graph_paths, node.key) orelse node.path;
-    if (node_path) |path| {
-        if (path.len >= 1) {
-            try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, path[0]) });
-        }
-        if (path.len >= 2) {
-            try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, path[path.len - 2]) });
-        }
-        try tree_meta.put(alloc, "path_length", .{ .integer = @intCast(path.len) });
-        var path_text = std.ArrayListUnmanaged(u8).empty;
-        defer path_text.deinit(alloc);
-        for (path, 0..) |segment, i| {
-            if (i != 0) try path_text.appendSlice(alloc, " > ");
-            try path_text.appendSlice(alloc, segment);
-        }
-        try tree_meta.put(alloc, "path_text", .{ .string = try path_text.toOwnedSlice(alloc) });
-        if (bestTreeBranchPathForNode(graph_paths, node.key)) |branch_path| {
-            try tree_meta.put(alloc, "branch_path_length", .{ .integer = @intCast(branch_path.len) });
-            try tree_meta.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, branch_path[branch_path.len - 1], node.key) });
-            var branch_path_text = std.ArrayListUnmanaged(u8).empty;
-            defer branch_path_text.deinit(alloc);
-            for (branch_path, 0..) |segment, i| {
-                if (i != 0) try branch_path_text.appendSlice(alloc, " > ");
-                try branch_path_text.appendSlice(alloc, segment);
+    var has_path = false;
+    if (bestTreePathPrefixForNode(graph_paths, node.key)) |path| {
+        const branch = bestTreeBranchPathForNode(graph_paths, node.key) orelse &.{};
+        try putTreePathMetadata(alloc, &tree_meta, path, branch, node.key);
+        has_path = true;
+    } else if (node.path) |path| {
+        try putTreePathMetadata(alloc, &tree_meta, path, @as([]const []const u8, &.{}), node.key);
+        has_path = true;
+    }
+    if (!has_path) {
+        if (fallback_root_key) |root_key| {
+            try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, root_key) });
+            if (depth == 1 and !std.mem.eql(u8, root_key, node.key)) {
+                try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, root_key) });
+                try tree_meta.put(alloc, "path_length", .{ .integer = 2 });
+                try tree_meta.put(alloc, "path_text", .{ .string = try std.fmt.allocPrint(alloc, "{s} > {s}", .{ root_key, node.key }) });
+            } else if (depth == 0 or std.mem.eql(u8, root_key, node.key)) {
+                try tree_meta.put(alloc, "path_length", .{ .integer = 1 });
+                try tree_meta.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, root_key) });
             }
-            try tree_meta.put(alloc, "branch_path_text", .{ .string = try branch_path_text.toOwnedSlice(alloc) });
-        }
-    } else if (fallback_root_key) |root_key| {
-        try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, root_key) });
-        if (depth == 1 and !std.mem.eql(u8, root_key, node.key)) {
-            try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, root_key) });
-            try tree_meta.put(alloc, "path_length", .{ .integer = 2 });
-            try tree_meta.put(alloc, "path_text", .{ .string = try std.fmt.allocPrint(alloc, "{s} > {s}", .{ root_key, node.key }) });
-        } else if (depth == 0 or std.mem.eql(u8, root_key, node.key)) {
-            try tree_meta.put(alloc, "path_length", .{ .integer = 1 });
-            try tree_meta.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, root_key) });
         }
     }
 
@@ -6226,11 +6210,10 @@ fn annotateTreeDocument(
 fn bestTreePathPrefixForNode(
     graph_paths: []const GraphPath,
     node_key: []const u8,
-) ?[]const []const u8 {
-    var best: ?[]const []const u8 = null;
+) ?[]const indexes_openapi.GraphPathEndpoint {
+    var best: ?[]const indexes_openapi.GraphPathEndpoint = null;
     for (graph_paths) |path| {
-        const nodes = path.nodes orelse continue;
-        const prefix = treePathPrefixForNode(nodes, node_key) orelse continue;
+        const prefix = treePathPrefixForNode(path.nodes, node_key) orelse continue;
         if (best == null or prefix.len > best.?.len) best = prefix;
     }
     return best;
@@ -6239,10 +6222,10 @@ fn bestTreePathPrefixForNode(
 fn bestTreeBranchPathForNode(
     graph_paths: []const GraphPath,
     node_key: []const u8,
-) ?[]const []const u8 {
-    var best: ?[]const []const u8 = null;
+) ?[]const indexes_openapi.GraphPathEndpoint {
+    var best: ?[]const indexes_openapi.GraphPathEndpoint = null;
     for (graph_paths) |path| {
-        const nodes = path.nodes orelse continue;
+        const nodes = path.nodes;
         if (treePathPrefixForNode(nodes, node_key) == null) continue;
         if (best == null or nodes.len > best.?.len) best = nodes;
     }
@@ -6250,13 +6233,50 @@ fn bestTreeBranchPathForNode(
 }
 
 fn treePathPrefixForNode(
-    path_nodes: []const []const u8,
+    path_nodes: []const indexes_openapi.GraphPathEndpoint,
     node_key: []const u8,
-) ?[]const []const u8 {
+) ?[]const indexes_openapi.GraphPathEndpoint {
     for (path_nodes, 0..) |segment, i| {
-        if (std.mem.eql(u8, segment, node_key)) return path_nodes[0 .. i + 1];
+        if (std.mem.eql(u8, segment.key, node_key)) return path_nodes[0 .. i + 1];
     }
     return null;
+}
+
+fn putTreePathMetadata(
+    alloc: std.mem.Allocator,
+    tree_meta: *std.json.ObjectMap,
+    path: anytype,
+    branch_path: anytype,
+    node_key: []const u8,
+) !void {
+    if (path.len >= 1) {
+        try tree_meta.put(alloc, "root", .{ .string = try alloc.dupe(u8, treePathSegmentKey(path[0])) });
+    }
+    if (path.len >= 2) {
+        try tree_meta.put(alloc, "parent", .{ .string = try alloc.dupe(u8, treePathSegmentKey(path[path.len - 2])) });
+    }
+    try tree_meta.put(alloc, "path_length", .{ .integer = @intCast(path.len) });
+    try tree_meta.put(alloc, "path_text", .{ .string = try treePathTextAlloc(alloc, path) });
+    if (branch_path.len > 0) {
+        try tree_meta.put(alloc, "branch_path_length", .{ .integer = @intCast(branch_path.len) });
+        try tree_meta.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, treePathSegmentKey(branch_path[branch_path.len - 1]), node_key) });
+        try tree_meta.put(alloc, "branch_path_text", .{ .string = try treePathTextAlloc(alloc, branch_path) });
+    }
+}
+
+fn treePathTextAlloc(alloc: std.mem.Allocator, path: anytype) ![]u8 {
+    var text = std.ArrayListUnmanaged(u8).empty;
+    errdefer text.deinit(alloc);
+    for (path, 0..) |segment, i| {
+        if (i != 0) try text.appendSlice(alloc, " > ");
+        try text.appendSlice(alloc, treePathSegmentKey(segment));
+    }
+    return try text.toOwnedSlice(alloc);
+}
+
+fn treePathSegmentKey(segment: anytype) []const u8 {
+    if (comptime @hasField(@TypeOf(segment), "key")) return segment.key;
+    return segment;
 }
 
 fn extractTreeFallbackRootKey(
@@ -7220,7 +7240,12 @@ test "annotate tree document prefers graph path branch metadata" {
     try document.put(alloc, "title", .{ .string = try alloc.dupe(u8, "child") });
 
     const paths = [_]GraphPath{
-        .{ .nodes = &[_][]const u8{ "doc:root", "doc:child", "doc:leaf" } },
+        .{
+            .nodes = &.{ .{ .key = "doc:root" }, .{ .key = "doc:child" }, .{ .key = "doc:leaf" } },
+            .edges = &.{},
+            .total_weight = 2,
+            .length = 2,
+        },
     };
     const annotated = try annotateTreeDocument(
         alloc,
@@ -7251,8 +7276,8 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
         \\],"paths":[
-        \\{"nodes":["doc:root","doc:a","doc:a:leaf"]},
-        \\{"nodes":["doc:root","doc:b"]}
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:a"},{"key":"doc:a:leaf"}],"edges":[],"total_weight":2,"length":2},
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:b"}],"edges":[],"total_weight":1,"length":1}
         \\],"stats":{"returned_items":3,"truncated":false},"took":1}}}]}
     ;
 

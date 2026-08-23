@@ -5332,7 +5332,7 @@ fn toOpenApiGraphQueryResult(
     }
 
     const nodes = try toOpenApiGraphNodes(alloc, graph_result);
-    const paths = try toOpenApiPaths(alloc, graph_result.paths);
+    const paths = try toOpenApiGraphPaths(alloc, graph_result.paths);
     const response: indexes_openapi.GraphNodesResult = .{
         .kind = "nodes",
         .nodes = nodes,
@@ -5598,6 +5598,44 @@ test "deprecated graph search preserves its response envelope" {
     try std.testing.expectEqual(@as(i64, 12), legacy.total);
 }
 
+test "canonical graph paths preserve table-qualified node identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var path_nodes = [_][]const u8{ "doc:a", "shared" };
+    var node_tables = [_]?[]const u8{ null, "entities" };
+    var paths = [_]db_mod.types.GraphPath{.{
+        .nodes = &path_nodes,
+        .node_tables = &node_tables,
+        .edges = &.{},
+        .total_weight = 1,
+        .length = 1,
+    }};
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .shortest_path,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .target_nodes = .{ .identities = &.{.{ .key = "shared", .table = "entities" }} },
+    };
+    const graph_result = db_mod.types.GraphSearchResult{
+        .name = @constCast("path"),
+        .paths = &paths,
+        .hits = &.{},
+        .total_hits = 1,
+    };
+
+    const canonical = try toOpenApiGraphQueryResult(alloc, query, .{}, graph_result);
+    try std.testing.expect(canonical == .graph_nodes_result);
+    try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].nodes[1].key);
+    try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].nodes[1].table.?);
+
+    var legacy_query = query;
+    legacy_query.legacy_response = true;
+    const legacy = try toOpenApiGraphQueryResult(alloc, legacy_query, .{}, graph_result);
+    try std.testing.expect(legacy == .legacy_graph_query_result);
+    try std.testing.expectEqualStrings("shared", legacy.legacy_graph_query_result.paths.?[0].nodes.?[1]);
+}
+
 test "generated graph result union decodes pre-discriminator legacy responses" {
     const raw =
         \\{"type":"neighbors","total":12}
@@ -5673,6 +5711,32 @@ fn toOpenApiPaths(
     for (paths, 0..) |path, i| {
         out[i] = .{
             .nodes = path.nodes,
+            .edges = try toOpenApiPathEdges(alloc, path.edges),
+            .total_weight = path.total_weight,
+            .length = @intCast(path.length),
+        };
+    }
+    return out;
+}
+
+fn toOpenApiGraphPaths(
+    alloc: std.mem.Allocator,
+    paths: []const db_mod.types.GraphPath,
+) ![]const indexes_openapi.GraphPath {
+    const out = try alloc.alloc(indexes_openapi.GraphPath, paths.len);
+    for (paths, 0..) |path, i| {
+        if (path.node_tables.len != 0 and path.node_tables.len != path.nodes.len) {
+            return error.InvalidRemoteResponse;
+        }
+        const nodes = try alloc.alloc(indexes_openapi.GraphPathEndpoint, path.nodes.len);
+        for (path.nodes, 0..) |key, node_index| {
+            nodes[node_index] = .{
+                .key = key,
+                .table = if (path.node_tables.len == 0) null else path.node_tables[node_index],
+            };
+        }
+        out[i] = .{
+            .nodes = nodes,
             .edges = try toOpenApiPathEdges(alloc, path.edges),
             .total_weight = path.total_weight,
             .length = @intCast(path.length),

@@ -85,6 +85,7 @@ pub const FieldStatistics = types.FieldStatistics;
 pub const ForeignColumn = types.ForeignColumn;
 pub const ForeignSource = types.ForeignSource;
 pub const GraphAnchorFilterRequiresIndexError = types.GraphAnchorFilterRequiresIndexError;
+pub const GraphCrossRangeModeUnsupportedError = types.GraphCrossRangeModeUnsupportedError;
 pub const GraphDistinctBudgetExceededError = types.GraphDistinctBudgetExceededError;
 pub const GraphMatchOperationLimitExceededError = types.GraphMatchOperationLimitExceededError;
 pub const HierarchyAncestor = types.HierarchyAncestor;
