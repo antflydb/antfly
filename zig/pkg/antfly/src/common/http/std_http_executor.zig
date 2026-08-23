@@ -36,6 +36,10 @@ pub const StdHttpExecutorConfig = struct {
     /// connection cancels the remaining attempts. This transport avoids that
     /// cancellation path and is required for long-lived HA replication loops.
     resolve_before_connect: bool = false,
+    /// Retain a successfully connected DNS result across requests. Keep this
+    /// disabled for Kubernetes headless Services: an old Pod can remain
+    /// connectable after the Service authority has moved to a new endpoint.
+    cache_resolved_addresses: bool = false,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -268,7 +272,7 @@ pub const StdHttpExecutor = struct {
             .redirect_policy = .{ .follow_redirects = false },
             .max_response_size = cfg.max_response_bytes,
             .keep_alive = false,
-            .cache_resolved_addresses = true,
+            .cache_resolved_addresses = cfg.cache_resolved_addresses,
         };
     }
 
@@ -599,6 +603,16 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "resolved executor does not retain DNS authority unless explicitly enabled" {
+    try std.testing.expect(!StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+    }).cache_resolved_addresses);
+    try std.testing.expect(StdHttpExecutor.resolvedClientConfig(.{
+        .resolve_before_connect = true,
+        .cache_resolved_addresses = true,
+    }).cache_resolved_addresses);
 }
 
 test "std http executor owns a finite controlled request worker budget" {

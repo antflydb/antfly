@@ -4642,6 +4642,11 @@ pub const DataServer = struct {
         return .{
             .max_response_bytes = ha_replication_default_max_response_bytes,
             .resolve_before_connect = true,
+            // The upstream is a Kubernetes headless Service. Resolve every
+            // bounded replication request so Pod replacement, fencing, and
+            // endpoint-based isolation take effect even while the old Pod is
+            // still reachable by its former IP.
+            .cache_resolved_addresses = false,
         };
     }
 
@@ -28452,6 +28457,7 @@ test "data runtime HA replication HTTP budget covers base64 apply envelope" {
     );
     try std.testing.expect(cfg.max_response_bytes >= encoded_batch_bytes + 64 * 1024);
     try std.testing.expect(cfg.resolve_before_connect);
+    try std.testing.expect(!cfg.cache_resolved_addresses);
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {
