@@ -20,6 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const metric_segment = @import("../graph_metric_segment/mod.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const runtime_mod = @import("runtime.zig");
 
 pub const Limits = struct {
@@ -27,6 +28,47 @@ pub const Limits = struct {
     max_scores_scanned: usize = 1_000_000,
     max_result_bytes: usize = 64 * 1024 * 1024,
 };
+
+pub const RejectionDiagnostic = struct {
+    graph_index_name: [256]u8 = undefined,
+    graph_index_name_len: u16 = 0,
+    metric_name: [128]u8 = undefined,
+    metric_name_len: u8 = 0,
+    materializer_fingerprint: u64 = 0,
+    reason: metric_segment.RejectionReason = .none,
+
+    pub fn graphIndexName(self: *const RejectionDiagnostic) []const u8 {
+        return self.graph_index_name[0..self.graph_index_name_len];
+    }
+
+    pub fn metricName(self: *const RejectionDiagnostic) []const u8 {
+        return self.metric_name[0..self.metric_name_len];
+    }
+};
+
+threadlocal var last_rejection: ?RejectionDiagnostic = null;
+
+pub fn clearLastRejectionDiagnostic() void {
+    last_rejection = null;
+}
+
+pub fn peekLastRejectionDiagnostic() ?RejectionDiagnostic {
+    return last_rejection;
+}
+
+fn recordRejectionDiagnostic(segment: metric_segment.Segment) void {
+    var diagnostic = RejectionDiagnostic{
+        .materializer_fingerprint = segment.materializer_fingerprint,
+        .reason = segment.rejection_reason,
+    };
+    const graph_len = @min(segment.graph_index_name.len, diagnostic.graph_index_name.len);
+    @memcpy(diagnostic.graph_index_name[0..graph_len], segment.graph_index_name[0..graph_len]);
+    diagnostic.graph_index_name_len = @intCast(graph_len);
+    const metric_len = @min(segment.metric_name.len, diagnostic.metric_name.len);
+    @memcpy(diagnostic.metric_name[0..metric_len], segment.metric_name[0..metric_len]);
+    diagnostic.metric_name_len = @intCast(metric_len);
+    last_rejection = diagnostic;
+}
 
 pub const Score = struct {
     node_id: []u8,
@@ -109,6 +151,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
 }
 
 fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8) !metric_segment.Segment {
+    clearLastRejectionDiagnostic();
     try session.checkCancellation();
     const graph_index = session.findNamedArtifactIndex(.graph_segment, graph_index_name) orelse return error.GraphSegmentNotFound;
     const graph_artifact = session.artifactRef(graph_index).?;
@@ -121,8 +164,12 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     errdefer segment.deinit(alloc);
     if (!std.mem.eql(u8, segment.graph_index_name, graph_index_name) or !std.mem.eql(u8, segment.metric_name, metric_name)) return error.InvalidGraphMetricSegment;
     if (!std.mem.eql(u8, segment.source_graph_artifact_id, graph_artifact.artifact_id) or !std.mem.eql(u8, segment.source_graph_checksum, graph_artifact.checksum)) return error.MetricStale;
+    if (segment.materializer_fingerprint != graph_metric_policy.materializerFingerprint(.{})) return error.GraphMetricPolicyStale;
     if (segment.materialization_state == .rejected) return switch (segment.rejection_reason) {
-        .build_budget_exceeded => error.GraphMetricMaterializationRejected,
+        .build_budget_exceeded => {
+            recordRejectionDiagnostic(segment);
+            return error.GraphMetricMaterializationRejected;
+        },
         .none => error.InvalidGraphMetricSegment,
     };
     return segment;

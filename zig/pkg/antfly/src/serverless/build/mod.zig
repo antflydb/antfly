@@ -23,6 +23,7 @@ pub const external_source_plan_resolver_api = @import("external_source_plan_reso
 pub const external_source_publish = @import("external_source_publish.zig");
 pub const external_source_publication = @import("external_source_publication.zig");
 pub const graph_metric_config = @import("graph_metric_config.zig");
+pub const graph_metric_policy = @import("graph_metric_policy.zig");
 pub const impact_planner = @import("impact_planner.zig");
 pub const lake_gc = @import("lake_gc.zig");
 pub const lake_promotion = @import("lake_promotion.zig");

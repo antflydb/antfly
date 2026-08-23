@@ -20,6 +20,12 @@ const object_store_support = @import("../object_store_support.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const ObjectStore = struct {
+    const verified_object_cache_limit: usize = 4096;
+    const VerifiedObject = struct {
+        byte_len: u64,
+        identity: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    };
+
     alloc: std.mem.Allocator,
     client: objectstore.Client,
     fs_client: ?*objectstore.FilesystemClient = null,
@@ -28,6 +34,8 @@ pub const ObjectStore = struct {
     owns_client: bool = true,
     bucket: []u8,
     prefix: []u8,
+    verified_mu: std.atomic.Mutex = .unlocked,
+    verified_objects: std.StringHashMapUnmanaged(VerifiedObject) = .empty,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -161,6 +169,11 @@ pub const ObjectStore = struct {
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        lockAtomic(&self.verified_mu);
+        var verified_it = self.verified_objects.keyIterator();
+        while (verified_it.next()) |key| self.alloc.free(key.*);
+        self.verified_objects.deinit(self.alloc);
+        self.verified_mu.unlock();
         if (self.owns_client) self.client.deinit();
         if (self.fs_client) |fs| self.alloc.destroy(fs);
         if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
@@ -186,8 +199,13 @@ pub const ObjectStore = struct {
         const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
         defer self.alloc.free(key);
 
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
+        var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
+        const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
         var result = try self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
+            .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
         });
         defer result.deinit(self.client.allocator);
 
@@ -312,6 +330,19 @@ pub const ObjectStore = struct {
             }
         }
 
+        const identity = metadataIdentity(meta);
+        if (identity) |value| {
+            lockAtomic(&self.verified_mu);
+            if (self.verified_objects.get(artifact_id)) |cached| {
+                if (cached.byte_len == expected_byte_len and std.mem.eql(u8, &cached.identity, &value)) {
+                    self.verified_mu.unlock();
+                    try cancellation.check();
+                    return;
+                }
+            }
+            self.verified_mu.unlock();
+        }
+
         // Providers without a comparable SHA-256 metadata checksum are read in
         // bounded ranges pinned to the provider identity when one is exposed.
         // The final digest is authoritative and memory remains O(1).
@@ -339,6 +370,9 @@ pub const ObjectStore = struct {
         const actual = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
         try cancellation.check();
+        // Integrity verification must not fail merely because this bounded,
+        // best-effort optimization cannot allocate a cache entry.
+        if (identity) |value| self.rememberVerifiedObject(artifact_id, expected_byte_len, value) catch {};
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
@@ -346,6 +380,26 @@ pub const ObjectStore = struct {
         const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        if (self.verified_objects.fetchRemove(artifact_id)) |removed| self.alloc.free(removed.key);
+    }
+
+    fn rememberVerifiedObject(self: *ObjectStore, artifact_id: []const u8, byte_len: u64, identity: [32]u8) !void {
+        const owned_id = try self.alloc.dupe(u8, artifact_id);
+        errdefer self.alloc.free(owned_id);
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        if (!self.verified_objects.contains(artifact_id) and self.verified_objects.count() >= verified_object_cache_limit) {
+            var iterator = self.verified_objects.keyIterator();
+            if (iterator.next()) |victim| {
+                const removed = self.verified_objects.fetchRemove(victim.*).?;
+                self.alloc.free(removed.key);
+            }
+        }
+        const gop = try self.verified_objects.getOrPut(self.alloc, owned_id);
+        if (gop.found_existing) self.alloc.free(owned_id) else gop.key_ptr.* = owned_id;
+        gop.value_ptr.* = .{ .byte_len = byte_len, .identity = identity };
     }
 
     const vtable: artifact_store.ArtifactStore.VTable = .{
@@ -449,6 +503,42 @@ fn sha256StringAlloc(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
 
 fn makeArtifactIdAlloc(alloc: std.mem.Allocator, checksum: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
+}
+
+fn metadataIdentity(meta: objectstore.ObjectMetadata) ?[std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var has_identity = false;
+    if (meta.version_id) |value| {
+        hashIdentityField(&hasher, 1, value);
+        has_identity = true;
+    }
+    if (meta.etag) |value| {
+        hashIdentityField(&hasher, 2, value);
+        has_identity = true;
+    }
+    if (meta.checksum) |checksum| {
+        var algorithm: u64 = @intFromEnum(checksum.algorithm);
+        var checksum_type: u64 = @intFromEnum(checksum.checksum_type);
+        hashIdentityField(&hasher, 3, std.mem.asBytes(&algorithm));
+        hashIdentityField(&hasher, 4, std.mem.asBytes(&checksum_type));
+        hashIdentityField(&hasher, 5, checksum.value);
+        has_identity = true;
+    }
+    if (!has_identity) return null;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashIdentityField(hasher: *std.crypto.hash.sha2.Sha256, tag: u8, value: []const u8) void {
+    hasher.update(&.{tag});
+    var len: u64 = value.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(value);
+}
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn keyForChecksumAlloc(alloc: std.mem.Allocator, prefix: []const u8, checksum: []const u8) ![]u8 {
@@ -556,6 +646,99 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
         error.ArtifactIntegrityMismatch,
         store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none),
     );
+}
+
+test "serverless objectstore verification caches immutable provider identities" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    const EtagOnlyClient = struct {
+        inner: objectstore.Client,
+
+        fn client(self: *@This()) objectstore.Client {
+            return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable: objectstore.Client.VTable = .{
+            .deinit = deinit,
+            .bucket_exists = bucketExists,
+            .make_bucket = makeBucket,
+            .put_object = putObject,
+            .get_object = getObject,
+            .get_object_attributes = getObjectAttributes,
+            .stat_object = statObject,
+            .stat_object_with_options = statObjectWithOptions,
+            .delete_object = deleteObject,
+            .list_objects = listObjects,
+        };
+
+        fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+
+        fn from(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn bucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+            return try from(ptr).inner.bucketExists(bucket);
+        }
+
+        fn makeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+            try from(ptr).inner.makeBucket(bucket);
+        }
+
+        fn putObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {
+            return try from(ptr).inner.putObject(bucket, key, body, options);
+        }
+
+        fn getObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.GetOptions) !objectstore.GetResult {
+            return try from(ptr).inner.getObject(bucket, key, options);
+        }
+
+        fn getObjectAttributes(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8) !objectstore.ObjectAttributes {
+            return try from(ptr).inner.getObjectAttributes(bucket, key);
+        }
+
+        fn etagOnly(metadata: *objectstore.ObjectMetadata, metadata_alloc: std.mem.Allocator) void {
+            if (metadata.checksum) |*checksum| checksum.deinit(metadata_alloc);
+            metadata.checksum = null;
+        }
+
+        fn statObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8) !objectstore.ObjectMetadata {
+            const self = from(ptr);
+            var metadata = try self.inner.statObject(bucket, key);
+            etagOnly(&metadata, self.inner.allocator);
+            return metadata;
+        }
+
+        fn statObjectWithOptions(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.StatOptions) !objectstore.ObjectMetadata {
+            const self = from(ptr);
+            var metadata = try self.inner.statObjectWithOptions(bucket, key, options);
+            etagOnly(&metadata, self.inner.allocator);
+            return metadata;
+        }
+
+        fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, options: objectstore.DeleteOptions) !void {
+            try from(ptr).inner.deleteObject(bucket, key, options);
+        }
+
+        fn listObjects(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, options: objectstore.ListOptions) !objectstore.ListResult {
+            return try from(ptr).inner.listObjects(bucket, options);
+        }
+    };
+
+    var etag_only = EtagOnlyClient{ .inner = memory.client() };
+    var impl = try ObjectStore.initWithClient(alloc, etag_only.client(), "bucket", "tenant/cache");
+    var store = impl.artifactStore();
+    defer store.deinit();
+
+    var metadata = try store.put("verify-once");
+    defer metadata.deinit(alloc);
+    memory.resetOperationCount();
+    try store.verifyContentWithCancellationUsingAllocator(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
+    try store.verifyContentWithCancellationUsingAllocator(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
+    try std.testing.expectEqual(@as(u64, 3), memory.operationCount());
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {

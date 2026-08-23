@@ -193,6 +193,7 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
+        GraphMetricConfigurationLimitExceeded,
         ProbeUnavailable,
         ModelNotFound,
         Backpressured,
@@ -775,6 +776,31 @@ pub fn graphMetricMaterializationRejectedBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphMetricMaterializationRejectedBodyWithContext(
+    alloc: std.mem.Allocator,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    materializer_fingerprint: u64,
+) ![]u8 {
+    const policy = try std.fmt.allocPrint(alloc, "{x:0>16}", .{materializer_fingerprint});
+    defer alloc.free(policy);
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "graph metric '{s}' on index '{s}' exceeded the current serverless materialization policy; narrow the graph or edge filter, or change the metric configuration to rebuild",
+        .{ metric_name, graph_index_name },
+    );
+    defer alloc.free(message);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_materialization_rejected",
+        .message = message,
+        .reason = "build_budget_exceeded",
+        .retryable = false,
+        .graph_index_name = graph_index_name,
+        .metric_name = metric_name,
+        .materializer_fingerprint = policy,
+    }, .{});
+}
+
 test "multi-shard graph metric rejection is actionable and non-retryable" {
     const encoded = try graphMetricGlobalMaterializationRequiredBody(std.testing.allocator);
     defer std.testing.allocator.free(encoded);
@@ -803,6 +829,18 @@ test "serverless graph metric build-budget rejection is actionable and non-retry
     try std.testing.expectEqualStrings("build_budget_exceeded", parsed.value.reason);
     try std.testing.expect(!parsed.value.retryable);
     try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "narrow the graph") != null);
+
+    const contextual = try graphMetricMaterializationRejectedBodyWithContext(std.testing.allocator, "graph_idx", "pagerank", 0x1234);
+    defer std.testing.allocator.free(contextual);
+    const contextual_parsed = try std.json.parseFromSlice(struct {
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: []const u8,
+    }, std.testing.allocator, contextual, .{ .ignore_unknown_fields = true });
+    defer contextual_parsed.deinit();
+    try std.testing.expectEqualStrings("graph_idx", contextual_parsed.value.graph_index_name);
+    try std.testing.expectEqualStrings("pagerank", contextual_parsed.value.metric_name);
+    try std.testing.expectEqualStrings("0000000000001234", contextual_parsed.value.materializer_fingerprint);
 }
 
 test "public table query maps multi-shard graph metric rejection" {
@@ -1408,6 +1446,7 @@ pub fn handleTableCreateIndex(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
+        error.GraphMetricConfigurationLimitExceeded => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"graph_metric_configuration_limit_exceeded\",\"message\":\"graph metric configuration exceeds serverless limits (maximum 16 metrics, 64 edge types per filter, 128-byte metric names, and 256-byte edge type names)\",\"retryable\":false}"), .json = true },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"), .json = true },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{

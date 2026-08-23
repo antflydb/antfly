@@ -710,6 +710,7 @@ pub const HttpHandler = struct {
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
             error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 metrics, 64 edge types per filter, and 128-byte metric names)"),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -755,7 +756,9 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const body = encodeServerlessIndexListAlloc(self.alloc, table.indexes_json, status) catch |err| {
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json);
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        const body = encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("table index list encode failed table={s} err={}", .{ table_name, err });
             return error.InternalFailure;
         };
@@ -771,7 +774,9 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const body = (encodeServerlessSingleIndexAlloc(self.alloc, table.indexes_json, index_name, status) catch |err| {
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json);
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        const body = (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         }) orelse {
@@ -779,6 +784,102 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(body);
         return try jsonSliceResponse(self.alloc, 200, body);
+    }
+
+    fn graphMetricIndexStatusesAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        indexes_json: []const u8,
+    ) ![]ServerlessGraphMetricStatus {
+        const specs = try build_mod.graph_metric_config.parseIndexSpecsAlloc(self.alloc, indexes_json);
+        defer build_mod.graph_metric_config.freeIndexSpecs(self.alloc, specs);
+        var status_count: usize = 0;
+        for (specs) |spec| status_count = std.math.add(usize, status_count, spec.configs.len) catch return error.OutOfMemory;
+        if (status_count == 0) return try self.alloc.alloc(ServerlessGraphMetricStatus, 0);
+
+        const statuses = try self.alloc.alloc(ServerlessGraphMetricStatus, status_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(self.alloc);
+            self.alloc.free(statuses);
+        }
+
+        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (namespace) |value| self.alloc.free(value);
+        var maybe_session: ?query_mod.QuerySession = if (namespace) |value|
+            self.query.openHeadSession(value) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (maybe_session) |*session| session.deinit();
+
+        for (specs) |spec| {
+            for (spec.configs) |config| {
+                const owned_index_name = try self.alloc.dupe(u8, spec.index_name);
+                var index_name_moved = false;
+                errdefer if (!index_name_moved) self.alloc.free(owned_index_name);
+                const owned_metric_name = try self.alloc.dupe(u8, config.name);
+                var metric_name_moved = false;
+                errdefer if (!metric_name_moved) self.alloc.free(owned_metric_name);
+                var status = ServerlessGraphMetricStatus{
+                    .index_name = owned_index_name,
+                    .metric_name = owned_metric_name,
+                    .kind = config.kind,
+                    .config_fingerprint = build_mod.lake_graph_metric.configFingerprint(config),
+                };
+                index_name_moved = true;
+                metric_name_moved = true;
+                var status_moved = false;
+                errdefer if (!status_moved) status.deinit(self.alloc);
+
+                if (maybe_session) |*session| {
+                    status.published_generation = session.manifest.version;
+                    const graph_index = session.findNamedArtifactIndex(.graph_segment, spec.index_name);
+                    const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(self.alloc, spec.index_name, config.name);
+                    defer self.alloc.free(artifact_name);
+                    const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name);
+                    if (graph_index != null and metric_index != null) {
+                        const metric_ref = session.artifactRef(metric_index.?).?;
+                        const prefix_len: usize = @intCast(@min(metric_ref.byte_len, 1024 * 1024));
+                        const prefix = session.fetchArtifactRangeAlloc(metric_index.?, 0, prefix_len) catch null;
+                        if (prefix) |payload| {
+                            defer self.alloc.free(payload);
+                            if (graph_metric_segment_mod.decodeHeader(payload)) |header| {
+                                const graph_ref = session.artifactRef(graph_index.?).?;
+                                status.materializer_fingerprint = header.materializer_fingerprint;
+                                const valid_identity = std.mem.eql(u8, header.graph_index_name, spec.index_name) and
+                                    std.mem.eql(u8, header.metric_name, config.name) and
+                                    header.kind == config.kind and
+                                    header.config_fingerprint == status.config_fingerprint;
+                                const valid_source = std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+                                    std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
+                                const current_policy = header.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
+                                status.state = if (!valid_identity or !valid_source or !current_policy)
+                                    .stale
+                                else switch (header.materialization_state) {
+                                    .ready => .ready,
+                                    .rejected => .rejected,
+                                };
+                                status.rejection_reason = header.rejection_reason;
+                            } else |_| {
+                                status.state = .unavailable;
+                            }
+                        } else {
+                            status.state = .unavailable;
+                        }
+                    }
+                }
+                statuses[initialized] = status;
+                initialized += 1;
+                status_moved = true;
+            }
+        }
+        return statuses;
     }
 
     fn handleCreateTableIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
@@ -809,6 +910,7 @@ pub const HttpHandler = struct {
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 metrics, 64 edge types per filter, and 128-byte metric names)"),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -2613,6 +2715,7 @@ pub const HttpHandler = struct {
 
     fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         try cancellation.check();
+        query_mod.clearLastGraphMetricRejectionDiagnostic();
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
@@ -2622,6 +2725,19 @@ pub const HttpHandler = struct {
         );
         defer resp.deinit(self.alloc);
         try cancellation.check();
+        if (resp.status == 422) {
+            if (query_mod.peekLastGraphMetricRejectionDiagnostic()) |diagnostic_value| {
+                var diagnostic = diagnostic_value;
+                const rejection_body = try public_table_http.graphMetricMaterializationRejectedBodyWithContext(
+                    self.alloc,
+                    diagnostic.graphIndexName(),
+                    diagnostic.metricName(),
+                    diagnostic.materializer_fingerprint,
+                );
+                defer self.alloc.free(rejection_body);
+                return try jsonSliceResponse(self.alloc, 422, rejection_body);
+            }
+        }
         return switch (resp.status) {
             200 => try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
@@ -4998,6 +5114,7 @@ pub const HttpHandler = struct {
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.FileNotFound, error.GraphSegmentNotFound, error.MetricNotReady => return error.NotFound,
+            error.GraphMetricPolicyStale => return error.IndexRebuilding,
             error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -5075,7 +5192,9 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        return encodeServerlessIndexListAlloc(self.alloc, table.indexes_json, status) catch return error.InternalFailure;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json) catch return error.InternalFailure;
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        return encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch return error.InternalFailure;
     }
 
     fn executePublicTableGetIndex(
@@ -5091,7 +5210,9 @@ pub const HttpHandler = struct {
         defer table.deinit(self.alloc);
         var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
         defer status.deinit(self.alloc);
-        return (encodeServerlessSingleIndexAlloc(self.alloc, table.indexes_json, index_name, status) catch return error.InternalFailure) orelse error.NotFound;
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json) catch return error.InternalFailure;
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        return (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch return error.InternalFailure) orelse error.NotFound;
     }
 
     fn executePublicTableCreateIndex(
@@ -5152,6 +5273,7 @@ pub const HttpHandler = struct {
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
             error.UnsupportedCreateTableRequest, error.UnsupportedGraphMetricRefreshMode, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
+            error.GraphMetricConfigurationLimitExceeded => return error.GraphMetricConfigurationLimitExceeded,
             else => return error.InternalFailure,
         };
         request.ensureActive() catch |err| switch (err) {
@@ -6231,10 +6353,66 @@ const ServerlessIndexStatus = struct {
     chunked_source_count: usize = 0,
 };
 
+const GraphMetricMaterializationState = enum {
+    pending,
+    ready,
+    rejected,
+    stale,
+    unavailable,
+};
+
+const ServerlessGraphMetricStatus = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    kind: graph_mod.GraphMetricKind,
+    state: GraphMetricMaterializationState = .pending,
+    rejection_reason: graph_metric_segment_mod.RejectionReason = .none,
+    config_fingerprint: u64,
+    materializer_fingerprint: u64 = 0,
+    published_generation: u64 = 0,
+
+    fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
+fn freeServerlessGraphMetricStatuses(alloc: Allocator, statuses: []ServerlessGraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
+
+fn graphMetricStatusesForIndex(
+    statuses: []const ServerlessGraphMetricStatus,
+    index_name: []const u8,
+) []const ServerlessGraphMetricStatus {
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (statuses, 0..) |status, i| {
+        if (!std.mem.eql(u8, status.index_name, index_name)) {
+            if (start != null) break;
+            continue;
+        }
+        if (start == null) start = i;
+        end = i + 1;
+    }
+    return if (start) |value| statuses[value..end] else &.{};
+}
+
 fn encodeServerlessIndexListAlloc(
     alloc: Allocator,
     indexes_json: []const u8,
     status: catalog_types.BuildStatus,
+) ![]u8 {
+    return try encodeServerlessIndexListWithGraphMetricsAlloc(alloc, indexes_json, status, &.{});
+}
+
+fn encodeServerlessIndexListWithGraphMetricsAlloc(
+    alloc: Allocator,
+    indexes_json: []const u8,
+    status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) ![]u8 {
     const config_map_json = try indexes_api.encodeIndexConfigMap(alloc, indexes_json);
     defer alloc.free(config_map_json);
@@ -6249,7 +6427,7 @@ fn encodeServerlessIndexListAlloc(
     while (it.next()) |entry| {
         if (!first) try out.append(alloc, ',');
         first = false;
-        try appendServerlessIndexEntry(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, status);
+        try appendServerlessIndexEntry(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, status, graph_metric_statuses);
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
@@ -6261,6 +6439,16 @@ fn encodeServerlessSingleIndexAlloc(
     index_name: []const u8,
     status: catalog_types.BuildStatus,
 ) !?[]u8 {
+    return try encodeServerlessSingleIndexWithGraphMetricsAlloc(alloc, indexes_json, index_name, status, &.{});
+}
+
+fn encodeServerlessSingleIndexWithGraphMetricsAlloc(
+    alloc: Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+    status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
+) !?[]u8 {
     const config_json = try indexes_api.encodeSingleIndexConfig(alloc, indexes_json, index_name);
     defer if (config_json) |value| alloc.free(value);
     const encoded = config_json orelse return null;
@@ -6270,7 +6458,7 @@ fn encodeServerlessSingleIndexAlloc(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendServerlessIndexEntry(alloc, &out, index_name, config, status);
+    try appendServerlessIndexEntry(alloc, &out, index_name, config, status, graph_metric_statuses);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -6280,14 +6468,16 @@ fn appendServerlessIndexEntry(
     index_name: []const u8,
     config: std.json.Value,
     status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !void {
     const config_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(config, .{})});
     defer alloc.free(config_json);
-    const runtime = try serverlessIndexStatus(index_name, config, status);
+    const index_metric_statuses = graphMetricStatusesForIndex(graph_metric_statuses, index_name);
+    const runtime = try serverlessIndexStatus(index_name, config, status, index_metric_statuses);
     try out.appendSlice(alloc, "{\"config\":");
     try out.appendSlice(alloc, config_json);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendServerlessIndexStatusJson(alloc, out, runtime);
+    try appendServerlessIndexStatusJson(alloc, out, runtime, index_metric_statuses);
     try out.appendSlice(alloc, ",\"shard_status\":{}}");
 }
 
@@ -6295,6 +6485,7 @@ fn appendServerlessIndexStatusJson(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     status: ServerlessIndexStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !void {
     try out.appendSlice(alloc, "{\"rebuilding\":");
     try out.appendSlice(alloc, if (status.rebuilding) "true" else "false");
@@ -6417,6 +6608,31 @@ fn appendServerlessIndexStatusJson(
         defer alloc.free(encoded_chunk_count);
         try out.appendSlice(alloc, encoded_chunk_count);
     }
+    if (graph_metric_statuses.len > 0) {
+        try out.appendSlice(alloc, ",\"graph_metrics\":[");
+        for (graph_metric_statuses, 0..) |metric, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const encoded_name = try std.json.Stringify.valueAlloc(alloc, metric.metric_name, .{});
+            defer alloc.free(encoded_name);
+            try out.print(
+                alloc,
+                "{{\"name\":{s},\"kind\":\"{s}\",\"state\":\"{s}\",\"config_fingerprint\":\"{x:0>16}\",\"materializer_fingerprint\":\"{x:0>16}\",\"published_generation\":{}",
+                .{
+                    encoded_name,
+                    @tagName(metric.kind),
+                    @tagName(metric.state),
+                    metric.config_fingerprint,
+                    metric.materializer_fingerprint,
+                    metric.published_generation,
+                },
+            );
+            if (metric.rejection_reason != .none) {
+                try out.print(alloc, ",\"rejection_reason\":\"{s}\"", .{@tagName(metric.rejection_reason)});
+            }
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+    }
     try out.append(alloc, '}');
 }
 
@@ -6424,6 +6640,7 @@ fn serverlessIndexStatus(
     index_name: []const u8,
     config: std.json.Value,
     status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !ServerlessIndexStatus {
     if (config != .object) return error.InvalidTableIndexMetadata;
     const kind = switch (indexes_api.inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata) {
@@ -6480,6 +6697,13 @@ fn serverlessIndexStatus(
             0
     else
         0;
+    var graph_metric_blocked = false;
+    for (graph_metric_statuses) |metric| {
+        if (metric.state != .ready) {
+            graph_metric_blocked = true;
+            break;
+        }
+    }
     const materialization_blocker: ?[]const u8 = if (std.mem.eql(u8, kind, "full_text")) blk: {
         if (full_text_action) |action| {
             if (action.chunked_source_count > 0 and status.pending_materialization_families.chunk_preview) break :blk "chunk_preview";
@@ -6495,7 +6719,10 @@ fn serverlessIndexStatus(
         if (indexUsesChunkEmbeddings(config) and status.pending_materialization_families.chunk_embeddings) break :blk "chunk_embeddings";
         if (status.pending_materialization_families.dense_vector) break :blk "dense_vector";
         break :blk null;
-    } else null;
+    } else if (std.mem.eql(u8, kind, "graph") and graph_metric_blocked)
+        "graph_metric"
+    else
+        null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
     return .{
         .rebuilding = !built and has_documents,
@@ -6593,7 +6820,7 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         else => return error.InvalidTableIndexMetadata,
     };
     const graph_metric_specs = build_mod.graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json) catch |err| switch (err) {
-        error.OutOfMemory, error.UnsupportedGraphMetricRefreshMode => return err,
+        error.OutOfMemory, error.UnsupportedGraphMetricRefreshMode, error.GraphMetricConfigurationLimitExceeded => return err,
         else => return error.InvalidTableIndexMetadata,
     };
     defer build_mod.graph_metric_config.freeIndexSpecs(alloc, graph_metric_specs);
@@ -10198,6 +10425,40 @@ fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
         .enrichment_publish_min_pending_records = 16,
         .enrichment_pipeline_version = 1,
     };
+}
+
+test "serverless graph index status exposes rejected metric policy and blocker" {
+    const alloc = std.testing.allocator;
+    const status = readyServerlessBuildStatusForSyncTest();
+    var metric_status = ServerlessGraphMetricStatus{
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .kind = .pagerank,
+        .state = .rejected,
+        .rejection_reason = .build_budget_exceeded,
+        .config_fingerprint = 0x11,
+        .materializer_fingerprint = 0x22,
+        .published_generation = 7,
+    };
+    defer metric_status.deinit(alloc);
+    const metric_statuses = [_]ServerlessGraphMetricStatus{metric_status};
+    const encoded = (try encodeServerlessSingleIndexWithGraphMetricsAlloc(
+        alloc,
+        "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"kind\":\"pagerank\"}}}}",
+        "graph_idx",
+        status,
+        &metric_statuses,
+    )).?;
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const runtime = parsed.value.object.get("status").?.object;
+    try std.testing.expect(runtime.get("materialization_blocked").?.bool);
+    try std.testing.expectEqualStrings("graph_metric", runtime.get("materialization_blocker").?.string);
+    const metric = runtime.get("graph_metrics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("rejected", metric.get("state").?.string);
+    try std.testing.expectEqualStrings("build_budget_exceeded", metric.get("rejection_reason").?.string);
+    try std.testing.expectEqualStrings("0000000000000022", metric.get("materializer_fingerprint").?.string);
 }
 
 test "http handler serves published graph query endpoints" {

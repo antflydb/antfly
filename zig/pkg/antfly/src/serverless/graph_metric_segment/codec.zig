@@ -18,15 +18,17 @@ const bounded_decode = @import("../bounded_decode.zig");
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
-pub const wire_version: u16 = 2;
+pub const wire_version: u16 = 3;
 const fixed_header_len_v1 = 4 + 2 + 1 + 1 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4;
-const fixed_header_len = fixed_header_len_v1 + 2;
+const fixed_header_len_v2 = fixed_header_len_v1 + 2;
+const fixed_header_len = fixed_header_len_v2 + 8;
 
 pub const Header = struct {
     kind: @import("../../graph/graph.zig").GraphMetricKind,
     materialization_state: types.MaterializationState,
     rejection_reason: types.RejectionReason,
     config_fingerprint: u64,
+    materializer_fingerprint: u64,
     graph_index_name: []const u8,
     metric_name: []const u8,
     source_graph_artifact_id: []const u8,
@@ -60,6 +62,7 @@ pub fn decodeHeader(data: []const u8) !Header {
     if (converged_byte > 1) return error.InvalidGraphMetricSegment;
     const iterations = try readInt(u32, data, &pos);
     const fingerprint = try readInt(u64, data, &pos);
+    const materializer_fingerprint = if (version >= 3) try readInt(u64, data, &pos) else 0;
     const delta: f64 = @bitCast(try readInt(u64, data, &pos));
     if (!std.math.isFinite(delta)) return error.InvalidGraphMetricSegment;
     switch (materialization_state) {
@@ -80,6 +83,7 @@ pub fn decodeHeader(data: []const u8) !Header {
         .materialization_state = materialization_state,
         .rejection_reason = rejection_reason,
         .config_fingerprint = fingerprint,
+        .materializer_fingerprint = materializer_fingerprint,
         .graph_index_name = graph_index_name,
         .metric_name = metric_name,
         .source_graph_artifact_id = source_graph_artifact_id,
@@ -121,6 +125,7 @@ pub fn encodeAlloc(alloc: Allocator, segment: types.Segment) ![]u8 {
     pos += 1;
     putInt(u32, data, &pos, segment.iterations_completed);
     putInt(u64, data, &pos, segment.config_fingerprint);
+    putInt(u64, data, &pos, segment.materializer_fingerprint);
     putInt(u64, data, &pos, @bitCast(segment.delta));
     putInt(u32, data, &pos, @intCast(segment.graph_index_name.len));
     putInt(u32, data, &pos, @intCast(segment.metric_name.len));
@@ -183,6 +188,10 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
     if (converged_byte > 1) return error.InvalidGraphMetricSegment;
     const iterations = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
     const fingerprint = readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment;
+    const materializer_fingerprint = if (version >= 3)
+        readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment
+    else
+        0;
     const delta: f64 = @bitCast(readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment);
     if (!std.math.isFinite(delta)) return error.InvalidGraphMetricSegment;
     const graph_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
@@ -227,7 +236,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         initialized += 1;
     }
     if (pos != data.len) return error.InvalidGraphMetricSegment;
-    var segment = types.Segment{ .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
+    var segment = types.Segment{ .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
     try validateSegment(segment);
     return segment;
@@ -342,12 +351,13 @@ test "serverless graph metric segment decodes version one artifacts as ready" {
         .scores = try alloc.alloc(types.Score, 0),
     };
     defer segment.deinit(alloc);
-    const version_two = try encodeAlloc(alloc, segment);
-    defer alloc.free(version_two);
-    const version_one = try alloc.alloc(u8, version_two.len - 2);
+    const version_three = try encodeAlloc(alloc, segment);
+    defer alloc.free(version_three);
+    const version_one = try alloc.alloc(u8, version_three.len - 10);
     defer alloc.free(version_one);
-    @memcpy(version_one[0..7], version_two[0..7]);
-    @memcpy(version_one[7..], version_two[9..]);
+    @memcpy(version_one[0..7], version_three[0..7]);
+    @memcpy(version_one[7..20], version_three[9..22]);
+    @memcpy(version_one[20..], version_three[30..]);
     std.mem.writeInt(u16, version_one[4..6], 1, .little);
 
     const header = try decodeHeader(version_one);
@@ -357,4 +367,15 @@ test "serverless graph metric segment decodes version one artifacts as ready" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(types.MaterializationState.ready, decoded.materialization_state);
     try std.testing.expectEqual(types.RejectionReason.none, decoded.rejection_reason);
+    try std.testing.expectEqual(@as(u64, 0), decoded.materializer_fingerprint);
+
+    const version_two = try alloc.alloc(u8, version_three.len - 8);
+    defer alloc.free(version_two);
+    @memcpy(version_two[0..22], version_three[0..22]);
+    @memcpy(version_two[22..], version_three[30..]);
+    std.mem.writeInt(u16, version_two[4..6], 2, .little);
+    var decoded_v2 = try decodeAlloc(alloc, version_two);
+    defer decoded_v2.deinit(alloc);
+    try std.testing.expectEqual(types.MaterializationState.ready, decoded_v2.materialization_state);
+    try std.testing.expectEqual(@as(u64, 0), decoded_v2.materializer_fingerprint);
 }

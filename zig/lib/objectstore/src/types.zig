@@ -128,6 +128,10 @@ pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
+    /// Optional full-object SHA-256 supplied by callers that already hashed
+    /// the body. S3-compatible implementations persist this as provider
+    /// checksum metadata so later integrity checks remain metadata-only.
+    checksum_sha256_base64: ?[]const u8 = null,
 };
 
 pub const GetOptions = struct {

@@ -46,6 +46,10 @@ pub const Segment = struct {
     source_graph_artifact_id: []u8,
     source_graph_checksum: []u8,
     config_fingerprint: u64,
+    /// Identifies the implementation and admission policy that produced this
+    /// artifact. A changed runtime policy invalidates terminal rejections and
+    /// safely causes a rebuild without user configuration churn.
+    materializer_fingerprint: u64 = 0,
     materialization_state: MaterializationState = .ready,
     rejection_reason: RejectionReason = .none,
     edge_filter: graph_mod.GraphMetricEdgeFilter,

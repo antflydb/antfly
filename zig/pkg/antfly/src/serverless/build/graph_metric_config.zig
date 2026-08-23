@@ -19,6 +19,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("../../graph/graph.zig");
+const graph_metric_policy = @import("graph_metric_policy.zig");
 
 pub const IndexSpec = struct {
     index_name: []u8,
@@ -147,6 +148,7 @@ pub fn parseMetricConfigsAlloc(alloc: Allocator, index: std.json.Value) ![]graph
         }
     }.lessThan);
     try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs.items);
+    try graph_metric_policy.validateConfigs(configs.items, .{});
     return try configs.toOwnedSlice(alloc);
 }
 

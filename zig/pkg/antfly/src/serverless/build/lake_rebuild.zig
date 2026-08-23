@@ -605,6 +605,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 spec.configs,
                 .none,
                 .build_budget_exceeded,
+                .{},
             ),
             else => return err,
         };
@@ -1274,8 +1275,12 @@ fn graphMetricBindingHashAlloc(
 ) ![]u8 {
     return try std.fmt.allocPrint(
         alloc,
-        "graph-metric-v1:{x}:{s}",
-        .{ lake_graph_metric.configFingerprint(config), graph_artifact_id },
+        "graph-metric-v2:{x}:{x}:{s}",
+        .{
+            lake_graph_metric.configFingerprint(config),
+            lake_graph_metric.materializerFingerprint(.{}),
+            graph_artifact_id,
+        },
     );
 }
 
@@ -1303,6 +1308,7 @@ fn graphMetricArtifactReusable(
         std.mem.eql(u8, header.metric_name, config.name) and
         header.kind == config.kind and
         header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
+        header.materializer_fingerprint == lake_graph_metric.materializerFingerprint(.{}) and
         std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
         std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
