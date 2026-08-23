@@ -6108,21 +6108,21 @@ func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves
 	}
 }
 
-func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
+func TestFullReconcileDoesNotOwnKubernetesLeaseRenewalClock(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 
-	if got, want := periodicRequeueAfter(cluster), 10*time.Second/3; got != want {
-		t.Fatalf("expected HA lease renewal requeue %s, got %s", want, got)
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("expected dedicated Lease controller to own renewal, full reconcile requeue=%s", got)
 	}
 
 	cluster.Spec.DataNodes.AutoScaling = &antflyv1.AutoScalingSpec{Enabled: true}
-	if got, want := periodicRequeueAfter(cluster), 10*time.Second/3; got != want {
-		t.Fatalf("expected HA lease requeue to win over autoscaling, got %s", got)
+	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
+		t.Fatalf("expected only the independent autoscaling cadence, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds = 18
-	if got, want := periodicRequeueAfter(cluster), 6*time.Second; got != want {
-		t.Fatalf("expected configured watchdog grace to derive renewal cadence %s, got %s", want, got)
+	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
+		t.Fatalf("watchdog grace must not change the full reconcile cadence, got %s", got)
 	}
 
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{Enabled: false}

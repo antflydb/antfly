@@ -370,18 +370,32 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 	if !gate.RuntimeEligible {
 		return false, "DeclarativelySuspended"
 	}
+	if cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return false, "ActivationReceiptNotObserved"
+	}
+	return haStartupGateActivationReceiptMatches(cluster, pvc, cluster.Status.HAStatus.StartupGate.ActivationReceipt)
+}
+
+func haStartupGateActivationReceiptMatches(
+	cluster *antflyv1.AntflyCluster,
+	pvc *corev1.PersistentVolumeClaim,
+	receipt *antflyv1.HASeedActivationReceiptStatus,
+) (bool, string) {
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil {
+		return false, "NotConfigured"
+	}
 	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
 		return false, "UnsupportedPolicy"
 	}
 	if pvc == nil || strings.TrimSpace(string(pvc.UID)) == "" {
 		return false, "TargetPVCNotObserved"
 	}
-	if cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
-		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+	if receipt == nil {
 		return false, "ActivationReceiptNotObserved"
 	}
 	required := *gate.RequiredReceipt
-	receipt := cluster.Status.HAStatus.StartupGate.ActivationReceipt
 	if receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
 		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
 		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
@@ -408,6 +422,11 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
 		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
 		return false, "ActivationReceiptDigestMismatch"
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
+		receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+		return false, "ActivationReceiptReplicationIdentityMismatch"
 	}
 	return true, "ExactActivationReceiptMatched"
 }
@@ -2927,9 +2946,10 @@ func periodicRequeueAfterAt(cluster *antflyv1.AntflyCluster, now time.Time) time
 	if effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Status.MetadataTopologyReplicas > 0 {
 		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
 	}
-	if haKubernetesLeaseRenewalEnabled(cluster) {
-		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter(cluster))
-	}
+	// Kubernetes Lease renewal has its own narrow controller and fixed cadence.
+	// Putting that clock on the full reconciler turns every renewal into an
+	// expensive status/seed observation cycle and can starve the very watchdog
+	// proof that keeps the primary authoritative.
 	// A suspended seeded runtime has no Pod, Job, or Lease event of its own
 	// after the primary checkpoints the final receipt. Re-observe peer status
 	// until Colony accepts that exact receipt and opens the declarative gate;
@@ -5555,6 +5575,10 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 		}
 		return
 	}
+	var previousReceipt *antflyv1.HASeedActivationReceiptStatus
+	if cluster.Status.HAStatus.StartupGate != nil && cluster.Status.HAStatus.StartupGate.ActivationReceipt != nil {
+		previousReceipt = cluster.Status.HAStatus.StartupGate.ActivationReceipt.DeepCopy()
+	}
 	status := &antflyv1.HAStartupGateStatus{Reason: "ActivationReceiptNotObserved"}
 	cluster.Status.HAStatus.StartupGate = status
 	if gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
@@ -5656,6 +5680,22 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 			status.Reason = reason
 			return
 		}
+	}
+	// Once the operator has validated a materialized receipt, keep that exact
+	// receipt available after the primary's bounded action history advances.
+	// Revalidate it against the current declarative identity and live PVC on
+	// every pass; a topology, digest, or PVC-incarnation change still closes the
+	// gate. Without this monotonic handoff, the standby can start, lose its peer
+	// receipt on the next observation, and be suspended again indefinitely.
+	if eligible, reason := haStartupGateActivationReceiptMatches(cluster, pvc, previousReceipt); eligible {
+		status.ActivationReceipt = previousReceipt
+		status.RuntimeEligible = gate.RuntimeEligible
+		if gate.RuntimeEligible {
+			status.Reason = reason
+		} else {
+			status.Reason = "DeclarativelySuspended"
+		}
+		return
 	}
 	if !gate.RuntimeEligible {
 		status.Reason = "DeclarativelySuspended"

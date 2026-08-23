@@ -14417,6 +14417,7 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 			"activationReceipt": {
 				"topologyID": "test-standalone", "topologyGeneration": 3,
 				"nodeID": "standby-a", "slotName": "standby-a", "generation": "prod-standby-a-10",
+				"clusterID": 100, "timelineID": 1, "epoch": 1,
 				"manifestID": "manifest-standby-a-10", "targetPVCName": "standby-a-data", "targetPVCUID": "pvc-uid-1",
 				"checkpointLSN": 12, "manifestSHA256": %q, "aggregateSHA256": %q, "seedReceiptSHA256": %q,
 				"captureReceiptSHA256": %q, "materializedReceiptSHA256": %q, "materializedAggregateSHA256": %q,
@@ -14589,6 +14590,27 @@ func TestUpdateHAStartupGateStatusObservesActivationReceiptFromPrimaryCR(t *test
 	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
 	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
 	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID).To(Equal("pvc-uid-1"))
+
+	// The primary bounds completed action history. Once this standby has
+	// validated the exact materialized receipt, losing the peer copy must not
+	// oscillate the declarative startup gate closed.
+	primaryWithoutActions := primary.DeepCopy()
+	primaryWithoutActions.Status.HAStatus.PlannedActions = nil
+	reconciler.Client = fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(target.DeepCopy(), primaryWithoutActions, pvc.DeepCopy()).
+		Build()
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeTrue())
+	g.Expect(target.Status.HAStatus.StartupGate.Reason).To(Equal("ExactActivationReceiptMatched"))
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).NotTo(BeNil())
+
+	// A replacement volume never inherits the old receipt even when the logical
+	// PVC name is unchanged.
+	target.Status.HAStatus.StartupGate.ActivationReceipt.TargetPVCUID = "stale-pvc-uid"
+	reconciler.updateHAStartupGateStatus(context.Background(), target)
+	g.Expect(target.Status.HAStatus.StartupGate.RuntimeEligible).To(BeFalse())
+	g.Expect(target.Status.HAStatus.StartupGate.ActivationReceipt).To(BeNil())
 }
 
 func TestUpdateHAStartupGateStatusSkipsUnrelatedReceiptCollision(t *testing.T) {
