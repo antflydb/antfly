@@ -713,6 +713,52 @@ pub fn artifactRepairIssueKeyAlloc(
     return try list.toOwnedSlice(alloc);
 }
 
+pub const ArtifactRepairIssueKeyParts = struct {
+    index_name: []u8,
+    repair_artifact_kind: []u8,
+    issue_id: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.repair_artifact_kind);
+        alloc.free(self.issue_id);
+        self.* = undefined;
+    }
+};
+
+/// Decode the authoritative identity embedded in a primary repair-issue key.
+/// Cleanup uses this when the value is malformed, so callers never have to
+/// trust corrupt payload fields to locate secondary or completion metadata.
+pub fn artifactRepairIssueKeyPartsAlloc(
+    alloc: Allocator,
+    key: []const u8,
+) !ArtifactRepairIssueKeyParts {
+    const prefix = [_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+
+    var pos = prefix.len;
+    const index_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const index_name = try decodeBodyAlloc(alloc, key[pos..index_end]);
+    errdefer alloc.free(index_name);
+
+    pos = index_end + 2;
+    const kind_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const repair_artifact_kind = try decodeBodyAlloc(alloc, key[pos..kind_end]);
+    errdefer alloc.free(repair_artifact_kind);
+
+    pos = kind_end + 2;
+    const issue_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    if (issue_end + 2 != key.len) return error.InvalidInternalUserKey;
+    const issue_id = try decodeBodyAlloc(alloc, key[pos..issue_end]);
+    errdefer alloc.free(issue_id);
+
+    return .{
+        .index_name = index_name,
+        .repair_artifact_kind = repair_artifact_kind,
+        .issue_id = issue_id,
+    };
+}
+
 /// Durable single-flight fence for producer repair work. Repair issues remain
 /// indexed per consumer, while this key is canonical per physical artifact so
 /// a successful regeneration is never repeated for sibling consumer records,
@@ -2029,6 +2075,30 @@ test "derived coverage outcome keys are generation scoped" {
     var encoded_count: [8]u8 = undefined;
     const encoded = encodeDerivedCoverageOutcomeCount(&encoded_count, 42);
     try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageOutcomeCount(encoded));
+}
+
+test "artifact repair issue keys expose authoritative encoded identity" {
+    const alloc = std.testing.allocator;
+    const key = try artifactRepairIssueKeyAlloc(
+        alloc,
+        "semantic\x00index",
+        "embedding",
+        "artifact\x00identity",
+    );
+    defer alloc.free(key);
+
+    var parts = try artifactRepairIssueKeyPartsAlloc(alloc, key);
+    defer parts.deinit(alloc);
+    try std.testing.expectEqualStrings("semantic\x00index", parts.index_name);
+    try std.testing.expectEqualStrings("embedding", parts.repair_artifact_kind);
+    try std.testing.expectEqualStrings("artifact\x00identity", parts.issue_id);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        artifactRepairIssueKeyPartsAlloc(alloc, malformed),
+    );
 }
 
 test "managed index admission keys round trip encoded names" {

@@ -17,6 +17,7 @@ const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
@@ -63,30 +64,47 @@ pub const ObjectStore = struct {
         fs.* = try objectstore.FilesystemClient.init(alloc, path);
 
         var owned_client = fs.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists("serverless-artifacts"))) try owned_client.makeBucket("serverless-artifacts");
+        const owned_bucket = try alloc.dupe(u8, "serverless-artifacts");
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, "");
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .fs_client = fs,
-            .bucket = try alloc.dupe(u8, "serverless-artifacts"),
-            .prefix = try alloc.dupe(u8, ""),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
     pub fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) !ObjectStore {
         const gcs = try alloc.create(objectstore.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try objectstore.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var cfg = try objectstore.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var config_owned = true;
+        errdefer if (config_owned) cfg.deinit(alloc);
         gcs.* = try objectstore.Gcs.JsonApiClient.init(alloc, cfg);
+        config_owned = false;
 
         var owned_client = gcs.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .gcs_client = gcs,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -102,29 +120,43 @@ pub const ObjectStore = struct {
     ) !ObjectStore {
         const s3 = try alloc.create(objectstore.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try object_store_support.s3ConfigAlloc(alloc, options);
+        var cfg = try object_store_support.s3ConfigAlloc(alloc, options);
+        var config_owned = true;
+        errdefer if (config_owned) cfg.deinit(alloc);
         s3.* = try objectstore.S3.Client.init(alloc, cfg);
+        config_owned = false;
 
         var owned_client = s3.client();
+        var client_initialized = true;
+        errdefer if (client_initialized) owned_client.deinit();
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
+        client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .s3_client = s3,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
         var owned_client = client;
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_prefix = try alloc.dupe(u8, prefix);
+        errdefer alloc.free(owned_prefix);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .owns_client = false,
-            .bucket = try alloc.dupe(u8, bucket),
-            .prefix = try alloc.dupe(u8, prefix),
+            .bucket = owned_bucket,
+            .prefix = owned_prefix,
         };
     }
 
@@ -151,13 +183,13 @@ pub const ObjectStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
 
         var result = try self.client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
         });
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.allocator);
 
         return .{
             .artifact_id = artifact_id,
@@ -167,34 +199,75 @@ pub const ObjectStore = struct {
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{});
-        defer result.deinit(alloc);
-        return try alloc.dupe(u8, result.body);
+        return try self.getAllocWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn getAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
+        defer result.deinit(self.client.allocator);
+        try cancellation.check();
+        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
 
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
-        var result = try self.client.getObject(self.bucket, key, .{
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, .none);
+    }
+
+    pub fn getRangeAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
-        });
-        defer result.deinit(alloc);
-        return try alloc.dupe(u8, result.body);
+            .skip_metadata_probe = true,
+            .max_response_bytes = len,
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
+        defer result.deinit(self.client.allocator);
+        try cancellation.check();
+        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
 
     pub fn stat(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
+        return try self.statWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn statWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForChecksumAlloc(alloc, self.prefix, checksum);
-        defer alloc.free(key);
-        var meta = try self.client.statObject(self.bucket, key);
-        defer meta.deinit(alloc);
+        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        defer self.alloc.free(key);
+        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| return normalizeCancellationError(err);
+        defer meta.deinit(self.client.allocator);
+        try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),
             .byte_len = meta.content_length,
@@ -203,8 +276,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
-        const checksum = try checksumFromArtifactIdAlloc(self.alloc, artifact_id);
-        defer self.alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
@@ -214,8 +286,11 @@ pub const ObjectStore = struct {
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
+        .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .stat = erasedStat,
+        .stat_with_cancellation = erasedStatWithCancellation,
         .delete = erasedDelete,
     };
 
@@ -234,9 +309,19 @@ pub const ObjectStore = struct {
         return try self.getAlloc(alloc, artifact_id);
     }
 
+    fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.getAllocWithCancellation(alloc, artifact_id, cancellation);
+    }
+
     fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.getRangeAlloc(alloc, artifact_id, offset, len);
+    }
+
+    fn erasedGetRangeAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, cancellation);
     }
 
     fn erasedStat(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
@@ -244,11 +329,39 @@ pub const ObjectStore = struct {
         return try self.stat(alloc, artifact_id);
     }
 
+    fn erasedStatWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.statWithCancellation(alloc, artifact_id, cancellation);
+    }
+
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         try self.delete(artifact_id);
     }
 };
+
+fn normalizeCancellationError(err: anyerror) anyerror {
+    return if (err == error.Cancelled) error.Canceled else err;
+}
+
+fn dupeWithCancellationAlloc(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    cancellation: CancellationToken,
+) ![]u8 {
+    const out = try alloc.alloc(u8, source.len);
+    errdefer alloc.free(out);
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < source.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, source.len - copied);
+        @memcpy(out[copied..][0..chunk_len], source[copied..][0..chunk_len]);
+        copied += chunk_len;
+    }
+    try cancellation.check();
+    return out;
+}
 
 fn sha256StringAlloc(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
@@ -266,14 +379,8 @@ fn makeArtifactIdAlloc(alloc: std.mem.Allocator, checksum: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
 }
 
-fn checksumFromArtifactIdAlloc(alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
-    const prefix = "sha256:";
-    if (!std.mem.startsWith(u8, artifact_id, prefix)) return error.InvalidArtifactId;
-    return try alloc.dupe(u8, artifact_id[prefix.len..]);
-}
-
 fn keyForChecksumAlloc(alloc: std.mem.Allocator, prefix: []const u8, checksum: []const u8) ![]u8 {
-    if (checksum.len < 4) return error.InvalidArtifactId;
+    try artifact_store.validateSha256Checksum(checksum);
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "sha256/{s}/{s}", .{ checksum[0..2], checksum[2..] });
     return try std.fmt.allocPrint(alloc, "{s}/sha256/{s}/{s}", .{ prefix, checksum[0..2], checksum[2..] });
 }
@@ -301,6 +408,17 @@ test "objectstore-backed artifacts store round-trips over file uri" {
     try std.testing.expectEqualStrings("payload", got);
 }
 
+test "objectstore-backed artifacts reject malformed content addresses before I/O" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "tenant/a");
+    var store = impl.artifactStore();
+    defer store.deinit();
+
+    try std.testing.expectError(error.InvalidArtifactId, store.getAlloc("sha256:abcd"));
+}
+
 test "objectstore-backed artifacts store opens gs uri through parser with injected client" {
     const alloc = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(alloc);
@@ -314,6 +432,70 @@ test "objectstore-backed artifacts store opens gs uri through parser with inject
     const got = try store.getAlloc(meta.artifact_id);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("payload", got);
+}
+
+test "serverless objectstore-backed artifacts preserve distinct client and result allocators" {
+    const result_alloc = std.testing.allocator;
+    var client_buffer: [256 * 1024]u8 = undefined;
+    var client_fba = std.heap.FixedBufferAllocator.init(&client_buffer);
+    const client_alloc = client_fba.allocator();
+    var memory = objectstore.MemoryClient.init(client_alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(result_alloc, memory.client(), "bucket", "tenant/a");
+    var store = impl.artifactStore();
+    defer store.deinit();
+
+    var meta = try store.put("allocator-safe");
+    defer meta.deinit(result_alloc);
+    const got = try store.getAlloc(meta.artifact_id);
+    defer result_alloc.free(got);
+    try std.testing.expectEqualStrings("allocator-safe", got);
+    const range = try store.getRangeAlloc(meta.artifact_id, 10, 4);
+    defer result_alloc.free(range);
+    try std.testing.expectEqualStrings("safe", range);
+    var stat = try store.stat(meta.artifact_id);
+    defer stat.deinit(result_alloc);
+    try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
+
+    var query_buffer: [1024]u8 = undefined;
+    var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
+    const query_alloc = query_fba.allocator();
+    const verified = try store.getVerifiedAllocWithCancellationUsingAllocator(
+        query_alloc,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        .none,
+    );
+    try std.testing.expect(query_fba.ownsSlice(verified));
+    query_alloc.free(verified);
+    try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
+}
+
+test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {
+    var file_root_buf: [256]u8 = undefined;
+    const file_root = tmpPath(&file_root_buf, "owned-init-oom");
+    defer cleanupTmp(file_root);
+    var uri_buf: [320]u8 = undefined;
+    const file_uri = try std.fmt.bufPrint(&uri_buf, "file://{s}", .{std.mem.span(file_root)});
+    var seeded_store = try ObjectStore.initFileUri(std.testing.allocator, file_uri);
+    seeded_store.deinit();
+
+    const Runner = struct {
+        fn borrowed(alloc: std.mem.Allocator) !void {
+            var memory = objectstore.MemoryClient.init(alloc);
+            defer memory.deinit();
+            var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "tenant/a");
+            defer impl.deinit();
+        }
+
+        fn owned(alloc: std.mem.Allocator, uri: []const u8) !void {
+            var impl = try ObjectStore.initFileUri(alloc, uri);
+            defer impl.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

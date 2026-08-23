@@ -1538,7 +1538,11 @@ const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
-    repair_active_generation_serviceable: bool = true,
+    // This is proof about an observed repair, not the neutral element for an
+    // AND reduction. A repair-free aggregate must not suppress live catch-up
+    // telemetry merely because every observed repair (there are none) is
+    // serviceable.
+    repair_active_generation_serviceable: bool = false,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1733,9 +1737,11 @@ fn aggregateIndexStatusIndexed(
         }
         materialization_count += 1;
         if (publicIndexRepairState(item)) |state| {
-            aggregate.repair_active_generation_serviceable =
+            aggregate.repair_active_generation_serviceable = if (aggregate.repair_state == null)
+                item.index_repair_active_generation_serviceable
+            else
                 aggregate.repair_active_generation_serviceable and
-                item.index_repair_active_generation_serviceable;
+                    item.index_repair_active_generation_serviceable;
             if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
                 aggregate.repair_state = state;
             }
@@ -2256,6 +2262,46 @@ test "settled terminal enrichment debt is degraded rather than rebuilding" {
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
 }
 
+test "derived coverage source totals ignore derived index fan out" {
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "visual",
+            .kind = .dense_vector,
+            .coverage_generation = 42,
+            .coverage_config_hash = 99,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .coverage_produced_count = 2,
+        },
+        .{
+            .name = "relationships",
+            .kind = .graph,
+            .doc_count = 50,
+            .node_count = 50,
+        },
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 2,
+            .doc_count = 50,
+            .index_count = indexes.len,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{1}, 42, 99, null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
+    try std.testing.expect(!aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+
+    const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
+    try std.testing.expect(!view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
 test "derived coverage aggregation rejects mixed config observations" {
     var indexes_a = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
@@ -2477,6 +2523,77 @@ test "complete partial embeddings coverage is ready after active generation proo
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("repair") == null);
+}
+
+test "repair-free embeddings aggregate retains live dense catch-up" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 1,
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = indexes[0..],
+            // The table-level worker snapshot can lead the per-index replay
+            // overlay briefly. That fallback must fail closed for an ordinary
+            // aggregate even though no repair serviceability fact exists.
+            .async_indexing = .{ .dense_catch_up = .{
+                .active = true,
+                .phase = .replay,
+                .current_sequence = 7,
+                .current_target_sequence = 11,
+            } },
+        },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "thumbnail",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(aggregate.repair_state == null);
+    try std.testing.expect(!aggregate.repair_active_generation_serviceable);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .partial,
+        false,
+        42,
+        99,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":11,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\"}",
+        encoded.items,
+    );
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -3081,7 +3198,12 @@ fn appendSingleIndexRuntimeStatus(
     const embeddings_materialization_current = index_type != .embeddings or
         (coverage_runtime_present and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
     const public_item = publicIndexRuntimeView(item);
-    const active_generation_serviceable = repairActiveGenerationServiceable(item);
+    const observed_repair_state = publicIndexRepairState(item);
+    // Aggregates use a boolean reduction for serviceability. Require the
+    // corresponding repair fact as well so its accumulator cannot hide
+    // ordinary dense catch-up on a repair-free index.
+    const active_generation_serviceable = observed_repair_state != null and
+        repairActiveGenerationServiceable(item);
     const visible_doc_count = if (embeddings_materialization_current) item.doc_count else 0;
     const visible_term_count = if (embeddings_materialization_current) item.term_count else 0;
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
@@ -3157,7 +3279,7 @@ fn appendSingleIndexRuntimeStatus(
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
     const repair_state = if (embeddings_materialization_current and !active_generation_serviceable)
-        publicIndexRepairState(item)
+        observed_repair_state
     else
         null;
     // A load failure with no durable automatic repair remains a terminal

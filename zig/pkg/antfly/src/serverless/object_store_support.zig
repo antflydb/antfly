@@ -55,8 +55,21 @@ pub const OpenedObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
 
+    pub const OpenOptions = struct {
+        ensure_bucket: bool = true,
+    };
+
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
-        return try initRemoteUriWithS3Options(alloc, uri, file_bucket, null);
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, null, .{});
+    }
+
+    pub fn initRemoteUriWithOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, null, options);
     }
 
     /// Opens an existing S3 namespace without creating a missing bucket. This
@@ -74,6 +87,16 @@ pub const OpenedObjectStore = struct {
         file_bucket: []const u8,
         s3_options: ?S3Options,
     ) !OpenedObjectStore {
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, s3_options, .{});
+    }
+
+    pub fn initRemoteUriWithS3AndOpenOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        s3_options: ?S3Options,
+        open_options: OpenOptions,
+    ) !OpenedObjectStore {
         var parsed = try remote_uri.parseAlloc(alloc, uri);
         defer switch (parsed) {
             .file => |value| alloc.free(value),
@@ -85,14 +108,23 @@ pub const OpenedObjectStore = struct {
             .file => |path| blk: {
                 const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
                 defer alloc.free(file_uri);
-                break :blk try initFileUri(alloc, file_uri, file_bucket);
+                break :blk try initFileUriWithOptions(alloc, file_uri, file_bucket, open_options);
             },
-            .gcs => |value| try initGcsUri(alloc, value.bucket, value.prefix),
-            .s3 => |value| try initS3UriWithOptions(alloc, value.bucket, value.prefix, s3_options),
+            .gcs => |value| try initGcsUriWithOptions(alloc, value.bucket, value.prefix, open_options),
+            .s3 => |value| try initS3UriWithS3AndOpenOptions(alloc, value.bucket, value.prefix, s3_options, open_options),
         };
     }
 
     pub fn initFileUri(alloc: Allocator, uri: []const u8, bucket: []const u8) !OpenedObjectStore {
+        return try initFileUriWithOptions(alloc, uri, bucket, .{});
+    }
+
+    pub fn initFileUriWithOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        bucket: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
         const path = try remote_uri.filePathFromUriAlloc(alloc, uri);
         defer alloc.free(path);
         const fs = try alloc.create(object_storage.FilesystemObjectStorage);
@@ -100,7 +132,7 @@ pub const OpenedObjectStore = struct {
         fs.* = try object_storage.FilesystemObjectStorage.init(alloc, path);
 
         var owned_client = fs.client();
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
@@ -111,13 +143,36 @@ pub const OpenedObjectStore = struct {
     }
 
     pub fn initGcsUri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initGcsUriWithOptions(alloc, bucket, prefix, .{});
+    }
+
+    pub fn initGcsUriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initGcsUriWithBearerTokenAndOptions(alloc, bucket, prefix, null, options);
+    }
+
+    pub fn initGcsUriWithBearerTokenAndOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        bearer_token: ?[]const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
-        const cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        var cfg = if (bearer_token) |token|
+            try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(alloc, token, null)
+        else
+            try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        errdefer cfg.deinit(alloc);
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
 
         var owned_client = gcs.client();
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
@@ -128,7 +183,7 @@ pub const OpenedObjectStore = struct {
     }
 
     pub fn initS3Uri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
-        return try initS3UriWithOptions(alloc, bucket, prefix, null);
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, null, .{});
     }
 
     pub fn initS3UriWithOptions(
@@ -137,7 +192,7 @@ pub const OpenedObjectStore = struct {
         prefix: []const u8,
         options: ?S3Options,
     ) !OpenedObjectStore {
-        return try initS3UriWithOptionsAndBucketPolicy(alloc, bucket, prefix, options, true);
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, options, .{});
     }
 
     fn initExistingS3UriWithOptions(
@@ -146,24 +201,64 @@ pub const OpenedObjectStore = struct {
         prefix: []const u8,
         options: ?S3Options,
     ) !OpenedObjectStore {
-        return try initS3UriWithOptionsAndBucketPolicy(alloc, bucket, prefix, options, false);
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, options, .{ .ensure_bucket = false });
     }
 
-    fn initS3UriWithOptionsAndBucketPolicy(
+    pub fn initS3UriWithOpenOptions(
         alloc: Allocator,
         bucket: []const u8,
         prefix: []const u8,
-        options: ?S3Options,
-        create_missing_bucket: bool,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, null, options);
+    }
+
+    pub const S3Overrides = struct {
+        endpoint: ?[]const u8 = null,
+        use_ssl: bool = true,
+        access_key_id: ?[]const u8 = null,
+        secret_access_key: ?[]const u8 = null,
+        session_token: ?[]const u8 = null,
+        region: ?[]const u8 = null,
+        addressing_style: object_storage.S3.AddressingStyle = .path,
+    };
+
+    pub fn initS3UriWithOverrides(alloc: Allocator, bucket: []const u8, prefix: []const u8, overrides: S3Overrides) !OpenedObjectStore {
+        return try initS3UriWithOverridesAndOptions(alloc, bucket, prefix, overrides, .{});
+    }
+
+    pub fn initS3UriWithOverridesAndOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        overrides: S3Overrides,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, .{
+            .endpoint = overrides.endpoint,
+            .region = overrides.region,
+            .access_key_id = overrides.access_key_id,
+            .secret_access_key = overrides.secret_access_key,
+            .session_token = overrides.session_token,
+            .use_ssl = overrides.use_ssl,
+            .addressing_style = overrides.addressing_style,
+        }, options);
+    }
+
+    pub fn initS3UriWithS3AndOpenOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        s3_options: ?S3Options,
+        open_options: OpenOptions,
     ) !OpenedObjectStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try s3ConfigAlloc(alloc, options);
+        const cfg = try s3ConfigAlloc(alloc, s3_options);
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         var owned_client = s3.client();
-        if (create_missing_bucket and !(try owned_client.bucketExists(bucket)))
-            try owned_client.makeBucket(bucket);
+        if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
@@ -174,8 +269,18 @@ pub const OpenedObjectStore = struct {
     }
 
     pub fn initWithClient(alloc: Allocator, client: object_storage.ObjectStorage, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initWithClientOptions(alloc, client, bucket, prefix, .{});
+    }
+
+    pub fn initWithClientOptions(
+        alloc: Allocator,
+        client: object_storage.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,

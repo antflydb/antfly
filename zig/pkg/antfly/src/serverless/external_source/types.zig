@@ -1,0 +1,396 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Metadata artifacts for user-owned external lake files referenced by
+//! serverless manifests.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const Format = enum(u8) {
+    parquet = 1,
+    iceberg = 2,
+    lance = 3,
+};
+
+pub const ColumnChunk = struct {
+    column_id: []u8,
+    file_offset: u64,
+    compressed_len: u64,
+    uncompressed_len: u64 = 0,
+    compression_codec: []u8 = &.{},
+    encoding: []u8 = &.{},
+    physical_type: []u8 = &.{},
+    type_length: i32 = 0,
+    logical_type: []u8 = &.{},
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
+    field_id: ?i32 = null,
+    stats_min_i64: ?i64 = null,
+    stats_max_i64: ?i64 = null,
+    stats_min_bytes: ?[]u8 = null,
+    stats_max_bytes: ?[]u8 = null,
+    stats_min_bool: ?bool = null,
+    stats_max_bool: ?bool = null,
+    stats_min_f64: ?f64 = null,
+    stats_max_f64: ?f64 = null,
+    nullable: bool = false,
+
+    pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
+        alloc.free(self.column_id);
+        if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
+        if (self.encoding.len > 0) alloc.free(self.encoding);
+        if (self.physical_type.len > 0) alloc.free(self.physical_type);
+        if (self.logical_type.len > 0) alloc.free(self.logical_type);
+        if (self.stats_min_bytes) |value| alloc.free(value);
+        if (self.stats_max_bytes) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: ColumnChunk, file_len: u64) !void {
+        if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
+        if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
+        if (self.compressed_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+        if (self.field_id) |id| {
+            if (id < 0) return error.InvalidExternalSourceInventory;
+        }
+        if (self.stats_min_i64 != null and self.stats_max_i64 != null and self.stats_min_i64.? > self.stats_max_i64.?) return error.InvalidExternalSourceInventory;
+        if ((self.stats_min_bytes == null) != (self.stats_max_bytes == null)) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_bytes) |min| {
+            const max = self.stats_max_bytes.?;
+            if (std.mem.order(u8, min, max) == .gt) return error.InvalidExternalSourceInventory;
+        }
+        if ((self.stats_min_bool == null) != (self.stats_max_bool == null)) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_bool == true and self.stats_max_bool == false) return error.InvalidExternalSourceInventory;
+        if ((self.stats_min_f64 == null) != (self.stats_max_f64 == null)) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_f64) |min| {
+            const max = self.stats_max_f64.?;
+            if (std.math.isNan(min) or std.math.isNan(max) or min > max) return error.InvalidExternalSourceInventory;
+        }
+    }
+};
+
+pub const RowGroup = struct {
+    ordinal: u32,
+    row_count: u64,
+    file_offset: u64 = 0,
+    total_byte_len: u64 = 0,
+    column_chunks: []ColumnChunk = &.{},
+
+    pub fn deinit(self: *RowGroup, alloc: Allocator) void {
+        for (self.column_chunks) |*chunk| chunk.deinit(alloc);
+        if (self.column_chunks.len > 0) alloc.free(self.column_chunks);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: RowGroup, file_len: u64) !void {
+        if (self.row_count == 0) return error.InvalidExternalSourceInventory;
+        if (self.total_byte_len != 0) {
+            if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
+            if (self.total_byte_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+        }
+        for (self.column_chunks, 0..) |chunk, idx| {
+            try chunk.validate(file_len);
+            for (self.column_chunks[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.column_id, chunk.column_id)) return error.InvalidExternalSourceInventory;
+            }
+        }
+    }
+};
+
+pub const FileEntry = struct {
+    file_id: []u8,
+    object_uri: []u8,
+    etag: []u8 = &.{},
+    version_id: []u8 = &.{},
+    byte_len: u64,
+    row_count: u64,
+    data_sequence_number: ?i64 = null,
+    partition_spec_id: ?i32 = null,
+    partition_field_count: u32 = 0,
+    partition_values: []PartitionValue = &.{},
+    row_groups: []RowGroup,
+
+    pub fn deinit(self: *FileEntry, alloc: Allocator) void {
+        alloc.free(self.file_id);
+        alloc.free(self.object_uri);
+        if (self.etag.len > 0) alloc.free(self.etag);
+        if (self.version_id.len > 0) alloc.free(self.version_id);
+        for (self.partition_values) |*partition| partition.deinit(alloc);
+        if (self.partition_values.len > 0) alloc.free(self.partition_values);
+        for (self.row_groups) |*row_group| row_group.deinit(alloc);
+        if (self.row_groups.len > 0) alloc.free(self.row_groups);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: FileEntry) !void {
+        if (self.file_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.object_uri.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.etag.len == 0 and self.version_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.byte_len == 0) return error.InvalidExternalSourceInventory;
+        if (self.data_sequence_number) |sequence| {
+            if (sequence < 0) return error.InvalidExternalSourceInventory;
+        }
+        if (self.partition_spec_id) |spec_id| {
+            if (spec_id < 0) return error.InvalidExternalSourceInventory;
+        }
+        if (self.partition_field_count != 0 and self.partition_values.len > self.partition_field_count) {
+            return error.InvalidExternalSourceInventory;
+        }
+        for (self.partition_values, 0..) |partition, idx| {
+            try partition.validate();
+            for (self.partition_values[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.column_id, partition.column_id)) return error.InvalidExternalSourceInventory;
+            }
+        }
+        var total_rows: u64 = 0;
+        for (self.row_groups, 0..) |row_group, idx| {
+            try row_group.validate(self.byte_len);
+            if (row_group.ordinal != idx) return error.InvalidExternalSourceInventory;
+            total_rows = std.math.add(u64, total_rows, row_group.row_count) catch return error.InvalidExternalSourceInventory;
+        }
+        if (self.row_groups.len != 0 and total_rows != self.row_count) return error.InvalidExternalSourceInventory;
+    }
+};
+
+pub const PartitionValue = struct {
+    column_id: []u8,
+    string_value: []u8,
+
+    pub fn deinit(self: *PartitionValue, alloc: Allocator) void {
+        alloc.free(self.column_id);
+        alloc.free(self.string_value);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: PartitionValue) !void {
+        if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
+    }
+};
+
+/// Compact durable deletion set for one data-file row group. Ordinals are
+/// strictly increasing so serving can use binary search without allocating a
+/// per-request hash table.
+pub const DeletedRowGroup = struct {
+    file_id: []u8,
+    row_group_ordinal: u32,
+    row_ordinals: []u64,
+
+    pub fn deinit(self: *DeletedRowGroup, alloc: Allocator) void {
+        alloc.free(self.file_id);
+        alloc.free(self.row_ordinals);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: DeletedRowGroup, inventory: Inventory) !void {
+        if (self.file_id.len == 0 or self.row_ordinals.len == 0) return error.InvalidExternalSourceInventory;
+        const file = inventory.fileById(self.file_id) orelse return error.InvalidExternalSourceInventory;
+        if (self.row_group_ordinal >= file.row_groups.len) return error.InvalidExternalSourceInventory;
+        const row_count = file.row_groups[self.row_group_ordinal].row_count;
+        for (self.row_ordinals, 0..) |ordinal, idx| {
+            if (ordinal >= row_count) return error.InvalidExternalSourceInventory;
+            if (idx != 0 and ordinal <= self.row_ordinals[idx - 1]) return error.InvalidExternalSourceInventory;
+        }
+    }
+};
+
+pub const Inventory = struct {
+    format: Format,
+    source_id: []u8,
+    source_uri: []u8,
+    snapshot_id: []u8,
+    schema_fingerprint: []u8,
+    files: []FileEntry,
+    deleted_row_groups: []DeletedRowGroup = &.{},
+
+    pub fn deinit(self: *Inventory, alloc: Allocator) void {
+        alloc.free(self.source_id);
+        alloc.free(self.source_uri);
+        alloc.free(self.snapshot_id);
+        alloc.free(self.schema_fingerprint);
+        for (self.files) |*file| file.deinit(alloc);
+        alloc.free(self.files);
+        for (self.deleted_row_groups) |*group| group.deinit(alloc);
+        if (self.deleted_row_groups.len > 0) alloc.free(self.deleted_row_groups);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: Inventory) !void {
+        try self.validateAlloc(std.heap.page_allocator);
+    }
+
+    pub fn validateAlloc(self: Inventory, alloc: Allocator) !void {
+        if (self.source_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.source_uri.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.snapshot_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.schema_fingerprint.len == 0) return error.InvalidExternalSourceInventory;
+
+        var file_ids = std.StringHashMapUnmanaged(void).empty;
+        defer file_ids.deinit(alloc);
+        const file_capacity = std.math.cast(u32, self.files.len) orelse return error.InvalidExternalSourceInventory;
+        try file_ids.ensureTotalCapacity(alloc, file_capacity);
+        for (self.files) |file| {
+            try file.validate();
+            const entry = try file_ids.getOrPut(alloc, file.file_id);
+            if (entry.found_existing) return error.InvalidExternalSourceInventory;
+        }
+        if (self.deleted_row_groups.len != 0 and self.format != .iceberg) return error.InvalidExternalSourceInventory;
+        for (self.deleted_row_groups, 0..) |group, idx| {
+            try group.validate(self);
+            if (idx == 0) continue;
+            const previous = self.deleted_row_groups[idx - 1];
+            const file_order = std.mem.order(u8, previous.file_id, group.file_id);
+            if (file_order == .gt) return error.InvalidExternalSourceInventory;
+            if (file_order == .eq and previous.row_group_ordinal >= group.row_group_ordinal) {
+                return error.InvalidExternalSourceInventory;
+            }
+        }
+    }
+
+    pub fn fileById(self: Inventory, file_id: []const u8) ?FileEntry {
+        for (self.files) |file| {
+            if (std.mem.eql(u8, file.file_id, file_id)) return file;
+        }
+        return null;
+    }
+
+    pub fn isDeleted(self: Inventory, file_id: []const u8, row_group_ordinal: u32, row_ordinal: u64) bool {
+        var low: usize = 0;
+        var high = self.deleted_row_groups.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const group = self.deleted_row_groups[mid];
+            const file_order = std.mem.order(u8, group.file_id, file_id);
+            if (file_order == .lt or (file_order == .eq and group.row_group_ordinal < row_group_ordinal)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low >= self.deleted_row_groups.len) return false;
+        const group = self.deleted_row_groups[low];
+        if (!std.mem.eql(u8, group.file_id, file_id) or group.row_group_ordinal != row_group_ordinal) return false;
+        return std.sort.binarySearch(u64, group.row_ordinals, row_ordinal, struct {
+            fn compare(key: u64, candidate: u64) std.math.Order {
+                return std.math.order(key, candidate);
+            }
+        }.compare) != null;
+    }
+};
+
+pub fn freeInventory(alloc: Allocator, inventory: *Inventory) void {
+    inventory.deinit(alloc);
+}
+
+test "external source inventory validates files and row groups" {
+    const alloc = std.testing.allocator;
+    var inventory = Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events"),
+        .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(FileEntry, 1),
+        .deleted_row_groups = try alloc.alloc(DeletedRowGroup, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
+        .byte_len = 1024,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(RowGroup, &[_]RowGroup{
+            .{
+                .ordinal = 0,
+                .row_count = 1,
+                .file_offset = 4,
+                .total_byte_len = 100,
+                .column_chunks = try alloc.dupe(ColumnChunk, &[_]ColumnChunk{.{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 16,
+                    .compressed_len = 40,
+                    .uncompressed_len = 80,
+                    .compression_codec = try alloc.dupe(u8, "zstd"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                }}),
+            },
+            .{ .ordinal = 1, .row_count = 2, .file_offset = 104, .total_byte_len = 120 },
+        }),
+    };
+    inventory.deleted_row_groups[0] = .{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .row_group_ordinal = 1,
+        .row_ordinals = try alloc.dupe(u64, &.{0}),
+    };
+
+    try inventory.validate();
+    try std.testing.expect(inventory.fileById("file-a.parquet") != null);
+    try std.testing.expect(inventory.fileById("missing.parquet") == null);
+    try std.testing.expect(inventory.isDeleted("file-a.parquet", 1, 0));
+    try std.testing.expect(!inventory.isDeleted("file-a.parquet", 1, 1));
+    try std.testing.expect(!inventory.isDeleted("missing.parquet", 1, 0));
+}
+
+test "external source inventory rejects malformed durable delete sets" {
+    const file = FileEntry{
+        .file_id = @constCast("file-a.parquet"),
+        .object_uri = @constCast("s3://bucket/file-a.parquet"),
+        .etag = @constCast("etag"),
+        .byte_len = 1,
+        .row_count = 3,
+        .row_groups = @constCast(&[_]RowGroup{.{ .ordinal = 0, .row_count = 3 }}),
+    };
+    var ordinals = [_]u64{ 1, 1 };
+    const inventory = Inventory{
+        .format = .iceberg,
+        .source_id = @constCast("events"),
+        .source_uri = @constCast("s3://bucket/events"),
+        .snapshot_id = @constCast("1"),
+        .schema_fingerprint = @constCast("schema"),
+        .files = @constCast(&[_]FileEntry{file}),
+        .deleted_row_groups = @constCast(&[_]DeletedRowGroup{.{
+            .file_id = @constCast("file-a.parquet"),
+            .row_group_ordinal = 0,
+            .row_ordinals = &ordinals,
+        }}),
+    };
+    try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(std.testing.allocator));
+}
+
+test "external source inventory rejects duplicate file ids with allocator-backed validation" {
+    const alloc = std.testing.allocator;
+    var inventory = Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "snapshot-1"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(FileEntry, 2),
+    };
+    defer inventory.deinit(alloc);
+    for (inventory.files, 0..) |*file, idx| {
+        file.* = .{
+            .file_id = try alloc.dupe(u8, "part.parquet"),
+            .object_uri = try std.fmt.allocPrint(alloc, "s3://bucket/events/part-{d}.parquet", .{idx}),
+            .etag = try std.fmt.allocPrint(alloc, "etag-{d}", .{idx}),
+            .byte_len = 1,
+            .row_count = 0,
+            .row_groups = &.{},
+        };
+    }
+
+    try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(alloc));
+}

@@ -18,9 +18,12 @@ pub const codec = @import("codec.zig");
 pub const Edge = types.Edge;
 pub const Adjacency = types.Adjacency;
 pub const Segment = types.Segment;
+pub const AdjacencyIndex = types.AdjacencyIndex;
 pub const freeSegment = types.freeSegment;
 pub const encodeAlloc = codec.encodeAlloc;
+pub const encodedSize = codec.encodedSize;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
 
 test "serverless graph segment module compiles" {
     _ = types;
@@ -28,7 +31,10 @@ test "serverless graph segment module compiles" {
     _ = Edge;
     _ = Adjacency;
     _ = Segment;
+    _ = AdjacencyIndex;
     _ = freeSegment;
     _ = encodeAlloc;
+    _ = encodedSize;
     _ = decodeAlloc;
+    _ = decodeAllocWithLimits;
 }
