@@ -26,6 +26,7 @@ import type {
   Edge,
   EdgeDirection,
   EdgeTypeConfig,
+  GraphPathEndpoint,
   GraphQuery,
   GraphQueryResult,
   IndexStatus,
@@ -45,7 +46,7 @@ type ExplorerNodeMeta = {
   depth?: number;
   distance?: number;
   document?: Record<string, unknown>;
-  path?: string[];
+  path?: GraphPathEndpoint[];
   resultCount?: number;
 };
 
@@ -59,7 +60,10 @@ type ExplorerEdge = GraphEdge & {
 type GraphVisualizationWireResult = {
   kind?: "nodes" | "legacy";
   type?: string;
-  nodes?: Extract<GraphQueryResult, { kind: "nodes" }>["nodes"];
+  nodes?: (
+    | Extract<GraphQueryResult, { kind: "nodes" }>["nodes"][number]
+    | NonNullable<Extract<GraphQueryResult, { kind: "legacy" }>["nodes"]>[number]
+  )[];
   paths?: {
     nodes?: (string | { key: string; table?: string })[];
     edges?: Partial<Edge>[];
@@ -227,7 +231,9 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
       depth: node.depth,
       distance: node.distance,
       document: node.document as Record<string, unknown> | undefined,
-      path: node.path,
+      path: node.path?.map((identity) =>
+        typeof identity === "string" ? { key: identity } : identity
+      ),
       resultCount: 1,
     });
 
@@ -844,9 +850,9 @@ export function GraphIndexExplorer({
                   <div>
                     <div className="mb-1 text-xs text-muted-foreground">Path</div>
                     <div className="space-y-1">
-                      {selectedNode.metadata.path.map((key) => (
-                        <Badge key={key} className="mr-1 max-w-full">
-                          {displayKey(key)}
+                      {selectedNode.metadata.path.map((identity) => (
+                        <Badge key={graphNodeId(identity)} className="mr-1 max-w-full">
+                          {qualifiedDocumentLabel(identity)}
                         </Badge>
                       ))}
                     </div>

@@ -346,12 +346,8 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         };
 
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer {
-            var it = seen.keyIterator();
-            while (it.next()) |k| self.alloc.free(k.*);
-            seen.deinit(self.alloc);
-        }
+        var seen = node_identity.Map(void){};
+        defer seen.deinit(self.alloc);
 
         for (start_keys, 0..) |key, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
@@ -361,8 +357,11 @@ pub const GraphQueryEngine = struct {
             for (trav_results) |tr| {
                 if (!targetKeyAllowed(target_keys, tr.key)) continue;
                 if (params.deduplicate) {
-                    if (seen.contains(tr.key)) continue;
-                    try seen.put(self.alloc, try self.alloc.dupe(u8, tr.key), {});
+                    if (!try seen.putIfAbsent(
+                        self.alloc,
+                        .{ .table = tr.target_table, .key = tr.key },
+                        {},
+                    )) continue;
                 }
 
                 var result_node = try traversalResultNodeAlloc(self.alloc, tr);
@@ -412,6 +411,10 @@ pub const GraphQueryEngine = struct {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
             var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
             defer algebraic_edges.deinit(self.alloc);
+            // Algebraic reachability currently keys tensor vertices by document
+            // key alone. A cross-table endpoint introduces a distinct namespace,
+            // so preserve exact identity by falling back to the table-aware BFS.
+            if (algebraic_edges.has_cross_table_edges) return null;
             if (self.node_admission) |admission| {
                 try filterAlgebraicReachabilityEdgesWithAdmission(
                     self.alloc,
@@ -425,15 +428,12 @@ pub const GraphQueryEngine = struct {
 
             for (reached) |item| {
                 if (seen.contains(item.node)) continue;
-                var node = if (params.include_paths)
+                const node = if (params.include_paths)
                     (try algebraicShortestPathResultNodeAlloc(self.alloc, graph_index, params, start_key, item.node, item)) orelse return null
                 else
                     try algebraicTraversalResultNodeAlloc(self.alloc, item);
                 var node_owned = true;
                 errdefer if (node_owned) freeResultNode(self.alloc, node);
-                if (algebraic_edges.target_tables.get(item.node)) |tt| {
-                    node.table = try self.alloc.dupe(u8, tt);
-                }
                 try all_results.append(self.alloc, node);
                 node_owned = false;
                 try seen.put(self.alloc, try self.alloc.dupe(u8, item.node), {});
@@ -516,10 +516,11 @@ pub const GraphQueryEngine = struct {
         if (!try algebraicTraversalTensorProgramAccepted(self.alloc, graph_index, params, target_keys)) return null;
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
-        errdefer {
+        var cleanup_results = true;
+        defer if (cleanup_results) {
             for (all_results.items) |node| freeResultNode(self.alloc, node);
             all_results.deinit(self.alloc);
-        }
+        };
 
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -535,6 +536,9 @@ pub const GraphQueryEngine = struct {
 
                 var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
                 defer algebraic_edges.deinit(self.alloc);
+                // Tensor vertex names are key-only; cross-table endpoints must
+                // use the exact table-aware path implementation below.
+                if (algebraic_edges.has_cross_table_edges) return null;
                 if (self.node_admission) |admission| {
                     try filterAlgebraicReachabilityEdgesWithAdmission(
                         self.alloc,
@@ -560,6 +564,7 @@ pub const GraphQueryEngine = struct {
         }
 
         const owned = try self.alloc.dupe(GraphResultNode, all_results.items);
+        cleanup_results = false;
         all_results.deinit(self.alloc);
         return .{ .nodes = owned };
     }
@@ -695,6 +700,7 @@ pub const GraphQueryEngine = struct {
 
             var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, plan.params);
             defer algebraic_edges.deinit(self.alloc);
+            if (algebraic_edges.has_cross_table_edges) return null;
 
             const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, plan.depth, .{});
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
@@ -1345,12 +1351,9 @@ fn freeProvenanceLabels(alloc: Allocator, labels: []const []const u8) void {
 
 const AlgebraicReachabilityEdges = struct {
     items: []algebraic_path_mod.Edge,
-    /// Reached-node key -> cross-table endpoint (`target_table` from the edge
-    /// metadata), so the algebraic fast path can set `GraphResultNode.table`
-    /// and stay on par with the BFS path's cross-table DocRef hydration.
-    /// Keys and values are owned.
-    target_tables: std.StringHashMapUnmanaged([]const u8) = .empty,
-
+    /// The algebraic tensor representation is key-scoped. Cross-table graph
+    /// identities therefore require the table-aware traversal implementation.
+    has_cross_table_edges: bool = false,
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |edge| {
             alloc.free(edge.from);
@@ -1358,12 +1361,6 @@ const AlgebraicReachabilityEdges = struct {
             alloc.free(edge.provenance);
         }
         if (self.items.len > 0) alloc.free(self.items);
-        var it = self.target_tables.iterator();
-        while (it.next()) |entry| {
-            alloc.free(entry.key_ptr.*);
-            alloc.free(entry.value_ptr.*);
-        }
-        self.target_tables.deinit(alloc);
         self.* = .{ .items = &.{} };
     }
 };
@@ -1389,15 +1386,7 @@ fn collectAlgebraicReachabilityEdges(
         edges.deinit(alloc);
     }
 
-    var target_tables = std.StringHashMapUnmanaged([]const u8).empty;
-    errdefer {
-        var it = target_tables.iterator();
-        while (it.next()) |entry| {
-            alloc.free(entry.key_ptr.*);
-            alloc.free(entry.value_ptr.*);
-        }
-        target_tables.deinit(alloc);
-    }
+    var has_cross_table_edges = false;
 
     var queue = std.ArrayListUnmanaged(AlgebraicQueueEntry).empty;
     defer {
@@ -1419,7 +1408,7 @@ fn collectAlgebraicReachabilityEdges(
     });
     try visited.put(alloc, try alloc.dupe(u8, start_key), {});
 
-    while (queue_head < queue.items.len) {
+    scan: while (queue_head < queue.items.len) {
         const current = queue.items[queue_head];
         queue_head += 1;
         if (current.depth >= params.max_depth) continue;
@@ -1430,21 +1419,19 @@ fn collectAlgebraicReachabilityEdges(
             if (!graphEdgeTypeAllowed(params.edge_types, edge.edge_type)) continue;
             if (!graphEdgeWeightAllowed(params, edge.weight)) continue;
             const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+            const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                traversal_mod.metadataTargetTable(edge.metadata)
+            else
+                null;
+            // Stop the algebraic probe immediately. Its tensor vertices are
+            // key-only, while this edge names a table-qualified identity.
+            if (target_table != null) {
+                has_cross_table_edges = true;
+                break :scan;
+            }
             if (std.mem.eql(u8, next_key, start_key)) continue;
             const already_visited = visited.contains(next_key);
             if (!already_visited) try visited.put(alloc, try alloc.dupe(u8, next_key), {});
-
-            // Record the reached node's cross-table endpoint (mirrors the BFS
-            // path) so the algebraic result node can hydrate cross-table.
-            if (std.mem.eql(u8, next_key, edge.target) and !target_tables.contains(next_key)) {
-                if (traversal_mod.metadataTargetTable(edge.metadata)) |tt| {
-                    const key_dup = try alloc.dupe(u8, next_key);
-                    errdefer alloc.free(key_dup);
-                    const val_dup = try alloc.dupe(u8, tt);
-                    errdefer alloc.free(val_dup);
-                    try target_tables.put(alloc, key_dup, val_dup);
-                }
-            }
 
             const provenance_label = try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
             defer alloc.free(provenance_label);
@@ -1476,9 +1463,10 @@ fn collectAlgebraicReachabilityEdges(
     }
 
     const owned = try edges.toOwnedSlice(alloc);
-    const tables_out = target_tables;
-    target_tables = .empty;
-    return .{ .items = owned, .target_tables = tables_out };
+    return .{
+        .items = owned,
+        .has_cross_table_edges = has_cross_table_edges,
+    };
 }
 
 fn filterAlgebraicReachabilityEdgesWithAdmission(
@@ -1490,11 +1478,10 @@ fn filterAlgebraicReachabilityEdgesWithAdmission(
     const refs = try alloc.alloc(NodeRef, edges.items.len);
     defer alloc.free(refs);
     for (edges.items, 0..) |edge, i| {
-        const table = edges.target_tables.get(edge.to);
         refs[i] = .{
             .key = edge.to,
-            .table = table,
-            .external = table != null,
+            .table = null,
+            .external = false,
         };
     }
     const allowed = try admission.filterAlloc(alloc, refs);
@@ -1709,6 +1696,65 @@ test "traverse: multi-start with depth 2" {
 
     // Should find B, C, D (from A) + Y, Z (from X) = 5 nodes
     try std.testing.expectEqual(@as(usize, 5), result.nodes.len);
+}
+
+test "traverse preserves table-scoped identities across result dedup and algebraic fallback" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-table-identity-s", "gq-table-identity-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "shared", "local", 1.0, 0, 0, "");
+    try ctx.graph.addEdge(
+        "A",
+        "shared",
+        "external",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"entities\"}",
+    );
+
+    var algebraic_probe = try collectAlgebraicReachabilityEdges(alloc, &ctx.graph, "A", .{
+        .max_depth = 1,
+        .max_results = 0,
+        .algebraic_semiring = true,
+    });
+    defer algebraic_probe.deinit(alloc);
+    try std.testing.expect(algebraic_probe.has_cross_table_edges);
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{
+            .max_depth = 1,
+            .max_results = 0,
+            .algebraic_semiring = true,
+        },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+    var local_count: usize = 0;
+    var external_count: usize = 0;
+    for (result.nodes) |node| {
+        try std.testing.expectEqualStrings("shared", node.key);
+        if (node.table) |table| {
+            try std.testing.expectEqualStrings("entities", table);
+            external_count += 1;
+        } else {
+            local_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_count);
+    try std.testing.expectEqual(@as(usize, 1), external_count);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {
