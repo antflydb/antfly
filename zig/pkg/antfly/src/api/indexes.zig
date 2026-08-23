@@ -1516,6 +1516,46 @@ fn publicIndexRuntimeView(item: anytype) @TypeOf(item) {
     return view;
 }
 
+fn publicShardIndexRuntimeView(
+    item: db_mod.types.DBIndexStats,
+    async_indexing: db_mod.types.AsyncIndexingStats,
+) db_mod.types.DBIndexStats {
+    var view = publicIndexRuntimeView(item);
+    if (item.kind != .dense_vector and item.kind != .sparse_vector) return view;
+    // A serviceable repair's DB-wide dense worker describes the candidate
+    // generation, which is deliberately absent from the public view until
+    // activation. Filter it while shard ownership is still available; doing
+    // this after aggregation can erase unrelated live catch-up on a sibling.
+    if (publicIndexRepairState(item) != null and repairActiveGenerationServiceable(item)) return view;
+
+    const dense_catch_up = async_indexing.dense_catch_up;
+    if (!dense_catch_up.active) return view;
+    view.catch_up_active = true;
+    view.catch_up_phase = dense_catch_up.phase;
+    view.catch_up_applied_sequence = @max(view.catch_up_applied_sequence, dense_catch_up.current_sequence);
+    view.catch_up_target_sequence = @max(view.catch_up_target_sequence, dense_catch_up.current_target_sequence);
+
+    // The DB-wide snapshot can lead the per-index overlay briefly. Only use it
+    // as a replay-watermark fallback when the index has published no replay
+    // facts of its own; explicit per-index watermarks remain authoritative.
+    const index_replay_present = view.replay_applied_sequence != 0 or
+        view.replay_target_sequence != 0 or view.replay_catch_up_required;
+    if (!index_replay_present) {
+        view.replay_catch_up_required = true;
+        view.backfill_active = true;
+        view.replay_target_sequence = dense_catch_up.current_target_sequence;
+        view.replay_applied_sequence = dense_catch_up.current_sequence;
+        if (view.replay_target_sequence > 0) {
+            view.backfill_progress = @min(
+                0.999,
+                @as(f64, @floatFromInt(view.replay_applied_sequence)) /
+                    @as(f64, @floatFromInt(view.replay_target_sequence)),
+            );
+        }
+    }
+    return view;
+}
+
 fn repairStateRank(state: []const u8) u8 {
     // Aggregate toward the least-progressing shard so a partially stalled
     // distributed index is not presented as uniformly rebuilding.
@@ -1746,7 +1786,7 @@ fn aggregateIndexStatusIndexed(
                 aggregate.repair_state = state;
             }
         }
-        const public_item = publicIndexRuntimeView(item);
+        const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
@@ -2594,6 +2634,124 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
         "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":11,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\"}",
         encoded.items,
     );
+}
+
+test "serviceable repair preserves sibling shard dense catch-up fallback" {
+    var repair_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 2,
+        .replay_target_sequence = 5,
+        .replay_catch_up_required = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 2,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    }};
+    var live_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 1,
+                .doc_count = 1,
+                .index_count = 1,
+                .indexes = repair_indexes[0..],
+                // Candidate-only worker state must stay hidden while the old
+                // generation remains serviceable.
+                .async_indexing = .{ .dense_catch_up = .{
+                    .active = true,
+                    .phase = .replay,
+                    .current_sequence = 2,
+                    .current_target_sequence = 5,
+                } },
+            },
+        },
+        .{
+            .group_id = 8,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 1,
+                .doc_count = 1,
+                .index_count = 1,
+                .indexes = live_indexes[0..],
+                // This shard's table-level snapshot leads its per-index
+                // overlay and remains authoritative public readiness debt.
+                .async_indexing = .{ .dense_catch_up = .{
+                    .active = true,
+                    .phase = .replay,
+                    .current_sequence = 7,
+                    .current_target_sequence = 11,
+                } },
+            },
+        },
+    };
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "thumbnail",
+        &.{ 7, 8 },
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rebuilding", aggregate.repair_state.?);
+    try std.testing.expect(aggregate.repair_active_generation_serviceable);
+    // The repair shard contributes its active-generation 2 -> 2 boundary;
+    // the sibling contributes the live 7 -> 11 fallback.
+    try std.testing.expectEqual(@as(u64, 9), aggregate.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 13), aggregate.replay_target_sequence);
+    try std.testing.expect(aggregate.replay_catch_up_required);
+    try std.testing.expect(aggregate.catch_up_active);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .partial,
+        false,
+        42,
+        99,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":9,\"dense_replay_target_sequence\":13,\"dense_publish_pending\":true,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\"}",
+        encoded.items,
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("repair") == null);
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
