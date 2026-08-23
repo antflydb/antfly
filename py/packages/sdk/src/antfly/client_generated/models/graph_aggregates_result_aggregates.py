@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from ..models.graph_aggregate_value import GraphAggregateValue
 
 
-T = TypeVar("T", bound="GraphQueryResultAggregates")
+T = TypeVar("T", bound="GraphAggregatesResultAggregates")
 
 
 @_attrs_define
-class GraphQueryResultAggregates:
+class GraphAggregatesResultAggregates:
     """ """
 
     additional_properties: dict[str, GraphAggregateValue] = _attrs_field(init=False, factory=dict)
@@ -32,7 +32,7 @@ class GraphQueryResultAggregates:
         from ..models.graph_aggregate_value import GraphAggregateValue
 
         d = dict(src_dict)
-        graph_query_result_aggregates = cls()
+        graph_aggregates_result_aggregates = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -40,8 +40,8 @@ class GraphQueryResultAggregates:
 
             additional_properties[prop_name] = additional_property
 
-        graph_query_result_aggregates.additional_properties = additional_properties
-        return graph_query_result_aggregates
+        graph_aggregates_result_aggregates.additional_properties = additional_properties
+        return graph_aggregates_result_aggregates
 
     @property
     def additional_keys(self) -> list[str]:

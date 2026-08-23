@@ -17874,7 +17874,7 @@ test "parseRemoteSearchResult preserves grouped hierarchy matches" {
 test "parseRemoteSearchResult preserves typed graph rows and hydrated documents" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"messages"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"messages"}]}
     );
     defer result.deinit();
 
@@ -17908,17 +17908,43 @@ fn parseRemoteGraphResults(
     var it = value.map.iterator();
     while (it.next()) |entry| {
         const result_value = entry.value_ptr.*;
-        var parsed_nodes = if (result_value.nodes) |nodes_value|
+        const ResultView = struct {
+            nodes: ?[]const indexes_openapi.GraphResultNode = null,
+            paths: ?[]const indexes_openapi.Path = null,
+            rows: ?[]const indexes_openapi.GraphResultRow = null,
+            aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
+            truncated: bool = false,
+        };
+        const view: ResultView = switch (result_value) {
+            .graph_nodes_result => |result| .{
+                .nodes = result.nodes,
+                .paths = result.paths,
+                .truncated = result.stats.truncated,
+            },
+            .graph_bindings_result => |result| .{
+                .rows = result.rows,
+                .truncated = result.stats.truncated,
+            },
+            .graph_aggregates_result => |result| .{
+                .aggregates = result.aggregates,
+                .truncated = result.stats.truncated,
+            },
+            .legacy_graph_query_result => |result| .{
+                .nodes = result.nodes,
+                .paths = result.paths,
+            },
+        };
+        var parsed_nodes = if (view.nodes) |nodes_value|
             try parseRemoteGraphNodes(alloc, nodes_value)
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
-        var parsed_matches = if (result_value.rows) |rows_value|
+        var parsed_matches = if (view.rows) |rows_value|
             try parseRemoteGraphRows(alloc, rows_value)
         else
             ParsedRemoteGraphMatches{};
         errdefer parsed_matches.deinit(alloc);
-        const paths: []graph_paths.Path = if (result_value.paths) |paths_value|
+        const paths: []graph_paths.Path = if (view.paths) |paths_value|
             try parseRemoteGraphPaths(alloc, paths_value)
         else
             @constCast((&[_]graph_paths.Path{})[0..]);
@@ -17926,7 +17952,7 @@ fn parseRemoteGraphResults(
             for (paths) |path| graph_paths.freePath(alloc, path);
             if (paths.len > 0) alloc.free(paths);
         }
-        const aggregates = if (result_value.aggregates) |aggregates_value|
+        const aggregates = if (view.aggregates) |aggregates_value|
             try parseRemoteGraphAggregates(alloc, aggregates_value)
         else
             @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
@@ -17955,7 +17981,7 @@ fn parseRemoteGraphResults(
             .aggregates = aggregates,
             .hits = joined_hits,
             .total_hits = @intCast(@max(parsed_nodes.nodes.len, @max(paths.len, parsed_matches.matches.len))),
-            .truncated = if (result_value.stats) |stats| stats.truncated else false,
+            .truncated = view.truncated,
         };
         initialized += 1;
     }

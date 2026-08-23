@@ -6202,11 +6202,15 @@ test "public api e2e restores chunked managed embeddings from table backup" {
 
 test "public api e2e supports graph queries" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphQueryResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
-            return graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            return switch (result) {
+                .graph_nodes_result => |nodes| nodes,
+                else => error.TestUnexpectedResult,
+            };
         }
     };
 
@@ -6311,9 +6315,9 @@ test "public api e2e supports graph queries" {
     defer parsed_graph.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_graph.value.responses.?[0].hits.?.total.?.value);
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
-    try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors.nodes.?[1].key);
+    try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors.nodes[1].key);
 
     const traverse_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequestWithPaths(
         std.testing.allocator,
@@ -6330,14 +6334,14 @@ test "public api e2e supports graph queries" {
     var parsed_traverse = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, traverse_query.body);
     defer parsed_traverse.deinit();
     const traverse = try expectSingleGraphResult.get(parsed_traverse.value, "traverse");
-    try std.testing.expectEqual(@as(usize, 2), traverse.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", traverse.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", traverse.nodes.?[1].key);
-    try std.testing.expectEqual(@as(i64, 2), traverse.nodes.?[1].depth.?);
-    try std.testing.expectEqual(@as(usize, 3), traverse.nodes.?[1].path.?.len);
-    try std.testing.expectEqualStrings("doc-a", traverse.nodes.?[1].path.?[0]);
-    try std.testing.expectEqualStrings("doc-b", traverse.nodes.?[1].path.?[1]);
-    try std.testing.expectEqualStrings("doc-c", traverse.nodes.?[1].path.?[2]);
+    try std.testing.expectEqual(@as(usize, 2), traverse.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", traverse.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", traverse.nodes[1].key);
+    try std.testing.expectEqual(@as(i64, 2), traverse.nodes[1].depth.?);
+    try std.testing.expectEqual(@as(usize, 3), traverse.nodes[1].path.?.len);
+    try std.testing.expectEqualStrings("doc-a", traverse.nodes[1].path.?[0]);
+    try std.testing.expectEqualStrings("doc-b", traverse.nodes[1].path.?[1]);
+    try std.testing.expectEqualStrings("doc-c", traverse.nodes[1].path.?[2]);
 
     const shortest_path_query_body = try test_contract_helpers.encodeGraphShortestPathQueryRequest(
         std.testing.allocator,
@@ -6355,13 +6359,13 @@ test "public api e2e supports graph queries" {
     var parsed_shortest = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, shortest_path_query.body);
     defer parsed_shortest.deinit();
     const shortest = try expectSingleGraphResult.get(parsed_shortest.value, "shortest");
-    try std.testing.expectEqual(@as(usize, 1), shortest.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-c", shortest.nodes.?[0].key);
-    try std.testing.expectEqual(@as(i64, 2), shortest.nodes.?[0].depth.?);
-    try std.testing.expectEqual(@as(usize, 3), shortest.nodes.?[0].path.?.len);
-    try std.testing.expectEqualStrings("doc-a", shortest.nodes.?[0].path.?[0]);
-    try std.testing.expectEqualStrings("doc-b", shortest.nodes.?[0].path.?[1]);
-    try std.testing.expectEqualStrings("doc-c", shortest.nodes.?[0].path.?[2]);
+    try std.testing.expectEqual(@as(usize, 1), shortest.nodes.len);
+    try std.testing.expectEqualStrings("doc-c", shortest.nodes[0].key);
+    try std.testing.expectEqual(@as(i64, 2), shortest.nodes[0].depth.?);
+    try std.testing.expectEqual(@as(usize, 3), shortest.nodes[0].path.?.len);
+    try std.testing.expectEqualStrings("doc-a", shortest.nodes[0].path.?[0]);
+    try std.testing.expectEqualStrings("doc-b", shortest.nodes[0].path.?[1]);
+    try std.testing.expectEqualStrings("doc-c", shortest.nodes[0].path.?[2]);
 
     try std.testing.expectError(
         error.UnexpectedHttpStatus,
@@ -6391,11 +6395,15 @@ test "public api e2e supports graph queries" {
 
 test "public api e2e graph queries respect full_index sync level" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphQueryResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
-            return graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            return switch (result) {
+                .graph_nodes_result => |nodes| nodes,
+                else => error.TestUnexpectedResult,
+            };
         }
     };
 
@@ -6499,9 +6507,9 @@ test "public api e2e graph queries respect full_index sync level" {
     var parsed_graph = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body);
     defer parsed_graph.deinit();
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
-    try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors.nodes.?[1].key);
+    try std.testing.expectEqual(@as(usize, 2), neighbors.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors.nodes[1].key);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"deletes":["doc-b"],"sync_level":"full_index"}
@@ -6515,17 +6523,21 @@ test "public api e2e graph queries respect full_index sync level" {
     var parsed_after = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body);
     defer parsed_after.deinit();
     const neighbors_after = try expectSingleGraphResult.get(parsed_after.value, "neighbors");
-    try std.testing.expectEqual(@as(usize, 1), neighbors_after.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes.?[0].key);
+    try std.testing.expectEqual(@as(usize, 1), neighbors_after.nodes.len);
+    try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes[0].key);
 }
 
 test "public api e2e restores graph indexes from table backup" {
     const expectSingleGraphResult = struct {
-        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !indexes_openapi.GraphQueryResult {
+        fn get(parsed: metadata_openapi.QueryResponses, name: []const u8) !*indexes_openapi.GraphNodesResult {
             const responses = parsed.responses orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(usize, 1), responses.len);
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
-            return graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
+            return switch (result) {
+                .graph_nodes_result => |nodes| nodes,
+                else => error.TestUnexpectedResult,
+            };
         }
     };
 
@@ -6630,9 +6642,9 @@ test "public api e2e restores graph indexes from table backup" {
     var parsed_graph_before = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_before.body);
     defer parsed_graph_before.deinit();
     const neighbors_before = try expectSingleGraphResult.get(parsed_graph_before.value, "neighbors");
-    try std.testing.expectEqual(@as(usize, 2), neighbors_before.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors_before.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_before.nodes.?[1].key);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_before.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_before.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_before.nodes[1].key);
 
     var graph_index_before = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
     defer graph_index_before.deinit(std.testing.allocator);
@@ -6695,9 +6707,9 @@ test "public api e2e restores graph indexes from table backup" {
     var parsed_graph_after = try parseJsonBody(metadata_openapi.QueryResponses, std.testing.allocator, graph_query_after.body);
     defer parsed_graph_after.deinit();
     const neighbors_after = try expectSingleGraphResult.get(parsed_graph_after.value, "neighbors");
-    try std.testing.expectEqual(@as(usize, 2), neighbors_after.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors_after.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes.?[1].key);
+    try std.testing.expectEqual(@as(usize, 2), neighbors_after.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_after.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_after.nodes[1].key);
 }
 
 test "public api smoke e2e queries across split ranges" {

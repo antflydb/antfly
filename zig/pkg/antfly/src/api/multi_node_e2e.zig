@@ -1182,19 +1182,18 @@ fn ensureGroupGraphIndex(
 }
 
 fn expectGraphNodeKeys(
-    nodes: ?[]const indexes_openapi.GraphResultNode,
+    nodes: []const indexes_openapi.GraphResultNode,
     expected: []const []const u8,
 ) !void {
-    const actual = nodes orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(expected.len, actual.len);
+    try std.testing.expectEqual(expected.len, nodes.len);
 
-    var matched = try std.testing.allocator.alloc(bool, actual.len);
+    var matched = try std.testing.allocator.alloc(bool, nodes.len);
     defer std.testing.allocator.free(matched);
     @memset(matched, false);
 
     for (expected) |key| {
         var found = false;
-        for (actual, 0..) |node, i| {
+        for (nodes, 0..) |node, i| {
             if (matched[i]) continue;
             if (!std.mem.eql(u8, node.key, key)) continue;
             matched[i] = true;
@@ -1203,6 +1202,13 @@ fn expectGraphNodeKeys(
         }
         try std.testing.expect(found);
     }
+}
+
+fn expectGraphNodesResult(result: indexes_openapi.GraphQueryResult) !*indexes_openapi.GraphNodesResult {
+    return switch (result) {
+        .graph_nodes_result => |nodes| nodes,
+        else => error.TestUnexpectedResult,
+    };
 }
 
 fn expectQueryProfileSummary(
@@ -1229,18 +1235,17 @@ fn expectQueryProfileSummary(
 }
 
 fn findGraphNode(
-    nodes: ?[]const indexes_openapi.GraphResultNode,
+    nodes: []const indexes_openapi.GraphResultNode,
     key: []const u8,
 ) ?indexes_openapi.GraphResultNode {
-    const actual = nodes orelse return null;
-    for (actual) |node| {
+    for (nodes) |node| {
         if (std.mem.eql(u8, node.key, key)) return node;
     }
     return null;
 }
 
 fn expectGraphNodePath(
-    nodes: ?[]const indexes_openapi.GraphResultNode,
+    nodes: []const indexes_openapi.GraphResultNode,
     key: []const u8,
     expected_path: []const []const u8,
     expected_edge_types: []const []const u8,
@@ -5805,9 +5810,9 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     var parsed_graph = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, graph_query.body, .{});
     defer parsed_graph.deinit();
     const graph_results = parsed_graph.value.responses.?[0].graph_results.?;
-    const neighbors = graph_results.map.get("neighbors").?;
-    try std.testing.expectEqual(@as(usize, 1), neighbors.nodes.?.len);
-    try std.testing.expectEqualStrings("doc:b", neighbors.nodes.?[0].key);
+    const neighbors = try expectGraphNodesResult(graph_results.map.get("neighbors").?);
+    try std.testing.expectEqual(@as(usize, 1), neighbors.nodes.len);
+    try std.testing.expectEqualStrings("doc:b", neighbors.nodes[0].key);
 }
 
 test "public api multi-node e2e routes split flow from a non-host node" {
@@ -6069,8 +6074,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer graph_query.deinit(std.heap.page_allocator);
     var graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, graph_query.body, .{});
     defer graph_responses.deinit();
-    const graph_result = graph_responses.value.responses.?[0].graph_results.?.map.get("walk").?;
-    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.?.len);
+    const graph_result = try expectGraphNodesResult(graph_responses.value.responses.?[0].graph_results.?.map.get("walk").?);
+    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.len);
     try expectGraphNodeKeys(graph_result.nodes, &.{ "doc:z", "doc:y" });
 
     const graph_paths_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequestWithPaths(
@@ -6087,8 +6092,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer graph_paths_query.deinit(std.heap.page_allocator);
     var graph_paths_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, graph_paths_query.body, .{});
     defer graph_paths_responses.deinit();
-    const graph_paths_result = graph_paths_responses.value.responses.?[0].graph_results.?.map.get("walk_paths").?;
-    try std.testing.expectEqual(@as(usize, 2), graph_paths_result.nodes.?.len);
+    const graph_paths_result = try expectGraphNodesResult(graph_paths_responses.value.responses.?[0].graph_results.?.map.get("walk_paths").?);
+    try std.testing.expectEqual(@as(usize, 2), graph_paths_result.nodes.len);
     try expectGraphNodePath(graph_paths_result.nodes, "doc:z", &.{ "doc:a", "doc:z" }, &.{"links"});
     try expectGraphNodePath(graph_paths_result.nodes, "doc:y", &.{ "doc:a", "doc:z", "doc:y" }, &.{ "links", "links" });
 
@@ -6107,8 +6112,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer shortest_query.deinit(std.heap.page_allocator);
     var shortest_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, shortest_query.body, .{});
     defer shortest_responses.deinit();
-    const shortest_result = shortest_responses.value.responses.?[0].graph_results.?.map.get("shortest").?;
-    try std.testing.expectEqual(@as(usize, 1), shortest_result.nodes.?.len);
+    const shortest_result = try expectGraphNodesResult(shortest_responses.value.responses.?[0].graph_results.?.map.get("shortest").?);
+    try std.testing.expectEqual(@as(usize, 1), shortest_result.nodes.len);
     try expectGraphNodeKeys(shortest_result.nodes, &.{"doc:y"});
     try expectGraphNodePath(shortest_result.nodes, "doc:y", &.{ "doc:a", "doc:z", "doc:y" }, &.{ "links", "links" });
 
@@ -6144,8 +6149,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer min_weight_query.deinit(std.heap.page_allocator);
     var min_weight_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, min_weight_query.body, .{});
     defer min_weight_responses.deinit();
-    const min_weight_result = min_weight_responses.value.responses.?[0].graph_results.?.map.get("shortest_min_weight").?;
-    try std.testing.expectEqual(@as(usize, 1), min_weight_result.nodes.?.len);
+    const min_weight_result = try expectGraphNodesResult(min_weight_responses.value.responses.?[0].graph_results.?.map.get("shortest_min_weight").?);
+    try std.testing.expectEqual(@as(usize, 1), min_weight_result.nodes.len);
     try expectGraphNodePath(min_weight_result.nodes, "doc:y", &.{ "doc:a", "doc:b", "doc:c", "doc:y" }, &.{ "links", "links", "links" });
 
     const max_weight_query_body = try test_contract_helpers.encodeWeightedGraphShortestPathQueryRequest(
@@ -6164,8 +6169,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer max_weight_query.deinit(std.heap.page_allocator);
     var max_weight_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, max_weight_query.body, .{});
     defer max_weight_responses.deinit();
-    const max_weight_result = max_weight_responses.value.responses.?[0].graph_results.?.map.get("shortest_max_weight").?;
-    try std.testing.expectEqual(@as(usize, 1), max_weight_result.nodes.?.len);
+    const max_weight_result = try expectGraphNodesResult(max_weight_responses.value.responses.?[0].graph_results.?.map.get("shortest_max_weight").?);
+    try std.testing.expectEqual(@as(usize, 1), max_weight_result.nodes.len);
     try expectGraphNodePath(max_weight_result.nodes, "doc:y", &.{ "doc:a", "doc:z", "doc:y" }, &.{ "links", "links" });
 
     const k_shortest_query_body = try test_contract_helpers.encodeWeightedGraphKShortestPathsQueryRequest(
@@ -6185,10 +6190,10 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer k_shortest_query.deinit(std.heap.page_allocator);
     var k_shortest_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, k_shortest_query.body, .{});
     defer k_shortest_responses.deinit();
-    const k_shortest_result = k_shortest_responses.value.responses.?[0].graph_results.?.map.get("k_shortest").?;
-    try std.testing.expectEqual(@as(usize, 2), k_shortest_result.nodes.?.len);
+    const k_shortest_result = try expectGraphNodesResult(k_shortest_responses.value.responses.?[0].graph_results.?.map.get("k_shortest").?);
+    try std.testing.expectEqual(@as(usize, 2), k_shortest_result.nodes.len);
     try expectGraphNodePath(k_shortest_result.nodes, "doc:y", &.{ "doc:a", "doc:b", "doc:c", "doc:y" }, &.{ "links", "links", "links" });
-    const k_shortest_nodes = k_shortest_result.nodes orelse return error.TestExpectedEqual;
+    const k_shortest_nodes = k_shortest_result.nodes;
     try expectGraphNodePath(k_shortest_nodes[1..], "doc:y", &.{ "doc:a", "doc:z", "doc:y" }, &.{ "links", "links" });
 
     const ref_graph_query_body = try test_contract_helpers.encodeMatchGraphTraverseFromResultRefQueryRequest(
@@ -6208,8 +6213,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer ref_graph_responses.deinit();
     const ref_query_result = ref_graph_responses.value.responses.?[0];
     try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?.value);
-    const ref_graph_result = ref_query_result.graph_results.?.map.get("walk_from_text").?;
-    try std.testing.expectEqual(@as(usize, 2), ref_graph_result.nodes.?.len);
+    const ref_graph_result = try expectGraphNodesResult(ref_query_result.graph_results.?.map.get("walk_from_text").?);
+    try std.testing.expectEqual(@as(usize, 2), ref_graph_result.nodes.len);
     try expectGraphNodeKeys(ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
 
     const fused_ref_graph_query_body = try test_contract_helpers.encodeMatchGraphTraverseFromResultRefQueryRequest(
@@ -6229,8 +6234,8 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     defer fused_ref_graph_responses.deinit();
     const fused_ref_query_result = fused_ref_graph_responses.value.responses.?[0];
     try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?.value);
-    const fused_ref_graph_result = fused_ref_query_result.graph_results.?.map.get("walk_from_fused").?;
-    try std.testing.expectEqual(@as(usize, 2), fused_ref_graph_result.nodes.?.len);
+    const fused_ref_graph_result = try expectGraphNodesResult(fused_ref_query_result.graph_results.?.map.get("walk_from_fused").?);
+    try std.testing.expectEqual(@as(usize, 2), fused_ref_graph_result.nodes.len);
     try expectGraphNodeKeys(fused_ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
@@ -6548,8 +6553,8 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     defer graph_query.deinit(std.heap.page_allocator);
     var graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, graph_query.body, .{});
     defer graph_responses.deinit();
-    const graph_result = graph_responses.value.responses.?[0].graph_results.?.map.get("neighbors").?;
-    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.?.len);
+    const graph_result = try expectGraphNodesResult(graph_responses.value.responses.?[0].graph_results.?.map.get("neighbors").?);
+    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.len);
     try expectGraphNodeKeys(graph_result.nodes, &.{ "doc:b", "doc:y" });
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator, "{\"deletes\":[\"doc:z\"]}");
@@ -6794,8 +6799,8 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     defer graph_query.deinit(std.heap.page_allocator);
     var graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, graph_query.body, .{});
     defer graph_responses.deinit();
-    const graph_result = graph_responses.value.responses.?[0].graph_results.?.map.get("walk").?;
-    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.?.len);
+    const graph_result = try expectGraphNodesResult(graph_responses.value.responses.?[0].graph_results.?.map.get("walk").?);
+    try std.testing.expectEqual(@as(usize, 2), graph_result.nodes.len);
     try expectGraphNodeKeys(graph_result.nodes, &.{ "doc:z", "doc:y" });
     try std.testing.expectEqual(@as(u32, 1), churn_executor.trigger_count);
 }

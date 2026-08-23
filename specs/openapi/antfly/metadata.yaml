@@ -1734,6 +1734,7 @@ components:
       properties:
         error:
           type: string
+          enum: [unsupported_exact_sort]
           description: Stable error class.
           example: unsupported_exact_sort
         message:
@@ -1784,7 +1785,95 @@ components:
         status:
           type: integer
           format: int32
+          enum: [422]
           example: 422
+    QueryCandidateBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - message
+        - reason
+        - budget_rejection_reason
+        - sort_rejection_reason
+        - sort_rejection_detail
+        - sort_rejection_field
+        - status
+      properties:
+        error:
+          type: string
+          enum: [query_candidate_budget_exceeded]
+        message:
+          type: string
+        reason:
+          type: string
+        budget_rejection_reason:
+          type: string
+        sort_rejection_reason:
+          type: string
+        sort_rejection_detail:
+          type: string
+        sort_rejection_field:
+          type: string
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+    GraphDistinctBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, max_distinct_identities, max_distinct_identity_bytes]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_distinct_budget_exceeded]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        max_distinct_identities:
+          type: integer
+          format: uint64
+          description: Maximum distinct table-qualified identities retained by one request.
+        max_distinct_identity_bytes:
+          type: integer
+          format: uint64
+          description: Maximum identity payload bytes retained by one request.
+    GraphAnchorFilterRequiresIndexError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_anchor_filter_requires_index]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+    QueryUnprocessableError:
+      oneOf:
+        - $ref: '#/components/schemas/ExactSortError'
+        - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
+        - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+      discriminator:
+        propertyName: error
+        mapping:
+          unsupported_exact_sort: '#/components/schemas/ExactSortError'
+          query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
+          graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
+          graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
     SortDirection:
       $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
@@ -8679,12 +8768,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-    UnsupportedExactSort:
-      description: Exact sort cannot be executed through a supported native plan
+    QueryUnprocessable:
+      description: The query is valid but cannot be executed exactly under the declared contract
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ExactSortError"
+            $ref: "#/components/schemas/QueryUnprocessableError"
     HierarchyCursorStale:
       description: The hierarchy changed after the traversal cursor was issued
       content:
@@ -9746,7 +9835,7 @@ paths:
         "409":
           $ref: "#/components/responses/HierarchyCursorStale"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/QueryUnprocessable"
         "503":
           $ref: "#/components/responses/QueryTemporarilyUnavailable"
         "500":
@@ -10133,7 +10222,7 @@ paths:
         "409":
           $ref: "#/components/responses/HierarchyCursorStale"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/QueryUnprocessable"
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "503":

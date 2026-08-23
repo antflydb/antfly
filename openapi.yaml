@@ -3430,7 +3430,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/QueryUnprocessable'
         '503':
           $ref: '#/components/responses/QueryTemporarilyUnavailable'
         '500':
@@ -3906,7 +3906,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/QueryUnprocessable'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -8146,6 +8146,8 @@ components:
       properties:
         error:
           type: string
+          enum:
+            - unsupported_exact_sort
           description: Stable error class.
           example: unsupported_exact_sort
         message:
@@ -8214,7 +8216,114 @@ components:
         status:
           type: integer
           format: int32
+          enum:
+            - 422
           example: 422
+    QueryCandidateBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - message
+        - reason
+        - budget_rejection_reason
+        - sort_rejection_reason
+        - sort_rejection_detail
+        - sort_rejection_field
+        - status
+      properties:
+        error:
+          type: string
+          enum:
+            - query_candidate_budget_exceeded
+        message:
+          type: string
+        reason:
+          type: string
+        budget_rejection_reason:
+          type: string
+        sort_rejection_reason:
+          type: string
+        sort_rejection_detail:
+          type: string
+        sort_rejection_field:
+          type: string
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+    GraphDistinctBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - error
+        - message
+        - retryable
+        - max_distinct_identities
+        - max_distinct_identity_bytes
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - graph_distinct_budget_exceeded
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+        max_distinct_identities:
+          type: integer
+          format: uint64
+          description: Maximum distinct table-qualified identities retained by one request.
+        max_distinct_identity_bytes:
+          type: integer
+          format: uint64
+          description: Maximum identity payload bytes retained by one request.
+    GraphAnchorFilterRequiresIndexError:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - error
+        - message
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - graph_anchor_filter_requires_index
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    QueryUnprocessableError:
+      oneOf:
+        - $ref: '#/components/schemas/ExactSortError'
+        - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
+        - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+      discriminator:
+        propertyName: error
+        mapping:
+          unsupported_exact_sort: '#/components/schemas/ExactSortError'
+          query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
+          graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
+          graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.
@@ -23025,6 +23134,111 @@ components:
           items:
             $ref: '#/components/schemas/Edge'
           description: Connected edges when supplied by the graph executor.
+    GraphResultBinding:
+      x-go-type: '*GraphResultNode'
+      oneOf:
+        - $ref: '#/components/schemas/GraphResultNode'
+        - enum:
+            - null
+    GraphResultRow:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/GraphResultBinding'
+    GraphQueryStats:
+      type: object
+      required:
+        - returned_items
+        - truncated
+      properties:
+        returned_items:
+          type: integer
+          format: uint64
+          description: Number of primary result items returned (nodes, paths, rows, or aggregates).
+        truncated:
+          type: boolean
+    GraphBindingsResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required:
+        - rows
+        - stats
+        - took
+      description: Complete projected bindings from a canonical graph MATCH query.
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResultRow'
+        stats:
+          $ref: '#/components/schemas/GraphQueryStats'
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
+    GraphAggregateValue:
+      type: object
+      required:
+        - value
+        - exact
+      properties:
+        value:
+          type: string
+          pattern: ^[0-9]+$
+          description: Decimal string so counts remain lossless in JavaScript.
+        exact:
+          type: boolean
+    GraphAggregatesResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required:
+        - aggregates
+        - stats
+        - took
+      description: Complete exact aggregates from a canonical graph MATCH query.
+      properties:
+        aggregates:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphAggregateValue'
+        stats:
+          $ref: '#/components/schemas/GraphQueryStats'
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
+    GraphNodesResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required:
+        - nodes
+        - paths
+        - stats
+        - took
+      description: Nodes and any materialized paths from a canonical traversal or path query.
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResultNode'
+          description: Result nodes.
+        paths:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            $ref: '#/components/schemas/Path'
+          description: Materialized result paths; empty when paths were not requested or produced.
+        stats:
+          $ref: '#/components/schemas/GraphQueryStats'
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
     PatternMatch:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -23041,61 +23255,34 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PathEdge'
-    GraphResultBinding:
-      x-go-type: '*GraphResultNode'
-      oneOf:
-        - $ref: '#/components/schemas/GraphResultNode'
-        - enum:
-            - null
-    GraphResultRow:
-      type: object
-      additionalProperties:
-        $ref: '#/components/schemas/GraphResultBinding'
-    GraphAggregateValue:
-      type: object
-      required:
-        - value
-        - exact
-      properties:
-        value:
-          type: string
-          pattern: ^[0-9]+$
-          description: Decimal string so counts remain lossless in JavaScript.
-        exact:
-          type: boolean
-    GraphQueryStats:
-      type: object
-      required:
-        - returned_items
-        - truncated
-      properties:
-        returned_items:
-          type: integer
-          format: uint64
-          description: Number of primary result items returned (nodes, paths, rows, or aggregates).
-        truncated:
-          type: boolean
-    GraphQueryResult:
+    LegacyGraphQueryResult:
       x-go-type-skip-optional-pointer: true
       type: object
-      description: Results of a graph query
+      additionalProperties: false
+      deprecated: true
+      required:
+        - type
+        - nodes
+        - paths
+        - total
+        - took
+      description: Deprecated graph_searches response envelope.
       properties:
         type:
           deprecated: true
-          description: Deprecated graph_searches query discriminator; omitted for graph_queries.
           $ref: '#/components/schemas/GraphQueryType'
         nodes:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
             $ref: '#/components/schemas/GraphResultNode'
-          description: Result nodes
+          description: Result nodes.
         paths:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
             $ref: '#/components/schemas/Path'
-          description: Result paths (for pathfinding queries)
+          description: Result paths.
         matches:
           deprecated: true
           x-go-type-skip-optional-pointer: true
@@ -23108,22 +23295,20 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Deprecated graph_searches result count; use stats or a named count aggregate.
-        rows:
-          type: array
-          items:
-            $ref: '#/components/schemas/GraphResultRow'
-        aggregates:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/GraphAggregateValue'
-        stats:
-          $ref: '#/components/schemas/GraphQueryStats'
         took:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: int64
           x-go-type: time.Duration
           description: Query execution time
+    GraphQueryResult:
+      description: A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path
+        results cannot be confused with the deprecated graph_searches envelope.
+      oneOf:
+        - $ref: '#/components/schemas/GraphBindingsResult'
+        - $ref: '#/components/schemas/GraphAggregatesResult'
+        - $ref: '#/components/schemas/GraphNodesResult'
+        - $ref: '#/components/schemas/LegacyGraphQueryResult'
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true
@@ -26578,12 +26763,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-    UnsupportedExactSort:
-      description: Exact sort cannot be executed through a supported native plan
+    QueryUnprocessable:
+      description: The query is valid but cannot be executed exactly under the declared contract
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ExactSortError'
+            $ref: '#/components/schemas/QueryUnprocessableError'
     HierarchyCursorStale:
       description: The hierarchy changed after the traversal cursor was issued
       content:

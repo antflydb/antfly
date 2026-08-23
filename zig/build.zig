@@ -3769,6 +3769,7 @@ pub fn build(b: *std.Build) void {
         "inapplicable exact plan does not consume generic fallback budget",
         "graph exact edge probes stay aligned and preserve payloads",
         "query parser preserves exact graph path endpoint identities",
+        "query parser owns graph match anchor through its required node alias",
         "query merge allocation scales with the selected page",
         "graph merge enforces query-wide row limit and exact distinct identity",
         "graph merge rejects missing and inexact aggregate shards",

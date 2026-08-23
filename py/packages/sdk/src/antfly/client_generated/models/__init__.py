@@ -227,6 +227,8 @@ from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
+from .exact_sort_error_error import ExactSortErrorError
+from .exact_sort_error_status import ExactSortErrorStatus
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -301,10 +303,15 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_aggregate_value import GraphAggregateValue
+from .graph_aggregates_result import GraphAggregatesResult
+from .graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
 from .graph_aggregates_return import GraphAggregatesReturn
 from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
 from .graph_alias_operand import GraphAliasOperand
+from .graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
+from .graph_anchor_filter_requires_index_error_error import GraphAnchorFilterRequiresIndexErrorError
+from .graph_anchor_filter_requires_index_error_status import GraphAnchorFilterRequiresIndexErrorStatus
 from .graph_artifact_context_config import GraphArtifactContextConfig
 from .graph_artifact_edge_mapping_config import GraphArtifactEdgeMappingConfig
 from .graph_artifact_edge_mapping_config_metadata import GraphArtifactEdgeMappingConfigMetadata
@@ -318,10 +325,14 @@ from .graph_artifact_producer_source_config_type import GraphArtifactProducerSou
 from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
+from .graph_bindings_result import GraphBindingsResult
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_count_aggregate import GraphCountAggregate
+from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
+from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
+from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
 from .graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
 from .graph_document_date_range_filter import GraphDocumentDateRangeFilter
 from .graph_document_filter_boolean import GraphDocumentFilterBoolean
@@ -361,6 +372,7 @@ from .graph_match_edge import GraphMatchEdge
 from .graph_match_node import GraphMatchNode
 from .graph_match_nodes import GraphMatchNodes
 from .graph_match_query import GraphMatchQuery
+from .graph_nodes_result import GraphNodesResult
 from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
@@ -368,8 +380,6 @@ from .graph_optional_match_nodes import GraphOptionalMatchNodes
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
-from .graph_query_result import GraphQueryResult
-from .graph_query_result_aggregates import GraphQueryResultAggregates
 from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_resolver_config import GraphResolverConfig
@@ -597,6 +607,7 @@ from .key_range import KeyRange
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
+from .legacy_graph_query_result import LegacyGraphQueryResult
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -680,6 +691,9 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
+from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExceededErrorError
+from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
 from .query_hierarchy import QueryHierarchy
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
@@ -1101,6 +1115,8 @@ __all__ = (
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
     "ExactSortError",
+    "ExactSortErrorError",
+    "ExactSortErrorStatus",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExecutionPolicy",
@@ -1176,11 +1192,16 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphAggregatesResult",
+    "GraphAggregatesResultAggregates",
     "GraphAggregatesReturn",
     "GraphAggregatesReturnAggregates",
     "GraphAggregateValue",
     "GraphAlgebraicPlanningConfig",
     "GraphAliasOperand",
+    "GraphAnchorFilterRequiresIndexError",
+    "GraphAnchorFilterRequiresIndexErrorError",
+    "GraphAnchorFilterRequiresIndexErrorStatus",
     "GraphArtifactContextConfig",
     "GraphArtifactEdgeMappingConfig",
     "GraphArtifactEdgeMappingConfigMetadata",
@@ -1194,10 +1215,14 @@ __all__ = (
     "GraphArtifactSourceConfig",
     "GraphArtifactSourceConfigFormat",
     "GraphArtifactSourceConfigKind",
+    "GraphBindingsResult",
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphCountAggregate",
+    "GraphDistinctBudgetExceededError",
+    "GraphDistinctBudgetExceededErrorError",
+    "GraphDistinctBudgetExceededErrorStatus",
     "GraphDocumentBoolFieldFilter",
     "GraphDocumentDateRangeFilter",
     "GraphDocumentFilterBoolean",
@@ -1237,6 +1262,7 @@ __all__ = (
     "GraphMatchNode",
     "GraphMatchNodes",
     "GraphMatchQuery",
+    "GraphNodesResult",
     "GraphNotEqualPredicate",
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
@@ -1244,8 +1270,6 @@ __all__ = (
     "GraphPathEndpoint",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
-    "GraphQueryResult",
-    "GraphQueryResultAggregates",
     "GraphQueryStats",
     "GraphQueryType",
     "GraphResolverConfig",
@@ -1471,6 +1495,7 @@ __all__ = (
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
+    "LegacyGraphQueryResult",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -1552,6 +1577,9 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryCandidateBudgetExceededError",
+    "QueryCandidateBudgetExceededErrorError",
+    "QueryCandidateBudgetExceededErrorStatus",
     "QueryHierarchy",
     "QueryHit",
     "QueryHitHierarchy",

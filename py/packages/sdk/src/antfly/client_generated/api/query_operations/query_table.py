@@ -8,7 +8,10 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.exact_sort_error import ExactSortError
+from ...models.graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
+from ...models.graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from ...models.hierarchy_cursor_stale_error import HierarchyCursorStaleError
+from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from ...models.query_request import QueryRequest
 from ...models.query_responses import QueryResponses
 from ...models.query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
@@ -50,6 +53,9 @@ def _parse_response(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -76,7 +82,46 @@ def _parse_response(
         return response_409
 
     if response.status_code == 422:
-        response_422 = ExactSortError.from_dict(response.json())
+
+        def _parse_response_422(
+            data: object,
+        ) -> (
+            ExactSortError
+            | GraphAnchorFilterRequiresIndexError
+            | GraphDistinctBudgetExceededError
+            | QueryCandidateBudgetExceededError
+        ):
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_0 = ExactSortError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_1 = QueryCandidateBudgetExceededError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_2 = GraphDistinctBudgetExceededError.from_dict(data)
+
+                return componentsschemas_query_unprocessable_error_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_query_unprocessable_error_type_3 = GraphAnchorFilterRequiresIndexError.from_dict(data)
+
+            return componentsschemas_query_unprocessable_error_type_3
+
+        response_422 = _parse_response_422(response.json())
 
         return response_422
 
@@ -119,6 +164,9 @@ def _build_response(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -141,6 +189,9 @@ def sync_detailed(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -157,7 +208,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -182,6 +233,9 @@ def sync(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -199,7 +253,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return sync_detailed(
@@ -219,6 +273,9 @@ async def asyncio_detailed(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -235,7 +292,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError]
     """
 
     kwargs = _get_kwargs(
@@ -258,6 +315,9 @@ async def asyncio(
     | Error
     | TableStorageUnreadableError
     | ExactSortError
+    | GraphAnchorFilterRequiresIndexError
+    | GraphDistinctBudgetExceededError
+    | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | QueryResponses
     | QueryTemporarilyUnavailableError
@@ -275,7 +335,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | QueryResponses | QueryTemporarilyUnavailableError
     """
 
     return (

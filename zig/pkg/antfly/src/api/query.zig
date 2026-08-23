@@ -1970,6 +1970,19 @@ test "query parser accepts graph pattern searches" {
     try std.testing.expectEqual(@as(u32, 10), owned.req.graph_queries[0].query.params.max_results);
 }
 
+test "query parser owns graph match anchor through its required node alias" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_queries":{"escaped":{"index":"graph_idx","match":{"anchor":"a\n","nodes":{"a\n":{}},"edges":[]},"return":{"bindings":["a\n"]}}}}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    const pattern = owned.req.graph_queries[0].query.match_pattern.?;
+    try std.testing.expect(pattern.anchor_alias != null);
+    const anchor_alias = pattern.anchor_alias.?;
+    try std.testing.expectEqualStrings("a\n", anchor_alias);
+    try std.testing.expectEqual(@intFromPtr(pattern.nodes[0].alias.ptr), @intFromPtr(anchor_alias.ptr));
+}
+
 test "query parser treats explicit graph document fields as a projection" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"include_documents":true,"fields":["title"]}}},"limit":10}
@@ -2294,8 +2307,12 @@ test "query encoder emits graph results" {
     const responses = parsed.value.responses orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), responses.len);
     const decoded_graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
-    const neighbors = decoded_graph_results.map.get("neighbors") orelse return error.TestUnexpectedResult;
-    const nodes = neighbors.nodes orelse return error.TestUnexpectedResult;
+    const result_value = decoded_graph_results.map.get("neighbors") orelse return error.TestUnexpectedResult;
+    const neighbors = switch (result_value) {
+        .graph_nodes_result => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const nodes = neighbors.nodes;
     try std.testing.expectEqual(@as(usize, 1), nodes.len);
     try std.testing.expectEqualStrings("doc:b", nodes[0].key);
     const document = nodes[0].document orelse return error.TestUnexpectedResult;

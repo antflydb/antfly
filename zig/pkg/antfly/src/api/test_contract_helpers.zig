@@ -509,10 +509,11 @@ pub fn encodeGraphNeighborsQueryRequest(
 ) ![]u8 {
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
     var query = indexes_openapi.GraphTraverseQuery{
         .index = index_name,
         .traverse = .{
-            .start = .{ .keys = start_keys },
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = 1,
             .limit = limit,
@@ -536,10 +537,11 @@ pub fn encodeGraphTraverseQueryRequest(
 ) ![]u8 {
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
     var query = indexes_openapi.GraphTraverseQuery{
         .index = index_name,
         .traverse = .{
-            .start = .{ .keys = start_keys },
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = max_depth,
             .limit = limit,
@@ -563,10 +565,11 @@ pub fn encodeGraphTraverseQueryRequestWithPaths(
 ) ![]u8 {
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphKeyNodeSelector{ .keys = start_keys };
     var query = indexes_openapi.GraphTraverseQuery{
         .index = index_name,
         .traverse = .{
-            .start = .{ .keys = start_keys },
+            .start = .{ .graph_key_node_selector = &start },
             .edge_types = edge_types,
             .max_depth = max_depth,
             .limit = limit,

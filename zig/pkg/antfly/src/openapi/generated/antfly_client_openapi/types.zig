@@ -4275,6 +4275,14 @@ pub const GraphAggregateValue = struct {
     exact: bool,
 };
 
+/// Complete exact aggregates from a canonical graph MATCH query.
+pub const GraphAggregatesResult = struct {
+    aggregates: std.json.ArrayHashMap(GraphAggregateValue),
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
+};
+
 pub const GraphAggregatesReturn = struct {
     aggregates: std.json.ArrayHashMap(GraphCountAggregate),
 };
@@ -4286,6 +4294,13 @@ pub const GraphAlgebraicPlanningConfig = struct {
 
 pub const GraphAliasOperand = struct {
     alias: []const u8,
+};
+
+pub const GraphAnchorFilterRequiresIndexError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// Document fields made available to graph mapping templates through `_doc.value`.
@@ -4334,6 +4349,14 @@ pub const GraphArtifactSourceConfig = struct {
     mention_edge_type: ?[]const u8 = null,
 };
 
+/// Complete projected bindings from a canonical graph MATCH query.
+pub const GraphBindingsResult = struct {
+    rows: []const GraphResultRow,
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
+};
+
 pub const GraphBindingsReturn = struct {
     bindings: []const []const u8,
     limit: ?i64 = null,
@@ -4353,6 +4376,17 @@ pub const GraphCountAggregate = struct {
     count: []const u8,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
+};
+
+pub const GraphDistinctBudgetExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Maximum distinct table-qualified identities retained by one request.
+    max_distinct_identities: i64,
+    /// Maximum identity payload bytes retained by one request.
+    max_distinct_identity_bytes: i64,
 };
 
 pub const GraphDocumentBoolFieldFilter = struct {
@@ -4843,6 +4877,17 @@ pub const GraphNodeSelector = union(enum) {
     }
 };
 
+/// Nodes and any materialized paths from a canonical traversal or path query.
+pub const GraphNodesResult = struct {
+    /// Result nodes.
+    nodes: []const GraphResultNode,
+    /// Materialized result paths; empty when paths were not requested or produced.
+    paths: []const Path,
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
+};
+
 pub const GraphNotEqualPredicate = struct {
     left: GraphAliasOperand,
     right: GraphAliasOperand,
@@ -4950,23 +4995,80 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
-/// Results of a graph query
-pub const GraphQueryResult = struct {
-    /// Deprecated graph_searches query discriminator; omitted for graph_queries.
-    type: ?GraphQueryType = null,
-    /// Result nodes
-    nodes: ?[]const GraphResultNode = null,
-    /// Result paths (for pathfinding queries)
-    paths: ?[]const Path = null,
-    /// Deprecated graph_searches pattern results; use rows for graph_queries.
-    matches: ?[]const PatternMatch = null,
-    /// Deprecated graph_searches result count; use stats or a named count aggregate.
-    total: ?i64 = null,
-    rows: ?[]const GraphResultRow = null,
-    aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
-    stats: ?GraphQueryStats = null,
-    /// Query execution time
-    took: ?i64 = null,
+/// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
+pub const GraphQueryResult = union(enum) {
+    legacy_graph_query_result: *LegacyGraphQueryResult,
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "nodes",
+            "paths",
+            "matches",
+            "total",
+            "took",
+        })) {
+            if (try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options)) |parsed| return .{ .legacy_graph_query_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "nodes",
+            "paths",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "aggregates",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "rows",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .legacy_graph_query_result => |v| try jw.write(v.*),
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
+        }
+    }
 };
 
 pub const GraphQueryStats = struct {
@@ -7218,6 +7320,21 @@ pub const LegacyGraphQuery = struct {
     fields: ?[]const []const u8 = null,
 };
 
+/// Deprecated graph_searches response envelope.
+pub const LegacyGraphQueryResult = struct {
+    type: GraphQueryType,
+    /// Result nodes.
+    nodes: []const GraphResultNode,
+    /// Result paths.
+    paths: []const Path,
+    /// Deprecated graph_searches pattern results; use rows for graph_queries.
+    matches: ?[]const PatternMatch = null,
+    /// Deprecated graph_searches result count; use stats or a named count aggregate.
+    total: i64,
+    /// Query execution time
+    took: i64,
+};
+
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
 pub const LinearMergePageStatus = enum {
     success,
@@ -8230,6 +8347,17 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
+pub const QueryCandidateBudgetExceededError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    reason: []const u8,
+    budget_rejection_reason: []const u8,
+    sort_rejection_reason: []const u8,
+    sort_rejection_detail: []const u8,
+    sort_rejection_field: []const u8,
+    status: i32,
+};
+
 /// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
@@ -8487,6 +8615,49 @@ pub const QueryTemporarilyUnavailableError = struct {
     message: []const u8,
     /// Always true; retry after the response's Retry-After delay.
     retryable: bool,
+};
+
+pub const QueryUnprocessableError = union(enum) {
+    exact_sort_error: ExactSortError,
+    query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
+    graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
+    graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("error") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
+            return .{ .exact_sort_error = try std.json.parseFromValueLeaky(ExactSortError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
+            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromValueLeaky(QueryCandidateBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .exact_sort_error => |v| try jw.write(v),
+            .query_candidate_budget_exceeded_error => |v| try jw.write(v),
+            .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
+            .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
+        }
+    }
 };
 
 /// A validated Antfly query retained as raw JSON by Go servers and clients.

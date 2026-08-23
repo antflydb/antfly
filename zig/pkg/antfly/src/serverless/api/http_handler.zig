@@ -9906,10 +9906,14 @@ test "http handler serves published graph query endpoints" {
     defer parsed_from_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
-    const neighbors_from_search = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
-    try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes.?[1].key);
+    const neighbors_from_search_result = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
+    const neighbors_from_search = switch (neighbors_from_search_result) {
+        .graph_nodes_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
 
     var from_fused = try handler.handle(.{
         .method = .post,
@@ -9924,10 +9928,14 @@ test "http handler serves published graph query endpoints" {
     defer parsed_from_fused.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
     try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
-    const neighbors_from_fused = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
-    try std.testing.expectEqual(@as(usize, 2), neighbors_from_fused.nodes.?.len);
-    try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes.?[0].key);
-    try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes.?[1].key);
+    const neighbors_from_fused_result = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
+    const neighbors_from_fused = switch (neighbors_from_fused_result) {
+        .graph_nodes_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), neighbors_from_fused.nodes.len);
+    try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes[0].key);
+    try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes[1].key);
 
     var pattern = try handler.handle(.{
         .method = .post,
@@ -9940,9 +9948,13 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(u16, 200), pattern.status);
     var parsed_pattern = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, pattern.body);
     defer parsed_pattern.deinit();
-    const two_hop = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
-    try std.testing.expectEqual(@as(usize, 1), two_hop.rows.?.len);
-    const row = two_hop.rows.?[0].map;
+    const two_hop_result = parsed_pattern.value.responses.?[0].graph_results.?.map.get("two_hop").?;
+    const two_hop = switch (two_hop_result) {
+        .graph_bindings_result => |result| result,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), two_hop.rows.len);
+    const row = two_hop.rows[0].map;
     const binding_a = row.get("a").? orelse return error.TestUnexpectedResult;
     const binding_b = row.get("b").? orelse return error.TestUnexpectedResult;
     const binding_c = row.get("c").? orelse return error.TestUnexpectedResult;

@@ -2851,10 +2851,10 @@ export interface components {
         };
         ExactSortError: {
             /**
-             * @description Stable error class.
-             * @example unsupported_exact_sort
+             * @description Stable error class. (enum property replaced by openapi-typescript)
+             * @enum {string}
              */
-            error: string;
+            error: "unsupported_exact_sort";
             /**
              * @description Human-readable error summary.
              * @example exact sort is unsupported for this query
@@ -2906,9 +2906,69 @@ export interface components {
             /**
              * Format: int32
              * @example 422
+             * @enum {integer}
              */
-            status: number;
+            status: 422;
         };
+        QueryCandidateBudgetExceededError: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "query_candidate_budget_exceeded";
+            message: string;
+            reason: string;
+            budget_rejection_reason: string;
+            sort_rejection_reason: string;
+            sort_rejection_detail: string;
+            sort_rejection_field: string;
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+        };
+        GraphDistinctBudgetExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_distinct_budget_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /**
+             * Format: uint64
+             * @description Maximum distinct table-qualified identities retained by one request.
+             */
+            max_distinct_identities: number;
+            /**
+             * Format: uint64
+             * @description Maximum identity payload bytes retained by one request.
+             */
+            max_distinct_identity_bytes: number;
+        };
+        GraphAnchorFilterRequiresIndexError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_anchor_filter_requires_index";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -12129,6 +12189,58 @@ export interface components {
             /** @description Connected edges when supplied by the graph executor. */
             edges?: components["schemas"]["Edge"][];
         };
+        GraphResultBinding: components["schemas"]["GraphResultNode"] | null;
+        GraphResultRow: {
+            [key: string]: components["schemas"]["GraphResultBinding"];
+        };
+        GraphQueryStats: {
+            /**
+             * Format: uint64
+             * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
+             */
+            returned_items: number;
+            truncated: boolean;
+        };
+        /** @description Complete projected bindings from a canonical graph MATCH query. */
+        GraphBindingsResult: {
+            rows: components["schemas"]["GraphResultRow"][];
+            stats: components["schemas"]["GraphQueryStats"];
+            /**
+             * Format: int64
+             * @description Query execution time.
+             */
+            took: number;
+        };
+        GraphAggregateValue: {
+            /** @description Decimal string so counts remain lossless in JavaScript. */
+            value: string;
+            exact: boolean;
+        };
+        /** @description Complete exact aggregates from a canonical graph MATCH query. */
+        GraphAggregatesResult: {
+            aggregates: {
+                [key: string]: components["schemas"]["GraphAggregateValue"];
+            };
+            stats: components["schemas"]["GraphQueryStats"];
+            /**
+             * Format: int64
+             * @description Query execution time.
+             */
+            took: number;
+        };
+        /** @description Nodes and any materialized paths from a canonical traversal or path query. */
+        GraphNodesResult: {
+            /** @description Result nodes. */
+            nodes: components["schemas"]["GraphResultNode"][];
+            /** @description Materialized result paths; empty when paths were not requested or produced. */
+            paths: components["schemas"]["Path"][];
+            stats: components["schemas"]["GraphQueryStats"];
+            /**
+             * Format: int64
+             * @description Query execution time.
+             */
+            took: number;
+        };
         /**
          * @deprecated
          * @description Deprecated graph_searches pattern response row.
@@ -12139,34 +12251,17 @@ export interface components {
             };
             path?: components["schemas"]["PathEdge"][];
         };
-        GraphResultBinding: components["schemas"]["GraphResultNode"] | null;
-        GraphResultRow: {
-            [key: string]: components["schemas"]["GraphResultBinding"];
-        };
-        GraphAggregateValue: {
-            /** @description Decimal string so counts remain lossless in JavaScript. */
-            value: string;
-            exact: boolean;
-        };
-        GraphQueryStats: {
-            /**
-             * Format: uint64
-             * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
-             */
-            returned_items: number;
-            truncated: boolean;
-        };
-        /** @description Results of a graph query */
-        GraphQueryResult: {
-            /**
-             * @deprecated
-             * @description Deprecated graph_searches query discriminator; omitted for graph_queries.
-             */
-            type?: components["schemas"]["GraphQueryType"];
-            /** @description Result nodes */
-            nodes?: components["schemas"]["GraphResultNode"][];
-            /** @description Result paths (for pathfinding queries) */
-            paths?: components["schemas"]["Path"][];
+        /**
+         * @deprecated
+         * @description Deprecated graph_searches response envelope.
+         */
+        LegacyGraphQueryResult: {
+            /** @deprecated */
+            type: components["schemas"]["GraphQueryType"];
+            /** @description Result nodes. */
+            nodes: components["schemas"]["GraphResultNode"][];
+            /** @description Result paths. */
+            paths: components["schemas"]["Path"][];
             /**
              * @deprecated
              * @description Deprecated graph_searches pattern results; use rows for graph_queries.
@@ -12176,18 +12271,15 @@ export interface components {
              * @deprecated
              * @description Deprecated graph_searches result count; use stats or a named count aggregate.
              */
-            total?: number;
-            rows?: components["schemas"]["GraphResultRow"][];
-            aggregates?: {
-                [key: string]: components["schemas"]["GraphAggregateValue"];
-            };
-            stats?: components["schemas"]["GraphQueryStats"];
+            total: number;
             /**
              * Format: int64
              * @description Query execution time
              */
-            took?: number;
+            took: number;
         };
+        /** @description A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope. */
+        GraphQueryResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["LegacyGraphQueryResult"];
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
          *     Useful for testing evaluators without running a query.
@@ -14263,13 +14355,13 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Exact sort cannot be executed through a supported native plan */
-        UnsupportedExactSort: {
+        /** @description The query is valid but cannot be executed exactly under the declared contract */
+        QueryUnprocessable: {
             headers: {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["ExactSortError"];
+                "application/json": components["schemas"]["QueryUnprocessableError"];
             };
         };
         /** @description The hierarchy changed after the traversal cursor was issued */
@@ -15297,7 +15389,7 @@ export interface operations {
                 };
             };
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15575,7 +15667,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };

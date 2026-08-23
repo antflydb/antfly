@@ -5289,7 +5289,8 @@ fn toOpenApiGraphQueryResult(
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
     if (query.legacy_response) {
-        return .{
+        const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
+        response.* = .{
             .type = legacyGraphQueryType(query.query_type),
             .nodes = try toOpenApiGraphNodes(alloc, graph_result),
             .paths = try toOpenApiPaths(alloc, graph_result.paths),
@@ -5301,34 +5302,48 @@ fn toOpenApiGraphQueryResult(
             .total = @intCast(graph_result.total_hits),
             .took = meta.took_ms,
         };
+        return .{ .legacy_graph_query_result = response };
     }
-    const rows = if (query.match_pattern != null and query.aggregates.len == 0)
-        try toOpenApiGraphRows(alloc, graph_result)
-    else
-        null;
-    const aggregates = if (query.aggregates.len > 0)
-        try toOpenApiGraphAggregates(alloc, query, graph_result)
-    else
-        null;
-    const returned_items: usize = if (rows) |items|
-        items.len
-    else if (aggregates) |items|
-        items.map.count()
-    else if (graph_result.paths.len > 0)
-        graph_result.paths.len
-    else
-        graph_result.nodes.len;
-    return .{
-        .nodes = if (query.match_pattern == null) try toOpenApiGraphNodes(alloc, graph_result) else null,
-        .paths = if (query.match_pattern == null) try toOpenApiPaths(alloc, graph_result.paths) else null,
-        .rows = rows,
-        .aggregates = aggregates,
+    if (query.match_pattern != null and query.aggregates.len == 0) {
+        const rows = try toOpenApiGraphRows(alloc, graph_result);
+        const response = try alloc.create(indexes_openapi.GraphBindingsResult);
+        response.* = .{
+            .rows = rows,
+            .stats = .{
+                .returned_items = @intCast(rows.len),
+                .truncated = graph_result.truncated,
+            },
+            .took = meta.took_ms,
+        };
+        return .{ .graph_bindings_result = response };
+    }
+    if (query.aggregates.len > 0) {
+        const aggregates = try toOpenApiGraphAggregates(alloc, query, graph_result);
+        const response = try alloc.create(indexes_openapi.GraphAggregatesResult);
+        response.* = .{
+            .aggregates = aggregates,
+            .stats = .{
+                .returned_items = @intCast(aggregates.map.count()),
+                .truncated = graph_result.truncated,
+            },
+            .took = meta.took_ms,
+        };
+        return .{ .graph_aggregates_result = response };
+    }
+
+    const nodes = try toOpenApiGraphNodes(alloc, graph_result);
+    const paths = try toOpenApiPaths(alloc, graph_result.paths);
+    const response = try alloc.create(indexes_openapi.GraphNodesResult);
+    response.* = .{
+        .nodes = nodes,
+        .paths = paths,
         .stats = .{
-            .returned_items = @intCast(returned_items),
+            .returned_items = @intCast(if (paths.len > 0) paths.len else nodes.len),
             .truncated = graph_result.truncated,
         },
         .took = meta.took_ms,
     };
+    return .{ .graph_nodes_result = response };
 }
 
 fn legacyGraphQueryType(query_type: graph_query_mod.QueryType) indexes_openapi.GraphQueryType {
@@ -5504,12 +5519,13 @@ test "graph aggregate response preserves exact decimal counts" {
             .total_hits = 0,
         },
     );
-    const aggregates = result.aggregates orelse return error.TestUnexpectedResult;
+    try std.testing.expect(result == .graph_aggregates_result);
+    const aggregate_result = result.graph_aggregates_result;
+    const aggregates = aggregate_result.aggregates;
     const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("9384729384729384", count.value);
     try std.testing.expect(count.exact);
-    try std.testing.expect(result.rows == null);
-    try std.testing.expectEqual(@as(i64, 1), result.stats.?.returned_items);
+    try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
 }
 
 test "graph aggregate response fails closed on missing or inexact results" {
@@ -5576,11 +5592,10 @@ test "deprecated graph search preserves its response envelope" {
         },
     );
 
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, result.type.?);
-    try std.testing.expectEqual(@as(i64, 12), result.total.?);
-    try std.testing.expect(result.rows == null);
-    try std.testing.expect(result.aggregates == null);
-    try std.testing.expect(result.stats == null);
+    try std.testing.expect(result == .legacy_graph_query_result);
+    const legacy = result.legacy_graph_query_result;
+    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
+    try std.testing.expectEqual(@as(i64, 12), legacy.total);
 }
 
 fn toOpenApiGraphNodes(
@@ -8990,9 +9005,14 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     else
         &.{};
     errdefer freeOwnedStringSlice(alloc, fields);
-    if (!graphAliasIsDeclared(nodes, &.{}, value.match.anchor)) return error.InvalidQueryRequest;
+    const anchor_alias = for (nodes) |node| {
+        if (std.mem.eql(u8, node.alias, value.match.anchor)) break node.alias;
+    } else return error.InvalidQueryRequest;
     const match_pattern = graph_pattern_mod.ConjunctivePattern{
-        .anchor_alias = value.match.anchor,
+        // Keep the anchor tied to the cloned required-node storage. The
+        // generated request parser may borrow its input or own an unescaped
+        // copy, and both lifetimes end before the owned search request does.
+        .anchor_alias = anchor_alias,
         .nodes = nodes,
         .edges = edges,
         .predicates = predicates,

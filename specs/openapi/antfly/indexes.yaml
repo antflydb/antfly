@@ -3264,27 +3264,82 @@ components:
           format: uint64
           description: Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated: { type: boolean }
-    GraphQueryResult:
+    GraphBindingsResult:
       x-go-type-skip-optional-pointer: true
       type: object
-      description: "Results of a graph query"
+      additionalProperties: false
+      required: [rows, stats, took]
+      description: Complete projected bindings from a canonical graph MATCH query.
+      properties:
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/GraphResultRow' }
+        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
+    GraphAggregatesResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required: [aggregates, stats, took]
+      description: Complete exact aggregates from a canonical graph MATCH query.
+      properties:
+        aggregates:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphAggregateValue'
+        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
+    GraphNodesResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required: [nodes, paths, stats, took]
+      description: Nodes and any materialized paths from a canonical traversal or path query.
+      properties:
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/GraphResultNode' }
+          description: Result nodes.
+        paths:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items: { $ref: '#/components/schemas/Path' }
+          description: Materialized result paths; empty when paths were not requested or produced.
+        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        took:
+          type: integer
+          format: int64
+          x-go-type: time.Duration
+          description: Query execution time.
+    LegacyGraphQueryResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      deprecated: true
+      required: [type, nodes, paths, total, took]
+      description: Deprecated graph_searches response envelope.
       properties:
         type:
           deprecated: true
-          description: Deprecated graph_searches query discriminator; omitted for graph_queries.
           $ref: "#/components/schemas/GraphQueryType"
         nodes:
           x-go-type-skip-optional-pointer: true
           type: array
-          items:
-            $ref: '#/components/schemas/GraphResultNode'
-          description: "Result nodes"
+          items: { $ref: '#/components/schemas/GraphResultNode' }
+          description: Result nodes.
         paths:
           x-go-type-skip-optional-pointer: true
           type: array
-          items:
-            $ref: '#/components/schemas/Path'
-          description: "Result paths (for pathfinding queries)"
+          items: { $ref: '#/components/schemas/Path' }
+          description: Result paths.
         matches:
           deprecated: true
           x-go-type-skip-optional-pointer: true
@@ -3297,20 +3352,22 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Deprecated graph_searches result count; use stats or a named count aggregate.
-        rows:
-          type: array
-          items: { $ref: '#/components/schemas/GraphResultRow' }
-        aggregates:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/GraphAggregateValue'
-        stats: { $ref: '#/components/schemas/GraphQueryStats' }
         took:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: int64
           x-go-type: time.Duration
           description: "Query execution time"
+    GraphQueryResult:
+      description: >-
+        A structurally distinct graph result. Canonical bindings, exact
+        aggregates, and node/path results cannot be confused with the
+        deprecated graph_searches envelope.
+      oneOf:
+        - $ref: '#/components/schemas/GraphBindingsResult'
+        - $ref: '#/components/schemas/GraphAggregatesResult'
+        - $ref: '#/components/schemas/GraphNodesResult'
+        - $ref: '#/components/schemas/LegacyGraphQueryResult'
     GraphResultBinding:
       x-go-type: '*GraphResultNode'
       oneOf:

@@ -19,6 +19,10 @@ const Allocator = std.mem.Allocator;
 const json = std.json;
 
 pub fn supportsType(comptime T: type) bool {
+    // OpenAPI response types can be wide, nested unions. Keep the capability
+    // walk proportional to the generated type instead of Zig's small default
+    // comptime branch budget.
+    @setEvalBranchQuota(100_000);
     if (std.meta.hasFn(T, "jsonParse")) return true;
 
     switch (@typeInfo(T)) {
@@ -51,6 +55,7 @@ pub fn supportsType(comptime T: type) bool {
 }
 
 pub fn containsCustomJsonParseType(comptime T: type) bool {
+    @setEvalBranchQuota(100_000);
     if (std.meta.hasFn(T, "jsonParse")) return true;
 
     switch (@typeInfo(T)) {

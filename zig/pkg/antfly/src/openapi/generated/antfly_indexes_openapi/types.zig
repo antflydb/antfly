@@ -1179,6 +1179,14 @@ pub const GraphAggregateValue = struct {
     exact: bool,
 };
 
+/// Complete exact aggregates from a canonical graph MATCH query.
+pub const GraphAggregatesResult = struct {
+    aggregates: std.json.ArrayHashMap(GraphAggregateValue),
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
+};
+
 pub const GraphAggregatesReturn = struct {
     aggregates: std.json.ArrayHashMap(GraphCountAggregate),
 };
@@ -1236,6 +1244,14 @@ pub const GraphArtifactSourceConfig = struct {
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mention_edge_type: ?[]const u8 = null,
+};
+
+/// Complete projected bindings from a canonical graph MATCH query.
+pub const GraphBindingsResult = struct {
+    rows: []const GraphResultRow,
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
 };
 
 pub const GraphBindingsReturn = struct {
@@ -1747,6 +1763,17 @@ pub const GraphNodeSelector = union(enum) {
     }
 };
 
+/// Nodes and any materialized paths from a canonical traversal or path query.
+pub const GraphNodesResult = struct {
+    /// Result nodes.
+    nodes: []const GraphResultNode,
+    /// Materialized result paths; empty when paths were not requested or produced.
+    paths: []const Path,
+    stats: GraphQueryStats,
+    /// Query execution time.
+    took: i64,
+};
+
 pub const GraphNotEqualPredicate = struct {
     left: GraphAliasOperand,
     right: GraphAliasOperand,
@@ -1854,23 +1881,80 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
-/// Results of a graph query
-pub const GraphQueryResult = struct {
-    /// Deprecated graph_searches query discriminator; omitted for graph_queries.
-    type: ?GraphQueryType = null,
-    /// Result nodes
-    nodes: ?[]const GraphResultNode = null,
-    /// Result paths (for pathfinding queries)
-    paths: ?[]const Path = null,
-    /// Deprecated graph_searches pattern results; use rows for graph_queries.
-    matches: ?[]const PatternMatch = null,
-    /// Deprecated graph_searches result count; use stats or a named count aggregate.
-    total: ?i64 = null,
-    rows: ?[]const GraphResultRow = null,
-    aggregates: ?std.json.ArrayHashMap(GraphAggregateValue) = null,
-    stats: ?GraphQueryStats = null,
-    /// Query execution time
-    took: ?i64 = null,
+/// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
+pub const GraphQueryResult = union(enum) {
+    legacy_graph_query_result: *LegacyGraphQueryResult,
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "nodes",
+            "paths",
+            "matches",
+            "total",
+            "took",
+        })) {
+            if (try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options)) |parsed| return .{ .legacy_graph_query_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "nodes",
+            "paths",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "aggregates",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "rows",
+            "stats",
+            "took",
+        })) {
+            if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .legacy_graph_query_result => |v| try jw.write(v.*),
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
+        }
+    }
 };
 
 pub const GraphQueryStats = struct {
@@ -2458,6 +2542,21 @@ pub const LegacyGraphQuery = struct {
     include_documents: ?bool = null,
     include_edges: ?bool = null,
     fields: ?[]const []const u8 = null,
+};
+
+/// Deprecated graph_searches response envelope.
+pub const LegacyGraphQueryResult = struct {
+    type: GraphQueryType,
+    /// Result nodes.
+    nodes: []const GraphResultNode,
+    /// Result paths.
+    paths: []const Path,
+    /// Deprecated graph_searches pattern results; use rows for graph_queries.
+    matches: ?[]const PatternMatch = null,
+    /// Deprecated graph_searches result count; use stats or a named count aggregate.
+    total: i64,
+    /// Query execution time
+    took: i64,
 };
 
 /// Configuration for result fusion when combining multiple search indexes.

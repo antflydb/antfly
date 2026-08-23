@@ -3216,17 +3216,20 @@ test "public table query handler maps exact graph execution failures" {
     );
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    var distinct = try std.json.parseFromSlice(struct {
-        @"error": []const u8,
-        retryable: bool,
-        max_distinct_identities: usize,
-        max_distinct_identity_bytes: usize,
-    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    var distinct = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        resp.body,
+        .{},
+    );
     defer distinct.deinit();
-    try std.testing.expectEqualStrings("graph_distinct_budget_exceeded", distinct.value.@"error");
-    try std.testing.expect(!distinct.value.retryable);
-    try std.testing.expectEqual(graph_pattern_mod.default_max_distinct_identities, distinct.value.max_distinct_identities);
-    try std.testing.expectEqual(graph_pattern_mod.default_max_distinct_identity_bytes, distinct.value.max_distinct_identity_bytes);
+    const distinct_error = switch (distinct.value) {
+        .graph_distinct_budget_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!distinct_error.retryable);
+    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_identities)), distinct_error.max_distinct_identities);
+    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_identity_bytes)), distinct_error.max_distinct_identity_bytes);
 
     kind = .anchor_filter;
     var anchor_resp = try handleTableQueryRequest(
@@ -3238,13 +3241,18 @@ test "public table query handler maps exact graph execution failures" {
     );
     defer anchor_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 422), anchor_resp.status);
-    var anchor = try std.json.parseFromSlice(struct {
-        @"error": []const u8,
-        retryable: bool,
-    }, std.testing.allocator, anchor_resp.body, .{ .ignore_unknown_fields = true });
+    var anchor = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        anchor_resp.body,
+        .{},
+    );
     defer anchor.deinit();
-    try std.testing.expectEqualStrings("graph_anchor_filter_requires_index", anchor.value.@"error");
-    try std.testing.expect(!anchor.value.retryable);
+    const anchor_error = switch (anchor.value) {
+        .graph_anchor_filter_requires_index_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!anchor_error.retryable);
 }
 
 test "public table query handler maps unsupported exact sort" {

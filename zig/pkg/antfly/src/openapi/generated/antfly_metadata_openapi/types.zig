@@ -1493,6 +1493,24 @@ pub const ForeignSource = struct {
     columns: ?[]const ForeignColumn = null,
 };
 
+pub const GraphAnchorFilterRequiresIndexError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+pub const GraphDistinctBudgetExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Maximum distinct table-qualified identities retained by one request.
+    max_distinct_identities: i64,
+    /// Maximum identity payload bytes retained by one request.
+    max_distinct_identity_bytes: i64,
+};
+
 pub const HierarchyAncestor = struct {
     id: ?[]const u8 = null,
     document: ?std.json.Value = null,
@@ -2158,6 +2176,17 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
+pub const QueryCandidateBudgetExceededError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    reason: []const u8,
+    budget_rejection_reason: []const u8,
+    sort_rejection_reason: []const u8,
+    sort_rejection_detail: []const u8,
+    sort_rejection_field: []const u8,
+    status: i32,
+};
+
 /// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
@@ -2378,6 +2407,49 @@ pub const QueryTemporarilyUnavailableError = struct {
     message: []const u8,
     /// Always true; retry after the response's Retry-After delay.
     retryable: bool,
+};
+
+pub const QueryUnprocessableError = union(enum) {
+    exact_sort_error: ExactSortError,
+    query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
+    graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
+    graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("error") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
+            return .{ .exact_sort_error = try std.json.parseFromValueLeaky(ExactSortError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
+            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromValueLeaky(QueryCandidateBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .exact_sort_error => |v| try jw.write(v),
+            .query_candidate_budget_exceeded_error => |v| try jw.write(v),
+            .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
+            .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
+        }
+    }
 };
 
 /// A validated Antfly query retained as raw JSON by Go servers and clients.
