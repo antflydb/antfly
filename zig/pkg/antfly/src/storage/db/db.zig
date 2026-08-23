@@ -111,6 +111,55 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const process_memory_mod = @import("antfly_platform").process_memory;
+
+fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resource_manager_mod.Options {
+    var options = resource_manager_mod.Options{ .identity_allocator = alloc };
+    if (total == 0) return options;
+
+    const gib: u64 = 1024 * 1024 * 1024;
+    const preferred_headroom = std.math.clamp(@max(total / 4, 6 * gib), 4 * gib, 24 * gib);
+    const managed_hard = total - @min(preferred_headroom, total / 2);
+    options.memory_budget = .{
+        .soft_limit_bytes = managed_hard * 3 / 4,
+        .hard_limit_bytes = managed_hard,
+    };
+
+    const raw_hbc = total / 3;
+    const hbc_hard = if (total < 512 * 1024 * 1024)
+        @min(@max(@as(u64, 8 * 1024 * 1024), raw_hbc), 16 * gib)
+    else
+        std.math.clamp(raw_hbc, 128 * 1024 * 1024, 16 * gib);
+    const raw_lsm = total / 4;
+    const lsm_hard = if (total < 256 * 1024 * 1024)
+        @min(@max(@as(u64, 8 * 1024 * 1024), raw_lsm), 8 * gib)
+    else
+        std.math.clamp(raw_lsm, 64 * 1024 * 1024, 8 * gib);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+        .soft_limit_bytes = lsm_hard * 7 / 8,
+        .hard_limit_bytes = lsm_hard,
+    };
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = hbc_hard * 7 / 8,
+        .hard_limit_bytes = hbc_hard,
+    };
+    return options;
+}
+
+fn standaloneResourceManagerOptions(alloc: Allocator) resource_manager_mod.Options {
+    return standaloneResourceManagerOptionsForTotal(alloc, process_memory_mod.systemEnvelope().limit_bytes);
+}
+
+test "standalone resource manager derives elastic storage cache envelopes" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    const options = standaloneResourceManagerOptionsForTotal(std.testing.allocator, 12 * gib);
+    const lsm = options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+    const hbc = options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+    try std.testing.expectEqual(@as(u64, 6 * gib), options.memory_budget.hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 3 * gib), lsm.hard_limit_bytes);
+    try std.testing.expectEqual(lsm.hard_limit_bytes * 7 / 8, lsm.soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 4 * gib), hbc.hard_limit_bytes);
+    try std.testing.expectEqual(hbc.hard_limit_bytes * 7 / 8, hbc.soft_limit_bytes);
+}
 const schema_mod = @import("../schema.zig");
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -144,6 +193,11 @@ const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
+
+pub const SearchWithDenseProfileResult = struct {
+    result: types.SearchResult,
+    dense_profile: ?db_query_search.DenseSearchProfile = null,
+};
 const dense_exact = @import("dense_exact.zig");
 const search_mod = @import("../../search/search.zig");
 const index_mod = @import("../../index.zig");
@@ -3283,7 +3337,7 @@ pub const DB = struct {
             const bind_cache_resource_manager = opts.resource_manager != null;
             if (opts.resource_manager == null) {
                 const manager = try alloc.create(resource_manager_mod.ResourceManager);
-                manager.* = resource_manager_mod.ResourceManager.init(.{});
+                manager.* = resource_manager_mod.ResourceManager.init(standaloneResourceManagerOptions(alloc));
                 owned_resource_manager = manager;
                 opts.resource_manager = manager;
             }
@@ -20383,7 +20437,11 @@ pub const DB = struct {
         return .{
             .used_bytes = cache_stats.used_bytes,
             .peak_bytes = cache_stats.peak_bytes,
+            .hits = cache_stats.hits,
+            .misses = cache_stats.misses,
             .insertions = cache_stats.insertions,
+            .replacements = cache_stats.replacements,
+            .sampled_admissions = cache_stats.sampled_admissions,
             .admission_skips = cache_stats.admission_skips,
             .evictions = cache_stats.evictions,
         };
@@ -20393,6 +20451,7 @@ pub const DB = struct {
         return .{
             .total_bytes = cache_stats.total_bytes,
             .accounted_bytes = cache_stats.accounted_bytes,
+            .pinned_bytes = cache_stats.pinned_bytes,
             .node = dbHbcCacheKindStats(cache_stats.node),
             .quantized = dbHbcCacheKindStats(cache_stats.quantized),
             .vector = dbHbcCacheKindStats(cache_stats.vector),
@@ -22500,6 +22559,23 @@ pub const DB = struct {
         return try self.searchWithExecutionContext(alloc, req, .{});
     }
 
+    /// Execute a general query while retaining the single dense component's
+    /// profile when the request is composed (for example text+dense hybrid).
+    /// The public response currently has one dense profile slot; compositions
+    /// with multiple dense lanes intentionally leave it unset rather than
+    /// publishing an ambiguous aggregate.
+    pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        const search_access = self.beginDenseSearchAccess(req);
+        defer self.endDenseSearchAccess(search_access);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        var dense_profile: db_query_search.DenseSearchProfile = .{};
+        const result = try self.searchLockedWithExecutionContextImpl(alloc, snapshot_req, .{}, true, &dense_profile);
+        return .{
+            .result = result,
+            .dense_profile = if (dense_profile.search_route.len > 0) dense_profile else null,
+        };
+    }
+
     pub fn searchWithExecutionContext(
         self: *DB,
         alloc: Allocator,
@@ -22563,7 +22639,7 @@ pub const DB = struct {
         // primary selection query. This protects direct storage callers and
         // internal worker envelopes in addition to the public API boundary.
         if (!types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-        return try self.searchLockedWithExecutionContextImpl(alloc, req, exec_ctx, true);
+        return try self.searchLockedWithExecutionContextImpl(alloc, req, exec_ctx, true, null);
     }
 
     fn searchLockedWithExecutionContextImpl(
@@ -22572,6 +22648,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
         externalize_artifact_ids: bool,
+        dense_profile_sink: ?*db_query_search.DenseSearchProfile,
     ) !types.SearchResult {
         const execution_req = directSingleVectorRequest(req) orelse req;
         if (execution_req.hierarchy_children != null) {
@@ -22582,7 +22659,7 @@ pub const DB = struct {
         }
         const selection_req = types.canonicalGroupedMatchSelectionRequest(execution_req);
         if (searchRequestRequiresComposedSearch(selection_req)) {
-            var composed = try self.searchComposed(alloc, selection_req, exec_ctx);
+            var composed = try self.searchComposed(alloc, selection_req, exec_ctx, dense_profile_sink);
             errdefer composed.deinit();
             try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
             if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
@@ -23038,7 +23115,7 @@ pub const DB = struct {
             defer if (unit_filter_json) |value| alloc.free(value);
             if (unit_filter_json) |value| scoped_match_req.filter_query_json = value;
 
-            var matches = try self.searchLockedWithExecutionContextImpl(alloc, scoped_match_req, exec_ctx, false);
+            var matches = try self.searchLockedWithExecutionContextImpl(alloc, scoped_match_req, exec_ctx, false, null);
             defer matches.deinit();
 
             const nested_matches: []types.ChunkHit = if (matches.hits.len == 0)
@@ -23124,6 +23201,7 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
+        dense_profile_sink: ?*db_query_search.DenseSearchProfile,
     ) !types.SearchResult {
         _ = exec_ctx;
         const metric_name = composedQueryMetricIndexName(req);
@@ -23138,6 +23216,8 @@ pub const DB = struct {
             .search_text_query = searchTextQueryCallback,
             .search_text = searchTextComposedCallback,
             .search_dense = searchDenseComposedCallback,
+            .search_dense_profiled = searchDenseComposedProfiledCallback,
+            .dense_profile_sink = dense_profile_sink,
             .search_sparse = searchSparseComposedCallback,
             .clone_named_set = cloneNamedSetCallback,
             .fuse_named_sets = fuseNamedSetsCallback,
@@ -23532,6 +23612,16 @@ pub const DB = struct {
     ) anyerror!types.SearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.searchDense(alloc, req, dense);
+    }
+
+    fn searchDenseComposedProfiledCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+    ) anyerror!db_query_search.ProfiledDenseSearchResult {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.searchDenseProfiledAtSnapshot(alloc, req, dense);
     }
 
     fn searchSparseComposedCallback(
@@ -48636,7 +48726,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         expected_candidates: usize = eligible_count,
         expected_scored: usize = eligible_count,
         expected_route: []const u8 = "exact_native_filter",
-        expected_route_reason: []const u8 = "candidate_count_within_budget",
+        expected_route_reason: []const u8 = "",
     }{
         .{ .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}" },
         .{ .filter_query_json = "{\"term\":{\"bucket\":\"selected\"}}" },
@@ -48682,8 +48772,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
             .expected_candidates = 4000,
         },
     };
-    var expected_vector_loads: usize = 0;
-    for (cases) |case| {
+    for (cases, 0..) |case, case_index| {
         var profiled = try db.searchDenseProfiled(alloc, .{
             .index_name = "dv_v1",
             .primary_text_index_name = "ft_v1",
@@ -48695,21 +48784,28 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         }, .{ .vector = &.{ 9999.0, 0.0 }, .k = 100 });
         defer profiled.result.deinit();
 
-        expected_vector_loads += case.expected_scored;
         try std.testing.expectEqual(@as(u32, @intCast(case.expected_scored)), profiled.result.total_hits);
         try std.testing.expectEqual(case.expected_scored, profiled.result.hits.len);
         try std.testing.expectEqual(@as(u64, @intCast(case.expected_candidates)), profiled.profile.native_filter_candidate_count);
         try std.testing.expectEqual(@as(u64, @intCast(case.expected_scored)), profiled.profile.hbc_exact_vectors_scored);
         try std.testing.expectEqualStrings(case.expected_route, profiled.profile.search_route);
-        try std.testing.expectEqualStrings(case.expected_route_reason, profiled.profile.route_reason);
-        try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
+        const expected_route_reason = if (case.expected_route_reason.len > 0)
+            case.expected_route_reason
+        else if (case_index == 0)
+            "exact_prior_work_lower"
+        else
+            "exact_measured_work_lower";
+        try std.testing.expectEqualStrings(expected_route_reason, profiled.profile.route_reason);
+        try std.testing.expectEqual(@as(u64, 0), profiled.profile.exact_raw_scalar_reads);
+        try std.testing.expectEqual(@as(u64, 0), profiled.profile.exact_request_vector_cache_entries);
+        try std.testing.expectEqual(@as(usize, 0), vector_load_counter.count);
         for (profiled.result.hits, 0..) |hit, rank| {
             const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
             defer alloc.free(expected);
             try std.testing.expectEqualStrings(expected, hit.id);
         }
     }
-    try std.testing.expectEqual(expected_vector_loads, vector_load_counter.count);
+    try std.testing.expectEqual(@as(usize, 0), vector_load_counter.count);
 }
 
 test "db exact sort resolves explicit keyword metadata filters natively" {
@@ -79129,7 +79225,8 @@ test "db search fuses full_text and dense named searches before graph expansion"
         .sync_level = .full_index,
     });
 
-    var result = try db.search(alloc, .{
+    const profiled = try db.searchWithDenseProfile(alloc, .{
+        .profile = true,
         .full_text = .{ .match = .{ .field = "body", .text = "machine learning" } },
         .index_name = "ft_v1",
         .dense_queries = &.{
@@ -79162,8 +79259,12 @@ test "db search fuses full_text and dense named searches before graph expansion"
         },
         .limit = 10,
     });
+    var result = profiled.result;
     defer result.deinit();
 
+    const dense_profile = profiled.dense_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hbc", dense_profile.search_route);
+    try std.testing.expectEqualStrings("no_native_filter", dense_profile.route_reason);
     try std.testing.expect(result.total_hits >= 1);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);

@@ -107,8 +107,26 @@ pub const SearchProfile = struct {
     rerank_distance_ns: u64 = 0,
     rerank_apply_ns: u64 = 0,
     rerank_resort_ns: u64 = 0,
+    rerank_batches: u64 = 0,
+    rerank_max_batch_size: u64 = 0,
+    rerank_candidates_skipped_by_bound: u64 = 0,
     rerank_finalize_ns: u64 = 0,
     rerank_metadata_ns: u64 = 0,
+    filter_candidates: u64 = 0,
+    filter_rejected: u64 = 0,
+    filter_metadata_batches: u64 = 0,
+    filter_metadata_batch_ns: u64 = 0,
+    traversal_waves: u64 = 0,
+    traversal_initial_wave_leaves: u64 = 0,
+    traversal_max_wave_leaves: u64 = 0,
+    traversal_bound_resolutions: u64 = 0,
+    traversal_bound_fallbacks: u64 = 0,
+    traversal_bound_stops: u64 = 0,
+    traversal_yield_stops: u64 = 0,
+    traversal_frontier_remaining: u64 = 0,
+    traversal_eligible_vectors: u64 = 0,
+    traversal_stop_lower_bound: f32 = 0,
+    traversal_stop_result_upper_bound: f32 = 0,
     nodes_visited: u64 = 0,
     leaves_explored: u64 = 0,
     approx_nodes_expanded: u64 = 0,
@@ -250,6 +268,10 @@ pub fn candidateLessThan(_: void, a: types.PriorityItem, b: types.PriorityItem) 
 }
 
 fn candidatePriorityScore(item: types.PriorityItem) f32 {
+    // An unresolved candidate may conceal the best admissible bound, so it
+    // must be resolved before any bound-based frontier ordering or stop.
+    if (!item.bound_resolved) return -std.math.inf(f32);
+    if (std.math.isFinite(item.lower_bound)) return item.lower_bound;
     return item.distance - item.error_bound;
 }
 

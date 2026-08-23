@@ -163,21 +163,21 @@ fn childType(comptime T: type) type {
     };
 }
 
-fn CachedNodeReadHandle(comptime T: type) type {
+pub fn CachedNodeReadHandle(comptime T: type) type {
     const Index = childType(T);
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedNode")) Index.BorrowedNode else void;
     return union(enum) {
         borrowed: Borrowed,
         owned: types.Node,
 
-        fn ptr(self: *const @This()) *const types.Node {
+        pub fn ptr(self: *const @This()) *const types.Node {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
                 .owned => |*node| node,
             };
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -189,21 +189,21 @@ fn CachedNodeReadHandle(comptime T: type) type {
     };
 }
 
-fn CachedQuantizedReadHandle(comptime T: type) type {
+pub fn CachedQuantizedReadHandle(comptime T: type) type {
     const Index = childType(T);
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedQuantized")) Index.BorrowedQuantized else void;
     return union(enum) {
         borrowed: Borrowed,
         owned: hbc_runtime.QuantizedSet,
 
-        fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
+        pub fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
                 .owned => |*qs| qs,
             };
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -305,6 +305,46 @@ fn borrowCachedVectorHandle(self: anytype, vector_id: u64) ?CachedVectorReadHand
     return null;
 }
 
+const VectorCacheFill = struct {
+    guarded: bool,
+    epoch: ?u64,
+};
+
+fn beginVectorCacheFillIfSupported(self: anytype, vector_id: u64) VectorCacheFill {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "beginVectorCacheFill")) {
+        return .{ .guarded = true, .epoch = self.beginVectorCacheFill(vector_id) };
+    }
+    return .{ .guarded = false, .epoch = null };
+}
+
+fn cacheVectorAfterLoad(self: anytype, vector_id: u64, vector: []const f32, fill: VectorCacheFill) ![]const f32 {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return vector;
+        if (comptime @hasDecl(Index, "cacheVectorIfFillCurrent")) {
+            return try self.cacheVectorIfFillCurrent(vector_id, vector, epoch);
+        }
+        return vector;
+    }
+    return try self.cacheVector(vector_id, vector);
+}
+
+fn abortVectorCacheMutationsIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "abortVectorCacheMutations")) self.abortVectorCacheMutations();
+}
+
+fn seedRetainedVectorsAfterCommit(self: anytype, items: []const hbc_runtime.BatchInsertItem, options: anytype) void {
+    const Options = @TypeOf(options);
+    if (comptime !@hasField(Options, "skip_vector_store")) return;
+    if (!options.skip_vector_store) return;
+    // Skip-store embeddings are authoritative in the caller's LSM. Cache
+    // them only after the index transaction publishes, never from its
+    // uncommitted mutation window.
+    for (items) |item| _ = self.cacheVector(item.vector_id, item.vector) catch {};
+}
+
 fn shouldSeedRetainedVectorCacheOnSkipStore(self: anytype) bool {
     const Index = switch (@typeInfo(@TypeOf(self))) {
         .pointer => |ptr| ptr.child,
@@ -335,7 +375,7 @@ fn txnUsesImmutableGeneration(self: anytype, txn: anytype) bool {
     return false;
 }
 
-fn loadNodeReadHandleProfiled(
+pub fn loadNodeReadHandleProfiled(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -359,7 +399,7 @@ fn loadNodeReadHandleProfiled(
     return .{ .owned = loaded };
 }
 
-fn loadNodeReadHandle(
+pub fn loadNodeReadHandle(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -389,7 +429,7 @@ fn loadMutationNodeReadHandle(
     return .{ .owned = loaded };
 }
 
-fn loadQuantizedReadHandleProfiled(
+pub fn loadQuantizedReadHandleProfiled(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -442,7 +482,7 @@ fn loadQuantizedReadHandleProfiled(
     return .{ .owned = decoded };
 }
 
-fn loadQuantizedReadHandle(
+pub fn loadQuantizedReadHandle(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -481,6 +521,36 @@ fn loadQuantizedReadHandle(
         self.cacheQuantized(node_id, &decoded) catch {};
     }
     return .{ .owned = decoded };
+}
+
+/// Return an independently owned quantized value for mutation paths. Cached
+/// entries are immutable while published: writers clone, modify, persist, and
+/// replace them instead of retaining a lease and racing readers in place.
+fn loadQuantizedOwned(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+    is_not_found: fn (anyerror) bool,
+) !?hbc_runtime.QuantizedSet {
+    if (try self.getCachedQuantizedClone(node_id)) |cached_value| {
+        var cached = cached_value;
+        validateQuantizedSet(self, &cached, expected_count) catch {
+            cached.deinit(self.alloc);
+            self.invalidateQuantizedCache(node_id);
+            return loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+                if (is_not_found(err) or err == error.Corrupted) return null;
+                return err;
+            };
+        };
+        return cached;
+    }
+
+    return loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+        if (is_not_found(err) or err == error.Corrupted) return null;
+        return err;
+    };
 }
 
 fn recordDeferredQuantizedNode(self: anytype, node_id: u64) !void {
@@ -811,14 +881,13 @@ pub fn updateParent(self: anytype, txn: anytype, node_id: u64, new_parent: u64, 
     }
     var key_buf: [12]u8 = undefined;
     const packed_data = try self.getNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node));
-    const packed_value = try self.alloc.dupe(u8, packed_data);
+    const decoded = try hbc.decodePackedNodeValue(packed_data);
+    const packed_value = try self.alloc.alloc(u8, hbc.packedNodeValueSize(decoded.centroid_bytes.len, decoded.ids_bytes.len));
     defer self.alloc.free(packed_value);
-    var decoded = try hbc.decodePackedNodeValue(packed_value);
     var header = decoded.header;
     const old_parent = header.parent;
     header.parent = new_parent;
-    decoded.header = header;
-    _ = try hbc.encodePackedNodeValue(packed_value, decoded.header, decoded.centroid_bytes, decoded.ids_bytes);
+    _ = try hbc.encodePackedNodeValue(packed_value, header, decoded.covering_radius, decoded.centroid_bytes, decoded.ids_bytes);
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node), packed_value);
     self.invalidateNodeCache(node_id);
     if (self.config.use_quantization and (old_parent == 0) != (new_parent == 0)) {
@@ -859,10 +928,11 @@ pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
 pub fn getVectorViewOrScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -878,12 +948,13 @@ pub fn getVectorViewOrScratchWithCursor(self: anytype, cursor: anytype, vector_i
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const key = hbc.encodeVecKey(&key_buf, vector_id);
     const entry = (try cursor.seekAtOrAfter(key)) orelse return error.NotFound;
     if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
     const view = try vectorViewFromRaw(entry.value, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
 pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -895,10 +966,11 @@ pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
 pub fn vectorViewFromRaw(data: []const u8, scratch: []f32) ![]const f32 {
@@ -981,7 +1053,7 @@ fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !vo
     const packed_len = hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
     const packed_value = try self.alloc.alloc(u8, packed_len);
     defer self.alloc.free(packed_value);
-    const encoded = try hbc.encodePackedNodeValue(packed_value, header, centroid_bytes, ids_bytes);
+    const encoded = try hbc.encodePackedNodeValue(packed_value, header, node.covering_radius, centroid_bytes, ids_bytes);
     var key_buf: [12]u8 = undefined;
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
 }
@@ -1081,7 +1153,7 @@ fn refreshQuantizedWithKnownVectors(
 fn saveLeafNodeBodyWithKnownVectors(
     self: anytype,
     txn: anytype,
-    node: *const types.Node,
+    node: *types.Node,
     vectors: []const f32,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
@@ -1094,6 +1166,10 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
+    node.covering_radius = if (self.config.metric == .l2_squared)
+        l2CoveringRadiusForMatrix(node.centroid, vectors, node.members.len)
+    else
+        std.math.nan(f32);
     try savePackedNodeValue(self, txn, node);
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
     // Only an exact nonquantized payload can replace the rolling split
@@ -1107,7 +1183,7 @@ fn saveLeafNodeBodyWithKnownVectors(
 fn saveLeafNodeWithKnownVectors(
     self: anytype,
     txn: anytype,
-    node: *const types.Node,
+    node: *types.Node,
     vectors: []const f32,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
@@ -1333,13 +1409,13 @@ pub fn updateQuantizedWithAddedVector(
     if (node.members.len == 0) return false;
 
     const previous_count = node.members.len - 1;
-    _ = self.getQuantized(txn, node.id, usesNonQuantizedPayload(node), previous_count) catch |err| switch (err) {
+    var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
-    };
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+    }) orelse return false;
+    defer cached.deinit(self.alloc);
 
-    switch (cached.*) {
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1359,7 +1435,8 @@ pub fn updateQuantizedWithAddedVector(
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
 
     const store_start = now_fn();
-    try self.putQuantizedCached(txn, node.id, cached);
+    try self.putQuantizedCached(txn, node.id, &cached);
+    try self.cacheQuantized(node.id, &cached);
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
     self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
     return true;
@@ -1390,14 +1467,14 @@ fn primeDeferredLeafNonQuantCacheWithAddedVector(
                 .data = try self.alloc.dupe(f32, transformed_vector),
             },
         } };
-        _ = try self.cacheQuantizedOwned(node.id, fresh);
+        try self.cacheQuantizedOwned(node.id, fresh);
         self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
         return true;
     }
 
-    _ = try self.getQuantized(txn, node.id, true, previous_count);
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
-    switch (cached.*) {
+    var cached = (try loadQuantizedOwned(self, txn, node.id, true, previous_count, isNotFoundGeneric)) orelse return false;
+    defer cached.deinit(self.alloc);
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1409,6 +1486,7 @@ fn primeDeferredLeafNonQuantCacheWithAddedVector(
                 @memcpy(set.vectors.data[old_len..][0..transformed_vector.len], transformed_vector);
             }
             noteMutatedCachedQuantized(self, node.id);
+            try self.cacheQuantized(node.id, &cached);
             self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
             return true;
         },
@@ -1433,13 +1511,13 @@ pub fn updateQuantizedWithAddedVectors(
     if (added_count == 0) return true;
 
     const previous_count = node.members.len - added_count;
-    _ = self.getQuantized(txn, node.id, usesNonQuantizedPayload(node), previous_count) catch |err| switch (err) {
+    var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
-    };
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+    }) orelse return false;
+    defer cached.deinit(self.alloc);
 
-    switch (cached.*) {
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1459,7 +1537,8 @@ pub fn updateQuantizedWithAddedVectors(
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
 
     const store_start = now_fn();
-    try self.putQuantizedCached(txn, node.id, cached);
+    try self.putQuantizedCached(txn, node.id, &cached);
+    try self.cacheQuantized(node.id, &cached);
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
     self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
     return true;
@@ -1492,14 +1571,14 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
                 .data = try self.alloc.dupe(f32, transformed_vectors),
             },
         } };
-        _ = try self.cacheQuantizedOwned(node.id, fresh);
+        try self.cacheQuantizedOwned(node.id, fresh);
         self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
         return true;
     }
 
-    _ = try self.getQuantized(txn, node.id, true, previous_count);
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
-    switch (cached.*) {
+    var cached = (try loadQuantizedOwned(self, txn, node.id, true, previous_count, isNotFoundGeneric)) orelse return false;
+    defer cached.deinit(self.alloc);
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1511,6 +1590,7 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
                 @memcpy(set.vectors.data[old_len..][0..transformed_vectors.len], transformed_vectors);
             }
             noteMutatedCachedQuantized(self, node.id);
+            try self.cacheQuantized(node.id, &cached);
             self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
             return true;
         },
@@ -1973,11 +2053,12 @@ pub fn searchProfiledRequest(
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
+    const Index = comptime childType(@TypeOf(self));
+    defer if (comptime @hasDecl(Index, "observeSearchCacheBenefit")) self.observeSearchCacheBenefit(&profile);
     const total_start = now_fn_u64();
     try search_types.checkCancelled(req);
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
-    const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "publishedActiveCount")) {
         if (self.publishedActiveCount() == 0) {
             const empty = search_results.SearchResults.init(self.alloc, req.k);
@@ -2040,15 +2121,20 @@ pub fn searchProfiledRequest(
             self.config.flat_centroid_probe_count
         else
             @as(usize, @intCast(search_width));
-        const probe_limit = @max(configured_probe_count, @as(usize, 1));
-        var probes = try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_limit);
+        const initial_probe_limit = @max(configured_probe_count, @as(usize, 1));
+        // The flat directory is compact (one id/radius plus a quantized
+        // centroid per posting). Keep the full ordered frontier so selective
+        // filters can advance without rebuilding it and stopping can be based
+        // on a real lower bound instead of the old fixed probe cutoff.
+        const probe_capacity = @max(initial_probe_limit, spfresh_index.publishedFlatPostingCapacity(self));
+        var probes = try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_capacity);
         defer self.alloc.free(probes);
 
         const probe_count = try spfresh_index.selectFlatRabitqPostings(
             self,
             &txn,
             transformed_query,
-            probe_limit,
+            probe_capacity,
             probes,
             scratch,
             &profile,
@@ -2057,7 +2143,40 @@ pub fn searchProfiledRequest(
         );
 
         var flat_leaves_scored: usize = 0;
+        var previous_wave_end: usize = 0;
+        var next_wave_end: usize = @min(initial_probe_limit, probe_count);
+        profile.traversal_initial_wave_leaves = @intCast(@min(next_wave_end, std.math.maxInt(u32)));
         for (probes[0..probe_count], 0..) |probe, i| {
+            if (i == next_wave_end and next_wave_end < probe_count) {
+                profile.traversal_waves += 1;
+                profile.traversal_max_wave_leaves = @max(
+                    profile.traversal_max_wave_leaves,
+                    @as(u64, @intCast(next_wave_end - previous_wave_end)),
+                );
+                if (approx_results.isFull() and probe.bound_resolved) {
+                    const result_upper = retainedResultUpperBound(&approx_results);
+                    if (probe.member_lower_bound > result_upper) {
+                        profile.traversal_bound_stops += 1;
+                        profile.traversal_frontier_remaining = @intCast(probe_count - i);
+                        profile.traversal_stop_lower_bound = probe.member_lower_bound;
+                        profile.traversal_stop_result_upper_bound = result_upper;
+                        break;
+                    }
+                }
+
+                const explored = @max(flat_leaves_scored, 1);
+                const eligible = @max(profile.traversal_eligible_vectors, 1);
+                const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
+                const projected_more = std.math.divCeil(
+                    usize,
+                    still_needed *| explored,
+                    @as(usize, @intCast(eligible)),
+                ) catch probe_count;
+                const current_wave = @max(next_wave_end - previous_wave_end, 1);
+                const next_size = @max(current_wave, @min(projected_more, current_wave *| 2));
+                previous_wave_end = next_wave_end;
+                next_wave_end = @min(probe_count, next_wave_end +| next_size);
+            }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
             var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
@@ -2079,6 +2198,14 @@ pub fn searchProfiledRequest(
             try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
+        }
+
+        if (flat_leaves_scored > previous_wave_end) {
+            profile.traversal_waves += 1;
+            profile.traversal_max_wave_leaves = @max(
+                profile.traversal_max_wave_leaves,
+                @as(u64, @intCast(flat_leaves_scored - previous_wave_end)),
+            );
         }
 
         if (flat_leaves_scored > 0) {
@@ -2162,9 +2289,46 @@ pub fn searchProfiledRequest(
     }
 
     var beam_state = search_mod.BeamSearchState{};
+    const initial_wave_leaves: u32 = @min(search_width, @max(@as(u32, 4), @min(@as(u32, @intCast(req.k)), @as(u32, 16))));
+    var previous_wave_leaf: u32 = 0;
+    var next_wave_leaf: u32 = initial_wave_leaves;
+    profile.traversal_initial_wave_leaves = initial_wave_leaves;
     while (true) {
         try search_types.checkCancelled(req);
-        const candidate = candidates.pop() orelse break;
+        if (beam_state.leaves_explored >= next_wave_leaf) {
+            profile.traversal_waves += 1;
+            profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
+            if (approx_results.isFull()) {
+                if (candidates.peek()) |frontier| {
+                    if (frontier.bound_resolved and std.math.isFinite(frontier.lower_bound)) {
+                        const result_upper = retainedResultUpperBound(&approx_results);
+                        if (frontier.lower_bound > result_upper) {
+                            profile.traversal_bound_stops += 1;
+                            profile.traversal_frontier_remaining = @intCast(candidates.items.len);
+                            profile.traversal_stop_lower_bound = frontier.lower_bound;
+                            profile.traversal_stop_result_upper_bound = result_upper;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (next_wave_leaf < search_width) {
+                const explored = @max(beam_state.leaves_explored, 1);
+                const eligible = @max(profile.traversal_eligible_vectors, 1);
+                const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
+                const projected_more_u64 = std.math.divCeil(
+                    u64,
+                    @as(u64, @intCast(still_needed)) *| explored,
+                    eligible,
+                ) catch @as(u64, search_width);
+                const current_wave = @max(next_wave_leaf - previous_wave_leaf, 1);
+                const projected_more: u32 = @intCast(@min(projected_more_u64, std.math.maxInt(u32)));
+                const next_size = @max(current_wave, @min(projected_more, current_wave *| 2));
+                previous_wave_leaf = next_wave_leaf;
+                next_wave_leaf = @min(search_width, next_wave_leaf +| next_size);
+            }
+        }
+        var candidate = candidates.pop() orelse break;
         if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
         profile.nodes_visited += 1;
 
@@ -2172,6 +2336,26 @@ pub fn searchProfiledRequest(
         var node_handle_active = true;
         defer if (node_handle_active) node_handle.deinit(self.alloc);
         const node = node_handle.ptr();
+        if (!candidate.bound_resolved) {
+            profile.traversal_bound_resolutions += 1;
+            // Mutable ancestors are intentionally not used as proof objects:
+            // foreground appends update a posting without rewriting its whole
+            // ancestor chain. Resolve/expand those internal nodes first, then
+            // order the resulting leaf frontier by durable posting radii.
+            if (node.is_leaf and self.config.metric == .l2_squared) {
+                if (l2SubtreeLowerBound(candidate, node.covering_radius)) |lower_bound| {
+                    candidate.lower_bound = lower_bound;
+                    candidate.bound_resolved = true;
+                    candidate.is_leaf = node.is_leaf;
+                    node_handle.deinit(self.alloc);
+                    node_handle_active = false;
+                    try candidates.push(self.alloc, candidate);
+                    continue;
+                }
+            }
+            profile.traversal_bound_fallbacks += 1;
+            candidate.bound_resolved = true;
+        }
         const allow_dynamic_pruning = self.config.metric != .inner_product;
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) {
             node_handle.deinit(self.alloc);
@@ -2327,7 +2511,12 @@ fn addChildCandidatesFromIds(
             try self.estimateQuantizedDistances(quantized, query, query_measure, distances, error_bounds, &scratch.estimate);
             for (child_ids, 0..) |child_id, i| {
                 _ = error_bounds[i];
-                try candidates.push(self.alloc, .{ .id = child_id, .distance = distances[i], .error_bound = 0 });
+                try candidates.push(self.alloc, .{
+                    .id = child_id,
+                    .distance = distances[i],
+                    .error_bound = error_bounds[i],
+                    .bound_resolved = false,
+                });
             }
             return;
         }
@@ -2340,14 +2529,14 @@ fn addChildCandidatesFromIds(
                 handle.deinit(self.alloc);
             }
             const dist = vec.distanceToQuery(query, query_measure, cached_handle.ptr().centroid, self.config.metric);
-            try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0 });
+            try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
             continue;
         }
 
         var child_handle = loadNodeReadHandle(self, txn, child_id) catch continue;
         defer child_handle.deinit(self.alloc);
         const dist = vec.distanceToQuery(query, query_measure, child_handle.ptr().centroid, self.config.metric);
-        try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0 });
+        try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
     }
 }
 
@@ -2393,8 +2582,63 @@ fn scoreLeafMemberIds(
 ) !void {
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
-    const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
+
+    // Resolve selective ID and metadata-prefix predicates once per leaf. The
+    // sorted metadata batch reuses LSM blocks and replaces the former scalar
+    // point lookup (plus cache lock) for every quantized candidate.
+    const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0;
+    var filtered_count: usize = 0;
+    for (member_ids, 0..) |member_id, original_index| {
+        if (filters_active) profile.filter_candidates += 1;
+        if (filter_state.rejects(member_id)) {
+            profile.filter_rejected += 1;
+            continue;
+        }
+        scratch.member_ids[filtered_count] = member_id;
+        scratch.positions[filtered_count] = original_index;
+        filtered_count += 1;
+    }
+    if (req.filter_prefix.len > 0 and filtered_count > 0) {
+        const filter_start = now_fn_u64();
+        profile.filter_metadata_batches += 1;
+        const candidates = scratch.member_ids[0..filtered_count];
+        try getMetadataManySortedInTxnWithScratch(
+            self,
+            txn,
+            candidates,
+            scratch.metadata[0..filtered_count],
+            scratch.lookups[0..filtered_count],
+            scratch.key_views[0..filtered_count],
+            scratch.values[0..filtered_count],
+        );
+        profile.filter_metadata_batch_ns += elapsed_fn_u64(filter_start);
+        var prefix_count: usize = 0;
+        for (candidates, scratch.metadata[0..filtered_count], scratch.positions[0..filtered_count]) |member_id, maybe_metadata, original_index| {
+            const metadata = maybe_metadata orelse {
+                profile.filter_rejected += 1;
+                continue;
+            };
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) {
+                profile.filter_rejected += 1;
+                continue;
+            }
+            scratch.member_ids[prefix_count] = member_id;
+            scratch.positions[prefix_count] = original_index;
+            prefix_count += 1;
+        }
+        filtered_count = prefix_count;
+    }
+    if (filtered_count == 0) return;
+    profile.traversal_eligible_vectors += @intCast(filtered_count);
+    const scoring_member_ids = scratch.member_ids[0..filtered_count];
+    const original_positions = scratch.positions[0..filtered_count];
+    const has_extra_filters = req.distance_over != null or req.distance_under != null;
+    var scoring_req = req;
+    scoring_req.filter_prefix = "";
+    scoring_req.filter_ids = &.{};
+    scoring_req.exclude_ids = &.{};
+    const empty_filter_state = search_types.RequestFilterState{};
     if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
         if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
@@ -2408,17 +2652,24 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (!has_extra_filters) {
-                var batch_start: usize = 0;
-                while (batch_start < member_ids.len) {
-                    try search_types.checkCancelled(req);
-                    const batch_end = @min(batch_start + 256, member_ids.len);
-                    results.addApproxResults(member_ids[batch_start..batch_end], distances[batch_start..batch_end], error_bounds[batch_start..batch_end]);
-                    batch_start = batch_end;
+                if (filtered_count == member_ids.len) {
+                    var batch_start: usize = 0;
+                    while (batch_start < scoring_member_ids.len) {
+                        try search_types.checkCancelled(req);
+                        const batch_end = @min(batch_start + 256, scoring_member_ids.len);
+                        results.addApproxResults(scoring_member_ids[batch_start..batch_end], distances[batch_start..batch_end], error_bounds[batch_start..batch_end]);
+                        batch_start = batch_end;
+                    }
+                } else {
+                    for (scoring_member_ids, original_positions, 0..) |member_id, original_position, ordinal| {
+                        if (ordinal % 256 == 0) try search_types.checkCancelled(req);
+                        results.addApproxResult(member_id, distances[original_position], error_bounds[original_position]);
+                    }
                 }
             } else {
-                for (member_ids, 0..) |member_id, i| {
+                for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
-                    if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], req, filter_state, true)) continue;
+                    if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true)) continue;
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
             }
@@ -2435,15 +2686,15 @@ fn scoreLeafMemberIds(
         }
     }
 
-    const fetch_member_ids = scratch.member_ids[0..member_ids.len];
+    const fetch_member_ids = scratch.vector_ids[0..scoring_member_ids.len];
     var fetch_count: usize = 0;
-    for (member_ids, 0..) |member_id, i| {
+    for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
         if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
             var handle = cached_handle;
             defer handle.deinit();
             const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
                 continue;
             }
             results.addResult(member_id, dist, 0);
@@ -2479,7 +2730,7 @@ fn scoreLeafMemberIds(
         for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
             const dist = exact_distances[i];
             if (!std.math.isFinite(dist)) continue;
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
                 continue;
             }
             results.addResult(member_id, dist, 0);
@@ -2523,7 +2774,7 @@ fn scoreLeafMemberIds(
         if (dist_index % 256 == 0) try search_types.checkCancelled(req);
         const member_id = fetch_member_ids[member_index];
         const dist = exact_distances[dist_index];
-        if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+        if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
             continue;
         }
         results.addResult(member_id, dist, 0);
@@ -2590,26 +2841,71 @@ pub fn rerankResults(
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratch")) {
-            const score_start = now_fn_u64();
-            external_scored = try self.scoreExternalRerankVectorsSortedWithScratch(
-                txn,
-                ranked_items,
-                rerank_positions,
-                query,
-                query_measure,
-                exact_distances,
-                scratch.vector_ids,
-                scratch.metadata,
-                scratch.vector_views,
-                scratch.lookups,
-                scratch.key_views,
-                scratch.values,
-                scratch.vector_batch,
-                profile,
-            );
-            const score_elapsed = elapsed_fn_u64(score_start);
-            profile.rerank_prefetch_ns += score_elapsed;
-            profile.rerank_vector_load_ns += score_elapsed;
+            const max_external_rerank_batch: usize = 128;
+            var offset: usize = 0;
+            while (offset < rerank_positions.len) {
+                const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
+                const batch_positions = rerank_positions[offset..batch_end];
+                const batch_distances = exact_distances[0..batch_positions.len];
+                const score_start = now_fn_u64();
+                const handled = try self.scoreExternalRerankVectorsSortedWithScratch(
+                    txn,
+                    ranked_items,
+                    batch_positions,
+                    query,
+                    query_measure,
+                    batch_distances,
+                    scratch.vector_ids,
+                    scratch.metadata,
+                    scratch.vector_views,
+                    scratch.lookups,
+                    scratch.key_views,
+                    scratch.values,
+                    scratch.vector_batch,
+                    profile,
+                );
+                const score_elapsed = elapsed_fn_u64(score_start);
+                profile.rerank_prefetch_ns += score_elapsed;
+                profile.rerank_vector_load_ns += score_elapsed;
+                if (!handled) {
+                    if (offset != 0) return error.ExternalRerankCapabilityChanged;
+                    break;
+                }
+                external_scored = true;
+                profile.rerank_batches += 1;
+                profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, batch_positions.len);
+
+                const apply_start = now_fn_u64();
+                for (batch_positions, 0..) |index, slot| {
+                    if (slot % 64 == 0) try search_types.checkCancelled(req);
+                    const item = &ranked_items[index];
+                    const dist = batch_distances[slot];
+                    rerank_selection.flags[index] = false;
+                    if (!std.math.isFinite(dist) or
+                        (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)))
+                    {
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    item.distance = dist;
+                    item.error_bound = 0;
+                    profile.exact_vectors_scored += 1;
+                    profile.reranked_vectors += 1;
+                }
+                profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
+                offset = batch_end;
+
+                if (offset < rerank_positions.len and remainingRerankCandidatesCannotEnter(
+                    ranked_items,
+                    rerank_selection.flags,
+                    rerank_selection.top_k_count,
+                    scratch.distances,
+                )) {
+                    profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                    break;
+                }
+            }
         }
 
         if (!external_scored) {
@@ -2650,33 +2946,34 @@ pub fn rerankResults(
             profile.rerank_distance_ns += elapsed_fn_u64(dist_start);
         }
 
-        const apply_start = now_fn_u64();
-        var exact_idx: usize = 0;
-        for (rerank_positions, 0..) |index, slot| {
-            if (slot % 256 == 0) try search_types.checkCancelled(req);
-            const item = &ranked_items[index];
-            if (!std.math.isFinite(item.distance)) continue;
-            const dist = if (external_scored) exact_distances[slot] else blk: {
-                const value = exact_distances[exact_idx];
+        if (!external_scored) {
+            profile.rerank_batches += 1;
+            profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, rerank_positions.len);
+            const apply_start = now_fn_u64();
+            var exact_idx: usize = 0;
+            for (rerank_positions, 0..) |index, slot| {
+                if (slot % 256 == 0) try search_types.checkCancelled(req);
+                const item = &ranked_items[index];
+                if (!std.math.isFinite(item.distance)) continue;
+                const dist = exact_distances[exact_idx];
                 exact_idx += 1;
-                break :blk value;
-            };
-            if (!std.math.isFinite(dist)) {
-                item.distance = std.math.inf(f32);
+                if (!std.math.isFinite(dist)) {
+                    item.distance = std.math.inf(f32);
+                    item.error_bound = 0;
+                    continue;
+                }
+                if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
+                    item.distance = std.math.inf(f32);
+                    item.error_bound = 0;
+                    continue;
+                }
+                item.distance = dist;
                 item.error_bound = 0;
-                continue;
+                profile.exact_vectors_scored += 1;
+                profile.reranked_vectors += 1;
             }
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
-                item.distance = std.math.inf(f32);
-                item.error_bound = 0;
-                continue;
-            }
-            item.distance = dist;
-            item.error_bound = 0;
-            profile.exact_vectors_scored += 1;
-            profile.reranked_vectors += 1;
+            profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
         }
-        profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
 
         const resort_start = now_fn_u64();
         search_mod.sortApproxResultsByDistance(ranked_items);
@@ -2885,6 +3182,55 @@ fn countSelectedRerankCandidates(flags: []const bool) usize {
     return count;
 }
 
+/// Returns true only when `top_k` already-scored/permanently-retained
+/// candidates have upper bounds strictly below every still-selected
+/// candidate's lower bound. This lets external reranking stop between sorted
+/// artifact batches without weakening membership recall.
+fn remainingRerankCandidatesCannotEnter(
+    ranked_items: []const search_results.ApproxSearchResult,
+    pending_flags: []const bool,
+    top_k: usize,
+    upper_storage: []f32,
+) bool {
+    if (top_k == 0 or upper_storage.len < ranked_items.len) return false;
+    var retained_count: usize = 0;
+    var pending_lower = std.math.inf(f32);
+    for (ranked_items, pending_flags) |item, pending| {
+        if (pending) {
+            pending_lower = @min(pending_lower, item.distance - item.error_bound);
+            continue;
+        }
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[retained_count] = upper;
+        retained_count += 1;
+    }
+    if (retained_count < top_k or !std.math.isFinite(pending_lower)) return false;
+    std.mem.sort(f32, upper_storage[0..retained_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    return upper_storage[top_k - 1] < pending_lower;
+}
+
+test "progressive rerank stops only beyond retained kth upper bound" {
+    const items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0 },
+        .{ .vector_id = 2, .distance = 2.0, .error_bound = 0.1 },
+        .{ .vector_id = 3, .distance = 4.0, .error_bound = 0.2 },
+        .{ .vector_id = 4, .distance = 6.0, .error_bound = 0.5 },
+    };
+    var storage: [items.len]f32 = undefined;
+    try std.testing.expect(remainingRerankCandidatesCannotEnter(&items, &.{ false, false, true, true }, 2, &storage));
+    try std.testing.expect(!remainingRerankCandidatesCannotEnter(&items, &.{ false, true, true, true }, 2, &storage));
+
+    var overlapping = items;
+    overlapping[2].distance = 2.0;
+    overlapping[2].error_bound = 0.5;
+    try std.testing.expect(!remainingRerankCandidatesCannotEnter(&overlapping, &.{ false, false, true, true }, 2, &storage));
+}
+
 fn selectedRerankCandidatePositions(
     alloc: std.mem.Allocator,
     ranked_items: []const search_results.ApproxSearchResult,
@@ -3027,6 +3373,7 @@ fn loadVectorIdsSortedWithScratch(
             .item_index = slot,
             .vector_id = vector_id,
             .key = key,
+            .vector_cache_fill_epoch = beginVectorCacheFillIfSupported(self, vector_id).epoch,
         };
         lookup_count += 1;
     }
@@ -3038,7 +3385,11 @@ fn loadVectorIdsSortedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    try getNamespacedManySorted(self, txn, .vecs, key_views, values);
+    const vector_namespace = if (comptime @hasDecl(Index, "vectorArtifactReadNamespace"))
+        self.vectorArtifactReadNamespace()
+    else
+        .vecs;
+    try getNamespacedManySorted(self, txn, vector_namespace, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
@@ -3058,7 +3409,11 @@ fn loadVectorIdsSortedWithScratch(
         if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
             self.notifyVectorViewLoadForTest(lookups[i].vector_id);
         }
-        vector_views[lookups[i].item_index] = try self.cacheVector(lookups[i].vector_id, view);
+        const guarded = comptime @hasDecl(Index, "beginVectorCacheFill");
+        vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, lookups[i].vector_id, view, .{
+            .guarded = guarded,
+            .epoch = lookups[i].vector_cache_fill_epoch,
+        });
     }
 }
 
@@ -3838,6 +4193,105 @@ fn normalizeCentroidForMetric(self: anytype, centroid: []f32) void {
     }
 }
 
+fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count: usize) f32 {
+    if (count == 0) return 0;
+    if (centroid.len == 0 or vectors.len < count * centroid.len) return std.math.nan(f32);
+    var max_squared: f32 = 0;
+    for (0..count) |row| {
+        const candidate = vectors[row * centroid.len ..][0..centroid.len];
+        var squared: f32 = 0;
+        for (centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        max_squared = @max(max_squared, squared);
+    }
+    return @sqrt(max_squared);
+}
+
+fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
+    if (node.members.len <= 1) {
+        node.covering_radius = 0;
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len != node.centroid.len) {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+    const old_count: f32 = @floatFromInt(node.members.len - 1);
+    var shift_squared: f32 = 0;
+    var appended_squared: f32 = 0;
+    for (node.centroid, appended) |new_center, value| {
+        const appended_delta = value - new_center;
+        appended_squared += appended_delta * appended_delta;
+        const shift = appended_delta / old_count;
+        shift_squared += shift * shift;
+    }
+    node.covering_radius = @max(node.covering_radius + @sqrt(shift_squared), @sqrt(appended_squared));
+}
+
+fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, added_count: usize) void {
+    if (added_count == 0) return;
+    if (node.members.len == added_count) {
+        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, appended, added_count);
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len < added_count * node.centroid.len) {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+    const old_count = node.members.len - added_count;
+    const old_count_f: f32 = @floatFromInt(old_count);
+    const total_count_f: f32 = @floatFromInt(node.members.len);
+    var shift_squared: f32 = 0;
+    for (node.centroid, 0..) |new_center, dim| {
+        var appended_sum: f32 = 0;
+        for (0..added_count) |row| appended_sum += appended[row * node.centroid.len + dim];
+        const old_center = (new_center * total_count_f - appended_sum) / old_count_f;
+        const shift = old_center - new_center;
+        shift_squared += shift * shift;
+    }
+    var radius = node.covering_radius + @sqrt(shift_squared);
+    for (0..added_count) |row| {
+        const candidate = appended[row * node.centroid.len ..][0..node.centroid.len];
+        var squared: f32 = 0;
+        for (node.centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        radius = @max(radius, @sqrt(squared));
+    }
+    node.covering_radius = radius;
+}
+
+fn l2SubtreeLowerBound(candidate: types.PriorityItem, covering_radius: f32) ?f32 {
+    if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
+    const centroid_squared_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    if (!std.math.isFinite(centroid_squared_lower)) return null;
+    const vector_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
+    return vector_distance_lower * vector_distance_lower;
+}
+
+fn retainedResultUpperBound(results: *const search_results.ApproxSearchResults) f32 {
+    var upper: f32 = -std.math.inf(f32);
+    for (results.items.items) |item| upper = @max(upper, item.distance + item.error_bound);
+    return upper;
+}
+
+fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
+    if (self.config.metric != .l2_squared) return std.math.nan(f32);
+    if (node.children.len == 0) return 0;
+    var radius: f32 = 0;
+    for (node.children) |child_id| {
+        var child = try loadNode(self, txn, child_id);
+        defer child.deinit(self.alloc);
+        if (!std.math.isFinite(child.covering_radius) or child.covering_radius < 0) return std.math.nan(f32);
+        const center_squared = vec.distanceToQuery(node.centroid, vec.dot(node.centroid, node.centroid), child.centroid, .l2_squared);
+        radius = @max(radius, @sqrt(@max(center_squared, 0)) + child.covering_radius);
+    }
+    return radius;
+}
+
 pub fn recomputeLeafCentroid(self: anytype, txn: anytype, leaf: *types.Node) !void {
     try posting.PostingStore.recomputeCentroid(self, txn, leaf);
 }
@@ -3853,6 +4307,10 @@ fn applyLeafCentroidDelta(self: anytype, leaf: *types.Node, delta: []const f32) 
     const n: f32 = @floatFromInt(leaf.members.len);
     for (leaf.centroid, 0..) |*c, i| c.* += delta[i] / n;
     normalizeCentroidForMetric(self, leaf.centroid);
+    // An in-place replacement removes one old point and adds another. The
+    // centroid delta alone cannot tighten the old sphere safely without both
+    // endpoints, so maintenance recomputes it and search uses width meanwhile.
+    leaf.covering_radius = std.math.nan(f32);
     posting.PostingStore.noteCentroidRefreshed(leaf);
 }
 
@@ -3899,6 +4357,7 @@ pub fn recomputeInternalCentroid(self: anytype, txn: anytype, node: *types.Node)
     }
     vec.scale(1.0 / @as(f32, @floatFromInt(node.children.len)), node.centroid);
     normalizeCentroidForMetric(self, node.centroid);
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, node);
 }
 
 fn updateInternalCentroidForLeafSplit(
@@ -3972,6 +4431,7 @@ fn collapseSingleChildParentsOptions(
 pub fn delete(self: anytype, vector_id: u64) !void {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try deleteTxn(self, &txn, vector_id);
     try runAutoPostingMaintenanceTxn(self, &txn);
     try self.flushMetadata(&txn);
@@ -3985,6 +4445,7 @@ pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
 
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try batchDeleteTxn(self, &batch, vector_ids);
     try runAutoPostingMaintenanceTxn(self, &batch);
     try self.flushMetadata(&batch);
@@ -4391,6 +4852,7 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
 pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     const report = try repairTreeLinks(self, &txn, max_nodes);
     try self.flushMetadata(&txn);
     try txn.commit();
@@ -4452,6 +4914,7 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
     try leaf.ensureUnbacked(self.alloc);
 
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
+    leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
 
     if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
@@ -4459,6 +4922,7 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
         try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
     } else {
         @memset(leaf.centroid, 0);
+        leaf.covering_radius = 0;
     }
 
     if (leaf.members.len == 0 and leaf.parent != 0) {
@@ -4635,6 +5099,7 @@ pub fn insertWithMetadata(
 ) !void {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     const transformed_vector = try self.alloc.alloc(f32, self.config.dims);
     defer self.alloc.free(transformed_vector);
     try insertWithMetadataTxn(self, &txn, vector_id, vector_data, metadata_value, transformed_vector, now_fn_u64, elapsed_fn_u64);
@@ -4774,6 +5239,11 @@ pub fn insertWithMetadataTxnOptions(
     };
 
     const store_start = now_fn_u64();
+    // The embedding may be authoritative in an external LSM rather than this
+    // index's vector namespace. Invalidate unconditionally so a retained
+    // derivative from an earlier generation cannot survive an update merely
+    // because cache seeding is bypassed for this write.
+    self.invalidateVectorCache(vector_id);
     if (!skip_vector_store) {
         try putVector(self, txn, vector_id, vector_data);
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
@@ -4803,6 +5273,11 @@ pub fn insertWithMetadataTxnOptions(
         }
         normalizeCentroidForMetric(self, leaf.centroid);
         posting.PostingStore.noteCentroidRefreshed(&leaf);
+    }
+    if (self.config.metric == .l2_squared) {
+        expandL2RadiusAfterAppend(&leaf, effective_transformed);
+    } else {
+        leaf.covering_radius = std.math.nan(f32);
     }
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
@@ -5066,11 +5541,15 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             try sibling.ensureUnbacked(self.alloc);
             const merged_len = sibling.members.len + leaf.members.len;
             var merged = try self.alloc.alloc(u64, merged_len);
-            errdefer self.alloc.free(merged);
+            var merged_owned = true;
+            errdefer if (merged_owned) self.alloc.free(merged);
             @memcpy(merged[0..sibling.members.len], sibling.members);
             @memcpy(merged[sibling.members.len..], leaf.members);
             self.alloc.free(sibling.members);
             sibling.members = merged;
+            // sibling's deferred destructor owns the replacement after the
+            // transfer, including every subsequent error path.
+            merged_owned = false;
             try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
             try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
@@ -5172,6 +5651,8 @@ pub fn splitInternalWithOptions(
 
     for (n1.children) |child_id| try updateParent(self, txn, child_id, n1_id, nowNsU64Fixed, elapsedSinceU64Fixed);
     for (n2.children) |child_id| try updateParent(self, txn, child_id, n2_id, nowNsU64Fixed, elapsedSinceU64Fixed);
+    n1.covering_radius = try computeInternalCoveringRadius(self, txn, &n1);
+    n2.covering_radius = try computeInternalCoveringRadius(self, txn, &n2);
 
     if (node.parent == 0) {
         const new_root_id = self.nextNodeId();
@@ -5202,6 +5683,7 @@ pub fn splitInternalWithOptions(
             .members = &.{},
         };
         defer new_root.deinit(self.alloc);
+        new_root.covering_radius = try computeInternalCoveringRadius(self, txn, &new_root);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
     } else {
@@ -5401,18 +5883,27 @@ pub fn splitLeafWithOptions(
     defer self.alloc.free(vec_data);
     const vector_load_start = now_fn();
     var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, vec_data, options);
-    if (!used_cached_nonquant) {
-        _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), count) catch null;
-        if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-            switch (cached.*) {
-                .nonquant => |*set| {
-                    if (set.vectors.dims == dims and set.vectors.count == count and set.vectors.data.len >= count * dims) {
-                        @memcpy(vec_data, set.vectors.data[0 .. count * dims]);
-                        used_cached_nonquant = true;
-                    }
-                },
-                .rabit => {},
-            }
+    var quantized_handle = if (!used_cached_nonquant)
+        try loadQuantizedReadHandle(
+            self,
+            txn,
+            leaf.id,
+            usesNonQuantizedPayload(leaf),
+            count,
+            isNotFoundGeneric,
+        )
+    else
+        null;
+    defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
+    if (quantized_handle) |*handle| {
+        switch (handle.ptr().*) {
+            .nonquant => |*set| {
+                if (set.vectors.dims == dims and set.vectors.count == count and set.vectors.data.len >= count * dims) {
+                    @memcpy(vec_data, set.vectors.data[0 .. count * dims]);
+                    used_cached_nonquant = true;
+                }
+            },
+            .rabit => {},
         }
     }
     if (!used_cached_nonquant) {
@@ -5489,9 +5980,13 @@ pub fn splitLeafWithOptions(
     defer if (left_vectors.len > 0) self.alloc.free(left_vectors);
     var right_vectors: []f32 = &.{};
     defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
-    if (publish_known_quantized_now) {
+    if (publish_known_quantized_now or self.config.metric == .l2_squared) {
         left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
         right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
+    }
+    if (self.config.metric == .l2_squared) {
+        left_node.covering_radius = l2CoveringRadiusForMatrix(left_node.centroid, left_vectors, left_node.members.len);
+        right_node.covering_radius = l2CoveringRadiusForMatrix(right_node.centroid, right_vectors, right_node.members.len);
     }
 
     if (splitting_root) {
@@ -5530,6 +6025,7 @@ pub fn splitLeafWithOptions(
             .members = &.{},
         };
         defer new_root.deinit(self.alloc);
+        new_root.covering_radius = try computeInternalCoveringRadius(self, txn, &new_root);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
 
@@ -5608,18 +6104,27 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
 
     const vector_load_start = now_fn();
     var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, dense_vectors, options);
-    if (!used_cached_nonquant) {
-        _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len) catch null;
-        if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-            switch (cached.*) {
-                .nonquant => |*set| {
-                    if (set.vectors.dims == dims and set.vectors.count == leaf.members.len and set.vectors.data.len >= leaf.members.len * dims) {
-                        @memcpy(dense_vectors, set.vectors.data[0 .. leaf.members.len * dims]);
-                        used_cached_nonquant = true;
-                    }
-                },
-                .rabit => {},
-            }
+    var quantized_handle = if (!used_cached_nonquant)
+        try loadQuantizedReadHandle(
+            self,
+            txn,
+            leaf.id,
+            usesNonQuantizedPayload(leaf),
+            leaf.members.len,
+            isNotFoundGeneric,
+        )
+    else
+        null;
+    defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
+    if (quantized_handle) |*handle| {
+        switch (handle.ptr().*) {
+            .nonquant => |*set| {
+                if (set.vectors.dims == dims and set.vectors.count == leaf.members.len and set.vectors.data.len >= leaf.members.len * dims) {
+                    @memcpy(dense_vectors, set.vectors.data[0 .. leaf.members.len * dims]);
+                    used_cached_nonquant = true;
+                }
+            },
+            .rabit => {},
         }
     }
     if (!used_cached_nonquant) {
@@ -5728,6 +6233,10 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
                 .members = members,
             };
             defer node.deinit(self.alloc);
+            node.covering_radius = if (self.config.metric == .l2_squared)
+                l2CoveringRadiusForMatrix(node.centroid, group_vectors, node.members.len)
+            else
+                std.math.nan(f32);
             if (publish_known_quantized_now) {
                 try saveLeafNodeWithKnownVectors(self, txn, &node, group_vectors, now_fn, elapsed_fn);
             } else {
@@ -5760,6 +6269,7 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
             .members = &.{},
         };
         defer root.deinit(self.alloc);
+        root.covering_radius = try computeInternalCoveringRadius(self, txn, &root);
         try saveNodeWithOptions(self, txn, &root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
     } else {
@@ -5832,6 +6342,7 @@ pub fn batchApplyOptions(
         else
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         try batchDeleteTxnOptions(self, &batch, deletes, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
@@ -5850,6 +6361,7 @@ pub fn batchApplyOptions(
     else
         try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
 
     var insert_options = options;
     // Replacement batches change membership before adding vectors back. Do
@@ -5883,6 +6395,7 @@ pub fn batchApplyOptions(
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);
+    seedRetainedVectorsAfterCommit(self, writes, insert_options);
 }
 
 pub fn batchInsertWithMetadataOptions(
@@ -5901,6 +6414,7 @@ pub fn batchInsertWithMetadataOptions(
         else
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         const grouped = if (options.coalesce_leaf_writes)
             try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, items, options, now_fn, elapsed_fn)
         else
@@ -5913,9 +6427,11 @@ pub fn batchInsertWithMetadataOptions(
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
+        seedRetainedVectorsAfterCommit(self, items, options);
     } else {
         var txn = try self.beginRuntimeWriteTxn();
         errdefer txn.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         try batchInsertWithMetadataTxnOptions(self, &txn, items, options);
         try finalizeWriteTxnOptions(self, &txn, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
@@ -5924,6 +6440,7 @@ pub fn batchInsertWithMetadataOptions(
         try txn.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
+        seedRetainedVectorsAfterCommit(self, items, options);
     }
 }
 
@@ -6103,7 +6620,9 @@ fn routeBatchNodeToLeaves(
     profile: *BatchRouteProfile,
 ) !void {
     if (current_item_indexes.len == 0) return;
-    const node = try self.getNodePtr(txn, node_id);
+    var node_handle = try loadMutationNodeReadHandle(self, txn, node_id);
+    defer node_handle.deinit(self.alloc);
+    const node = node_handle.ptr();
     if (node.is_leaf or node.children.len == 0) {
         for (current_item_indexes) |item_index| {
             prepared[prepared_count.*] = .{ .item_index = item_index, .leaf_id = node_id };
@@ -6304,6 +6823,9 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
 
     const store_start = now_fn();
     for (sorted_item_indexes) |item_idx| {
+        self.invalidateVectorCache(items[item_idx].vector_id);
+    }
+    for (sorted_item_indexes) |item_idx| {
         const item = items[item_idx];
         if (item.metadata.len == 0) continue;
         var key_buf: [10]u8 = undefined;
@@ -6314,7 +6836,6 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             const item = items[item_idx];
             var key_buf: [10]u8 = undefined;
             try self.appendNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, item.vector_id), std.mem.sliceAsBytes(item.vector));
-            self.invalidateVectorCache(item.vector_id);
         }
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
         for (sorted_item_indexes) |item_idx| {
@@ -6440,6 +6961,11 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             for (leaf.centroid, 0..) |*c, dim| c.* = (c.* * old_f + centroid_sum[dim]) / new_f;
             normalizeCentroidForMetric(self, leaf.centroid);
             posting.PostingStore.noteCentroidRefreshed(&leaf);
+        }
+        if (self.config.metric == .l2_squared) {
+            expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len);
+        } else {
+            leaf.covering_radius = std.math.nan(f32);
         }
 
         const leaf_overflows = leaf.members.len > self.config.leaf_size;
@@ -6614,6 +7140,7 @@ pub fn bulkBuildWithMetadataOptions(
 
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try bulkBuildWithMetadataTxnOptions(self, &batch, items, options, now_fn, elapsed_fn);
     try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
     const commit_start = now_fn();
@@ -6622,6 +7149,7 @@ pub fn bulkBuildWithMetadataOptions(
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);
+    seedRetainedVectorsAfterCommit(self, items, options);
 }
 
 pub fn bulkBuildWithMetadataTxn(self: anytype, txn: anytype, items: []const hbc_runtime.BatchInsertItem) !void {
@@ -6654,6 +7182,9 @@ pub fn bulkBuildPreparedInputsTxnOptions(
     }.lessThan);
 
     const store_start = now_fn();
+    for (sorted_indexes) |input_idx| {
+        self.invalidateVectorCache(inputs[input_idx].vector_id);
+    }
     for (sorted_indexes) |input_idx| {
         const input = inputs[input_idx];
         if (input.metadata.len > 0) {
@@ -6868,6 +7399,7 @@ pub fn buildBulkHilbertSeeded(
                 .children = child_ids,
                 .members = &.{},
             };
+            node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
             self.alloc.free(child_ids);
@@ -7130,19 +7662,8 @@ pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, e
     return decoded;
 }
 
-pub fn getQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !?*const hbc_runtime.QuantizedSet {
-    if (self.getCachedQuantizedPtr(node_id)) |cached| {
-        validateQuantizedSet(self, cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (self.getCachedQuantizedPtr(node_id)) |valid| return valid;
-    }
-
-    const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
-        return err;
-    };
-    return try self.cacheQuantizedOwned(node_id, decoded);
+pub fn getQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return try loadQuantizedReadHandle(self, txn, node_id, is_root, expected_count, is_not_found);
 }
 
 pub fn getQuantizedProfiled(
@@ -7155,23 +7676,8 @@ pub fn getQuantizedProfiled(
     is_not_found: fn (anyerror) bool,
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
-) !?*const hbc_runtime.QuantizedSet {
-    if (self.getCachedQuantizedPtr(node_id)) |cached| {
-        validateQuantizedSet(self, cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (self.getCachedQuantizedPtr(node_id)) |valid| return valid;
-    }
-
-    const start = now_fn();
-    const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
-        return err;
-    };
-    const cached = try self.cacheQuantizedOwned(node_id, decoded);
-    profile.quantized_cache_miss_ns += elapsed_fn(start);
-    profile.quantized_cache_misses += 1;
-    return cached;
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return try loadQuantizedReadHandleProfiled(self, txn, node_id, is_root, expected_count, profile, now_fn, elapsed_fn, is_not_found);
 }
 
 fn loadQuantizedProfiledOwned(
@@ -7185,11 +7691,22 @@ fn loadQuantizedProfiledOwned(
     elapsed_fn: fn (u64) u64,
     is_not_found: fn (anyerror) bool,
 ) !?hbc_runtime.QuantizedSet {
-    if (try self.getCachedQuantizedClone(node_id)) |cached| {
-        validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
+    if (try self.getCachedQuantizedClone(node_id)) |cached_value| {
+        var cached = cached_value;
+        validateQuantizedSet(self, &cached, expected_count) catch {
+            cached.deinit(self.alloc);
+            self.invalidateQuantizedCache(node_id);
+            const start = now_fn();
+            const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+                if (is_not_found(err) or err == error.Corrupted) return null;
+                return err;
+            };
+            profile.quantized_cache_miss_ns += elapsed_fn(start);
+            profile.quantized_cache_misses += 1;
+            if (self.cache_enabled) self.cacheQuantized(node_id, &decoded) catch {};
+            return decoded;
         };
-        if (try self.getCachedQuantizedClone(node_id)) |valid| return valid;
+        return cached;
     }
 
     const start = now_fn();
@@ -7289,8 +7806,10 @@ pub fn refreshQuantizedWithOptions(
         return;
     }
 
-    if (self.getCachedQuantizedPtr(node.id)) |cached| {
-        switch (cached.*) {
+    if (try self.getCachedQuantizedClone(node.id)) |cached_value| {
+        var cached = cached_value;
+        defer cached.deinit(self.alloc);
+        switch (cached) {
             .nonquant => |*set| {
                 if (!usesNonQuantizedPayload(node)) {
                     const compute_start = now_fn();
@@ -7310,9 +7829,10 @@ pub fn refreshQuantizedWithOptions(
                     set.vectors.data = try self.alloc.realloc(set.vectors.data, count * dims);
                 }
                 @memcpy(set.vectors.data, vectors);
-                noteMutatedCachedQuantized(self, node.id);
                 const store_start = now_fn();
-                try putQuantizedCached(self, txn, node.id, cached, now_fn, elapsed_fn);
+                try putQuantizedCached(self, txn, node.id, &cached, now_fn, elapsed_fn);
+                try self.cacheQuantized(node.id, &cached);
+                noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
                 return;
             },
@@ -7336,9 +7856,10 @@ pub fn refreshQuantizedWithOptions(
                 const compute_start = now_fn();
                 try self.quantizer.quantizeInto(set, node.centroid, vectors, count);
                 self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
-                noteMutatedCachedQuantized(self, node.id);
                 const store_start = now_fn();
-                try putQuantizedCached(self, txn, node.id, cached, now_fn, elapsed_fn);
+                try putQuantizedCached(self, txn, node.id, &cached, now_fn, elapsed_fn);
+                try self.cacheQuantized(node.id, &cached);
+                noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
                 return;
             },
@@ -7510,6 +8031,7 @@ fn storeVectorAndMetadataWithOptions(
     metadata_value: []const u8,
     skip_vector_store: bool,
 ) !void {
+    self.invalidateVectorCache(vector_id);
     if (!skip_vector_store) {
         try putVector(self, txn, vector_id, vector_data);
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
@@ -7595,6 +8117,7 @@ fn buildBulkSubtreeRecursive(
         .children = child_ids,
         .members = &.{},
     };
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
     try self.saveNodeBody(txn, &node);
     self.alloc.free(child_ids);
 
@@ -7736,6 +8259,7 @@ fn buildBulkParentLevels(
                 .children = child_ids,
                 .members = &.{},
             };
+            node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
             self.alloc.free(child_ids);
@@ -7958,6 +8482,7 @@ fn buildBulkParentFromNodeIndexes(
         .children = child_ids,
         .members = &.{},
     };
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
     self.alloc.free(child_ids);
@@ -8009,6 +8534,14 @@ fn buildBulkLeaf(
         .children = &.{},
         .members = members,
     };
+    if (self.config.metric == .l2_squared) {
+        const radius_matrix = try self.alloc.alloc(f32, inputs.len * self.config.dims);
+        defer self.alloc.free(radius_matrix);
+        for (inputs, 0..) |input, row| {
+            @memcpy(radius_matrix[row * self.config.dims ..][0..self.config.dims], input.transformed);
+        }
+        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, radius_matrix, inputs.len);
+    }
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
