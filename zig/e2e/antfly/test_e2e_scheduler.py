@@ -895,6 +895,90 @@ def test_lightweight_runway_preserves_successor_for_session_rotation(
     assert successor.sent == [[1]]
 
 
+def test_process_runway_preserves_last_successor_for_queued_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    first = FakeWorker()
+    second = FakeWorker()
+    first_scope = f"{PROCESS_GROUP_PREFIX}test--first"
+    second_scope = f"{PROCESS_GROUP_PREFIX}test--second"
+    queued_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}new_runtime--module--queued"
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {}
+    scheduler.assigned_work = {
+        first: {first_scope: {"test_process.py::test_first": False}},
+        second: {second_scope: {"test_process.py::test_second": False}},
+    }
+    scheduler.workqueue = OrderedDict(
+        {queued_scope: {"test_process.py::test_queued": False}}
+    )
+    scheduler.registered_collections = {
+        first: ["test_process.py::test_first", "test_process.py::test_queued"],
+        second: ["test_process.py::test_second", "test_process.py::test_queued"],
+    }
+
+    scheduler._reschedule(first)
+    scheduler._reschedule(second)
+
+    retiring = [node for node in (first, second) if node.shutting_down]
+    successors = [node for node in (first, second) if not node.shutting_down]
+    assert len(retiring) == 1
+    assert len(successors) == 1
+    assert scheduler.workqueue
+
+    retired_workload = scheduler.assigned_work[retiring[0]]
+    for work_unit in retired_workload.values():
+        for nodeid in work_unit:
+            work_unit[nodeid] = True
+    scheduler._reschedule(successors[0])
+
+    assert successors[0].sent == [[1]]
+    assert not scheduler.workqueue
+
+
+def test_session_rotation_preserves_owner_needed_by_queued_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    useful_owner = FakeWorker()
+    unrelated_owner = FakeWorker(exitstatus=0)
+    successor = FakeWorker()
+    useful_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a--module--done"
+    unrelated_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_b--module--done"
+    queued_scope = f"{MIXED_PROCESS_GROUP_PREFIX}runtime_a--module--queued"
+    queued_nodeid = "test_mixed.py::test_queued"
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {
+        useful_owner: {"runtime_a"},
+        unrelated_owner: {"runtime_b"},
+    }
+    scheduler.assigned_work = {
+        useful_owner: {useful_scope: {"test_a.py::test_done": True}},
+        unrelated_owner: {unrelated_scope: {"test_b.py::test_done": True}},
+        successor: {"light--test--queued": {"test_light.py::test_queued": False}},
+    }
+    scheduler.workqueue = OrderedDict({queued_scope: {queued_nodeid: False}})
+    scheduler.registered_collections = {
+        useful_owner: [queued_nodeid],
+        successor: ["test_light.py::test_queued", queued_nodeid],
+    }
+
+    scheduler._reschedule(useful_owner)
+
+    assert unrelated_owner.shutting_down
+    assert unrelated_owner in scheduler._retiring_nodes
+    assert not useful_owner.shutting_down
+
+    assert scheduler.remove_node(unrelated_owner) is None
+    assert useful_owner.sent == [[0]]
+    assert not scheduler.workqueue
+
+
 def test_lightweight_runway_waits_for_transient_slot_release(tmp_path: Path) -> None:
     scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
     scheduler.process_slots = 2

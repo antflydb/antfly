@@ -650,6 +650,85 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             for candidate in self.nodes
         )
 
+    def _retirement_score(
+        self,
+        candidate: WorkerController,
+    ) -> tuple[float, float, int]:
+        """Prefer retirements that unlock work without discarding useful reuse."""
+        candidate_workload = self.assigned_work[candidate]
+        released_slots = len(self._persistent_processes.get(candidate, ())) + int(
+            self._workload_uses_transient_process(candidate_workload)
+        )
+        reserved_after_retirement = max(
+            0, self._reserved_process_slots() - released_slots
+        )
+        remaining_nodes = [
+            node
+            for node in self.nodes
+            if node is not candidate and not node.shutting_down
+        ]
+        unlocked_duration = 0.0
+        reuse_value = 0.0
+        owned = self._persistent_processes.get(candidate, set())
+        for scope, work_unit in self.workqueue.items():
+            if not any(not complete for complete in work_unit.values()):
+                continue
+            duration = self._scope_duration(scope, work_unit)
+            if any(
+                reserved_after_retirement + self._additional_process_slots(node, scope)
+                <= self.process_slots
+                for node in remaining_nodes
+            ):
+                unlocked_duration += duration
+            requested = self._scope_persistent_processes(scope)
+            if requested:
+                reuse_value += (
+                    duration * len(requested.intersection(owned)) / len(requested)
+                )
+        return unlocked_duration, -reuse_value, released_slots
+
+    def _retire_best_resource_worker(self) -> bool:
+        """Retire one drainable resource worker while preserving a successor."""
+        live_nodes = [node for node in self.nodes if not node.shutting_down]
+        candidates = [
+            node
+            for node in live_nodes
+            if self._pending_of(self.assigned_work[node]) <= 1
+            and (
+                self._persistent_processes.get(node)
+                or self._workload_uses_process(self.assigned_work[node])
+            )
+            and any(successor is not node for successor in live_nodes)
+        ]
+        if not candidates:
+            return False
+        candidate = max(candidates, key=self._retirement_score)
+        self._retiring_nodes.add(candidate)
+        candidate.shutdown()
+        return True
+
+    def _another_worker_will_make_progress(
+        self,
+        node: WorkerController,
+    ) -> bool:
+        """Return whether a future worker event can reopen scheduling capacity."""
+        if any(
+            candidate.shutting_down for candidate in self.nodes if candidate is not node
+        ):
+            return True
+        return any(
+            candidate is not node and self._pending_of(workload) > 1
+            for candidate, workload in self.assigned_work.items()
+        )
+
+    def _another_worker_can_accept_work(self, node: WorkerController) -> bool:
+        return any(
+            candidate is not node
+            and not candidate.shutting_down
+            and self._next_eligible_scope(candidate) is not None
+            for candidate in self.nodes
+        )
+
     def _next_eligible_scope(self, node: WorkerController) -> str | None:
         reserved_process_slots = self._reserved_process_slots()
         for scope, work_unit in self.workqueue.items():
@@ -720,71 +799,41 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             self._assign_work_unit(node)
             return
         # This worker cannot reserve an Antfly process slot and no lightweight
-        # work remains. A shutdown command lets it finish its queued item while
-        # the process-reserved workers drain the remaining queue.
+        # work remains. Preserve a live successor whenever a shutdown is needed
+        # to drain a one-item worker queue or release a persistent reservation.
         pending = self._pending_of(self.assigned_work[node])
         if pending == 0:
             # An idle worker can safely wait for a slot. If it owns a session
             # process that blocks all remaining work, rotate one such worker at
             # a time so teardown releases the lifetime reservation.
-            owns_persistent_process = bool(self._persistent_processes.get(node))
-            persistent_retirement_in_flight = any(
-                self._persistent_processes.get(candidate)
-                for candidate in self._retiring_nodes
-            )
-            other_live_worker = any(
-                candidate is not node and not candidate.shutting_down
-                for candidate in self.nodes
-            )
-            if owns_persistent_process and not persistent_retirement_in_flight:
-                if not other_live_worker:
+            if self._persistent_processes.get(node):
+                if self._another_worker_can_accept_work(
+                    node
+                ) or self._another_worker_will_make_progress(node):
+                    return
+                if not self._retire_best_resource_worker():
                     raise pytest.UsageError(
                         "all remaining work requires a new session process, but no "
                         "worker is available to replace the current session owner; "
                         "increase --e2e-process-slots or run without xdist"
                     )
-                self._retiring_nodes.add(node)
-                node.shutdown()
             return
         if pending == 1:
-            # A lightweight worker with one queued item can wait for a process
-            # slot: assigning it the newly eligible unit will also unblock its
-            # current item. Do not discard every clean successor while a
-            # session owner is draining. If a persistent reservation is the
-            # blocker, start rotating that owner now.
-            if not self._workload_uses_process(
-                self.assigned_work[node]
-            ) and not self._persistent_processes.get(node):
-                transient_release_pending = any(
-                    candidate is not node
-                    and self._workload_uses_transient_process(workload)
-                    for candidate, workload in self.assigned_work.items()
-                )
-                persistent_owners = [
-                    candidate
-                    for candidate in self.nodes
-                    if candidate is not node
-                    and not candidate.shutting_down
-                    and self._persistent_processes.get(candidate)
-                ]
-                owner_can_continue = any(
-                    self._next_eligible_scope(candidate) is not None
-                    for candidate in persistent_owners
-                )
-                if transient_release_pending or owner_can_continue:
-                    return
-                persistent_retirement_in_flight = any(
-                    self._persistent_processes.get(candidate)
-                    for candidate in self._retiring_nodes
-                )
-                if not persistent_retirement_in_flight:
-                    persistent_owner = next(iter(persistent_owners), None)
-                    if persistent_owner is not None:
-                        self._retiring_nodes.add(persistent_owner)
-                        persistent_owner.shutdown()
+            # A one-item worker can wait when another worker will produce an
+            # event or accept queued work. Otherwise rotate the resource worker
+            # that unlocks the most work, while retaining one live successor to
+            # receive the follow-up assignment that unblocks its current item.
+            if self._another_worker_can_accept_work(
+                node
+            ) or self._another_worker_will_make_progress(node):
                 return
-            self._retiring_nodes.add(node)
-            node.shutdown()
+            if self._retire_best_resource_worker():
+                return
+            raise pytest.UsageError(
+                "all remaining work requires another process slot, but no worker "
+                "is available to release or replace the current process owner; "
+                "increase --e2e-process-slots or run without xdist"
+            )
 
     def mark_test_complete(
         self,
