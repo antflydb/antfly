@@ -649,6 +649,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 cancellation,
                 .build_budget_exceeded,
                 graph_metric_limits,
+                .{},
             );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_declaration.artifact)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
@@ -669,6 +670,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                         cancellation,
                         .build_budget_exceeded,
                         graph_metric_limits,
+                        .{},
                     ),
                     else => return err,
                 };
@@ -683,6 +685,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 graph_metric_limits,
                 &graph_metric_budget,
                 &prepared_graph.?,
+                .{},
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,
@@ -693,6 +696,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                     cancellation,
                     .build_budget_exceeded,
                     graph_metric_limits,
+                    .{},
                 ),
                 else => return err,
             };
@@ -1996,6 +2000,10 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_artifact.ArtifactR
         .artifact_id = artifact_id,
         .byte_len = artifact.byte_len,
         .checksum = checksum,
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
     };
 }
 

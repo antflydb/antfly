@@ -37,6 +37,12 @@ pub const ArtifactRef = struct {
     artifact_id: []const u8,
     byte_len: u64,
     checksum: []const u8,
+    /// Optional artifact-specific metadata schema version. Zero means the
+    /// producing manifest predates persisted provenance.
+    metadata_version: u16 = 0,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    computed_at_ms: u64 = 0,
 };
 
 test "manifest artifact kinds include lake-native artifacts" {

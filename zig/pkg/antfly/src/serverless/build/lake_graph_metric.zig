@@ -30,6 +30,12 @@ const graph_metric_policy = @import("graph_metric_policy.zig");
 
 pub const Limits = graph_metric_policy.Limits;
 
+pub const Provenance = struct {
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    computed_at_ms: u64 = 0,
+};
+
 pub const BuildOptions = struct {
     graph_index_name: []const u8,
     config: graph_mod.GraphMetricConfig,
@@ -37,6 +43,7 @@ pub const BuildOptions = struct {
     cancellation: CancellationToken = .none,
     limits: Limits = .{},
     batch_budget: ?*graph_metric_policy.Budget = null,
+    provenance: Provenance = .{},
 };
 
 pub const BuildResult = struct {
@@ -99,7 +106,17 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
     errdefer alloc.free(artifact_id);
     const checksum = try alloc.dupe(u8, metadata.checksum);
-    return .{ .kind = .graph_metric_segment, .name = name, .artifact_id = artifact_id, .byte_len = metadata.byte_len, .checksum = checksum };
+    return .{
+        .kind = .graph_metric_segment,
+        .name = name,
+        .artifact_id = artifact_id,
+        .byte_len = metadata.byte_len,
+        .checksum = checksum,
+        .metadata_version = built.artifact.metadata_version,
+        .published_generation = built.artifact.published_generation,
+        .edge_generation = built.artifact.edge_generation,
+        .computed_at_ms = built.artifact.computed_at_ms,
+    };
 }
 
 /// Builds a metric only from bytes verified against the immutable graph
@@ -177,6 +194,7 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
         limits,
         batch_budget,
         &prepared,
+        .{},
     );
 }
 
@@ -225,6 +243,7 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
     limits: Limits,
     batch_budget: *graph_metric_policy.Budget,
     prepared: *const PreparedGraphArtifact,
+    provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
@@ -254,11 +273,12 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
                 .cancellation = cancellation,
                 .limits = limits,
                 .batch_budget = batch_budget,
+                .provenance = provenance,
             }, configs[pair_index]) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => {
-                    refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, .build_budget_exceeded, limits);
+                    refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, .build_budget_exceeded, limits, provenance);
                     initialized[i] = true;
-                    refs[pair_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, configs[pair_index], cancellation, .build_budget_exceeded, limits);
+                    refs[pair_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, configs[pair_index], cancellation, .build_budget_exceeded, limits, provenance);
                     initialized[pair_index] = true;
                     processed[i] = true;
                     processed[pair_index] = true;
@@ -282,9 +302,10 @@ pub fn publishManyFromPreparedGraphWithBudgetAlloc(
             .cancellation = cancellation,
             .limits = limits,
             .batch_budget = batch_budget,
+            .provenance = provenance,
         }) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => {
-                refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, .build_budget_exceeded, limits);
+                refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, .build_budget_exceeded, limits, provenance);
                 initialized[i] = true;
                 processed[i] = true;
                 continue;
@@ -328,6 +349,10 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
         .artifact_id = artifact_id,
         .byte_len = metadata.byte_len,
         .checksum = try alloc.dupe(u8, metadata.checksum),
+        .metadata_version = built.artifact.metadata_version,
+        .published_generation = built.artifact.published_generation,
+        .edge_generation = built.artifact.edge_generation,
+        .computed_at_ms = built.artifact.computed_at_ms,
     };
 }
 
@@ -353,6 +378,7 @@ pub fn publishRejectedManyAlloc(
     cancellation: CancellationToken,
     reason: metric_segment.RejectionReason,
     limits: Limits,
+    provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
     try graph_metric_policy.validateConfigs(configs, limits);
     const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
@@ -363,7 +389,7 @@ pub fn publishRejectedManyAlloc(
     }
     for (configs, 0..) |config, i| {
         try cancellation.check();
-        refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, reason, limits);
+        refs[i] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, config, cancellation, reason, limits, provenance);
         initialized += 1;
     }
     return refs;
@@ -378,9 +404,10 @@ fn publishRejectedAlloc(
     cancellation: CancellationToken,
     reason: metric_segment.RejectionReason,
     limits: Limits,
+    provenance: Provenance,
 ) !artifact_ref.ArtifactRef {
     try cancellation.check();
-    var segment = try rejectedSegmentAlloc(alloc, graph_index_name, source_graph, config, reason, limits);
+    var segment = try rejectedSegmentAlloc(alloc, graph_index_name, source_graph, config, reason, limits, provenance);
     defer segment.deinit(alloc);
     const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, cancellation);
     defer alloc.free(payload);
@@ -397,6 +424,10 @@ fn publishRejectedAlloc(
         .artifact_id = artifact_id,
         .byte_len = metadata.byte_len,
         .checksum = checksum,
+        .metadata_version = metric_segment.wire_version,
+        .published_generation = provenance.published_generation,
+        .edge_generation = provenance.edge_generation,
+        .computed_at_ms = provenance.computed_at_ms,
     };
 }
 
@@ -407,6 +438,7 @@ fn rejectedSegmentAlloc(
     config: graph_mod.GraphMetricConfig,
     reason: metric_segment.RejectionReason,
     limits: Limits,
+    provenance: Provenance,
 ) !metric_segment.Segment {
     const owned_graph_index_name = try alloc.dupe(u8, graph_index_name);
     errdefer alloc.free(owned_graph_index_name);
@@ -428,6 +460,9 @@ fn rejectedSegmentAlloc(
         .source_graph_checksum = owned_source_graph_checksum,
         .config_fingerprint = configFingerprint(config),
         .materializer_fingerprint = graph_metric_policy.materializerFingerprint(limits),
+        .published_generation = provenance.published_generation,
+        .edge_generation = provenance.edge_generation,
+        .computed_at_ms = provenance.computed_at_ms,
         .materialization_state = .rejected,
         .rejection_reason = reason,
         .edge_filter = edge_filter,
@@ -622,7 +657,17 @@ fn encodeMetricResultAlloc(
     const artifact_id = try std.fmt.allocPrint(alloc, "lake-graph-metric:{d}:{s}:{d}", .{ name.len, name, payload.len });
     errdefer alloc.free(artifact_id);
     const checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{payload.len});
-    return .{ .payload = payload, .artifact = .{ .kind = .graph_metric_segment, .name = name, .artifact_id = artifact_id, .byte_len = @intCast(payload.len), .checksum = checksum } };
+    return .{ .payload = payload, .artifact = .{
+        .kind = .graph_metric_segment,
+        .name = name,
+        .artifact_id = artifact_id,
+        .byte_len = @intCast(payload.len),
+        .checksum = checksum,
+        .metadata_version = metric_segment.wire_version,
+        .published_generation = options.provenance.published_generation,
+        .edge_generation = options.provenance.edge_generation,
+        .computed_at_ms = options.provenance.computed_at_ms,
+    } };
 }
 
 fn validateOptions(graph_payload: []const u8, options: BuildOptions) !void {
@@ -654,6 +699,9 @@ fn makeMetricSegmentAlloc(alloc: Allocator, options: BuildOptions, result: metri
         .source_graph_checksum = source_checksum,
         .config_fingerprint = configFingerprint(options.config),
         .materializer_fingerprint = graph_metric_policy.materializerFingerprint(options.limits),
+        .published_generation = options.provenance.published_generation,
+        .edge_generation = options.provenance.edge_generation,
+        .computed_at_ms = options.provenance.computed_at_ms,
         .edge_filter = edge_filter,
         .converged = result.converged,
         .iterations_completed = result.iterations_completed,
@@ -1001,6 +1049,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         shared_budget.limits,
         &shared_budget,
         &prepared,
+        .{},
     );
     defer {
         for (first_index) |ref| freeArtifactRef(alloc, ref);
@@ -1016,6 +1065,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         shared_budget.limits,
         &shared_budget,
         &prepared,
+        .{},
     );
     defer {
         for (second_index) |ref| freeArtifactRef(alloc, ref);

@@ -21,7 +21,7 @@ const manifest_types = @import("types.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 13;
+pub const wire_version: u16 = 14;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -145,7 +145,7 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 }
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
-    return 1 + 4 + 4 + 8 + 4 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+    return 1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
 fn publishedSearchSourceEncodedSize(source: search_sources.SearchSourceDescriptor) usize {
@@ -335,6 +335,14 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         pos += 8;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(artifact.checksum.len), .little);
         pos += 4;
+        std.mem.writeInt(u16, buf[pos..][0..2], artifact.metadata_version, .little);
+        pos += 2;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.published_generation, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.edge_generation, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.computed_at_ms, .little);
+        pos += 8;
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
         pos += artifact.name.len;
         @memcpy(buf[pos..][0..artifact.artifact_id.len], artifact.artifact_id);
@@ -410,7 +418,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != 13 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -742,7 +750,12 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     }
 
     for (0..artifact_count) |idx| {
-        const min_artifact_header_len: usize = if (version >= 9) 1 + 4 + 4 + 8 + 4 else 1 + 4 + 8 + 4;
+        const min_artifact_header_len: usize = if (version >= 14)
+            1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8
+        else if (version >= 9)
+            1 + 4 + 4 + 8 + 4
+        else
+            1 + 4 + 8 + 4;
         if (pos + min_artifact_header_len > data.len) return error.InvalidManifest;
         const kind = std.enums.fromInt(manifest_types.ArtifactKind, data[pos]) orelse return error.InvalidManifest;
         pos += 1;
@@ -757,6 +770,26 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         pos += 8;
         const checksum_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
+        const metadata_version = if (version >= 14) blk: {
+            const value = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            break :blk value;
+        } else 0;
+        const published_generation = if (version >= 14) blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        } else 0;
+        const edge_generation = if (version >= 14) blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        } else 0;
+        const computed_at_ms = if (version >= 14) blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        } else 0;
 
         if (pos + name_len + artifact_id_len + checksum_len > data.len) return error.InvalidManifest;
         const name = if (name_len > 0) try alloc.dupe(u8, data[pos .. pos + name_len]) else &.{};
@@ -774,6 +807,10 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .artifact_id = artifact_id,
             .byte_len = byte_len,
             .checksum = checksum,
+            .metadata_version = metadata_version,
+            .published_generation = published_generation,
+            .edge_generation = edge_generation,
+            .computed_at_ms = computed_at_ms,
         };
         initialized += 1;
     }
@@ -1007,6 +1044,10 @@ test "serverless manifest codec round-trips deterministically" {
         .artifact_id = try alloc.dupe(u8, "metric-0001"),
         .byte_len = 256,
         .checksum = try alloc.dupe(u8, "sha256:metric"),
+        .metadata_version = 4,
+        .published_generation = 40,
+        .edge_generation = 39,
+        .computed_at_ms = 123,
     };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
@@ -1035,14 +1076,37 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(manifest_types.ArtifactKind.sparse_segment, decoded.artifacts[2].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded.artifacts[4].kind);
+    try std.testing.expectEqual(@as(u16, 4), decoded.artifacts[4].metadata_version);
+    try std.testing.expectEqual(@as(u64, 40), decoded.artifacts[4].published_generation);
+    try std.testing.expectEqual(@as(u64, 39), decoded.artifacts[4].edge_generation);
+    try std.testing.expectEqual(@as(u64, 123), decoded.artifacts[4].computed_at_ms);
 
-    // v13 only adds an artifact tag; the v12 layout remains readable.
-    const encoded_v12 = try alloc.dupe(u8, encoded_a);
-    defer alloc.free(encoded_v12);
-    std.mem.writeInt(u16, encoded_v12[4..6], 12, .little);
-    var decoded_v12 = try decodeAlloc(alloc, encoded_v12);
-    defer decoded_v12.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 5), decoded_v12.artifacts.len);
+    // v14 adds fixed provenance fields per artifact; compact them out to
+    // exercise the still-supported v13 layout.
+    const provenance_bytes: usize = 2 + 8 + 8 + 8;
+    var current_artifact_bytes: usize = 0;
+    for (manifest.artifacts) |artifact| current_artifact_bytes += artifactEncodedSize(artifact);
+    const prefix_len = encoded_a.len - current_artifact_bytes;
+    const encoded_v13 = try alloc.alloc(u8, encoded_a.len - provenance_bytes * manifest.artifacts.len);
+    defer alloc.free(encoded_v13);
+    @memcpy(encoded_v13[0..prefix_len], encoded_a[0..prefix_len]);
+    var src_pos = prefix_len;
+    var dst_pos = prefix_len;
+    const artifact_header_bytes: usize = 1 + 4 + 4 + 8 + 4;
+    for (manifest.artifacts) |artifact| {
+        @memcpy(encoded_v13[dst_pos..][0..artifact_header_bytes], encoded_a[src_pos..][0..artifact_header_bytes]);
+        src_pos += artifact_header_bytes + provenance_bytes;
+        dst_pos += artifact_header_bytes;
+        const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+        @memcpy(encoded_v13[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);
+        src_pos += payload_len;
+        dst_pos += payload_len;
+    }
+    std.mem.writeInt(u16, encoded_v13[4..6], 13, .little);
+    var decoded_v13 = try decodeAlloc(alloc, encoded_v13);
+    defer decoded_v13.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), decoded_v13.artifacts.len);
+    try std.testing.expectEqual(@as(u16, 0), decoded_v13.artifacts[4].metadata_version);
 }
 
 test "serverless manifest codec round-trips optional lake base source" {

@@ -27,6 +27,10 @@ pub const PublishedArtifact = struct {
     byte_len: u64,
     checksum: []const u8,
     name: []const u8 = &.{},
+    metadata_version: u16 = 0,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    computed_at_ms: u64 = 0,
 };
 
 pub const Plan = struct {
@@ -189,6 +193,10 @@ fn cloneArtifactRef(
         .artifact_id = try alloc.dupe(u8, artifact.artifact_id),
         .byte_len = artifact.byte_len,
         .checksum = try alloc.dupe(u8, artifact.checksum),
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
     };
 }
 
@@ -210,6 +218,10 @@ fn cloneAppendedArtifactsAlloc(
             .byte_len = artifact.byte_len,
             .checksum = artifact.checksum,
             .name = artifact.name,
+            .metadata_version = artifact.metadata_version,
+            .published_generation = artifact.published_generation,
+            .edge_generation = artifact.edge_generation,
+            .computed_at_ms = artifact.computed_at_ms,
         });
         initialized += 1;
     }
@@ -219,6 +231,10 @@ fn cloneAppendedArtifactsAlloc(
             .byte_len = artifact.byte_len,
             .checksum = artifact.checksum,
             .name = artifact.name,
+            .metadata_version = artifact.metadata_version,
+            .published_generation = artifact.published_generation,
+            .edge_generation = artifact.edge_generation,
+            .computed_at_ms = artifact.computed_at_ms,
         });
         initialized += 1;
     }

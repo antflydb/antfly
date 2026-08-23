@@ -767,7 +767,7 @@ pub const Client = struct {
         if (stat.size <= multipart_threshold) {
             const body = try alloc.alloc(u8, @intCast(stat.size));
             defer alloc.free(body);
-            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            try client_mod.readPositionalAllWithCancellation(source, io, body, opts.cancellation);
             var extra: [1]u8 = undefined;
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);

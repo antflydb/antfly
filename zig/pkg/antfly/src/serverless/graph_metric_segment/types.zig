@@ -40,6 +40,9 @@ pub const RejectionReason = enum(u8) {
 /// was computed. Scores are sorted by node id for deterministic encoding and
 /// binary-search point lookups without a per-request hash table.
 pub const Segment = struct {
+    /// Wire schema observed while decoding. Producers leave this at zero; the
+    /// codec stamps the emitted version on read.
+    metadata_version: u16 = 0,
     graph_index_name: []u8,
     metric_name: []u8,
     kind: graph_mod.GraphMetricKind,
@@ -50,6 +53,14 @@ pub const Segment = struct {
     /// artifact. A changed runtime policy invalidates terminal rejections and
     /// safely causes a rebuild without user configuration churn.
     materializer_fingerprint: u64 = 0,
+    /// Serving generation that first published this immutable metric. These
+    /// remain stable when a later manifest reuses the artifact.
+    published_generation: u64 = 0,
+    /// Graph/source generation evaluated by the materializer.
+    edge_generation: u64 = 0,
+    /// Wall-clock completion time in Unix epoch milliseconds. Zero denotes an
+    /// older artifact whose provenance predates this field.
+    computed_at_ms: u64 = 0,
     materialization_state: MaterializationState = .ready,
     rejection_reason: RejectionReason = .none,
     edge_filter: graph_mod.GraphMetricEdgeFilter,

@@ -82,14 +82,7 @@ pub const Client = struct {
         if (stat.size > fallback_upload_limit_bytes) return error.StreamingUploadUnsupported;
         const body = try self.allocator.alloc(u8, @intCast(stat.size));
         defer self.allocator.free(body);
-        const cancellation_chunk_bytes = 1024 * 1024;
-        var copied: usize = 0;
-        while (copied < body.len) {
-            if (opts.cancellation) |token| try token.check();
-            const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
-            if (try file.readPositionalAll(io, body[copied..][0..chunk_len], copied) != chunk_len) return error.SourceFileChanged;
-            copied += chunk_len;
-        }
+        try readPositionalAllWithCancellation(file, io, body, opts.cancellation);
         var extra: [1]u8 = undefined;
         if (try file.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
         return try self.putObject(bucket, key, body, opts);
@@ -211,6 +204,60 @@ pub const Client = struct {
 
 fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
+}
+
+/// Reads a stable file snapshot with bounded cancellation latency. Provider
+/// implementations share this path so their non-multipart uploads cannot hide
+/// a long local read behind one cancellation checkpoint.
+pub fn readPositionalAllWithCancellation(
+    file: std.Io.File,
+    io: std.Io,
+    body: []u8,
+    cancellation: ?types.CancellationToken,
+) !void {
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < body.len) {
+        if (cancellation) |token| try token.check();
+        const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
+        if (try file.readPositionalAll(io, body[copied..][0..chunk_len], copied) != chunk_len) return error.SourceFileChanged;
+        copied += chunk_len;
+    }
+    if (cancellation) |token| try token.check();
+}
+
+test "objectstore file reads observe cancellation between bounded chunks" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-objectstore-cancel-read-{d}", .{uniqueNs(io)});
+    defer alloc.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    const source_bytes = try alloc.alloc(u8, 3 * 1024 * 1024);
+    defer alloc.free(source_bytes);
+    @memset(source_bytes, 0x5a);
+    {
+        var output = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        defer output.close(io);
+        try output.writePositionalAll(io, source_bytes, 0);
+    }
+    const source = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer source.close(io);
+    const body = try alloc.alloc(u8, source_bytes.len);
+    defer alloc.free(body);
+    @memset(body, 0);
+    const State = struct {
+        calls: usize = 0,
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var state = State{};
+    const cancellation = types.CancellationToken{ .ptr = &state, .is_cancelled_fn = State.cancelled };
+    try std.testing.expectError(error.Canceled, readPositionalAllWithCancellation(source, io, body, cancellation));
+    try std.testing.expectEqual(@as(u8, 0x5a), body[0]);
+    try std.testing.expectEqual(@as(u8, 0), body[1024 * 1024]);
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {

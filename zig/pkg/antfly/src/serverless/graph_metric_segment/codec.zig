@@ -536,7 +536,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
     if (version >= 4) {
         try validateRoutingFooter(data, pos, scores, cancellation);
     } else if (pos != data.len) return error.InvalidGraphMetricSegment;
-    var segment = types.Segment{ .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
+    var segment = types.Segment{ .metadata_version = version, .graph_index_name = graph_name, .metric_name = metric_name, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
     try validateSegmentWithCancellation(segment, cancellation);
     return segment;

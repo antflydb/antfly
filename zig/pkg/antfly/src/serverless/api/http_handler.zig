@@ -2958,13 +2958,16 @@ pub const HttpHandler = struct {
             const metric_name = try self.alloc.dupe(u8, named.query.metric_name);
             errdefer self.alloc.free(metric_name);
             var status = try self.graphMetricStatusAlloc(
-                session,
                 named.query.metric_name,
                 metric.config_fingerprint,
                 metric.edge_filter,
                 metric.converged,
                 metric.iterations_completed,
                 metric.delta,
+                metric.metadata_version,
+                metric.published_generation,
+                metric.edge_generation,
+                metric.computed_at_ms,
             );
             errdefer status.deinit(self.alloc);
             results[i] = .{
@@ -3014,7 +3017,7 @@ pub const HttpHandler = struct {
         for (dependency_names[0..dependency_count], 0..) |metric_name, i| {
             var point_scores = try query_mod.graphMetricScoresAlloc(self.alloc, session, query.index_name, metric_name, node_ids);
             defer point_scores.deinit(self.alloc);
-            statuses[i] = try self.graphMetricStatusAlloc(session, metric_name, point_scores.config_fingerprint, point_scores.edge_filter, point_scores.converged, point_scores.iterations_completed, point_scores.delta);
+            statuses[i] = try self.graphMetricStatusAlloc(metric_name, point_scores.config_fingerprint, point_scores.edge_filter, point_scores.converged, point_scores.iterations_completed, point_scores.delta, point_scores.metadata_version, point_scores.published_generation, point_scores.edge_generation, point_scores.computed_at_ms);
             initialized_statuses += 1;
             for (result.nodes, point_scores.scores) |*node, score| {
                 node.metrics[i] = .{ .name = statuses[i].name, .score = score, .name_owned = false };
@@ -3216,7 +3219,7 @@ pub const HttpHandler = struct {
                 .metric_weight = rerank.weight,
                 .missing_score_used = metric_score == null,
                 .final_score = final_score,
-                .published_generation = session.manifest.version,
+                .published_generation = metric.published_generation,
             };
             hit.score = final_score;
         }
@@ -3229,25 +3232,31 @@ pub const HttpHandler = struct {
             }
         }.lessThan);
         return try self.graphMetricStatusAlloc(
-            session,
             rerank.metric_name,
             metric.config_fingerprint,
             metric.edge_filter,
             metric.converged,
             metric.iterations_completed,
             metric.delta,
+            metric.metadata_version,
+            metric.published_generation,
+            metric.edge_generation,
+            metric.computed_at_ms,
         );
     }
 
     fn graphMetricStatusAlloc(
         self: *HttpHandler,
-        session: *const query_mod.QuerySession,
         metric_name: []const u8,
         config_fingerprint: u64,
         edge_filter: graph_mod.GraphMetricEdgeFilter,
         converged: bool,
         iterations_completed: u32,
         delta: f64,
+        metadata_version: u16,
+        published_generation: u64,
+        edge_generation: u64,
+        computed_at_ms: u64,
     ) !db_types.GraphMetricStatus {
         const name = try self.alloc.dupe(u8, metric_name);
         errdefer self.alloc.free(name);
@@ -3257,16 +3266,16 @@ pub const HttpHandler = struct {
             .state = .fresh,
             .phase = .complete,
             .edge_filter = owned_filter,
-            .metadata_version = @import("../graph_metric_segment/mod.zig").wire_version,
+            .metadata_version = metadata_version,
             .config_fingerprint = config_fingerprint,
-            .published_generation = session.manifest.version,
-            .edge_generation = session.manifest.version,
-            .target_edge_generation = session.manifest.version,
+            .published_generation = published_generation,
+            .edge_generation = edge_generation,
+            .target_edge_generation = edge_generation,
             .progress = 1,
             .converged = converged,
             .iterations_completed = iterations_completed,
             .delta = delta,
-            .computed_at_ms = @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+            .computed_at_ms = computed_at_ms,
         };
     }
 

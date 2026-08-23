@@ -120,6 +120,10 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
         .artifact_id = artifact_id,
         .byte_len = artifact.byte_len,
         .checksum = checksum,
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
     };
 }
 

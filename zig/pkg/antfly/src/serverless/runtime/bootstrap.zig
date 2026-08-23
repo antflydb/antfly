@@ -406,6 +406,7 @@ pub const OwnedStack = struct {
         errdefer self.catalog_store.deinit();
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
+        self.builder.setIo(io);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
         self.external_source_object_store_resolver = .{};
         self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);

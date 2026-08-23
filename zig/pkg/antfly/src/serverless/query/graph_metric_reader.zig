@@ -25,6 +25,8 @@ const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const cache_mod = @import("cache.zig");
 const runtime_mod = @import("runtime.zig");
+const artifacts_mod = @import("../artifacts/mod.zig");
+const manifest_mod = @import("../manifest/mod.zig");
 
 pub const Limits = struct {
     max_top_k: usize = 100_000,
@@ -91,6 +93,10 @@ pub const Result = struct {
     iterations_completed: u32,
     delta: f64,
     edge_filter: graph_mod.GraphMetricEdgeFilter,
+    metadata_version: u16,
+    published_generation: u64,
+    edge_generation: u64,
+    computed_at_ms: u64,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
         for (self.scores) |*score| score.deinit(alloc);
@@ -107,6 +113,10 @@ pub const PointScoresResult = struct {
     iterations_completed: u32,
     delta: f64,
     edge_filter: graph_mod.GraphMetricEdgeFilter,
+    metadata_version: u16,
+    published_generation: u64,
+    edge_generation: u64,
+    computed_at_ms: u64,
 
     pub fn deinit(self: *PointScoresResult, alloc: Allocator) void {
         alloc.free(self.scores);
@@ -117,6 +127,9 @@ pub const PointScoresResult = struct {
 
 const BorrowedScore = struct { node_id: []const u8, value: f64 };
 const TopQueue = std.PriorityQueue(BorrowedScore, void, compareWorstFirst);
+const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
+const max_score_range_requests: usize = 32;
+const coalesced_score_window_bytes: u64 = 8 * 1024 * 1024;
 
 pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_id: []const u8) !?Score {
     const node_ids = [_][]const u8{node_id};
@@ -151,6 +164,11 @@ pub fn scoresAlloc(
     defer alloc.free(artifact_name);
     const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name) orelse return error.MetricNotReady;
     const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
+
+    // Authenticate the immutable payload before trusting independently cached
+    // ranges. S3 can satisfy this from native SHA-256 metadata; filesystem and
+    // other providers retain bounded identity caches after the first digest.
+    try session.verifyArtifact(metric_index);
 
     const control_len = try metric_segment.controlProbeLen(
         metric_artifact.byte_len,
@@ -190,6 +208,10 @@ pub fn scoresAlloc(
             .iterations_completed = segment.iterations_completed,
             .delta = segment.delta,
             .edge_filter = edge_filter,
+            .metadata_version = control.header.version,
+            .published_generation = segment.published_generation,
+            .edge_generation = segment.edge_generation,
+            .computed_at_ms = segment.computed_at_ms,
         };
     }
 
@@ -225,39 +247,54 @@ pub fn scoresAlloc(
     const values = try alloc.alloc(?f64, node_ids.len);
     errdefer alloc.free(values);
     @memset(values, null);
-    const block_for_node = try alloc.alloc(?usize, node_ids.len);
-    defer alloc.free(block_for_node);
-    const needed = try alloc.alloc(bool, routing.entries.len);
-    defer alloc.free(needed);
-    @memset(needed, false);
-    for (node_ids, 0..) |node_id, i| {
-        const block_index = routing.findIndex(node_id);
-        block_for_node[i] = block_index;
-        if (block_index) |index| needed[index] = true;
-    }
-    for (routing.entries, 0..) |entry, block_index| {
-        if (!needed[block_index]) continue;
+    const block_counts = try alloc.alloc(usize, routing.entries.len);
+    defer alloc.free(block_counts);
+    @memset(block_counts, 0);
+    var grouped_count: usize = 0;
+    for (node_ids) |node_id| if (routing.findIndex(node_id)) |block_index| {
+        block_counts[block_index] += 1;
+        grouped_count += 1;
+    };
+    const block_offsets = try alloc.alloc(usize, routing.entries.len + 1);
+    defer alloc.free(block_offsets);
+    block_offsets[0] = 0;
+    for (block_counts, 0..) |count, block_index| block_offsets[block_index + 1] = block_offsets[block_index] + count;
+    const grouped_node_indexes = try alloc.alloc(usize, grouped_count);
+    defer alloc.free(grouped_node_indexes);
+    const cursors = try alloc.dupe(usize, block_offsets[0..routing.entries.len]);
+    defer alloc.free(cursors);
+    for (node_ids, 0..) |node_id, node_index| if (routing.findIndex(node_id)) |block_index| {
+        grouped_node_indexes[cursors[block_index]] = node_index;
+        cursors[block_index] += 1;
+    };
+
+    const fetch_ranges = try planScoreFetchRangesAlloc(alloc, routing.entries, block_counts, control.score_data_offset);
+    defer alloc.free(fetch_ranges);
+
+    for (fetch_ranges) |range| {
         try session.checkCancellation();
-        const block = try session.fetchArtifactBlockRangeAlloc(
-            metric_index,
-            cache_mod.graph_metric_score_block_id,
-            entry.offset,
-            entry.len,
-        );
-        defer alloc.free(block);
-        const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(block, session.cancellation);
-        const expected_score_count = if (block_index + 1 < routing.entries.len)
-            metric_segment.score_block_entries
-        else
-            @as(usize, control.score_count) - block_index * metric_segment.score_block_entries;
-        if (decoded_block.len != expected_score_count or
-            !std.mem.eql(u8, decoded_block.scores[0].node_id, entry.first_node_id))
-        {
-            return error.InvalidGraphMetricSegment;
-        }
-        for (node_ids, block_for_node, 0..) |node_id, maybe_block_index, node_index| {
-            if (maybe_block_index != block_index) continue;
-            values[node_index] = decoded_block.score(node_id);
+        const payload = try session.fetchArtifactBlockRangeAlloc(metric_index, cache_mod.graph_metric_score_block_id, range.offset, range.len);
+        defer alloc.free(payload);
+        for (range.first_block..range.last_block + 1) |block_index| {
+            if (block_counts[block_index] == 0) continue;
+            const entry = routing.entries[block_index];
+            if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;
+            const relative_offset = std.math.cast(usize, entry.offset - range.offset) orelse return error.InvalidGraphMetricSegment;
+            const relative_end = std.math.add(usize, relative_offset, entry.len) catch return error.InvalidGraphMetricSegment;
+            if (relative_end > payload.len) return error.InvalidGraphMetricSegment;
+            const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(payload[relative_offset..relative_end], session.cancellation);
+            const expected_score_count = if (block_index + 1 < routing.entries.len)
+                metric_segment.score_block_entries
+            else
+                @as(usize, control.score_count) - block_index * metric_segment.score_block_entries;
+            if (decoded_block.len != expected_score_count or
+                !std.mem.eql(u8, decoded_block.scores[0].node_id, entry.first_node_id))
+            {
+                return error.InvalidGraphMetricSegment;
+            }
+            for (grouped_node_indexes[block_offsets[block_index]..block_offsets[block_index + 1]]) |node_index| {
+                values[node_index] = decoded_block.score(node_ids[node_index]);
+            }
         }
     }
     var edge_filter = try config.edge_filter.cloneAlloc(alloc);
@@ -269,7 +306,48 @@ pub fn scoresAlloc(
         .iterations_completed = control.header.iterations_completed,
         .delta = control.header.delta,
         .edge_filter = edge_filter,
+        .metadata_version = if (metric_artifact.metadata_version != 0) metric_artifact.metadata_version else control.header.version,
+        .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
+        .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
+        .computed_at_ms = if (metric_artifact.metadata_version != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
     };
+}
+
+fn planScoreFetchRangesAlloc(
+    alloc: Allocator,
+    entries: []const metric_segment.codec.RoutingEntry,
+    block_counts: []const usize,
+    score_data_offset: u64,
+) ![]ScoreFetchRange {
+    if (entries.len != block_counts.len) return error.InvalidGraphMetricSegment;
+    var ranges = std.ArrayListUnmanaged(ScoreFetchRange).empty;
+    errdefer ranges.deinit(alloc);
+    var touched_blocks: usize = 0;
+    for (block_counts) |count| touched_blocks += @intFromBool(count != 0);
+    if (touched_blocks <= max_score_range_requests) {
+        for (entries, block_counts, 0..) |entry, count, block_index| {
+            if (count == 0) continue;
+            try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
+        }
+    } else {
+        var active_window: ?u64 = null;
+        for (entries, block_counts, 0..) |entry, count, block_index| {
+            if (count == 0) continue;
+            if (entry.offset < score_data_offset) return error.InvalidGraphMetricSegment;
+            const window = (entry.offset - score_data_offset) / coalesced_score_window_bytes;
+            if (active_window == null or active_window.? != window) {
+                try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
+                active_window = window;
+            } else {
+                const range = &ranges.items[ranges.items.len - 1];
+                const entry_end = std.math.add(u64, entry.offset, entry.len) catch return error.InvalidGraphMetricSegment;
+                range.last_block = block_index;
+                range.len = std.math.cast(usize, entry_end - range.offset) orelse return error.GraphMetricQueryBudgetExceeded;
+            }
+        }
+    }
+    if (ranges.items.len > max_score_range_requests) return error.GraphMetricQueryBudgetExceeded;
+    return try ranges.toOwnedSlice(alloc);
 }
 
 pub fn openAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8) !metric_segment.Segment {
@@ -313,7 +391,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
         scores[i] = .{ .node_id = try alloc.dupe(u8, item.node_id), .value = item.value };
         initialized += 1;
     }
-    return .{ .scores = scores, .config_fingerprint = loaded.config_fingerprint, .converged = loaded.converged, .iterations_completed = loaded.iterations_completed, .delta = loaded.delta, .edge_filter = edge_filter };
+    return .{ .scores = scores, .config_fingerprint = loaded.config_fingerprint, .converged = loaded.converged, .iterations_completed = loaded.iterations_completed, .delta = loaded.delta, .edge_filter = edge_filter, .metadata_version = loaded.metadata_version, .published_generation = loaded.published_generation, .edge_generation = loaded.edge_generation, .computed_at_ms = loaded.computed_at_ms };
 }
 
 fn findConfig(
@@ -363,6 +441,11 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     defer alloc.free(payload);
     var segment = try metric_segment.decodeAllocWithCancellation(alloc, payload, session.cancellation);
     errdefer segment.deinit(alloc);
+    const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
+    segment.metadata_version = if (metric_artifact.metadata_version != 0) metric_artifact.metadata_version else segment.metadata_version;
+    segment.published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version;
+    segment.edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version;
+    segment.computed_at_ms = if (metric_artifact.metadata_version != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms);
     if (!std.mem.eql(u8, segment.graph_index_name, graph_index_name) or !std.mem.eql(u8, segment.metric_name, metric_name)) return error.InvalidGraphMetricSegment;
     if (segment.kind != config.kind or segment.config_fingerprint != lake_graph_metric.configFingerprint(config) or
         !segment.edge_filter.equivalent(config.edge_filter)) return error.MetricStale;
@@ -376,6 +459,98 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
         .none => error.InvalidGraphMetricSegment,
     };
     return segment;
+}
+
+test "serverless graph metric range planning caps broad point batches" {
+    const alloc = std.testing.allocator;
+    var entries: [64]metric_segment.codec.RoutingEntry = undefined;
+    var counts: [64]usize = @splat(1);
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .first_node_id = "node",
+        .offset = index * (4 * 1024 * 1024),
+        .len = 1024,
+    };
+    const broad = try planScoreFetchRangesAlloc(alloc, &entries, &counts, 0);
+    defer alloc.free(broad);
+    try std.testing.expectEqual(max_score_range_requests, broad.len);
+    for (broad) |range| try std.testing.expectEqual(@as(usize, 2), range.last_block - range.first_block + 1);
+
+    @memset(&counts, 0);
+    counts[0] = 1;
+    counts[counts.len - 1] = 1;
+    const sparse = try planScoreFetchRangesAlloc(alloc, &entries, &counts, 0);
+    defer alloc.free(sparse);
+    try std.testing.expectEqual(@as(usize, 2), sparse.len);
+    try std.testing.expectEqual(@as(usize, 1024), sparse[0].len);
+    try std.testing.expectEqual(@as(usize, 1024), sparse[1].len);
+}
+
+test "serverless graph metric point reads authenticate before fetching ranges" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        verify_calls: usize = 0,
+        range_calls: usize = 0,
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedPut;
+        }
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFullRead;
+        }
+        fn getRangeAlloc(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_calls += 1;
+            return error.UnexpectedRangeRead;
+        }
+        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedStat;
+        }
+        fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.verify_calls += 1;
+            return error.ArtifactIntegrityMismatch;
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedDelete;
+        }
+
+        const vtable = artifacts_mod.ArtifactStore.VTable{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = getAlloc,
+            .get_range_alloc = getRangeAlloc,
+            .stat = stat,
+            .verify_content = verifyContent,
+            .delete = delete,
+        };
+    };
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    var state = State{};
+    var artifacts = artifacts_mod.ArtifactStore{ .allocator = alloc, .ptr = &state, .vtable = &State.vtable };
+    defer artifacts.deinit();
+    var refs = [_]manifest_mod.ArtifactRef{
+        .{ .kind = .graph_segment, .name = "graph_idx", .artifact_id = artifact_id, .byte_len = 1, .checksum = checksum },
+        .{ .kind = .graph_metric_segment, .name = "9:graph_idx4:rank", .artifact_id = artifact_id, .byte_len = 100, .checksum = checksum },
+    };
+    var session = runtime_mod.QuerySession{
+        .alloc = alloc,
+        .artifacts = &artifacts,
+        .manifest = .{
+            .namespace = "docs",
+            .version = 1,
+            .built_at_ns = 1,
+            .wal_start_lsn = 1,
+            .wal_end_lsn = 1,
+            .stats = .{ .indexes_json = @constCast("{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}") },
+            .artifacts = &refs,
+        },
+    };
+    const node_ids = [_][]const u8{"node"};
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
+    try std.testing.expectEqual(@as(usize, 1), state.verify_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.range_calls);
 }
 
 fn scoreOrder(a: BorrowedScore, b: BorrowedScore) std.math.Order {
