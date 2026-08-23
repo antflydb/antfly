@@ -7294,6 +7294,38 @@ pub const DB = struct {
 
     const retired_index_artifact_repair_cleanup_page_size: usize = 64;
 
+    const RetiredArtifactRepairIssueKeyParse = union(enum) {
+        valid: internal_keys.ArtifactRepairIssueKeyParts,
+        malformed: anyerror,
+    };
+
+    fn parseRetiredArtifactRepairIssueKeyAlloc(
+        alloc: Allocator,
+        key: []const u8,
+    ) !RetiredArtifactRepairIssueKeyParse {
+        const parts = internal_keys.artifactRepairIssueKeyPartsAlloc(alloc, key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidInternalUserKey => return .{ .malformed = err },
+        };
+        return .{ .valid = parts };
+    }
+
+    const RetiredArtifactRepairIssueValueDecode = union(enum) {
+        valid: types.ArtifactRepairIssue,
+        malformed: anyerror,
+    };
+
+    fn decodeRetiredArtifactRepairIssueAlloc(
+        alloc: Allocator,
+        raw: []const u8,
+    ) !RetiredArtifactRepairIssueValueDecode {
+        const issue = decodeArtifactRepairIssueValueAlloc(alloc, raw) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .malformed = err },
+        };
+        return .{ .valid = issue };
+    }
+
     fn drainRetiredIndexArtifactRepairIssuesPageContext(
         ctx: *AsyncContext,
         index_name: []const u8,
@@ -7399,12 +7431,15 @@ pub const DB = struct {
             const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(ctx.alloc, row.key);
             try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, generation_key);
 
-            var parts = internal_keys.artifactRepairIssueKeyPartsAlloc(ctx.alloc, row.key) catch |err| {
-                std.log.warn("retired index cleanup removed malformed artifact repair key index={s} err={s}", .{
-                    index_name,
-                    @errorName(err),
-                });
-                continue;
+            var parts = switch (try parseRetiredArtifactRepairIssueKeyAlloc(ctx.alloc, row.key)) {
+                .valid => |value| value,
+                .malformed => |err| {
+                    std.log.warn("retired index cleanup removed malformed artifact repair key index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    continue;
+                },
             };
             defer parts.deinit(ctx.alloc);
             if (!std.mem.eql(u8, parts.index_name, index_name)) return error.InvalidInternalUserKey;
@@ -7418,13 +7453,16 @@ pub const DB = struct {
             try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, kind_key);
 
             var issue_valid = true;
-            var issue = decodeArtifactRepairIssueValueAlloc(ctx.alloc, row.value) catch |err| issue: {
-                issue_valid = false;
-                std.log.warn("retired index cleanup removed malformed artifact repair issue index={s} err={s}", .{
-                    index_name,
-                    @errorName(err),
-                });
-                break :issue types.ArtifactRepairIssue{};
+            var issue = switch (try decodeRetiredArtifactRepairIssueAlloc(ctx.alloc, row.value)) {
+                .valid => |value| value,
+                .malformed => |err| issue: {
+                    issue_valid = false;
+                    std.log.warn("retired index cleanup removed malformed artifact repair issue index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    break :issue types.ArtifactRepairIssue{};
+                },
             };
             defer if (issue_valid) issue.deinit(ctx.alloc);
             if (issue_valid) {
@@ -37374,27 +37412,29 @@ fn decodeArtifactRepairIssueValueAlloc(alloc: Allocator, raw: []const u8) !types
     const kind = std.meta.stringToEnum(types.ArtifactRepairKind, Fields.string(obj, "artifact_kind")) orelse .embedding;
     const reason = std.meta.stringToEnum(types.ArtifactRepairReason, Fields.string(obj, "reason")) orelse .missing_artifact;
     const default_repairable = artifactRepairKindHasAutomatedReprocessor(kind);
-    return .{
+    var issue = types.ArtifactRepairIssue{
         .artifact_kind = kind,
-        .index_name = try alloc.dupe(u8, Fields.string(obj, "index_name")),
-        .doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key")),
-        .parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key")),
-        .unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id")),
-        .source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name")),
-        .artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name")),
-        .artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key")),
         .chunk_id = Fields.optionalU32(obj, "chunk_id"),
         .repairable = Fields.boolValue(obj, "repairable", default_repairable),
-        .unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason")),
         .sequence = Fields.u64Value(obj, "sequence"),
         .reason = reason,
         .generation_attempts = Fields.u64Value(obj, "generation_attempts"),
-        .generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error")),
         .attempts = Fields.u64Value(obj, "attempts"),
         .first_seen_ns = Fields.u64Value(obj, "first_seen_ns"),
         .last_seen_ns = Fields.u64Value(obj, "last_seen_ns"),
-        .last_error = try alloc.dupe(u8, Fields.string(obj, "last_error")),
     };
+    errdefer issue.deinit(alloc);
+    issue.index_name = try alloc.dupe(u8, Fields.string(obj, "index_name"));
+    issue.doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key"));
+    issue.parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key"));
+    issue.unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id"));
+    issue.source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name"));
+    issue.artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name"));
+    issue.artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key"));
+    issue.unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason"));
+    issue.generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error"));
+    issue.last_error = try alloc.dupe(u8, Fields.string(obj, "last_error"));
+    return issue;
 }
 
 fn loadArtifactRepairIssueFromStoreByKey(
@@ -59953,6 +59993,68 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     try std.testing.expect(stats.indexes[0].repair_summary_ready);
     try std.testing.expect(!stats.indexes[0].repair_degraded);
     try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].repair_issue_count);
+}
+
+test "retired repair cleanup propagates allocation failures from durable metadata parsing" {
+    const alloc = std.testing.allocator;
+    const issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = "retired_index",
+        .doc_key = "doc:retired",
+        .artifact_name = "retired_index",
+        .artifact_key = "retired-physical-artifact",
+        .reason = .enrichment_failed,
+    };
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const encoded_issue = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+    defer alloc.free(encoded_issue);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, key: []const u8) !void {
+                var parsed = try DB.parseRetiredArtifactRepairIssueKeyAlloc(failing_alloc, key);
+                switch (parsed) {
+                    .valid => |*parts| parts.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueKey,
+                }
+            }
+        }.run,
+        .{issue_key},
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, raw: []const u8) !void {
+                var decoded = try DB.decodeRetiredArtifactRepairIssueAlloc(failing_alloc, raw);
+                switch (decoded) {
+                    .valid => |*value| value.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueValue,
+                }
+            }
+        }.run,
+        .{encoded_issue},
+    );
+
+    const malformed_key = try DB.parseRetiredArtifactRepairIssueKeyAlloc(alloc, "not-an-internal-key");
+    switch (malformed_key) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueKey;
+        },
+        .malformed => {},
+    }
+    const malformed_value = try DB.decodeRetiredArtifactRepairIssueAlloc(alloc, "{");
+    switch (malformed_value) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueValue;
+        },
+        .malformed => {},
+    }
 }
 
 test "retired repair cleanup resumes marker retirement and removes corrupt sidecars after reopen" {
