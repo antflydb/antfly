@@ -2000,6 +2000,10 @@ const RunBatchIndexState = struct {
     block_index: ?usize = null,
     block_handle: ?cache_mod.Handle = null,
     block_has_values: bool = false,
+    // The first lookup in a prefix-compressed block materializes only that
+    // entry. A second lookup in the same block promotes it to the decoded
+    // block cache so dense adjacent batches retain their amortized path.
+    direct_prefix_block_index: ?usize = null,
 
     fn deinit(self: *@This()) void {
         self.handle.release();
@@ -2993,7 +2997,12 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     result.add(chunk_result);
                     offset = end;
                 }
-                try self.ownValues(values);
+                // A stable probe has no mutable or live-immutable sources.
+                // Run-backed results are already retained by held_blocks (or
+                // owned in held_values when the block cache cannot lend a
+                // view), and the captured run generation remains pinned until
+                // abort. Copying every hit again here only duplicates large
+                // point-read payloads such as dense-vector artifacts.
             } else {
                 const resolved = try self.metadata_allocator.alloc(bool, keys.len);
                 defer self.metadata_allocator.free(resolved);
@@ -5491,13 +5500,34 @@ fn findExactEntryInBatchBlocks(
         backend.recordBloomNegative();
         return null;
     }
-    // A single point lookup can search a prefix-compressed physical block
-    // without retaining its decoded form. Repeating that work for every key
-    // in a batch is much more expensive than decoding the block once. Keep
-    // the decoded block in this run's batch state and reuse it until sorted
-    // iteration advances to another block.
-    _ = held_values;
-    _ = value_allocator;
+    const window = index.blockWindow(block_index);
+    switch (window.compression) {
+        .prefix, .prefix_snappy => {
+            if (state.block_index != block_index and state.direct_prefix_block_index != block_index) {
+                // Sparse exact-rerank batches typically touch one large value
+                // per 32 KiB table block. Decoding and pinning the entire block
+                // creates roughly 10x read/copy amplification. Materialize the
+                // first entry directly from the physical prefix block. If the
+                // next sorted key lands in the same block, promote on demand.
+                try state.transferBlock(backend.allocator, held_blocks);
+                state.direct_prefix_block_index = block_index;
+                return try findExactEntryInCachedCompressedPrefixBlock(
+                    backend,
+                    run,
+                    index,
+                    block_index,
+                    held_values,
+                    value_allocator,
+                    namespace,
+                    key,
+                );
+            }
+            if (state.direct_prefix_block_index == block_index) {
+                state.direct_prefix_block_index = null;
+            }
+        },
+        .none, .snappy => {},
+    }
     const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
     const positioned = try lsm_table_file.findExactEntryInBlock(
         index,

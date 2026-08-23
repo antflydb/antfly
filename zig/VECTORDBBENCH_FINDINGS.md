@@ -1292,6 +1292,144 @@ immutable deltas and materialize/cache a value on first access. More frequent
 full rewrites would reduce disk but give back the load-time and RSS gains this
 experiment was designed to obtain.
 
+## Whole-HBC native query qualification and competitor target
+
+The complete native HBC format now owns topology, quantized payloads, postings,
+vector-to-leaf mappings, metadata, WAL replay, generation publication, and the
+covered source sequence. A compacted 1M generation is approximately 251 MB and
+restart mounts it directly; dedicated HBC LSM runs are no longer required. The
+primary document/artifact LSM remains authoritative for exact source embeddings.
+Its settled 1M layout had 16 runs (three L0 and thirteen lower-level runs), so
+the former 825-L0-run compaction-debt failure is not present in this result.
+
+The first complete-format 1M load was not a performance win: 1,897.67 seconds
+of insertion plus 17.50 seconds of catch-up, 1,915.17 seconds total. The native
+checkpoint itself is cheap; foreground source insertion and derived mutation
+publication now dominate. The data directory occupied approximately 3.5 GiB,
+including about 3.07 GB of irreducible float32 payload for one million 768-D
+vectors. A final design cannot beat the roughly 3.15 GB Elasticsearch disk
+result by adding another per-index exact-vector plane. Exact artifacts need one
+shared table-level vector-block authority, or an exact reconstructible encoding,
+before the duplicate primary artifact rows can be removed safely.
+
+At search effort 0.45, the original policy produced 0.9628 recall and 0.9668
+NDCG. A representative serial run was 24.6/53.8/65.4 ms p50/p95/p99 and peaked
+at 349.5 QPS, but host contention makes absolute comparisons provisional. The
+deterministic work profile is the more important result: the resolved width was
+1,097 leaves, with about 130,000 quantized vectors scored per typical query and
+hundreds of exact boundary candidates. Primary exact-artifact reads dominated
+cold and tail latency.
+
+Moving exact rerank batches from broad snapshot transactions to current-tip
+point probes removes their mutable-state clone/rotation path. Shared-cache batch
+admission is epoch guarded so a concurrent update cannot resurrect stale vector
+bytes, and stable run-backed probe values remain pinned rather than being copied
+a second time. The first query-only memory sample peaked at 2.25 GB attributable
+demand and 1.54 GB RSS. After a full serial plus concurrent cache warmup, the
+same process peaked at 2.56 GB demand and 1.24 GB RSS; approximately 716 MB of
+that warm state was retained exact vectors in the HBC heap cache. This is bounded
+but is not the desired steady-state architecture: a shared mmap vector-block
+store should make those pages reclaimable and eliminate the second heap copy.
+
+Pruning calibration exposed a sharp but useful quality knee on the full 1,000
+query ground-truth set:
+
+| epsilon | recall | NDCG | serial p50 | serial p95 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.19 | 0.3882 | 0.4101 | 3.2 ms | 86.1 ms |
+| 0.70 | 0.9253 | 0.9319 | 56.2 ms | 146.6 ms |
+| 0.90 | 0.9527 | 0.9574 | 46.3 ms | 103.2 ms |
+| 0.95 | 0.9548 | 0.9593 | 39.2 ms | 86.8 ms |
+| 0.97 | 0.9556 | 0.9602 | 40.7 ms | 97.9 ms |
+
+Only the quality numbers are comparable across this sweep; unrelated builds
+changed CPU and IO availability between runs. Epsilon 0.97 clears Circus's
+0.955 calibration target, but a 100-query work sample still visited a mean of
+1,014 leaves (p50 and p95 both at the 1,097 hard cap) and scored 119,734
+quantized vectors on average. Lowering epsilon alone therefore gives away recall
+without removing enough hard-query work and must not become a benchmark-specific
+default. The production improvement is confidence-aware routing backed by stored
+cluster bounds and better cluster quality, with the width retained only as a
+safety cap.
+
+The current Circus 1M comparison target is deliberately Pareto-oriented. At
+recall at or above 0.955, first beat pgvector's 731.8 QPS, keep p95 below the
+low-teens Chroma/Weaviate range, reduce attributable demand toward Elasticsearch's
+2.06 GB, and reduce disk toward its 3.15 GB. Elasticsearch and Milvus publish
+3,104.7 and 3,813.0 QPS respectively, so they remain the throughput stretch
+target after the shared exact-vector read path and routing work are complete.
+
+The public batch-100 qualification is an online incremental build, not a
+recursive offline build. The VectorDBBench adapter creates the external dense
+index before loading, then sends 10,000 ordinary public batch requests for the
+1M case. Antfly's empty-index bulk path does select the balanced recursive
+builder when a single derived bulk-ingest window contains at least 1,024
+vectors, and production backfill/import can reach that path. That does not make
+it valid to label the existing online run recursive: its lifecycle must remain
+the apples-to-apples Circus score. A recursive backfill/import result should be
+reported separately, including its build time, recall, restart behavior, and
+steady-state footprint.
+
+A subsequent public-API qualification removed per-candidate shared-cache lock
+and refcount traffic by scoring a complete rerank batch under one shared cache
+lease. The exact cosine and invalidation/epoch invariants remain unchanged. On
+the preserved 1M generation, the default public request resolved to width 2,048
+and epsilon 1.45; a warmed 100-query diagnostic measured 13.9 ms mean, 10.5 ms
+p50, and 35.2 ms p95 while scoring approximately 240,000 quantized vectors and
+450 exact vectors per query. Cache-hit distance work was only 0.2--0.3 ms even
+on the slow tail, so routing and cache misses—not lease bookkeeping—now dominate.
+
+Under the current host load, the full public harness scaled from 107.1 QPS at
+C5 to 264.6 QPS at C10 and 265.0 QPS at C20, then fell to 227.2 QPS at C30.
+These are diagnostic rather than publication numbers because another Zig build
+was active. C40 exceeded the server's 32-request admission envelope and returned
+429, so the run was stopped rather than recording invalid higher-concurrency
+points. A live C30 sample used roughly 780% CPU and a 307 MB HBC cache: 141 MB
+quantized topology plus 130 MB for 41,273 exact vectors. This validates the next
+A/B: scan the small flat block-quantized leaf-centroid directory before selected
+posting reads, then replace cold primary artifact point reads with a shared,
+versioned mmap vector plane.
+
+The flat RaBitQ centroid directory did not beat the hierarchy and is rejected as
+the production default. It reached 0.9600 recall on the 200-query calibration
+set at effort 0.47, but the full 1,000-query run scored roughly 167,625 centroid
+candidates and 433 exact candidates per query for 0.95626 recall, 84.27 ms mean,
+and 178.2 ms p95 under the then-current host load. The hierarchical directory
+reached comparable quality with materially less deterministic work. Keeping the
+flat selector is useful only as an explicit experimental A/B surface.
+
+The adaptive primary exact-read path avoids decoding and pinning an entire
+prefix-compressed table block when a sorted rerank batch touches only one large
+artifact in that block. A second key in the same block promotes it to the
+decoded-block path, preserving adjacent-batch amortization. Stable probes own
+directly reconstructed values and pin decoded blocks and the run generation, so
+this optimization changes copy amplification rather than visibility semantics.
+
+With that path and the original boundary-rerank policy, the lowest public
+`search_effort` that cleared both Circus gates on this generation was 0.437:
+0.95625 recall on the 200-query calibration set and 0.95021 on the disjoint
+800-query held-out set. The held-out sequential diagnostic averaged 6.37 ms with
+8.09 ms p95 while visiting about 927 leaves, scoring 109,618 quantized vectors,
+and reranking 431 exact vectors per query. Effort 0.436 cleared calibration but
+fell to 0.94934 held-out recall and is therefore invalid.
+
+At effort 0.45, the normal C1/C5/C10/C20/C30 sequence produced
+148.3/602.9/505.7/460.9/420.5 QPS, with C1 and C5 p95 of 7.78 and 9.53 ms. A
+heavily warmed effort-0.437 C5 diagnostic reached 670.7 QPS at 8.64 ms p95.
+These results beat the published Antfly and Chroma throughput figures while
+holding recall, but they do not yet beat pgvector's 731.8 QPS and are not
+publication numbers: other Zig builds were active, and the 0.437 C5 run began
+with a larger exact-vector cache than a fresh Circus lifecycle.
+
+Two follow-up routing shortcuts were rejected. Reducing the approximate
+candidate window from nine to eight times `k` only barely held the recall floor
+and did not improve C5 throughput. A metric-ball A/B using each leaf's exact
+centroid radius pruned no meaningful payload work because these online HBC
+partitions overlap too broadly. The radius code was removed rather than leaving
+an extra query-to-centroid pass. Faster routing therefore requires better
+partition geometry, controlled boundary replication, or a tighter second-level
+posting directory—not another benchmark-specific effort constant.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1353,3 +1491,14 @@ published.
    chain. Preserve source-journal retention, atomic generation leases, and
    boundary rerank while testing indexed patch-native or chunked-copy-on-write
    deltas and cheaper WAL-generation rotation.
+9. Store metric-correct cluster radii (or an equivalent conservative lower
+   bound) in native node records and stop when the next subtree cannot improve
+   the current candidate boundary. Keep the leaf-width policy as a hard safety
+   cap, disable bound pruning for inner product until it has a proven contract,
+   and requalify across 50K/1M plus at least one non-Cohere dataset.
+10. Replace retained per-index exact-vector heap copies with one table-level,
+    versioned mmap vector-block store shared by every index using an embedding
+    artifact. Its WAL/delta publication must carry source sequence and artifact
+    revision, and HBC query leases must request the matching revision so an old
+    topology generation cannot score a newly overwritten vector. Do not add a
+    second 3.07 GB per-index float32 plane as the final implementation.

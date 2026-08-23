@@ -806,6 +806,33 @@ pub const Cache = struct {
         return null;
     }
 
+    fn scoreVectorsBatch(
+        self: *Cache,
+        namespace: u64,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        metric: vec.DistanceMetric,
+        distances: []f32,
+        missing_positions: []usize,
+    ) !usize {
+        if (distances.len < vector_ids.len or missing_positions.len < vector_ids.len) return error.InvalidArgument;
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        var missing_count: usize = 0;
+        for (vector_ids, 0..) |vector_id, position| {
+            const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
+            const entry = self.vector_cache.get(key) orelse {
+                missing_positions[missing_count] = position;
+                missing_count += 1;
+                continue;
+            };
+            if (entry.vector.len != query.len) return error.InvalidVectorDimensions;
+            distances[position] = vec.distanceToQuery(query, query_measure, entry.vector, metric);
+        }
+        return missing_count;
+    }
+
     pub fn getMetadata(self: *Cache, namespace: u64, vector_id: u64) ?[]const u8 {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
@@ -917,9 +944,17 @@ pub const Cache = struct {
     pub fn cacheVector(self: *Cache, namespace: u64, vector_id: u64, vector_data: []const f32) ![]const f32 {
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
+        return try self.cacheVectorLocked(namespace, vector_id, vector_data, false);
+    }
+
+    fn cacheVectorLocked(self: *Cache, namespace: u64, vector_id: u64, vector_data: []const f32, keep_existing: bool) ![]const f32 {
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
+        // A vector id is immutable until its mutation path invalidates this
+        // namespace entry. Concurrent rerank batches commonly discover the
+        // same miss together; keep the first admitted copy instead of turning
+        // that harmless race into allocation and CLOCK churn.
         if (self.vector_cache.get(key)) |existing| {
-            if (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len) return existing.vector;
+            if (keep_existing or (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len)) return existing.vector;
         }
         _ = self.removeVectorLocked(key, false);
         const bytes = estimateVectorCacheBytes(vector_data);
@@ -937,6 +972,33 @@ pub const Cache = struct {
         try self.vector_cache.put(self.alloc, key, entry);
         self.finishInsertLocked(.vector, key, bytes, admission);
         return self.vector_cache.get(key).?.vector;
+    }
+
+    fn cacheVectorsAtPositions(
+        self: *Cache,
+        namespace: u64,
+        vector_ids: []const u64,
+        positions: []const usize,
+        vectors: []const []const f32,
+    ) void {
+        std.debug.assert(positions.len == vectors.len);
+        // Copying a large rerank batch under one exclusive cache lock creates
+        // a convoy: unrelated cache hits cannot borrow their already-retained
+        // vectors until every allocation and possible CLOCK eviction finishes.
+        // Keep admission amortized, but bound each critical section to a small
+        // amount of vector data so concurrent queries make progress.
+        const lock_chunk_entries = 16;
+        var start: usize = 0;
+        while (start < positions.len) {
+            const end = @min(start + lock_chunk_entries, positions.len);
+            self.mutex.lockExclusive();
+            for (positions[start..end], vectors[start..end]) |position, vector_data| {
+                if (position >= vector_ids.len or vector_data.len == 0) continue;
+                _ = self.cacheVectorLocked(namespace, vector_ids[position], vector_data, true) catch continue;
+            }
+            self.mutex.unlockExclusive();
+            start = end;
+        }
     }
 
     pub fn cacheMetadata(self: *Cache, namespace: u64, vector_id: u64, metadata: []const u8) ![]const u8 {
@@ -2179,6 +2241,11 @@ pub const HBCIndex = struct {
     bypass_external_vector_cache: bool = false,
     cache_mu: apply_rw_lock_mod.ApplyRwLock,
     active_searches: std.atomic.Value(u32),
+    // Invalidations advance this epoch before touching the shared cache. A
+    // rerank batch can therefore admit vectors read from one primary snapshot
+    // with a single cache lock without repopulating an entry invalidated by a
+    // concurrent update.
+    vector_cache_epoch: std.atomic.Value(u64),
     hbc_cache_bytes_accounted: u64 = 0,
     search_workspace_bytes_accounted: u64 = 0,
     routing_scratch_bytes_accounted: u64 = 0,
@@ -2218,6 +2285,7 @@ pub const HBCIndex = struct {
     pub const ExternalVectorBatchDistanceScratch = struct {
         artifact_keys: [][]const u8,
         raw_values: []?[]const u8,
+        vector_views: [][]const f32,
     };
     pub const ExternalVectorBatchDistanceLoader = *const fn (
         ctx: *anyopaque,
@@ -2986,6 +3054,7 @@ pub const HBCIndex = struct {
             .retained_vector_cache_enabled = true,
             .cache_mu = .{},
             .active_searches = .init(0),
+            .vector_cache_epoch = .init(1),
             .hbc_cache_bytes_accounted = 0,
             .search_workspace_bytes_accounted = 0,
             .routing_scratch_bytes_accounted = 0,
@@ -6528,6 +6597,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn invalidateVectorCache(self: *HBCIndex, vector_id: u64) void {
+        _ = self.vector_cache_epoch.fetchAdd(1, .acq_rel);
         if (self.shared_cache) |cache| {
             cache.invalidateVector(self.cache_namespace, vector_id);
             return;
@@ -6700,6 +6770,48 @@ pub const HBCIndex = struct {
         if (self.lsmSessionBatchingActive()) return vector_data;
         if (self.active_searches.load(.acquire) > 1) return vector_data;
         return try self.cacheVectorRetained(vector_id, vector_data);
+    }
+
+    pub fn vectorCacheEpoch(self: *const HBCIndex) u64 {
+        return self.vector_cache_epoch.load(.acquire);
+    }
+
+    /// Batch-admit exact vectors discovered by one rerank read. Shared caches
+    /// are synchronized and resource bounded, so they remain safe under query
+    /// concurrency; local caches retain the historical single-search guard.
+    /// If an update invalidates any vector while the primary snapshot is being
+    /// read, discard the entire batch rather than publish mixed-generation
+    /// entries.
+    pub fn cacheVectorsAtPositionsIfEpoch(
+        self: *HBCIndex,
+        vector_ids: []const u64,
+        positions: []const usize,
+        vectors: []const []const f32,
+        observed_epoch: u64,
+    ) void {
+        if (!self.cache_enabled or !self.retained_vector_cache_enabled or self.bypass_external_vector_cache) return;
+        if (positions.len != vectors.len) return;
+        if (self.vector_cache_epoch.load(.acquire) != observed_epoch) return;
+        if (self.shared_cache) |cache| {
+            if (self.config.max_cached_vectors == 0) return;
+            cache.cacheVectorsAtPositions(self.cache_namespace, vector_ids, positions, vectors);
+            if (self.vector_cache_epoch.load(.acquire) != observed_epoch) {
+                for (positions) |position| {
+                    if (position < vector_ids.len) cache.invalidateVector(self.cache_namespace, vector_ids[position]);
+                }
+            }
+            return;
+        }
+        if (self.active_searches.load(.acquire) > 1) return;
+        for (positions, vectors) |position, vector_data| {
+            if (position >= vector_ids.len or vector_data.len == 0) continue;
+            _ = self.cacheVectorRetained(vector_ids[position], vector_data) catch continue;
+        }
+        if (self.vector_cache_epoch.load(.acquire) != observed_epoch) {
+            for (positions) |position| {
+                if (position < vector_ids.len) self.invalidateVectorCache(vector_ids[position]);
+            }
+        }
     }
 
     pub fn cacheVectorForWarmup(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
@@ -6913,6 +7025,51 @@ pub const HBCIndex = struct {
         }
         self.cache_mu.unlockShared();
         return null;
+    }
+
+    /// Score all retained exact-vector hits under one cache generation lease
+    /// and return the positions that still require external point reads. This
+    /// avoids hundreds of lock/refcount round trips in a boundary rerank while
+    /// preserving the same exclusive-lock invalidation boundary.
+    pub fn scoreCachedVectorsBatch(
+        self: *HBCIndex,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        metric: vec.DistanceMetric,
+        distances: []f32,
+        missing_positions: []usize,
+    ) !usize {
+        if (distances.len < vector_ids.len or missing_positions.len < vector_ids.len) return error.InvalidArgument;
+        if (!self.cache_enabled or !self.retained_vector_cache_enabled or self.bypass_external_vector_cache) {
+            for (vector_ids, 0..) |_, position| missing_positions[position] = position;
+            return vector_ids.len;
+        }
+        if (self.shared_cache) |cache| {
+            return try cache.scoreVectorsBatch(
+                self.cache_namespace,
+                vector_ids,
+                query,
+                query_measure,
+                metric,
+                distances,
+                missing_positions,
+            );
+        }
+
+        self.cache_mu.lockShared();
+        defer self.cache_mu.unlockShared();
+        var missing_count: usize = 0;
+        for (vector_ids, 0..) |vector_id, position| {
+            const entry = self.vector_cache.get(vector_id) orelse {
+                missing_positions[missing_count] = position;
+                missing_count += 1;
+                continue;
+            };
+            if (entry.vector.len != query.len) return error.InvalidVectorDimensions;
+            distances[position] = vec.distanceToQuery(query, query_measure, entry.vector, metric);
+        }
+        return missing_count;
     }
 
     pub fn borrowCachedMetadata(self: *HBCIndex, vector_id: u64) ?BorrowedMetadata {
@@ -8046,6 +8203,7 @@ pub const HBCIndex = struct {
         distances: []f32,
         vector_id_storage: []u64,
         metadata_storage: []?[]const u8,
+        vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
         key_views_storage: [][]const u8,
         values_storage: []?[]const u8,
@@ -8057,6 +8215,7 @@ pub const HBCIndex = struct {
         if (distances.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (metadata_storage.len < rerank_positions.len) return error.InvalidArgument;
+        if (vector_view_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (rerank_positions.len == 0) return true;
 
         const vector_ids = vector_id_storage[0..rerank_positions.len];
@@ -8089,6 +8248,7 @@ pub const HBCIndex = struct {
             .{
                 .artifact_keys = key_views_storage,
                 .raw_values = values_storage,
+                .vector_views = vector_view_storage,
             },
             profile,
         ) catch |err| switch (err) {
@@ -8106,6 +8266,7 @@ pub const HBCIndex = struct {
         query_measure: f32,
         distances: []f32,
         metadata_storage: []?[]const u8,
+        vector_view_storage: [][]const f32,
         lookup_storage: []FixedKeyLookup,
         key_views_storage: [][]const u8,
         values_storage: []?[]const u8,
@@ -8115,6 +8276,7 @@ pub const HBCIndex = struct {
         const ctx = self.external_vector_ctx orelse return false;
         if (distances.len < vector_ids.len) return error.InvalidArgument;
         if (metadata_storage.len < vector_ids.len) return error.InvalidArgument;
+        if (vector_view_storage.len < vector_ids.len) return error.InvalidArgument;
         if (vector_ids.len == 0) return true;
 
         for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
@@ -8140,6 +8302,7 @@ pub const HBCIndex = struct {
             .{
                 .artifact_keys = key_views_storage,
                 .raw_values = values_storage,
+                .vector_views = vector_view_storage,
             },
             null,
         ) catch |err| switch (err) {
@@ -9864,6 +10027,102 @@ test "hbc metadata cache remains active when vector cache capacity is zero" {
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
     try std.testing.expect(idx.hbcCacheStats().metadata.used_bytes > 0);
     try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
+}
+
+test "hbc shared vector cache batch admission is concurrent and epoch guarded" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+    idx.setRetainedVectorCacheEnabled(true);
+
+    idx.active_searches.store(2, .release);
+    defer idx.active_searches.store(0, .release);
+
+    const vector_ids = [_]u64{ 11, 12, 13 };
+    const positions = [_]usize{ 0, 2 };
+    const vectors = [_][]const f32{
+        &.{ 1.0, 2.0, 3.0, 4.0 },
+        &.{ 9.0, 10.0, 11.0, 12.0 },
+    };
+    const epoch = idx.vectorCacheEpoch();
+    idx.cacheVectorsAtPositionsIfEpoch(&vector_ids, &positions, &vectors, epoch);
+
+    try std.testing.expectEqualSlices(f32, vectors[0], idx.getCachedVector(11).?);
+    try std.testing.expectEqual(@as(?[]const f32, null), idx.getCachedVector(12));
+    try std.testing.expectEqualSlices(f32, vectors[1], idx.getCachedVector(13).?);
+
+    // Mutation invalidation advances the epoch before removing an entry. A
+    // batch decoded from the preceding primary snapshot must not repopulate it.
+    idx.invalidateVectorCache(12);
+    const stale_positions = [_]usize{1};
+    const stale_vectors = [_][]const f32{&.{ 5.0, 6.0, 7.0, 8.0 }};
+    idx.cacheVectorsAtPositionsIfEpoch(&vector_ids, &stale_positions, &stale_vectors, epoch);
+    try std.testing.expectEqual(@as(?[]const f32, null), idx.getCachedVector(12));
+    try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
+}
+
+test "hbc shared vector cache batch scoring returns exact hits and misses" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+    idx.setRetainedVectorCacheEnabled(true);
+
+    _ = try idx.cacheVector(11, &.{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try idx.cacheVector(13, &.{ 0.0, 1.0, 0.0, 0.0 });
+    const vector_ids = [_]u64{ 11, 12, 13 };
+    const query = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    var distances = [_]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+    var missing_positions: [vector_ids.len]usize = undefined;
+
+    const missing_count = try idx.scoreCachedVectorsBatch(
+        &vector_ids,
+        &query,
+        vec.dot(&query, &query),
+        .l2_squared,
+        &distances,
+        &missing_positions,
+    );
+    try std.testing.expectEqual(@as(usize, 1), missing_count);
+    try std.testing.expectEqual(@as(usize, 1), missing_positions[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), distances[0], 1e-6);
+    try std.testing.expect(std.math.isInf(distances[1]));
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), distances[2], 1e-6);
+
+    idx.invalidateVectorCache(11);
+    distances = [_]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+    const invalidated_missing_count = try idx.scoreCachedVectorsBatch(
+        &vector_ids,
+        &query,
+        vec.dot(&query, &query),
+        .l2_squared,
+        &distances,
+        &missing_positions,
+    );
+    try std.testing.expectEqual(@as(usize, 2), invalidated_missing_count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, missing_positions[0..invalidated_missing_count]);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), distances[2], 1e-6);
 }
 
 test "hbc metadata cache is retained and resource managed during concurrent search" {

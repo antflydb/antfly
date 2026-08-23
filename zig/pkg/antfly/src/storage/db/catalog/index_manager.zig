@@ -15756,9 +15756,13 @@ pub const IndexManager = struct {
         if (load_session) |session| {
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
-            var runtime_store = try initRuntimeStore(manager.alloc, store);
-            defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginRead();
+            // Exact reranking is a sorted point-read workload. A broad runtime
+            // read transaction snapshots (and may clone) mutable primary LSM
+            // state that this query neither scans nor needs to retain. Probe
+            // transactions pin a stable current-tip point view and use the
+            // LSM multi-get planner without that snapshot-copy cost; LMDB maps
+            // the same contract to its cheap read-only transaction.
+            var txn = try store.beginProbeTxn();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
 
@@ -15928,6 +15932,9 @@ pub const IndexManager = struct {
         if (batch_scratch.len < dims) return error.BufferTooSmall;
         if (scratch.artifact_keys.len < vector_ids.len) return error.InvalidArgument;
         if (scratch.raw_values.len < vector_ids.len) return error.InvalidArgument;
+        if (scratch.vector_views.len < vector_ids.len) return error.InvalidArgument;
+        const required_batch_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
+        if (batch_scratch.len < required_batch_floats) return error.BufferTooSmall;
 
         const artifact_name = entry.embedding_name orelse blk: {
             if (!entry.external) return error.Unsupported;
@@ -15944,9 +15951,36 @@ pub const IndexManager = struct {
         defer key_arena.deinit();
         const key_alloc = key_arena.allocator();
         const artifact_reads = try key_alloc.alloc(DenseArtifactReadKey, vector_ids.len);
+        const missing_positions = try key_alloc.alloc(usize, vector_ids.len);
+        const vector_cache_epoch = entry.index.vectorCacheEpoch();
         var key_count: usize = 0;
-        for (metadata, 0..) |maybe_doc_key, i| {
-            if (load_session) |session| {
+        if (load_session == null) {
+            const cache_score_start = platform_time.monotonicNs();
+            const missing_count = try entry.index.scoreCachedVectorsBatch(
+                vector_ids,
+                query,
+                query_measure,
+                metric,
+                distances,
+                missing_positions,
+            );
+            if (profile) |p| {
+                const elapsed = platform_time.monotonicNs() - cache_score_start;
+                p.rerank_artifact_distance_ns += elapsed;
+                p.rerank_distance_ns += elapsed;
+            }
+            for (missing_positions[0..missing_count]) |i| {
+                const doc_key = metadata[i] orelse continue;
+                const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
+                    try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
+                else
+                    try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
+                artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+                key_count += 1;
+            }
+        } else {
+            for (metadata, 0..) |maybe_doc_key, i| {
+                const session = load_session.?;
                 if (session.getVector(vector_ids[i])) |cached| {
                     if (cached.len != dims) return error.InvalidVectorDimensions;
                     const distance_start = platform_time.monotonicNs();
@@ -15958,28 +15992,28 @@ pub const IndexManager = struct {
                     }
                     continue;
                 }
-            }
-            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
-                var handle = cached_handle;
-                defer handle.deinit();
-                const cached = handle.view();
-                if (cached.len != dims) return error.InvalidVectorDimensions;
-                const distance_start = platform_time.monotonicNs();
-                distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
-                if (profile) |p| {
-                    const elapsed = platform_time.monotonicNs() - distance_start;
-                    p.rerank_artifact_distance_ns += elapsed;
-                    p.rerank_distance_ns += elapsed;
+                if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+                    var handle = cached_handle;
+                    defer handle.deinit();
+                    const cached = handle.view();
+                    if (cached.len != dims) return error.InvalidVectorDimensions;
+                    const distance_start = platform_time.monotonicNs();
+                    distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
+                    if (profile) |p| {
+                        const elapsed = platform_time.monotonicNs() - distance_start;
+                        p.rerank_artifact_distance_ns += elapsed;
+                        p.rerank_distance_ns += elapsed;
+                    }
+                    continue;
                 }
-                continue;
+                const doc_key = maybe_doc_key orelse continue;
+                const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
+                    try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
+                else
+                    try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
+                artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+                key_count += 1;
             }
-            const doc_key = maybe_doc_key orelse continue;
-            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
-                try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
-            else
-                try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
-            artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
-            key_count += 1;
         }
         if (key_count == 0) return;
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
@@ -15989,14 +16023,16 @@ pub const IndexManager = struct {
         for (artifact_reads[0..key_count], 0..) |artifact_read, i| artifact_keys[i] = artifact_read.key;
 
         const raw_values = scratch.raw_values[0..key_count];
+        const cache_positions = try key_alloc.alloc(usize, key_count);
+        const cache_vectors = scratch.vector_views[0..key_count];
         const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
-            var runtime_store = try initRuntimeStore(manager.alloc, store);
-            defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginRead();
+            // This is a sorted point-read workload; avoid a broad primary LSM
+            // snapshot and its mutable-state clone/rotation machinery.
+            var txn = try store.beginProbeTxn();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);
             if (profile) |p| {
@@ -16014,13 +16050,15 @@ pub const IndexManager = struct {
                 }
             }
 
+            var cache_count: usize = 0;
             for (raw_values, 0..) |maybe_raw, key_index| {
                 const slot = artifact_reads[key_index].position;
                 const raw = maybe_raw orelse {
                     distances[slot] = std.math.inf(f32);
                     continue;
                 };
-                const vector_scratch = batch_scratch[0..dims];
+                const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
+                const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
                 const decode_start = platform_time.monotonicNs();
                 const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, vector_scratch) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) {
@@ -16031,7 +16069,9 @@ pub const IndexManager = struct {
                 };
                 if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
                 if (vector.len != dims) return error.InvalidVectorDimensions;
-                _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+                cache_positions[cache_count] = slot;
+                cache_vectors[cache_count] = vector;
+                cache_count += 1;
                 const distance_start = platform_time.monotonicNs();
                 distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
                 if (profile) |p| {
@@ -16040,6 +16080,12 @@ pub const IndexManager = struct {
                     p.rerank_distance_ns += elapsed;
                 }
             }
+            entry.index.cacheVectorsAtPositionsIfEpoch(
+                vector_ids,
+                cache_positions[0..cache_count],
+                cache_vectors[0..cache_count],
+                vector_cache_epoch,
+            );
             return;
         }
         if (profile) |p| {
@@ -16057,13 +16103,15 @@ pub const IndexManager = struct {
             }
         }
 
+        var cache_count: usize = 0;
         for (raw_values, 0..) |maybe_raw, key_index| {
             const slot = artifact_reads[key_index].position;
             const raw = maybe_raw orelse {
                 distances[slot] = std.math.inf(f32);
                 continue;
             };
-            const vector_scratch = batch_scratch[0..dims];
+            const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
+            const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
             const decode_start = platform_time.monotonicNs();
             const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, vector_scratch) catch |err| {
                 if (isRecoverableEmbeddingArtifactError(err)) {
@@ -16075,7 +16123,9 @@ pub const IndexManager = struct {
             if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
             if (vector.len != dims) return error.InvalidVectorDimensions;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
-            _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+            cache_positions[cache_count] = slot;
+            cache_vectors[cache_count] = vector;
+            cache_count += 1;
             const distance_start = platform_time.monotonicNs();
             distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
             if (profile) |p| {
@@ -16084,6 +16134,12 @@ pub const IndexManager = struct {
                 p.rerank_distance_ns += elapsed;
             }
         }
+        entry.index.cacheVectorsAtPositionsIfEpoch(
+            vector_ids,
+            cache_positions[0..cache_count],
+            cache_vectors[0..cache_count],
+            vector_cache_epoch,
+        );
     }
 
     fn exactStoredVectorDistance(
@@ -17466,6 +17522,13 @@ const DenseConfig = struct {
     }
 };
 
+fn defaultDenseCentroidDirectoryMode() hbc_mod.HBCConfig.CentroidDirectoryMode {
+    const raw_z = getenv("ANTFLY_HBC_CENTROID_DIRECTORY_MODE") orelse return .hbc;
+    const raw = std.mem.span(raw_z);
+    if (std.mem.eql(u8, raw, "flat_rabitq")) return .flat_rabitq;
+    return .hbc;
+}
+
 /// Returns whether rebuilding this dense projection depends on durable
 /// embedding artifacts and their authoritative coverage counter. Kept here so
 /// repair preflight and normal index open interpret the same config grammar.
@@ -17863,7 +17926,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
         .centroid_directory_mode = if (root.object.get("centroid_directory_mode")) |value|
             try parseCentroidDirectoryMode(value.string)
         else
-            .hbc,
+            defaultDenseCentroidDirectoryMode(),
         .flat_centroid_block_size = if (root.object.get("flat_centroid_block_size")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else

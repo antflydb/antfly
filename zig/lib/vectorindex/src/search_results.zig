@@ -270,6 +270,41 @@ pub const ApproxSearchResults = struct {
         }
     }
 
+    /// Admit an ordered block of approximate results with the same semantics
+    /// as repeated addApproxResult calls. Once the heap is at its hard limit,
+    /// groups whose lower bounds all exceed the current worst upper bound
+    /// cannot mutate the heap and can be rejected with one SIMD comparison.
+    /// A group containing even one possible admission is replayed in original
+    /// order so error-bound overlap and tie behavior remain unchanged.
+    pub fn addApproxResults(
+        self: *ApproxSearchResults,
+        vector_ids: []const u64,
+        distances: []const f32,
+        error_bounds: []const f32,
+    ) void {
+        std.debug.assert(vector_ids.len == distances.len);
+        std.debug.assert(vector_ids.len == error_bounds.len);
+
+        const F32x8 = @Vector(8, f32);
+        var i: usize = 0;
+        while (i < vector_ids.len) {
+            if (i + 8 <= vector_ids.len and self.items.items.len >= self.max_items) {
+                const worst = self.items.peek() orelse break;
+                const worst_upper: F32x8 = @splat(worst.distance + worst.error_bound);
+                const dist: F32x8 = distances[i..][0..8].*;
+                const error_bound: F32x8 = error_bounds[i..][0..8].*;
+                const maybe_closer = dist - error_bound <= worst_upper;
+                if (!@reduce(.Or, maybe_closer)) {
+                    i += 8;
+                    continue;
+                }
+            }
+
+            self.addApproxResult(vector_ids[i], distances[i], error_bounds[i]);
+            i += 1;
+        }
+    }
+
     pub fn sort(self: *ApproxSearchResults) void {
         std.mem.sort(ApproxSearchResult, self.items.items, {}, struct {
             fn lessThan(_: void, a: ApproxSearchResult, b: ApproxSearchResult) bool {
@@ -311,6 +346,72 @@ test "approx result heap comparator ignores vector id ties to match Go" {
             .{ .vector_id = 2, .distance = 1, .error_bound = 0 },
         ),
     );
+}
+
+test "batched approximate admission is identical to scalar admission" {
+    const vector_ids = [_]u64{
+        11, 12, 13, 14, 15, 16, 17, 18,
+        21, 22, 23, 24, 25, 26, 27, 28,
+        31, 32, 33, 34, 35, 36, 37, 38,
+    };
+    const distances = [_]f32{
+        4.0,  1.0,  8.0,  2.0,  7.0,  3.0,  6.0,  5.0,
+        20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0,
+        2.5,  9.0,  1.5,  30.0, 0.5,  4.5,  2.25, 12.0,
+    };
+    const error_bounds = [_]f32{
+        0.1, 0.2, 0.1, 0.3, 0.2, 0.1, 0.2, 0.1,
+        0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+        0.4, 0.1, 0.2, 0.1, 0.1, 0.3, 0.2, 0.1,
+    };
+
+    var scalar = try ApproxSearchResults.initCapacity(std.testing.allocator, 4, 8, 8);
+    defer scalar.deinit();
+    for (vector_ids, 0..) |vector_id, i| {
+        scalar.addApproxResult(vector_id, distances[i], error_bounds[i]);
+    }
+
+    var batched = try ApproxSearchResults.initCapacity(std.testing.allocator, 4, 8, 8);
+    defer batched.deinit();
+    batched.addApproxResults(&vector_ids, &distances, &error_bounds);
+
+    scalar.sort();
+    batched.sort();
+    try std.testing.expectEqualSlices(ApproxSearchResult, scalar.items.items, batched.items.items);
+}
+
+test "batched approximate admission preserves scalar thresholds across random blocks" {
+    const count = 513;
+    var vector_ids: [count]u64 = undefined;
+    var distances: [count]f32 = undefined;
+    var error_bounds: [count]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x4150_5052_4f58);
+    const random = prng.random();
+    for (0..count) |i| {
+        vector_ids[i] = @intCast(i + 1);
+        distances[i] = random.float(f32) * 100.0;
+        error_bounds[i] = random.float(f32) * 3.0;
+    }
+
+    for ([_]struct { k: usize, max_items: usize }{
+        .{ .k = 1, .max_items = 1 },
+        .{ .k = 10, .max_items = 80 },
+        .{ .k = 100, .max_items = 800 },
+    }) |config| {
+        var scalar = try ApproxSearchResults.initCapacity(std.testing.allocator, config.k, config.max_items, config.max_items);
+        defer scalar.deinit();
+        for (vector_ids, 0..) |vector_id, i| {
+            scalar.addApproxResult(vector_id, distances[i], error_bounds[i]);
+        }
+
+        var batched = try ApproxSearchResults.initCapacity(std.testing.allocator, config.k, config.max_items, config.max_items);
+        defer batched.deinit();
+        batched.addApproxResults(&vector_ids, &distances, &error_bounds);
+
+        scalar.sort();
+        batched.sort();
+        try std.testing.expectEqualSlices(ApproxSearchResult, scalar.items.items, batched.items.items);
+    }
 }
 
 test "fromSortedApproxSlice preserves sorted order without heap pushes" {

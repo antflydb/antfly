@@ -2408,9 +2408,12 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (!has_extra_filters) {
-                for (member_ids, 0..) |member_id, i| {
-                    if (i % 256 == 0) try search_types.checkCancelled(req);
-                    results.addApproxResult(member_id, distances[i], error_bounds[i]);
+                var batch_start: usize = 0;
+                while (batch_start < member_ids.len) {
+                    try search_types.checkCancelled(req);
+                    const batch_end = @min(batch_start + 256, member_ids.len);
+                    results.addApproxResults(member_ids[batch_start..batch_end], distances[batch_start..batch_end], error_bounds[batch_start..batch_end]);
+                    batch_start = batch_end;
                 }
             } else {
                 for (member_ids, 0..) |member_id, i| {
@@ -2464,6 +2467,7 @@ fn scoreLeafMemberIds(
             exact_query_measure,
             exact_distances,
             scratch.metadata,
+            scratch.vector_views,
             scratch.lookups,
             scratch.key_views,
             scratch.values,
@@ -2596,6 +2600,7 @@ pub fn rerankResults(
                 exact_distances,
                 scratch.vector_ids,
                 scratch.metadata,
+                scratch.vector_views,
                 scratch.lookups,
                 scratch.key_views,
                 scratch.values,

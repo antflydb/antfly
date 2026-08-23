@@ -10075,6 +10075,53 @@ test "lsm backend probe owns active mutable point values across later writes" {
     try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
 }
 
+test "lsm backend stable probe batch borrows pinned run values without recopying" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var cache = Cache.init(std.testing.allocator, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-stable-probe-batch-borrow", .{
+        .flush_threshold = 1,
+        .storage = storage.storage(),
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    const value_a = [_]u8{'a'} ** 4096;
+    const value_b = [_]u8{'b'} ** 4096;
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", &value_a);
+        try write.put("doc:b", &value_b);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    const keys = [_][]const u8{ "doc:a", "doc:b" };
+    var values = [_]?[]const u8{ null, null };
+    const before = backend.snapshotReadStats();
+    try probe.getManySorted(&keys, &values);
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
+    try std.testing.expectEqualSlices(u8, &value_b, values[1].?);
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+
+    // The probe pins the run-backed block generation, so a later replacement
+    // cannot change the views returned by the earlier batch.
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "new-a");
+        try write.commit();
+    }
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
+}
+
 test "lsm backend probe owns active mutable point values during bulk ingest" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1000,
@@ -14458,7 +14505,7 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
     try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
-test "lsm backend getManySorted decodes prefix-compressed blocks once for batch reuse" {
+test "lsm backend getManySorted promotes repeated prefix-block reads for batch reuse" {
     const alloc = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(alloc);
     defer storage.deinit();
@@ -14517,7 +14564,73 @@ test "lsm backend getManySorted decodes prefix-compressed blocks once for batch 
 
     const cache_stats = cache.snapshotStats();
     try std.testing.expect(cache_stats.run_table_block.inserts > 0);
-    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_physical_block.inserts);
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+}
+
+test "lsm backend getManySorted materializes sparse large prefix values without decoded blocks" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-batch-prefix-sparse-large-values";
+    const count = 96;
+    const stride = 4;
+    const selected_count = count / stride;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:artifact:very-long-shared-prefix:{d:0>6}:dense",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(.{ .name = "docs" }, key, large_value);
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var selected_keys: [selected_count][]const u8 = undefined;
+    for (&selected_keys, 0..) |*key, i| key.* = keys[i * stride];
+    var values: [selected_count]?[]const u8 = [_]?[]const u8{null} ** selected_count;
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, &selected_keys, &values);
+    for (values) |maybe_value| try std.testing.expectEqualSlices(u8, large_value, maybe_value.?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point + stats.get_many_sorted_plan_sorted_by_run);
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
 test "lsm backend probe getManySorted uses point path for large sparse batches" {

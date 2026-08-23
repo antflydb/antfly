@@ -10,8 +10,8 @@ usage() {
   echo "  VDBBENCH_CASE    Case name (default: Performance1536D50K)" >&2
   echo "  VDBBENCH_BATCH   Insert batch size (default: 100)" >&2
   echo "  VDBBENCH_WORKERS Load workers when supported by the checkout (default: 4)" >&2
-  echo "  VDBBENCH_CONCURRENCY  Query concurrencies (default: 1,4,16)" >&2
-  echo "  VDBBENCH_QUERY_SECONDS Seconds per concurrency (default: 10)" >&2
+  echo "  VDBBENCH_CONCURRENCY  Query concurrencies (default: 1,5,10,20,30)" >&2
+  echo "  VDBBENCH_QUERY_SECONDS Seconds per concurrency (default: 30)" >&2
   exit 2
 }
 
@@ -29,8 +29,8 @@ vdbbench_root=${VDBBENCH_ROOT:-$main_checkout/../VectorDBBench}
 vdbbench_case=${VDBBENCH_CASE:-Performance1536D50K}
 batch_size=${VDBBENCH_BATCH:-100}
 load_workers=${VDBBENCH_WORKERS:-4}
-query_concurrency=${VDBBENCH_CONCURRENCY:-1,4,16}
-query_seconds=${VDBBENCH_QUERY_SECONDS:-10}
+query_concurrency=${VDBBENCH_CONCURRENCY:-1,5,10,20,30}
+query_seconds=${VDBBENCH_QUERY_SECONDS:-30}
 sampler=${FOOTPRINT_SAMPLER:-$main_checkout/../antfly-circus/benchmarks/CRAG-harness/footprint_sampler.py}
 supports_load_concurrency=false
 supports_serial_cooldown=false
@@ -64,6 +64,33 @@ if [[ "$vdbbench_help" == *"--serial-cooldown"* ]]; then
 fi
 
 mkdir -p "$run_root/results"
+python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" <<'PY'
+import json
+import subprocess
+import sys
+
+out_path, repo_root, case_name, batch_size, workers, concurrency, query_seconds = sys.argv[1:]
+git_head = subprocess.check_output(
+    ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
+).strip()
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "git_head": git_head,
+            "case": case_name,
+            "client_batch_size": int(batch_size),
+            "load_workers_requested": int(workers),
+            "query_concurrency": concurrency,
+            "query_seconds": int(query_seconds),
+            "load_lifecycle": "public_api_online_incremental",
+            "builder": "server_selected; do not assume recursive from client batch size",
+        },
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+    handle.write("\n")
+PY
 python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
 
 server_pid=
@@ -165,7 +192,7 @@ python3 "$sampler" \
 sampler_pid=$!
 
 mark_phase live_load_and_query_start
-run_vdbbench antfly-qualification-live --drop-old --load --search-concurrent --search-serial \
+run_vdbbench antfly-qualification-online-live --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
 mark_phase live_load_and_query_end
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-before-restart.txt"
