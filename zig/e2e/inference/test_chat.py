@@ -17,6 +17,7 @@
 import json
 
 import pytest
+from .conftest import FIRST_USE_REQUEST_TIMEOUT
 from .models import default_generator_model_name
 
 pytestmark = pytest.mark.model_integration
@@ -42,6 +43,7 @@ def test_chat_basic(api):
         [{"role": "user", "content": CHAT_SMOKE_PROMPT}],
         model=model,
         max_tokens=CHAT_SMOKE_MAX_TOKENS,
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     assert isinstance(resp.get("id"), str) and resp["id"].startswith("chatcmpl-"), resp
     assert resp.get("object") == "chat.completion", resp
@@ -62,6 +64,7 @@ def test_chat_streaming(api):
         model=model,
         max_tokens=CHAT_SMOKE_MAX_TOKENS,
         stream=True,
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     body = r.text
     r.close()

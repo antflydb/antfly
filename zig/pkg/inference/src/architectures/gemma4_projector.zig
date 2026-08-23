@@ -125,6 +125,8 @@ const Geometry = struct {
 };
 
 const LoadedF32 = struct {
+    store: *tensor_store_mod.GgufStore,
+    name: []const u8,
     weight: weight_source_mod.LoadedWeight,
     converted: ?Tensor = null,
     data: []const f32,
@@ -133,6 +135,7 @@ const LoadedF32 = struct {
     fn deinit(self: *LoadedF32) void {
         if (self.converted) |*converted| converted.deinit();
         self.weight.deinit();
+        self.store.discardTensorFileCache(self.name);
     }
 };
 
@@ -2254,6 +2257,8 @@ fn loadTensorF32(store: *tensor_store_mod.GgufStore, name: []const u8) !LoadedF3
 
     if (loaded.tensor.dtype == .f32) {
         return .{
+            .store = store,
+            .name = name,
             .weight = loaded,
             .data = loaded.tensor.asFloat32(),
             .shape = loaded.tensor.shape,
@@ -2264,6 +2269,8 @@ fn loadTensorF32(store: *tensor_store_mod.GgufStore, name: []const u8) !LoadedF3
         const converted = try weight_source_mod.convertToF32(store.allocator, &loaded.tensor);
         errdefer converted.deinit();
         return .{
+            .store = store,
+            .name = name,
             .weight = loaded,
             .converted = converted,
             .data = converted.asFloat32(),

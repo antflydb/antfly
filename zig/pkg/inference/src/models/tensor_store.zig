@@ -36,6 +36,8 @@ const c_file = if (builtin.os.tag == .freestanding) struct {
         pub fn deinit(_: *MmapRegion) void {}
 
         pub fn adviseSequentialPrefix(_: *MmapRegion, _: usize) void {}
+
+        pub fn discardFileRange(_: *MmapRegion, _: usize, _: usize) void {}
     };
 
     pub fn readRegion(_: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
@@ -107,6 +109,7 @@ pub const TensorStore = struct {
         describeTensorRange: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?TensorRangeRef,
         loadTensorRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!weight_source_mod.LoadedWeight,
         loadQuantizedStorageRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!?weight_source_mod.QuantizedStorage,
+        discardTensorFileCache: *const fn (*anyopaque, name: []const u8) void,
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
         deinit: *const fn (*anyopaque) void,
     };
@@ -135,6 +138,13 @@ pub const TensorStore = struct {
         return self.vtable.loadQuantizedStorageRef(self.ptr, tensor_ref);
     }
 
+    /// Best-effort release of clean file-backed pages for a tensor whose last
+    /// runtime borrower has been dropped. Heap-backed stores intentionally do
+    /// nothing; their LoadedWeight teardown already releases physical memory.
+    pub fn discardTensorFileCache(self: TensorStore, name: []const u8) void {
+        self.vtable.discardTensorFileCache(self.ptr, name);
+    }
+
     pub fn ggufFile(self: TensorStore) ?*const gguf_mod.format.File {
         return self.vtable.ggufFile(self.ptr);
     }
@@ -143,6 +153,8 @@ pub const TensorStore = struct {
         self.vtable.deinit(self.ptr);
     }
 };
+
+fn discardTensorFileCacheNoop(_: *anyopaque, _: []const u8) void {}
 
 pub const SafetensorsStore = struct {
     source: *weight_source_mod.SafetensorsSource,
@@ -155,6 +167,7 @@ pub const SafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = &discardTensorFileCacheNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -239,6 +252,7 @@ pub const ShardedSafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = &discardTensorFileCacheNoop,
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -325,6 +339,7 @@ pub const GgufStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -382,6 +397,26 @@ pub const GgufStore = struct {
 
     pub fn tensorStore(self: *GgufStore) TensorStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Drop clean file-cache pages after a request-scoped consumer has copied
+    /// a tensor into its compute representation. Persistent model stores do not
+    /// call this because another concurrent execution may still be borrowing
+    /// their mapped weights.
+    pub fn discardTensorFileCache(self: *GgufStore, name: []const u8) void {
+        const region = if (self.mmap_region) |*mapped| mapped else return;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(name) orelse return;
+        const byte_len_u64 = gguf_mod.tensor_types.byteLen(
+            tensor.tensor_type,
+            tensor.dimensions,
+        ) orelse return;
+        const offset = std.math.cast(usize, tensor.data_offset) orelse return;
+        const byte_len = std.math.cast(usize, byte_len_u64) orelse return;
+        region.discardFileRange(offset, byte_len);
+    }
+
+    fn discardTensorFileCacheImpl(self: *GgufStore, name: []const u8) void {
+        self.discardTensorFileCache(name);
     }
 
     fn rawData(self: *const GgufStore) []const u8 {
@@ -951,6 +986,7 @@ pub const CompositeGlinerStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -1030,6 +1066,14 @@ pub const CompositeGlinerStore = struct {
             return self.head_gguf.?.loadQuantizedStorageRefImpl(tensor_ref);
         }
         return self.encoder.loadQuantizedStorageRefImpl(tensor_ref);
+    }
+
+    fn discardTensorFileCacheImpl(self: *CompositeGlinerStore, name: []const u8) void {
+        if (self.hasHeadTensor(name)) {
+            if (self.head_gguf) |head| head.discardTensorFileCache(name);
+            return;
+        }
+        self.encoder.discardTensorFileCache(name);
     }
 
     fn ggufFileImpl(self: *CompositeGlinerStore) ?*const gguf_mod.format.File {

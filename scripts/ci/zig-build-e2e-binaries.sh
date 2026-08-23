@@ -36,6 +36,8 @@ if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
 fi
 strip="${ANTFLY_CI_ZIG_STRIP:-false}"
 build_capi="${ANTFLY_CI_BUILD_CAPI:-false}"
+enable_cuda="${ANTFLY_CI_ZIG_CUDA:-false}"
+cuda_artifacts="${ANTFLY_CI_ZIG_CUDA_ARTIFACTS:-fatbin}"
 
 case "$strip" in
   true|false) ;;
@@ -48,6 +50,20 @@ case "$build_capi" in
   true|false) ;;
   *)
     echo "ANTFLY_CI_BUILD_CAPI must be true or false, got: $build_capi" >&2
+    exit 2
+    ;;
+esac
+case "$enable_cuda" in
+  true|false) ;;
+  *)
+    echo "ANTFLY_CI_ZIG_CUDA must be true or false, got: $enable_cuda" >&2
+    exit 2
+    ;;
+esac
+case "$cuda_artifacts" in
+  fatbin|portable|sm89) ;;
+  *)
+    echo "ANTFLY_CI_ZIG_CUDA_ARTIFACTS must be fatbin, portable, or sm89, got: $cuda_artifacts" >&2
     exit 2
     ;;
 esac
@@ -67,6 +83,8 @@ python3 tools/run_bounded_zig_build.py --zig zig -- build \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
   -Dstrip="$strip" \
+  -Dcuda="$enable_cuda" \
+  -Dcuda-artifacts="$cuda_artifacts" \
   "${build_steps[@]}"
 
 chmod +x zig-out/bin/antfly

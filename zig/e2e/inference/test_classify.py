@@ -19,6 +19,7 @@ Matches Go antfly's classifier_test.go patterns.
 
 import pytest
 
+from .conftest import FIRST_USE_REQUEST_TIMEOUT
 from .models import DEFAULT_EXTRACTOR_MODEL
 
 pytestmark = pytest.mark.model_integration
@@ -56,6 +57,7 @@ def test_classify_native_safetensors_deberta_smoke(api):
         labels=["technology", "sports", "politics", "entertainment"],
         hypothesis_template="This text is about {}.",
         top_k=4,
+        request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     assert resp["model"] == "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
     classifications = [item["classifications"] for item in resp["data"]]

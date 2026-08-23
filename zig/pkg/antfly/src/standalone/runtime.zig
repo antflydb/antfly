@@ -21,6 +21,7 @@ const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
@@ -119,6 +120,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
+    inference_process_memory_budget_mb: ?usize = null,
     inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
@@ -439,6 +441,40 @@ const RuntimeLeaseWatchdog = struct {
         try self.applyDecision(alloc, io, data_server, decision);
     }
 
+    const ObservationFailureTransition = struct {
+        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        should_log: bool,
+    };
+
+    // Called with proof_mutex held. Separate the deterministic fail-closed
+    // state transition from logging so tests can exercise expected failure
+    // paths without emitting a real production error. The wrapper below
+    // remains the sole logging boundary.
+    fn transitionObservationFailureLocked(
+        self: *RuntimeLeaseWatchdog,
+        stage: ObservationFailureStage,
+        now_ns: u64,
+    ) ObservationFailureTransition {
+        const should_log = switch (stage) {
+            .fetch => first: {
+                const first_failure = !self.fetch_failure_logged;
+                self.fetch_failure_logged = true;
+                break :first first_failure;
+            },
+            .validation => first: {
+                self.proof_active.store(false, .release);
+                self.proof_capability_deadline_ns.store(0, .release);
+                const first_failure = !self.validation_failure_logged;
+                self.validation_failure_logged = true;
+                break :first first_failure;
+            },
+        };
+        return .{
+            .decision = self.watchdog.noteAPIFailure(now_ns),
+            .should_log = should_log,
+        };
+    }
+
     // Called with proof_mutex held. Each failure stage logs at most once per
     // runtime process and includes only the Zig error name: bearer tokens,
     // request headers, and response bodies are never rendered.
@@ -448,23 +484,12 @@ const RuntimeLeaseWatchdog = struct {
         err: anyerror,
         now_ns: u64,
     ) antfly.ha.kubernetes_lease_watchdog.Decision {
-        switch (stage) {
-            .fetch => {
-                if (!self.fetch_failure_logged) {
-                    std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)});
-                    self.fetch_failure_logged = true;
-                }
-            },
-            .validation => {
-                self.proof_active.store(false, .release);
-                self.proof_capability_deadline_ns.store(0, .release);
-                if (!self.validation_failure_logged) {
-                    std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)});
-                    self.validation_failure_logged = true;
-                }
-            },
-        }
-        return self.watchdog.noteAPIFailure(now_ns);
+        const transition = self.transitionObservationFailureLocked(stage, now_ns);
+        if (transition.should_log) switch (stage) {
+            .fetch => std.log.err("HA Lease watchdog Kubernetes Lease fetch failed err={s}", .{@errorName(err)}),
+            .validation => std.log.err("HA Lease watchdog Lease response validation failed err={s}", .{@errorName(err)}),
+        };
+        return transition.decision;
     }
 
     fn runIndependent(
@@ -1746,6 +1771,14 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
+    const process_memory_resolution = resolveProcessMemoryBudget(
+        cli,
+        init.environ_map,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
     const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
     const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
         const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);
@@ -1814,11 +1847,15 @@ pub fn runFromIterator(
         .data_dir_len = data_dir.len,
         .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir orelse if (loaded_cfg) |cfg| cfg.inference.models_dir else null),
         .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir orelse if (loaded_cfg) |cfg| cfg.inference.ml_dir else null),
-        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
+        .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
         .preload_len = active_preload.len,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
@@ -2048,6 +2085,8 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .process_memory_limit_bytes = process_memory_limit_bytes,
+        .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -2119,6 +2158,24 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
+    std.log.info(
+        "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            data_server.provisioned_storage.effective_memory_limit_bytes,
+            managed_memory.hard_limit_bytes,
+        },
+    );
+    var inference_resource_owner = InferenceResourceBudgetOwner{
+        .alloc = alloc,
+        .manager = &data_server.provisioned_storage.resource_manager,
+    };
+    // This defer is registered before node teardown, so the node releases all
+    // opaque admission leases before the owner validates its registry.
+    defer inference_resource_owner.deinit();
     antfly_node_needs_errdeinit = false;
     defer {
         // DataServer sources, recovery workers, and durable API jobs retain the
@@ -2169,12 +2226,14 @@ pub fn runFromIterator(
 
     var inference_resource_budget = inference_bridge.ResourceBudget{
         .abi_version = inference_bridge.abi_version,
-        .context = &data_server.provisioned_storage.resource_manager,
+        .context = &inference_resource_owner,
+        .retain_context = retainInferenceResourceOwner,
+        .release_context = releaseInferenceResourceOwner,
         .reserve_admission = reserveInferenceResources,
+        .retain_admission = retainInferenceResources,
         .release_admission = releaseInferenceResources,
         .observe_prompt_cache = observeInferencePromptCache,
-        .reserve_tokenizer_cache = reserveInferenceTokenizerCache,
-        .release_tokenizer_cache = releaseInferenceTokenizerCache,
+        .observe_tokenizer_cache = observeInferenceTokenizerCache,
     };
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
@@ -3472,6 +3531,12 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb") or
+            std.mem.eql(u8, arg, "--inference-process-memory-budget-mb"))
+        {
+            cfg.inference_process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
             cfg.inference_kernel_jit_mode = std.meta.stringToEnum(
                 antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
@@ -4365,13 +4430,13 @@ const InferenceBudgetOverrides = struct {
     scratch_limit_bytes: usize,
 };
 
-fn resolveInferenceBudgetOverrides(cli: CliConfig) InferenceBudgetOverrides {
+fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
     return .{
-        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
+        .host_limit_bytes = try mibToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = try mibToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = try mibToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = try mibToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = try mibToBytes(cli.inference_scratch_budget_mb),
     };
 }
 
@@ -4823,41 +4888,348 @@ fn inferenceResourceSlices(amounts: *const inference_bridge.AdmissionAmounts) ![
     };
 }
 
-fn reserveInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
-    manager.reserveBatchClassified(&slices) catch |err| return inference_bridge.statusFromError(err);
-    return .ok;
+fn inferenceHostCharge(amounts: *const inference_bridge.AdmissionAmounts) !u64 {
+    var total = try std.math.add(usize, amounts.host_weight_bytes, amounts.host_kv_bytes);
+    total = try std.math.add(usize, total, amounts.host_scratch_bytes);
+    if (builtin.os.tag == .macos) {
+        total = try std.math.add(usize, total, amounts.backend_weight_bytes);
+        total = try std.math.add(usize, total, amounts.backend_kv_bytes);
+        total = try std.math.add(usize, total, amounts.backend_scratch_bytes);
+    }
+    return @intCast(total);
 }
 
-fn releaseInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceResourceSlices(amounts) catch return;
-    manager.releaseBatch(&slices);
-}
+const InferenceResourceBudgetOwner = struct {
+    alloc: std.mem.Allocator,
+    manager: *antfly.resource_manager.ResourceManager,
+    lease_pool_mutex: std.atomic.Mutex = .unlocked,
+    free_leases: ?*InferenceAdmissionLease = null,
+    active_leases: std.AutoHashMapUnmanaged(usize, *InferenceAdmissionLease) = .empty,
+    next_lease_token: usize = 1,
+    observer_mutex: std.atomic.Mutex = .unlocked,
+    prompt_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    tokenizer_mutex: std.atomic.Mutex = .unlocked,
+    tokenizer_cache_observers: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    outstanding_admission_leases: std.atomic.Value(usize) = .init(0),
+    references: std.atomic.Value(usize) = .init(1),
+    closing: std.atomic.Value(bool) = .init(false),
+    lifetime_mutex: std.atomic.Mutex = .unlocked,
 
-fn observeInferencePromptCache(context: *anyopaque, previous: u64, next: u64) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    var current = previous;
-    manager.observeUsage(.inference_prompt_cache, &current, next);
-}
+    fn deinit(self: *@This()) void {
+        lockAtomic(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.closing.swap(true, .acq_rel))
+            @panic("inference resource owner closed twice");
+        if (self.references.load(.acquire) != 1)
+            @panic("inference resource owner closed with retained capability contexts");
+        if (self.outstanding_admission_leases.load(.acquire) != 0 or
+            self.active_leases.count() != 0)
+            @panic("inference resource owner closed with active admission leases");
+        self.active_leases.deinit(self.alloc);
+        self.active_leases = .empty;
+        var current = self.free_leases;
+        while (current) |lease| {
+            current = lease.next_free;
+            self.alloc.destroy(lease);
+        }
+        self.free_leases = null;
+        if (self.prompt_cache_observers.count() != 0)
+            @panic("inference resource owner closed with prompt cache observers");
+        self.prompt_cache_observers.deinit(self.alloc);
+        self.prompt_cache_observers = .empty;
+        if (self.tokenizer_cache_observers.count() != 0)
+            @panic("inference resource owner closed with tokenizer cache observers");
+        self.tokenizer_cache_observers.deinit(self.alloc);
+        self.tokenizer_cache_observers = .empty;
+    }
 
-fn reserveInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) u8 {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    if (manager.admissionDecision(.inference_tokenizer_cache, @intCast(bytes)).action == .shrink_cache)
-        return 0;
-    var reservation = manager.reserve(.inference_tokenizer_cache, @intCast(bytes)) catch return 0;
-    reservation.released = true;
+    fn acquireLease(self: *@This()) !*InferenceAdmissionLease {
+        lockAtomic(&self.lease_pool_mutex);
+        if (self.free_leases) |lease| {
+            self.free_leases = lease.next_free;
+            self.lease_pool_mutex.unlock();
+            lease.next_free = null;
+            return lease;
+        }
+        self.lease_pool_mutex.unlock();
+        return try self.alloc.create(InferenceAdmissionLease);
+    }
+
+    fn recycleLease(self: *@This(), lease: *InferenceAdmissionLease) void {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        lease.next_free = self.free_leases;
+        self.free_leases = lease;
+    }
+
+    fn registerLease(self: *@This(), lease: *InferenceAdmissionLease) !usize {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+
+        // Tokens are monotonically advanced and never expose the recycled
+        // pointer. On integer wrap, skip zero and any token still active.
+        // This prevents a delayed duplicate release from targeting a newer
+        // reservation that happens to reuse the same pool slot.
+        var token = self.next_lease_token;
+        while (token == 0 or self.active_leases.contains(token)) {
+            token +%= 1;
+        }
+        self.next_lease_token = token +% 1;
+        if (self.next_lease_token == 0) self.next_lease_token = 1;
+        try self.active_leases.put(self.alloc, token, lease);
+        return token;
+    }
+
+    fn retainLease(
+        self: *@This(),
+        token: usize,
+        retained: []const antfly.resource_manager.SliceAmount,
+        retained_host_charge_bytes: u64,
+    ) !void {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        const lease = self.active_leases.get(token) orelse {
+            self.manager.recordAccountingError();
+            return error.InvalidArguments;
+        };
+        try lease.reservation.retain(retained, retained_host_charge_bytes);
+    }
+
+    fn takeLease(self: *@This(), token: usize) ?*InferenceAdmissionLease {
+        lockAtomic(&self.lease_pool_mutex);
+        defer self.lease_pool_mutex.unlock();
+        const removed = self.active_leases.fetchRemove(token) orelse return null;
+        return removed.value;
+    }
+
+    fn observePromptCache(
+        self: *@This(),
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        return self.observeCacheUsage(
+            &self.observer_mutex,
+            &self.prompt_cache_observers,
+            .inference_prompt_cache,
+            observer_id,
+            previous,
+            next,
+            false,
+        );
+    }
+
+    fn observeTokenizerCache(
+        self: *@This(),
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+    ) bool {
+        return self.observeCacheUsage(
+            &self.tokenizer_mutex,
+            &self.tokenizer_cache_observers,
+            .inference_tokenizer_cache,
+            observer_id,
+            previous,
+            next,
+            true,
+        );
+    }
+
+    fn observeCacheUsage(
+        self: *@This(),
+        mutex: *std.atomic.Mutex,
+        observers: *std.AutoHashMapUnmanaged(usize, u64),
+        slice: antfly.resource_manager.Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+        enforce_growth_limits: bool,
+    ) bool {
+        lockAtomic(mutex);
+        defer mutex.unlock();
+
+        if (observer_id == 0) {
+            self.manager.recordAccountingError();
+            return false;
+        }
+        var inserted = false;
+        const current = observers.getPtr(observer_id) orelse blk: {
+            if (previous != 0) {
+                self.manager.recordAccountingError();
+                return false;
+            }
+            if (next == 0) return true;
+            const entry = observers.getOrPut(
+                self.alloc,
+                observer_id,
+            ) catch {
+                self.manager.recordAccountingError();
+                return false;
+            };
+            entry.value_ptr.* = 0;
+            inserted = true;
+            break :blk entry.value_ptr;
+        };
+        if (current.* != previous) {
+            self.manager.recordAccountingError();
+            return false;
+        }
+        const accepted = if (enforce_growth_limits)
+            self.manager.tryAdjustUsageIdentity(slice, observer_id, current.*, next)
+        else
+            self.manager.tryObserveUsageIdentity(slice, observer_id, current.*, next);
+        if (!accepted) {
+            if (inserted) _ = observers.remove(observer_id);
+            return false;
+        }
+        current.* = next;
+        if (next == 0) _ = observers.remove(observer_id);
+        return true;
+    }
+};
+
+const InferenceAdmissionLease = struct {
+    reservation: antfly.resource_manager.BatchReservation,
+    next_free: ?*InferenceAdmissionLease = null,
+};
+
+fn retainInferenceResourceOwner(context: *anyopaque) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.lifetime_mutex);
+    defer owner.lifetime_mutex.unlock();
+    if (owner.closing.load(.acquire)) return 0;
+    const current = owner.references.load(.acquire);
+    if (current == 0 or current == std.math.maxInt(usize)) return 0;
+    owner.references.store(current + 1, .release);
     return 1;
 }
 
-fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
+fn releaseInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    lockAtomic(&owner.lifetime_mutex);
+    defer owner.lifetime_mutex.unlock();
+    // The standalone runtime owns the base reference until node destruction
+    // completes; capability consumers may never release that final edge.
+    const current = owner.references.load(.acquire);
+    if (current <= 1)
+        @panic("inference resource capability released its owner's base reference");
+    owner.references.store(current - 1, .release);
 }
 
-fn mbToBytes(value: usize) usize {
-    return value * 1024 * 1024;
+fn reserveInferenceResources(
+    context: *anyopaque,
+    amounts: *const inference_bridge.AdmissionAmounts,
+    out_lease: *usize,
+) callconv(.c) inference_bridge.Status {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    out_lease.* = 0;
+    const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
+    const host_charge = inferenceHostCharge(amounts) catch |err| return inference_bridge.statusFromError(err);
+    const lease = owner.acquireLease() catch |err|
+        return inference_bridge.statusFromError(err);
+    lease.* = .{
+        .reservation = owner.manager.reserveBatchClassifiedWithHostCharge(
+            &slices,
+            host_charge,
+        ) catch |err| {
+            owner.recycleLease(lease);
+            return inference_bridge.statusFromError(err);
+        },
+    };
+    const lease_token = owner.registerLease(lease) catch |err| {
+        lease.reservation.release();
+        owner.recycleLease(lease);
+        return inference_bridge.statusFromError(err);
+    };
+    _ = owner.outstanding_admission_leases.fetchAdd(1, .acq_rel);
+    out_lease.* = lease_token;
+    return .ok;
+}
+
+fn retainInferenceResources(
+    context: *anyopaque,
+    lease_token: usize,
+    retained: *const inference_bridge.AdmissionAmounts,
+) callconv(.c) inference_bridge.Status {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    if (lease_token == 0) return inference_bridge.statusFromError(error.InvalidArguments);
+    const slices = inferenceResourceSlices(retained) catch |err| return inference_bridge.statusFromError(err);
+    const host_charge = inferenceHostCharge(retained) catch |err| return inference_bridge.statusFromError(err);
+    owner.retainLease(lease_token, &slices, host_charge) catch |err|
+        return inference_bridge.statusFromError(err);
+    return .ok;
+}
+
+fn releaseInferenceResources(context: *anyopaque, lease_token: usize) callconv(.c) void {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    if (lease_token == 0) return;
+    const lease = owner.takeLease(lease_token) orelse {
+        owner.manager.recordAccountingError();
+        return;
+    };
+    lease.reservation.release();
+    owner.recycleLease(lease);
+    _ = owner.outstanding_admission_leases.fetchSub(1, .acq_rel);
+}
+
+fn observeInferencePromptCache(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: u64,
+    next: u64,
+) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    return @intFromBool(owner.observePromptCache(observer_id, previous, next));
+}
+
+fn observeInferenceTokenizerCache(
+    context: *anyopaque,
+    observer_id: usize,
+    previous: u64,
+    next: u64,
+) callconv(.c) u8 {
+    const owner: *InferenceResourceBudgetOwner = @ptrCast(@alignCast(context));
+    return @intFromBool(owner.observeTokenizerCache(observer_id, previous, next));
+}
+
+fn mibToBytes(value: usize) !usize {
+    return process_memory_budget.mibToBytes(value);
+}
+
+fn resolveProcessMemoryBudget(
+    cli: CliConfig,
+    env: *const std.process.Environ.Map,
+) !process_memory_budget.EffectiveResolution {
+    return process_memory_budget.resolveSystemDetailed(
+        cli.inference_process_memory_budget_mb,
+        env.get(process_memory_budget.canonical_env),
+        env.get(process_memory_budget.inference_compat_env),
+    );
+}
+
+fn storageMemoryLimitSource(
+    source: process_memory_budget.EffectiveSource,
+) antfly.public_api.MemoryLimitSource {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
+fn inferenceMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference_bridge.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
 }
 
 fn printUsage() void {
@@ -4883,8 +5255,10 @@ fn printUsage() void {
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
         \\  --inference-backend-budget-mb <n>     Embedded inference native generation backend budget override
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
+        \\  --process-memory-budget-mb <n>        Whole-process host-memory envelope (0: auto-detect)
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
+        \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
         \\  --kernel-jit-mode <off|shadow|on|required> Embedded inference runtime JIT mode override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
@@ -6619,7 +6993,15 @@ test "antfly config uses cli override before common config" {
     };
     try std.testing.expectEqualStrings("/tmp/from-cli", resolveInferenceModelsDir(cli, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/ml-from-cli", resolveInferenceMlDir(cli, &cfg).?);
-    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), (try resolveInferenceBudgetOverrides(cli)).backend_limit_bytes);
+}
+
+test "standalone memory budget conversion rejects overflow" {
+    try std.testing.expectError(error.InvalidArguments, mibToBytes(std.math.maxInt(usize)));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try process_memory_budget.resolve(0, "invalid", "14000"),
+    );
 }
 
 test "standalone public api caps keep alive request reuse" {
@@ -6671,6 +7053,8 @@ test "parse cli accepts inference budget overrides" {
         "2048",
         "--inference-scratch-budget-mb",
         "1024",
+        "--process-memory-budget-mb",
+        "14000",
         "--kernel-jit-mode",
         "required",
     };
@@ -6682,7 +7066,27 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(@as(?usize, 14000), cfg.inference_process_memory_budget_mb);
     try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
+}
+
+test "standalone preserves effective process envelope provenance for inference" {
+    const Case = struct {
+        source: process_memory_budget.EffectiveSource,
+        expected: inference_bridge.ProcessMemoryLimitProvenance,
+    };
+    inline for ([_]Case{
+        .{ .source = .explicit, .expected = .explicit },
+        .{ .source = .cgroup_v2, .expected = .cgroup_v2 },
+        .{ .source = .cgroup_v1, .expected = .cgroup_v1 },
+        .{ .source = .host, .expected = .host },
+        .{ .source = .unavailable, .expected = .unavailable },
+    }) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            inferenceMemoryLimitProvenance(case.source),
+        );
+    }
 }
 
 test "standalone kernel JIT mode precedence is CLI then environment then config" {
@@ -6752,6 +7156,15 @@ test "inference admission bridge charges combined native residency to resource m
     budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
         .{ .hard_limit_bytes = 100 };
     var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+    var owner = InferenceResourceBudgetOwner{
+        .alloc = std.testing.allocator,
+        .manager = &manager,
+    };
+    defer owner.deinit();
+    try std.testing.expectEqual(@as(u8, 1), retainInferenceResourceOwner(&owner));
+    try std.testing.expectEqual(@as(usize, 2), owner.references.load(.acquire));
+    releaseInferenceResourceOwner(&owner);
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
 
     const oversized = inference_bridge.AdmissionAmounts{
         .host_weight_bytes = 80,
@@ -6761,10 +7174,12 @@ test "inference admission bridge charges combined native residency to resource m
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
+    var lease_token: usize = 0;
     try std.testing.expectEqual(
         error.ResourceRequestTooLarge,
-        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &oversized)),
+        inference_bridge.errorFromStatus(reserveInferenceResources(&owner, &oversized, &lease_token)),
     );
+    try std.testing.expectEqual(@as(usize, 0), lease_token);
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
@@ -6778,30 +7193,122 @@ test "inference admission bridge charges combined native residency to resource m
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
-    try std.testing.expect(reserveInferenceResources(&manager, &admitted).isOk());
+    try std.testing.expect(reserveInferenceResources(&owner, &admitted, &lease_token).isOk());
+    try std.testing.expect(lease_token != 0);
     try std.testing.expectEqual(
         @as(u64, 90),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+    try std.testing.expectEqual(
+        if (builtin.os.tag == .macos) @as(u64, 90) else @as(u64, 60),
+        manager.snapshot().memory.used_bytes,
+    );
+
+    const retained = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 40,
+        .backend_weight_bytes = 30,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expect(retainInferenceResources(&owner, lease_token, &retained).isOk());
+    try std.testing.expectEqual(
+        @as(u64, 70),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
 
     const unavailable = inference_bridge.AdmissionAmounts{
-        .host_weight_bytes = 11,
+        .host_weight_bytes = 31,
         .backend_weight_bytes = 0,
         .host_kv_bytes = 0,
         .backend_kv_bytes = 0,
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     };
+    var unavailable_lease: usize = 0;
     try std.testing.expectEqual(
         error.ResourceTemporarilyUnavailable,
-        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &unavailable)),
+        inference_bridge.errorFromStatus(reserveInferenceResources(&owner, &unavailable, &unavailable_lease)),
     );
+    try std.testing.expectEqual(@as(usize, 0), unavailable_lease);
 
-    releaseInferenceResources(&manager, &admitted);
+    releaseInferenceResources(&owner, lease_token);
     try std.testing.expectEqual(
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    var replacement_token: usize = 0;
+    const replacement = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 10,
+        .backend_weight_bytes = 0,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expect(reserveInferenceResources(&owner, &replacement, &replacement_token).isOk());
+    try std.testing.expect(replacement_token != lease_token);
+    releaseInferenceResources(&owner, lease_token);
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!retainInferenceResources(&owner, lease_token, &replacement).isOk());
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    releaseInferenceResources(&owner, replacement_token);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 1, 0, 10));
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 2, 0, 20));
+    try std.testing.expectEqual(@as(u8, 0), observeInferencePromptCache(&owner, 1, 0, 0));
+    try std.testing.expectEqual(@as(u64, 30), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 1, 10, 0));
+    try std.testing.expectEqual(@as(u8, 1), observeInferencePromptCache(&owner, 2, 20, 0));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 11, 0, 10));
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 22, 0, 10));
+    try std.testing.expectEqual(@as(u8, 0), observeInferenceTokenizerCache(&owner, 11, 0, 0));
+    try std.testing.expectEqual(@as(u64, 20), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 11, 10, 0));
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 1), observeInferenceTokenizerCache(&owner, 22, 10, 0));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "standalone tokenizer bridge enforces growth and permits exact teardown" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
+        .{ .hard_limit_bytes = 16 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 20 },
+        .budgets = budgets,
+        .identity_allocator = std.testing.allocator,
+    });
+    defer manager.deinit(std.testing.allocator);
+    var owner = InferenceResourceBudgetOwner{
+        .alloc = std.testing.allocator,
+        .manager = &manager,
+    };
+    defer owner.deinit();
+
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        observeInferenceTokenizerCache(&owner, 101, 0, 12),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        observeInferenceTokenizerCache(&owner, 101, 12, 18),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 12),
+        manager.sliceStats(.inference_tokenizer_cache).used_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        observeInferenceTokenizerCache(&owner, 101, 12, 0),
+    );
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
 test "standalone runtime resolves paths from common storage base dir" {
@@ -7095,9 +7602,13 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .process_boot_id = [_]u8{'a'} ** 64,
         };
         platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
-        const decision = runtime_watchdog.noteObservationFailureLocked(stage, error.TestLeaseObservationFailure, 1);
+        const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);
+        const repeated_transition = runtime_watchdog.transitionObservationFailureLocked(stage, 2);
         runtime_watchdog.proof_mutex.unlock();
-        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, transition.decision);
+        try std.testing.expect(transition.should_log);
+        try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, repeated_transition.decision);
+        try std.testing.expect(!repeated_transition.should_log);
         try std.testing.expectEqual(stage == .fetch, runtime_watchdog.fetch_failure_logged);
         try std.testing.expectEqual(stage == .validation, runtime_watchdog.validation_failure_logged);
 

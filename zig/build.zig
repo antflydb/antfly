@@ -3617,6 +3617,7 @@ pub fn build(b: *std.Build) void {
         "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
+        "inference runtime preserves effective process envelope provenance",
         "metadata.table generated field capabilities include schema dynamic templates",
         "metadata.table status exposes stable field capabilities",
         "metadata.table status promotes schema capability when runtime coverage is complete",
@@ -4274,6 +4275,22 @@ pub fn build(b: *std.Build) void {
     const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, lake_scaffold_test_mod, true, true);
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
+    unit_test_step.dependOn(&run_lake_scaffold_tests.step);
+
     const lib_data_runtime_default_filters = [_][]const u8{
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -4352,6 +4369,7 @@ pub fn build(b: *std.Build) void {
         "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback uses its durable table contract",
         "data runtime resolves extension package store env before local default",
+        "data runtime parses optional split store registration flags",
         "data runtime cli accepts ARD identity flags",
         "data runtime parses experimental flag",
         "data public API listener uses public API request body limit",
@@ -6086,6 +6104,7 @@ pub fn build(b: *std.Build) void {
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
+            "derived coverage source totals ignore derived index fan out",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "rebuild quarantine remains an explicit failed public index status",
@@ -6152,6 +6171,7 @@ pub fn build(b: *std.Build) void {
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
             "runtime status refreshes aged live writer publications",
+            "provisioned table write source best effort publish does not advertise lock contention as an empty table",
             "hosted backup forwarding preserves external io authority",
             "backup storage resolution rejects a reused table name from another incarnation",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
@@ -6529,9 +6549,17 @@ pub fn build(b: *std.Build) void {
 
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
+        "identity allocation failure rolls back every memory ledger",
+        "manager teardown retires live observer snapshots",
         "batch reservation is atomic across inference resource slices",
         "classified batch reservation distinguishes size from contention",
+        "aggregate host memory admission is atomic across slices",
+        "logical inference slices can charge only physical host memory",
+        "batch release accounting errors fail closed",
+        "single release and observer mismatch cannot debit unrelated memory",
+        "bounded oversized progress cannot bypass aggregate host memory",
         "resource manager observes over-budget external usage",
+        "identity-aware cache admission rejects growth and always permits shrink",
         "resource manager evaluates projected admission with configured action",
         "resource manager bounds soft write throttling without waiting for compaction publication",
         "resource manager records index repair activation pause separately from cleanup",
@@ -6548,6 +6576,7 @@ pub fn build(b: *std.Build) void {
         "hbc cache shrinks to resource budget under pressure",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
@@ -6878,6 +6907,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA runtime rejects ambiguous role flags",
             "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
+            "standalone memory budget conversion rejects overflow",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
             "standalone public ready endpoint fails closed before API initialization",
@@ -6889,12 +6919,15 @@ pub fn build(b: *std.Build) void {
             "common config rejects removed top-level storage backend fields",
             "common config parses bounded transaction session policy",
             "parse cli accepts inference budget overrides",
+            "standalone preserves effective process envelope provenance for inference",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
             "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
+            "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
             "standalone linked inference ABI validates the supported function-table prefix",
+            "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
@@ -7868,6 +7901,7 @@ pub fn build(b: *std.Build) void {
             "storage.persistent.",
             "storage.portable_backup.",
             "storage.resource_manager.",
+            "storage.rowsource.",
             "storage.schema.",
             "storage.shard.",
             "storage.sim_runtime.",

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -47,6 +48,8 @@ DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB = 12288
 DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB = 16384
 DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB = 0
 DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB = 0
+DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT = 300.0
 
 
 def _integration_enabled(env_name: str) -> bool:
@@ -63,6 +66,19 @@ def _env_int(name: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
+
+
+def _positive_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return value
 
 
 def _wait_for_server(url: str, timeout_s: float = 30.0, path: str = "/status") -> bool:
@@ -126,14 +142,33 @@ def _normalize_model_ref_for_path(model_name: str) -> str:
 
 def _candidate_model_dirs(models_dir: Path, model_name: str) -> list[Path]:
     normalized = _normalize_model_ref_for_path(model_name)
-    return [
+    legacy_candidates = [
         models_dir / normalized,
         models_dir / "generators" / normalized,
     ]
+    candidates = list(legacy_candidates)
+    for legacy in legacy_candidates:
+        parent = legacy.parent
+        if not parent.is_dir():
+            continue
+        prefix = f"{legacy.name}--antfly-"
+        # Explicit variants are atomically published beside the legacy model
+        # directory using a 16-character SHA-256 prefix. Enumerating only that
+        # namespace keeps this preflight bounded and avoids accepting temporary
+        # download directories as complete models.
+        for child in sorted(parent.iterdir()):
+            if not child.is_dir() or not child.name.startswith(prefix):
+                continue
+            variant_hash = child.name[len(prefix) :]
+            if len(variant_hash) == 16 and all(
+                char in "0123456789abcdef" for char in variant_hash
+            ):
+                candidates.append(child)
+    return candidates
 
 
 def _model_exists(models_dir: Path, model_name: str) -> bool:
-    return any(path.exists() for path in _candidate_model_dirs(models_dir, model_name))
+    return any(path.is_dir() for path in _candidate_model_dirs(models_dir, model_name))
 
 
 class EmbeddedInferenceStandaloneServer:
@@ -144,6 +179,7 @@ class EmbeddedInferenceStandaloneServer:
         model_name: str,
         *,
         inference_budget_mb: dict[str, int] | None = None,
+        process_memory_budget_mb: int = 0,
         host: str = "127.0.0.1",
     ):
         self.binary = binary
@@ -151,6 +187,10 @@ class EmbeddedInferenceStandaloneServer:
         self.model_name = model_name
         self.host = host
         self.inference_budget_mb = inference_budget_mb or {}
+        self.process_memory_budget_mb = process_memory_budget_mb
+        self.forced_kill = False
+        self.returncode: int | None = None
+        self.final_logs = ""
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -205,6 +245,8 @@ class EmbeddedInferenceStandaloneServer:
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
+        if self.process_memory_budget_mb > 0:
+            command.extend(["--process-memory-budget-mb", str(self.process_memory_budget_mb)])
         self.proc = self.port_reservations.handoff_to(
             (self.public_port, self.health_port),
             lambda: subprocess.Popen(
@@ -232,16 +274,25 @@ class EmbeddedInferenceStandaloneServer:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
-                self.proc.wait(timeout=10)
+                self.proc.wait(timeout=45)
             except subprocess.TimeoutExpired:
+                self.forced_kill = True
                 self.proc.kill()
                 self.proc.wait()
+        if self.proc is not None:
+            self.returncode = self.proc.returncode
         self.proc = None
+        self.final_logs = self.debug_logs()
         self.log_file.close()
         self.tempdir.cleanup()
 
 
-def _warm_inference_generator(api_url: str, model_name: str) -> None:
+def _warm_inference_generator(
+    api_url: str,
+    model_name: str,
+    *,
+    request_timeout: float,
+) -> None:
     response = requests.post(
         f"{api_url}/generate",
         json={
@@ -250,9 +301,37 @@ def _warm_inference_generator(api_url: str, model_name: str) -> None:
             "max_tokens": 8,
             "temperature": 0,
         },
-        timeout=300,
+        timeout=request_timeout,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise AssertionError(
+            f"generator warmup failed: {response.status_code} {response.text}"
+        )
+
+
+def _finish_standalone_server(
+    server: EmbeddedInferenceStandaloneServer,
+    primary_failure: BaseException | None,
+) -> None:
+    cleanup_failure: str | None = None
+    try:
+        server.stop()
+    except Exception as exc:
+        cleanup_failure = f"standalone inference cleanup raised {type(exc).__name__}: {exc}"
+    else:
+        if server.forced_kill or server.returncode != 0:
+            cleanup_failure = (
+                "standalone inference did not shut down cleanly "
+                f"(forced_kill={server.forced_kill}, returncode={server.returncode})\n"
+                f"last logs:\n{server.final_logs[-8000:]}"
+            )
+
+    if cleanup_failure is None:
+        return
+    if primary_failure is not None:
+        primary_failure.add_note(cleanup_failure)
+        return
+    raise AssertionError(cleanup_failure)
 
 
 @pytest.fixture(scope="session")
@@ -262,18 +341,23 @@ def embedded_standalone_runtime():
 
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
-        pytest.skip(f"Antfly binary not found: {binary}")
+        pytest.fail(
+            f"Standalone inference was explicitly enabled but the Antfly binary was not found: {binary}"
+        )
 
     models_dir = Path(
         os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
     ).expanduser().resolve()
     if not models_dir.exists():
-        pytest.skip(f"Antfly inference models directory not found: {models_dir}")
+        pytest.fail(
+            "Standalone inference was explicitly enabled but its models directory was not found: "
+            f"{models_dir}"
+        )
 
     model_name = os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
     if not _model_exists(models_dir, model_name):
-        pytest.skip(
-            "Antfly inference generator model not found under "
+        pytest.fail(
+            "Standalone inference was explicitly enabled but its generator model was not found under "
             f"{models_dir}. Pull it with: antfly inference pull hf:{_normalize_model_ref_for_path(model_name)}"
         )
 
@@ -290,16 +374,38 @@ def embedded_standalone_runtime():
             "ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB
         ),
     }
+    process_memory_budget_mb = _env_int(
+        "ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB",
+        DEFAULT_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB,
+    )
+    first_use_request_timeout = _positive_timeout(
+        "ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT",
+        DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT,
+    )
 
     server = EmbeddedInferenceStandaloneServer(
         binary,
         models_dir,
         model_name,
         inference_budget_mb=inference_budget_mb,
+        process_memory_budget_mb=process_memory_budget_mb,
     )
+    warmup_performed = False
+    primary_failure: BaseException | None = None
     try:
         if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
-            _warm_inference_generator(server.inference_api_url, model_name)
+            try:
+                _warm_inference_generator(
+                    server.inference_api_url,
+                    model_name,
+                    request_timeout=first_use_request_timeout,
+                )
+            except Exception as exc:
+                raise AssertionError(
+                    f"standalone inference generator warmup failed for {model_name}: {exc}\n"
+                    f"server logs:\n{server.debug_logs()}"
+                ) from exc
+            warmup_performed = True
         yield {
             "base_url": server.url,
             "public_url": server.public_url,
@@ -308,10 +414,18 @@ def embedded_standalone_runtime():
             "model": model_name,
             "models_dir": str(models_dir),
             "inference_budget_mb": inference_budget_mb,
+            "process_memory_budget_mb": process_memory_budget_mb,
+            "warmup_performed": warmup_performed,
             "logs": server.debug_logs,
         }
+    except BaseException as exc:
+        # A skipped test has no primary failure to preserve; a teardown defect
+        # must still surface instead of being hidden behind the skip outcome.
+        if not isinstance(exc, pytest.skip.Exception):
+            primary_failure = exc
+        raise
     finally:
-        server.stop()
+        _finish_standalone_server(server, primary_failure)
 
 
 @pytest.fixture(scope="function")
@@ -463,6 +577,21 @@ def _parse_cli_json(stdout: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def test_standalone_inference_process_envelope_composition(embedded_standalone_runtime):
+    budget_mb = embedded_standalone_runtime["process_memory_budget_mb"]
+    if budget_mb <= 0:
+        pytest.skip("Set ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB to validate composition")
+
+    assert embedded_standalone_runtime["warmup_performed"], "real generator warmup must complete"
+    expected_bytes = budget_mb * 1024 * 1024
+    logs = embedded_standalone_runtime["logs"]()
+    assert "effective_source=explicit" in logs
+    assert f"configured_limit_bytes={expected_bytes}" in logs
+    assert f"effective_limit_bytes={expected_bytes}" in logs
+    assert "inference resource policy ownership=external_required" in logs
+    assert "process_memory_limit_provenance=explicit" in logs
 
 
 def test_standalone_health_endpoints(embedded_standalone_runtime):

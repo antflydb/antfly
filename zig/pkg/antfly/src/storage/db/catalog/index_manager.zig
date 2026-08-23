@@ -3257,7 +3257,11 @@ pub const IndexManager = struct {
     fn releaseFullTextPendingBytes(self: *IndexManager) void {
         if (self.full_text_pending_bytes_accounted == 0) return;
         if (self.resource_manager) |manager| {
-            manager.releaseBytes(.full_text_pending_segments, self.full_text_pending_bytes_accounted);
+            manager.adjustUsage(
+                .full_text_pending_segments,
+                &self.full_text_pending_bytes_accounted,
+                0,
+            ) catch {};
         }
         self.full_text_pending_bytes_accounted = 0;
     }
@@ -12836,6 +12840,7 @@ pub const IndexManager = struct {
             defer self.alloc.free(planned);
             var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                else => return err,
             };
             defer if (reservation) |*active| active.release();
 

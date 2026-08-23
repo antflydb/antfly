@@ -4385,6 +4385,14 @@ pub const DB = struct {
         }
         self.async_context.promotion_runtime = null;
         if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        // Derived full-text publishers may be asleep in merge backpressure
+        // admission. Close that admission before joining their executor: the
+        // merge runtime is the owner of the wakeup predicate, so joining the
+        // publishers first can otherwise strand shutdown behind a predicate
+        // that is not closed until later in this function. Drain the merge
+        // worker too because its tasks borrow inline index generations.
+        if (executor_ready) self.executor.beginShutdown();
+        if (self.text_merge_runtime) |runtime| _ = runtime.stop();
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
@@ -79654,6 +79662,59 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
     pool.releaseDescriptorsForTest(io, 2);
     held_descriptors = false;
     try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "db close stops text admission before joining derived publishers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        // If close joins the derived executor first, the injected producer
+        // wait expires at this ordinary deadline. A correct ownership order
+        // wakes it through text-runtime shutdown instead.
+        .text_merge = .{ .enabled = true, .backpressure_max_wait_ms = 5_000 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    const io = db.backend_runtime.io() orelse return error.SkipZigTest;
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    text_merge_runtime_mod.test_wait_for_producer_shutdown.store(true, .release);
+    text_merge_runtime_mod.test_producer_shutdown_wait_entered.store(false, .release);
+    text_merge_runtime_mod.test_producer_shutdown_wait_outcome.store(0, .release);
+    defer {
+        text_merge_runtime_mod.test_wait_for_producer_shutdown.store(false, .release);
+        text_merge_runtime_mod.test_producer_shutdown_wait_entered.store(false, .release);
+        text_merge_runtime_mod.test_producer_shutdown_wait_outcome.store(0, .release);
+    }
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"shutdown ordering\"}" }},
+        .sync_level = .write,
+    });
+
+    const wait_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!text_merge_runtime_mod.test_producer_shutdown_wait_entered.load(.acquire) and
+        monotonicTimeNs() < wait_deadline)
+    {
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!text_merge_runtime_mod.test_producer_shutdown_wait_entered.load(.acquire))
+        return error.TestTimeout;
+
+    db.close();
+    db_open = false;
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        text_merge_runtime_mod.test_producer_shutdown_wait_outcome.load(.acquire),
+    );
 }
 
 test "db text merge backpressure drains sustained segment debt to low watermark" {

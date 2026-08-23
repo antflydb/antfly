@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifact_store = @import("store.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const FsStore = struct {
     alloc: Allocator,
@@ -50,8 +51,8 @@ pub const FsStore = struct {
         const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
 
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
 
         if (!fileExists(path)) {
             try ensureParentDir(path);
@@ -66,34 +67,59 @@ pub const FsStore = struct {
     }
 
     pub fn getAlloc(self: *FsStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
-        defer alloc.free(checksum);
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
-        return try readFileAlloc(alloc, path);
+        return try self.getAllocWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn getAllocWithCancellation(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
+        return try readFileAllocWithCancellation(alloc, path, cancellation);
     }
 
     pub fn getRangeAlloc(self: *FsStore, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
-        const all = try self.getAlloc(alloc, artifact_id);
-        defer alloc.free(all);
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, .none);
+    }
 
-        if (offset > all.len) return error.InvalidRange;
-        const start: usize = @intCast(offset);
-        const end = @min(all.len, start + len);
-        return try alloc.dupe(u8, all[start..end]);
+    pub fn getRangeAllocWithCancellation(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
+        return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
     }
 
     pub fn stat(self: *FsStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try checksumFromArtifactIdAlloc(alloc, artifact_id);
+        return try self.statWithCancellation(alloc, artifact_id, .none);
+    }
+
+    pub fn statWithCancellation(self: *FsStore, alloc: Allocator, artifact_id: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
-        const path = try pathForArtifactAlloc(alloc, self.root_dir, checksum);
-        defer alloc.free(path);
+        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        defer self.alloc.free(path);
 
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const file_stat = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
+        try cancellation.check();
 
         return .{
             .artifact_id = artifact_id_copy,
@@ -103,8 +129,7 @@ pub const FsStore = struct {
     }
 
     pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
-        const checksum = try checksumFromArtifactIdAlloc(self.alloc, artifact_id);
-        defer self.alloc.free(checksum);
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
         defer self.alloc.free(path);
         try deleteFile(path);
@@ -114,8 +139,11 @@ pub const FsStore = struct {
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
+        .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .stat = erasedStat,
+        .stat_with_cancellation = erasedStatWithCancellation,
         .delete = erasedDelete,
     };
 
@@ -134,14 +162,29 @@ pub const FsStore = struct {
         return try self.getAlloc(alloc, artifact_id);
     }
 
+    fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, cancellation: CancellationToken) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.getAllocWithCancellation(alloc, artifact_id, cancellation);
+    }
+
     fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.getRangeAlloc(alloc, artifact_id, offset, len);
     }
 
+    fn erasedGetRangeAllocWithCancellation(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, cancellation);
+    }
+
     fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.stat(alloc, artifact_id);
+    }
+
+    fn erasedStatWithCancellation(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.statWithCancellation(alloc, artifact_id, cancellation);
     }
 
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
@@ -161,10 +204,67 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-fn readFileAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+fn readFileAllocWithCancellation(alloc: Allocator, path: []const u8, cancellation: CancellationToken) ![]u8 {
+    try cancellation.check();
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(std.math.maxInt(usize)));
+    const io = io_impl.io();
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const output_len = std.math.cast(usize, stat.size) orelse return error.ArtifactTooLarge;
+    const out = try alloc.alloc(u8, output_len);
+    errdefer alloc.free(out);
+
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < out.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, out.len - copied);
+        const chunk = out[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, copied) != chunk.len) return error.ShortArtifactRead;
+        copied += chunk.len;
+    }
+    try cancellation.check();
+    return out;
+}
+
+fn readFileRangeAllocWithCancellation(
+    alloc: Allocator,
+    path: []const u8,
+    offset: u64,
+    len: usize,
+    cancellation: CancellationToken,
+) ![]u8 {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (offset > stat.size) return error.InvalidRange;
+    const available = stat.size - offset;
+    const output_len: usize = @intCast(@min(available, len));
+    const out = try alloc.alloc(u8, output_len);
+    errdefer alloc.free(out);
+
+    const cancellation_chunk_bytes = 1024 * 1024;
+    var copied: usize = 0;
+    while (copied < out.len) {
+        try cancellation.check();
+        const chunk_len = @min(cancellation_chunk_bytes, out.len - copied);
+        const chunk = out[copied..][0..chunk_len];
+        if (try file.readPositionalAll(io, chunk, offset + copied) != chunk.len) return error.ShortArtifactRead;
+        copied += chunk.len;
+    }
+    try cancellation.check();
+    return out;
 }
 
 fn deleteFile(path: []const u8) !void {
@@ -227,14 +327,8 @@ fn makeArtifactIdAlloc(alloc: Allocator, checksum: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
 }
 
-fn checksumFromArtifactIdAlloc(alloc: Allocator, artifact_id: []const u8) ![]u8 {
-    const prefix = "sha256:";
-    if (!std.mem.startsWith(u8, artifact_id, prefix)) return error.InvalidArtifactId;
-    return try alloc.dupe(u8, artifact_id[prefix.len..]);
-}
-
 fn pathForArtifactAlloc(alloc: Allocator, root_dir: []const u8, checksum: []const u8) ![]u8 {
-    if (checksum.len < 4) return error.InvalidArtifactId;
+    try artifact_store.validateSha256Checksum(checksum);
     return try std.fs.path.join(alloc, &.{ root_dir, "sha256", checksum[0..2], checksum[2..] });
 }
 
@@ -307,6 +401,16 @@ test "fs artifact store getRangeAlloc returns requested slice" {
     const mid = try store.getRangeAlloc(std.testing.allocator, meta.artifact_id, 2, 3);
     defer std.testing.allocator.free(mid);
     try std.testing.expectEqualStrings("cde", mid);
+}
+
+test "fs artifact store rejects malformed content addresses before lookup" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "invalid-id");
+    defer cleanupTmp(path);
+
+    var store = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidArtifactId, store.getAlloc(std.testing.allocator, "sha256:abcd"));
 }
 
 test "fs artifact store erased interface works" {

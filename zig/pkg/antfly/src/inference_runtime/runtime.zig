@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
 const httpx = @import("httpx");
@@ -96,9 +97,23 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
+    process_memory_limit_bytes: usize = 0,
+    process_memory_limit_provenance: inference.runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     preload: []const inference.server.WarmModel = &.{},
     allow_insecure_public_bind: bool = false,
 };
+
+fn inferenceProcessMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference.runtime.tier.memory.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
 
 const BudgetOverridesMb = struct {
     host_budget_mb: usize = 0,
@@ -240,6 +255,8 @@ pub fn runFromIterator(
         return try inference.compare_generate.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "finetune")) {
         return try inference.finetune_cli.main(init, try collectArgs(alloc, args));
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        return try inference.cuda_info.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try inference.native_smoke.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "list")) {
@@ -295,6 +312,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var max_loaded_models: usize = 10;
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?u32 = null;
+    var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mb = BudgetOverridesMb{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var kernel_jit_cache_dir_override: ?[]const u8 = null;
@@ -331,6 +349,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
                 args.next() orelse return error.InvalidArguments,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--process-memory-budget-mb") or
+            std.mem.eql(u8, arg, "--inference-process-memory-budget-mb"))
+        {
+            process_memory_budget_mb_override = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -377,6 +399,11 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         max_concurrent_requests_override,
         if (loaded_config) |*config| config else null,
     );
+    const process_memory_resolution = try process_memory_budget.resolveSystemDetailed(
+        process_memory_budget_mb_override,
+        platform.env.getenv(process_memory_budget.canonical_env),
+        platform.env.getenv(process_memory_budget.inference_compat_env),
+    );
 
     const kernel_jit = try resolveKernelJitConfig(
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
@@ -394,6 +421,15 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         kernel_jit.max_cache_bytes_mb,
         kernel_jit.preload_budget_ms,
     });
+    std.log.info(
+        "process memory policy input_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            process_memory_resolution.limit_bytes,
+        },
+    );
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
@@ -401,6 +437,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .max_loaded_models = max_loaded_models,
         .max_concurrent_requests = max_concurrent_requests,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_provenance = inferenceProcessMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload = preload_models.items,
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
@@ -413,6 +453,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
+    node.startReadinessInventory(io);
 
     node.validateHttpBind(host) catch |err| {
         std.log.err(
@@ -466,6 +507,8 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
+        .process_memory_limit_bytes = config.process_memory_limit_bytes,
+        .process_memory_limit_provenance = config.process_memory_limit_provenance,
         .preload = config.preload,
         .allow_insecure_public_bind = config.allow_insecure_public_bind,
         .allow_unknown_models = config.allow_unknown_models,
@@ -484,6 +527,7 @@ pub fn spawnServerProcess(
     try node.validateHttpBind(host_dup);
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
+    node.startReadinessInventory(io);
 
     const server = try alloc.create(httpx.Server);
     errdefer alloc.destroy(server);
@@ -788,6 +832,7 @@ fn printUsage() void {
         \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
+        \\  cuda-info   Inspect the compiled CUDA artifact or validate a CUDA device
         \\  smoke       Run a model smoke test
         \\  list        List available models
         \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
@@ -802,6 +847,8 @@ fn printUsage() void {
         \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
         \\  --config <path>     Load admission settings from an Antfly config file
         \\  --max-concurrent-requests <n> Override admission.inference.max_concurrent_requests; 0 disables it
+        \\  --process-memory-budget-mb <n> Whole-process host-memory envelope; 0 selects cgroup/host detection
+        \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
@@ -832,6 +879,25 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference runtime preserves effective process envelope provenance" {
+    const Case = struct {
+        source: process_memory_budget.EffectiveSource,
+        expected: inference.runtime.tier.memory.ProcessMemoryLimitProvenance,
+    };
+    inline for ([_]Case{
+        .{ .source = .explicit, .expected = .explicit },
+        .{ .source = .cgroup_v2, .expected = .cgroup_v2 },
+        .{ .source = .cgroup_v1, .expected = .cgroup_v1 },
+        .{ .source = .host, .expected = .host },
+        .{ .source = .unavailable, .expected = .unavailable },
+    }) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            inferenceProcessMemoryLimitProvenance(case.source),
+        );
+    }
 }
 
 test "inference run detects trailing help without consuming arguments" {
