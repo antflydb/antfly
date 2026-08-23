@@ -6817,6 +6817,7 @@ pub fn build(b: *std.Build) void {
             "production DataServer public HTTP",
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
             "DataServer LSM maintenance owner runs on borrowed VoprIo",
+            "DataServer VOPR background owner executes and cancels maintenance on VoprIo",
         },
     });
     const run_data_server_vopr_tests = b.addRunArtifact(data_server_vopr_tests);

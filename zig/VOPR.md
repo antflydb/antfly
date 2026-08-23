@@ -6,9 +6,10 @@ storage, HA, data-plane, derived-workflow, backup/restore, and clock-fault
 scenarios are implemented. The production DataServer now serves public HTTP on
 borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
 resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
-debug cursor are executable. The most important remaining seam is finer-grained
-scheduling inside routed data, Raft, split/merge, and the native-only
-DataServer service loops.
+debug cursor are executable. Routed data, Raft, split/merge, query assembly,
+and DataServer-owned maintenance services now expose production-safe scheduler
+boundaries. The primary remaining work is campaign integration and interactive
+tooling for the already implemented counterfactual and quarantine primitives.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -40,7 +41,7 @@ not a prerequisite for deterministic search.
 | --- | --- | --- |
 | Stable structured choices and exact clean-world replay | `lib/vopr/src/choice.zig`, `runner.zig`, `replay.zig`, canonical `vopr-trace-v1` | `zig build vopr-engine-test` |
 | One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-engine-test` |
-| Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; Antfly `DurableJobLane` adapter | `zig build vopr-runtime-test` |
+| Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; `VoprIo` composes the narrow atomic executor into its scheduler; Antfly `DurableJobLane` adapter | `zig build vopr-engine-test vopr-runtime-test` |
 | Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-engine-test` in Debug and ReleaseSafe |
 | Modeled files, durability, streams, datagrams, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-engine-test` |
 | Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
@@ -56,7 +57,7 @@ not a prerequisite for deterministic search.
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
-| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, and repair workers on borrowed `std.Io`; `vopr/admission.zig` | `zig build vopr-runtime-test data-server-vopr-test admission-vopr-test` |
+| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, repair, DataServer warmup/catch-up/root/status refresh, and auto-bulk finish work on borrowed `std.Io`/shared owners; `vopr/admission.zig` | `zig build storage-vopr-runtime-test vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 
 The real DataServer listener, httpx client/server transport, request lifecycle,
@@ -612,6 +613,11 @@ VOPR work has found concrete production defects, not only harness gaps:
 - Virtual TCP half-close marked EOF immediately even when earlier payload bytes
   were still queued, allowing FIN to overtake data. FIN is now its own ordered,
   scheduler-visible packet transition.
+- The threaded durable-job lane held its global reap mutex while awaiting an
+  owner job. A job that closed a nested DB/background owner then tried to enter
+  the same reap path, deadlocking both teardown operations. Drains now detach
+  entries under the mutex and await them after releasing it; a focused nested-
+  owner regression preserves this reentrant lifetime contract.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -812,14 +818,22 @@ implementation or another transport backend.
 
 `DurableJobLane` and both production/VOPR implementations now share
 pause/resume/drain/close/reopen semantics; tests include admission while paused,
-committed-job drain, close, reopen, wrapper relocation, and exact teardown.
+committed-job drain, close, reopen, wrapper relocation, nested-owner teardown,
+and exact cleanup. `VoprIo` now composes the Antfly-independent narrow executor
+into the same scheduler as its `std.Io` fibers, sockets, and virtual time, so
+the Antfly adapter does not require a second simulated runtime.
 Transaction recovery, TTL, enrichment, text merge, sparse compaction,
 resolution, promotion, LSM maintenance, quarantine retry, and repair now
 retain the backend-neutral `std.Io` borrowed from `BackendRuntime`; their
-production passes and lifecycle controls execute on `VoprIo`. Continue by
-moving the remaining DataServer-owned native loops—provisioned
-warmup/catch-up/root refresh, status refresh, and derived-index execution—onto
-the same owner protocol and add service-specific teardown-order properties.
+production passes and lifecycle controls execute on `VoprIo`. DataServer
+provisioned warmup, startup catch-up, replica-root refresh, local/runtime status
+refresh, and auto-bulk finish work now use one shared durable owner instead of
+private native threads. Their run/deinit callbacks clear active state on normal
+completion, submission failure, cancellation, and DataServer teardown; file
+probes inside these services use the runtime's borrowed `std.Io`. Derived-index
+execution was already owned by the DB background runtime. The focused
+DataServer campaign proves both scheduler execution and queued cancellation;
+extend the owner only when another DataServer-native service is introduced.
 
 ### 4. Serverless Object-Store Protocols
 
@@ -924,8 +938,10 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The next correctness gains will come from moving routed DataServer/Raft,
-background-runtime, serverless object-store, admission, and the remaining HTTP
-edge cases across those existing scheduler boundaries. That work should deepen
-production control through `std.Io` and safe suspension seams, not multiply
-suite names or weaken production ownership contracts.
+The next correctness gains will come from wiring counterfactual graphs and
+quarantine exports into long-running campaign artifacts, adding an interactive
+frontend over the replay debugger, and deepening durable corruption and
+provider-specific datagram campaigns. New product services should cross the
+existing `std.Io`, lifecycle-hook, admission, and owner seams rather than
+creating native-only loops, multiplying suite names, or weakening production
+ownership contracts.

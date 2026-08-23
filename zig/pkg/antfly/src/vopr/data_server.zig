@@ -9,6 +9,7 @@ const httpx = @import("httpx");
 const vopr = @import("vopr");
 const data_runtime = @import("../data/runtime.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
+const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const http_common = @import("../common/http/http_common.zig");
 const request_lifecycle = @import("request_lifecycle.zig");
 const http_disconnect = @import("http_disconnect.zig");
@@ -66,6 +67,9 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         },
     });
     defer backend_runtime.deinit();
+    var background_jobs = durable_job_lane.Lane.init(alloc, vopr_io.executor());
+    defer background_jobs.deinit();
+    backend_runtime.durable_jobs = background_jobs.lane();
 
     var lifecycle = request_lifecycle.Hook{ .vopr_io = &vopr_io };
     var data_lifecycle = request_lifecycle.DataHook{ .vopr_io = &vopr_io };

@@ -72,6 +72,19 @@ pub const SimRuntime = struct {
         return self.timers.items.len;
     }
 
+    /// Executes a transition owned by this runtime and reports whether the ID
+    /// belonged to it. Composite deterministic runtimes use this to merge the
+    /// narrow atomic executor with a larger scheduler without treating an ID
+    /// owned by another backend as an error.
+    pub fn executeReadyIfKnown(
+        self: *SimRuntime,
+        transition_id: ids.StableId,
+        sink: *event.Sink,
+        allocator: std.mem.Allocator,
+    ) !bool {
+        return try self.executeKnown(transition_id, sink, allocator);
+    }
+
     fn allocateSequence(self: *SimRuntime) !u64 {
         if (self.next_sequence == std.math.maxInt(u64)) return error.RuntimeSequenceExhausted;
         const result = self.next_sequence;
@@ -176,6 +189,11 @@ pub const SimRuntime = struct {
 
     fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink, allocator: std.mem.Allocator) !void {
         const self: *SimRuntime = @ptrCast(@alignCast(ptr));
+        if (!try self.executeKnown(transition_id, sink, allocator))
+            return error.UnknownRuntimeTransition;
+    }
+
+    fn executeKnown(self: *SimRuntime, transition_id: ids.StableId, sink: *event.Sink, allocator: std.mem.Allocator) !bool {
         for (self.tasks.items, 0..) |queued, index| {
             if (queued.transitionId() != transition_id) continue;
             const removed = self.tasks.orderedRemove(index);
@@ -187,7 +205,7 @@ pub const SimRuntime = struct {
                 .kind = .state_change,
                 .resource_id = removed.task.id,
             });
-            return;
+            return true;
         }
         for (self.timers.items, 0..) |queued, index| {
             if (queued.transitionId() != transition_id) continue;
@@ -202,11 +220,11 @@ pub const SimRuntime = struct {
                 .resource_id = removed.timer.id,
                 .payload_digest = removed.timer.deadline_ns,
             });
-            return;
+            return true;
         }
 
-        const deadline = self.nextDeadline() orelse return error.UnknownRuntimeTransition;
-        if (transition_id != ids.derive("runtime.time-advance", deadline, 0)) return error.UnknownRuntimeTransition;
+        const deadline = self.nextDeadline() orelse return false;
+        if (transition_id != ids.derive("runtime.time-advance", deadline, 0)) return false;
         if (deadline <= self.now_ns) return error.TimeAdvanceNotReady;
         self.now_ns = deadline;
         try sink.emit(allocator, .{
@@ -215,6 +233,7 @@ pub const SimRuntime = struct {
             .kind = .state_change,
             .payload_digest = deadline,
         });
+        return true;
     }
 
     fn nextDeadline(self: *const SimRuntime) ?u64 {

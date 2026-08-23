@@ -988,20 +988,28 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn drainAll(self: *ThreadedDurableJobLane) void {
-        lockAtomic(&self.reap_mutex);
-        defer self.reap_mutex.unlock();
         while (true) {
-            const entry = self.popAny() orelse return;
-            self.awaitAndDestroy(entry);
+            // Detaching under reap_mutex gives this caller exclusive ownership
+            // of the entry. Do not retain the global reap lock while awaiting
+            // the job: a durable job may close a nested DB/background owner,
+            // which must be allowed to enter this lane and drain its own jobs.
+            lockAtomic(&self.reap_mutex);
+            const entry = self.popAny();
+            self.reap_mutex.unlock();
+            const detached = entry orelse return;
+            self.awaitAndDestroy(detached);
         }
     }
 
     fn drainMatching(self: *ThreadedDurableJobLane, owner_id: u64) void {
-        lockAtomic(&self.reap_mutex);
-        defer self.reap_mutex.unlock();
         while (true) {
-            const entry = self.popOwner(owner_id) orelse return;
-            self.awaitAndDestroy(entry);
+            // See drainAll: awaiting outside reap_mutex is required for nested
+            // owner teardown and is safe once the entry has been detached.
+            lockAtomic(&self.reap_mutex);
+            const entry = self.popOwner(owner_id);
+            self.reap_mutex.unlock();
+            const detached = entry orelse return;
+            self.awaitAndDestroy(detached);
         }
     }
 
@@ -1225,6 +1233,68 @@ test "backend runtime threaded durable lane sees initialized jobs" {
         try std.testing.expect(ctx.ran.load(.acquire));
         try std.testing.expect(ctx.deinit_called.load(.acquire));
     }
+}
+
+test "backend runtime threaded durable job can close a nested owner while its owner drains" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Context = struct {
+        lane: DurableJobLane,
+        nested_owner_id: u64,
+        outer_ran: std.atomic.Value(bool) = .init(false),
+        nested_ran: std.atomic.Value(bool) = .init(false),
+        outer_deinited: std.atomic.Value(bool) = .init(false),
+        nested_deinited: std.atomic.Value(bool) = .init(false),
+
+        fn runOuter(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lane.closeOwner(self.nested_owner_id);
+            self.outer_ran.store(true, .release);
+        }
+
+        fn runNested(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.nested_ran.store(true, .release);
+        }
+
+        fn deinitOuter(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.outer_deinited.store(true, .release);
+        }
+
+        fn deinitNested(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.nested_deinited.store(true, .release);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const outer_owner_id = try handle.ptr().allocOwnerId();
+    const nested_owner_id = try handle.ptr().allocOwnerId();
+    const lane = handle.ptr().durable_jobs;
+    var context = Context{ .lane = lane, .nested_owner_id = nested_owner_id };
+    try lane.submit(.{
+        .owner_id = nested_owner_id,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.runNested,
+        .deinit = Context.deinitNested,
+    });
+    try lane.submit(.{
+        .owner_id = outer_owner_id,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.runOuter,
+        .deinit = Context.deinitOuter,
+    });
+
+    lane.drainOwner(outer_owner_id);
+    try std.testing.expect(context.outer_ran.load(.acquire));
+    try std.testing.expect(context.nested_ran.load(.acquire));
+    try std.testing.expect(context.outer_deinited.load(.acquire));
+    try std.testing.expect(context.nested_deinited.load(.acquire));
 }
 
 test "backend runtime allocates stable nonzero owner ids" {

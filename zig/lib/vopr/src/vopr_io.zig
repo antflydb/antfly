@@ -16,6 +16,7 @@ const std = @import("std");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
+const sim_runtime_mod = @import("sim_runtime.zig");
 const file_mod = @import("vopr_io_file.zig");
 const instrumentation_mod = @import("vopr_io_instrumentation.zig");
 const net_mod = @import("vopr_io_net.zig");
@@ -227,6 +228,7 @@ pub const VoprIo = struct {
     random_calls: u64 = 0,
     violation_count: u64 = 0,
     first_violation: ?CapabilityViolation = null,
+    atomic_runtime: sim_runtime_mod.SimRuntime,
     tasks: task_mod.Kernel,
     files: file_mod.FileSystem,
     network: net_mod.Network,
@@ -261,6 +263,7 @@ pub const VoprIo = struct {
             .realtime_ns = config.realtime_ns,
             .process_cpu_ns = config.process_cpu_ns,
             .thread_cpu_ns = config.thread_cpu_ns,
+            .atomic_runtime = sim_runtime_mod.SimRuntime.init(config.task_allocator, 0),
             .tasks = try task_mod.Kernel.init(config.task_allocator, config.tasks),
             .files = files,
             .network = network,
@@ -270,6 +273,7 @@ pub const VoprIo = struct {
     }
 
     pub fn deinit(self: *VoprIo) void {
+        self.atomic_runtime.deinit();
         self.tasks.deinit();
         self.files.deinit();
         self.network.deinit();
@@ -286,6 +290,13 @@ pub const VoprIo = struct {
     pub fn scheduler(self: *VoprIo) runtime_mod.SchedulerPort {
         self.bindNetwork();
         return .{ .ptr = self, .vtable = &scheduler_vtable };
+    }
+
+    /// Atomic application work composed into the same scheduler as std.Io
+    /// fibers, network delivery, and virtual time. This is the narrow bridge
+    /// for durable/background services that do not need a Future handle.
+    pub fn executor(self: *VoprIo) runtime_mod.Executor {
+        return self.atomic_runtime.runtime().executor;
     }
 
     pub fn safepoint(self: *VoprIo, stable_id: ids.StableId) std.Io.Cancelable!void {
@@ -1101,6 +1112,7 @@ fn netLookup(userdata: ?*anyopaque, host_name: std.Io.net.HostName, resolved: *s
 
 fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Allocator) !void {
     const self: *VoprIo = @ptrCast(@alignCast(ptr));
+    try self.atomic_runtime.scheduler().enumerateReady(list, allocator);
     try self.tasks.enumerateReady(list, allocator);
     try self.network.enumerateReady(list, allocator);
     if (self.tasks.nextWakeDelta(self.monotonic_ns, self.realtime_ns)) |delta_ns| {
@@ -1117,6 +1129,10 @@ fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Al
 
 fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink, allocator: std.mem.Allocator) !void {
     const self: *VoprIo = @ptrCast(@alignCast(ptr));
+    if (try self.atomic_runtime.executeReadyIfKnown(transition_id, sink, allocator)) {
+        try self.ensureNoCapabilityViolation();
+        return;
+    }
     if (try self.tasks.executeReady(transition_id)) |execution| {
         try self.ensureNoCapabilityViolation();
         try sink.emit(allocator, .{
@@ -1158,7 +1174,7 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
 
 fn quiescent(ptr: *anyopaque) bool {
     const self: *VoprIo = @ptrCast(@alignCast(ptr));
-    return self.tasks.isQuiescent() and self.network.isQuiescent();
+    return self.atomic_runtime.scheduler().quiescent() and self.tasks.isQuiescent() and self.network.isQuiescent();
 }
 
 const scheduler_vtable: runtime_mod.SchedulerPort.VTable = .{
@@ -1384,6 +1400,62 @@ test "VoprIo replay backend identities are canonical and compatibility checked" 
         error.IncompatibleVoprIoBackend,
         validateArtifactBackendIds(backend_ids[1..]),
     );
+}
+
+test "VoprIo composes atomic executor work into its scheduler" {
+    const Context = struct {
+        runs: usize = 0,
+        deinits: usize = 0,
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runs += 1;
+        }
+
+        fn deinitTask(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deinits += 1;
+        }
+    };
+
+    var backend = try VoprIo.init(.{ .task_allocator = std.testing.allocator });
+    defer backend.deinit();
+    var context = Context{};
+    const task_id = ids.stable("test", "vopr-io-atomic-executor");
+    try backend.executor().submit(.{
+        .id = task_id,
+        .name = "test.atomic_executor",
+        .context = &context,
+        .run_fn = Context.run,
+        .deinit_fn = Context.deinitTask,
+    });
+
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    try backend.scheduler().enumerateReady(&enabled, std.testing.allocator);
+    try enabled.canonicalize();
+    try std.testing.expectEqual(@as(usize, 1), enabled.items.items.len);
+    try std.testing.expectEqual(task_id, enabled.items.items[0].resource_id);
+
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    try backend.scheduler().executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), context.runs);
+    try std.testing.expectEqual(@as(usize, 1), context.deinits);
+    try std.testing.expect(backend.scheduler().quiescent());
+
+    const canceled_id = ids.stable("test", "vopr-io-atomic-executor-canceled");
+    try backend.executor().submit(.{
+        .id = canceled_id,
+        .name = "test.atomic_executor_cancel",
+        .context = &context,
+        .run_fn = Context.run,
+        .deinit_fn = Context.deinitTask,
+    });
+    try std.testing.expect(try backend.executor().cancel(canceled_id));
+    try std.testing.expectEqual(@as(usize, 1), context.runs);
+    try std.testing.expectEqual(@as(usize, 2), context.deinits);
+    try std.testing.expect(backend.scheduler().quiescent());
 }
 
 test "VoprIo scheduler controls nested futures and virtual sleep" {
