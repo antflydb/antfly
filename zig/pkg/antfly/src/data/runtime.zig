@@ -4637,11 +4637,16 @@ pub const DataServer = struct {
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
     const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
+    const ha_standby_replication_request_timeout_ms = 10_000;
 
     fn haStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
         return .{
             .max_response_bytes = ha_replication_default_max_response_bytes,
             .resolve_before_connect = true,
+            // DNS is part of the failover transport. A resolver outage must
+            // become a bounded failed round, not monopolize the only standby
+            // control loop for the host resolver's multi-minute retry budget.
+            .request_timeout_ms = ha_standby_replication_request_timeout_ms,
             // The upstream is a Kubernetes headless Service. Resolve every
             // bounded replication request so Pod replacement, fencing, and
             // endpoint-based isolation take effect even while the old Pod is
@@ -28458,6 +28463,7 @@ test "data runtime HA replication HTTP budget covers base64 apply envelope" {
     try std.testing.expect(cfg.max_response_bytes >= encoded_batch_bytes + 64 * 1024);
     try std.testing.expect(cfg.resolve_before_connect);
     try std.testing.expect(!cfg.cache_resolved_addresses);
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.request_timeout_ms);
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {

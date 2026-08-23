@@ -40,6 +40,10 @@ pub const StdHttpExecutorConfig = struct {
     /// disabled for Kubernetes headless Services: an old Pod can remain
     /// connectable after the Service authority has moved to a new endpoint.
     cache_resolved_addresses: bool = false,
+    /// Default end-to-end request deadline, including DNS lookup and connect,
+    /// when the individual request does not provide a tighter deadline. Zero
+    /// preserves the caller's unbounded behavior.
+    request_timeout_ms: u32 = 0,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -168,13 +172,17 @@ pub const StdHttpExecutor = struct {
         try self.beginRequest();
         defer self.endRequest();
 
-        if (req.cancellation) |cancellation| {
+        var effective_req = req;
+        if (effective_req.timeout_ms == null and self.cfg.request_timeout_ms > 0) {
+            effective_req.timeout_ms = self.cfg.request_timeout_ms;
+        }
+        if (effective_req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
-        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, req);
-        if (req.timeout_ms != null or req.cancellation != null)
-            return try self.executeWithControl(alloc, req);
-        return try self.executeDirect(alloc, req);
+        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, effective_req);
+        if (effective_req.timeout_ms != null or effective_req.cancellation != null)
+            return try self.executeWithControl(alloc, effective_req);
+        return try self.executeDirect(alloc, effective_req);
     }
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -267,6 +275,7 @@ pub const StdHttpExecutor = struct {
                 .connect_ms = 30_000,
                 .read_ms = 30_000,
                 .write_ms = 30_000,
+                .request_ms = cfg.request_timeout_ms,
             },
             .retry_policy = .{ .max_retries = 0 },
             .redirect_policy = .{ .follow_redirects = false },
@@ -613,6 +622,14 @@ test "resolved executor does not retain DNS authority unless explicitly enabled"
         .resolve_before_connect = true,
         .cache_resolved_addresses = true,
     }).cache_resolved_addresses);
+}
+
+test "executor request deadline bounds resolved transport by default" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .request_timeout_ms = 7_500,
+    };
+    try std.testing.expectEqual(@as(u64, 7_500), StdHttpExecutor.resolvedClientConfig(cfg).timeouts.request_ms);
 }
 
 test "std http executor owns a finite controlled request worker budget" {
