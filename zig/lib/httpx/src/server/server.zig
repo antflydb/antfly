@@ -98,6 +98,18 @@ pub const H1DisconnectCancellation = enum {
     disabled,
 };
 
+/// Backend-neutral hard-disconnect observation for virtual or embedded
+/// transports whose socket handles are not native process descriptors.
+/// Orderly half-close must return false; only a reset/abort is cancellation.
+pub const H1DisconnectProbe = struct {
+    ptr: ?*const anyopaque,
+    is_hard_disconnected: *const fn (?*const anyopaque, std.Io.net.Socket.Handle) bool,
+
+    pub fn requested(self: H1DisconnectProbe, handle: std.Io.net.Socket.Handle) bool {
+        return self.is_hard_disconnected(self.ptr, handle);
+    }
+};
+
 pub const ConnectionExecution = enum {
     /// Every accepted connection is submitted to HttpRuntime's bounded
     /// connection lane. Saturation rejects it without blocking accept.
@@ -134,6 +146,9 @@ pub const ServerConfig = struct {
     /// request-task lanes are sized to this configuration.
     http_runtime: ?*HttpRuntime = null,
     h1_disconnect_cancellation: H1DisconnectCancellation = .required,
+    /// Required when disconnect cancellation runs on borrowed std.Io lanes.
+    /// Native runtimes leave this null and use their descriptor observer.
+    h1_disconnect_probe: ?H1DisconnectProbe = null,
     /// Maximum H1 requests allowed to wait for a body after headers have been
     /// parsed. 0 inherits max_connections. This preserves connection capacity
     /// for control/recovery traffic during slow uploads.
@@ -189,6 +204,25 @@ pub const ServerConfig = struct {
         resolved.accept_error_backoff_initial_ms = @max(resolved.accept_error_backoff_initial_ms, 1);
         resolved.accept_error_backoff_max_ms = @max(resolved.accept_error_backoff_max_ms, resolved.accept_error_backoff_initial_ms);
         return resolved;
+    }
+};
+
+const H1DisconnectProbeContext = struct {
+    probe: H1DisconnectProbe,
+    handle: std.Io.net.Socket.Handle,
+    cancellation: *std.atomic.Value(bool),
+    runtime: *HttpRuntime,
+    recorded: bool = false,
+
+    fn requested(raw: ?*const anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw orelse return false)));
+        if (!self.probe.requested(self.handle)) return false;
+        self.cancellation.store(true, .release);
+        if (!self.recorded) {
+            self.runtime.recordBorrowedH1HardDisconnect();
+            self.recorded = true;
+        }
+        return true;
     }
 };
 
@@ -1414,7 +1448,15 @@ pub const Server = struct {
     /// (useful when port 0 is used for OS-assigned ports).
     pub fn bind(self: *Self) !void {
         if (self.listener != null) return;
-        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
+        if ((self.config.tls_cert_path == null) != (self.config.tls_key_path == null))
+            return error.InvalidServerTlsConfiguration;
+        // Direct server TLS is not implemented. Reject it before reserving
+        // runtime or socket capacity so deployments cannot accidentally serve
+        // plaintext on a port configured as HTTPS. The supported boundary is
+        // explicit TLS termination in a reverse proxy/load balancer.
+        if (self.config.tls_cert_path != null) return error.ServerTlsUnsupported;
+        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required and
+            self.config.h1_disconnect_probe == null)
             self.config.max_connections
         else
             0;
@@ -1469,10 +1511,6 @@ pub const Server = struct {
         if (self.shutdown_mode.load(.acquire) != 0) {
             self.running = false;
             return;
-        }
-
-        if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
-            std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
         var accept_error_backoff_ms = self.config.accept_error_backoff_initial_ms;
@@ -1603,6 +1641,12 @@ pub const Server = struct {
     }
 
     fn wakeListener(self: *Self) void {
+        // Before listen() publishes ownership there is no accept/admission wait
+        // to wake and the runtime lease may not exist yet (or may already have
+        // been released after listen returned). A concurrent stop still wins:
+        // listen() checks shutdown_mode on both sides of bind/startup.
+        if (!self.listen_started.load(.acquire)) return;
+
         // Only publish a permit when the listener has announced that it may
         // block in the admission gate. The listener consumes this permit before
         // leaving, so repeated stop/listen cycles cannot inflate capacity.
@@ -1979,14 +2023,28 @@ pub const Server = struct {
             connection.h1_request_cancellation.store(false, .release);
             ctx.cancellation = &connection.h1_request_cancellation;
             var cancellation_registration: CancellationObserver.Registration = .{};
+            var disconnect_probe_context: H1DisconnectProbeContext = undefined;
             if (self.config.h1_disconnect_cancellation == .required) {
-                cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
-                    sock.handle,
-                    &connection.h1_request_cancellation,
-                ) catch {
-                    try self.sendError(&sock, 503);
-                    return;
-                };
+                if (self.config.h1_disconnect_probe) |probe| {
+                    disconnect_probe_context = .{
+                        .probe = probe,
+                        .handle = sock.handle,
+                        .cancellation = &connection.h1_request_cancellation,
+                        .runtime = self.config.http_runtime orelse &self.owned_http_runtime,
+                    };
+                    ctx.cancellation_probe = .{
+                        .ptr = &disconnect_probe_context,
+                        .is_cancelled = H1DisconnectProbeContext.requested,
+                    };
+                } else {
+                    cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
+                        sock.handle,
+                        &connection.h1_request_cancellation,
+                    ) catch {
+                        try self.sendError(&sock, 503);
+                        return;
+                    };
+                }
             }
             defer cancellation_registration.deinit();
             defer ctx.deinit();

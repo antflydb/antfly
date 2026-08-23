@@ -785,6 +785,7 @@ const DataPublicHttpRuntime = struct {
         http_runtime: *httpx.HttpRuntime,
         cfg: antfly.raft.transport.StdHttpListenerConfig,
         api_server: *antfly.public_api.kernel_bridge.ApiHttpServer,
+        h1_disconnect_probe: ?httpx.H1DisconnectProbe,
     ) !*DataPublicHttpRuntime {
         var api_lane_lease = try backend_runtime.acquireApiLane();
         errdefer api_lane_lease.release();
@@ -796,8 +797,13 @@ const DataPublicHttpRuntime = struct {
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
             .server = blk: {
                 var server_cfg = publicApiHttpxConfig(cfg, http_runtime);
-                if (!http_runtime.supportsH1DisconnectCancellation())
-                    server_cfg.h1_disconnect_cancellation = .disabled;
+                if (!http_runtime.supportsH1DisconnectCancellation()) {
+                    if (h1_disconnect_probe) |probe| {
+                        server_cfg.h1_disconnect_probe = probe;
+                    } else {
+                        server_cfg.h1_disconnect_cancellation = .disabled;
+                    }
+                }
                 break :blk httpx.Server.initWithConfig(
                     alloc,
                     api_lane_lease.io(),
@@ -3056,6 +3062,7 @@ pub const DataServerConfig = struct {
     /// deterministic runtime drive the real DataServer without constructing a
     /// host-backed StdHttpExecutor. Executor contexts must outlive DataServer.
     metadata_request_executors: []const antfly.common.http.RequestExecutor = &.{},
+    h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
@@ -4599,6 +4606,7 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     ha_cfg: DataServerHAConfig = .{},
     /// Immutable startup role used by lock-free ingress policy snapshots.
@@ -4845,6 +4853,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
+            .h1_disconnect_probe = cfg.h1_disconnect_probe,
             .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
@@ -4888,6 +4897,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .h1_disconnect_probe = cfg.h1_disconnect_probe,
             .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
@@ -4931,6 +4941,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .h1_disconnect_probe = cfg.h1_disconnect_probe,
             .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
@@ -6257,6 +6268,7 @@ pub const DataServer = struct {
                 http_runtime,
                 self.listener_cfg,
                 &self.http_server.?,
+                self.h1_disconnect_probe,
             );
         }
     }
@@ -14665,6 +14677,7 @@ pub const DataServer = struct {
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
+            .h1_disconnect_probe = cfg.h1_disconnect_probe,
             .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,

@@ -122,6 +122,7 @@ pub const HttpRuntime = struct {
     reserved_connection_capacity: std.atomic.Value(usize) = .init(0),
     reserved_request_capacity: std.atomic.Value(usize) = .init(0),
     registration_failures_total: std.atomic.Value(u64) = .init(0),
+    borrowed_hard_disconnect_cancellations_total: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, config: Config) HttpRuntime {
         const listener_capacity = @max(config.max_listeners, 1);
@@ -215,7 +216,8 @@ pub const HttpRuntime = struct {
             .active_listener_leases = self.listener_leases.load(.acquire),
             .listener_capacity = self.listener_capacity,
             .active_h1_cancellation_observers = self.observer.activeCount(),
-            .h1_hard_disconnect_cancellations_total = self.observer.cancellations(),
+            .h1_hard_disconnect_cancellations_total = self.observer.cancellations() +|
+                self.borrowed_hard_disconnect_cancellations_total.load(.acquire),
             .h1_cancellation_observer_failures_total = self.observer.failures(),
             .h1_cancellation_registration_failures_total = self.registration_failures_total.load(.acquire),
             .healthy = self.observer.isHealthy(),
@@ -241,6 +243,10 @@ pub const HttpRuntime = struct {
 
     pub fn supportsNativeSocketTimeouts(self: *const HttpRuntime) bool {
         return self.borrowed_io == null;
+    }
+
+    pub fn recordBorrowedH1HardDisconnect(self: *HttpRuntime) void {
+        _ = self.borrowed_hard_disconnect_cancellations_total.fetchAdd(1, .monotonic);
     }
 
     fn releaseListener(

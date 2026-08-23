@@ -416,6 +416,18 @@ pub const VoprIo = struct {
         try self.files.crash();
     }
 
+    /// Injects a connection-reset style close rather than an orderly FIN.
+    /// This remains outside std.Io because std.Io exposes transport operations,
+    /// not test-only fault selection; consumers observe it through the
+    /// backend-neutral hard-disconnect probe below.
+    pub fn abortNetworkSocket(self: *VoprIo, handle: std.Io.net.Socket.Handle) !void {
+        try self.network.abort(handle);
+    }
+
+    pub fn socketPeerHardDisconnected(self: *const VoprIo, handle: std.Io.net.Socket.Handle) bool {
+        return self.network.peerHardDisconnected(handle);
+    }
+
     pub fn setCpuTime(self: *VoprIo, process_ns: i64, thread_ns: i64) void {
         self.process_cpu_ns = process_ns;
         self.thread_cpu_ns = thread_ns;

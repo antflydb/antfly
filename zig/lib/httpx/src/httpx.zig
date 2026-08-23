@@ -215,6 +215,7 @@ pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
+pub const H1DisconnectProbe = server_mod.H1DisconnectProbe;
 pub const HttpRuntime = http_runtime.HttpRuntime;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;

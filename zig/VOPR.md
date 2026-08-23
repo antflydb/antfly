@@ -572,6 +572,10 @@ VOPR work has found concrete production defects, not only harness gaps:
 - The standard HTTP listener shutdown path could close the listening socket
   before waking the accept loop, producing Debug `BADF` failures. Shutdown now
   wakes the loop before close.
+- A stop published before listener ownership, or after `listen` returned,
+  could try to wake through an unacquired/released `HttpRuntime` lease. Wakeup
+  is now gated by the listener's atomic ownership publication; startup still
+  observes the already-published stop on both sides of bind.
 - The independent-domain checkpoint exposed a latent compile defect caused by
   a local durable-job-lane variable shadowing the `lane` method.
 - httpx bypassed its supplied `std.Io` backend for ordinary POSIX reads and
@@ -585,6 +589,15 @@ VOPR work has found concrete production defects, not only harness gaps:
   native descriptor observer. It now supports caller-owned backend-neutral
   lanes, preserves bounded admission, and fails closed when native disconnect
   observation is requested from a backend that cannot provide it.
+- Borrowed HTTP runtimes could not observe a peer reset because the native
+  descriptor observer cannot inspect virtual socket handles; DataServer
+  consequently disabled hard-disconnect cancellation under deterministic I/O.
+  httpx now accepts a backend-neutral reset probe, and `VoprIo` distinguishes
+  reset from ordered FIN even when unread pipelined bytes remain.
+- Supplying server TLS certificate and key paths only printed a warning and
+  continued serving plaintext. Binding now rejects incomplete TLS
+  configuration and fails closed before reserving runtime or socket capacity;
+  the supported production boundary remains explicit TLS termination.
 - Production metadata/table-read setup assumed concrete Threaded executors.
   Transport-neutral request executors and generic `std.Io` fanout now allow the
   same DataServer composition to run deterministically.
@@ -780,10 +793,14 @@ The common listener and executors run on `VoprIo`; tests cover normal,
 single-byte partial-write, deadline-first cancellation, chunked request bodies,
 chunked streaming responses, keep-alive reuse, pipelining, half-close ordering,
 accept-versus-shutdown, bounded connection/request admission, minimum socket
-capacity, descriptor reuse, and overload recovery. Next, exercise TLS
-termination boundaries and a backend-neutral hard-disconnect signal. Native
-descriptor observation remains unavailable on virtual handles and borrowed
-lanes fail closed instead of polling a virtual descriptor through POSIX.
+capacity, descriptor reuse, and overload recovery. Hard disconnect now has a
+backend-neutral probe at the httpx handler boundary: native runtimes retain the
+shared descriptor observer, while `VoprIo` models reset separately from FIN and
+cancels an active handler even with unread pipelined input. Direct server TLS
+configuration fails closed before runtime or socket admission; the supported
+production boundary is explicit TLS termination at a reverse proxy or load
+balancer. Extend this suite when httpx gains a production server-side TLS
+implementation or another transport backend.
 
 ### 3. Background Runtime Lifecycle
 

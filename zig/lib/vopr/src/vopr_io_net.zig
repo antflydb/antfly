@@ -72,6 +72,10 @@ const SocketState = struct {
     read_open: bool = true,
     write_open: bool = true,
     peer_write_open: bool = true,
+    /// Unlike an orderly peer FIN, a hard abort means the peer abandoned both
+    /// directions and an in-flight application request may be canceled even
+    /// when pipelined bytes remain unread.
+    peer_hard_disconnected: bool = false,
     closed: bool = false,
 
     fn readResource(self: *const SocketState) ids.StableId {
@@ -407,6 +411,30 @@ pub const Network = struct {
             self.wait_port.?.wake(socket_state.acceptResource(), std.math.maxInt(u32)) catch {};
         }
         return valid;
+    }
+
+    pub fn abort(self: *Network, handle: std.Io.net.Socket.Handle) !void {
+        const socket_state = self.getSocket(handle) orelse return error.SocketUnconnected;
+        if (socket_state.closed) return error.SocketUnconnected;
+        socket_state.closed = true;
+        std.debug.assert(self.open_sockets > 0);
+        self.open_sockets -= 1;
+        socket_state.read_open = false;
+        socket_state.write_open = false;
+        if (socket_state.peer) |peer_handle| if (self.getSocket(peer_handle)) |peer| {
+            if (!peer.closed) {
+                peer.peer_write_open = false;
+                peer.peer_hard_disconnected = true;
+                try self.wait_port.?.wake(peer.readResource(), std.math.maxInt(u32));
+                try self.wait_port.?.wake(peer.writeResource(), std.math.maxInt(u32));
+            }
+        };
+        try self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32));
+    }
+
+    pub fn peerHardDisconnected(self: *const Network, handle: std.Io.net.Socket.Handle) bool {
+        const socket_state = self.getSocket(handle) orelse return true;
+        return socket_state.peer_hard_disconnected;
     }
 
     pub fn enumerateReady(self: *const Network, list: *transition.List, allocator: std.mem.Allocator) !void {

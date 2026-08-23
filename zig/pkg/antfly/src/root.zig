@@ -101,6 +101,7 @@ pub const admission_vopr = @import("vopr/admission.zig");
 pub const object_store_vopr = @import("vopr/object_store.zig");
 pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
 pub const http_lifecycle_vopr = @import("vopr/http_lifecycle.zig");
+pub const http_disconnect_vopr = @import("vopr/http_disconnect.zig");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
