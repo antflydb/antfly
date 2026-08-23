@@ -31,6 +31,8 @@ from e2e_scheduler import (
     _consolidate_scheduling_groups,
     e2e_resource,
     normalize_nodeid,
+    pytest_addoption,
+    pytest_configure,
     scheduling_group,
 )
 
@@ -95,6 +97,28 @@ class FakeWorker:
 
 def mark(name: str, *args: object, **kwargs: object) -> pytest.Mark:
     return pytest.Mark(name, args, kwargs, _ispytest=True)
+
+
+def test_process_slot_environment_default_uses_pytest_integer_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTFLY_E2E_PROCESS_SLOTS", "invalid")
+
+    with pytest.raises(pytest.UsageError, match="invalid int value: 'invalid'"):
+        parser = pytest.Parser(_ispytest=True)
+        pytest_addoption(parser)
+        parser.parse([])
+
+
+@pytest.mark.parametrize("slots", [0, -1])
+def test_process_slot_configuration_rejects_non_positive_values(slots: int) -> None:
+    config = SimpleNamespace(getoption=lambda name: slots)
+
+    with pytest.raises(
+        pytest.UsageError,
+        match="--e2e-process-slots must be a positive integer",
+    ):
+        pytest_configure(config)  # type: ignore[arg-type]
 
 
 def test_fixture_resource_decorator_rejects_inverted_order() -> None:

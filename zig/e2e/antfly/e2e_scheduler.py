@@ -1094,7 +1094,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--e2e-process-slots",
         type=int,
-        default=int(os.environ.get("ANTFLY_E2E_PROCESS_SLOTS", "2")),
+        # Keep environment defaults as text so pytest's argument parser applies
+        # the same integer conversion and concise usage error as a CLI value.
+        default=os.environ.get("ANTFLY_E2E_PROCESS_SLOTS", "2"),
         help="Maximum concurrently scheduled Antfly process or cluster work units.",
     )
     group.addoption(
