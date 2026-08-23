@@ -2689,8 +2689,7 @@ pub const HttpHandler = struct {
         defer if (session_initialized) session.deinit();
 
         if (requestHasSearchInputs(request)) {
-            var search_request = request;
-            search_request.graph_searches = null;
+            const search_request = requestWithoutGraphControls(request);
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -2852,14 +2851,21 @@ pub const HttpHandler = struct {
         for (query.order_by) |order| appendUniqueMetricDependency(&dependency_names, &dependency_count, order.name);
         for (query.where_metric) |filter| appendUniqueMetricDependency(&dependency_names, &dependency_count, filter.name);
         if (dependency_count == 0) return;
+        if (graphMetricPostProcessingNeeded(query) and result.nodes.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
 
-        const loaded = try self.alloc.alloc(graph_metric_segment_mod.Segment, dependency_count);
-        defer self.alloc.free(loaded);
-        var loaded_count: usize = 0;
-        defer for (loaded[0..loaded_count]) |*segment| segment.deinit(self.alloc);
-        for (dependency_names[0..dependency_count], 0..) |metric_name, i| {
-            loaded[i] = try query_mod.openGraphMetricAlloc(self.alloc, session, query.index_name, metric_name);
-            loaded_count += 1;
+        // Reject pathological multi-metric requests before decoding anything.
+        // Individual segments are also decoder-bounded; this aggregate bound
+        // controls total I/O/CPU while the sequential loop below controls peak
+        // memory independently of the dependency count.
+        const max_dependency_bytes: u64 = 512 * 1024 * 1024;
+        var dependency_bytes: u64 = 0;
+        for (dependency_names[0..dependency_count]) |metric_name| {
+            const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(self.alloc, query.index_name, metric_name);
+            defer self.alloc.free(artifact_name);
+            const artifact_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name) orelse return error.MetricNotReady;
+            const artifact = session.artifactRef(artifact_index) orelse return error.InvalidGraphMetricSegment;
+            dependency_bytes = std.math.add(u64, dependency_bytes, artifact.byte_len) catch return error.GraphMetricQueryBudgetExceeded;
+            if (dependency_bytes > max_dependency_bytes) return error.GraphMetricQueryBudgetExceeded;
         }
 
         const statuses = try self.alloc.alloc(db_types.GraphMetricStatus, dependency_count);
@@ -2869,23 +2875,21 @@ pub const HttpHandler = struct {
             for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
             self.alloc.free(statuses);
         };
-        for (loaded, dependency_names[0..dependency_count], 0..) |segment, metric_name, i| {
-            statuses[i] = try self.graphMetricStatusAlloc(session, metric_name, segment.config_fingerprint, segment.edge_filter, segment.converged, segment.iterations_completed, segment.delta);
-            initialized_statuses += 1;
+        for (result.nodes) |*node| {
+            if (node.metrics.len != 0) return error.InvalidGraphQueryResult;
+            const values = try self.alloc.alloc(graph_query_mod.GraphMetricValue, dependency_count);
+            for (values) |*value| value.* = .{ .name = "", .name_owned = false };
+            node.metrics = values;
         }
 
-        for (result.nodes) |*node| {
-            const values = try self.alloc.alloc(graph_query_mod.GraphMetricValue, dependency_count);
-            var initialized_values: usize = 0;
-            errdefer {
-                for (values[0..initialized_values]) |*value| value.deinit(self.alloc);
-                self.alloc.free(values);
+        for (dependency_names[0..dependency_count], 0..) |metric_name, i| {
+            var segment = try query_mod.openGraphMetricAlloc(self.alloc, session, query.index_name, metric_name);
+            defer segment.deinit(self.alloc);
+            statuses[i] = try self.graphMetricStatusAlloc(session, metric_name, segment.config_fingerprint, segment.edge_filter, segment.converged, segment.iterations_completed, segment.delta);
+            initialized_statuses += 1;
+            for (result.nodes) |*node| {
+                node.metrics[i] = .{ .name = statuses[i].name, .score = segment.score(node.key), .name_owned = false };
             }
-            for (loaded, statuses, 0..) |segment, status, i| {
-                values[i] = .{ .name = status.name, .score = segment.score(node.key), .name_owned = false };
-                initialized_values += 1;
-            }
-            node.metrics = values;
         }
         result.metric_status = statuses;
         statuses_owned = false;
@@ -2900,7 +2904,24 @@ pub const HttpHandler = struct {
             result.nodes = kept;
         }
         try self.retainPublicGraphMetricProjection(query.metrics, result.nodes);
+        if (result.paths.len > 0) try self.rebuildPublicGraphPathsFromNodes(result);
         try self.rebuildPublicGraphHitsFromNodes(result);
+    }
+
+    fn rebuildPublicGraphPathsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
+        const paths = try self.alloc.alloc(db_types.GraphPath, result.nodes.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (paths[0..initialized]) |path| graph_paths.freePath(self.alloc, path);
+            self.alloc.free(paths);
+        }
+        for (result.nodes, 0..) |node, i| {
+            paths[i] = try graphResultNodeToDbPathAlloc(self.alloc, node);
+            initialized += 1;
+        }
+        for (result.paths) |path| graph_paths.freePath(self.alloc, path);
+        self.alloc.free(result.paths);
+        result.paths = paths;
     }
 
     fn filterPublicGraphMetricNodes(self: *HttpHandler, filters: []const graph_query_mod.GraphMetricFilter, result: *db_types.GraphSearchResult) !void {
@@ -3588,8 +3609,18 @@ pub const HttpHandler = struct {
             for (paths.items) |path| graph_paths.freePath(self.alloc, path);
             paths.deinit(self.alloc);
         }
+        var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+        errdefer {
+            for (nodes.items) |*node| node.deinit(self.alloc);
+            nodes.deinit(self.alloc);
+        }
 
-        for (start_keys) |start_key| {
+        const execution_limit: u32 = if (graphMetricPostProcessingNeeded(named_query.query))
+            graph_query_mod.graph_metric_candidate_limit + 1
+        else
+            named_query.query.params.max_results;
+
+        outer: for (start_keys) |start_key| {
             for (target_keys) |target_key| {
                 var req = query_mod.GraphShortestPathRequest{
                     .index_name = try self.alloc.dupe(u8, named_query.query.index_name),
@@ -3605,14 +3636,20 @@ pub const HttpHandler = struct {
                 if (maybe_path) |owned_path| {
                     var path = owned_path;
                     defer query_mod.freeGraphShortestPath(self.alloc, &path);
-                    try paths.append(self.alloc, try toDbGraphPath(self.alloc, path));
+                    const db_path = try toDbGraphPath(self.alloc, path);
+                    errdefer graph_paths.freePath(self.alloc, db_path);
+                    try nodes.append(self.alloc, try graphPathToResultNodeAlloc(self.alloc, db_path));
+                    try paths.append(self.alloc, db_path);
+                    if (execution_limit > 0 and paths.items.len >= execution_limit) break :outer;
                 }
             }
         }
+        if (graphMetricPostProcessingNeeded(named_query.query) and nodes.items.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
 
         const total_hits: u32 = @intCast(paths.items.len);
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
+            .nodes = try nodes.toOwnedSlice(self.alloc),
             .paths = try paths.toOwnedSlice(self.alloc),
             .hits = &.{},
             .total_hits = total_hits,
@@ -3786,7 +3823,7 @@ pub const HttpHandler = struct {
             start_key_refs,
             named_query.query.pattern,
             .{
-                .max_results = named_query.query.params.max_results,
+                .max_results = if (graphMetricPostProcessingNeeded(named_query.query)) graph_query_mod.graph_metric_candidate_limit + 1 else named_query.query.params.max_results,
                 .return_aliases = named_query.query.return_aliases,
                 .target_nodes = target_nodes,
                 .target_required = named_query.query.target_nodes != null,
@@ -3798,11 +3835,18 @@ pub const HttpHandler = struct {
             },
         );
         defer graph_pattern_mod.freeMatches(self.alloc, raw_matches);
+        if (graphMetricPostProcessingNeeded(named_query.query) and raw_matches.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
 
         const matches = try self.convertPatternMatchesToGraphMatchesAlloc(raw_matches);
         errdefer {
             for (matches) |*match| match.deinit(self.alloc);
             if (matches.len > 0) self.alloc.free(matches);
+        }
+
+        const nodes = try collectUniquePublicPatternNodesAlloc(self.alloc, matches);
+        errdefer {
+            for (nodes) |*node| node.deinit(self.alloc);
+            if (nodes.len > 0) self.alloc.free(nodes);
         }
 
         const hits = try self.buildPatternDocumentHitsAlloc(named_query.query, matches, if (need_docs) docs else null);
@@ -3813,7 +3857,7 @@ pub const HttpHandler = struct {
 
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
-            .nodes = &.{},
+            .nodes = nodes,
             .paths = &.{},
             .matches = matches,
             .hits = hits,
@@ -5326,11 +5370,23 @@ fn findGraphSegmentAdjacency(
 }
 
 fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
-    return request.full_text_search != null or
+    return request.query != null or
+        request.full_text_search != null or
         request.embeddings != null or
         request.semantic_search != null or
         request.filter_query != null or
         request.exclusion_query != null;
+}
+
+fn requestWithoutGraphControls(request: metadata_openapi.QueryRequest) metadata_openapi.QueryRequest {
+    var search_request = request;
+    // Graph controls execute against the same pinned serverless session after
+    // ordinary retrieval. They must not reach the ordinary search planner,
+    // whose public allowlist intentionally excludes graph-only fields.
+    search_request.graph_searches = null;
+    search_request.graph_metric = null;
+    search_request.graph_metric_rerank = null;
+    return search_request;
 }
 
 fn graphMetricPostProcessingNeeded(query: graph_query_mod.GraphQuery) bool {
@@ -5523,6 +5579,119 @@ fn traversalDistance(node: query_mod.GraphTraversalNode) f64 {
     var total: f64 = 0;
     for (edge_path) |hop| total += hop.weight;
     return total;
+}
+
+fn graphPathToResultNodeAlloc(alloc: Allocator, path: db_types.GraphPath) !graph_query_mod.GraphResultNode {
+    const target = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
+    const nodes = try alloc.alloc([]const u8, path.nodes.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
+    for (path.nodes, 0..) |node, i| {
+        nodes[i] = try alloc.dupe(u8, node);
+        initialized_nodes += 1;
+    }
+
+    const edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, path.edges.len);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (edges[0..initialized_edges]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
+    for (path.edges, 0..) |edge, i| {
+        const source = try alloc.dupe(u8, edge.source);
+        errdefer alloc.free(source);
+        const edge_target = try alloc.dupe(u8, edge.target);
+        errdefer alloc.free(edge_target);
+        const edge_type = try alloc.dupe(u8, edge.edge_type);
+        edges[i] = .{
+            .source = source,
+            .target = edge_target,
+            .edge_type = edge_type,
+            .weight = edge.weight,
+            .metadata = "",
+        };
+        initialized_edges += 1;
+    }
+
+    return .{
+        .key = try alloc.dupe(u8, target),
+        .depth = path.length,
+        .distance = path.total_weight,
+        .path = nodes,
+        .path_edges = edges,
+    };
+}
+
+fn graphResultNodeToDbPathAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !db_types.GraphPath {
+    const source_nodes = node.path orelse return error.InvalidGraphQueryResult;
+    const source_edges = node.path_edges orelse return error.InvalidGraphQueryResult;
+    const nodes = try alloc.alloc([]const u8, source_nodes.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |item| alloc.free(item);
+        alloc.free(nodes);
+    }
+    for (source_nodes, 0..) |item, i| {
+        nodes[i] = try alloc.dupe(u8, item);
+        initialized_nodes += 1;
+    }
+    const edges = try alloc.alloc(graph_paths.PathEdge, source_edges.len);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (edges[0..initialized_edges]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
+    for (source_edges, 0..) |edge, i| {
+        const source = try alloc.dupe(u8, edge.source);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, edge.target);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, edge.edge_type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+        edges[i] = .{ .source = source, .target = target, .edge_type = edge_type, .weight = edge.weight, .metadata = metadata };
+        initialized_edges += 1;
+    }
+    return .{ .nodes = nodes, .edges = edges, .total_weight = node.distance, .length = node.depth };
+}
+
+fn collectUniquePublicPatternNodesAlloc(alloc: Allocator, matches: []const db_types.GraphPatternMatch) ![]graph_query_mod.GraphResultNode {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    errdefer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            const gop = try seen.getOrPut(alloc, binding.node.key);
+            if (gop.found_existing) continue;
+            const key = try alloc.dupe(u8, binding.node.key);
+            errdefer alloc.free(key);
+            try nodes.append(alloc, .{
+                .key = key,
+                .depth = binding.node.depth,
+                .distance = binding.node.distance,
+                .path = null,
+                .path_edges = null,
+            });
+        }
+    }
+    return try nodes.toOwnedSlice(alloc);
 }
 
 fn toDbGraphPath(alloc: Allocator, path: query_mod.GraphShortestPath) !db_types.GraphPath {
@@ -10478,6 +10647,19 @@ test "serverless public graph query rejects exact sort controls" {
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
+}
+
+test "serverless ordinary search planning strips every graph metric control" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"full_text_search":{"query":"needle"},"graph_metric":{"index":"graph_idx","metric":"pagerank"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank"},"graph_searches":{}}
+    , .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer parsed.deinit();
+    const search_request = requestWithoutGraphControls(parsed.value);
+    try std.testing.expect(search_request.full_text_search != null);
+    try std.testing.expect(search_request.graph_metric == null);
+    try std.testing.expect(search_request.graph_metric_rerank == null);
+    try std.testing.expect(search_request.graph_searches == null);
 }
 
 test "serverless graph HTTP result copies are allocation-failure safe" {

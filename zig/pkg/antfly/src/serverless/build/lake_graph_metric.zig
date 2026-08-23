@@ -77,6 +77,90 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
     return .{ .kind = .graph_metric_segment, .name = name, .artifact_id = artifact_id, .byte_len = metadata.byte_len, .checksum = checksum };
 }
 
+/// Builds a metric only from bytes verified against the immutable graph
+/// artifact reference. Production callers should prefer this entry point so a
+/// caller cannot accidentally publish a metric whose provenance names bytes
+/// other than those that were actually evaluated.
+pub fn publishFromGraphArtifactAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    options: BuildOptions,
+) !artifact_ref.ArtifactRef {
+    if (options.source_graph.byte_len > options.limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    const graph_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+        alloc,
+        options.source_graph.artifact_id,
+        options.source_graph.byte_len,
+        options.source_graph.checksum,
+        options.cancellation,
+    );
+    defer alloc.free(graph_payload);
+    return try publishFromGraphPayloadAlloc(alloc, artifacts, graph_payload, options);
+}
+
+/// Publishes several metric configurations from one verified fetch and one
+/// graph decode. This is the normal lifecycle entry point for a graph index;
+/// its peak graph memory is constant and its graph verification/decoding cost
+/// does not grow with the number of configured metrics.
+pub fn publishManyFromGraphArtifactAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    limits: Limits,
+) ![]artifact_ref.ArtifactRef {
+    if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
+    if (graph_index_name.len == 0 or source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
+    if (source_graph.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs);
+    const graph_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+        alloc,
+        source_graph.artifact_id,
+        source_graph.byte_len,
+        source_graph.checksum,
+        cancellation,
+    );
+    defer alloc.free(graph_payload);
+    var graph = try graph_segment.decodeAlloc(alloc, graph_payload);
+    defer graph.deinit(alloc);
+
+    const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (refs[0..initialized]) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(refs);
+    }
+    for (configs, 0..) |config, i| {
+        try cancellation.check();
+        var built = try buildFromSegmentAlloc(alloc, graph, .{
+            .graph_index_name = graph_index_name,
+            .config = config,
+            .source_graph = source_graph,
+            .cancellation = cancellation,
+            .limits = limits,
+        });
+        defer built.deinit(alloc);
+        var metadata = try artifacts.put(built.payload);
+        defer metadata.deinit(alloc);
+        const name = try alloc.dupe(u8, built.artifact.name);
+        errdefer alloc.free(name);
+        const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
+        errdefer alloc.free(artifact_id);
+        const checksum = try alloc.dupe(u8, metadata.checksum);
+        refs[i] = .{
+            .kind = .graph_metric_segment,
+            .name = name,
+            .artifact_id = artifact_id,
+            .byte_len = metadata.byte_len,
+            .checksum = checksum,
+        };
+        initialized += 1;
+    }
+    return refs;
+}
+
 fn buildFromSegmentAlloc(alloc: Allocator, graph: graph_segment.Segment, options: BuildOptions) !BuildResult {
     try options.cancellation.check();
     var ordinals = std.StringHashMapUnmanaged(usize).empty;
@@ -88,9 +172,6 @@ fn buildFromSegmentAlloc(alloc: Allocator, graph: graph_segment.Segment, options
 
     for (graph.adjacencies, 0..) |adjacency, adjacency_index| {
         if (adjacency_index % 256 == 0) try options.cancellation.check();
-        // Metrics are defined over every graph node, including isolated nodes
-        // and nodes whose incident edges are excluded by the metric filter.
-        _ = try getOrPutNode(alloc, &ordinals, &node_ids, adjacency.node_id, options.limits.max_nodes);
         for (adjacency.out_edges) |edge| {
             if (!edgeAllowed(options.config.edge_filter, edge.edge_type)) continue;
             const source = try getOrPutNode(alloc, &ordinals, &node_ids, adjacency.node_id, options.limits.max_nodes);
@@ -147,6 +228,9 @@ fn buildFromSegmentAlloc(alloc: Allocator, graph: graph_segment.Segment, options
 
 fn validateOptions(graph_payload: []const u8, options: BuildOptions) !void {
     if (graph_payload.len == 0 or graph_payload.len > options.limits.max_graph_payload_bytes or options.graph_index_name.len == 0 or options.config.name.len == 0 or options.source_graph.kind != .graph_segment or options.source_graph.artifact_id.len == 0 or options.source_graph.checksum.len == 0 or options.limits.max_metric_payload_bytes == 0) return error.InvalidGraphMetricBuildOptions;
+    if (options.source_graph.byte_len != graph_payload.len) return error.ArtifactIntegrityMismatch;
+    artifact_store.validateSha256ArtifactIdentity(options.source_graph.artifact_id, options.source_graph.checksum) catch return error.ArtifactIntegrityMismatch;
+    try artifact_store.validatePayloadSha256WithCancellation(graph_payload, options.source_graph.checksum, options.cancellation);
     try graph_mod.validateGraphMetricEdgeFilters(&.{}, &.{options.config});
 }
 
@@ -224,7 +308,7 @@ fn lessScore(_: void, a: metric_segment.Score, b: metric_segment.Score) bool {
     return std.mem.lessThan(u8, a.node_id, b.node_id);
 }
 
-fn configFingerprint(config: graph_mod.GraphMetricConfig) u64 {
+pub fn configFingerprint(config: graph_mod.GraphMetricConfig) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hashU64(&hasher, @intFromEnum(config.kind));
     hashU64(&hasher, @bitCast(config.damping));
@@ -271,13 +355,34 @@ test "serverless lake graph metrics build immutable pagerank and degree vectors"
     graph.adjacencies[2] = .{ .node_id = try alloc.dupe(u8, "isolated"), .out_edges = try alloc.alloc(graph_segment.Edge, 0), .in_edges = try alloc.alloc(graph_segment.Edge, 0) };
     const graph_payload = try graph_segment.encodeAlloc(alloc, graph);
     defer alloc.free(graph_payload);
-    const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = "sha256:graph", .byte_len = graph_payload.len, .checksum = "graph-checksum" };
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(graph_payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    var artifact_id_buf: [artifact_store.sha256_artifact_id_prefix.len + checksum.len]u8 = undefined;
+    const artifact_id = try std.fmt.bufPrint(&artifact_id_buf, "{s}{s}", .{ artifact_store.sha256_artifact_id_prefix, checksum });
+    const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = artifact_id, .byte_len = graph_payload.len, .checksum = &checksum };
     var built = try buildFromGraphPayloadAlloc(alloc, graph_payload, .{ .graph_index_name = "graph", .config = .{ .name = "pagerank" }, .source_graph = source });
     defer built.deinit(alloc);
     var decoded = try metric_segment.decodeAlloc(alloc, built.payload);
     defer decoded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), decoded.scores.len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.scores.len);
     try std.testing.expect(decoded.score("b").? > decoded.score("a").?);
-    try std.testing.expect(decoded.score("isolated") != null);
+    try std.testing.expect(decoded.score("isolated") == null);
     try std.testing.expectEqualStrings("5:graph8:pagerank", built.artifact.name);
+
+    var tampered = try alloc.dupe(u8, graph_payload);
+    defer alloc.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, buildFromGraphPayloadAlloc(alloc, tampered, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "pagerank" },
+        .source_graph = source,
+    }));
+    var wrong_length = source;
+    wrong_length.byte_len += 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, buildFromGraphPayloadAlloc(alloc, graph_payload, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "pagerank" },
+        .source_graph = wrong_length,
+    }));
 }

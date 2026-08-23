@@ -29,6 +29,9 @@ const source_binding = @import("../segment/source_binding.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const lake_sidecar_algebraic = @import("lake_sidecar_algebraic.zig");
 const lake_sidecar_graph = @import("lake_sidecar_graph.zig");
+const graph_metric_config = @import("graph_metric_config.zig");
+const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
+const lake_graph_metric = @import("lake_graph_metric.zig");
 const lake_sidecar_sparse = @import("lake_sidecar_sparse.zig");
 const lake_sidecar_text = @import("lake_sidecar_text.zig");
 const lake_sidecar_vector = @import("lake_sidecar_vector.zig");
@@ -509,7 +512,12 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, table);
     defer desired.deinit(alloc);
 
-    const published = try publishedArtifactsFromDeclarationsAlloc(alloc, published_declarations);
+    var base_declarations = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    defer base_declarations.deinit(alloc);
+    for (published_declarations) |declaration| {
+        if (declaration.binding.sidecar_kind != .graph_metric) try base_declarations.append(alloc, declaration);
+    }
+    const published = try publishedArtifactsFromDeclarationsAlloc(alloc, base_declarations.items);
     defer alloc.free(published);
 
     var operation_plan = try planOperationsAlloc(alloc, desired.artifacts, published);
@@ -518,7 +526,143 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     var executed = try executeOperationsAlloc(alloc, artifacts, source_provider, operation_plan);
     defer executed.deinit(alloc);
 
-    return try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
+    var reconciled = try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
+    defer reconciled.deinit(alloc);
+    return try appendExternalGraphMetricDeclarationsAlloc(alloc, artifacts, table.indexes_json, reconciled.artifacts, published_declarations);
+}
+
+fn appendExternalGraphMetricDeclarationsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    indexes_json: []const u8,
+    base_declarations: []const sidecar_manifest.DeclaredArtifact,
+    published_declarations: []const sidecar_manifest.DeclaredArtifact,
+) !ReconciledManifest {
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+
+    var declarations = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    errdefer {
+        for (declarations.items) |declaration| freeOwnedDeclaration(alloc, declaration);
+        declarations.deinit(alloc);
+    }
+    try declarations.ensureUnusedCapacity(alloc, base_declarations.len);
+    for (base_declarations) |declaration| declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
+
+    for (specs) |spec| {
+        const graph_declaration = findDeclaration(base_declarations, spec.index_name) orelse continue;
+        if (graph_declaration.binding.sidecar_kind != .graph or graph_declaration.artifact.kind != .graph_segment) return error.SidecarArtifactKindMismatch;
+
+        var reusable = true;
+        for (spec.configs) |config| {
+            const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+            defer alloc.free(metric_name);
+            const existing = findDeclaration(published_declarations, metric_name) orelse {
+                reusable = false;
+                break;
+            };
+            if (existing.binding.sidecar_kind != .graph_metric or
+                !source_binding.sameSourceSnapshot(existing.binding, graph_declaration.binding))
+            {
+                reusable = false;
+                break;
+            }
+            const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+                alloc,
+                existing.artifact.artifact_id,
+                existing.artifact.byte_len,
+                existing.artifact.checksum,
+                .none,
+            );
+            defer alloc.free(payload);
+            var segment = try graph_metric_segment.decodeAlloc(alloc, payload);
+            defer segment.deinit(alloc);
+            if (!std.mem.eql(u8, segment.graph_index_name, spec.index_name) or
+                !std.mem.eql(u8, segment.metric_name, config.name) or
+                !std.mem.eql(u8, segment.source_graph_artifact_id, graph_declaration.artifact.artifact_id) or
+                !std.mem.eql(u8, segment.source_graph_checksum, graph_declaration.artifact.checksum) or
+                segment.config_fingerprint != lake_graph_metric.configFingerprint(config))
+            {
+                reusable = false;
+                break;
+            }
+        }
+
+        if (reusable) {
+            try declarations.ensureUnusedCapacity(alloc, spec.configs.len);
+            for (spec.configs) |config| {
+                const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+                defer alloc.free(metric_name);
+                const existing = findDeclaration(published_declarations, metric_name) orelse unreachable;
+                declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, existing));
+            }
+            continue;
+        }
+
+        const built = try lake_graph_metric.publishManyFromGraphArtifactAlloc(
+            alloc,
+            artifacts,
+            spec.index_name,
+            graph_declaration.artifact,
+            spec.configs,
+            .none,
+            .{},
+        );
+        defer {
+            for (built) |artifact| lake_graph_metric.freeArtifactRef(alloc, artifact);
+            alloc.free(built);
+        }
+        try declarations.ensureUnusedCapacity(alloc, built.len);
+        for (spec.configs, built) |config, artifact| {
+            declarations.appendAssumeCapacity(try graphMetricDeclarationAlloc(alloc, graph_declaration, config, artifact));
+        }
+    }
+
+    const owned = try declarations.toOwnedSlice(alloc);
+    errdefer {
+        for (owned) |declaration| freeOwnedDeclaration(alloc, declaration);
+        alloc.free(owned);
+    }
+    const result = ReconciledManifest{ .artifacts = owned };
+    try result.manifest().validate();
+    return result;
+}
+
+fn findDeclaration(
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+    name: []const u8,
+) ?sidecar_manifest.DeclaredArtifact {
+    for (declarations) |declaration| if (std.mem.eql(u8, declaration.name, name)) return declaration;
+    return null;
+}
+
+fn graphMetricDeclarationAlloc(
+    alloc: Allocator,
+    graph_declaration: sidecar_manifest.DeclaredArtifact,
+    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    artifact: manifest_artifact.ArtifactRef,
+) !sidecar_manifest.DeclaredArtifact {
+    const name = try alloc.dupe(u8, artifact.name);
+    errdefer alloc.free(name);
+    var binding = try cloneBindingAlloc(alloc, graph_declaration.binding);
+    errdefer freeOwnedBinding(alloc, binding);
+    binding.sidecar_kind = .graph_metric;
+    const metric_config_hash = try std.fmt.allocPrint(
+        alloc,
+        "graph-metric-v1:{x}:{s}",
+        .{ lake_graph_metric.configFingerprint(config), graph_declaration.artifact.artifact_id },
+    );
+    alloc.free(binding.index_config_hash);
+    binding.index_config_hash = metric_config_hash;
+    const owned_artifact = try cloneArtifactRefAlloc(alloc, artifact);
+    errdefer {
+        if (owned_artifact.name.len != 0) alloc.free(owned_artifact.name);
+        alloc.free(owned_artifact.artifact_id);
+        alloc.free(owned_artifact.checksum);
+    }
+    const declaration = sidecar_manifest.DeclaredArtifact{ .name = name, .binding = binding, .artifact = owned_artifact };
+    try declaration.validate();
+    return declaration;
 }
 
 pub fn planOperationsAlloc(
@@ -1373,6 +1517,7 @@ fn builderKindForDesired(want: DesiredArtifact) !BuilderKind {
         .sparse => .sparse,
         .graph => .graph,
         .algebraic => error.AmbiguousLakeRebuildBuilder,
+        .graph_metric => error.MissingLakeRebuildBuildSpec,
     };
 }
 
@@ -1384,6 +1529,7 @@ fn buildSpecForDesiredAlloc(alloc: Allocator, want: DesiredArtifact) !BuildSpec 
         .sparse => .{ .sparse = .{ .sparse_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
         .graph => .{ .graph = .{ .graph_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
         .algebraic => error.MissingLakeRebuildBuildSpec,
+        .graph_metric => error.MissingLakeRebuildBuildSpec,
     };
 }
 
@@ -1783,7 +1929,6 @@ const TestRowSourceState = struct {
 const MemoryArtifactStore = struct {
     alloc: Allocator,
     entries: std.StringArrayHashMapUnmanaged([]u8) = .empty,
-    next_id: usize = 0,
 
     fn init(alloc: Allocator) MemoryArtifactStore {
         return .{ .alloc = alloc };
@@ -1805,18 +1950,22 @@ const MemoryArtifactStore = struct {
     }
 
     fn put(self: *MemoryArtifactStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        const artifact_id = try std.fmt.allocPrint(alloc, "mem:{d}", .{self.next_id});
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const artifact_id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ artifact_store.sha256_artifact_id_prefix, hex });
         errdefer alloc.free(artifact_id);
-        self.next_id += 1;
-        const key = try self.alloc.dupe(u8, artifact_id);
-        errdefer self.alloc.free(key);
-        const bytes = try self.alloc.dupe(u8, contents);
-        errdefer self.alloc.free(bytes);
-        try self.entries.put(self.alloc, key, bytes);
+        if (!self.entries.contains(artifact_id)) {
+            const key = try self.alloc.dupe(u8, artifact_id);
+            errdefer self.alloc.free(key);
+            const bytes = try self.alloc.dupe(u8, contents);
+            errdefer self.alloc.free(bytes);
+            try self.entries.put(self.alloc, key, bytes);
+        }
         return .{
             .artifact_id = artifact_id,
             .byte_len = @intCast(contents.len),
-            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{contents.len}),
+            .checksum = try alloc.dupe(u8, &hex),
         };
     }
 
@@ -1835,10 +1984,13 @@ const MemoryArtifactStore = struct {
 
     fn stat(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
+        const owned_id = try alloc.dupe(u8, artifact_id);
+        errdefer alloc.free(owned_id);
+        const checksum = try alloc.dupe(u8, try artifact_store.sha256ChecksumFromArtifactId(artifact_id));
         return .{
-            .artifact_id = try alloc.dupe(u8, artifact_id),
+            .artifact_id = owned_id,
             .byte_len = @intCast(bytes.len),
-            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{bytes.len}),
+            .checksum = checksum,
         };
     }
 
@@ -2388,7 +2540,7 @@ test "lake rebuild operation executor publishes row-source sidecars" {
     const executed = result.find("docs.body_text").?;
     try std.testing.expectEqual(Action.rebuild, executed.action);
     try std.testing.expect(executed.declaration != null);
-    try std.testing.expectEqualStrings("mem:0", executed.artifact_id);
+    try std.testing.expect(std.mem.startsWith(u8, executed.artifact_id, artifact_store.sha256_artifact_id_prefix));
     const stored = try artifacts.getAlloc(executed.artifact_id);
     defer alloc.free(stored);
     try std.testing.expect(stored.len > 0);
@@ -2493,8 +2645,14 @@ test "lake rebuild reconciles resolved external sidecars end to end" {
         .{ .external = .{ .source_id = "docs", .snapshot_id = "parquet-31", .file_id = "file-a.parquet", .row_group_ordinal = 0, .row_ordinal = 1 } },
     };
     const bodies = [_][]const u8{ "lake rebuild workflow", "sidecar reconcile" };
+    const target_key = try source_binding.rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(target_key);
+    const first_graph = try std.fmt.allocPrint(alloc, "[{{\"target\":{f},\"edge_type\":\"cites\"}}]", .{std.json.fmt(target_key, .{})});
+    defer alloc.free(first_graph);
+    const graph_values = [_][]const u8{ first_graph, "[]" };
     const columns = [_]rowsource.ColumnVector{
         .{ .name = "body", .values = .{ .bytes = &bodies } },
+        .{ .name = "graph_edges", .values = .{ .json = &graph_values } },
     };
     const batches = [_]rowsource.ColumnBatch{.{
         .snapshot = .{ .table_id = "docs", .snapshot_id = "parquet-31" },
@@ -2511,23 +2669,41 @@ test "lake rebuild reconciles resolved external sidecars end to end" {
         inventory,
         .{
             .table_name = "docs",
-            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}",
         },
         &.{},
     );
     defer reconciled.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), reconciled.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 3), reconciled.artifacts.len);
     const declaration = reconciled.find("body_text").?;
     try std.testing.expectEqual(source_binding.SidecarKind.text, declaration.binding.sidecar_kind);
     try std.testing.expectEqual(rowsource.SourceKind.external_parquet, declaration.binding.source_kind);
     try std.testing.expectEqualStrings("docs", declaration.binding.source_id);
     try std.testing.expectEqualStrings("parquet-31", declaration.binding.snapshot_id);
     try std.testing.expectEqualStrings("schema-v3", declaration.binding.schema_fingerprint);
-    try std.testing.expectEqualStrings("mem:0", declaration.artifact.artifact_id);
+    try std.testing.expect(std.mem.startsWith(u8, declaration.artifact.artifact_id, artifact_store.sha256_artifact_id_prefix));
     const stored = try artifacts.getAlloc(declaration.artifact.artifact_id);
     defer alloc.free(stored);
     try std.testing.expect(stored.len > 0);
+
+    const graph_declaration = reconciled.find("graph_idx").?;
+    const metric_artifact_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "rank");
+    defer alloc.free(metric_artifact_name);
+    const metric_declaration = reconciled.find(metric_artifact_name).?;
+    try std.testing.expectEqual(source_binding.SidecarKind.graph_metric, metric_declaration.binding.sidecar_kind);
+    const metric_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+        alloc,
+        metric_declaration.artifact.artifact_id,
+        metric_declaration.artifact.byte_len,
+        metric_declaration.artifact.checksum,
+        .none,
+    );
+    defer alloc.free(metric_payload);
+    var metric = try graph_metric_segment.decodeAlloc(alloc, metric_payload);
+    defer metric.deinit(alloc);
+    try std.testing.expectEqualStrings(graph_declaration.artifact.artifact_id, metric.source_graph_artifact_id);
+    try std.testing.expect(metric.score(target_key) != null);
 }
 
 test "lake rebuild operation planner preserves reuse and drop artifacts" {

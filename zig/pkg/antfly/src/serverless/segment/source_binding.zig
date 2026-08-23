@@ -24,6 +24,7 @@ pub const SidecarKind = enum(u8) {
     sparse = 3,
     graph = 4,
     algebraic = 5,
+    graph_metric = 6,
 };
 
 pub const RowRefKind = enum(u8) {

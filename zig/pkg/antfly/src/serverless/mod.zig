@@ -288,6 +288,7 @@ pub const LakeGraphMetricBuildOptions = build.LakeGraphMetricBuildOptions;
 pub const LakeGraphMetricBuildResult = build.LakeGraphMetricBuildResult;
 pub const buildLakeGraphMetricFromGraphPayloadAlloc = build.buildLakeGraphMetricFromGraphPayloadAlloc;
 pub const publishLakeGraphMetricFromGraphPayloadAlloc = build.publishLakeGraphMetricFromGraphPayloadAlloc;
+pub const publishLakeGraphMetricFromGraphArtifactAlloc = build.publishLakeGraphMetricFromGraphArtifactAlloc;
 pub const LakeSparseSidecarBuildOptions = build.LakeSparseSidecarBuildOptions;
 pub const LakeSparseSidecarBuildResult = build.LakeSparseSidecarBuildResult;
 pub const LakeSparseSidecarPublishResult = build.LakeSparseSidecarPublishResult;
@@ -720,6 +721,7 @@ test "serverless module compiles" {
     _ = LakeGraphMetricBuildResult;
     _ = buildLakeGraphMetricFromGraphPayloadAlloc;
     _ = publishLakeGraphMetricFromGraphPayloadAlloc;
+    _ = publishLakeGraphMetricFromGraphArtifactAlloc;
     _ = LakeSparseSidecarBuildOptions;
     _ = LakeSparseSidecarBuildResult;
     _ = LakeSparseSidecarPublishResult;

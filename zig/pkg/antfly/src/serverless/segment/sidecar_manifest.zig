@@ -71,6 +71,7 @@ pub fn artifactKindForSidecarKind(kind: source_binding.SidecarKind) artifact_ref
         .sparse => .sparse_segment,
         .graph => .graph_segment,
         .algebraic => .algebraic_segment,
+        .graph_metric => .graph_metric_segment,
     };
 }
 
@@ -81,6 +82,7 @@ pub fn sidecarKindForArtifactKind(kind: artifact_ref.ArtifactKind) ?source_bindi
         .sparse_segment => .sparse,
         .graph_segment => .graph,
         .algebraic_segment => .algebraic,
+        .graph_metric_segment => .graph_metric,
         else => null,
     };
 }
