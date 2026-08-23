@@ -297,6 +297,8 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    graph_distinct_budget_exceeded,
+    graph_anchor_filter_requires_index,
 };
 
 pub const Status = extern struct {
@@ -412,6 +414,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
+        error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -882,6 +886,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
+        .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
     };
 }
 

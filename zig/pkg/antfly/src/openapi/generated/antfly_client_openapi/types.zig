@@ -4351,6 +4351,7 @@ pub const GraphBoundedTraversalConfig = struct {
 pub const GraphCountAggregate = struct {
     /// Use `*` to count rows, or an alias to count non-null bindings.
     count: []const u8,
+    /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 };
 
@@ -4750,7 +4751,7 @@ pub const GraphKeyNodeSelector = struct {
 };
 
 pub const GraphMatch = struct {
-    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity.
+    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
     anchor: []const u8,
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
@@ -4776,7 +4777,7 @@ pub const GraphMatchNode = struct {
     filter: ?GraphDocumentFilter = null,
 };
 
-/// Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission.
+/// Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted.
 pub const GraphMatchQuery = struct {
     index: []const u8,
     match: GraphMatch,

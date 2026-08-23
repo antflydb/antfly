@@ -15,7 +15,8 @@ class GraphCountAggregate:
     """
     Attributes:
         count (str): Use `*` to count rows, or an alias to count non-null bindings.
-        distinct (bool | Unset):  Default: False.
+        distinct (bool | Unset): Count exact table-qualified identities. Exact distinct sets share a request memory
+            budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count. Default: False.
     """
 
     count: str

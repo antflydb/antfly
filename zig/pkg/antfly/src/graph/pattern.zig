@@ -32,6 +32,8 @@ pub const max_count_aggregates: usize = 64;
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
+pub const default_max_distinct_identities: usize = 100_000;
+pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
 
 pub const NodeFilter = struct {
     filter_prefix: []const u8 = "",
@@ -178,6 +180,11 @@ pub const MatchOptions = struct {
     /// anchors are storage-scan input, not graph expansion, and therefore do not
     /// consume this budget; every reached node and examined edge still does.
     work_budget: ?*WorkBudget = null,
+    /// Optional request-scoped budget for the exact identity sets retained by
+    /// count(distinct alias). The budget is shared across aggregate specs and
+    /// cursor pages so exact aggregation either completes or fails closed with
+    /// bounded memory.
+    distinct_budget: ?*DistinctBudget = null,
 };
 
 pub const WorkBudget = struct {
@@ -196,6 +203,30 @@ pub const WorkBudget = struct {
     fn consumeEdges(self: *WorkBudget, count: usize) !void {
         if (count > self.remaining_edges) return error.QueryCandidateBudgetExceeded;
         self.remaining_edges -= count;
+    }
+};
+
+pub const DistinctBudget = struct {
+    remaining_identities: usize,
+    remaining_identity_bytes: usize,
+
+    pub fn init(max_identities: usize, max_identity_bytes: usize) DistinctBudget {
+        return .{
+            .remaining_identities = max_identities,
+            .remaining_identity_bytes = max_identity_bytes,
+        };
+    }
+
+    pub fn consume(self: *DistinctBudget, ref: node_identity.Ref) !void {
+        const identity_bytes = std.math.add(
+            usize,
+            if (ref.table) |table| table.len else 0,
+            ref.key.len,
+        ) catch return error.GraphDistinctBudgetExceeded;
+        if (self.remaining_identities == 0 or identity_bytes > self.remaining_identity_bytes)
+            return error.GraphDistinctBudgetExceeded;
+        self.remaining_identities -= 1;
+        self.remaining_identity_bytes -= identity_bytes;
     }
 };
 
@@ -1357,13 +1388,18 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
     try validateConjunctivePattern(pattern);
 
     const accumulators = try alloc.alloc(StreamingCountAccumulator, specs.len);
+    var local_distinct_budget = DistinctBudget.init(
+        default_max_distinct_identities,
+        default_max_distinct_identity_bytes,
+    );
+    const distinct_budget = aggregate_opts.distinct_budget orelse &local_distinct_budget;
     var initialized_accumulators: usize = 0;
     errdefer {
         for (accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
         if (accumulators.len > 0) alloc.free(accumulators);
     }
     for (specs, 0..) |spec, i| {
-        accumulators[i] = .{ .spec = spec };
+        accumulators[i] = .{ .spec = spec, .distinct_budget = distinct_budget };
         initialized_accumulators += 1;
     }
 
@@ -1432,6 +1468,7 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
 
 const StreamingCountAccumulator = struct {
     spec: CountAggregateSpec,
+    distinct_budget: *DistinctBudget,
     value: u128 = 0,
     seen: node_identity.Map(void) = .{},
     distinct_values: std.ArrayListUnmanaged(node_identity.Ref) = .empty,
@@ -1448,6 +1485,7 @@ const StreamingCountAccumulator = struct {
         }
         const ref = node_identity.Ref{ .table = binding.table, .key = binding.key };
         if (self.seen.contains(ref)) return;
+        try self.distinct_budget.consume(ref);
         try appendOwnedIdentity(alloc, &self.distinct_values, binding.table, binding.key);
         const owned = self.distinct_values.items[self.distinct_values.items.len - 1];
         _ = try self.seen.putIfAbsent(alloc, owned, {});
@@ -2652,6 +2690,68 @@ test "prevalidated conjunctive anchors skip duplicate checks but reached nodes r
     try std.testing.expectEqual(@as(u128, 0), aggregates[0].value);
     try std.testing.expectEqual(@as(usize, 1), checks.admission_nodes);
     try std.testing.expectEqual(@as(usize, 1), checks.filter_nodes);
+}
+
+test "exact distinct aggregates share a fail-closed identity and byte budget" {
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]MatchNode{.{ .alias = "a" }};
+    const specs = [_]CountAggregateSpec{
+        .{ .alias = "a", .distinct = true },
+        .{ .alias = "a", .distinct = true },
+    };
+
+    var identity_budget = DistinctBudget.init(1, 1024);
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        aggregateConjunctivePatternWithEdgeReader(
+            std.testing.allocator,
+            Reader{},
+            &.{ "one", "two" },
+            .{ .anchor_alias = "a", .nodes = &nodes, .edges = &.{} },
+            &specs,
+            .{ .distinct_budget = &identity_budget },
+        ),
+    );
+
+    // Repeated identities are retained once per distinct set, but separate
+    // aggregate specs share the request budget because each owns a set.
+    var shared_budget = DistinctBudget.init(2, 1024);
+    const repeated = try aggregateConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{ "same", "same" },
+        .{ .anchor_alias = "a", .nodes = &nodes, .edges = &.{} },
+        &specs,
+        .{ .distinct_budget = &shared_budget },
+    );
+    defer {
+        for (repeated) |*aggregate| aggregate.deinit(std.testing.allocator);
+        std.testing.allocator.free(repeated);
+    }
+    try std.testing.expectEqual(@as(u128, 1), repeated[0].value);
+    try std.testing.expectEqual(@as(u128, 1), repeated[1].value);
+    try std.testing.expectEqual(@as(usize, 0), shared_budget.remaining_identities);
+
+    var byte_budget = DistinctBudget.init(10, 3);
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        aggregateConjunctivePatternWithEdgeReader(
+            std.testing.allocator,
+            Reader{},
+            &.{"four"},
+            .{ .anchor_alias = "a", .nodes = &nodes, .edges = &.{} },
+            specs[0..1],
+            .{ .distinct_budget = &byte_budget },
+        ),
+    );
 }
 
 test "conjunctive anchor selection prefers filters and ignores declaration order" {

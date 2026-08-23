@@ -5115,6 +5115,12 @@ fn completeGraphMatchAnchorFilterAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn graphMatchAnchorScanError(has_filter: bool, err: anyerror) anyerror {
+    if (has_filter and err == error.UnsupportedQueryRequest)
+        return error.GraphAnchorFilterRequiresIndex;
+    return err;
+}
+
 const ProvisionedMatchAnchorPager = struct {
     source: *ProvisionedTableReadSource,
     group_ids: []const u64,
@@ -5137,7 +5143,7 @@ const ProvisionedMatchAnchorPager = struct {
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
         if (anchor_filter) |value| anchor_req.filter_query_json = value;
-        return try queryProvisionedAcrossGroupsAtGenerations(
+        return queryProvisionedAcrossGroupsAtGenerations(
             self.source,
             alloc,
             self.group_ids,
@@ -5145,7 +5151,13 @@ const ProvisionedMatchAnchorPager = struct {
             self.table_name,
             self.consistency,
             self.generations,
-        );
+        ) catch |err| {
+            // The anchor scan is a controlled `_id` cursor query. When its
+            // combined MATCH/auth filter cannot be resolved by native storage
+            // filtering, exact enumeration must fail closed with graph-specific
+            // remediation instead of exposing an internal sort-planner error.
+            return graphMatchAnchorScanError(anchor_filter != null, err);
+        };
     }
 };
 
@@ -5171,7 +5183,7 @@ const HostedMatchAnchorPager = struct {
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
         if (anchor_filter) |value| anchor_req.filter_query_json = value;
-        return try queryHostedAcrossGroupsAtGenerations(
+        return queryHostedAcrossGroupsAtGenerations(
             self.source,
             alloc,
             self.group_ids,
@@ -5179,7 +5191,9 @@ const HostedMatchAnchorPager = struct {
             self.table_name,
             self.consistency,
             self.generations,
-        );
+        ) catch |err| {
+            return graphMatchAnchorScanError(anchor_filter != null, err);
+        };
     }
 };
 
@@ -5272,6 +5286,21 @@ test "complete graph match anchor scan is independent per named operation" {
     try std.testing.expectEqualStrings(
         "{\"bool\":{\"must\":[{\"ids\":[\"a\"]},{\"term\":{\"tenant\":\"one\"}}]}}",
         combined,
+    );
+}
+
+test "complete graph match anchor scan reports native filter coverage failures" {
+    try std.testing.expectEqual(
+        error.GraphAnchorFilterRequiresIndex,
+        graphMatchAnchorScanError(true, error.UnsupportedQueryRequest),
+    );
+    try std.testing.expectEqual(
+        error.UnsupportedQueryRequest,
+        graphMatchAnchorScanError(false, error.UnsupportedQueryRequest),
+    );
+    try std.testing.expectEqual(
+        error.ReadUnavailable,
+        graphMatchAnchorScanError(true, error.ReadUnavailable),
     );
 }
 

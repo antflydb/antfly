@@ -3056,7 +3056,10 @@ components:
           description: >-
             Alias enumerated from the query table as the source relation. Every
             other alias is reached through graph edges and may resolve to a
-            table-qualified target identity.
+            table-qualified target identity. Filters on this alias, including
+            row-level authorization filters, must have native index coverage so
+            Antfly can enumerate the complete relation in `_id` order; otherwise
+            the request fails with `graph_anchor_filter_requires_index`.
         nodes:
           type: object
           minProperties: 1
@@ -3079,7 +3082,13 @@ components:
         count:
           type: string
           description: Use `*` to count rows, or an alias to count non-null bindings.
-        distinct: { type: boolean, default: false }
+        distinct:
+          type: boolean
+          default: false
+          description: >-
+            Count exact table-qualified identities. Exact distinct sets share a
+            request memory budget and fail with
+            `graph_distinct_budget_exceeded` instead of returning a partial count.
     GraphBindingsReturn:
       type: object
       additionalProperties: false
@@ -3129,7 +3138,9 @@ components:
         Results are exact or the request fails; execution never labels a partial
         aggregate exact. Source anchors are streamed in stable snapshot-pinned
         pages; transient expansion state remains bounded, and execution observes
-        request deadlines, cancellation, and server resource admission.
+        request deadlines, cancellation, and server resource admission. Exact
+        distinct identity sets are also bounded and fail closed when their
+        request-scoped memory budget is exhausted.
       properties:
         index: { type: string }
         match: { $ref: '#/components/schemas/GraphMatch' }

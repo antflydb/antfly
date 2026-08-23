@@ -24,7 +24,9 @@ class GraphMatch:
     """
     Attributes:
         anchor (str): Alias enumerated from the query table as the source relation. Every other alias is reached through
-            graph edges and may resolve to a table-qualified target identity.
+            graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level
+            authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id`
+            order; otherwise the request fails with `graph_anchor_filter_requires_index`.
         nodes (GraphMatchNodes):
         edges (list[GraphMatchEdge]):
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):

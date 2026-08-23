@@ -11790,7 +11790,7 @@ export interface components {
             where?: components["schemas"]["GraphWhereExpression"];
         };
         GraphMatch: {
-            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. */
+            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
             anchor: string;
             nodes: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
@@ -11814,7 +11814,10 @@ export interface components {
         GraphCountAggregate: {
             /** @description Use `*` to count rows, or an alias to count non-null bindings. */
             count: string;
-            /** @default false */
+            /**
+             * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+             * @default false
+             */
             distinct?: boolean;
         };
         GraphAggregatesReturn: {
@@ -11824,7 +11827,7 @@ export interface components {
         };
         /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
         GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
-        /** @description Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. */
+        /** @description Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted. */
         GraphMatchQuery: {
             index: string;
             match: components["schemas"]["GraphMatch"];

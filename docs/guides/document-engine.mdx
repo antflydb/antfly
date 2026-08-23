@@ -270,9 +270,15 @@ named graph operation.
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached
-node.
+node. Because exact anchors are cursor-scanned in `_id` order, fields used by the
+anchor or authorization filters must have native index coverage. Antfly returns
+`graph_anchor_filter_requires_index` when it cannot prove that complete scan;
+index the referenced fields rather than relying on stored-source fallback.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 its graph work budget, the request fails instead of returning a partial count.
+Exact `count(distinct alias)` sets also share a request-scoped identity and byte
+budget. Exhaustion returns `graph_distinct_budget_exceeded`; narrow the anchor
+predicate or use a non-distinct aggregate.
 
 The deprecated `graph_searches` request field remains a wire-compatibility
 adapter for the v0.2 shape. New clients should generate only `graph_queries`.

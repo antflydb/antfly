@@ -19,6 +19,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -107,6 +108,8 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        GraphDistinctBudgetExceeded,
+        GraphAnchorFilterRequiresIndex,
         HierarchyCursorStale,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
@@ -746,6 +749,26 @@ fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_distinct_budget_exceeded",
+        .message = "exact graph distinct aggregation exceeded its memory budget; narrow match.anchor or remove distinct",
+        .retryable = false,
+        .max_distinct_identities = graph_pattern_mod.default_max_distinct_identities,
+        .max_distinct_identity_bytes = graph_pattern_mod.default_max_distinct_identity_bytes,
+    }, .{});
+}
+
+pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_anchor_filter_requires_index",
+        .message = "exact graph anchor enumeration requires native index coverage for match.anchor and authorization filters",
+        .retryable = false,
+    }, .{});
+}
+
 pub fn handleTableBatch(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -897,6 +920,14 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.GraphDistinctBudgetExceeded => {
+                std.log.warn("public table graph distinct budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphDistinctBudgetExceededBody(alloc), .json = true };
+            },
+            error.GraphAnchorFilterRequiresIndex => {
+                std.log.warn("public table graph anchor filter lacks native index coverage table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphAnchorFilterRequiresIndexBody(alloc), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -3136,6 +3167,84 @@ test "public table query handler maps candidate budget exhaustion" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps exact graph execution failures" {
+    const Kind = enum { distinct_budget, anchor_filter };
+    const Backend = struct {
+        fn iface(kind: *Kind) TableApi {
+            return .{
+                .ptr = kind,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const kind: *Kind = @ptrCast(@alignCast(ptr));
+            return switch (kind.*) {
+                .distinct_budget => error.GraphDistinctBudgetExceeded,
+                .anchor_filter => error.GraphAnchorFilterRequiresIndex,
+            };
+        }
+    };
+
+    var kind = Kind.distinct_budget;
+    var resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var distinct = try std.json.parseFromSlice(struct {
+        @"error": []const u8,
+        retryable: bool,
+        max_distinct_identities: usize,
+        max_distinct_identity_bytes: usize,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer distinct.deinit();
+    try std.testing.expectEqualStrings("graph_distinct_budget_exceeded", distinct.value.@"error");
+    try std.testing.expect(!distinct.value.retryable);
+    try std.testing.expectEqual(graph_pattern_mod.default_max_distinct_identities, distinct.value.max_distinct_identities);
+    try std.testing.expectEqual(graph_pattern_mod.default_max_distinct_identity_bytes, distinct.value.max_distinct_identity_bytes);
+
+    kind = .anchor_filter;
+    var anchor_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer anchor_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), anchor_resp.status);
+    var anchor = try std.json.parseFromSlice(struct {
+        @"error": []const u8,
+        retryable: bool,
+    }, std.testing.allocator, anchor_resp.body, .{ .ignore_unknown_fields = true });
+    defer anchor.deinit();
+    try std.testing.expectEqualStrings("graph_anchor_filter_requires_index", anchor.value.@"error");
+    try std.testing.expect(!anchor.value.retryable);
 }
 
 test "public table query handler maps unsupported exact sort" {

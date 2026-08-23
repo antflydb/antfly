@@ -4699,6 +4699,8 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
+            error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });

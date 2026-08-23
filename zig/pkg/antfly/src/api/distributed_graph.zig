@@ -1722,12 +1722,21 @@ const AggregatePageAccumulator = struct {
     value: u128 = 0,
     seen: graph_node_identity.Map(void) = .{},
 
-    fn observe(self: *@This(), alloc: std.mem.Allocator, page: graph_pattern_mod.CountAggregateResult) !void {
+    fn observe(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        page: graph_pattern_mod.CountAggregateResult,
+        distinct_budget: *graph_pattern_mod.DistinctBudget,
+    ) !void {
         if (!self.distinct) {
             self.value = std.math.add(u128, self.value, page.value) catch return error.QueryCandidateBudgetExceeded;
             return;
         }
-        for (page.distinct_values) |identity| _ = try self.seen.putIfAbsent(alloc, identity, {});
+        for (page.distinct_values) |identity| {
+            if (self.seen.contains(identity)) continue;
+            try distinct_budget.consume(identity);
+            _ = try self.seen.putIfAbsent(alloc, identity, {});
+        }
         self.value = @intCast(self.seen.count());
     }
 
@@ -1939,6 +1948,10 @@ fn executeDistributedConjunctivePattern(
         aggregate_accumulators[i] = .{ .distinct = spec.distinct };
         initialized_accumulators += 1;
     }
+    var distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        graph_pattern_mod.default_max_distinct_identities,
+        graph_pattern_mod.default_max_distinct_identity_bytes,
+    );
 
     var collected_matches = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
     defer {
@@ -1994,7 +2007,11 @@ fn executeDistributedConjunctivePattern(
                 for (computed) |*aggregate| aggregate.deinit(alloc);
                 if (computed.len > 0) alloc.free(computed);
             }
-            for (computed, 0..) |aggregate, i| try aggregate_accumulators[i].observe(alloc, aggregate);
+            for (computed, 0..) |aggregate, i| try aggregate_accumulators[i].observe(
+                alloc,
+                aggregate,
+                &distinct_budget,
+            );
         } else {
             var page_opts = base_opts;
             const desired = std.math.add(usize, graph_query.query.return_limit, 1) catch return error.QueryCandidateBudgetExceeded;
@@ -4687,6 +4704,164 @@ test "distributed graph paged anchors use page completion instead of cursor-rela
     );
 }
 
+test "distributed graph paged execution trusts only source-filtered anchors across cursor pages" {
+    const alloc = std.testing.allocator;
+    const Pager = struct {
+        fetches: usize = 0,
+        authorization_rejections: usize = 0,
+        match_filter_rejections: usize = 0,
+
+        fn fetch(
+            ptr: *anyopaque,
+            page_alloc: std.mem.Allocator,
+            _: db_mod.types.NamedGraphQuery,
+            search_after: []const std.json.Value,
+        ) !db_mod.types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fetches += 1;
+            var candidate_index: usize = 0;
+            if (search_after.len > 0) {
+                if (search_after.len != 1) return error.InvalidQueryResult;
+                const cursor = switch (search_after[0]) {
+                    .string => |value| value,
+                    else => return error.InvalidQueryResult,
+                };
+                if (!std.mem.startsWith(u8, cursor, "anchor:")) return error.InvalidQueryResult;
+                candidate_index = try std.fmt.parseInt(usize, cursor["anchor:".len..], 10);
+                candidate_index += 1;
+            }
+
+            var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+            errdefer {
+                for (hits.items) |*hit| hit.deinit(page_alloc);
+                hits.deinit(page_alloc);
+            }
+            while (candidate_index < 4099 and hits.items.len < complete_match_anchor_page_size) : (candidate_index += 1) {
+                if (candidate_index == 1) {
+                    self.authorization_rejections += 1;
+                    continue;
+                }
+                if (candidate_index == 4097) {
+                    self.match_filter_rejections += 1;
+                    continue;
+                }
+                try hits.append(page_alloc, .{
+                    .id = try std.fmt.allocPrint(page_alloc, "anchor:{d:0>5}", .{candidate_index}),
+                });
+            }
+            const owned_hits = try hits.toOwnedSlice(page_alloc);
+            return .{
+                .alloc = page_alloc,
+                .hits = owned_hits,
+                .total_hits = @intCast(owned_hits.len),
+                .total_hits_relation = if (owned_hits.len == complete_match_anchor_page_size) .gte else .exact,
+            };
+        }
+    };
+
+    const nodes = [_]graph_pattern_mod.MatchNode{.{
+        .alias = "anchor",
+        .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"allowed\"}}" },
+    }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const source_req = db_mod.types.SearchRequest{
+        .filter_query_json = "{\"term\":{\"tenant\":\"authorized\"}}",
+    };
+    const base_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+        .total_hits = 0,
+    };
+
+    var pager = Pager{};
+    var admission = GraphNodeAdmissionContext.init(
+        alloc,
+        undefined,
+        undefined,
+        "docs",
+        0,
+        source_req,
+        null,
+        &.{},
+        .{},
+        .read_index,
+    );
+    defer admission.deinit();
+    const edge_reader = DistributedEdgeReader{
+        .catalog = undefined,
+        .worker = undefined,
+        .source_table = "docs",
+        .index_name = "graph",
+        .consistency = .read_index,
+        .admission = &admission,
+    };
+
+    const row_query = db_mod.types.NamedGraphQuery{
+        .name = "rows",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = pattern,
+            .return_aliases = &.{"anchor"},
+            .return_limit = 5000,
+        },
+    };
+    var row_state = QueryState{ .name = try alloc.dupe(u8, row_query.name) };
+    var rows = try executeDistributedConjunctivePattern(
+        alloc,
+        edge_reader,
+        source_req,
+        row_query,
+        .{ .paged = .{ .ctx = &pager, .fetch_fn = Pager.fetch } },
+        base_result,
+        &admission,
+        &row_state,
+    );
+    defer rows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4097), rows.matches.len);
+    try std.testing.expectEqual(@as(usize, 2), pager.fetches);
+    try std.testing.expectEqual(@as(usize, 1), pager.authorization_rejections);
+    try std.testing.expectEqual(@as(usize, 1), pager.match_filter_rejections);
+
+    pager = .{};
+    const aggregates = [_]graph_query_mod.NamedCountAggregate{.{
+        .name = "matches",
+        .of = "*",
+    }};
+    const aggregate_query = db_mod.types.NamedGraphQuery{
+        .name = "counts",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = pattern,
+            .aggregates = &aggregates,
+        },
+    };
+    var aggregate_state = QueryState{ .name = try alloc.dupe(u8, aggregate_query.name) };
+    var counts = try executeDistributedConjunctivePattern(
+        alloc,
+        edge_reader,
+        source_req,
+        aggregate_query,
+        .{ .paged = .{ .ctx = &pager, .fetch_fn = Pager.fetch } },
+        base_result,
+        &admission,
+        &aggregate_state,
+    );
+    defer counts.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), counts.aggregates.len);
+    try std.testing.expectEqual(@as(u128, 4097), counts.aggregates[0].value);
+    try std.testing.expectEqual(@as(usize, 2), pager.fetches);
+    try std.testing.expectEqual(@as(usize, 1), pager.authorization_rejections);
+    try std.testing.expectEqual(@as(usize, 1), pager.match_filter_rejections);
+}
+
 test "distributed graph duplicate distinct aggregates share one merge payload" {
     const alloc = std.testing.allocator;
     var accumulators = [_]AggregatePageAccumulator{.{ .distinct = true, .value = 1 }};
@@ -4710,6 +4885,39 @@ test "distributed graph duplicate distinct aggregates share one merge payload" {
     try std.testing.expect(aggregates[0].distinct_values_owned);
     try std.testing.expect(!aggregates[1].distinct_values_owned);
     try std.testing.expectEqual(aggregates[0].distinct_values.ptr, aggregates[1].distinct_values.ptr);
+}
+
+test "distributed graph exact distinct merge budget spans cursor pages" {
+    const alloc = std.testing.allocator;
+    var accumulator = AggregatePageAccumulator{ .distinct = true };
+    defer accumulator.deinit(alloc);
+    var budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+
+    const first_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:1" }};
+    try accumulator.observe(alloc, .{
+        .value = 1,
+        .distinct_values = @constCast(first_values[0..]),
+    }, &budget);
+    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_identities);
+
+    // A duplicate on a later page neither grows the exact set nor consumes
+    // another unit of request memory.
+    try accumulator.observe(alloc, .{
+        .value = 1,
+        .distinct_values = @constCast(first_values[0..]),
+    }, &budget);
+    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
+
+    const next_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:2" }};
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        accumulator.observe(alloc, .{
+            .value = 1,
+            .distinct_values = @constCast(next_values[0..]),
+        }, &budget),
+    );
+    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
 }
 
 test "distributed graph canonical MATCH admission excludes retrieval predicates" {
