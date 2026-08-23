@@ -7173,6 +7173,16 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
     storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
+    const lmdb_vopr_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    lmdb_vopr_test_mod.addImport("vopr", vopr_mod);
+    const lmdb_vopr_tests = b.addTest(.{
+        .root_module = lmdb_vopr_test_mod,
+        .filters = &.{"LMDB VOPR"},
+    });
+    const run_lmdb_vopr_tests = addFilteredTestRunArtifact(b, lmdb_vopr_tests);
+    const lmdb_vopr_test_step = b.step("lmdb-vopr-test", "Run replayable C-versus-Zig LMDB VOPR campaigns");
+    lmdb_vopr_test_step.dependOn(&run_lmdb_vopr_tests.step);
+
     const storage_sim_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_sim_runtime_root.zig"),
         .target = target,
@@ -7491,6 +7501,7 @@ pub fn build(b: *std.Build) void {
     const storage_vopr_step = b.step("storage-vopr-test", "Run storage modeled-time/model-I/O VOPR smoke and simulation checks");
     storage_vopr_step.dependOn(&run_storage_sim_runtime_tests.step);
     storage_vopr_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    storage_vopr_step.dependOn(&run_lmdb_vopr_tests.step);
     storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
     storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);

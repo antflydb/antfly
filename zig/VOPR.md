@@ -1294,8 +1294,8 @@ can be modeled without weakening production parity.
 
 ### Raft Runtime
 
-Status: planned migration; the metadata adapter already exposes selected Raft
-HTTP messages and node rounds, but a reusable per-group Raft scenario remains.
+Status: implemented. The metadata adapter exposes selected Raft HTTP messages
+and node rounds, and `raft/vopr.zig` supplies the reusable per-group scenario.
 
 Expose atomic host rounds, per-group scheduler choices, message deliveries,
 snapshot operations, persistence/apply completions, and backpressure. Reuse the
@@ -1303,9 +1303,9 @@ existing differential trace corpus and compare selected histories with etcd.
 
 ### Modeled Storage
 
-Status: partially implemented. WAL uses the common runner; LMDB, persistent
-index, DB split, index manager, and LSM retain their focused simulators pending
-adapter-by-adapter replay parity.
+Status: partially implemented. WAL and LMDB use the common runner. Persistent
+index, DB split, and index manager have modeled VOPR build gates but still need
+common artifact/CLI parity; LSM retains its focused simulator pending migration.
 
 Adapt WAL, LMDB, persistent index, DB split, index manager, and LSM campaigns to
 the common trace/property interface. Preserve their focused reference models
@@ -1395,9 +1395,9 @@ pkg/antfly/src/sim/
     metadata/
     distributed-data/
     transaction/
-    raft/              # planned migration namespace
+    raft/              # promoted-fixture namespace
     wal/               # planned promoted-fixture namespace
-    lmdb/              # planned promoted-fixture namespace
+    lmdb/              # promoted-fixture namespace
     lsm/               # planned migration namespace
     ha/                # planned migration namespace
   scenarios/           # planned registry/consolidation; adapters may stay by domain
@@ -1424,10 +1424,12 @@ cleaner dependency direction. The stable rule is:
 - production code only depends on narrow runtime, clock, entropy, transport,
   and storage interfaces, never on the explorer or `SchedulerPort`
 
-The Raft, LMDB, LSM, and HA entries are forward migration targets, not removed
-scope. WAL is the first modeled-storage adapter; the remaining focused suites
-keep their existing runners and oracles until they reach exact replay parity,
-then join the same scenario registry and fixture policy incrementally.
+LSM and HA remain forward migration targets, not removed scope. Raft now wraps
+the real `RawNode` cluster with independent message, persistence, apply,
+restart, partition, proposal, and compaction choices. LMDB now wraps the
+existing C-versus-Zig action union and crash publication oracle. The remaining
+focused suites keep their existing runners and oracles until they reach exact
+replay parity, then join the same scenario registry and fixture policy.
 
 The CLI is a standalone command surface, not additional behavior in Antfly's
 ordinary unit-test runner. Its scenario implementations intentionally use

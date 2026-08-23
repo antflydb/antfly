@@ -156,6 +156,7 @@ pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
 pub const lmdb = @import("storage/lmdb.zig");
+pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
 pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const ha = @import("storage/ha/mod.zig");
@@ -313,6 +314,7 @@ test {
 
     // Storage
     _ = lmdb;
+    _ = lmdb_vopr;
     _ = lmdb_engine;
     _ = hbc;
     _ = ha;
