@@ -41,7 +41,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             scenario = try nextValue(args, &index);
             if (!std.mem.eql(u8, scenario, "metadata") and
                 !std.mem.eql(u8, scenario, "transaction") and
-                !std.mem.eql(u8, scenario, "distributed-data")) return error.UnsupportedScenario;
+                !std.mem.eql(u8, scenario, "distributed-data") and
+                !std.mem.eql(u8, scenario, "raft")) return error.UnsupportedScenario;
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -55,7 +56,14 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         index += 1;
     }
     const output_path = trace_out orelse return error.TraceOutputRequired;
-    const transition_budget: usize = transitions orelse if (std.mem.eql(u8, scenario, "metadata")) 64 else if (std.mem.eql(u8, scenario, "distributed-data")) 4 else 3;
+    const transition_budget: usize = transitions orelse if (std.mem.eql(u8, scenario, "metadata"))
+        64
+    else if (std.mem.eql(u8, scenario, "distributed-data"))
+        4
+    else if (std.mem.eql(u8, scenario, "raft"))
+        33
+    else
+        3;
     if (transition_budget == 0) return error.InvalidTransitionBudget;
     var artifact = if (std.mem.eql(u8, scenario, "metadata")) blk: {
         const base_id = 10_000 + seed % 1_000_000;
@@ -76,6 +84,9 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             .seed = seed,
             .table_id = table_id,
         });
+    } else if (std.mem.eql(u8, scenario, "raft")) blk: {
+        if (transition_budget != 33) return error.RaftScenarioRequiresThirtyThreeTransitions;
+        break :blk try antfly.raft_vopr.record(alloc, seed);
     } else blk: {
         if (transition_budget != 3) return error.TransactionScenarioRequiresThreeTransitions;
         break :blk try antfly.transaction_vopr.record(alloc, seed);
@@ -116,6 +127,8 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.metadata_sim_harness.replayDistributedDataVoprCampaign(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return antfly.transaction_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
+        return antfly.raft_vopr.replay(alloc, recorded);
     return error.UnsupportedScenario;
 }
 
@@ -356,6 +369,30 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name)) {
+        const target = if (recorded.failures.items.len > 0)
+            recorded.failures.items[0].fingerprint
+        else
+            return error.FailingTraceRequired;
+        var reduced = try vopr.reducer.reduce(
+            antfly.raft_vopr.CliScenario,
+            alloc,
+            &recorded,
+            target,
+            .{ .max_attempts = attempts },
+        );
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
         var reduced = try antfly.metadata_sim_harness.reduceDistributedDataVoprCampaign(alloc, &recorded, attempts);
         defer reduced.deinit();
@@ -493,6 +530,8 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/sim/fixtures/distributed-data";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return "pkg/antfly/src/sim/fixtures/transaction";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/raft";
     return error.UnsupportedScenario;
 }
 

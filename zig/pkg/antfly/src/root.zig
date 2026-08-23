@@ -98,6 +98,7 @@ pub const sim = @import("vopr");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
+pub const raft_vopr = @import("raft/vopr.zig");
 pub const admin = @import("admin/mod.zig");
 pub const extensions = @import("extensions/mod.zig");
 pub const public_api = @import("api/mod.zig");
@@ -273,6 +274,7 @@ test {
 
     // Raft integration
     _ = raft;
+    _ = raft_vopr;
     _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;

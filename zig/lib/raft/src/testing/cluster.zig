@@ -33,6 +33,11 @@ pub const Cluster = struct {
         max_inflight_bytes: usize = 0,
         max_uncommitted_entries_size: usize = std.math.maxInt(usize),
         async_storage_writes: bool = false,
+        /// Keep async storage append/apply messages pending until the test
+        /// harness explicitly completes them. This exposes persistence and
+        /// application as scheduler-visible transitions without changing the
+        /// eager behavior used by existing tests.
+        defer_storage_writes: bool = false,
         check_quorum: bool = true,
         pre_vote: bool = true,
         step_down_on_removal: bool = false,
@@ -56,6 +61,7 @@ pub const Cluster = struct {
     max_inflight_bytes: usize = 0,
     max_uncommitted_entries_size: usize = std.math.maxInt(usize),
     async_storage_writes: bool = false,
+    defer_storage_writes: bool = false,
     check_quorum: bool = true,
     pre_vote: bool = true,
     step_down_on_removal: bool = false,
@@ -68,6 +74,7 @@ pub const Cluster = struct {
     committed: []std.ArrayListUnmanaged(core.types.Entry),
     read_states: []std.ArrayListUnmanaged(core.types.ReadState),
     network: std.ArrayListUnmanaged(message.Message) = .empty,
+    storage_completions: std.ArrayListUnmanaged(message.Message) = .empty,
     blocked_links: std.AutoHashMapUnmanaged(u128, void) = .empty,
     active_nodes: std.AutoHashMapUnmanaged(core.types.NodeId, void) = .empty,
 
@@ -162,6 +169,7 @@ pub const Cluster = struct {
             .max_inflight_bytes = options.max_inflight_bytes,
             .max_uncommitted_entries_size = options.max_uncommitted_entries_size,
             .async_storage_writes = options.async_storage_writes,
+            .defer_storage_writes = options.defer_storage_writes,
             .check_quorum = options.check_quorum,
             .pre_vote = options.pre_vote,
             .step_down_on_removal = options.step_down_on_removal,
@@ -180,6 +188,8 @@ pub const Cluster = struct {
     pub fn deinit(self: *Cluster) void {
         for (self.network.items) |*msg| msg.deinit(self.alloc);
         self.network.deinit(self.alloc);
+        for (self.storage_completions.items) |*msg| msg.deinit(self.alloc);
+        self.storage_completions.deinit(self.alloc);
         self.blocked_links.deinit(self.alloc);
         self.active_nodes.deinit(self.alloc);
         for (self.committed) |*entries| {
@@ -224,6 +234,10 @@ pub const Cluster = struct {
 
     pub fn pendingMessageSlice(self: *const Cluster) []const message.Message {
         return self.network.items;
+    }
+
+    pub fn pendingStorageSlice(self: *const Cluster) []const message.Message {
+        return self.storage_completions.items;
     }
 
     pub fn isNodeActive(self: *const Cluster, id: core.types.NodeId) bool {
@@ -280,6 +294,7 @@ pub const Cluster = struct {
 
     pub fn restartWithApplied(self: *Cluster, id: core.types.NodeId, applied: core.types.Index) !void {
         const idx = self.nodeIndex(id).?;
+        self.dropStorageCompletionsForNode(id);
         self.applied_indexes[idx] = applied;
         self.nodes[idx].deinit();
         self.nodes[idx] = try initNode(self.alloc, self.peer_ids, .{
@@ -293,6 +308,7 @@ pub const Cluster = struct {
             .max_inflight_bytes = self.max_inflight_bytes,
             .max_uncommitted_entries_size = self.max_uncommitted_entries_size,
             .async_storage_writes = self.async_storage_writes,
+            .defer_storage_writes = self.defer_storage_writes,
             .check_quorum = self.check_quorum,
             .pre_vote = self.node_pre_vote[idx],
             .step_down_on_removal = self.step_down_on_removal,
@@ -470,15 +486,49 @@ pub const Cluster = struct {
     pub fn deliverOne(self: *Cluster) !bool {
         if (self.network.items.len == 0) return false;
 
-        var msg = self.network.orderedRemove(0);
+        try self.deliverAt(0);
+        return true;
+    }
+
+    /// Deliver one scheduler-selected network message. The index is part of
+    /// the harness decision, while message identity remains observable to the
+    /// trace adapter.
+    pub fn deliverAt(self: *Cluster, index: usize) !void {
+        if (index >= self.network.items.len) return error.PendingMessageIndexOutOfBounds;
+
+        var msg = self.network.orderedRemove(index);
         defer msg.deinit(self.alloc);
 
-        if (self.blocked_links.contains(edgeKey(msg.from, msg.to))) return true;
-        if (!self.isNodeActive(msg.from) or !self.isNodeActive(msg.to)) return true;
+        if (self.blocked_links.contains(edgeKey(msg.from, msg.to))) return;
+        if (!self.isNodeActive(msg.from) or !self.isNodeActive(msg.to)) return;
 
         try self.node(msg.to).step(msg);
         try self.collectReady(msg.to);
-        return true;
+    }
+
+    /// Drop one scheduler-selected network message without delivering it.
+    pub fn dropMessageAt(self: *Cluster, index: usize) !void {
+        if (index >= self.network.items.len) return error.PendingMessageIndexOutOfBounds;
+        var msg = self.network.orderedRemove(index);
+        msg.deinit(self.alloc);
+    }
+
+    /// Complete one scheduler-selected async persistence or apply operation.
+    pub fn completeStorageAt(self: *Cluster, index: usize) !void {
+        if (index >= self.storage_completions.items.len) return error.PendingStorageIndexOutOfBounds;
+        var msg = self.storage_completions.orderedRemove(index);
+        defer msg.deinit(self.alloc);
+        const node_id = msg.from;
+        const node_index = self.nodeIndex(node_id) orelse return error.UnknownStorageCompletionNode;
+        switch (msg.msg_type) {
+            .storage_append => try self.handleStorageAppendMessage(node_index, node_id, msg),
+            .storage_apply => try self.handleStorageApplyMessage(node_index, node_id, msg),
+            else => return error.InvalidStorageCompletionMessage,
+        }
+    }
+
+    pub fn pendingStorageCompletions(self: *const Cluster) usize {
+        return self.storage_completions.items.len;
     }
 
     pub fn deliverAll(self: *Cluster) !void {
@@ -521,8 +571,12 @@ pub const Cluster = struct {
     ) anyerror!void {
         for (messages) |msg| {
             switch (msg.msg_type) {
-                .storage_append => try self.handleStorageAppendMessage(idx, node_id, msg),
-                .storage_apply => try self.handleStorageApplyMessage(idx, node_id, msg),
+                .storage_append, .storage_apply => if (self.defer_storage_writes)
+                    try self.storage_completions.append(self.alloc, try msg.clone(self.alloc))
+                else if (msg.msg_type == .storage_append)
+                    try self.handleStorageAppendMessage(idx, node_id, msg)
+                else
+                    try self.handleStorageApplyMessage(idx, node_id, msg),
                 else => try self.network.append(self.alloc, try msg.clone(self.alloc)),
             }
         }
@@ -622,6 +676,22 @@ pub const Cluster = struct {
             keep += 1;
         }
         self.network.shrinkRetainingCapacity(keep);
+    }
+
+    fn dropStorageCompletionsForNode(self: *Cluster, node_id: core.types.NodeId) void {
+        var keep: usize = 0;
+        var i: usize = 0;
+        while (i < self.storage_completions.items.len) : (i += 1) {
+            const msg = self.storage_completions.items[i];
+            if (msg.from == node_id) {
+                var dropped = msg;
+                dropped.deinit(self.alloc);
+                continue;
+            }
+            if (keep != i) self.storage_completions.items[keep] = self.storage_completions.items[i];
+            keep += 1;
+        }
+        self.storage_completions.shrinkRetainingCapacity(keep);
     }
 
     fn activateNode(self: *Cluster, node_id: core.types.NodeId) !void {

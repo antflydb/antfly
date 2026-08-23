@@ -4113,6 +4113,14 @@ pub fn build(b: *std.Build) void {
     const lib_raft_chaos_test_step = b.step("lib-raft-chaos-test", "Run longer raft restart/HTTP simulation campaigns");
     lib_raft_chaos_test_step.dependOn(&run_lib_raft_chaos_tests.step);
 
+    const lib_raft_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"raft VOPR"},
+    });
+    const run_lib_raft_vopr_tests = addFilteredTestRunArtifact(b, lib_raft_vopr_tests);
+    const lib_raft_vopr_test_step = b.step("raft-vopr-test", "Run replayable per-group Raft VOPR campaigns");
+    lib_raft_vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
+
     const lib_lsm_backend_sim_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"lsm backend simulation"},
@@ -6787,6 +6795,7 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
+    sim_test_step.dependOn(&run_lib_raft_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
     sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
 
@@ -6800,6 +6809,7 @@ pub fn build(b: *std.Build) void {
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_raft_vopr_tests, "raft-vopr-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
