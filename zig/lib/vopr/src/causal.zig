@@ -55,7 +55,26 @@ pub const Report = struct {
 pub const CounterfactualConfig = struct {
     prefix_window: usize = 16,
     descendants_per_alternative: usize = 4,
+    max_experiments: usize = 64,
     suffix_seed: u64 = 0,
+};
+
+/// Scenario execution supplied by the application registry. This keeps the
+/// counterfactual engine Antfly-independent while allowing campaigns whose
+/// worlds are constructed from trace parameters rather than a context-free
+/// Scenario type to use the same clean-replay graph builder.
+pub const CounterfactualRunner = struct {
+    context: ?*anyopaque = null,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, *const trace.Trace, choice.Source) anyerror!trace.Trace,
+    replay_fn: *const fn (?*anyopaque, std.mem.Allocator, *const trace.Trace) anyerror!trace.Trace,
+
+    pub fn run(self: CounterfactualRunner, allocator: std.mem.Allocator, parent: *const trace.Trace, source: choice.Source) !trace.Trace {
+        return self.run_fn(self.context, allocator, parent, source);
+    }
+
+    pub fn exactReplay(self: CounterfactualRunner, allocator: std.mem.Allocator, artifact: *const trace.Trace) !trace.Trace {
+        return self.replay_fn(self.context, allocator, artifact);
+    }
 };
 
 pub const Experiment = struct {
@@ -108,9 +127,41 @@ pub fn analyzeCounterfactual(
     failure_ordinal: usize,
     config: CounterfactualConfig,
 ) !CounterfactualReport {
+    const Adapter = struct {
+        fn run(
+            _: ?*anyopaque,
+            child_allocator: std.mem.Allocator,
+            parent: *const trace.Trace,
+            source: choice.Source,
+        ) !trace.Trace {
+            return runner.run(Scenario, child_allocator, source, runnerConfigFromArtifact(parent));
+        }
+
+        fn exactReplay(
+            _: ?*anyopaque,
+            child_allocator: std.mem.Allocator,
+            child: *const trace.Trace,
+        ) !trace.Trace {
+            return replay.exact(Scenario, child_allocator, child);
+        }
+    };
+    return analyzeCounterfactualWithRunner(allocator, artifact, failure_ordinal, config, .{
+        .run_fn = Adapter.run,
+        .replay_fn = Adapter.exactReplay,
+    });
+}
+
+pub fn analyzeCounterfactualWithRunner(
+    allocator: std.mem.Allocator,
+    artifact: *const trace.Trace,
+    failure_ordinal: usize,
+    config: CounterfactualConfig,
+    scenario_runner: CounterfactualRunner,
+) !CounterfactualReport {
     try artifact.validate();
     if (failure_ordinal >= artifact.failures.items.len) return error.FailureOrdinalOutOfRange;
     if (config.descendants_per_alternative == 0) return error.InvalidCounterfactualDescendantBudget;
+    if (config.max_experiments == 0) return error.InvalidCounterfactualExperimentBudget;
     const failure = artifact.failures.items[failure_ordinal];
     const failure_choice_end = @min(artifact.choices.items.len, std.math.cast(usize, failure.index) orelse artifact.choices.items.len);
     const choice_start = failure_choice_end -| config.prefix_window;
@@ -119,9 +170,17 @@ pub fn analyzeCounterfactual(
     var graph = multiverse.Graph.init(allocator);
     errdefer graph.deinit();
     const parent_digest = try graph.addHistory(artifact, null, null, null);
-    for (artifact.choices.items[choice_start..failure_choice_end], choice_start..) |record, choice_index| {
+    // Spend a bounded experiment budget nearest the failure first. Otherwise
+    // one high-cardinality site at the oldest edge of the window can consume
+    // the whole budget before the likely proximate choices are examined.
+    var choice_cursor = failure_choice_end;
+    choices: while (choice_cursor > choice_start) {
+        choice_cursor -= 1;
+        const choice_index = choice_cursor;
+        const record = artifact.choices.items[choice_index];
         for (record.enabled_ids) |replacement_id| {
             if (replacement_id == record.selected_id) continue;
+            if (experiments.items.len >= config.max_experiments) break :choices;
             var experiment: Experiment = .{
                 .experiment_id = ids.derive("counterfactual-experiment", failure.fingerprint, ids.derive("branch", @intCast(choice_index), replacement_id)),
                 .choice_index = choice_index,
@@ -142,9 +201,9 @@ pub fn analyzeCounterfactual(
                 );
                 experiment.trial_seed_digest = ids.derive("counterfactual-trial-seeds", experiment.trial_seed_digest, seed);
                 var source = choice.Mutating.init(artifact.choices.items, choice_index, replacement_id, seed);
-                var child = try runner.run(Scenario, allocator, source.source(), runnerConfigFromArtifact(artifact));
+                var child = try scenario_runner.run(allocator, artifact, source.source());
                 defer child.deinit();
-                var replayed = try replay.exact(Scenario, allocator, &child);
+                var replayed = try scenario_runner.exactReplay(allocator, &child);
                 replayed.deinit();
                 for (child.failures.items) |child_failure| {
                     if (child_failure.fingerprint == failure.fingerprint) {
@@ -387,6 +446,7 @@ test "counterfactual report exact replays alternate descendants" {
     var report = try analyzeCounterfactual(Scenario, std.testing.allocator, &artifact, 0, .{
         .prefix_window = 1,
         .descendants_per_alternative = 2,
+        .max_experiments = 1,
         .suffix_seed = 7,
     });
     defer report.deinit();
@@ -394,4 +454,8 @@ test "counterfactual report exact replays alternate descendants" {
     try std.testing.expectEqual(Scenario.good_id, report.experiments[0].replacement_id);
     try std.testing.expectEqual(@as(usize, 0), report.experiments[0].same_failure_trials);
     try std.testing.expect(report.experiments[0].child_artifact_digest != 0);
+    try std.testing.expectError(
+        error.InvalidCounterfactualExperimentBudget,
+        analyzeCounterfactual(Scenario, std.testing.allocator, &artifact, 0, .{ .max_experiments = 0 }),
+    );
 }

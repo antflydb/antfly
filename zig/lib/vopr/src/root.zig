@@ -277,13 +277,18 @@ test {
     _ = command;
     _ = benchmark;
     _ = causal;
+    _ = clock_fault;
+    _ = collector;
     _ = coverage;
     _ = corpus;
     _ = event;
+    _ = debugger;
     _ = explorer;
     _ = fault;
     _ = fixture;
     _ = id;
+    _ = meta_test;
+    _ = multiverse;
     _ = observation;
     _ = outcome;
     _ = property;
@@ -291,9 +296,18 @@ test {
     _ = reducer;
     _ = runtime;
     _ = scheduler;
+    _ = scenario;
     _ = sim_runtime;
     _ = snapshot;
     _ = splice;
     _ = transition;
     _ = time;
+    _ = trace;
+    _ = vopr_io;
+    _ = vopr_io_file;
+    _ = vopr_io_instrumentation;
+    _ = vopr_io_net;
+    _ = vopr_io_process;
+    _ = vopr_io_scenario_test;
+    _ = vopr_io_task;
 }

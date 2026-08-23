@@ -254,6 +254,23 @@ fn runKnownScenarioWithChoices(
     return error.UnsupportedScenario;
 }
 
+fn counterfactualRunKnown(
+    _: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    return runKnownScenarioWithChoices(alloc, recorded, source);
+}
+
+fn counterfactualReplayKnown(
+    _: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+) !vopr.trace.Trace {
+    return replayKnownScenario(alloc, recorded);
+}
+
 fn defaultCampaignTransitions(scenario: []const u8) !usize {
     if (std.mem.eql(u8, scenario, "metadata")) return 64;
     if (std.mem.eql(u8, scenario, "distributed-data")) return 4;
@@ -450,9 +467,146 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     });
 }
 
+fn collectKnownAt(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    prefix: usize,
+) !vopr.collector.Sink {
+    const kind = antfly.domain_vopr.kindFromArtifact(recorded) orelse
+        return error.ScenarioCollectorsUnsupported;
+    return switch (kind) {
+        .distributed_transaction => vopr.debugger.collectAt(antfly.domain_vopr.DistributedTransactionScenario, alloc, recorded, prefix),
+        .data_plane => vopr.debugger.collectAt(antfly.domain_vopr.DataPlaneScenario, alloc, recorded, prefix),
+        .derived_workflow => vopr.debugger.collectAt(antfly.domain_vopr.DerivedWorkflowScenario, alloc, recorded, prefix),
+        .backup_restore => vopr.debugger.collectAt(antfly.domain_vopr.BackupRestoreScenario, alloc, recorded, prefix),
+        .clock_fault => vopr.debugger.collectAt(antfly.domain_vopr.ClockLeaseTtlScenario, alloc, recorded, prefix),
+    };
+}
+
+fn writeDebugArtifact(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try ensureDir(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+const DebugSession = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    recorded: *const vopr.trace.Trace,
+    prefix: usize,
+
+    /// Commands are deliberately line-oriented so the exact same debugger is
+    /// usable from a terminal, CI recipe, or editor integration.
+    fn execute(self: *@This(), line_raw: []const u8) !bool {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') return true;
+        var tokens = std.mem.tokenizeAny(u8, line, " \t");
+        const command = tokens.next() orelse return true;
+        if (std.mem.eql(u8, command, "quit") or std.mem.eql(u8, command, "exit")) return false;
+        if (std.mem.eql(u8, command, "help")) {
+            std.debug.print(
+                "show <out> | seek <prefix> [out] | causal <failure> <out> | causal-window <failure> <prefix-window> <descendants> <experiments> <suffix-seed> <out> | collector <prefix> <out> | branch <choice> <replacement-id> <suffix-seed> <child-trace> <comparison-out> | compare <child-trace> <out> | quit\n",
+                .{},
+            );
+            return true;
+        }
+        if (std.mem.eql(u8, command, "show") or std.mem.eql(u8, command, "seek")) {
+            if (std.mem.eql(u8, command, "seek")) {
+                self.prefix = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+                if (self.prefix > self.recorded.choices.items.len) return error.DebuggerPrefixOutOfRange;
+            }
+            if (tokens.next()) |output| {
+                const snapshot = try vopr.debugger.inspectAlloc(self.alloc, self.recorded, self.prefix);
+                defer self.alloc.free(snapshot);
+                try writeDebugArtifact(self.io, output, snapshot);
+            } else std.debug.print("VOPR debugger prefix={d}/{d}\n", .{ self.prefix, self.recorded.choices.items.len });
+            return true;
+        }
+        if (std.mem.eql(u8, command, "causal")) {
+            const ordinal = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const output = tokens.next() orelse return error.MissingDebuggerArgument;
+            var report_value = try vopr.causal.analyzeAlloc(self.alloc, self.recorded, ordinal);
+            defer report_value.deinit();
+            const encoded = try report_value.renderAlloc(self.alloc);
+            defer self.alloc.free(encoded);
+            try writeDebugArtifact(self.io, output, encoded);
+            return true;
+        }
+        if (std.mem.eql(u8, command, "causal-window")) {
+            const ordinal = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const prefix_window = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const descendants = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const experiments = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const suffix_seed = try std.fmt.parseInt(u64, tokens.next() orelse return error.MissingDebuggerArgument, 0);
+            const output = tokens.next() orelse return error.MissingDebuggerArgument;
+            var report_value = try vopr.causal.analyzeCounterfactualWithRunner(
+                self.alloc,
+                self.recorded,
+                ordinal,
+                .{ .prefix_window = prefix_window, .descendants_per_alternative = descendants, .max_experiments = experiments, .suffix_seed = suffix_seed },
+                .{ .run_fn = counterfactualRunKnown, .replay_fn = counterfactualReplayKnown },
+            );
+            defer report_value.deinit();
+            const encoded = try report_value.renderAlloc(self.alloc);
+            defer self.alloc.free(encoded);
+            try writeDebugArtifact(self.io, output, encoded);
+            return true;
+        }
+        if (std.mem.eql(u8, command, "collector")) {
+            const prefix = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const output = tokens.next() orelse return error.MissingDebuggerArgument;
+            var sink = try collectKnownAt(self.alloc, self.recorded, prefix);
+            defer sink.deinit();
+            const encoded = try sink.renderAlloc(self.alloc);
+            defer self.alloc.free(encoded);
+            try writeDebugArtifact(self.io, output, encoded);
+            return true;
+        }
+        if (std.mem.eql(u8, command, "branch")) {
+            const choice_index = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingDebuggerArgument, 10);
+            const replacement = try std.fmt.parseInt(vopr.id.StableId, tokens.next() orelse return error.MissingDebuggerArgument, 0);
+            const suffix_seed = try std.fmt.parseInt(u64, tokens.next() orelse return error.MissingDebuggerArgument, 0);
+            const child_output = tokens.next() orelse return error.MissingDebuggerArgument;
+            const comparison_output = tokens.next() orelse return error.MissingDebuggerArgument;
+            if (choice_index >= self.recorded.choices.items.len) return error.DebuggerPrefixOutOfRange;
+            const choice_record = self.recorded.choices.items[choice_index];
+            if (std.mem.indexOfScalar(vopr.id.StableId, choice_record.enabled_ids, replacement) == null)
+                return error.DebuggerAlternativeNotEnabled;
+            var source = vopr.choice.Mutating.init(self.recorded.choices.items, choice_index, replacement, suffix_seed);
+            var child = try runKnownScenarioWithChoices(self.alloc, self.recorded, source.source());
+            defer child.deinit();
+            var replayed = try replayKnownScenario(self.alloc, &child);
+            replayed.deinit();
+            const child_bytes = try child.renderAlloc(self.alloc);
+            defer self.alloc.free(child_bytes);
+            try writeDebugArtifact(self.io, child_output, child_bytes);
+            const comparison = try vopr.debugger.compareAlloc(self.alloc, self.recorded, &child);
+            defer self.alloc.free(comparison);
+            try writeDebugArtifact(self.io, comparison_output, comparison);
+            return true;
+        }
+        if (std.mem.eql(u8, command, "compare")) {
+            const child_path = tokens.next() orelse return error.MissingDebuggerArgument;
+            const output = tokens.next() orelse return error.MissingDebuggerArgument;
+            const child_bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, child_path, self.alloc, .limited(max_trace_bytes));
+            defer self.alloc.free(child_bytes);
+            var child = try vopr.trace.parseAlloc(self.alloc, child_bytes);
+            defer child.deinit();
+            var replayed = try replayKnownScenario(self.alloc, &child);
+            replayed.deinit();
+            const comparison = try vopr.debugger.compareAlloc(self.alloc, self.recorded, &child);
+            defer self.alloc.free(comparison);
+            try writeDebugArtifact(self.io, output, comparison);
+            return true;
+        }
+        return error.UnknownDebuggerCommand;
+    }
+};
+
 fn debugCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var trace_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
+    var commands_path: ?[]const u8 = null;
+    var interactive = false;
     var prefix: usize = 0;
     var index: usize = 0;
     while (index < args.len) {
@@ -462,22 +616,45 @@ fn debugCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             output_path = try nextValue(args, &index);
         } else if (std.mem.eql(u8, args[index], "--prefix")) {
             prefix = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--commands")) {
+            commands_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--interactive")) {
+            interactive = true;
         } else return error.UnknownArgument;
         index += 1;
     }
     const input = trace_path orelse return error.TracePathRequired;
-    const output = output_path orelse return error.TraceOutputRequired;
     const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
     var replayed = try replayKnownScenario(alloc, &recorded);
     replayed.deinit();
-    const snapshot = try vopr.debugger.inspectAlloc(alloc, &recorded, prefix);
-    defer alloc.free(snapshot);
-    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = snapshot });
-    std.debug.print("VOPR debug snapshot prefix={d} out={s}\n", .{ prefix, output });
+    var session = DebugSession{ .alloc = alloc, .io = io, .recorded = &recorded, .prefix = prefix };
+    if (output_path) |output| {
+        const snapshot = try vopr.debugger.inspectAlloc(alloc, &recorded, prefix);
+        defer alloc.free(snapshot);
+        try writeDebugArtifact(io, output, snapshot);
+        std.debug.print("VOPR debug snapshot prefix={d} out={s}\n", .{ prefix, output });
+    }
+    if (commands_path) |path| {
+        const commands = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024 * 1024));
+        defer alloc.free(commands);
+        var lines = std.mem.splitScalar(u8, commands, '\n');
+        while (lines.next()) |line| if (!try session.execute(line)) break;
+    }
+    if (interactive) {
+        var stdin_buffer: [64 * 1024]u8 = undefined;
+        var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+        const stdin = &stdin_reader.interface;
+        std.debug.print("VOPR debugger ready; type help or quit\n", .{});
+        while (true) {
+            std.debug.print("vopr[{d}]> ", .{session.prefix});
+            const line = try stdin.takeDelimiter('\n') orelse break;
+            if (!try session.execute(line)) break;
+        }
+    }
+    if (output_path == null and commands_path == null and !interactive) return error.DebuggerActionRequired;
 }
 
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -542,6 +719,7 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         spawned += 1;
     }
     for (threads) |thread| thread.join();
+    try context.exportQuarantineArtifacts();
     try context.reportSummary();
     if (context.first_error) |err| return err;
 }
@@ -1020,6 +1198,7 @@ const CampaignContext = struct {
     workload_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
     properties: std.AutoHashMapUnmanaged(u64, PropertySummary) = .empty,
     failure_summaries: std.AutoHashMapUnmanaged(u64, FailureSummary) = .empty,
+    counterfactual_reports: u64 = 0,
     first_error: ?anyerror = null,
 
     fn deinitReport(self: *@This()) void {
@@ -1111,9 +1290,19 @@ const CampaignContext = struct {
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
         if (failed) {
-            try self.mutex.lock(self.io);
-            defer self.mutex.unlock(self.io);
-            try self.recordFailureArtifactsLocked(&artifact, history_index, path);
+            var new_failure_ordinals: std.ArrayListUnmanaged(usize) = .empty;
+            defer new_failure_ordinals.deinit(alloc);
+            {
+                try self.mutex.lock(self.io);
+                defer self.mutex.unlock(self.io);
+                try self.recordFailureArtifactsLocked(&artifact, history_index, path, &new_failure_ordinals);
+            }
+            for (new_failure_ordinals.items) |failure_ordinal| {
+                try self.writeFailureDiagnostics(&artifact, failure_ordinal);
+                try self.mutex.lock(self.io);
+                self.counterfactual_reports += 1;
+                self.mutex.unlock(self.io);
+            }
         }
     }
 
@@ -1149,9 +1338,10 @@ const CampaignContext = struct {
         artifact: *const vopr.trace.Trace,
         history_index: u64,
         path: []const u8,
+        new_failure_ordinals: *std.ArrayListUnmanaged(usize),
     ) !void {
         const alloc = std.heap.smp_allocator;
-        for (artifact.failures.items) |failure| {
+        for (artifact.failures.items, 0..) |failure, failure_ordinal| {
             const gop = try self.failure_summaries.getOrPut(alloc, failure.fingerprint);
             if (!gop.found_existing) {
                 errdefer _ = self.failure_summaries.remove(failure.fingerprint);
@@ -1166,6 +1356,7 @@ const CampaignContext = struct {
                     .smallest_transitions = artifact.summary.?.transitions,
                     .smallest_path = smallest_path,
                 };
+                try new_failure_ordinals.append(alloc, failure_ordinal);
                 continue;
             }
             if (history_index < gop.value_ptr.first_history) {
@@ -1186,12 +1377,61 @@ const CampaignContext = struct {
         }
     }
 
+    fn writeFailureDiagnostics(
+        self: *@This(),
+        artifact: *const vopr.trace.Trace,
+        failure_ordinal: usize,
+    ) !void {
+        const alloc = std.heap.smp_allocator;
+        const failure = artifact.failures.items[failure_ordinal];
+        var causal_report = try vopr.causal.analyzeAlloc(alloc, artifact, failure_ordinal);
+        defer causal_report.deinit();
+        const causal_bytes = try causal_report.renderAlloc(alloc);
+        defer alloc.free(causal_bytes);
+        const causal_path = try std.fmt.allocPrint(
+            alloc,
+            "{s}/failure-{x}.causal.json",
+            .{ self.artifact_dir, failure.fingerprint },
+        );
+        defer alloc.free(causal_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = causal_path, .data = causal_bytes });
+
+        var counterfactual = try vopr.causal.analyzeCounterfactualWithRunner(
+            alloc,
+            artifact,
+            failure_ordinal,
+            .{
+                .prefix_window = 8,
+                .descendants_per_alternative = 2,
+                .max_experiments = 16,
+                .suffix_seed = self.base_seed ^ failure.fingerprint,
+            },
+            .{
+                .run_fn = counterfactualRunKnown,
+                .replay_fn = counterfactualReplayKnown,
+            },
+        );
+        defer counterfactual.deinit();
+        const counterfactual_bytes = try counterfactual.renderAlloc(alloc);
+        defer alloc.free(counterfactual_bytes);
+        const counterfactual_path = try std.fmt.allocPrint(
+            alloc,
+            "{s}/failure-{x}.counterfactual.json",
+            .{ self.artifact_dir, failure.fingerprint },
+        );
+        defer alloc.free(counterfactual_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{
+            .sub_path = counterfactual_path,
+            .data = counterfactual_bytes,
+        });
+    }
+
     fn reportSummary(self: *@This()) !void {
         const alloc = std.heap.smp_allocator;
         var productive: usize = 0;
         for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
         std.debug.print(
-            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
+            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} counterfactual_reports={d} workers={d} artifacts={s}\n",
             .{
                 self.scenario,
                 self.histories,
@@ -1212,6 +1452,7 @@ const CampaignContext = struct {
                 self.splice_attempts,
                 self.spliced,
                 self.splice_rejected,
+                self.counterfactual_reports,
                 self.worker_count,
                 self.artifact_dir,
             },
@@ -1459,6 +1700,49 @@ const CampaignContext = struct {
             if (added.inserted) self.seeded_entries += 1;
         }
     }
+
+    fn exportQuarantineArtifacts(self: *@This()) !void {
+        if (self.corpus.quarantined.items.len == 0) return;
+        const alloc = std.heap.smp_allocator;
+        const quarantine_dir = try std.fmt.allocPrint(alloc, "{s}/quarantine", .{self.artifact_dir});
+        defer alloc.free(quarantine_dir);
+        try ensureDir(self.io, quarantine_dir);
+
+        const ManifestEntry = struct {
+            trace_digest: u64,
+            reason: vopr.corpus.QuarantineReason,
+            path: []const u8,
+        };
+        const entries = try alloc.alloc(ManifestEntry, self.corpus.quarantined.items.len);
+        defer alloc.free(entries);
+        var initialized: usize = 0;
+        defer for (entries[0..initialized]) |entry| alloc.free(entry.path);
+        for (self.corpus.quarantined.items, 0..) |entry, index| {
+            const relative_path = try std.fmt.allocPrint(
+                alloc,
+                "quarantine/{s}-{x}.voprquarantine",
+                .{ @tagName(entry.reason), entry.trace_digest },
+            );
+            entries[index] = .{
+                .trace_digest = entry.trace_digest,
+                .reason = entry.reason,
+                .path = relative_path,
+            };
+            initialized += 1;
+            const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.artifact_dir, relative_path });
+            defer alloc.free(full_path);
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full_path, .data = entry.bytes });
+        }
+        const manifest = try std.json.Stringify.valueAlloc(alloc, .{
+            .format = "vopr-quarantine-manifest-v1",
+            .scenario = self.scenario,
+            .entries = entries,
+        }, .{ .whitespace = .indent_2 });
+        defer alloc.free(manifest);
+        const manifest_path = try std.fmt.allocPrint(alloc, "{s}/quarantine/index.json", .{self.artifact_dir});
+        defer alloc.free(manifest_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = manifest_path, .data = manifest });
+    }
 };
 
 fn ensureDir(io: std.Io, path: []const u8) !void {
@@ -1503,7 +1787,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr migrate --trace <path> --out <path> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
-        \\  vopr debug --trace <path> [--prefix <choice-index>] --out <path.json>
+        \\  vopr debug --trace <path> [--prefix <choice-index>] [--out <path.json>] [--commands <path>] [--interactive]
         \\
     , .{});
     return error.InvalidUsage;
@@ -1582,6 +1866,79 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
         mutation_replay.deinit();
     } else return error.PersistentCorpusMutationRequired;
 
+    try context.writeFailureDiagnostics(&promoted, 0);
+    const causal_artifact_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/failure-{x}.causal.json",
+        .{ corpus_path, promoted.failures.items[0].fingerprint },
+    );
+    defer alloc.free(causal_artifact_path);
+    const causal_artifact = try std.Io.Dir.cwd().readFileAlloc(io, causal_artifact_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(causal_artifact);
+    try std.testing.expect(std.mem.indexOf(u8, causal_artifact, "failure_identity") != null);
+    const counterfactual_artifact_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/failure-{x}.counterfactual.json",
+        .{ corpus_path, promoted.failures.items[0].fingerprint },
+    );
+    defer alloc.free(counterfactual_artifact_path);
+    const counterfactual_artifact = try std.Io.Dir.cwd().readFileAlloc(io, counterfactual_artifact_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(counterfactual_artifact);
+    try std.testing.expect(std.mem.indexOf(u8, counterfactual_artifact, "vopr-multiverse-v1") != null);
+
+    _ = try context.corpus.quarantineBytes("not-a-vopr-trace", .invalid_trace);
+    try context.exportQuarantineArtifacts();
+    const quarantine_manifest_path = try std.fmt.allocPrint(alloc, "{s}/quarantine/index.json", .{corpus_path});
+    defer alloc.free(quarantine_manifest_path);
+    const quarantine_manifest = try std.Io.Dir.cwd().readFileAlloc(io, quarantine_manifest_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(quarantine_manifest);
+    try std.testing.expect(std.mem.indexOf(u8, quarantine_manifest, "vopr-quarantine-manifest-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quarantine_manifest, "invalid_trace") != null);
+
+    var debug_session = DebugSession{ .alloc = alloc, .io = io, .recorded = &promoted, .prefix = 0 };
+    const debug_snapshot_path = try std.fmt.allocPrint(alloc, "{s}/debug-snapshot.json", .{corpus_path});
+    defer alloc.free(debug_snapshot_path);
+    const seek_command = try std.fmt.allocPrint(alloc, "seek 0 {s}", .{debug_snapshot_path});
+    defer alloc.free(seek_command);
+    try std.testing.expect(try debug_session.execute(seek_command));
+    const debug_snapshot = try std.Io.Dir.cwd().readFileAlloc(io, debug_snapshot_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(debug_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, debug_snapshot, "vopr-debug-snapshot-v1") != null);
+    const causal_window_path = try std.fmt.allocPrint(alloc, "{s}/debug-causal-window.json", .{corpus_path});
+    defer alloc.free(causal_window_path);
+    const causal_window_command = try std.fmt.allocPrint(alloc, "causal-window 0 4 1 4 9 {s}", .{causal_window_path});
+    defer alloc.free(causal_window_command);
+    try std.testing.expect(try debug_session.execute(causal_window_command));
+    const causal_window = try std.Io.Dir.cwd().readFileAlloc(io, causal_window_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(causal_window);
+    try std.testing.expect(std.mem.indexOf(u8, causal_window, "vopr-multiverse-v1") != null);
+
+    var branch_index: ?usize = null;
+    var branch_replacement: vopr.id.StableId = 0;
+    for (promoted.choices.items, 0..) |choice_record, choice_index| {
+        for (choice_record.enabled_ids) |candidate| if (candidate != choice_record.selected_id) {
+            branch_index = choice_index;
+            branch_replacement = candidate;
+            break;
+        };
+        if (branch_index != null) break;
+    }
+    const chosen_branch_index = branch_index orelse return error.DebuggerFixtureRequiresAlternative;
+    const debug_child_path = try std.fmt.allocPrint(alloc, "{s}/debug-child.voprtrace", .{corpus_path});
+    defer alloc.free(debug_child_path);
+    const debug_comparison_path = try std.fmt.allocPrint(alloc, "{s}/debug-comparison.json", .{corpus_path});
+    defer alloc.free(debug_comparison_path);
+    const branch_command = try std.fmt.allocPrint(
+        alloc,
+        "branch {d} {d} 17 {s} {s}",
+        .{ chosen_branch_index, branch_replacement, debug_child_path, debug_comparison_path },
+    );
+    defer alloc.free(branch_command);
+    try std.testing.expect(try debug_session.execute(branch_command));
+    const debug_comparison = try std.Io.Dir.cwd().readFileAlloc(io, debug_comparison_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(debug_comparison);
+    try std.testing.expect(std.mem.indexOf(u8, debug_comparison, "vopr-debug-comparison-v1") != null);
+
     var transaction_artifact = try antfly.transaction_vopr.record(alloc, 0xA17F_7A4A);
     defer transaction_artifact.deinit();
     try std.testing.expectEqualStrings("pkg/antfly/src/vopr/fixtures/metadata", try fixtureDirForScenario(&promoted));
@@ -1595,6 +1952,18 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try validateTransactionTraceNdjson(alloc, transaction_ndjson.written());
     try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"InitTransaction\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"WriteIntentOnShard\"") != null);
+
+    var data_plane = try antfly.domain_vopr.recordDataPlane(alloc, 0xA17F_C011);
+    defer data_plane.deinit();
+    var collector_session = DebugSession{ .alloc = alloc, .io = io, .recorded = &data_plane, .prefix = 0 };
+    const collector_path = try std.fmt.allocPrint(alloc, "{s}/debug-collector.json", .{corpus_path});
+    defer alloc.free(collector_path);
+    const collector_command = try std.fmt.allocPrint(alloc, "collector 0 {s}", .{collector_path});
+    defer alloc.free(collector_command);
+    try std.testing.expect(try collector_session.execute(collector_command));
+    const collector_bytes = try std.Io.Dir.cwd().readFileAlloc(io, collector_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(collector_bytes);
+    try std.testing.expect(collector_bytes.len > 2);
 }
 
 test "VOPR scenario registry records and exactly replays every context-free domain" {

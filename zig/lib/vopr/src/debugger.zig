@@ -120,6 +120,59 @@ pub fn inspectAlloc(
     }, .{ .whitespace = .indent_2 });
 }
 
+/// Compare a counterfactual child with its parent without retaining pointers
+/// into either trace.  The stable JSON form is suitable for campaign
+/// artifacts, debugger sessions, and editor integrations.
+pub fn compareAlloc(
+    allocator: std.mem.Allocator,
+    parent: *const trace.Trace,
+    child: *const trace.Trace,
+) ![]u8 {
+    try parent.validate();
+    try child.validate();
+    if (!std.mem.eql(u8, parent.header.scenario, child.header.scenario) or
+        parent.header.scenario_version != child.header.scenario_version)
+        return error.DebuggerScenarioMismatch;
+
+    const shared_limit = @min(parent.choices.items.len, child.choices.items.len);
+    var shared_prefix: usize = 0;
+    while (shared_prefix < shared_limit) : (shared_prefix += 1) {
+        const left = parent.choices.items[shared_prefix];
+        const right = child.choices.items[shared_prefix];
+        if (left.selected_id != right.selected_id or
+            left.site_id != right.site_id or
+            left.occurrence != right.occurrence or
+            !std.mem.eql(ids.StableId, left.enabled_ids, right.enabled_ids)) break;
+    }
+    const parent_choice = if (shared_prefix < parent.choices.items.len)
+        parent.choices.items[shared_prefix]
+    else
+        null;
+    const child_choice = if (shared_prefix < child.choices.items.len)
+        child.choices.items[shared_prefix]
+    else
+        null;
+
+    const parent_bytes = try parent.renderAlloc(allocator);
+    defer allocator.free(parent_bytes);
+    const child_bytes = try child.renderAlloc(allocator);
+    defer allocator.free(child_bytes);
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .format = "vopr-debug-comparison-v1",
+        .scenario = parent.header.scenario,
+        .scenario_version = parent.header.scenario_version,
+        .shared_choice_prefix = shared_prefix,
+        .parent_choice = parent_choice,
+        .child_choice = child_choice,
+        .parent_summary = parent.summary,
+        .child_summary = child.summary,
+        .parent_failures = parent.failures.items,
+        .child_failures = child.failures.items,
+        .parent_trace_digest = ids.digest(parent_bytes),
+        .child_trace_digest = ids.digest(child_bytes),
+    }, .{ .whitespace = .indent_2 });
+}
+
 fn runnerConfigFromArtifact(artifact: *const trace.Trace) runner.Config {
     return .{
         .system = artifact.header.system,
@@ -199,5 +252,9 @@ test "debugger seeks branches exact replays and collects failure moments" {
     const snapshot = try inspectAlloc(std.testing.allocator, &artifact, 0);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "vopr-debug-snapshot-v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "debug.good") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "debug.safe") != null);
+    const comparison = try compareAlloc(std.testing.allocator, &artifact, &child);
+    defer std.testing.allocator.free(comparison);
+    try std.testing.expect(std.mem.indexOf(u8, comparison, "vopr-debug-comparison-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, comparison, "\"shared_choice_prefix\": 0") != null);
 }

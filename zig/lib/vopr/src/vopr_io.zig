@@ -409,6 +409,10 @@ pub const VoprIo = struct {
         self.files.faults.drop_next_sync = true;
     }
 
+    pub fn tearNextFileSync(self: *VoprIo, persisted_prefix_bytes: usize) void {
+        self.files.faults.torn_next_sync_limit = persisted_prefix_bytes;
+    }
+
     pub fn limitNextFileWrite(self: *VoprIo, bytes: usize) !void {
         if (bytes == 0) return error.InvalidPartialWriteLimit;
         self.files.faults.partial_write_limit = bytes;
@@ -421,6 +425,31 @@ pub const VoprIo = struct {
             .length = length,
             .xor_mask = xor_mask,
         };
+    }
+
+    pub fn corruptFileSectors(
+        self: *VoprIo,
+        file: std.Io.File,
+        sector_size: u64,
+        first_sector: u64,
+        sector_count: u64,
+        xor_mask: u8,
+    ) !void {
+        if (sector_size == 0 or sector_count == 0 or xor_mask == 0)
+            return error.InvalidFileCorruptionRange;
+        const offset = std.math.mul(u64, sector_size, first_sector) catch
+            return error.InvalidFileCorruptionRange;
+        const length = std.math.mul(u64, sector_size, sector_count) catch
+            return error.InvalidFileCorruptionRange;
+        try self.files.addPersistentCorruption(file, .{
+            .offset = offset,
+            .length = length,
+            .xor_mask = xor_mask,
+        });
+    }
+
+    pub fn clearFileSectorCorruption(self: *VoprIo, file: std.Io.File) !void {
+        try self.files.clearPersistentCorruption(file);
     }
 
     pub fn crashFileSystem(self: *VoprIo) !void {
@@ -1369,8 +1398,8 @@ test "VoprIo unsupported operations latch a deterministic harness violation" {
     try std.testing.expectError(error.VoprIoCapabilityViolation, sim.ensureNoCapabilityViolation());
 
     sim.clearCapabilityViolation();
-    _ = io.vtable.netSend(io.userdata, 0, &.{}, .{});
-    try std.testing.expectEqual(ViolationOperation.network_send, sim.firstCapabilityViolation().?.operation);
+    io.vtable.netClose(io.userdata, &.{0});
+    try std.testing.expectEqual(ViolationOperation.network_close, sim.firstCapabilityViolation().?.operation);
 }
 
 test "VoprIo vtable contains no std.Io.Threaded handlers" {

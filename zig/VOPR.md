@@ -6,10 +6,11 @@ storage, HA, data-plane, derived-workflow, backup/restore, and clock-fault
 scenarios are implemented. The production DataServer now serves public HTTP on
 borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
 resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
-debug cursor are executable. Routed data, Raft, split/merge, query assembly,
-and DataServer-owned maintenance services now expose production-safe scheduler
-boundaries. The primary remaining work is campaign integration and interactive
-tooling for the already implemented counterfactual and quarantine primitives.
+scriptable/interactive debugger are executable. Routed data, Raft, split/merge,
+query assembly, and DataServer-owned maintenance services now expose
+production-safe scheduler boundaries. Campaigns export bounded counterfactual
+graphs and explicit quarantine manifests; the virtual filesystem models
+persistent sector corruption and torn synchronization.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -43,14 +44,14 @@ not a prerequisite for deterministic search.
 | One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-engine-test` |
 | Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; `VoprIo` composes the narrow atomic executor into its scheduler; Antfly `DurableJobLane` adapter | `zig build vopr-engine-test vopr-runtime-test` |
 | Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-engine-test` in Debug and ReleaseSafe |
-| Modeled files, durability, streams, datagrams, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-engine-test` |
+| Modeled files, durability, persistent sector corruption, torn synchronization, streams, datagrams, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-engine-test` |
 | Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
-| Replay-before-retention campaigns and deterministic workers | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
+| Replay-before-retention campaigns, deterministic workers, bounded counterfactual graphs, and quarantine manifests/raw artifacts | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
 | Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-engine-test vopr-meta-test` |
 | TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
-| Ranked counterfactual causality, persistent multiverse identities, clean-replay branching, and debug cursor | `causal.zig`, `multiverse.zig`, `debugger.zig`, `collector.zig`, `vopr-debug` | `zig build vopr-engine-test vopr-meta-test` |
+| Ranked and explicitly budgeted counterfactual causality, persistent multiverse identities, clean-replay branching, and scriptable/interactive debug sessions | `causal.zig`, `multiverse.zig`, `debugger.zig`, `collector.zig`, `vopr-debug` | `zig build vopr-engine-test vopr-meta-test` |
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
@@ -435,11 +436,16 @@ never replay truth.
 Bounded counterfactual analysis replaces a selected pre-failure decision,
 explores deterministic descendants, exact-replays every child, ranks
 failure-probability reductions, and records stable experiment IDs, trial-seed
-digests, and a pointer-free parent/child multiverse graph. The debugger cursor
+digests, and a pointer-free parent/child multiverse graph. Prefix,
+descendant-per-alternative, and total-experiment limits bound the analysis even
+when a choice site has a large enabled set. The debugger cursor
 can seek a choice prefix, list recorded alternatives, create and verify a child
 branch, and collect deterministic state before, at, and after a failure.
-`vopr-debug` exports the generic replay-validated cursor snapshot for scripts,
-editors, or a future interactive frontend.
+`vopr-debug` exports replay-validated snapshots and provides the same
+line-oriented `show`, `seek`, `causal`, `causal-window`, `collector`, `branch`,
+and `compare` commands through a command file or interactive standard input.
+Collector commands are available for scenarios that implement the generic
+collector contract; unsupported scenarios fail closed.
 
 ## Quiet Suffix and Liveness
 
@@ -562,7 +568,7 @@ Focused gate: `clock-fault-vopr-test`.
 
 ## Defects Found
 
-VOPR work has found concrete production defects, not only harness gaps:
+VOPR work has found concrete production and harness defects:
 
 - Transaction recovery retained the address of the temporary `DB` wrapper
   constructed inside `DB.open`, although the wrapper is returned by value.
@@ -618,6 +624,17 @@ VOPR work has found concrete production defects, not only harness gaps:
   the same reap path, deadlocking both teardown operations. Drains now detach
   entries under the mutex and await them after releasing it; a focused nested-
   owner regression preserves this reentrant lifetime contract.
+- The VOPR task kernel treated current-task identity as ordinary mutable state
+  across a stackful context switch. ReleaseSafe could expose the main fiber's
+  cleared identity after a task resumed, crashing every scheduler path that
+  parked a fiber. Task fibers now publish their identity on entry/resume, the
+  main fiber clears it after return, and the compiler boundary uses atomic,
+  non-inline access. Debug and ReleaseSafe run the same 90-test engine gate.
+- Counterfactual analysis bounded the choice-prefix and descendants per
+  alternative but not the number of enabled alternatives. A high-cardinality
+  choice could therefore monopolize a campaign worker. The reusable engine now
+  enforces an explicit total experiment budget and spends it on choices nearest
+  the failure first.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -665,6 +682,14 @@ zig build vopr-debug -- \
   --trace /tmp/metadata-reduced.voprtrace \
   --prefix 12 \
   --out /tmp/metadata-debug.json
+
+# Run a repeatable debugger recipe or enter the same line-oriented frontend.
+zig build vopr-debug -- \
+  --trace /tmp/metadata-reduced.voprtrace \
+  --commands /tmp/debug.commands
+zig build vopr-debug -- \
+  --trace /tmp/metadata-reduced.voprtrace \
+  --interactive
 
 # Bounded deterministic campaign.
 zig build vopr-campaign -- \
@@ -868,16 +893,21 @@ request microsteps as those seams are added.
 ### 6. Hard Antithesis-Class Tooling and Search Quality
 
 - Persisted pointer-free multiverse nodes, ranked counterfactual experiments,
-  stable trial metadata, the `vopr-debug` cursor command, cross-revision
-  property history, explicit corpus quarantine, one-shot range corruption,
-  datagrams, scheduler-controlled completion order, and bounded systematic
-  starvation are implemented in the self-contained repository.
-- Wire counterfactual graph generation and quarantine export into long-running
-  campaign artifact management rather than only library/command consumers.
-- Add an interactive TUI or editor frontend over `vopr-debug` with branch,
-  collector, causal-window, and child-comparison commands.
-- Extend corruption from one-shot read ranges to durable sector/torn-write
-  maps and exercise provider-specific datagram consumers where they exist.
+  stable trial metadata, explicit total experiment budgets, cross-revision
+  property history, scheduler-controlled completion order, and bounded
+  systematic starvation are implemented in the self-contained repository.
+- Long-running campaigns write causal reports, counterfactual experiment and
+  multiverse graphs, and a quarantine manifest plus the original quarantined
+  bytes. Diagnostics run only for a newly observed failure fingerprint.
+- `vopr-debug` supports replay-proven navigation, branch creation, logical
+  collectors, causal and bounded counterfactual windows, and child comparison
+  from command files or an interactive terminal.
+- The virtual filesystem supports one-shot read corruption, durable sector
+  corruption, clearing persistent corruption, and torn synchronization that
+  preserves only a selected durable prefix while retaining the prior tail.
+- The generic datagram model is ready, but this repository currently has no
+  production provider-specific datagram consumer to campaign. Add such a
+  campaign with the first real consumer rather than inventing a test-only one.
 - Add stable source/basic-block coverage as secondary guidance when the Zig
   instrumentation surface can remain outside the replay ABI.
 
@@ -938,10 +968,9 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The next correctness gains will come from wiring counterfactual graphs and
-quarantine exports into long-running campaign artifacts, adding an interactive
-frontend over the replay debugger, and deepening durable corruption and
-provider-specific datagram campaigns. New product services should cross the
-existing `std.Io`, lifecycle-hook, admission, and owner seams rather than
-creating native-only loops, multiplying suite names, or weakening production
-ownership contracts.
+The remaining hard-feature opportunities are conditional: add stable
+source/basic-block guidance when Zig exposes a durable instrumentation surface,
+and add provider-specific datagram campaigns when a real product consumer
+exists. New product services should cross the existing `std.Io`, lifecycle-hook,
+admission, and owner seams rather than creating native-only loops, multiplying
+suite names, or weakening production ownership contracts.

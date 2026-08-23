@@ -211,5 +211,7 @@ fn proveMetaBug(comptime bug: Bug) !void {
 }
 
 test "systematic meta-suite discovers replays and reduces required bug shapes" {
-    inline for (std.meta.tags(Bug)) |bug| try proveMetaBug(bug);
+    inline for (@typeInfo(Bug).@"enum".fields) |field| {
+        try proveMetaBug(@field(Bug, field.name));
+    }
 }

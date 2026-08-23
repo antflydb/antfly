@@ -153,6 +153,7 @@ const Entry = struct {
 
     fn call(entry_context: *Entry, _: *const std.Io.fiber.Switch) callconv(.withStackAlign(.c, stack_alignment)) noreturn {
         const task = entry_context.task;
+        task.kernel.setCurrent(task);
         task.start(task.contextBytes().ptr, task.resultBytes().ptr);
         task.kernel.finishCurrent(task);
     }
@@ -183,7 +184,7 @@ pub const Kernel = struct {
     }
 
     pub fn deinit(self: *Kernel) void {
-        std.debug.assert(self.current == null);
+        std.debug.assert(self.currentTask() == null);
         for (self.tasks.items) |task| self.destroyTaskMemory(task);
         for (self.groups.items) |group| {
             group.tasks.deinit(self.allocator);
@@ -260,7 +261,7 @@ pub const Kernel = struct {
         if (target.kernel != self or target.group != null or target.result_len != result.len or
             !result_alignment.compare(.lte, .fromByteUnits(storage_alignment)))
             return error.InvalidVoprIoFuture;
-        const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+        const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
         if (target == awaiter or target.awaiter != null) return error.InvalidVoprIoFuture;
         if (target.status != .finished) {
             target.awaiter = awaiter;
@@ -344,7 +345,7 @@ pub const Kernel = struct {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
         if (group.tasks.items.len != 0) {
-            const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+            const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
             awaiter.waiting_on_group = group;
@@ -362,7 +363,7 @@ pub const Kernel = struct {
         if (group.public != public_group) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
         if (group.tasks.items.len != 0) {
-            const awaiter = self.current orelse return error.VoprIoAwaitOutsideTask;
+            const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
             awaiter.waiting_on_group = group;
@@ -374,26 +375,26 @@ pub const Kernel = struct {
     }
 
     pub fn recancel(self: *Kernel) !void {
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         if (!task.cancel_acknowledged) return error.InvalidVoprIoRecancel;
         task.cancel_acknowledged = false;
         task.cancel_requested = true;
     }
 
     pub fn swapCancelProtection(self: *Kernel, new: std.Io.CancelProtection) !std.Io.CancelProtection {
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         const old = task.cancel_protection;
         task.cancel_protection = new;
         return old;
     }
 
     pub fn checkCancel(self: *Kernel) std.Io.Cancelable!void {
-        const task = self.current orelse return;
+        const task = self.currentTask() orelse return;
         return task.checkCancel();
     }
 
     pub fn sleepCurrent(self: *Kernel, sleep_info: ?Sleep) !void {
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.sleep = sleep_info;
         task.status = .waiting_sleep;
@@ -405,7 +406,7 @@ pub const Kernel = struct {
     /// product code. The current task becomes runnable again, so resumption is
     /// selected and recorded by the ordinary scheduler.
     pub fn yieldCurrentTask(self: *Kernel) !void {
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.status = .runnable;
         task.resume_generation +|= 1;
@@ -416,7 +417,7 @@ pub const Kernel = struct {
     pub fn futexWait(self: *Kernel, ptr: *const u32, expected: u32, sleep_info: ?Sleep, uncancelable: bool) !void {
         if (@atomicLoad(u32, ptr, .seq_cst) != expected) return;
         _ = try self.ensureFutexIdentity(ptr);
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         if (!uncancelable) try task.checkCancel();
         task.futex_ptr = ptr;
         task.futex_uncancelable = uncancelable;
@@ -440,7 +441,7 @@ pub const Kernel = struct {
     /// Park the current fiber on a simulator-owned logical resource. The
     /// resource ID must be derived from stable modeled state, never a pointer.
     pub fn waitExternal(self: *Kernel, resource_id: ids.StableId) !void {
-        const task = self.current orelse return error.VoprIoOperationOutsideTask;
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.external_id = resource_id;
         task.status = .waiting_external;
@@ -505,11 +506,7 @@ pub const Kernel = struct {
         for (self.tasks.items) |task| {
             if (task.status != .runnable or task.transitionId() != transition_id) continue;
             task.status = .running;
-            self.current = task;
-            const message: std.Io.fiber.Switch = .{ .old = &self.main_context, .new = &task.context };
-            _ = std.Io.fiber.contextSwitch(&message);
-            std.debug.assert(self.current == task);
-            self.current = null;
+            self.switchToTask(task);
             const task_id = task.id;
             const completed = task.status == .finished;
             if (task.reap_after_switch) self.removeAndDestroyTask(task);
@@ -635,7 +632,7 @@ pub const Kernel = struct {
     }
 
     fn finishCurrent(self: *Kernel, task: *Task) noreturn {
-        std.debug.assert(self.current == task);
+        std.debug.assert(self.currentTask() == task);
         task.status = .finished;
         if (task.awaiter) |awaiter| awaiter.makeRunnable();
         if (task.group) |group| {
@@ -653,11 +650,30 @@ pub const Kernel = struct {
         unreachable;
     }
 
-    fn yieldCurrent(self: *Kernel, task: *Task) void {
-        std.debug.assert(self.current == task);
+    noinline fn switchToTask(self: *Kernel, task: *Task) void {
+        const message: std.Io.fiber.Switch = .{ .old = &self.main_context, .new = &task.context };
+        _ = std.Io.fiber.contextSwitch(&message);
+        self.setCurrent(null);
+    }
+
+    noinline fn yieldCurrent(self: *Kernel, task: *Task) void {
+        std.debug.assert(self.currentTask() == task);
         const message: std.Io.fiber.Switch = .{ .old = &task.context, .new = &self.main_context };
         _ = std.Io.fiber.contextSwitch(&message);
-        std.debug.assert(self.current == task);
+        self.setCurrent(task);
+    }
+
+    /// Context switching transfers control outside the compiler's ordinary
+    /// call/return model. Task fibers publish their identity on entry/resume,
+    /// the main fiber clears it after return, and atomic access plus non-inline
+    /// switch boundaries prevent either side from moving that state across the
+    /// transfer.
+    fn currentTask(self: *Kernel) ?*Task {
+        return @atomicLoad(?*Task, &self.current, .seq_cst);
+    }
+
+    fn setCurrent(self: *Kernel, task: ?*Task) void {
+        @atomicStore(?*Task, &self.current, task, .seq_cst);
     }
 
     fn destroyTaskMemory(self: *Kernel, task: *Task) void {

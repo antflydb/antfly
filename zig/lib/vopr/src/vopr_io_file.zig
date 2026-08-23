@@ -20,6 +20,7 @@ pub const Faults = struct {
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
     drop_next_sync: bool = false,
+    torn_next_sync_limit: ?usize = null,
     partial_write_limit: ?usize = null,
     corrupt_next_read: ?CorruptRange = null,
 };
@@ -28,6 +29,11 @@ pub const CorruptRange = struct {
     offset: u64,
     length: u64,
     xor_mask: u8,
+};
+
+const PersistentCorruption = struct {
+    inode: u64,
+    range: CorruptRange,
 };
 
 const Node = struct {
@@ -68,6 +74,7 @@ pub const FileSystem = struct {
     nodes: std.ArrayListUnmanaged(*Node) = .empty,
     paths: std.StringHashMapUnmanaged(*Node) = .empty,
     handles: std.AutoHashMapUnmanaged(std.Io.File.Handle, OpenHandle) = .empty,
+    persistent_corruptions: std.ArrayListUnmanaged(PersistentCorruption) = .empty,
     faults: Faults = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !FileSystem {
@@ -82,6 +89,7 @@ pub const FileSystem = struct {
 
     pub fn deinit(self: *FileSystem) void {
         self.handles.deinit(self.allocator);
+        self.persistent_corruptions.deinit(self.allocator);
         self.paths.deinit(self.allocator);
         for (self.nodes.items) |node| {
             self.allocator.free(node.path);
@@ -424,12 +432,11 @@ pub const FileSystem = struct {
             const count = @min(buffer.len, handle.node.data.items.len - source_index);
             @memcpy(buffer[0..count], handle.node.data.items[source_index..][0..count]);
             if (corruption) |range| {
-                const corrupt_start = std.math.cast(usize, range.offset) orelse std.math.maxInt(usize);
-                const corrupt_end = std.math.add(usize, corrupt_start, std.math.cast(usize, range.length) orelse std.math.maxInt(usize)) catch std.math.maxInt(usize);
-                for (buffer[0..count], source_index..) |*byte, absolute_index| {
-                    if (absolute_index >= corrupt_start and absolute_index < corrupt_end)
-                        byte.* ^= range.xor_mask;
-                }
+                applyCorruption(buffer[0..count], source_index, range);
+            }
+            for (self.persistent_corruptions.items) |entry| {
+                if (entry.inode == handle.node.inode)
+                    applyCorruption(buffer[0..count], source_index, entry.range);
             }
             total += count;
             source_index += count;
@@ -625,10 +632,46 @@ pub const FileSystem = struct {
             self.faults.drop_next_sync = false;
             return;
         }
+        if (self.faults.torn_next_sync_limit) |limit| {
+            self.faults.torn_next_sync_limit = null;
+            const persisted_len = @min(limit, handle.node.data.items.len);
+            if (handle.node.durable_data.items.len < persisted_len) {
+                handle.node.durable_data.resize(self.allocator, persisted_len) catch
+                    return error.AccessDenied;
+            }
+            @memcpy(handle.node.durable_data.items[0..persisted_len], handle.node.data.items[0..persisted_len]);
+            persistMetadata(handle.node);
+            return;
+        }
         handle.node.durable_data.resize(self.allocator, handle.node.data.items.len) catch
             return error.AccessDenied;
         @memcpy(handle.node.durable_data.items, handle.node.data.items);
         persistMetadata(handle.node);
+    }
+
+    /// Installs a media-corruption range keyed by durable inode identity. The
+    /// overlay affects every later read and survives virtual crashes until it
+    /// is explicitly cleared, modeling a bad sector rather than a one-shot
+    /// transport bit flip.
+    pub fn addPersistentCorruption(self: *FileSystem, file: std.Io.File, range: CorruptRange) !void {
+        if (range.length == 0 or range.xor_mask == 0) return error.InvalidFileCorruptionRange;
+        const handle = self.handles.get(file.handle) orelse return error.InvalidVoprIoFile;
+        try self.persistent_corruptions.append(self.allocator, .{
+            .inode = handle.node.inode,
+            .range = range,
+        });
+    }
+
+    pub fn clearPersistentCorruption(self: *FileSystem, file: std.Io.File) !void {
+        const handle = self.handles.get(file.handle) orelse return error.InvalidVoprIoFile;
+        var index: usize = 0;
+        while (index < self.persistent_corruptions.items.len) {
+            if (self.persistent_corruptions.items[index].inode != handle.node.inode) {
+                index += 1;
+                continue;
+            }
+            _ = self.persistent_corruptions.swapRemove(index);
+        }
     }
 
     pub fn syncNamespace(self: *FileSystem) !void {
@@ -912,6 +955,19 @@ fn mapRenamePathError(err: anyerror) std.Io.Dir.RenameError {
     };
 }
 
+fn applyCorruption(bytes: []u8, absolute_start: usize, range: CorruptRange) void {
+    const corrupt_start = std.math.cast(usize, range.offset) orelse std.math.maxInt(usize);
+    const corrupt_end = std.math.add(
+        usize,
+        corrupt_start,
+        std.math.cast(usize, range.length) orelse std.math.maxInt(usize),
+    ) catch std.math.maxInt(usize);
+    for (bytes, absolute_start..) |*byte, absolute_index| {
+        if (absolute_index >= corrupt_start and absolute_index < corrupt_end)
+            byte.* ^= range.xor_mask;
+    }
+}
+
 test "virtual filesystem separates file and namespace durability" {
     var fs = try FileSystem.init(std.testing.allocator, .{});
     defer fs.deinit();
@@ -964,4 +1020,34 @@ test "virtual filesystem applies precise one-shot read range corruption" {
     try std.testing.expectEqualStrings("abCDef", &bytes);
     try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
     try std.testing.expectEqualStrings("abcdef", &bytes);
+}
+
+test "virtual filesystem persists torn sync prefixes and durable sector corruption" {
+    var fs = try FileSystem.init(std.testing.allocator, .{});
+    defer fs.deinit();
+    var file = try fs.createFile(.cwd(), "durable-corruption", .{ .read = true }, 1);
+    try std.testing.expectEqual(@as(usize, 6), try fs.writePositional(file, &.{}, &.{"abcdef"}, 1, 0, 2));
+    try fs.syncFile(file);
+    try fs.syncNamespace();
+
+    try std.testing.expectEqual(@as(usize, 6), try fs.writePositional(file, &.{}, &.{"UVWXYZ"}, 1, 0, 3));
+    fs.faults.torn_next_sync_limit = 2;
+    try fs.syncFile(file);
+    try fs.crash();
+
+    file = try fs.openFile(.cwd(), "durable-corruption", .{});
+    var bytes: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("UVcdef", &bytes);
+
+    try fs.addPersistentCorruption(file, .{ .offset = 2, .length = 2, .xor_mask = 0x20 });
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("UVCDef", &bytes);
+    try fs.crash();
+    file = try fs.openFile(.cwd(), "durable-corruption", .{});
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("UVCDef", &bytes);
+    try fs.clearPersistentCorruption(file);
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("UVcdef", &bytes);
 }
