@@ -291,7 +291,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert image_coverage["produced"] == 1
         assert image_coverage["skipped"] == 1
         assert image_coverage["terminal_failed"] == 0
-        assert image_coverage["complete"] is True
+        assert image_coverage["complete"] is True, json.dumps(image_status, indent=2)
         assert image_coverage["healthy"] is True
 
         image_query = cli(
