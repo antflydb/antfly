@@ -342,6 +342,13 @@ pub const Reader = struct {
         return if (result) |found| found.value else null;
     }
 
+    /// Fingerprints the eagerly validated index and footer without touching
+    /// opaque payload pages. `init` has already checked their shape and the
+    /// index carries a checksum for every payload value.
+    pub fn admissionChecksum(self: Reader) u32 {
+        return std.hash.Crc32.hash(self.data[self.index_offset..]);
+    }
+
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
         return .{
             .reader = self,
@@ -438,7 +445,7 @@ pub const Reader = struct {
 /// payload page at startup.
 pub fn admissionChecksum(data: []const u8) !u32 {
     const reader = try Reader.init(data);
-    return std.hash.Crc32.hash(data[reader.index_offset..]);
+    return reader.admissionChecksum();
 }
 
 pub const VerifiedReader = struct {

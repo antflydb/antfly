@@ -70,6 +70,17 @@ pub const CheckpointPolicy = struct {
     wal_to_segment_percent: u8 = 50,
 };
 
+/// Proof produced only after an immutable checkpoint segment has been parsed,
+/// checksummed, and durably staged. Publication may trust these content
+/// fingerprints because the generation file is immutable and private to the
+/// store; it still verifies generation and file size before replacing CURRENT.
+pub const StagedCheckpointSegment = struct {
+    generation: u64,
+    bytes: u64,
+    checksum: u32,
+    admission_checksum: u32,
+};
+
 pub const RecoveredWal = struct {
     alloc: Allocator,
     bytes: []u8,
@@ -286,7 +297,7 @@ pub const Store = struct {
             covered_source_sequence,
             segment_bytes,
             null,
-            false,
+            null,
         );
     }
 
@@ -298,15 +309,29 @@ pub const Store = struct {
         self: *Store,
         segment_generation: u64,
         segment_bytes: []const u8,
-    ) !void {
+    ) !StagedCheckpointSegment {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
         }
-        _ = try posting_segment.Reader.init(segment_bytes);
+        const reader = try posting_segment.Reader.init(segment_bytes);
+        const admission_checksum = reader.admissionChecksum();
+        const receipt: StagedCheckpointSegment = .{
+            .generation = segment_generation,
+            .bytes = @intCast(segment_bytes.len),
+            // New generations use the eagerly verified index/footer checksum
+            // plus each entry's lazy payload checksum. A second full-file CRC
+            // would fault every payload page and duplicate that integrity
+            // coverage on every checkpoint.
+            // Zero means "not present" in older checkpoint formats. Preserve
+            // an unambiguous fallback if the index CRC happens to be zero.
+            .checksum = if (admission_checksum == 0) std.hash.Crc32.hash(segment_bytes) else 0,
+            .admission_checksum = admission_checksum,
+        };
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
         try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
+        return receipt;
     }
 
     /// Publishes a segment materialized from the committed WAL prefix ending
@@ -326,7 +351,7 @@ pub const Store = struct {
             covered_source_sequence,
             segment_bytes,
             flattened_wal_bytes,
-            false,
+            null,
         );
     }
 
@@ -338,13 +363,14 @@ pub const Store = struct {
         covered_source_sequence: u64,
         segment_bytes: []const u8,
         flattened_wal_bytes: u64,
+        staged: StagedCheckpointSegment,
     ) !void {
         return try self.publishCheckpointInternal(
             segment_generation,
             covered_source_sequence,
             segment_bytes,
             flattened_wal_bytes,
-            true,
+            staged,
         );
     }
 
@@ -354,13 +380,13 @@ pub const Store = struct {
         covered_source_sequence: u64,
         segment_bytes: []const u8,
         flattened_wal_bytes: ?u64,
-        segment_already_staged: bool,
+        staged: ?StagedCheckpointSegment,
     ) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.segment_generation) return error.OutOfOrderPostingSegmentGeneration;
         }
-        _ = try posting_segment.Reader.init(segment_bytes);
+        if (staged == null) _ = try posting_segment.Reader.init(segment_bytes);
 
         var retained_wal: ?RecoveredWal = null;
         defer if (retained_wal) |*wal| wal.deinit();
@@ -409,9 +435,26 @@ pub const Store = struct {
             return error.PostingWalGenerationOverflow;
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
-        if (segment_already_staged) {
-            if (try self.storage.fileSize(segment_path) != segment_bytes.len) return error.MissingPostingSegment;
-        } else {
+        const segment_checksum: u32 = if (staged) |receipt| blk: {
+            if (receipt.generation != segment_generation or receipt.bytes != segment_bytes.len) {
+                return error.InvalidStagedPostingSegment;
+            }
+            if (try self.storage.fileSize(segment_path) != receipt.bytes) return error.MissingPostingSegment;
+            break :blk receipt.checksum;
+        } else 0;
+        const segment_admission_checksum = if (staged) |receipt|
+            receipt.admission_checksum
+        else
+            try posting_segment.admissionChecksum(segment_bytes);
+        const effective_segment_checksum = if (staged != null or segment_admission_checksum != 0)
+            segment_checksum
+        else blk: {
+            // A zero admission CRC is valid but indistinguishable from the
+            // legacy "field absent" encoding. Only that one-in-2^32 case pays
+            // for the old full-file checksum.
+            break :blk std.hash.Crc32.hash(segment_bytes);
+        };
+        if (staged == null) {
             try atomicReplace(self.alloc, self.storage, segment_path, segment_bytes);
         }
 
@@ -421,8 +464,8 @@ pub const Store = struct {
 
         const next_checkpoint: posting_wal.Checkpoint = .{
             .segment_generation = segment_generation,
-            .segment_checksum = std.hash.Crc32.hash(segment_bytes),
-            .segment_admission_checksum = try posting_segment.admissionChecksum(segment_bytes),
+            .segment_checksum = effective_segment_checksum,
+            .segment_admission_checksum = segment_admission_checksum,
             .wal_generation = next_wal_generation,
             .wal_committed_bytes = @intCast(tail.len),
             .covered_source_sequence = covered_source_sequence,
@@ -475,7 +518,13 @@ pub const Store = struct {
         defer self.alloc.free(path);
         const bytes = try self.storage.readFileAlloc(self.alloc, path, boundedReadLimit(max_segment_bytes));
         errdefer self.alloc.free(bytes);
-        if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) return error.PostingSegmentChecksumMismatch;
+        if (checkpoint.segment_admission_checksum != 0) {
+            if ((posting_segment.admissionChecksum(bytes) catch 0) != checkpoint.segment_admission_checksum) {
+                return error.PostingSegmentChecksumMismatch;
+            }
+        } else if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) {
+            return error.PostingSegmentChecksumMismatch;
+        }
         _ = try posting_segment.Reader.init(bytes);
         return bytes;
     }
@@ -488,7 +537,13 @@ pub const Store = struct {
             else => return err,
         };
         errdefer self.alloc.free(bytes);
-        if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) return error.PostingSegmentChecksumMismatch;
+        if (checkpoint.segment_admission_checksum != 0) {
+            if ((posting_segment.admissionChecksum(bytes) catch 0) != checkpoint.segment_admission_checksum) {
+                return error.PostingSegmentChecksumMismatch;
+            }
+        } else if (std.hash.Crc32.hash(bytes) != checkpoint.segment_checksum) {
+            return error.PostingSegmentChecksumMismatch;
+        }
         _ = try posting_segment.Reader.init(bytes);
         return bytes;
     }
@@ -752,7 +807,14 @@ test "storage.posting segment publication preserves the exact committed WAL tail
     try next_writer.appendBaseAt(3, 11, "flattened");
     const next_segment = try next_writer.build();
     defer alloc.free(next_segment);
-    try store.publishCheckpointPreservingWalTail(2, 11, next_segment, flattened_wal_bytes);
+    const staged = try store.stageCheckpointSegment(2, next_segment);
+    var wrong_generation = staged;
+    wrong_generation.generation += 1;
+    try std.testing.expectError(
+        error.InvalidStagedPostingSegment,
+        store.publishStagedCheckpointPreservingWalTail(2, 11, next_segment, flattened_wal_bytes, wrong_generation),
+    );
+    try store.publishStagedCheckpointPreservingWalTail(2, 11, next_segment, flattened_wal_bytes, staged);
     try std.testing.expect(store.wal_committed_bytes > 0);
     try std.testing.expectEqual(@as(u64, 12), store.covered_source_sequence);
     try std.testing.expectEqual(@as(?u64, 3), store.last_committed_batch);

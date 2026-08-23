@@ -1788,6 +1788,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     completed: std.atomic.Value(bool) = .init(false),
     build_error: ?anyerror = null,
     result: ?ExperimentalPostingCheckpointBuildResult = null,
+    staged: ?posting_segment_store_mod.StagedCheckpointSegment = null,
 
     fn allocator() Allocator {
         return platform.allocator.processAllocator(std.heap.smp_allocator);
@@ -1810,7 +1811,7 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.completed.store(true, .release);
             return;
         };
-        self.staging_store.stageCheckpointSegment(
+        self.staged = self.staging_store.stageCheckpointSegment(
             self.segment_generation,
             result.segment_bytes,
         ) catch |err| {
@@ -3929,11 +3930,13 @@ pub const HBCIndex = struct {
             return false;
         }
         const result = build.result orelse return error.MissingPostingCheckpoint;
+        const staged = build.staged orelse return error.MissingPostingCheckpoint;
         try posting_store.publishStagedCheckpointPreservingWalTail(
             build.segment_generation,
             build.covered_source_sequence,
             result.segment_bytes,
             build.flattened_wal_bytes,
+            staged,
         );
         std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} source=immutable_generation_background wal_tail_bytes={}", .{
             build.segment_generation,
