@@ -3934,21 +3934,23 @@ const python_redirect_writer_server_script =
     "    httpd.serve_forever()\n";
 
 const python_tls_fixed_keepalive_server_script =
+    "import pathlib\n" ++
     "import socket\n" ++
     "import ssl\n" ++
     "import sys\n" ++
     "import time\n" ++
     "\n" ++
-    "port = int(sys.argv[1])\n" ++
-    "cert = sys.argv[2]\n" ++
-    "key = sys.argv[3]\n" ++
+    "cert = sys.argv[1]\n" ++
+    "key = sys.argv[2]\n" ++
+    "port_file = sys.argv[3]\n" ++
     "payload = (b'0123456789abcdef' * 16384)\n" ++
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
-    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.bind(('127.0.0.1', 0))\n" ++
     "listener.listen(1)\n" ++
     "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n" ++
     "ctx.load_cert_chain(certfile=cert, keyfile=key)\n" ++
+    "pathlib.Path(port_file).write_text(str(listener.getsockname()[1]))\n" ++
     "while True:\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
@@ -4528,24 +4530,19 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const port = try reserveEphemeralPort(io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_fixed_keepalive_server_script });
 
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-
     var child = std.process.spawn(io, .{
         .argv = &.{
             "python3",
             "server.py",
-            port_arg,
             "cert.pem",
             "key.pem",
+            "port.txt",
         },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
@@ -4557,9 +4554,25 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    // Python binds port zero and publishes the selected port only after the
+    // TLS context is ready, avoiding both port-reuse and fixed-sleep races.
+    var port: ?u16 = null;
+    var attempt: usize = 0;
+    while (attempt < 100 and port == null) : (attempt += 1) {
+        const raw = tmp.dir.readFileAlloc(io, "port.txt", allocator, .limited(32)) catch |err| switch (err) {
+            error.FileNotFound => {
+                io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(raw);
+        port = std.fmt.parseInt(u16, std.mem.trim(u8, raw, " \t\r\n"), 10) catch null;
+        if (port == null) io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+    }
+    const server_port = port orelse return error.TestExpectedEqual;
 
-    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{server_port});
     defer allocator.free(url);
 
     var client = Client.initWithConfig(allocator, io, .{
