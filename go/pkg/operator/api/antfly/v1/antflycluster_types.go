@@ -2240,7 +2240,10 @@ type HAPhysicalIsolationReceiptStatus struct {
 
 	LeaseScope HAPhysicalIsolationLeaseScope `json:"leaseScope"`
 
-	LeaseTransferTime metav1.Time `json:"leaseTransferTime"`
+	// LeaseTransferTime preserves the coordination Lease acquireTime exactly.
+	// metav1.Time serializes at whole-second precision, which cannot safely bind
+	// a persisted isolation receipt back to the MicroTime Lease authority.
+	LeaseTransferTime metav1.MicroTime `json:"leaseTransferTime"`
 
 	// WatchdogMaxFenceLatencyMS is copied exactly from the authenticated old
 	// runtime proof and must equal the configured runtime watchdog bound.

@@ -336,7 +336,7 @@ func newHAPhysicalIsolationIntentReceipt(
 		LeaseHolder:                       strings.TrimSpace(*lease.Spec.HolderIdentity),
 		LeaseGeneration:                   action.FenceGeneration,
 		LeaseScope:                        haPhysicalIsolationLeaseScope(scope, topologyID),
-		LeaseTransferTime:                 metav1.NewTime(lease.Spec.AcquireTime.Time),
+		LeaseTransferTime:                 metav1.NewMicroTime(lease.Spec.AcquireTime.Time),
 		WatchdogMaxFenceLatencyMS:         watchdogMaxFenceLatencyMS,
 	}
 	receipt.WatchdogProof = haBindPhysicalIsolationWatchdogProof(cluster, action, pods, receipt)
@@ -717,11 +717,11 @@ func haPhysicalIsolationWatchdogProofStructurallyValid(action antflyv1.HAPlanned
 	return false
 }
 
-func haWatchdogProofObservedBeforeTransfer(observedAt, transferAt metav1.Time) bool {
+func haWatchdogProofObservedBeforeTransfer(observedAt metav1.Time, transferAt metav1.MicroTime) bool {
 	if observedAt.IsZero() || transferAt.IsZero() {
 		return false
 	}
-	return observedAt.Before(&transferAt)
+	return observedAt.Time.Before(transferAt.Time)
 }
 
 func haIsolatedPromotionBoundary(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) (uint64, bool) {

@@ -4327,6 +4327,30 @@ func TestPhysicalIsolationReceiptRejectsForgedPartialAndStaleEvidence(t *testing
 	}
 }
 
+func TestPhysicalIsolationReceiptPreservesLeaseAcquireTimePrecision(t *testing.T) {
+	transfer := time.Date(2026, 8, 23, 20, 41, 22, 49_555_000, time.UTC)
+	receipt := antflyv1.HAPhysicalIsolationReceiptStatus{
+		LeaseTransferTime: metav1.NewMicroTime(transfer),
+	}
+
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal physical-isolation receipt: %v", err)
+	}
+	var persisted antflyv1.HAPhysicalIsolationReceiptStatus
+	if err := json.Unmarshal(encoded, &persisted); err != nil {
+		t.Fatalf("unmarshal physical-isolation receipt: %v", err)
+	}
+	if !persisted.LeaseTransferTime.Time.Equal(transfer) {
+		t.Fatalf(
+			"Lease acquireTime precision changed across status persistence: got %s want %s JSON=%s",
+			persisted.LeaseTransferTime.Time.Format(time.RFC3339Nano),
+			transfer.Format(time.RFC3339Nano),
+			encoded,
+		)
+	}
+}
+
 func TestPhysicalIsolationReceiptAcceptsOlderExactProcessSelfFencePromise(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	cluster, action := validPhysicalIsolationReceiptFixture(now)
@@ -4430,7 +4454,7 @@ func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluste
 		InitialPodListResourceVersion: "pods-initial", LeaseName: "topology-ha-fence", LeaseUID: "lease-uid",
 		LeaseResourceVersion: "1", LeaseHolder: "standby-a", LeaseGeneration: 2,
 		LeaseScope:        antflyv1.HAPhysicalIsolationLeaseScope{TopologyID: "topology-anchor-uid", ClusterID: 100, TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a", PrimaryLSN: 12},
-		LeaseTransferTime: metav1.NewTime(now), WatchdogMaxFenceLatencyMS: 10_000,
+		LeaseTransferTime: metav1.NewMicroTime(now), WatchdogMaxFenceLatencyMS: 10_000,
 		IsolatedStatefulSetGeneration: 2, IsolatedStatefulSetObservedGeneration: 2,
 		IsolatedStatefulSetResourceVersion: "2", ObservedLeaseResourceVersion: "2", AbsenceProven: true,
 		AbsencePodListResourceVersion: "pods-absence", FrozenBoundaryLSN: 12, ObservedAt: observed.DeepCopy(), CompletedAt: observed.DeepCopy(),
