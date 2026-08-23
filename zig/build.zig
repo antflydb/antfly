@@ -6851,6 +6851,17 @@ pub fn build(b: *std.Build) void {
     request_lifecycle_vopr_test_step.dependOn(&run_api_http_runtime_tests.step);
     data_plane_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
 
+    const replication_backfill_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"replication lifecycle adapter records stable VoprIo safepoints"},
+    });
+    const run_replication_backfill_vopr_tests = b.addRunArtifact(replication_backfill_vopr_tests);
+    const replication_backfill_vopr_test_step = b.step(
+        "replication-backfill-vopr-test",
+        "Run production replication lifecycle suspension points and VOPR campaigns",
+    );
+    replication_backfill_vopr_test_step.dependOn(&run_replication_backfill_vopr_tests.step);
+
     const data_server_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -7026,6 +7037,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
     vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_replication_backfill_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
