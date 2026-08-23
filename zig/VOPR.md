@@ -906,6 +906,25 @@ restart. It proves readiness is published only after all children start, first
 failure cancels the process, rollback and shutdown release every child, and a
 new generation can become ready before its own coordinated teardown.
 
+#### User and Authentication Lifecycle
+
+`UserManager` now borrows `std.Io` for password salts, API-key identity and
+secret generation, realtime expiry checks, and its mutation/seed-capture
+mutex. Production standalone, metadata, and data roles pass their process
+runtime explicitly; the manager no longer creates hidden `Threaded` executors.
+Production-neutral lifecycle events identify user persistence/publication,
+password persistence/publication, API-key persistence/publication/revocation,
+permission changes, and row-filter changes.
+
+The `auth-lifecycle-vopr-test` gate runs the real manager and stores through
+password rotation, API-key rotation, permission and row-filter changes,
+revocation with an already materialized reader, durable reload, and an injected
+crash between user persistence and policy publication. A separate fiber
+schedule holds the real seed-capture lease, forces a password mutation to park
+on the production `std.Io.Mutex`, and proves it cannot finish before capture
+releases the lease. Every lifecycle history exact-replays with deterministic
+randomness and time.
+
 #### Serverless Object-Store Protocols
 
 Real WAL, catalog, manifest, artifact, and progress-store operations now run
@@ -963,7 +982,7 @@ request microsteps as those seams are added.
 | --- | --- | --- |
 | P0 implemented | Replication backfill and rebalancing | `replication-backfill-vopr-test` covers snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, schema changes, and exact replay through the production runners. |
 | P0 implemented | Standalone and serverless supervision | `supervision-vopr-test` covers partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, virtual watchdog expiry, and restart through the production supervisor. The serverless manager now owns a borrowed-`std.Io` Future instead of a native run-loop thread. |
-| P0 | User and authentication lifecycle | Concurrent password, API-key, permission, and row-filter changes; seed capture; revoke and rotate; durable reload; crashes between user and policy persistence; and stale-reader behavior. The native-thread seed-lease regression in [`usermgr/user_manager.zig`](pkg/antfly/src/usermgr/user_manager.zig) should become a deterministic schedule. |
+| P0 implemented | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
 | P1 | Complete serverless workflow | Claim, build, compact or enrich, publish, and catalog visibility with duplicate workers, lease takeover, ambiguous object-store completion, retry, cancellation, and crash recovery. Object-store protocols are covered; their orchestration is not yet covered end to end. |
 | P1 | DB and index request races | Elevate meaningful native-thread regressions such as cross-index admission, reader/writer fairness, delete/materialize, capture, shutdown, and cancellation into VOPR transitions through production-safe seams. Do not mechanically port test threads. |
 | P2 | Provider boundaries | Add deterministic response adapters for inference providers and PostgreSQL/libpq covering timeout, partial response, cancellation, retry, malformed data, and admission ownership. Keep actual model execution, GPU kernels, and libpq internals in differential and integration tests. |

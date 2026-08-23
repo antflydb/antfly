@@ -6876,6 +6876,17 @@ pub fn build(b: *std.Build) void {
     );
     supervision_vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
 
+    const auth_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"user auth lifecycle VOPR exact replays rotate revoke reload and crash recovery"},
+    });
+    const run_auth_lifecycle_vopr_tests = b.addRunArtifact(auth_lifecycle_vopr_tests);
+    const auth_lifecycle_vopr_test_step = b.step(
+        "auth-lifecycle-vopr-test",
+        "Run password, API-key, permission, row-filter, seed, revoke, reload, and crash campaigns",
+    );
+    auth_lifecycle_vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
+
     const data_server_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -7053,6 +7064,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_replication_backfill_vopr_tests.step);
     vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
+    vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);

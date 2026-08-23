@@ -914,8 +914,9 @@ pub fn runFromIterator(
         errdefer if (auth_runtime) |*runtime| runtime.deinit();
         auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
         auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
-        user_manager = try antfly.usermgr.UserManager.init(
+        user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
+            init.io,
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
