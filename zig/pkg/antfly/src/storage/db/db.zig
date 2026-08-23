@@ -4972,20 +4972,6 @@ pub const DB = struct {
         return asyncContextHasActiveDenseBulkWork(self.async_context);
     }
 
-    /// A repair handoff may publish several intermediate visibility edges:
-    /// candidate activation, enrichment replay, and dense finalization. This
-    /// allocation-free predicate lets the owning status fence distinguish a
-    /// final serving observation from those intermediate publications.
-    pub fn repairHandoffVisibilitySettled(self: *const DB) bool {
-        if (self.hasActiveDenseBulkWork()) return false;
-        if (self.enrichment_runtime) |runtime| {
-            const runtime_stats = runtime.stats();
-            if (!runtime_stats.worker_failed and
-                runtime_stats.applied_sequence < runtime_stats.target_sequence) return false;
-        }
-        return true;
-    }
-
     pub fn runLsmMaintenanceUntilIdle(self: *DB) !usize {
         var steps: usize = 0;
         while (try self.runLsmMaintenanceStep()) {

@@ -1489,6 +1489,11 @@ fn repairActiveGenerationServiceable(item: anytype) bool {
 
 fn publicIndexRuntimeView(item: anytype) @TypeOf(item) {
     var view = item;
+    // Aggregation projects each shard independently so a serviceable repair
+    // generation cannot erase replay debt owned by a sibling shard. Do not
+    // project that already-folded view a second time during serialization.
+    if (@hasField(@TypeOf(item), "public_runtime_view_projected") and
+        item.public_runtime_view_projected) return view;
     if (!repairActiveGenerationServiceable(item) or publicIndexRepairState(item) == null) return view;
 
     // Candidate generation construction has its own replay session. The
@@ -1527,6 +1532,9 @@ test "index repair aggregation exposes a waiting shard over rebuilding shards" {
 }
 
 const AggregatedIndexStatus = struct {
+    // Internal encoder state; never emitted. Aggregate replay fields already
+    // contain the per-shard public views and must remain authoritative.
+    public_runtime_view_projected: bool = false,
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
@@ -1657,7 +1665,10 @@ fn aggregateIndexStatusIndexed(
     coverage_config_hash: u64,
     status_lookup: ?*const RuntimeStatusLookup,
 ) ?AggregatedIndexStatus {
-    var aggregate: AggregatedIndexStatus = .{ .coverage_config_hash = coverage_config_hash };
+    var aggregate: AggregatedIndexStatus = .{
+        .public_runtime_view_projected = true,
+        .coverage_config_hash = coverage_config_hash,
+    };
     var found = false;
     var materialization_count: usize = 0;
     var active_count: usize = 0;
@@ -4712,7 +4723,7 @@ test "index status aggregation reports selected algebraic progress summary shard
     try std.testing.expectEqualStrings("recommendation:high-progress", aggregate.algebraic_active_progress.?.recommendation);
 }
 
-test "index encoders aggregate replay debt across local shards" {
+test "index encoders preserve sibling replay debt during serviceable repair" {
     const shard_a_indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(shard_a_indexes);
     shard_a_indexes[0] = .{
@@ -4720,11 +4731,13 @@ test "index encoders aggregate replay debt across local shards" {
         .kind = .full_text,
         .doc_count = 4,
         .term_count = 10,
-        .backfill_active = true,
-        .backfill_progress = 0.4,
         .replay_applied_sequence = 2,
         .replay_target_sequence = 5,
         .replay_catch_up_required = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 2,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
     };
     defer std.testing.allocator.free(shard_a_indexes[0].name);
 
@@ -4735,9 +4748,11 @@ test "index encoders aggregate replay debt across local shards" {
         .kind = .full_text,
         .doc_count = 6,
         .term_count = 14,
+        .backfill_active = true,
+        .backfill_progress = 0.4,
         .replay_applied_sequence = 5,
-        .replay_target_sequence = 5,
-        .replay_catch_up_required = false,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
     };
     defer std.testing.allocator.free(shard_b_indexes[0].name);
 
@@ -4745,6 +4760,7 @@ test "index encoders aggregate replay debt across local shards" {
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 4,
             .index_count = 1,
@@ -4753,6 +4769,7 @@ test "index encoders aggregate replay debt across local shards" {
     };
     local_items[1] = .{
         .group_id = 8,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 6,
             .index_count = 1,
@@ -4779,6 +4796,9 @@ test "index encoders aggregate replay debt across local shards" {
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "search_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":7") != null);
+    // Shard 7's candidate-only 2 -> 5 debt is hidden by its serviceable
+    // active generation. Shard 8's independent 5 -> 8 debt must survive both
+    // aggregation and final serialization: 2 + 5 -> 2 + 8.
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.400") != null);

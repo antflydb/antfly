@@ -8484,8 +8484,12 @@ pub const ProvisionedTableWriteSource = struct {
         change: db_mod.QueryVisibilityChange,
     ) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        defer switch (change) {
-            .status, .publish, .publish_consistent, .publish_blocking => self.maybeSettleRepairHandoffAfterVisibility(table_name, group_id, db),
+        // Cached owners release repair handoff authority only after a fresh
+        // post-clear observation is successfully published. Sources without a
+        // status cache have no publication plane to wait for: their next live
+        // status request is itself authoritative.
+        defer if (self.runtime_status_cache == null) switch (change) {
+            .status, .publish, .publish_consistent, .publish_blocking => _ = self.settleRepairHandoffStatusBestEffort(table_name, group_id),
             else => {},
         };
         switch (change) {
@@ -8588,17 +8592,6 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .data);
-    }
-
-    fn maybeSettleRepairHandoffAfterVisibility(
-        self: *ProvisionedTableWriteSource,
-        table_name: []const u8,
-        group_id: u64,
-        db: ?*db_mod.DB,
-    ) void {
-        const managed_db = db orelse return;
-        if (!managed_db.repairHandoffVisibilitySettled()) return;
-        _ = self.settleRepairHandoffStatusBestEffort(table_name, group_id);
     }
 
     fn deferManagedRuntimeStatusPublication(
@@ -21443,6 +21436,12 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
         .runtime,
         db,
     );
+    // The cache now contains an observation captured after the durable repair
+    // clear edge. That publication, rather than global DB idleness, is the
+    // causal boundary that makes status authoritative again. Unrelated dense
+    // or enrichment work remains visible as ordinary catch-up diagnostics and
+    // cannot indefinitely hold another index's status fence.
+    _ = source.settleRepairHandoffStatusBestEffort(table_name, group_id);
 }
 
 fn publishTerminalStartupRuntimeStatusSnapshot(
@@ -33615,7 +33614,14 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
-    try std.testing.expect(source.settleRepairHandoffStatusBestEffort("docs", 7001));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .publish_blocking,
+    );
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
@@ -33625,8 +33631,55 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
-    try std.testing.expect(source.settleRepairHandoffStatusBestEffort("docs", 7002));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    // A post-clear status observation settles this shard without waiting for
+    // unrelated dense or enrichment workers to become globally idle.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7002,
+        null,
+        .status,
+    );
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
+test "repair handoff status settles after authoritative cached publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/repair-handoff-authoritative-publication",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var visible_generation = db.core.index_manager.lsm_root_generation;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    source.reserveStructuralReconcileStatus("docs");
+    var request = ProvisionedTableWriteSource.StructuralReconcileRequest{
+        .table_name = try alloc.dupe(u8, "docs"),
+    };
+    defer request.deinit(alloc);
+    try request.deferRepairDebt(alloc, 7001);
+    request.handoffDeferredRepairDebt(&source);
+    source.markRepairHandoffClearBestEffort("docs", 7001);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
 }
 
 test "index reconciliation request enqueues a catalog-deleted target without create admission" {
