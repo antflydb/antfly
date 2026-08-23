@@ -2571,10 +2571,23 @@ runs models arbitrary delay; bounded queues model clog and backpressure.
 Datagrams and accelerated file-to-socket transfer currently fail closed and
 latch a harness violation rather than reaching host networking.
 
-Registered processes/resources, richer storage corruption and completion-order
-faults, datagram networking, instrumentation, counterfactual tooling, and the
-five domain scenarios remain required work; the partial capability set does
-not advertise those later capabilities.
+Registered processes and resource controls are implemented in
+`lib/vopr/src/sim_io_process.zig` and the file/network configuration. Only
+harness-registered in-process entrypoints can spawn; names not in the registry
+return `FileNotFound`, so arbitrary executables cannot escape to the host.
+Arguments are copied into process-owned storage, each child runs as a SimIo
+fiber, and ordinary `std.process.spawn`, `Child.wait`, and `Child.kill` operate
+on virtual process IDs. Cooperative checkpoints expose pause/resume,
+cancellation, deterministic CPU-work budgets, and `SIGXCPU` exhaustion.
+Process, file-descriptor, socket, storage-capacity, send-buffer, and allocator
+limits provide deterministic resource pressure. Conformance tests cover
+suspended start/resume/wait, unknown-program rejection, CPU exhaustion, file
+descriptor exhaustion, storage-full behavior, and socket quota exhaustion.
+Image replacement and cwd mutation remain explicit fail-closed operations.
+
+Richer storage corruption and completion-order faults, datagram networking,
+instrumentation, counterfactual tooling, and the five domain scenarios remain
+required work; the partial capability set does not advertise instrumentation.
 
 ## Risks and Mitigations
 

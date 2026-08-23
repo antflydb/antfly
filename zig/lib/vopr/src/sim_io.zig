@@ -18,6 +18,7 @@ const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
 const file_mod = @import("sim_io_file.zig");
 const net_mod = @import("sim_io_net.zig");
+const process_mod = @import("sim_io_process.zig");
 const task_mod = @import("sim_io_task.zig");
 const transition = @import("transition.zig");
 
@@ -79,6 +80,8 @@ pub const supported_capabilities = CapabilitySet.of(&.{
     .sleep,
     .files,
     .sockets,
+    .processes,
+    .resources,
 });
 
 pub const Metadata = struct {
@@ -160,6 +163,8 @@ pub const ViolationOperation = enum {
     memory_map_write,
     stderr_lock,
     stderr_unlock,
+    process_replace,
+    process_current_path,
     child_wait,
     child_kill,
     sleep,
@@ -186,6 +191,8 @@ pub const Config = struct {
     files: file_mod.Config = .{},
     net_allocator: std.mem.Allocator = std.heap.page_allocator,
     network: net_mod.Config = .{},
+    process_allocator: std.mem.Allocator = std.heap.page_allocator,
+    processes: process_mod.Config = .{},
 };
 
 pub const InitError = error{
@@ -196,6 +203,9 @@ pub const InitError = error{
     InvalidSimIoFileHandleLimit,
     InvalidSimIoSocketLimit,
     InvalidSimIoStreamCapacity,
+    InvalidSimIoProcessLimit,
+    InvalidSimIoProgramName,
+    DuplicateSimIoProgram,
 };
 
 pub const SimIo = struct {
@@ -212,6 +222,7 @@ pub const SimIo = struct {
     tasks: task_mod.Kernel,
     files: file_mod.FileSystem,
     network: net_mod.Network,
+    processes: process_mod.Table,
 
     pub fn init(config: Config) InitError!SimIo {
         if (!supported_capabilities.containsAll(config.required)) {
@@ -227,6 +238,12 @@ pub const SimIo = struct {
             error.InvalidSimIoStreamCapacity => return error.InvalidSimIoStreamCapacity,
         };
         errdefer network.deinit();
+        var processes = process_mod.Table.init(config.process_allocator, config.processes) catch |err| switch (err) {
+            error.InvalidSimIoProcessLimit => return error.InvalidSimIoProcessLimit,
+            error.InvalidSimIoProgramName => return error.InvalidSimIoProgramName,
+            error.DuplicateSimIoProgram => return error.DuplicateSimIoProgram,
+        };
+        errdefer processes.deinit();
         return .{
             .prng = std.Random.DefaultPrng.init(config.seed),
             .monotonic_ns = config.monotonic_ns,
@@ -236,6 +253,7 @@ pub const SimIo = struct {
             .tasks = try task_mod.Kernel.init(config.task_allocator, config.tasks),
             .files = files,
             .network = network,
+            .processes = processes,
         };
     }
 
@@ -243,6 +261,7 @@ pub const SimIo = struct {
         self.tasks.deinit();
         self.files.deinit();
         self.network.deinit();
+        self.processes.deinit();
         self.* = undefined;
     }
 
@@ -316,7 +335,9 @@ pub const SimIo = struct {
     }
 
     fn bindNetwork(self: *SimIo) void {
-        self.network.bindWaitPort(.{ .ptr = &self.tasks, .vtable = &network_wait_vtable });
+        const wait_port: net_mod.WaitPort = .{ .ptr = &self.tasks, .vtable = &network_wait_vtable };
+        self.network.bindWaitPort(wait_port);
+        self.processes.bindWaitPort(wait_port);
     }
 };
 
@@ -736,14 +757,64 @@ fn unlockStderr(userdata: ?*anyopaque) void {
     state(userdata).latch(.stderr_unlock);
 }
 
-fn childWait(userdata: ?*anyopaque, _: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
-    state(userdata).latch(.child_wait);
-    return error.AccessDenied;
+fn processExecutableOpen(_: ?*anyopaque, _: std.Io.Dir.OpenFileOptions) std.process.OpenExecutableError!std.Io.File {
+    return error.FileNotFound;
+}
+
+fn processExecutablePath(_: ?*anyopaque, buffer: []u8) std.process.ExecutablePathError!usize {
+    const path = "/sim/bin/antfly-vopr";
+    if (path.len > buffer.len) return error.NameTooLong;
+    @memcpy(buffer[0..path.len], path);
+    return path.len;
+}
+
+fn processCurrentPath(_: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
+    if (buffer.len == 0) return error.NameTooLong;
+    buffer[0] = '/';
+    return 1;
+}
+
+fn processSetCurrentDir(userdata: ?*anyopaque, _: std.Io.Dir) std.process.SetCurrentDirError!void {
+    state(userdata).latch(.process_current_path);
+    return error.OperationUnsupported;
+}
+
+fn processSetCurrentPath(userdata: ?*anyopaque, _: []const u8) std.process.SetCurrentPathError!void {
+    state(userdata).latch(.process_current_path);
+    return error.OperationUnsupported;
+}
+
+fn processReplace(userdata: ?*anyopaque, _: std.process.ReplaceOptions) std.process.ReplaceError {
+    state(userdata).latch(.process_replace);
+    return error.OperationUnsupported;
+}
+
+fn processReplacePath(userdata: ?*anyopaque, _: std.Io.Dir, _: std.process.ReplaceOptions) std.process.ReplaceError {
+    state(userdata).latch(.process_replace);
+    return error.OperationUnsupported;
+}
+
+fn processSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    const self = state(userdata);
+    return self.processes.spawn(self.io(), options);
+}
+
+fn processSpawnPath(userdata: ?*anyopaque, _: std.Io.Dir, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    const self = state(userdata);
+    return self.processes.spawn(self.io(), options);
+}
+
+fn childWait(userdata: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+    const self = state(userdata);
+    return self.processes.wait(self.io(), child);
 }
 
 fn childKill(userdata: ?*anyopaque, child: *std.process.Child) void {
-    state(userdata).latch(.child_kill);
-    child.id = null;
+    const self = state(userdata);
+    if (!self.processes.kill(self.io(), child)) {
+        self.latch(.child_kill);
+        child.id = null;
+    }
 }
 
 fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
@@ -1062,9 +1133,18 @@ const vtable: std.Io.VTable = blk: {
     result.fileMemoryMapSetLength = memoryMapSetLength;
     result.fileMemoryMapRead = memoryMapRead;
     result.fileMemoryMapWrite = memoryMapWrite;
+    result.processExecutableOpen = processExecutableOpen;
+    result.processExecutablePath = processExecutablePath;
     result.lockStderr = lockStderr;
     result.tryLockStderr = tryLockStderr;
     result.unlockStderr = unlockStderr;
+    result.processCurrentPath = processCurrentPath;
+    result.processSetCurrentDir = processSetCurrentDir;
+    result.processSetCurrentPath = processSetCurrentPath;
+    result.processReplace = processReplace;
+    result.processReplacePath = processReplacePath;
+    result.processSpawn = processSpawn;
+    result.processSpawnPath = processSpawnPath;
     result.childWait = childWait;
     result.childKill = childKill;
     result.now = now;
@@ -1092,14 +1172,14 @@ const vtable: std.Io.VTable = blk: {
 };
 
 test "SimIo capability construction fails before exposing unsupported services" {
-    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files, .sockets }));
+    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files, .sockets, .processes, .resources }));
     try std.testing.expectError(
         error.UnsupportedSimIoCapabilities,
-        SimIo.init(.{ .required = .of(&.{.processes}) }),
+        SimIo.init(.{ .required = .of(&.{.instrumentation}) }),
     );
     try std.testing.expectEqual(
-        CapabilitySet.of(&.{.processes}).bits,
-        SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes })).bits,
+        CapabilitySet.of(&.{.instrumentation}).bits,
+        SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes, .resources, .instrumentation })).bits,
     );
 }
 
@@ -1564,5 +1644,108 @@ test "SimIo stream sockets expose packet delivery and waiter wake choices" {
     try std.testing.expectEqualStrings("pong", &shared.client_received);
     try std.testing.expect(saw_packet_delivery);
     try std.testing.expect(saw_external_wake);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo registered processes spawn pause resume and wait through std.process" {
+    const Program = struct {
+        fn run(context: *process_mod.Context, argv: []const []const u8) u8 {
+            context.checkpoint(3) catch return 99;
+            return @intCast(argv.len + 6);
+        }
+    };
+    const Waiter = struct {
+        io: std.Io,
+        child: *std.process.Child,
+        term: ?std.process.Child.Term = null,
+
+        fn run(self: *@This()) void {
+            self.term = self.child.wait(self.io) catch unreachable;
+        }
+    };
+    const registrations = [_]process_mod.Registration{.{
+        .name = "worker",
+        .start = Program.run,
+    }};
+    var sim = try SimIo.init(.{
+        .required = .of(&.{.processes}),
+        .processes = .{ .registrations = &registrations },
+    });
+    defer sim.deinit();
+    const io = sim.io();
+    try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{ .argv = &.{"host-program"} }));
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{"worker"},
+        .start_suspended = true,
+    });
+    const child_pid = process_mod.Table.childPid(&child).?;
+    var waiter: Waiter = .{ .io = io, .child = &child };
+    _ = io.async(Waiter.run, .{&waiter});
+
+    const scheduler = sim.scheduler();
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    while (true) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        if (enabled.items.items.len == 0) break;
+        try enabled.canonicalize();
+        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expect(waiter.term == null);
+    try std.testing.expect(sim.processes.resumeProcess(child_pid));
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, waiter.term.?);
+
+    var limited_child = try std.process.spawn(io, .{ .argv = &.{"worker"} });
+    const limited_pid = process_mod.Table.childPid(&limited_child).?;
+    try std.testing.expect(sim.processes.setCpuBudget(limited_pid, 1));
+    var limited_waiter: Waiter = .{ .io = io, .child = &limited_child };
+    _ = io.async(Waiter.run, .{&limited_waiter});
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .XCPU }, limited_waiter.term.?);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo resource capability enforces file socket and storage quotas" {
+    var sim = try SimIo.init(.{
+        .required = .of(&.{.resources}),
+        .files = .{ .max_open_handles = 1, .capacity_bytes = 4 },
+        .network = .{ .max_sockets = 2, .stream_capacity = 4 },
+    });
+    defer sim.deinit();
+    const io = sim.io();
+
+    const file = try std.Io.Dir.cwd().createFile(io, "quota", .{});
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        std.Io.Dir.cwd().openFile(io, "quota", .{}),
+    );
+    try file.writeStreamingAll(io, "full");
+    try std.testing.expectError(error.NoSpaceLeft, file.writeStreamingAll(io, "!"));
+    file.close(io);
+
+    const pair = try std.Io.net.Socket.createPair(io, .{});
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        std.Io.net.Socket.createPair(io, .{}),
+    );
+    pair[0].close(io);
+    pair[1].close(io);
     try sim.ensureNoCapabilityViolation();
 }

@@ -25,6 +25,7 @@ pub const scheduler = @import("scheduler.zig");
 pub const sim_io = @import("sim_io.zig");
 pub const sim_io_file = @import("sim_io_file.zig");
 pub const sim_io_net = @import("sim_io_net.zig");
+pub const sim_io_process = @import("sim_io_process.zig");
 pub const sim_io_task = @import("sim_io_task.zig");
 pub const sim_io_scenario_test = @import("sim_io_scenario_test.zig");
 pub const sim_runtime = @import("sim_runtime.zig");

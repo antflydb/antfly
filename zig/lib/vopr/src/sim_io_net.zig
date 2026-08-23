@@ -37,11 +37,11 @@ pub const WaitPort = struct {
         wake: *const fn (*anyopaque, ids.StableId, u32) anyerror!void,
     };
 
-    fn wait(self: WaitPort, resource_id: ids.StableId) !void {
+    pub fn wait(self: WaitPort, resource_id: ids.StableId) !void {
         return self.vtable.wait(self.ptr, resource_id);
     }
 
-    fn wake(self: WaitPort, resource_id: ids.StableId, max_waiters: u32) !void {
+    pub fn wake(self: WaitPort, resource_id: ids.StableId, max_waiters: u32) !void {
         return self.vtable.wake(self.ptr, resource_id, max_waiters);
     }
 };
