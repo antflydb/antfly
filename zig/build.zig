@@ -10128,7 +10128,10 @@ pub fn build(b: *std.Build) void {
                     // codegen has exceeded 16 GiB, so reserve 18 GiB there.
                     // This prevents an unrelated compiler unit from consuming
                     // the last few GiB of a 20 GiB release runner.
-                    .storage_kernel => @as(usize, if (target.result.os.tag == .macos) 18 else 11) * 1024 * 1024 * 1024,
+                    .storage_kernel => if (target.result.os.tag == .macos)
+                        18 * 1024 * 1024 * 1024
+                    else
+                        (10 * 1024 + 256) * 1024 * 1024,
                     .data_pic_probe => 11 * 1024 * 1024 * 1024,
                     .storage_runtime_pic_probe => 11 * 1024 * 1024 * 1024,
                     .application_pic_probe => 11 * 1024 * 1024 * 1024,

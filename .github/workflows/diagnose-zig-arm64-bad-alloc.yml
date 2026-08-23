@@ -1,295 +1,132 @@
-name: Diagnose linked Zig ARM64 runtime libraries
+name: Diagnose Darwin ARM64 release packaging
 
+# Run this expensive release reproduction from the Actions UI, or before a PR
+# merges by applying the `ci:darwin-release` label. Ordinary PR updates do not
+# schedule the 20 GiB ReleaseFast build.
 on:
+  workflow_dispatch:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [labeled]
 
 permissions:
   contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
+  MACOS_SDK_VERSION: "15.5"
+  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
 jobs:
-  linked-runtime:
-    name: ARM64 ReleaseFast single linked executable
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+  darwin-release:
+    name: Darwin ARM64 ReleaseFast archive
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'ci:darwin-release' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: arc-antfly-publish
     timeout-minutes: 180
     steps:
-      - name: Checkout PR head
+      - name: Checkout requested revision
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           submodules: true
 
       - name: Verify x86_64 host
         run: test "$(uname -m)" = x86_64
 
-      - name: Verify runtime import boundaries
+      - name: Verify runtime boundaries and bounded runner
         run: |
           python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
           python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
           python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
+          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file binutils
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
 
       - name: Install Zig
         run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Backport Zig max_rss scheduler fix
+      - name: Install pinned macOS cross-compilation SDK
         run: |
-          python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
-            "$RUNNER_TEMP/zig/lib/compiler/build_runner.zig" \
-            "$RUNNER_TEMP/zig-build-runner-maxrss.zig"
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
 
-      - name: Build linked ARM64 ReleaseFast archive artifacts
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/compiler-local
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Build production Darwin ARM64 archive
         run: |
-          set -o pipefail
-          mkdir -p \
-            "$RUNNER_TEMP/linked-runtime" \
-            "$RUNNER_TEMP/linked-runtime-cache/local" \
-            "$RUNNER_TEMP/linked-runtime-cache/global" \
-            "$RUNNER_TEMP/linked-runtime-reports"
-          # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
-          # scheduling budget. Step max_rss values are scheduling claims, not
-          # a complete accounting of build-runner state and page cache. Claims
-          # admit the measured 9GiB distributed-control consumer and 10.25GiB
-          # PIC storage kernel as the initial 19.25GiB group. This fits the
-          # unchanged 20,000MiB cap. With product composition moved out of the
-          # kernel, inference starts when distributed finishes and overlaps the
-          # storage tail at an 18.25GiB claim. API, enrichment, and remote CLI
-          # wait for storage; max_rss admission starts each as capacity becomes
-          # available alongside inference. Explicit build dependencies keep
-          # Zig's randomized traversal from admitting downstream units ahead
-          # of the two initial critical units. The pod reserve covers runner
-          # state, linker work, page cache, and drift.
-          cd zig
-          runner_root="$(dirname "$(dirname "$RUNNER_TEMP")")"
-          node_bin="$runner_root/externals/node24/bin/node"
-          if [ ! -x "$node_bin" ]; then
-            echo "Actions runner Node 24 binary not found at $node_bin" >&2
-            exit 1
-          fi
-          "$node_bin" --version
-          /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
-            zig build install capi \
-            --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
-            -Dtarget=aarch64-linux-musl \
-            -Doptimize=ReleaseFast \
-            -Dstrip=true \
-            -Dcpu=baseline \
-            -Donnx=false \
-            -Dmetal=false \
-            -Dsystem-blas=false \
-            -Dlinked-runtime-libraries=true \
-            -Dproduction-lsm-only=true \
-            -Dstorage-kernel-experiment=true \
-            --prefix "$RUNNER_TEMP/linked-runtime" \
-            --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
-            --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
-            --maxrss 20971520000 \
-            --summary all \
-            --time-report \
-            --webui=127.0.0.1:19125 \
-            >"$RUNNER_TEMP/linked-runtime.log" 2>&1 &
-          build_pid=$!
+          mkdir -p dist/release-archives
+          /usr/bin/time -v -o "$RUNNER_TEMP/darwin-arm64-release.time" \
+            scripts/packaging/build_zig_release_archive.sh \
+            --version 0.0.0-diagnostic \
+            --target aarch64-macos \
+            --optimize ReleaseFast \
+            --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
+            --out-dir dist/release-archives \
+            --metal true \
+            --system-blas true
 
-          stop_webui_build() {
-            if ! kill -0 "$build_pid" 2>/dev/null; then
-              wait "$build_pid" || true
-              return
-            fi
-            # GNU time, the Zig launcher, and Zig's generated build runner form
-            # a short parent/child chain. --time-report intentionally leaves
-            # the deepest build-runner process waiting in the WebUI after the
-            # summary. Interrupt that idle process; its parents then reap it
-            # and GNU time writes the complete resource report.
-            webui_pid="$build_pid"
-            while true; do
-              child_pid="$(pgrep -P "$webui_pid" | head -n 1 || true)"
-              if [ -z "$child_pid" ]; then break; fi
-              webui_pid="$child_pid"
-            done
-            kill -INT "$webui_pid" 2>/dev/null || true
-            for _ in $(seq 1 30); do
-              if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
-              sleep 1
-            done
-            if kill -0 "$build_pid" 2>/dev/null; then
-              kill -TERM "$webui_pid" 2>/dev/null || true
-              kill -TERM "$build_pid" 2>/dev/null || true
-            fi
-            wait "$build_pid" || true
-          }
-
-          webui_ready=false
-          for _ in $(seq 1 120); do
-            if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
-            if curl --silent --fail http://127.0.0.1:19125/ >/dev/null; then
-              webui_ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$webui_ready" != true ]; then
-            stop_webui_build
-            cat "$RUNNER_TEMP/linked-runtime.log"
-            echo "Zig time-report web UI did not become ready" >&2
-            exit 1
-          fi
-
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-storage-kernel \
-            "$RUNNER_TEMP/linked-runtime-reports/storage.json" 30 &
-          storage_report_pid=$!
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-runtime-distributed \
-            "$RUNNER_TEMP/linked-runtime-reports/distributed.json" 30 &
-          distributed_report_pid=$!
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-runtime-api_kernel \
-            "$RUNNER_TEMP/linked-runtime-reports/api.json" 30 &
-          api_report_pid=$!
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-runtime-serverless \
-            "$RUNNER_TEMP/linked-runtime-reports/serverless.json" 5 &
-          serverless_report_pid=$!
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-runtime-enrichment_compute \
-            "$RUNNER_TEMP/linked-runtime-reports/enrichment.json" 5 &
-          enrichment_report_pid=$!
-          "$node_bin" tools/capture_zig_time_report.mjs \
-            ws://127.0.0.1:19125/ antfly-runtime-inference \
-            "$RUNNER_TEMP/linked-runtime-reports/inference.json" 30 &
-          inference_report_pid=$!
-
-          report_status=0
-          for report_pid in \
-            "$storage_report_pid" \
-            "$distributed_report_pid" \
-            "$api_report_pid" \
-            "$serverless_report_pid" \
-            "$enrichment_report_pid" \
-            "$inference_report_pid"; do
-            wait "$report_pid" || report_status=$?
-          done
-          if [ "$report_status" -ne 0 ]; then
-            stop_webui_build
-            cat "$RUNNER_TEMP/linked-runtime.log"
-            exit "$report_status"
-          fi
-
-          # A Zig 0.16 WebUI build does not exit after completing its steps; it
-          # waits for an interactive rebuild request. The full summary is the
-          # authoritative completion marker. Allow ample time for the thin
-          # final links after the last compiler report arrives, then stop only
-          # the idle WebUI child above.
-          build_complete=false
-          for _ in $(seq 1 600); do
-            if grep -q '^Build Summary:' "$RUNNER_TEMP/linked-runtime.log"; then
-              build_complete=true
-              break
-            fi
-            if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          stop_webui_build
-          cat "$RUNNER_TEMP/linked-runtime.log"
-
-          if [ "$build_complete" != true ]; then
-            echo "Zig time-report build did not reach a final summary" >&2
-            exit 1
-          fi
-          if ! grep -Eq '^Build Summary: [0-9]+/[0-9]+ steps succeeded$' "$RUNNER_TEMP/linked-runtime.log"; then
-            echo "Zig time-report build summary was not successful" >&2
-            exit 1
-          fi
-
-          storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
-          distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
-          api_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-api_kernel_zcu.o' -print -quit)"
-          serverless_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-serverless_zcu.o' -print -quit)"
-          enrichment_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-enrichment_compute_zcu.o' -print -quit)"
-          inference_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-inference_zcu.o' -print -quit)"
-          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$api_object" ] || [ -z "$serverless_object" ] || [ -z "$enrichment_object" ] || [ -z "$inference_object" ]; then
-            echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
-            exit 1
-          fi
-
-          python3 tools/analyze_zig_import_graph.py \
-            --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
-            --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
-            --time-report "api=$RUNNER_TEMP/linked-runtime-reports/api.json" \
-            --time-report "serverless=$RUNNER_TEMP/linked-runtime-reports/serverless.json" \
-            --time-report "enrichment=$RUNNER_TEMP/linked-runtime-reports/enrichment.json" \
-            --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
-            --object "storage=$storage_object" \
-            --object "distributed=$distributed_object" \
-            --object "api=$api_object" \
-            --object "serverless=$serverless_object" \
-            --object "enrichment=$enrichment_object" \
-            --object "inference=$inference_object" \
-            --check-compiled-storage-boundary \
-            --check-ha-seed-failure-registry \
-            --top-groups 30 \
-            --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
-
-      - name: Verify ARM64 release artifacts
+      - name: Verify Darwin ARM64 archive
         run: |
-          test "$(find "$RUNNER_TEMP/linked-runtime/bin" -maxdepth 1 -type f | wc -l)" -eq 1
-          binary="$RUNNER_TEMP/linked-runtime/bin/antfly"
-          library="$RUNNER_TEMP/linked-runtime/lib/libantfly.so"
+          archive=dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
+          extract_root="$RUNNER_TEMP/darwin-arm64-archive"
+          mkdir -p "$extract_root"
+          tar -xzf "$archive" -C "$extract_root"
+
+          binary="$extract_root/antfly"
+          library="$extract_root/lib/libantfly.dylib"
+          test -x "$binary"
           test -f "$library"
-          test -f "$RUNNER_TEMP/linked-runtime/include/antfly.h"
-          file "$binary"
-          file "$library"
-          readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
-          readelf -h "$library" | tee "$RUNNER_TEMP/capi.elf-header"
-          readelf -Ws "$library" | tee "$RUNNER_TEMP/capi.symbols"
-          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
-          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/capi.elf-header"
-          grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/capi.symbols"
-          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|enrichment_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/capi.symbols"; then
-            echo "private executable ABI leaked from libantfly.so" >&2
-            exit 1
-          fi
-          stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
-          stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/capi.size"
+          test -f "$extract_root/include/antfly.h"
+          file "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-file"
+          file "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-file"
+          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.binary-file"
+          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.capi-file"
+          stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-size"
+          stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-size"
           library_size=$(stat -c '%s' "$library")
           if [ "$library_size" -ge 20971520 ]; then
-            echo "libantfly.so exceeded the 20MiB retained-code budget: $library_size bytes" >&2
+            echo "libantfly.dylib exceeded the 20MiB retained-code budget: $library_size bytes" >&2
             exit 1
           fi
 
       - name: Report compiler memory
         if: ${{ always() }}
-        run: |
-          cat "$RUNNER_TEMP/linked-runtime.time" || true
+        run: cat "$RUNNER_TEMP/darwin-arm64-release.time" || true
 
-      - name: Upload result
+      - name: Upload diagnostic result
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: zig-arm64-linked-runtime-release-fast
+          name: zig-darwin-arm64-release-fast
           path: |
-            ${{ runner.temp }}/linked-runtime
-            ${{ runner.temp }}/linked-runtime.log
-            ${{ runner.temp }}/linked-runtime.time
-            ${{ runner.temp }}/linked-runtime-reports
-            ${{ runner.temp }}/linked-runtime.elf-header
-            ${{ runner.temp }}/linked-runtime.size
-            ${{ runner.temp }}/capi.elf-header
-            ${{ runner.temp }}/capi.symbols
-            ${{ runner.temp }}/capi.size
-          if-no-files-found: error
+            dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
+            ${{ runner.temp }}/antfly-zig-release-aarch64-macos
+            ${{ runner.temp }}/darwin-arm64-release.time
+            ${{ runner.temp }}/darwin-arm64.binary-file
+            ${{ runner.temp }}/darwin-arm64.binary-size
+            ${{ runner.temp }}/darwin-arm64.capi-file
+            ${{ runner.temp }}/darwin-arm64.capi-size
+          if-no-files-found: warn
