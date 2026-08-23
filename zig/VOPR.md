@@ -761,11 +761,18 @@ phase plan and not dependencies of the already implemented domain suites.
 ### 1. Deeper DataServer and Raft Microsteps
 
 The production DataServer, public listener, health request, metadata executor,
-and lifecycle safepoints run on borrowed `VoprIo`. Continue with safe
-borrowed-writer-lease and request-executor suspension points around routing,
-Raft propose/persist/apply/ack, writer handoff, split/merge copy, cutover,
-rollback, cleanup, and query result assembly. These points must preserve the
-single production writer and its lease ownership.
+and lifecycle safepoints run on borrowed `VoprIo`. A production-neutral
+DataServer lifecycle seam now exposes routing, remote forwarding, proposal
+acceptance, apply confirmation, visibility confirmation, and response-ack
+readiness with stable group/table/log identities. Split and merge prepare,
+copy, cutover, and rollback completions carry stable transition identities;
+synchronous paths reach them after transition locks and writer leases are
+released, and durable split-copy jobs explicitly release their per-source lane
+before suspending. Independent Raft campaigns already expose persistence and
+apply ordering. Continue with a safe production persistence observation,
+writer handoff and cleanup boundaries, and operation-specific query result
+assembly. Every new point must preserve the single production writer and its
+lease ownership.
 
 ### 2. HTTP Lifecycle and Backpressure
 

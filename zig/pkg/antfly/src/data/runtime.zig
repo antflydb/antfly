@@ -2985,6 +2985,47 @@ const OwnedInferredSnapshotLeadershipSource = struct {
     }
 };
 
+/// Production-owned suspension seam for deterministic DataServer request and
+/// topology-transition testing. Hooks are reached only outside Raft, writer,
+/// and transition-owner locks, so an implementation may block or yield
+/// without lending exclusive storage ownership across the suspension.
+pub const DataRequestLifecyclePhase = enum {
+    routing_started,
+    remote_forward_started,
+    remote_forward_completed,
+    proposal_accepted,
+    apply_confirmed,
+    visibility_confirmed,
+    response_ack_ready,
+    split_prepare_completed,
+    split_copy_completed,
+    split_cutover_completed,
+    split_rollback_completed,
+    merge_copy_completed,
+    merge_cutover_completed,
+    merge_rollback_completed,
+    query_result_assembled,
+};
+
+pub const DataRequestLifecycleEvent = struct {
+    phase: DataRequestLifecyclePhase,
+    group_id: u64 = 0,
+    related_group_id: u64 = 0,
+    target_node_id: u64 = 0,
+    log_index: u64 = 0,
+    transition_id: u64 = 0,
+    table_name: []const u8 = "",
+};
+
+pub const DataRequestLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: DataRequestLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: DataRequestLifecycleHook, event: DataRequestLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
 pub const DataServerConfig = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
@@ -3015,6 +3056,7 @@ pub const DataServerConfig = struct {
     /// deterministic runtime drive the real DataServer without constructing a
     /// host-backed StdHttpExecutor. Executor contexts must outlive DataServer.
     metadata_request_executors: []const antfly.common.http.RequestExecutor = &.{},
+    data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
 };
@@ -4557,6 +4599,7 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     ha_cfg: DataServerHAConfig = .{},
     /// Immutable startup role used by lock-free ingress policy snapshots.
     /// Mutable HA context fields remain protected by `ha_state_mutex`.
@@ -4802,6 +4845,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
+            .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
@@ -4844,6 +4888,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
@@ -4886,6 +4931,7 @@ pub const DataServer = struct {
             .replica_catalog_path = cfg.replica_catalog_path,
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
@@ -6903,6 +6949,14 @@ pub const DataServer = struct {
         return try listener.baseUri(alloc);
     }
 
+    pub fn reachDataRequestLifecycle(
+        self: *DataServer,
+        event: DataRequestLifecycleEvent,
+    ) !void {
+        const hook = self.data_request_lifecycle_hook orelse return;
+        try hook.reach(event);
+    }
+
     pub fn refreshRemoteMetadataSnapshot(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         var snapshot = try remote_metadata.fetchSnapshot();
@@ -7508,6 +7562,11 @@ pub const DataServer = struct {
         var proposal_req = req;
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
+        try self.reachDataRequestLifecycle(.{
+            .phase = .routing_started,
+            .group_id = group_id,
+            .table_name = table_name,
+        });
         if (route.refresh_metadata) {
             self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                 error.Timeout => return error.LeaderUnavailable,
@@ -7745,6 +7804,18 @@ pub const DataServer = struct {
             }
 
             if (target_index) |index| {
+                // The protocol activation singleflight is an ownership lock,
+                // so release it before allowing a lifecycle hook to suspend.
+                if (protocol_activation_lock_owned) {
+                    protocol_activation_entry.?.activation_mutex.unlock();
+                    protocol_activation_lock_owned = false;
+                }
+                self.reachDataRequestLifecycle(.{
+                    .phase = .proposal_accepted,
+                    .group_id = group_id,
+                    .log_index = index,
+                    .table_name = table_name,
+                }) catch return error.RaftBatchWriteOutcomeUnknown;
                 defer if (outcome_waiter_index) |waiter_index|
                     if (self.data_raft_apply) |apply_sm|
                         apply_sm.cancelApplyOutcomeWaiter(group_id, waiter_index);
@@ -7767,6 +7838,12 @@ pub const DataServer = struct {
                         .failed => |failure| return failure.toError(),
                         .pending, .unknown => return error.RaftBatchWriteOutcomeUnknown,
                     }
+                    self.reachDataRequestLifecycle(.{
+                        .phase = .apply_confirmed,
+                        .group_id = group_id,
+                        .log_index = index,
+                        .table_name = table_name,
+                    }) catch return error.RaftBatchWriteOutcomeUnknown;
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 sync_source.syncReplicatedBatchGroupLocalWithCancellation(alloc, group_id, table_name, proposal_req.sync_level, route.visibility_cancellation) catch |err| {
@@ -7789,6 +7866,20 @@ pub const DataServer = struct {
                     });
                     return error.RaftBatchWriteOutcomeUnknown;
                 };
+                if (proposal_req.sync_level != .propose) {
+                    self.reachDataRequestLifecycle(.{
+                        .phase = .visibility_confirmed,
+                        .group_id = group_id,
+                        .log_index = index,
+                        .table_name = table_name,
+                    }) catch return error.RaftBatchWriteOutcomeUnknown;
+                }
+                self.reachDataRequestLifecycle(.{
+                    .phase = .response_ack_ready,
+                    .group_id = group_id,
+                    .log_index = index,
+                    .table_name = table_name,
+                }) catch return error.RaftBatchWriteOutcomeUnknown;
                 return;
             }
 
@@ -7850,6 +7941,12 @@ pub const DataServer = struct {
                                     sleepDataRaftBatchLeaderRetry();
                                     continue;
                                 };
+                                try self.reachDataRequestLifecycle(.{
+                                    .phase = .remote_forward_started,
+                                    .group_id = group_id,
+                                    .target_node_id = target_node_id,
+                                    .table_name = table_name,
+                                });
                                 var response = client.fetchGroupBatchWithForwarding(
                                     base_uri,
                                     group_id,
@@ -7884,6 +7981,12 @@ pub const DataServer = struct {
                                     }
                                 };
                                 response.deinit(alloc);
+                                self.reachDataRequestLifecycle(.{
+                                    .phase = .remote_forward_completed,
+                                    .group_id = group_id,
+                                    .target_node_id = target_node_id,
+                                    .table_name = table_name,
+                                }) catch return error.RaftBatchWriteOutcomeUnknown;
                                 return;
                             } else {
                                 failed_known_leader_node_id = target_node_id;
@@ -8038,6 +8141,12 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
+        try self.reachDataRequestLifecycle(.{
+            .phase = .remote_forward_started,
+            .group_id = group_id,
+            .target_node_id = target_node_id,
+            .table_name = table_name,
+        });
         var response = client.fetchGroupBatchWithForwarding(
             target_store.api_url,
             group_id,
@@ -8069,6 +8178,12 @@ pub const DataServer = struct {
             }
         };
         response.deinit(alloc);
+        self.reachDataRequestLifecycle(.{
+            .phase = .remote_forward_completed,
+            .group_id = group_id,
+            .target_node_id = target_node_id,
+            .table_name = table_name,
+        }) catch return error.RaftBatchWriteOutcomeUnknown;
         return true;
     }
 
@@ -9074,6 +9189,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().prepareSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_prepare_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localStartSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "start_split_source")) !void {
@@ -9095,6 +9217,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().startSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_copy_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localBootstrapSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "bootstrap_split_destination")) !void {
@@ -9114,6 +9243,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().bootstrapDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_copy_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localCatchUpSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_split_destination")) !void {
@@ -9133,6 +9269,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().catchUpDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_copy_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     const ReplicatedSplitActionJob = struct {
@@ -9152,10 +9295,10 @@ pub const DataServer = struct {
         fn run(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             defer self.server.invalidateLocalGroupStatusCache();
-            defer {
+            defer if (self.lane_held) {
                 self.lane.deinit();
                 self.lane_held = false;
-            }
+            };
             self.runAction() catch |err| {
                 std.log.warn("replicated split action failed kind={s} transition_id={} attempt_epoch={} source_group_id={} destination_group_id={} err={s}", .{
                     @tagName(self.kind),
@@ -9167,6 +9310,17 @@ pub const DataServer = struct {
                 });
                 return err;
             };
+            // Release the per-source transition owner before a scheduler hook
+            // can suspend this durable job.
+            self.lane.deinit();
+            self.lane_held = false;
+            try self.server.reachDataRequestLifecycle(.{
+                .phase = .split_copy_completed,
+                .group_id = self.source_group_id,
+                .related_group_id = self.destination_group_id,
+                .transition_id = self.transition_id,
+                .table_name = self.table_contract.table_name,
+            });
         }
 
         fn runAction(self: *@This()) !void {
@@ -9699,6 +9853,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().finalizeSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_cutover_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localRollbackSplit(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "rollback_split")) !void {
@@ -9720,6 +9881,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().rollbackSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .split_rollback_completed,
+            .group_id = op.source_group_id,
+            .related_group_id = op.destination_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn initLocalSplitRuntime(
@@ -10361,6 +10529,13 @@ pub const DataServer = struct {
             try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .merge_copy_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localCatchUpMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_merge_receiver")) !void {
@@ -10387,6 +10562,13 @@ pub const DataServer = struct {
             _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .merge_copy_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localFinalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
@@ -10413,6 +10595,13 @@ pub const DataServer = struct {
             _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .merge_cutover_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn localRollbackMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "rollback_merge")) !void {
@@ -10435,6 +10624,13 @@ pub const DataServer = struct {
             _ = try runtime.runtime().rollbackMerge(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+        try self.reachDataRequestLifecycle(.{
+            .phase = .merge_rollback_completed,
+            .group_id = op.donor_group_id,
+            .related_group_id = op.receiver_group_id,
+            .transition_id = op.transition_id,
+            .table_name = op.table_contract.table_name,
+        });
     }
 
     fn reporterIncarnation(self: *DataServer) !u64 {
@@ -14469,6 +14665,7 @@ pub const DataServer = struct {
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
+            .data_request_lifecycle_hook = cfg.data_request_lifecycle_hook,
             .provisioned_index_repair_discovery_interval_ms = cfg.index_repair_discovery_interval_ms,
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,

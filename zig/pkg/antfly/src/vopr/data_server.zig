@@ -67,6 +67,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
     defer backend_runtime.deinit();
 
     var lifecycle = request_lifecycle.Hook{ .vopr_io = &vopr_io };
+    var data_lifecycle = request_lifecycle.DataHook{ .vopr_io = &vopr_io };
     var metadata = StubMetadataExecutor{};
     const metadata_executors = [_]http_common.RequestExecutor{metadata.executor()};
     var server = try data_runtime.DataServer.initFromMetadataApiUrls(alloc, .{
@@ -74,6 +75,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         .enable_data_raft = false,
         .backend_runtime = &backend_runtime,
         .metadata_request_executors = &metadata_executors,
+        .data_request_lifecycle_hook = data_lifecycle.lifecycle(),
         .api_server_cfg = .{
             .deployment_mode = .serverless,
             .request_lifecycle_hook = lifecycle.lifecycle(),

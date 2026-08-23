@@ -8,6 +8,7 @@
 const std = @import("std");
 const vopr = @import("vopr");
 const http_server = @import("../api/http_server.zig");
+const data_runtime = @import("../data/runtime.zig");
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -31,6 +32,29 @@ pub const Hook = struct {
 
     fn reach(ptr: *anyopaque, event: http_server.RequestLifecycleEvent) !void {
         const self: *Hook = @ptrCast(@alignCast(ptr));
+        try self.vopr_io.safepoint(stableId(event));
+    }
+};
+
+pub const DataHook = struct {
+    vopr_io: *vopr.vopr_io.VoprIo,
+
+    pub fn lifecycle(self: *DataHook) data_runtime.DataRequestLifecycleHook {
+        return .{ .ptr = self, .reach_fn = reach };
+    }
+
+    pub fn stableId(event: data_runtime.DataRequestLifecycleEvent) vopr.id.StableId {
+        var result = vopr.id.stable("data-request-lifecycle-phase", @tagName(event.phase));
+        result = vopr.id.derive("data-request-lifecycle.group", result, event.group_id);
+        result = vopr.id.derive("data-request-lifecycle.related-group", result, event.related_group_id);
+        result = vopr.id.derive("data-request-lifecycle.target-node", result, event.target_node_id);
+        result = vopr.id.derive("data-request-lifecycle.log-index", result, event.log_index);
+        result = vopr.id.derive("data-request-lifecycle.transition", result, event.transition_id);
+        return vopr.id.derive("data-request-lifecycle.table", result, vopr.id.digest(event.table_name));
+    }
+
+    fn reach(ptr: *anyopaque, event: data_runtime.DataRequestLifecycleEvent) !void {
+        const self: *DataHook = @ptrCast(@alignCast(ptr));
         try self.vopr_io.safepoint(stableId(event));
     }
 };
@@ -59,6 +83,48 @@ test "request lifecycle adapter records stable VoprIo safepoints" {
     try std.testing.expect(Hook.stableId(admission) != Hook.stableId(.{
         .phase = .admission_acquired,
         .operation_id = "batchWrite",
+    }));
+    try vopr_io.ensureNoCapabilityViolation();
+}
+
+test "data request lifecycle adapter records stable semantic VoprIo safepoints" {
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
+        .instrumentation = .{ .enabled = false, .map_digest = 0x445251 },
+    });
+    defer vopr_io.deinit();
+    var adapter = DataHook{ .vopr_io = &vopr_io };
+    const hook = adapter.lifecycle();
+
+    const routed = data_runtime.DataRequestLifecycleEvent{
+        .phase = .routing_started,
+        .group_id = 7,
+        .table_name = "docs",
+    };
+    const accepted = data_runtime.DataRequestLifecycleEvent{
+        .phase = .proposal_accepted,
+        .group_id = 7,
+        .log_index = 11,
+        .table_name = "docs",
+    };
+    const cutover = data_runtime.DataRequestLifecycleEvent{
+        .phase = .split_cutover_completed,
+        .group_id = 7,
+        .related_group_id = 8,
+        .transition_id = 3,
+        .table_name = "docs",
+    };
+    try hook.reach(routed);
+    try hook.reach(accepted);
+    try hook.reach(cutover);
+
+    try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(routed)));
+    try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(accepted)));
+    try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(DataHook.stableId(cutover)));
+    try std.testing.expect(DataHook.stableId(accepted) != DataHook.stableId(.{
+        .phase = .proposal_accepted,
+        .group_id = 7,
+        .log_index = 12,
+        .table_name = "docs",
     }));
     try vopr_io.ensureNoCapabilityViolation();
 }
