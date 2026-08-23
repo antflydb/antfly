@@ -794,11 +794,16 @@ const DataPublicHttpRuntime = struct {
             .alloc = alloc,
             .api_server = api_server,
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
-            .server = httpx.Server.initWithConfig(
-                alloc,
-                api_lane_lease.io(),
-                publicApiHttpxConfig(cfg, http_runtime),
-            ),
+            .server = blk: {
+                var server_cfg = publicApiHttpxConfig(cfg, http_runtime);
+                if (!http_runtime.supportsH1DisconnectCancellation())
+                    server_cfg.h1_disconnect_cancellation = .disabled;
+                break :blk httpx.Server.initWithConfig(
+                    alloc,
+                    api_lane_lease.io(),
+                    server_cfg,
+                );
+            },
             .listener_task = undefined,
             .api_lane_lease = api_lane_lease,
         };
@@ -3006,6 +3011,10 @@ pub const DataServerConfig = struct {
     /// cgroup views or sizing from different host values.
     process_memory_limit_source: ?antfly.public_api.MemoryLimitSource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    /// Optional transport-neutral metadata executors. Supplying these lets a
+    /// deterministic runtime drive the real DataServer without constructing a
+    /// host-backed StdHttpExecutor. Executor contexts must outlive DataServer.
+    metadata_request_executors: []const antfly.common.http.RequestExecutor = &.{},
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
 };
@@ -4925,13 +4934,16 @@ pub const DataServer = struct {
         self.configureHAPublicGateState();
         api_server_cfg.ha_mutation_policy_source = self.haMutationPolicySource();
         self.attachHaExecutors(&api_server_cfg);
-        if (self.query_io_impl == null) {
+        if (self.backend_runtime) |runtime| {
+            const io = runtime.apiIo() orelse return error.HttpRuntimeUnavailable;
+            _ = self.read_source.withIoInterface(io, self.query_async_limit);
+        } else {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
                 .concurrent_limit = .limited(backend_runtime_mod.default_io_concurrent_limit),
             });
+            _ = self.read_source.withIo(&self.query_io_impl.?);
         }
-        _ = self.read_source.withIo(&self.query_io_impl.?);
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
         const restore_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null;
@@ -6167,17 +6179,7 @@ pub const DataServer = struct {
             try raft.start();
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
-        if (self.listener == null) {
-            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
-            const http_runtime = try self.ensureHttpRuntime();
-            self.listener = try DataPublicHttpRuntime.start(
-                self.alloc,
-                runtime,
-                http_runtime,
-                self.listener_cfg,
-                &self.http_server.?,
-            );
-        }
+        try self.startPublicHttp();
         if (self.store_registration != null) {
             self.store_status_dirty.store(true, .release);
         }
@@ -6193,6 +6195,24 @@ pub const DataServer = struct {
             => std.log.warn("provisioned startup catch-up start deferred err={}", .{err}),
             else => return err,
         };
+    }
+
+    /// Start only the production public API transport. Embedders and VOPR use
+    /// this boundary when they own background scheduling themselves.
+    pub fn startPublicHttp(self: *DataServer) !void {
+        _ = try self.ensureBackendRuntime();
+        try self.initApiServer();
+        if (self.listener == null) {
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            const http_runtime = try self.ensureHttpRuntime();
+            self.listener = try DataPublicHttpRuntime.start(
+                self.alloc,
+                runtime,
+                http_runtime,
+                self.listener_cfg,
+                &self.http_server.?,
+            );
+        }
     }
 
     fn metadataBootstrapRetryDue(self: *DataServer, now_ms: u64) bool {
@@ -6536,10 +6556,19 @@ pub const DataServer = struct {
         const runtime = try self.alloc.create(httpx.HttpRuntime);
         errdefer self.alloc.destroy(runtime);
         const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
+        const borrowed_io: ?httpx.HttpRuntime.BorrowedIo = if (self.backend_runtime) |backend_runtime|
+            if (backend_runtime.usesBorrowedIo()) .{
+                .listener = backend_runtime.controlIo() orelse backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable,
+                .connection = backend_runtime.apiIo(),
+                .request = backend_runtime.apiIo(),
+            } else null
+        else
+            null;
         runtime.* = httpx.HttpRuntime.init(self.alloc, .{
             .max_active_h1_requests = listener_config.max_connections,
             .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
             .max_active_requests = @as(usize, listener_config.max_request_tasks) +| health_metrics.max_connections,
+            .borrowed_io = borrowed_io,
         });
         self.owned_http_runtime = runtime;
         return runtime;
@@ -14309,11 +14338,22 @@ pub const DataServer = struct {
             owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
             backend_runtime = owned_backend_runtime.?.ptr();
         }
-        const api_io_impl = backend_runtime.?.apiIoImpl() orelse return error.HttpRuntimeUnavailable;
+        const api_io = backend_runtime.?.apiIo() orelse return error.HttpRuntimeUnavailable;
 
         const remote_metadata = try alloc.create(RemoteMetadataSource);
         errdefer alloc.destroy(remote_metadata);
-        remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls, api_io_impl);
+        remote_metadata.* = if (cfg.metadata_request_executors.len > 0)
+            try RemoteMetadataSource.initWithRequestExecutors(
+                alloc,
+                metadata_api_urls,
+                cfg.metadata_request_executors,
+            )
+        else
+            try RemoteMetadataSource.init(
+                alloc,
+                metadata_api_urls,
+                backend_runtime.?.apiIoImpl() orelse return error.MetadataRequestExecutorRequired,
+            );
         errdefer remote_metadata.deinit();
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
@@ -14378,7 +14418,7 @@ pub const DataServer = struct {
                             .secret_store = cfg.api_server_cfg.secret_store,
                             .node_config = cfg.api_server_cfg.node_config,
                             .required_capability = "restore.read",
-                            .io = api_io_impl.io(),
+                            .io = api_io,
                         },
                     }, .{
                         .http = .{
@@ -14701,6 +14741,7 @@ const RemoteMetadataSource = struct {
     published_linearizable_snapshot_sequence: u64 = 0,
     linearizable_snapshot_unsupported_until_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
+    request_executors: []antfly.common.http.RequestExecutor = &.{},
     next_http_executor: std.atomic.Value(usize) = .init(0),
     test_faults: TestFaults = .{},
 
@@ -14723,6 +14764,27 @@ const RemoteMetadataSource = struct {
             executor.initSharedInPlace(alloc, .{ .keep_alive = true }, io_impl);
             executors_initialized += 1;
         }
+        return try initBase(alloc, base_uris, http_executors, &.{});
+    }
+
+    fn initWithRequestExecutors(
+        alloc: std.mem.Allocator,
+        base_uris: []const []const u8,
+        request_executors: []const antfly.common.http.RequestExecutor,
+    ) !RemoteMetadataSource {
+        if (request_executors.len == 0) return error.MissingMetadataRequestExecutor;
+        const owned_executors = try alloc.dupe(antfly.common.http.RequestExecutor, request_executors);
+        errdefer alloc.free(owned_executors);
+        return try initBase(alloc, base_uris, &.{}, owned_executors);
+    }
+
+    fn initBase(
+        alloc: std.mem.Allocator,
+        base_uris: []const []const u8,
+        http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
+        request_executors: []antfly.common.http.RequestExecutor,
+    ) !RemoteMetadataSource {
+        if (base_uris.len == 0) return error.MissingMetadataApi;
         var owned = try alloc.alloc([]u8, base_uris.len);
         var initialized: usize = 0;
         errdefer {
@@ -14741,12 +14803,14 @@ const RemoteMetadataSource = struct {
             .base_uris = owned,
             .linearizable_snapshot_unsupported_until_ns = unsupported_until,
             .http_executors = http_executors,
+            .request_executors = request_executors,
         };
     }
 
     fn deinit(self: *RemoteMetadataSource) void {
         for (self.http_executors) |*executor| executor.deinit();
-        self.alloc.free(self.http_executors);
+        if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
+        if (self.request_executors.len > 0) self.alloc.free(self.request_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
@@ -14758,6 +14822,8 @@ const RemoteMetadataSource = struct {
 
     fn httpExecutor(self: *RemoteMetadataSource) antfly.common.http.RequestExecutor {
         const sequence = self.next_http_executor.fetchAdd(1, .monotonic);
+        if (self.request_executors.len > 0)
+            return self.request_executors[sequence % self.request_executors.len];
         return self.http_executors[sequence % self.http_executors.len].executor();
     }
 
@@ -29331,6 +29397,54 @@ test "remote metadata source shares backend runtime io across a bounded executor
         try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
     }
     try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
+}
+
+test "remote metadata source accepts transport-neutral request executors" {
+    const Stub = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: antfly.common.http.HttpRequest,
+        ) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 204 };
+        }
+    };
+
+    var first = Stub{};
+    var second = Stub{};
+    const executors = [_]antfly.common.http.RequestExecutor{
+        first.executor(),
+        second.executor(),
+    };
+    var source = try RemoteMetadataSource.initWithRequestExecutors(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        &executors,
+    );
+    defer source.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), source.http_executors.len);
+    try std.testing.expectEqual(@as(usize, 2), source.request_executors.len);
+    var response = try source.httpExecutor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "http://metadata.invalid/status",
+    });
+    response.deinit(std.testing.allocator);
+    response = try source.httpExecutor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "http://metadata.invalid/status",
+    });
+    response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
 }
 
 test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {

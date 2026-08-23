@@ -52,7 +52,7 @@ zig build antfly-test
 `antfly-test` includes:
 
 - `unit-test`
-- `sim-test`
+- `vopr-test`
 - `integration-test`
 - `recall-test`
 - the default recall harness over `testdata/vectorsets`
@@ -86,10 +86,10 @@ The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 From the `zig/` directory, the equivalent targets are `make test` and
 `make unit-test`.
 
-Run mocked-time and modeled simulation checks:
+Run fast deterministic VOPR checks, including production HTTP on `VoprIo`:
 
 ```sh
-zig build sim-test
+zig build vopr-test
 ```
 
 Run focused real HTTP and public API integration checks:

@@ -19,6 +19,7 @@ pub const memory = @import("memory.zig");
 pub const s3 = @import("s3.zig");
 pub const gcs = @import("gcs.zig");
 pub const s3_compat = @import("s3_compat.zig");
+pub const scripted_fault = @import("scripted_fault.zig");
 
 pub const ObjectMetadata = types.ObjectMetadata;
 pub const ObjectChecksum = types.ObjectChecksum;
@@ -40,6 +41,7 @@ pub const ListResult = types.ListResult;
 pub const Client = client.Client;
 pub const FilesystemClient = filesystem.FilesystemClient;
 pub const MemoryClient = memory.MemoryClient;
+pub const ScriptedFaultClient = scripted_fault.Client;
 pub const S3 = s3;
 pub const Gcs = gcs;
 
@@ -65,6 +67,7 @@ test "objectstore module compiles" {
     _ = s3;
     _ = gcs;
     _ = s3_compat;
+    _ = scripted_fault;
     _ = ObjectMetadata;
     _ = PutOptions;
     _ = GetOptions;
@@ -80,6 +83,7 @@ test "objectstore module compiles" {
     _ = Client;
     _ = FilesystemClient;
     _ = MemoryClient;
+    _ = ScriptedFaultClient;
     _ = S3;
     _ = Gcs;
     _ = S3Scheme;

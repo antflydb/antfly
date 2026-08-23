@@ -67,6 +67,53 @@ pub const Seeded = struct {
     fn finish(_: *anyopaque) !void {}
 };
 
+/// Deterministically withhold one transition for a bounded number of choice
+/// points, then force it when it remains enabled. This turns starvation from a
+/// low-probability random accident into a reproducible scheduling experiment.
+pub const Starving = struct {
+    target_id: ids.StableId,
+    skip_budget: usize,
+    skipped: usize = 0,
+    forced: bool = false,
+    fallback: Seeded,
+
+    pub fn init(target_id: ids.StableId, skip_budget: usize, seed: u64) Starving {
+        return .{ .target_id = target_id, .skip_budget = skip_budget, .fallback = Seeded.init(seed) };
+    }
+
+    pub fn source(self: *Starving) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *Starving = @ptrCast(@alignCast(ptr));
+        var target_enabled = false;
+        var alternatives: [64]transition.Transition = undefined;
+        var alternative_count: usize = 0;
+        for (request.enabled) |candidate| {
+            if (candidate.id == self.target_id) {
+                target_enabled = true;
+            } else if (alternative_count < alternatives.len) {
+                alternatives[alternative_count] = candidate;
+                alternative_count += 1;
+            }
+        }
+        if (target_enabled and self.skipped >= self.skip_budget) {
+            self.forced = true;
+            return self.target_id;
+        }
+        if (target_enabled and alternative_count != 0) {
+            self.skipped += 1;
+            var narrowed = request;
+            narrowed.enabled = alternatives[0..alternative_count];
+            return Seeded.choose(&self.fallback, narrowed);
+        }
+        return Seeded.choose(&self.fallback, request);
+    }
+
+    fn finish(_: *anyopaque) !void {}
+};
+
 pub const Scripted = struct {
     selections: []const ids.StableId,
     cursor: usize = 0,
@@ -404,6 +451,29 @@ test "seeded source honors weights while preserving enabled membership" {
     try source.finish();
     try std.testing.expect(common > rare * 5);
     try std.testing.expect(common < rare * 9);
+}
+
+test "starving source systematically delays then forces a runnable target" {
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "target", .kind = .scheduler },
+        .{ .id = 2, .name = "competitor", .kind = .scheduler },
+    };
+    var starving = Starving.init(1, 3, 7);
+    const source = starving.source();
+    for (0..3) |occurrence| try std.testing.expectEqual(@as(u64, 2), try source.choose(.{
+        .site_id = 9,
+        .site_name = "starvation",
+        .occurrence = occurrence,
+        .enabled = &enabled,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), try source.choose(.{
+        .site_id = 9,
+        .site_name = "starvation",
+        .occurrence = 3,
+        .enabled = &enabled,
+    }));
+    try std.testing.expectEqual(@as(usize, 3), starving.skipped);
+    try std.testing.expect(starving.forced);
 }
 
 test "enumerating source visits a dynamic choice tree exactly once" {

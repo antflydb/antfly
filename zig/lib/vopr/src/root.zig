@@ -18,6 +18,7 @@ pub const fault = @import("fault.zig");
 pub const fixture = @import("fixture.zig");
 pub const id = @import("id.zig");
 pub const meta_test = @import("meta_test.zig");
+pub const multiverse = @import("multiverse.zig");
 pub const observation = @import("observation.zig");
 pub const outcome = @import("outcome.zig");
 pub const property = @import("property.zig");

@@ -5,8 +5,7 @@ fixture policy, and remaining simulation work are maintained in
 [VOPR.md](VOPR.md).
 
 Storage-specific commands, replay-fixture locations, artifact promotion, and
-legacy real-I/O workflow remain in
-[pkg/antfly/src/storage/SIM.md](pkg/antfly/src/storage/SIM.md).
+the legacy real-I/O workflow are consolidated there as well.
 
 This file is retained as a compatibility pointer for existing documentation
 links. Do not add a second simulation plan here.

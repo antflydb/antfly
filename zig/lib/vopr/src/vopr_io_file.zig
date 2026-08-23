@@ -21,6 +21,13 @@ pub const Faults = struct {
     fail_next_sync: bool = false,
     drop_next_sync: bool = false,
     partial_write_limit: ?usize = null,
+    corrupt_next_read: ?CorruptRange = null,
+};
+
+pub const CorruptRange = struct {
+    offset: u64,
+    length: u64,
+    xor_mask: u8,
 };
 
 const Node = struct {
@@ -409,11 +416,21 @@ pub const FileSystem = struct {
         if (handle.directory) return error.IsDir;
         const start = std.math.cast(usize, offset) orelse return 0;
         if (start >= handle.node.data.items.len) return 0;
+        const corruption = self.faults.corrupt_next_read;
+        self.faults.corrupt_next_read = null;
         var source_index = start;
         var total: usize = 0;
         for (buffers) |buffer| {
             const count = @min(buffer.len, handle.node.data.items.len - source_index);
             @memcpy(buffer[0..count], handle.node.data.items[source_index..][0..count]);
+            if (corruption) |range| {
+                const corrupt_start = std.math.cast(usize, range.offset) orelse std.math.maxInt(usize);
+                const corrupt_end = std.math.add(usize, corrupt_start, std.math.cast(usize, range.length) orelse std.math.maxInt(usize)) catch std.math.maxInt(usize);
+                for (buffer[0..count], source_index..) |*byte, absolute_index| {
+                    if (absolute_index >= corrupt_start and absolute_index < corrupt_end)
+                        byte.* ^= range.xor_mask;
+                }
+            }
             total += count;
             source_index += count;
             if (count != buffer.len or source_index == handle.node.data.items.len) break;
@@ -934,4 +951,17 @@ test "virtual filesystem enforces descriptor capacity partial writes and crash p
     try std.testing.expect(fs.closeFiles(&.{file}));
     try fs.crash();
     try std.testing.expectError(error.FileNotFound, fs.openFile(.cwd(), "ephemeral", .{}));
+}
+
+test "virtual filesystem applies precise one-shot read range corruption" {
+    var fs = try FileSystem.init(std.testing.allocator, .{});
+    defer fs.deinit();
+    const file = try fs.createFile(.cwd(), "range", .{ .read = true }, 1);
+    try std.testing.expectEqual(@as(usize, 6), try fs.writePositional(file, &.{}, &.{"abcdef"}, 1, 0, 2));
+    fs.faults.corrupt_next_read = .{ .offset = 2, .length = 2, .xor_mask = 0x20 };
+    var bytes: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("abCDef", &bytes);
+    try std.testing.expectEqual(@as(usize, 6), try fs.readPositional(file, &.{&bytes}, 0));
+    try std.testing.expectEqualStrings("abcdef", &bytes);
 }

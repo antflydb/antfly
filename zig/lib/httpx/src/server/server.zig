@@ -1530,6 +1530,8 @@ pub const Server = struct {
                     .h1_request_cancellation = &connection.h1_request_cancellation,
                 },
             };
+            if ((self.config.http_runtime orelse &self.owned_http_runtime).supportsNativeSocketTimeouts())
+                connection.socket.enableNativeTimeouts();
             self.registerConnection(&connection.control) catch {
                 connection.socket.close();
                 self.allocator.destroy(connection);
@@ -1620,8 +1622,7 @@ pub const Server = struct {
                 addr = .{ .ip6 = .loopback(ip6.port) };
             },
         }
-        const wake_io = std.Io.Threaded.global_single_threaded.io();
-        var wake_socket = Socket.connect(addr, wake_io) catch return;
+        var wake_socket = Socket.connect(addr, self.listenerIo()) catch return;
         wake_socket.close();
     }
 
@@ -1851,12 +1852,9 @@ pub const Server = struct {
                     first_recv_done = false;
                     break :blk first_n;
                 } else blk: {
-                    applyReadDeadline(&sock, self.io, deadline_ms) catch |err| switch (err) {
-                        error.Timeout => {
-                            if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
-                            return;
-                        },
-                        else => return err,
+                    applyReadDeadline(&sock, self.io, deadline_ms) catch {
+                        if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
+                        return;
                     };
                     const received = sock.recv(&buffer) catch |err| switch (err) {
                         error.Timeout => {

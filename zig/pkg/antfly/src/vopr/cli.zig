@@ -25,6 +25,7 @@ pub fn dispatch(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) 
     if (std.mem.eql(u8, argv[1], "migrate")) return migrateCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "explain")) return explainCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "debug")) return debugCommand(alloc, io, argv[2..]);
     return usage();
 }
 
@@ -449,6 +450,36 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     });
 }
 
+fn debugCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var prefix: usize = 0;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--prefix")) {
+            prefix = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    const output = output_path orelse return error.TraceOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var replayed = try replayKnownScenario(alloc, &recorded);
+    replayed.deinit();
+    const snapshot = try vopr.debugger.inspectAlloc(alloc, &recorded, prefix);
+    defer alloc.free(snapshot);
+    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = snapshot });
+    std.debug.print("VOPR debug snapshot prefix={d} out={s}\n", .{ prefix, output });
+}
+
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var histories: u64 = 100;
     var requested_transitions: ?usize = null;
@@ -477,7 +508,7 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     }
     const transitions = requested_transitions orelse try defaultCampaignTransitions(scenario);
     const owned_artifact_dir = if (requested_artifact_dir == null)
-        try std.fmt.allocPrint(alloc, "/tmp/antfly-sim/{s}", .{scenario})
+        try std.fmt.allocPrint(alloc, "/tmp/antfly-vopr/{s}", .{scenario})
     else
         null;
     defer if (owned_artifact_dir) |path| alloc.free(path);
@@ -916,7 +947,7 @@ fn promoteRecordedToDir(
     force: bool,
 ) ![]u8 {
     try vopr.fixture.validatePromotion(recorded, name);
-    const filename = try std.fmt.allocPrint(alloc, "{s}.simtrace", .{name});
+    const filename = try std.fmt.allocPrint(alloc, "{s}.voprtrace", .{name});
     errdefer alloc.free(filename);
     if (!force) {
         if (dir.statFile(io, filename, .{})) |_| {
@@ -1076,7 +1107,7 @@ const CampaignContext = struct {
 
         const bytes = try artifact.renderAlloc(alloc);
         defer alloc.free(bytes);
-        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.simtrace", .{ self.artifact_dir, history_index, seed });
+        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
         if (failed) {
@@ -1160,7 +1191,7 @@ const CampaignContext = struct {
         var productive: usize = 0;
         for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
         std.debug.print(
-            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
+            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
             .{
                 self.scenario,
                 self.histories,
@@ -1171,6 +1202,7 @@ const CampaignContext = struct {
                 self.harness_errors,
                 self.exact_replays,
                 self.seeded_entries,
+                self.corpus.quarantined.items.len,
                 self.retained,
                 self.semantic_states.count(),
                 self.transition_ids.count(),
@@ -1210,7 +1242,7 @@ const CampaignContext = struct {
         for (fingerprints) |fingerprint| {
             const summary = self.failure_summaries.get(fingerprint).?;
             std.debug.print(
-                "VOPR failure fingerprint={x} first={s} smallest_transitions={d} smallest={s} replay='zig build vopr-replay -- --trace {s}' reduce='zig build vopr-reduce -- --trace {s} --out <reduced.simtrace>'\n",
+                "VOPR failure fingerprint={x} first={s} smallest_transitions={d} smallest={s} replay='zig build vopr-replay -- --trace {s}' reduce='zig build vopr-reduce -- --trace {s} --out <reduced.voprtrace>'\n",
                 .{ fingerprint, summary.first_path, summary.smallest_transitions, summary.smallest_path, summary.smallest_path, summary.smallest_path },
             );
         }
@@ -1394,7 +1426,9 @@ const CampaignContext = struct {
         var walker = try dir.walk(alloc);
         defer walker.deinit();
         while (try walker.next(self.io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".simtrace")) continue;
+            if (entry.kind != .file or
+                (!std.mem.endsWith(u8, entry.path, ".voprtrace") and
+                    !std.mem.endsWith(u8, entry.path, ".simtrace"))) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.path));
         }
         std.mem.sort([]u8, names.items, {}, struct {
@@ -1405,11 +1439,20 @@ const CampaignContext = struct {
         for (names.items) |name| {
             const encoded = try dir.readFileAlloc(self.io, name, alloc, .limited(max_trace_bytes));
             defer alloc.free(encoded);
-            var artifact = try vopr.trace.parseAlloc(alloc, encoded);
+            var artifact = vopr.trace.parseAlloc(alloc, encoded) catch {
+                _ = try self.corpus.quarantineBytes(encoded, .invalid_trace);
+                continue;
+            };
             defer artifact.deinit();
-            if (!artifactMatchesScenario(&artifact, self.scenario)) continue;
+            if (!artifactMatchesScenario(&artifact, self.scenario)) {
+                _ = try self.corpus.quarantineBytes(encoded, .scenario_changed);
+                continue;
+            }
             // Corpus files must still be executable under the current ABI.
-            var replayed = try replayKnownScenario(alloc, &artifact);
+            var replayed = replayKnownScenario(alloc, &artifact) catch {
+                _ = try self.corpus.quarantineBytes(encoded, .scenario_version_changed);
+                continue;
+            };
             replayed.deinit();
             const novelty = try self.coverage.observe(&artifact);
             const added = try self.corpus.add(&artifact, novelty);
@@ -1460,6 +1503,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr migrate --trace <path> --out <path> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
+        \\  vopr debug --trace <path> [--prefix <choice-index>] --out <path.json>
         \\
     , .{});
     return error.InvalidUsage;

@@ -1,10 +1,14 @@
-# VOPR: Deterministic Autonomous Simulation for Antfly
+# VOPR: Deterministic Autonomous Testing for Antfly
 
 Status (2026-08-23): the common VOPR engine, its deterministic `std.Io`
 runtime, Phases 0 through 5, and the independent metadata, transaction, Raft,
 storage, HA, data-plane, derived-workflow, backup/restore, and clock-fault
-scenarios are implemented. The most important remaining production seam is
-finer-grained scheduling inside the real DataServer and HTTP request lifecycle.
+scenarios are implemented. The production DataServer now serves public HTTP on
+borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
+resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
+debug cursor are executable. The most important remaining seam is finer-grained
+scheduling inside routed data, Raft, split/merge, and individual background
+services.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -34,29 +38,36 @@ not a prerequisite for deterministic search.
 
 | Capability | Implementation evidence | Verification |
 | --- | --- | --- |
-| Stable structured choices and exact clean-world replay | `lib/vopr/src/choice.zig`, `runner.zig`, `replay.zig`, canonical `vopr-trace-v1` | `zig build vopr-test` |
-| One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-test` |
+| Stable structured choices and exact clean-world replay | `lib/vopr/src/choice.zig`, `runner.zig`, `replay.zig`, canonical `vopr-trace-v1` | `zig build vopr-engine-test` |
+| One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-engine-test` |
 | Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; Antfly `DurableJobLane` adapter | `zig build vopr-runtime-test` |
-| Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-test` in Debug and ReleaseSafe |
-| Modeled files, durability, sockets, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-test` |
-| Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-test` |
-| Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-test storage-sim-runtime-test` |
-| Properties, observations, semantic coverage, corpus, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-test vopr-benchmark` |
+| Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-engine-test` in Debug and ReleaseSafe |
+| Modeled files, durability, streams, datagrams, processes, and quotas | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig` | `zig build vopr-engine-test` |
+| Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
+| Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
+| Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Replay-before-retention campaigns and deterministic workers | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
-| Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-test vopr-meta-test` |
+| Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-engine-test vopr-meta-test` |
 | TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
-| Counterfactual causality and clean-replay branching | `causal.zig`, `debugger.zig`, `collector.zig` | `zig build vopr-test vopr-meta-test` |
+| Ranked counterfactual causality, persistent multiverse identities, clean-replay branching, and debug cursor | `causal.zig`, `multiverse.zig`, `debugger.zig`, `collector.zig`, `vopr-debug` | `zig build vopr-engine-test vopr-meta-test` |
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
+| Production public HTTP on deterministic I/O | `vopr/data_server.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor | `zig build data-server-vopr-test` |
+| Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`, `vopr/admission.zig` | `zig build vopr-runtime-test admission-vopr-test` |
+| Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 
-The physical distributed-data shell is deliberately conservative. Its plan is
-generated and replayable, but the real HTTP/DataServer portion remains one
-atomic transition until production exposes safe borrowed-lease and
-request-executor suspension points. VOPR must not counterfeit concurrency by
-opening a competing writer or bypassing production lease ownership.
+The real DataServer listener, httpx client/server transport, request lifecycle,
+deadline, shutdown, and partial writes now execute as deterministic `VoprIo`
+transitions. Routed data and Raft operations remain deliberately conservative
+where production has not yet exposed a safe suspension point. VOPR must not
+counterfeit concurrency by opening a competing writer or bypassing production
+lease ownership. Ordinary socket reads and writes always use the injected
+`std.Io`; a runtime-proven native server handle may use kernel timeout options
+for scalable blocking I/O, while borrowed/virtual handles use logical
+Select-based timeouts and never reach POSIX with a virtual descriptor.
 
 ## Design Influences
 
@@ -163,8 +174,9 @@ lib/vopr/src/
   trace.zig                  replay.zig
   reducer.zig                fixture.zig
   snapshot.zig               splice.zig
-  causal.zig                 debugger.zig
-  collector.zig              vopr-trace-v1.schema.json
+  causal.zig                 multiverse.zig
+  debugger.zig               collector.zig
+  vopr-trace-v1.schema.json
 
 pkg/antfly/src/vopr/
   DETERMINISM_AUDIT.md
@@ -172,14 +184,21 @@ pkg/antfly/src/vopr/
   cli_runner.zig
   domain_vopr.zig
   request_lifecycle.zig
+  data_server.zig
+  object_store.zig
+  admission.zig
   fixtures/<scenario>/
 ```
 
-`VoprIo`, the `vopr_io*.zig` modules, `pkg/antfly/src/vopr`, and `vopr-*`
-build steps are canonical. The old `sim-*` CLI and contract-test steps remain
-temporary workflow aliases. Serialized `sim-io-*` backend identifiers remain
-unchanged because they are part of the `vopr-trace-v1` replay ABI, not source
-names.
+`VoprIo`, the `vopr_io*.zig` modules, `pkg/antfly/src/vopr`, `vopr_tests`
+identifiers, and `vopr-*` build steps are canonical. `vopr-test` is the fast
+Antfly aggregate; `vopr-engine-test` is the focused application-independent
+engine gate. The old `sim-*` CLI, contract-test, and aggregate steps remain
+temporary workflow aliases. Older randomized real-I/O suites use
+`workload`/`integration` terminology when renamed; they do not become VOPR
+suites merely by changing a label. Serialized `sim-io-*` backend identifiers
+remain unchanged because they are part of the `vopr-trace-v1` replay ABI, not
+source names.
 
 Domain adapters may remain beside their production domains when that preserves
 the cleanest dependency direction.
@@ -271,19 +290,22 @@ selection are scheduler-visible stable choices.
 Virtual integer handles provide directories, deterministic iteration, recursive
 rename, positional and streaming I/O, atomic publication, locks, mappings,
 metadata, descriptor and capacity limits, partial I/O, data sync, separate
-namespace sync, dropped sync, and crash reconstruction from durable state.
+namespace sync, dropped sync, precise one-shot read-range corruption, and crash
+reconstruction from durable state.
 
 Symlinks, hard links, and optimized file-to-file transfer currently fail
 closed. Modeled storage distinguishes volatile from durable state; a crash
 drops volatile state rather than invoking production close paths.
 
-### Implemented Stream Networking
+### Implemented Networking
 
 IP and Unix listen/connect/accept, socket pairs, stream reads and writes,
 half-close, close, deterministic loopback resolution, bounded send queues,
 partial writes, and packet delivery are modeled in memory. Drop, duplicate,
 reorder, outage, jam, directional partition, arbitrary delay, and backpressure
-are explicit model state. Datagram networking remains unsupported.
+are explicit model state. Bound UDP datagrams preserve message boundaries and
+source addresses while sharing scheduler-visible drop, duplicate, reorder, and
+delivery behavior.
 
 ### Implemented Processes and Resources
 
@@ -378,18 +400,20 @@ diagnostics, coverage, and formal export.
 Generated artifacts normally live under:
 
 ```text
-/tmp/antfly-sim/<campaign>/<history-id>.simtrace
+/tmp/antfly-vopr/<campaign>/<history-id>.voprtrace
 ```
 
 Reviewed promoted fixtures live under:
 
 ```text
-pkg/antfly/src/vopr/fixtures/<scenario>/<name>.simtrace
+pkg/antfly/src/vopr/fixtures/<scenario>/<name>.voprtrace
 ```
 
 Promotion is explicit. Migration must replay the source, translate it, replay
 the target, and verify semantic outcome equivalence before writing a new
-canonical artifact.
+canonical artifact. Readers continue to accept `.simtrace` as a legacy filename
+extension; the content format and serialized `sim-io-*` identities remain the
+versioned replay ABI.
 
 ### Reduction
 
@@ -408,10 +432,13 @@ never replay truth.
 ### Causality and Debugger Primitives
 
 Bounded counterfactual analysis replaces a selected pre-failure decision,
-explores deterministic descendants, exact-replays every child, and records
-same-fingerprint reachability and child digests. The debugger cursor can seek a
-choice prefix, list recorded alternatives, create and verify a child branch,
-and collect deterministic state before, at, and after a failure.
+explores deterministic descendants, exact-replays every child, ranks
+failure-probability reductions, and records stable experiment IDs, trial-seed
+digests, and a pointer-free parent/child multiverse graph. The debugger cursor
+can seek a choice prefix, list recorded alternatives, create and verify a child
+branch, and collect deterministic state before, at, and after a failure.
+`vopr-debug` exports the generic replay-validated cursor snapshot for scripts,
+editors, or a future interactive frontend.
 
 ## Quiet Suffix and Liveness
 
@@ -444,11 +471,14 @@ topology, split, merge, and a quiet recovery phase.
 
 The distributed-data integration composes real public API writes and reads,
 split, partition/restart, modeled durable-device crash/recovery, merge, and an
-acknowledged-operation oracle. Its real DataServer portion remains intentionally
-atomic pending the production seam described under Remaining Work.
+acknowledged-operation oracle. A focused production composition additionally
+runs the real DataServer public listener and `/healthz` request through httpx on
+borrowed `VoprIo`, including partial writes and deadline-first shutdown. Routed
+write/read, Raft, and split/merge internals remain the next microstep boundary.
 
 Focused gates: `lib-metadata-vopr-test`,
-`lib-metadata-vopr-data-test`, and `metadata-vopr-replay-stability-test`.
+`lib-metadata-vopr-data-test`, `data-server-vopr-test`, and
+`metadata-vopr-replay-stability-test`.
 
 ### Transaction
 
@@ -480,7 +510,7 @@ real PersistentIndex, split IndexManager, full DB split, maintenance,
 compaction, crash recovery, volatile/durable state, and typed storage faults.
 
 Focused aggregate: `storage-vopr-test`. Exact fixture and legacy real-I/O
-commands remain in [the storage simulation workflow](pkg/antfly/src/storage/SIM.md).
+commands are documented under Test-Tier Policy below.
 
 ### HA
 
@@ -531,7 +561,7 @@ Focused gate: `clock-fault-vopr-test`.
 
 ## Defects Found
 
-Simulation work has found concrete production defects, not only harness gaps:
+VOPR work has found concrete production defects, not only harness gaps:
 
 - Transaction recovery retained the address of the temporary `DB` wrapper
   constructed inside `DB.open`, although the wrapper is returned by value.
@@ -544,6 +574,31 @@ Simulation work has found concrete production defects, not only harness gaps:
   wakes the loop before close.
 - The independent-domain checkpoint exposed a latent compile defect caused by
   a local durable-job-lane variable shadowing the `lane` method.
+- httpx bypassed its supplied `std.Io` backend for ordinary POSIX reads and
+  listener creation. That made virtual sockets incomplete and split timeout
+  semantics between host and modeled I/O. Reads, ordinary listen, and logical
+  timeouts now stay on the injected backend.
+- httpx listener shutdown used a hidden global `std.Io.Threaded` loopback
+  connection to wake `accept`. On `VoprIo` that mixed unrelated handle spaces
+  and failed with `BADF`; the wake connection now uses the listener's own I/O.
+- `HttpRuntime` unconditionally created three hidden Threaded executors and a
+  native descriptor observer. It now supports caller-owned backend-neutral
+  lanes, preserves bounded admission, and fails closed when native disconnect
+  observation is requested from a backend that cannot provide it.
+- Production metadata/table-read setup assumed concrete Threaded executors.
+  Transport-neutral request executors and generic `std.Io` fanout now allow the
+  same DataServer composition to run deterministically.
+- The standard testing allocator's stack-trace unwinder was unsafe across
+  manually switched fiber stacks. VOPR production compositions retain leak
+  detection with stack-trace capture disabled rather than weakening allocator
+  checks globally.
+- Virtual socket admission counted every historical handle rather than live
+  handles. Closing a connection therefore never restored capacity and could
+  prevent the listener's shutdown wake connection. `VoprIo` now accounts live
+  descriptors and proves reuse after close.
+- Virtual TCP half-close marked EOF immediately even when earlier payload bytes
+  were still queued, allowing FIN to overtake data. FIN is now its own ordered,
+  scheduler-visible packet transition.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -560,31 +615,37 @@ zig build vopr-run -- \
   --scenario metadata \
   --seed 0xa17f0001 \
   --transitions 500 \
-  --trace-out /tmp/metadata.simtrace
+  --trace-out /tmp/metadata.voprtrace
 
 # Exact replay, reduction, and reviewed promotion.
-zig build vopr-replay -- --trace /tmp/metadata.simtrace
+zig build vopr-replay -- --trace /tmp/metadata.voprtrace
 zig build vopr-reduce -- \
-  --trace /tmp/metadata.simtrace \
-  --out /tmp/metadata-reduced.simtrace
+  --trace /tmp/metadata.voprtrace \
+  --out /tmp/metadata-reduced.voprtrace
 zig build vopr-promote -- \
-  --trace /tmp/metadata-reduced.simtrace \
+  --trace /tmp/metadata-reduced.voprtrace \
   --name split-leader-restart-before-finalize
 
 # Replay-proven format migration.
 zig build vopr-migrate -- \
-  --trace /tmp/metadata-reduced.simtrace \
-  --out /tmp/metadata-migrated.simtrace
+  --trace /tmp/metadata-reduced.voprtrace \
+  --out /tmp/metadata-migrated.voprtrace
 
 # Formal export and causal explanation.
 zig build vopr-tla -- \
-  --trace /tmp/metadata-reduced.simtrace \
+  --trace /tmp/metadata-reduced.voprtrace \
   --domain raft \
   --out /tmp/metadata-raft.ndjson
 zig build vopr-explain -- \
-  --trace /tmp/metadata-reduced.simtrace \
+  --trace /tmp/metadata-reduced.voprtrace \
   --failure 0 \
   --out /tmp/metadata-causal.json
+
+# Replay-validated navigation at an arbitrary choice prefix.
+zig build vopr-debug -- \
+  --trace /tmp/metadata-reduced.voprtrace \
+  --prefix 12 \
+  --out /tmp/metadata-debug.json
 
 # Bounded deterministic campaign.
 zig build vopr-campaign -- \
@@ -592,7 +653,7 @@ zig build vopr-campaign -- \
   --histories 1000 \
   --transitions 500 \
   --workers 8 \
-  --artifact-dir /tmp/antfly-sim
+  --artifact-dir /tmp/antfly-vopr
 
 # Host-independent checkpoint-search benchmark.
 zig build vopr-benchmark
@@ -618,14 +679,15 @@ lsm                   ha
 - Broad unit coverage belongs in focused unit buckets rather than a monolithic
   root-module test.
 
-### `sim-test`
+### `vopr-test`
 
 - Fast deterministic virtual-time and modeled-I/O smoke coverage.
-- Promoted simulator fixtures, replay-equivalence checks, bounded domain
-  scenarios, metadata virtual transport, Raft simulation, and
+- Promoted VOPR fixtures, replay-equivalence checks, bounded domain scenarios,
+  metadata virtual transport, Raft scheduling, production public HTTP, and
   `storage-vopr-test`.
-- No real HTTP listener/client forwarding campaign and no legacy real-I/O
-  storage workload pretending to be modeled I/O.
+- No legacy real-I/O storage workload pretending to be modeled I/O.
+- `vopr-engine-test` runs only the reusable `lib/vopr` contract; `sim-test` is
+  a temporary compatibility alias for this aggregate.
 
 ### `chaos-test`
 
@@ -645,9 +707,35 @@ lsm                   ha
 - Real HTTP, native threads, processes, sockets, and local object stores remain
   focused integration differentials.
 - Deterministic storage workloads that still use real LMDB/WAL/files stay in
-  `storage-sim-test`; longer ones stay in `storage-sim-soak`.
-- The exact storage targets, fixture layout, and promotion workflow are kept in
-  [pkg/antfly/src/storage/SIM.md](pkg/antfly/src/storage/SIM.md).
+  `storage-workload-test`; longer ones stay in `storage-workload-soak`.
+
+Legacy storage commands are:
+
+- LMDB: `storage-lmdb-test`, `storage-lmdb-test -Dlmdb_backend=c`,
+  `lmdb-replay-fixtures`, and `lmdb-workload-soak`.
+- WAL: `wal-test`, `wal-workload-test`, `wal-replay-fixtures`, and
+  `wal-workload-soak`.
+- Persistent index: `persistent-test`, `persistent-workload-test`,
+  `persistent-replay-fixtures`, and `persistent-workload-soak`.
+- Index manager: `index-manager-test`, `index-manager-workload-test`, and
+  `index-manager-replay-fixtures`.
+- DB split: `db-split-workload-test` and `db-split-replay-fixtures`.
+- Aggregate legacy workloads: `storage-workload-test` and
+  `storage-workload-soak`.
+
+The old `*-sim-test` and `storage-sim-soak` spellings are compatibility aliases,
+not canonical suite names.
+
+Reduced legacy artifacts are written under `/tmp` with an
+`antfly-{lmdb,wal,persistent,index-manager,db-split}-replay-` prefix. Promote a
+reviewed artifact with `zig build storage-fixture-promote -- <artifact>`;
+`--latest`, an optional destination stem, and `--force` are supported. Fixture
+directories retain their existing `_sim_fixtures` names as checked-in format
+and path compatibility, just as trace ABI identifiers do. Fixed-map LMDB stays
+out of randomized reopen matrices because persisted addresses are host-layout
+sensitive. Crash-mode WAL, persistent, and index-manager fixtures require the
+Zig backend's publish-phase hooks; the C backend remains the differential
+oracle.
 
 PR gates use deterministic transition and history counts. Nightly/manual
 controllers may use a wall-clock allocation across independently replayable
@@ -665,59 +753,71 @@ eligible TLA+ traces.
 - Obsolete fixtures change only through explicit replay-proven migration.
 - Fixed regressions do not depend on corpus scheduling or search heuristics.
 
-## Remaining Work
+## Next Steps
 
 These are capability and production-seam expansions, not a second numbered
 phase plan and not dependencies of the already implemented domain suites.
 
-### 1. Real DataServer and Public HTTP Microsteps
+### 1. Deeper DataServer and Raft Microsteps
 
-This is the highest-value gap. Add safe borrowed-writer-lease and request
-executor suspension points around public admission, routing, timeout,
-cancellation, Raft propose/persist/apply/ack, writer handoff, split/merge copy,
-cutover, rollback, cleanup, and query result assembly. Run the real request path
-on `VoprIo` without opening a second writer or weakening lease ownership.
+The production DataServer, public listener, health request, metadata executor,
+and lifecycle safepoints run on borrowed `VoprIo`. Continue with safe
+borrowed-writer-lease and request-executor suspension points around routing,
+Raft propose/persist/apply/ack, writer handoff, split/merge copy, cutover,
+rollback, cleanup, and query result assembly. These points must preserve the
+single production writer and its lease ownership.
 
 ### 2. HTTP Lifecycle and Backpressure
 
-Run the common listener, executor, and disconnect observer on `VoprIo`. Explore
-accept versus shutdown, half-close, slow and partial writes, cancellation,
-deadlines, connection admission, descriptor exhaustion, and recovery after
-overload.
+The common listener and executors run on `VoprIo`; tests cover normal,
+single-byte partial-write, deadline-first cancellation, half-close ordering,
+accept-versus-shutdown, bounded connection/request admission, minimum socket
+capacity, descriptor reuse, and overload recovery. Next, exercise streaming
+request/response bodies, keep-alive reuse, pipelining policy, TLS termination
+boundaries, and a backend-neutral disconnect signal. Native descriptor
+observation remains unavailable on virtual handles.
 
 ### 3. Background Runtime Lifecycle
 
-Apply a common start/pause/cancel/drain/close/reopen protocol to transaction
-recovery, TTL, enrichment, text merge, sparse compaction, repair, and durable
-job workers. Include wrapper relocation and teardown-order properties because
-that class produced the transaction recovery defect.
+`DurableJobLane` and both production/VOPR implementations now share
+pause/resume/drain/close/reopen semantics; tests include admission while paused,
+committed-job drain, close, reopen, wrapper relocation, and exact teardown.
+Adopt that protocol in transaction recovery, TTL, enrichment, text merge,
+sparse compaction, repair, and other workers, then add service-specific
+teardown-order properties.
 
 ### 4. Serverless Object-Store Protocols
 
-Schedule real WAL, catalog, manifest, artifact, and progress-store operations
-over deterministic object-store responses: partial transfer, delayed
-visibility, duplicate completion, timeout, retry, cancellation, publication,
-and crash. Reuse the backup/restore oracle rather than creating another
-suite-local runner.
+Real WAL, catalog, manifest, artifact, and progress-store operations now run
+over the reusable `ScriptedFaultClient`, covering partial committed transfer,
+delayed visibility, duplicate completion, timeout-after-commit, cancellation,
+retry, publication, reconciliation, and client crash. Next, reuse this provider
+in the full backup/restore workflow and decide whether WAL append needs an
+operation identity: today callers must reconcile a timeout-after-commit before
+retry because a blind append retry can create a second LSN.
 
 ### 5. Admission and Resource Pressure
 
-Compose the production resource manager and lane admission with `VoprIo` task,
-CPU, allocator, file-descriptor, socket, storage, and queue limits. Verify that
-overload is bounded, cancellation returns reservations, priorities make
-progress, and recovery restores capacity.
+The production resource manager now runs under a replayable contention schedule
+that proves hard-limit denial, idempotent release, accounting, and capacity
+recovery. `VoprIo` independently enforces task, CPU, allocator, file, socket,
+storage, and queue limits, and the DataServer covers socket admission. Next,
+compose multiple limits in one production request, cancel it at every admitted
+edge, prove reservation return, and add priority/minimum-progress campaigns.
 
-### 6. Hard Antithesis-Class Tooling
+### 6. Hard Antithesis-Class Tooling and Search Quality
 
-- Persist a navigable multiverse parent/child graph across retained histories.
-- Extend counterfactual sampling into ranked failure-probability inflection
-  points with reproducible experiment metadata.
-- Build the interactive `sim-debug` CLI or TUI over the existing cursor,
-  branching, collectors, and causal primitives.
-- Preserve corpus, stable property history, and search productivity across
-  commits; quarantine replay-incompatible entries explicitly.
-- Add storage-completion reordering and richer range corruption, datagrams,
-  and systematic task starvation.
+- Persisted pointer-free multiverse nodes, ranked counterfactual experiments,
+  stable trial metadata, the `vopr-debug` cursor command, cross-revision
+  property history, explicit corpus quarantine, one-shot range corruption,
+  datagrams, scheduler-controlled completion order, and bounded systematic
+  starvation are implemented in the self-contained repository.
+- Wire counterfactual graph generation and quarantine export into long-running
+  campaign artifact management rather than only library/command consumers.
+- Add an interactive TUI or editor frontend over `vopr-debug` with branch,
+  collector, causal-window, and child-comparison commands.
+- Extend corruption from one-shot read ranges to durable sector/torn-write
+  maps and exercise provider-specific datagram consumers where they exist.
 - Add stable source/basic-block coverage as secondary guidance when the Zig
   instrumentation surface can remain outside the replay ABI.
 
@@ -778,8 +878,8 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The next correctness gains will come from moving real DataServer, HTTP,
-background-runtime, serverless object-store, and admission lifecycles across
-those existing scheduler boundaries. That work should deepen production
-control through `std.Io` and safe suspension seams, not multiply suite names or
-weaken production ownership contracts.
+The next correctness gains will come from moving routed DataServer/Raft,
+background-runtime, serverless object-store, admission, and the remaining HTTP
+edge cases across those existing scheduler boundaries. That work should deepen
+production control through `std.Io` and safe suspension seams, not multiply
+suite names or weaken production ownership contracts.

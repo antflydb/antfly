@@ -403,6 +403,15 @@ pub const VoprIo = struct {
         self.files.faults.partial_write_limit = bytes;
     }
 
+    pub fn corruptNextFileReadRange(self: *VoprIo, offset: u64, length: u64, xor_mask: u8) !void {
+        if (length == 0 or xor_mask == 0) return error.InvalidFileCorruptionRange;
+        self.files.faults.corrupt_next_read = .{
+            .offset = offset,
+            .length = length,
+            .xor_mask = xor_mask,
+        };
+    }
+
     pub fn crashFileSystem(self: *VoprIo) !void {
         try self.files.crash();
     }
@@ -564,10 +573,12 @@ fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable
                 self.realtime_ns,
             ),
         },
-        .net_receive => {
-            self.latch(.operation_batch);
-            return .{ .net_receive = .{ error.NetworkDown, 0 } };
-        },
+        .net_receive => |request| .{ .net_receive = try self.network.receiveDatagrams(
+            request.socket_handle,
+            request.message_buffer,
+            request.data_buffer,
+            request.flags,
+        ) },
         .device_io_control => {
             self.latch(.operation_batch);
             return error.Canceled;
@@ -986,9 +997,8 @@ fn netAccept(userdata: ?*anyopaque, server: std.Io.net.Socket.Handle, _: std.Io.
     return state(userdata).network.accept(server);
 }
 
-fn netBindIp(userdata: ?*anyopaque, _: *const std.Io.net.IpAddress, _: std.Io.net.IpAddress.BindOptions) std.Io.net.IpAddress.BindError!std.Io.net.Socket {
-    state(userdata).latch(.network_send);
-    return error.OptionUnsupported;
+fn netBindIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.BindOptions) std.Io.net.IpAddress.BindError!std.Io.net.Socket {
+    return state(userdata).network.bindIp(address, options);
 }
 
 fn netConnectIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
@@ -1007,9 +1017,8 @@ fn netSocketCreatePair(userdata: ?*anyopaque, options: std.Io.net.Socket.CreateP
     return state(userdata).network.createPair(options);
 }
 
-fn netSend(userdata: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []std.Io.net.OutgoingMessage, _: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {
-    state(userdata).latch(.network_send);
-    return .{ error.NetworkDown, 0 };
+fn netSend(userdata: ?*anyopaque, handle: std.Io.net.Socket.Handle, messages: []std.Io.net.OutgoingMessage, _: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {
+    return state(userdata).network.send(handle, messages);
 }
 
 fn netRead(userdata: ?*anyopaque, source: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
@@ -1585,6 +1594,57 @@ test "VoprIo runs std.Io mutex queue and select on the futex kernel" {
     try sim.ensureNoCapabilityViolation();
 }
 
+test "VoprIo select cancels an outstanding task after the first result" {
+    const Selected = union(enum) { fast: u8, blocked: std.Io.Cancelable!void };
+    const Shared = struct {
+        io: std.Io,
+        done: bool = false,
+
+        fn fast(self: *@This()) u8 {
+            std.Io.sleep(self.io, .fromNanoseconds(1), .awake) catch unreachable;
+            return 7;
+        }
+
+        fn blocked(self: *@This()) std.Io.Cancelable!void {
+            const forever: std.Io.Timeout = .none;
+            return forever.sleep(self.io);
+        }
+
+        fn parent(self: *@This()) void {
+            var buffer: [2]Selected = undefined;
+            var selection = std.Io.Select(Selected).init(self.io, &buffer);
+            selection.async(.blocked, blocked, .{self});
+            selection.async(.fast, fast, .{self});
+            const result = selection.await() catch unreachable;
+            std.debug.assert(result.fast == 7);
+            selection.cancelDiscard();
+            self.done = true;
+        }
+    };
+
+    var sim = try VoprIo.init(.{
+        .required = .of(&.{ .task_scheduling, .synchronization, .sleep }),
+    });
+    defer sim.deinit();
+    var shared = Shared{ .io = sim.io() };
+    _ = shared.io.async(Shared.parent, .{&shared});
+
+    const scheduler = sim.scheduler();
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expect(shared.done);
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "VoprIo core modeled files execute through std.Io and survive only durable syncs" {
     var sim = try VoprIo.init(.{});
     defer sim.deinit();
@@ -1744,6 +1804,37 @@ test "VoprIo stream sockets expose packet delivery and waiter wake choices" {
     try sim.ensureNoCapabilityViolation();
 }
 
+test "VoprIo datagrams preserve message boundaries and scheduler-visible delivery" {
+    var sim = try VoprIo.init(.{ .required = .of(&.{.sockets}) });
+    defer sim.deinit();
+    const io = sim.io();
+    const left_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31_338) };
+    const right_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31_339) };
+    const left = try left_address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer left.close(io);
+    const right = try right_address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer right.close(io);
+    try left.send(io, &right_address, "one-datagram");
+
+    const scheduler = sim.scheduler();
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    try scheduler.enumerateReady(&enabled, std.testing.allocator);
+    try enabled.canonicalize();
+    try std.testing.expectEqual(@as(usize, 1), enabled.items.items.len);
+    try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+
+    var buffer: [32]u8 = undefined;
+    const received = try right.receive(io, &buffer);
+    try std.testing.expectEqualStrings("one-datagram", received.data);
+    try std.testing.expect(received.flags.eor);
+    try std.testing.expect(!received.flags.trunc);
+    try std.testing.expectEqual(left.address.getPort(), received.from.getPort());
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "VoprIo registered processes spawn pause resume and wait through std.process" {
     const Program = struct {
         fn run(context: *process_mod.Context, argv: []const []const u8) u8 {
@@ -1844,6 +1935,9 @@ test "VoprIo resource capability enforces file socket and storage quotas" {
     );
     pair[0].close(io);
     pair[1].close(io);
+    const replacement_pair = try std.Io.net.Socket.createPair(io, .{});
+    replacement_pair[0].close(io);
+    replacement_pair[1].close(io);
     try sim.ensureNoCapabilityViolation();
 }
 

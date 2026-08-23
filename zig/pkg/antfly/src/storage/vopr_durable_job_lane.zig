@@ -21,6 +21,7 @@ pub const Lane = struct {
     next_sequence: u64 = 1,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     closed_owners: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    paused_owners: std.AutoHashMapUnmanaged(u64, void) = .empty,
     completed_jobs: u64 = 0,
     failed_jobs: u64 = 0,
     last_error_name: ?[]const u8 = null,
@@ -70,6 +71,7 @@ pub const Lane = struct {
         }
         self.entries.deinit(self.allocator);
         self.closed_owners.deinit(self.allocator);
+        self.paused_owners.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -82,6 +84,7 @@ pub const Lane = struct {
     pub fn registerOwner(self: *Lane, owner_id: u64) !void {
         if (owner_id == 0) return error.InvalidBackgroundOwner;
         _ = self.closed_owners.remove(owner_id);
+        _ = self.paused_owners.remove(owner_id);
     }
 
     pub fn stats(self: *const Lane) Stats {
@@ -112,6 +115,7 @@ pub const Lane = struct {
         const self: *Lane = @ptrCast(@alignCast(ptr));
         if (job.owner_id == 0) return error.InvalidBackgroundOwner;
         if (self.closed_owners.contains(job.owner_id)) return error.BackgroundOwnerClosed;
+        if (self.paused_owners.contains(job.owner_id)) return error.BackgroundOwnerPaused;
 
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
@@ -142,6 +146,7 @@ pub const Lane = struct {
 
     fn closeOwner(ptr: *anyopaque, owner_id: u64) void {
         const self: *Lane = @ptrCast(@alignCast(ptr));
+        _ = self.paused_owners.remove(owner_id);
         self.closed_owners.put(self.allocator, owner_id, {}) catch |err| {
             std.debug.panic("failed to close VOPR durable-job owner: {s}", .{@errorName(err)});
         };
@@ -154,6 +159,25 @@ pub const Lane = struct {
             };
             if (!canceled) @panic("VOPR durable job disappeared during serialized owner close");
         }
+    }
+
+    fn pauseOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *Lane = @ptrCast(@alignCast(ptr));
+        if (owner_id == 0) return error.InvalidBackgroundOwner;
+        if (self.closed_owners.contains(owner_id)) return error.BackgroundOwnerClosed;
+        try self.paused_owners.put(self.allocator, owner_id, {});
+    }
+
+    fn resumeOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *Lane = @ptrCast(@alignCast(ptr));
+        if (owner_id == 0) return error.InvalidBackgroundOwner;
+        if (self.closed_owners.contains(owner_id)) return error.BackgroundOwnerClosed;
+        _ = self.paused_owners.remove(owner_id);
+    }
+
+    fn reopenOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *Lane = @ptrCast(@alignCast(ptr));
+        try self.registerOwner(owner_id);
     }
 
     fn poll(_: *anyopaque, _: usize) !usize {
@@ -175,6 +199,9 @@ pub const Lane = struct {
         .submit = submit,
         .drain_owner = drainOwner,
         .close_owner = closeOwner,
+        .pause_owner = pauseOwner,
+        .resume_owner = resumeOwner,
+        .reopen_owner = reopenOwner,
         .poll = poll,
         .executes_inline = false,
     };
@@ -264,4 +291,68 @@ test "VOPR durable job owner close cancels queued work exactly once" {
     }));
     // A failed submission leaves ownership with the caller.
     try std.testing.expectEqual(@as(usize, 1), context.deinits);
+}
+
+test "VOPR durable job owner uses production pause close and reopen protocol" {
+    const Context = struct {
+        runs: usize = 0,
+        deinits: usize = 0,
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runs += 1;
+        }
+
+        fn deinitJob(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deinits += 1;
+        }
+    };
+
+    var runtime = vopr.sim_runtime.SimRuntime.init(std.testing.allocator, 0);
+    defer runtime.deinit();
+    var adapter = Lane.init(std.testing.allocator, runtime.runtime().executor);
+    defer adapter.deinit();
+    const lane = adapter.lane();
+    var context = Context{};
+
+    try lane.pauseOwner(17);
+    try std.testing.expectError(error.BackgroundOwnerPaused, lane.submit(.{
+        .owner_id = 17,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    }));
+    try lane.resumeOwner(17);
+    try lane.submit(.{
+        .owner_id = 17,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    });
+    lane.closeOwner(17);
+    try std.testing.expectEqual(@as(usize, 0), context.runs);
+    try std.testing.expectEqual(@as(usize, 1), context.deinits);
+
+    try lane.reopenOwner(17);
+    try lane.submit(.{
+        .owner_id = 17,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    });
+    var transitions: vopr.transition.List = .{};
+    defer transitions.deinit(std.testing.allocator);
+    try runtime.scheduler().enumerateReady(&transitions, std.testing.allocator);
+    try transitions.canonicalize();
+    var sink: vopr.event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    try runtime.scheduler().executeReady(transitions.items.items[0].id, &sink, std.testing.allocator);
+    lane.drainOwner(17);
+    lane.closeOwner(17);
+    try std.testing.expectEqual(@as(usize, 1), context.runs);
+    try std.testing.expectEqual(@as(usize, 2), context.deinits);
 }

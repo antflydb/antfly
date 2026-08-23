@@ -1602,21 +1602,34 @@ pub fn parallelFanoutMetricsSnapshot() ParallelFanoutMetricsSnapshot {
     };
 }
 
-fn ioAsyncLimitWidth(io_impl: *std.Io.Threaded, group_count: usize) usize {
+const FanoutIo = struct {
+    backend: std.Io,
+    async_limit: std.Io.Limit,
+
+    fn fromThreaded(io_impl: *std.Io.Threaded) FanoutIo {
+        return .{ .backend = io_impl.io(), .async_limit = io_impl.async_limit };
+    }
+
+    fn io(self: FanoutIo) std.Io {
+        return self.backend;
+    }
+};
+
+fn ioAsyncLimitWidth(io_impl: FanoutIo, group_count: usize) usize {
     const raw = @intFromEnum(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return @max(@as(usize, 1), group_count);
     return @max(@as(usize, 1), @min(group_count, raw));
 }
 
-fn ioAsyncLimitCap(io_impl: *std.Io.Threaded) usize {
+fn ioAsyncLimitCap(io_impl: FanoutIo) usize {
     const raw = @intFromEnum(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return std.math.maxInt(usize);
     return @max(@as(usize, 1), raw);
 }
 
-fn planFanout(kind: ParallelFanoutKind, io_impl: ?*std.Io.Threaded, group_count: usize) FanoutPlan {
+fn planFanout(kind: ParallelFanoutKind, io_impl: ?FanoutIo, group_count: usize) FanoutPlan {
     const attached_io = io_impl orelse return .{
         .parallel = false,
         .width = 1,
@@ -1641,7 +1654,7 @@ fn planFanout(kind: ParallelFanoutKind, io_impl: ?*std.Io.Threaded, group_count:
 }
 
 fn planQueryFanout(
-    io_impl: ?*std.Io.Threaded,
+    io_impl: ?FanoutIo,
     group_count: usize,
     req: db_mod.types.SearchRequest,
 ) FanoutPlan {
@@ -2499,7 +2512,7 @@ pub const ProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     requester: raft_mod.ReadableLeaseRequester,
-    io_impl: ?*std.Io.Threaded = null,
+    io_impl: ?FanoutIo = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     cache: ?*ProvisionedTableReadCache = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
@@ -2560,7 +2573,16 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     pub fn withIo(self: *ProvisionedTableReadSource, io_impl: *std.Io.Threaded) *ProvisionedTableReadSource {
-        self.io_impl = io_impl;
+        self.io_impl = .fromThreaded(io_impl);
+        return self;
+    }
+
+    pub fn withIoInterface(
+        self: *ProvisionedTableReadSource,
+        io: std.Io,
+        async_limit: std.Io.Limit,
+    ) *ProvisionedTableReadSource {
+        self.io_impl = .{ .backend = io, .async_limit = async_limit };
         return self;
     }
 
@@ -3803,7 +3825,7 @@ pub const HostedProvisionedTableReadSource = struct {
     requester: raft_mod.ReadableLeaseRequester,
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
-    io_impl: ?*std.Io.Threaded = null,
+    io_impl: ?FanoutIo = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
 
@@ -3824,7 +3846,16 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     pub fn withIo(self: *HostedProvisionedTableReadSource, io_impl: *std.Io.Threaded) *HostedProvisionedTableReadSource {
-        self.io_impl = io_impl;
+        self.io_impl = .fromThreaded(io_impl);
+        return self;
+    }
+
+    pub fn withIoInterface(
+        self: *HostedProvisionedTableReadSource,
+        io: std.Io,
+        async_limit: std.Io.Limit,
+    ) *HostedProvisionedTableReadSource {
+        self.io_impl = .{ .backend = io, .async_limit = async_limit };
         return self;
     }
 
@@ -5384,7 +5415,7 @@ test "distributed grouped unit expansion rejects a missing selected group" {
 test "distributed unit group hydration routes selected units and deduplicates sources" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        io_impl: ?*std.Io.Threaded = null,
+        io_impl: ?FanoutIo = null,
         unit_calls: usize = 0,
         source_calls: usize = 0,
 
@@ -5469,7 +5500,7 @@ test "distributed unit group hydration routes selected units and deduplicates so
 test "distributed unit hydration preserves exclusion-only projections" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        io_impl: ?*std.Io.Threaded = null,
+        io_impl: ?FanoutIo = null,
         calls: usize = 0,
 
         fn lookup(
@@ -5556,7 +5587,7 @@ test "distributed unit hydration preserves exclusion-only projections" {
 test "distributed unit group hydration rejects a cross-revision unit payload" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        io_impl: ?*std.Io.Threaded = null,
+        io_impl: ?FanoutIo = null,
 
         fn lookup(
             _: *anyopaque,
@@ -7137,7 +7168,7 @@ fn hydrateDistributedGroupedUnitHits(
         }
     };
 
-    const io_impl: ?*std.Io.Threaded = if (@hasField(Source, "io_impl")) source.io_impl else null;
+    const io_impl: ?FanoutIo = if (@hasField(Source, "io_impl")) source.io_impl else null;
     const plan = planFanout(.query, io_impl, task_count);
     var task_start: usize = 0;
     while (task_start < task_count) : (task_start += plan.width) {
@@ -23056,7 +23087,7 @@ test "algebraic partial request rejects legacy cardinality bodies" {
 test "identity-only distributed unit groups consume envelopes without routed reads" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        io_impl: ?*std.Io.Threaded = null,
+        io_impl: ?FanoutIo = null,
         calls: usize = 0,
 
         fn lookup(

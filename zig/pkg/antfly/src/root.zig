@@ -96,6 +96,9 @@ pub const tracing = @import("tracing/mod.zig");
 // Deterministic VOPR contracts, campaign policy, and replay artifacts.
 pub const vopr = @import("vopr");
 pub const domain_vopr = @import("vopr/domain_vopr.zig");
+pub const data_server_vopr = @import("vopr/data_server.zig");
+pub const admission_vopr = @import("vopr/admission.zig");
+pub const object_store_vopr = @import("vopr/object_store.zig");
 pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
 
 // Raft integration
@@ -341,6 +344,8 @@ test {
     _ = transactions;
     _ = transaction_vopr;
     _ = domain_vopr;
+    _ = data_server_vopr;
+    _ = object_store_vopr;
     _ = request_lifecycle_vopr;
     _ = schema;
     _ = object_storage;

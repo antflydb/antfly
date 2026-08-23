@@ -2115,12 +2115,12 @@ pub fn build(b: *std.Build) void {
         antfly_imports.configure(b, test_mod.*, true, true);
     }
 
-    const raft_sim_test_mod = b.createModule(.{
+    const raft_harness_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_sim_test_mod, true, true);
+    antfly_imports.configure(b, raft_harness_test_mod, true, true);
 
     const introducer_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
@@ -4054,7 +4054,7 @@ pub fn build(b: *std.Build) void {
     );
     http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
 
-    const lib_raft_sim_default_filters = [_][]const u8{
+    const lib_raft_harness_default_filters = [_][]const u8{
         "virtual http network exposes selected message transitions",
         "managed host simulation drives add and peer refresh through deterministic steps",
         "managed host simulation restores through both raft state backends",
@@ -4067,13 +4067,15 @@ pub fn build(b: *std.Build) void {
         "cluster simulation drives split transition actions deterministically",
         "cluster simulation drives merge transition actions deterministically",
     };
-    const lib_raft_sim_tests = b.addTest(.{
-        .root_module = raft_sim_test_mod,
-        .filters = &lib_raft_sim_default_filters,
+    const lib_raft_harness_tests = b.addTest(.{
+        .root_module = raft_harness_test_mod,
+        .filters = &lib_raft_harness_default_filters,
     });
-    const run_lib_raft_sim_tests = addFilteredTestRunArtifact(b, lib_raft_sim_tests);
-    const lib_raft_sim_test_step = b.step("lib-raft-sim-test", "Run raft simulation harness tests");
-    lib_raft_sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
+    const run_lib_raft_harness_tests = addFilteredTestRunArtifact(b, lib_raft_harness_tests);
+    const lib_raft_harness_test_step = b.step("lib-raft-harness-test", "Run the legacy Raft deterministic harness tests");
+    lib_raft_harness_test_step.dependOn(&run_lib_raft_harness_tests.step);
+    const lib_raft_sim_test_compat_step = b.step("lib-raft-sim-test", "Compatibility alias for lib-raft-harness-test");
+    lib_raft_sim_test_compat_step.dependOn(lib_raft_harness_test_step);
 
     const lib_raft_chaos_default_filters = [_][]const u8{
         "managed host simulation restores through both raft state backends",
@@ -4107,7 +4109,7 @@ pub fn build(b: *std.Build) void {
         "cluster simulation ignores active merge removal and rolls back explicitly across restart",
     };
     const lib_raft_chaos_tests = b.addTest(.{
-        .root_module = raft_sim_test_mod,
+        .root_module = raft_harness_test_mod,
         .filters = &lib_raft_chaos_default_filters,
     });
     const run_lib_raft_chaos_tests = addFilteredTestRunArtifact(b, lib_raft_chaos_tests);
@@ -4122,13 +4124,15 @@ pub fn build(b: *std.Build) void {
     const lib_raft_vopr_test_step = b.step("raft-vopr-test", "Run replayable per-group Raft VOPR campaigns");
     lib_raft_vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
 
-    const lib_lsm_backend_sim_tests = b.addTest(.{
+    const lib_lsm_backend_workload_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"lsm backend simulation"},
     });
-    const run_lib_lsm_backend_sim_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_sim_tests);
-    const lib_lsm_backend_sim_test_step = b.step("lib-lsm-backend-sim-test", "Run LSM backend storage workload simulation tests");
-    lib_lsm_backend_sim_test_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    const run_lib_lsm_backend_workload_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_workload_tests);
+    const lib_lsm_backend_workload_test_step = b.step("lib-lsm-backend-workload-test", "Run legacy LSM backend storage workload tests");
+    lib_lsm_backend_workload_test_step.dependOn(&run_lib_lsm_backend_workload_tests.step);
+    const lib_lsm_backend_sim_test_compat_step = b.step("lib-lsm-backend-sim-test", "Compatibility alias for lib-lsm-backend-workload-test");
+    lib_lsm_backend_sim_test_compat_step.dependOn(lib_lsm_backend_workload_test_step);
 
     const lib_lsm_backend_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4190,7 +4194,7 @@ pub fn build(b: *std.Build) void {
     lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const test_step = b.step("test", "Run default package test aggregates");
-    const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
+    const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
 
@@ -4863,20 +4867,22 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
     lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
 
-    const lib_metadata_sim_default_filters = [_][]const u8{"metadata http cluster simulation"};
-    const lib_metadata_sim_tests = b.addTest(.{
+    const lib_metadata_http_integration_default_filters = [_][]const u8{"metadata http cluster simulation"};
+    const lib_metadata_http_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_http_integration_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_tests);
-    const lib_metadata_sim_test_step = b.step("lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only");
-    lib_metadata_sim_test_step.dependOn(&run_lib_metadata_sim_tests.step);
+    const run_lib_metadata_http_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_http_integration_tests);
+    const lib_metadata_http_integration_test_step = b.step("lib-metadata-http-integration-test", "Run metadata real-HTTP integration tests only");
+    lib_metadata_http_integration_test_step.dependOn(&run_lib_metadata_http_integration_tests.step);
+    const lib_metadata_sim_test_compat_step = b.step("lib-metadata-sim-test", "Compatibility alias for lib-metadata-http-integration-test");
+    lib_metadata_sim_test_compat_step.dependOn(lib_metadata_http_integration_test_step);
 
-    const lib_metadata_sim_core_default_filters = [_][]const u8{
+    const lib_metadata_virtual_transport_default_filters = [_][]const u8{
         "metadata http cluster simulation drives table placement convergence",
         "metadata http cluster simulation converges placement after candidate churn",
         "metadata http cluster simulation drives split intent through the control loop",
@@ -4890,35 +4896,39 @@ pub fn build(b: *std.Build) void {
         "metadata http cluster simulation provisions split destination replicas across nodes",
         "metadata http cluster simulation retires merge donor replicas across nodes",
     };
-    const lib_metadata_sim_core_tests = b.addTest(.{
+    const lib_metadata_virtual_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_core_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_virtual_transport_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_core_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_core_tests);
-    const lib_metadata_sim_core_test_step = b.step("lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos");
-    lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
+    const run_lib_metadata_virtual_transport_tests = addFilteredTestRunArtifact(b, lib_metadata_virtual_transport_tests);
+    const lib_metadata_virtual_transport_test_step = b.step("lib-metadata-virtual-transport-test", "Run deterministic metadata virtual-transport tests without public API or chaos");
+    lib_metadata_virtual_transport_test_step.dependOn(&run_lib_metadata_virtual_transport_tests.step);
+    const lib_metadata_sim_core_test_compat_step = b.step("lib-metadata-sim-core-test", "Compatibility alias for lib-metadata-virtual-transport-test");
+    lib_metadata_sim_core_test_compat_step.dependOn(lib_metadata_virtual_transport_test_step);
 
-    const lib_metadata_sim_smoke_default_filters = [_][]const u8{
+    const lib_metadata_virtual_smoke_default_filters = [_][]const u8{
         "metadata sim split runtime preserves source identity namespace",
         "metadata sim merge runtime records doc identity reassignment opt-in",
         "metadata http cluster simulation drives table placement convergence",
         "metadata http cluster simulation drives split intent through the control loop",
     };
-    const lib_metadata_sim_smoke_tests = b.addTest(.{
+    const lib_metadata_virtual_smoke_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_smoke_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_virtual_smoke_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_smoke_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_smoke_tests);
-    const lib_metadata_sim_smoke_test_step = b.step("lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests");
-    lib_metadata_sim_smoke_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
+    const run_lib_metadata_virtual_smoke_tests = addFilteredTestRunArtifact(b, lib_metadata_virtual_smoke_tests);
+    const lib_metadata_virtual_smoke_test_step = b.step("lib-metadata-virtual-smoke-test", "Run fast metadata virtual-transport smoke tests");
+    lib_metadata_virtual_smoke_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
+    const lib_metadata_sim_smoke_test_compat_step = b.step("lib-metadata-sim-smoke-test", "Compatibility alias for lib-metadata-virtual-smoke-test");
+    lib_metadata_sim_smoke_test_compat_step.dependOn(lib_metadata_virtual_smoke_test_step);
 
     const lib_metadata_vopr_default_filters = [_][]const u8{
         "metadata VOPR seeded smoke campaign",
@@ -5037,7 +5047,7 @@ pub fn build(b: *std.Build) void {
     metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_chaos_progress_tail);
     lib_metadata_chaos_test_step.dependOn(metadata_chaos_progress_tail.?);
 
-    const lib_metadata_sim_public_tests = b.addTest(.{
+    const lib_metadata_public_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
@@ -5053,9 +5063,11 @@ pub fn build(b: *std.Build) void {
         // 12 GiB. Reserve its observed class without serializing the suite.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
-    const run_lib_metadata_sim_public_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_public_tests);
-    const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
-    lib_metadata_sim_public_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
+    const run_lib_metadata_public_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_public_integration_tests);
+    const lib_metadata_public_integration_test_step = b.step("lib-metadata-public-integration-test", "Run metadata public lifecycle/split/merge integration tests");
+    lib_metadata_public_integration_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
+    const lib_metadata_sim_public_test_compat_step = b.step("lib-metadata-sim-public-test", "Compatibility alias for lib-metadata-public-integration-test");
+    lib_metadata_sim_public_test_compat_step.dependOn(lib_metadata_public_integration_test_step);
 
     const public_api_parity_default_filters = [_][]const u8{
         "public openapi contract module is generated and wired",
@@ -6325,8 +6337,8 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
@@ -6365,7 +6377,7 @@ pub fn build(b: *std.Build) void {
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
 
-    const lib_metadata_sim_forward_tests = b.addTest(.{
+    const lib_metadata_forwarding_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"forwards public table io"},
         .test_runner = .{
@@ -6373,9 +6385,11 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_sim_forward_tests = addFilteredTestRunArtifact(b, lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run public table IO forwarding simulation tests only");
-    lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
+    const run_lib_metadata_forwarding_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_forwarding_integration_tests);
+    const lib_metadata_forwarding_integration_test_step = b.step("lib-metadata-forwarding-integration-test", "Run public table I/O forwarding integration tests only");
+    lib_metadata_forwarding_integration_test_step.dependOn(&run_lib_metadata_forwarding_integration_tests.step);
+    const lib_metadata_sim_forward_test_compat_step = b.step("lib-metadata-sim-forward-test", "Compatibility alias for lib-metadata-forwarding-integration-test");
+    lib_metadata_sim_forward_test_compat_step.dependOn(lib_metadata_forwarding_integration_test_step);
 
     const lib_metadata_service_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6698,8 +6712,8 @@ pub fn build(b: *std.Build) void {
     });
     const vopr_contract_tests = b.addTest(.{ .root_module = vopr_contract_test_mod });
     const run_vopr_contract_tests = b.addRunArtifact(vopr_contract_tests);
-    const vopr_test_step = b.step("vopr-test", "Run standalone VOPR engine and replay tests");
-    vopr_test_step.dependOn(&run_vopr_contract_tests.step);
+    const vopr_engine_test_step = b.step("vopr-engine-test", "Run the standalone VOPR engine and replay tests");
+    vopr_engine_test_step.dependOn(&run_vopr_contract_tests.step);
     const vopr_contract_test_step = b.step("vopr-contract-test", "Run deterministic VOPR contract and replay-equivalence tests");
     vopr_contract_test_step.dependOn(&run_vopr_contract_tests.step);
     const sim_contract_test_compat_step = b.step("sim-contract-test", "Compatibility alias for vopr-contract-test");
@@ -6795,6 +6809,41 @@ pub fn build(b: *std.Build) void {
     request_lifecycle_vopr_test_step.dependOn(&run_api_http_runtime_tests.step);
     data_plane_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
 
+    const data_server_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"production DataServer public HTTP"},
+    });
+    const run_data_server_vopr_tests = b.addRunArtifact(data_server_vopr_tests);
+    const data_server_vopr_test_step = b.step(
+        "data-server-vopr-test",
+        "Run the production DataServer public HTTP transport on VoprIo",
+    );
+    data_server_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    data_server_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+
+    const serverless_object_store_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"serverless object store VOPR"},
+    });
+    const run_serverless_object_store_vopr_tests = b.addRunArtifact(serverless_object_store_vopr_tests);
+    const serverless_object_store_vopr_test_step = b.step(
+        "serverless-object-store-vopr-test",
+        "Run real serverless object-store protocols with deterministic faults",
+    );
+    serverless_object_store_vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
+
+    const admission_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"resource admission VOPR"},
+    });
+    const run_admission_vopr_tests = b.addRunArtifact(admission_vopr_tests);
+    const admission_vopr_test_step = b.step(
+        "admission-vopr-test",
+        "Run production resource admission under deterministic VOPR contention",
+    );
+    admission_vopr_test_step.dependOn(&run_admission_vopr_tests.step);
+
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"derived workflow VOPR records and exact replays"},
@@ -6839,7 +6888,10 @@ pub fn build(b: *std.Build) void {
 
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"VOPR durable job"},
+        .filters = &.{
+            "VOPR durable job",
+            "backend runtime durable owner lifecycle",
+        },
     });
     const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
@@ -6910,28 +6962,41 @@ pub fn build(b: *std.Build) void {
     const sim_explain_compat_step = b.step("sim-explain", "Compatibility alias for vopr-explain");
     sim_explain_compat_step.dependOn(&explain_vopr_cli.step);
 
-    const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
-    sim_test_step.dependOn(&run_vopr_contract_tests.step);
-    sim_test_step.dependOn(&run_transaction_vopr_tests.step);
-    sim_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
-    sim_test_step.dependOn(&run_data_plane_vopr_tests.step);
-    sim_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
-    sim_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
-    sim_test_step.dependOn(&run_backup_restore_vopr_tests.step);
-    sim_test_step.dependOn(&run_clock_fault_vopr_tests.step);
-    sim_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
-    sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-    sim_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
-    sim_test_step.dependOn(&run_lib_raft_vopr_tests.step);
-    sim_test_step.dependOn(&run_lib_ha_vopr_tests.step);
-    sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
-    sim_test_step.dependOn(&run_vopr_cli_meta_tests.step);
-    sim_test_step.dependOn(&run_vopr_cli_registry_tests.step);
+    const debug_vopr_cli = b.addRunArtifact(vopr_cli);
+    debug_vopr_cli.addArg("debug");
+    if (b.args) |args| debug_vopr_cli.addArgs(args);
+    const vopr_debug_step = b.step("vopr-debug", "Inspect a replay-validated VOPR artifact at a choice prefix");
+    vopr_debug_step.dependOn(&debug_vopr_cli.step);
+    const sim_debug_compat_step = b.step("sim-debug", "Compatibility alias for vopr-debug");
+    sim_debug_compat_step.dependOn(&debug_vopr_cli.step);
+
+    const vopr_test_step = b.step("vopr-test", "Run the fast deterministic Antfly VOPR suites");
+    vopr_test_step.dependOn(&run_vopr_contract_tests.step);
+    vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
+    vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
+    vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
+    vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
+    vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
+    vopr_test_step.dependOn(&run_admission_vopr_tests.step);
+    vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
+    vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
+    vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
+    vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
+    vopr_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
+    vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
+    vopr_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
+    vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
+    vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
+    vopr_test_step.dependOn(&run_lib_raft_harness_tests.step);
+    vopr_test_step.dependOn(&run_vopr_cli_meta_tests.step);
+    vopr_test_step.dependOn(&run_vopr_cli_registry_tests.step);
+    const sim_test_compat_step = b.step("sim-test", "Compatibility alias for vopr-test");
+    sim_test_compat_step.dependOn(vopr_test_step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
-    integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-    integration_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
+    integration_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
+    integration_test_step.dependOn(&run_lib_metadata_forwarding_integration_tests.step);
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
@@ -7319,18 +7384,20 @@ pub fn build(b: *std.Build) void {
     const lmdb_vopr_test_step = b.step("lmdb-vopr-test", "Run replayable C-versus-Zig LMDB VOPR campaigns");
     lmdb_vopr_test_step.dependOn(&run_lmdb_vopr_tests.step);
 
-    const storage_sim_runtime_test_mod = b.createModule(.{
+    const storage_vopr_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_sim_runtime_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    storage_sim_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    const storage_sim_runtime_tests = b.addTest(.{
-        .root_module = storage_sim_runtime_test_mod,
+    storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    const storage_vopr_runtime_tests = b.addTest(.{
+        .root_module = storage_vopr_runtime_test_mod,
     });
-    const run_storage_sim_runtime_tests = b.addRunArtifact(storage_sim_runtime_tests);
-    const storage_sim_runtime_test_step = b.step("storage-sim-runtime-test", "Run storage simulation runtime and modeled device tests");
-    storage_sim_runtime_test_step.dependOn(&run_storage_sim_runtime_tests.step);
+    const run_storage_vopr_runtime_tests = b.addRunArtifact(storage_vopr_runtime_tests);
+    const storage_vopr_runtime_test_step = b.step("storage-vopr-runtime-test", "Run storage VOPR runtime and modeled-device tests");
+    storage_vopr_runtime_test_step.dependOn(&run_storage_vopr_runtime_tests.step);
+    const storage_sim_runtime_test_compat_step = b.step("storage-sim-runtime-test", "Compatibility alias for storage-vopr-runtime-test");
+    storage_sim_runtime_test_compat_step.dependOn(storage_vopr_runtime_test_step);
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
@@ -7340,8 +7407,10 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"LMDB sim soak stays green"},
     });
     const run_storage_lmdb_soak_tests = addFilteredTestRunArtifact(b, storage_lmdb_soak_tests);
-    const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
+    const storage_lmdb_soak_step = b.step("lmdb-workload-soak", "Run only the legacy LMDB randomized workload soak");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
+    const lmdb_sim_soak_compat_step = b.step("lmdb-sim-soak", "Compatibility alias for lmdb-workload-soak");
+    lmdb_sim_soak_compat_step.dependOn(storage_lmdb_soak_step);
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
@@ -7379,13 +7448,15 @@ pub fn build(b: *std.Build) void {
     const wal_test_step = b.step("wal-test", "Run storage/wal unit tests");
     wal_test_step.dependOn(&run_wal_unit_tests.step);
 
-    const wal_sim_tests = b.addTest(.{
+    const wal_workload_tests = b.addTest(.{
         .root_module = wal_test_mod,
         .filters = &.{"wal sim"},
     });
-    const run_wal_sim_tests = addFilteredTestRunArtifact(b, wal_sim_tests);
-    const wal_sim_test_step = b.step("wal-sim-test", "Run only the WAL simulation workload tests");
-    wal_sim_test_step.dependOn(&run_wal_sim_tests.step);
+    const run_wal_workload_tests = addFilteredTestRunArtifact(b, wal_workload_tests);
+    const wal_workload_test_step = b.step("wal-workload-test", "Run only the legacy WAL randomized workload tests");
+    wal_workload_test_step.dependOn(&run_wal_workload_tests.step);
+    const wal_sim_test_compat_step = b.step("wal-sim-test", "Compatibility alias for wal-workload-test");
+    wal_sim_test_compat_step.dependOn(wal_workload_test_step);
 
     const wal_vopr_tests = b.addTest(.{
         .root_module = wal_test_mod,
@@ -7428,13 +7499,17 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"wal sim soak stays green"},
     });
     const run_wal_soak_tests = addFilteredTestRunArtifact(b, wal_soak_tests);
-    const wal_soak_step = b.step("wal-sim-soak", "Run only the WAL simulation soak test");
+    const wal_soak_step = b.step("wal-workload-soak", "Run only the legacy WAL randomized workload soak");
     wal_soak_step.dependOn(&run_wal_soak_tests.step);
+    const wal_sim_soak_compat_step = b.step("wal-sim-soak", "Compatibility alias for wal-workload-soak");
+    wal_sim_soak_compat_step.dependOn(wal_soak_step);
 
-    const storage_sim_soak_step = b.step("storage-sim-soak", "Run the LMDB and WAL simulation soak tests");
-    storage_sim_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
-    storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
-    soak_test_step.dependOn(storage_sim_soak_step);
+    const storage_workload_soak_step = b.step("storage-workload-soak", "Run the legacy LMDB and WAL randomized workload soaks");
+    storage_workload_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
+    storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
+    const storage_sim_soak_compat_step = b.step("storage-sim-soak", "Compatibility alias for storage-workload-soak");
+    storage_sim_soak_compat_step.dependOn(storage_workload_soak_step);
+    soak_test_step.dependOn(storage_workload_soak_step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
@@ -7469,13 +7544,15 @@ pub fn build(b: *std.Build) void {
     const persistent_delete_regression_step = b.step("persistent-delete-regression-test", "Run atomic multi-segment deletion regressions");
     persistent_delete_regression_step.dependOn(&run_persistent_delete_regression_tests.step);
 
-    const persistent_sim_tests = b.addTest(.{
+    const persistent_workload_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .filters = &.{"persistent sim workloads stay green"},
     });
-    const run_persistent_sim_tests = addFilteredTestRunArtifact(b, persistent_sim_tests);
-    const persistent_sim_step = b.step("persistent-sim-test", "Run only the persistent simulation workload tests");
-    persistent_sim_step.dependOn(&run_persistent_sim_tests.step);
+    const run_persistent_workload_tests = addFilteredTestRunArtifact(b, persistent_workload_tests);
+    const persistent_workload_step = b.step("persistent-workload-test", "Run only the legacy persistent randomized workload tests");
+    persistent_workload_step.dependOn(&run_persistent_workload_tests.step);
+    const persistent_sim_test_compat_step = b.step("persistent-sim-test", "Compatibility alias for persistent-workload-test");
+    persistent_sim_test_compat_step.dependOn(persistent_workload_step);
 
     const persistent_replay_tests = b.addTest(.{
         .root_module = persistent_test_mod,
@@ -7512,10 +7589,12 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"persistent sim soak stays green"},
     });
     const run_persistent_soak_tests = addFilteredTestRunArtifact(b, persistent_soak_tests);
-    const persistent_soak_step = b.step("persistent-sim-soak", "Run only the persistent simulation soak test");
+    const persistent_soak_step = b.step("persistent-workload-soak", "Run only the legacy persistent randomized workload soak");
     persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
+    const persistent_sim_soak_compat_step = b.step("persistent-sim-soak", "Compatibility alias for persistent-workload-soak");
+    persistent_sim_soak_compat_step.dependOn(persistent_soak_step);
 
-    storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
+    storage_workload_soak_step.dependOn(&run_persistent_soak_tests.step);
 
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     addSnowballModule(b, index_manager_test_mod);
@@ -7551,13 +7630,15 @@ pub fn build(b: *std.Build) void {
     const index_manager_resource_step = b.step("index-manager-resource-test", "Run index manager resource-manager accounting tests");
     index_manager_resource_step.dependOn(&run_index_manager_resource_tests.step);
 
-    const index_manager_sim_tests = b.addTest(.{
+    const index_manager_workload_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
         .filters = &.{"index manager sim workloads stay green"},
     });
-    const run_index_manager_sim_tests = addFilteredTestRunArtifact(b, index_manager_sim_tests);
-    const index_manager_sim_step = b.step("index-manager-sim-test", "Run only the index manager simulation workload tests");
-    index_manager_sim_step.dependOn(&run_index_manager_sim_tests.step);
+    const run_index_manager_workload_tests = addFilteredTestRunArtifact(b, index_manager_workload_tests);
+    const index_manager_workload_step = b.step("index-manager-workload-test", "Run only the legacy index-manager randomized workload tests");
+    index_manager_workload_step.dependOn(&run_index_manager_workload_tests.step);
+    const index_manager_sim_test_compat_step = b.step("index-manager-sim-test", "Compatibility alias for index-manager-workload-test");
+    index_manager_sim_test_compat_step.dependOn(index_manager_workload_step);
 
     const index_manager_replay_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
@@ -7611,17 +7692,19 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("structlog", structlog_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
-    const db_split_sim_default_filters = [_][]const u8{
+    const db_split_workload_default_filters = [_][]const u8{
         "db split sim default workload stays green",
         "db split sim reopen-heavy workload stays green",
     };
-    const db_split_sim_tests = b.addTest(.{
+    const db_split_workload_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_split_sim_default_filters),
+        .filters = selectTestFilters(b, &db_split_workload_default_filters),
     });
-    const run_db_split_sim_tests = addFilteredTestRunArtifact(b, db_split_sim_tests);
-    const db_split_sim_step = b.step("db-split-sim-test", "Run only the DB split simulation workload tests");
-    db_split_sim_step.dependOn(&run_db_split_sim_tests.step);
+    const run_db_split_workload_tests = addFilteredTestRunArtifact(b, db_split_workload_tests);
+    const db_split_workload_step = b.step("db-split-workload-test", "Run only the legacy DB split randomized workload tests");
+    db_split_workload_step.dependOn(&run_db_split_workload_tests.step);
+    const db_split_sim_test_compat_step = b.step("db-split-sim-test", "Compatibility alias for db-split-workload-test");
+    db_split_sim_test_compat_step.dependOn(db_split_workload_step);
 
     const db_split_vopr_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -7635,21 +7718,22 @@ pub fn build(b: *std.Build) void {
     const db_split_vopr_step = b.step("db-split-vopr-test", "Run only the DB split modeled-storage replay fixture tests");
     db_split_vopr_step.dependOn(&run_db_split_vopr_tests.step);
 
-    const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
-    storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_persistent_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_index_manager_sim_tests.step);
+    const storage_workload_test_step = b.step("storage-workload-test", "Run legacy deterministic storage workloads that still use real storage I/O");
+    storage_workload_test_step.dependOn(&run_wal_workload_tests.step);
+    storage_workload_test_step.dependOn(&run_persistent_workload_tests.step);
+    storage_workload_test_step.dependOn(&run_index_manager_workload_tests.step);
+    const storage_sim_test_compat_step = b.step("storage-sim-test", "Compatibility alias for storage-workload-test");
+    storage_sim_test_compat_step.dependOn(storage_workload_test_step);
 
-    const storage_vopr_step = b.step("storage-vopr-test", "Run storage modeled-time/model-I/O VOPR smoke and simulation checks");
-    storage_vopr_step.dependOn(&run_storage_sim_runtime_tests.step);
-    storage_vopr_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    const storage_vopr_step = b.step("storage-vopr-test", "Run deterministic storage modeled-time/model-I/O VOPR checks");
+    storage_vopr_step.dependOn(&run_storage_vopr_runtime_tests.step);
     storage_vopr_step.dependOn(&run_lib_lsm_vopr_tests.step);
     storage_vopr_step.dependOn(&run_lmdb_vopr_tests.step);
     storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
     storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
     storage_vopr_step.dependOn(&run_db_split_vopr_tests.step);
-    sim_test_step.dependOn(storage_vopr_step);
+    vopr_test_step.dependOn(storage_vopr_step);
     chaos_test_step.dependOn(storage_vopr_step);
 
     const db_unit_tests = b.addTest(.{
@@ -10515,7 +10599,7 @@ pub fn build(b: *std.Build) void {
 
     dependOnAll(antfly_test_step, &.{
         unit_test_step,
-        sim_test_step,
+        vopr_test_step,
         integration_test_step,
         recall_ci_test_step,
         chaos_test_step,

@@ -103,7 +103,7 @@ zig build lib-storage-test
 zig build lib-metadata-test
 zig build lib-image-test
 zig build lib-audio-test
-zig build lib-raft-sim-test
+zig build raft-vopr-test
 zig build inference-test
 ```
 

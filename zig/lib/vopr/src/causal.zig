@@ -9,6 +9,7 @@
 const std = @import("std");
 const choice = @import("choice.zig");
 const ids = @import("id.zig");
+const multiverse = @import("multiverse.zig");
 const replay = @import("replay.zig");
 const runner = @import("runner.zig");
 const trace = @import("trace.zig");
@@ -58,11 +59,16 @@ pub const CounterfactualConfig = struct {
 };
 
 pub const Experiment = struct {
+    experiment_id: ids.StableId,
+    rank: usize = 0,
     choice_index: usize,
     original_id: ids.StableId,
     replacement_id: ids.StableId,
     trials: usize,
     same_failure_trials: usize,
+    same_failure_probability_ppm: u32,
+    failure_reduction_ppm: u32,
+    trial_seed_digest: u64,
     child_artifact_digest: u64,
 };
 
@@ -71,9 +77,11 @@ pub const CounterfactualReport = struct {
     failure_fingerprint: u64,
     config: CounterfactualConfig,
     experiments: []Experiment,
+    graph: multiverse.Graph,
 
     pub fn deinit(self: *CounterfactualReport) void {
         self.allocator.free(self.experiments);
+        self.graph.deinit();
         self.* = undefined;
     }
 
@@ -82,6 +90,11 @@ pub const CounterfactualReport = struct {
             .failure_fingerprint = self.failure_fingerprint,
             .config = self.config,
             .experiments = self.experiments,
+            .multiverse = .{
+                .format = multiverse.format,
+                .nodes = self.graph.nodes.items,
+                .edges = self.graph.edges.items,
+            },
         }, .{ .whitespace = .indent_2 });
     }
 };
@@ -103,15 +116,22 @@ pub fn analyzeCounterfactual(
     const choice_start = failure_choice_end -| config.prefix_window;
     var experiments: std.ArrayListUnmanaged(Experiment) = .empty;
     errdefer experiments.deinit(allocator);
+    var graph = multiverse.Graph.init(allocator);
+    errdefer graph.deinit();
+    const parent_digest = try graph.addHistory(artifact, null, null, null);
     for (artifact.choices.items[choice_start..failure_choice_end], choice_start..) |record, choice_index| {
         for (record.enabled_ids) |replacement_id| {
             if (replacement_id == record.selected_id) continue;
             var experiment: Experiment = .{
+                .experiment_id = ids.derive("counterfactual-experiment", failure.fingerprint, ids.derive("branch", @intCast(choice_index), replacement_id)),
                 .choice_index = choice_index,
                 .original_id = record.selected_id,
                 .replacement_id = replacement_id,
                 .trials = config.descendants_per_alternative,
                 .same_failure_trials = 0,
+                .same_failure_probability_ppm = 0,
+                .failure_reduction_ppm = 0,
+                .trial_seed_digest = 0,
                 .child_artifact_digest = 0,
             };
             for (0..config.descendants_per_alternative) |trial| {
@@ -120,6 +140,7 @@ pub fn analyzeCounterfactual(
                     config.suffix_seed ^ replacement_id,
                     @as(u64, @intCast(choice_index)) ^ @as(u64, @intCast(trial)),
                 );
+                experiment.trial_seed_digest = ids.derive("counterfactual-trial-seeds", experiment.trial_seed_digest, seed);
                 var source = choice.Mutating.init(artifact.choices.items, choice_index, replacement_id, seed);
                 var child = try runner.run(Scenario, allocator, source.source(), runnerConfigFromArtifact(artifact));
                 defer child.deinit();
@@ -138,15 +159,28 @@ pub fn analyzeCounterfactual(
                     experiment.child_artifact_digest,
                     ids.digest(encoded),
                 );
+                _ = try graph.addHistory(&child, parent_digest, choice_index, replacement_id);
             }
+            experiment.same_failure_probability_ppm = @intCast((experiment.same_failure_trials * 1_000_000) / experiment.trials);
+            experiment.failure_reduction_ppm = 1_000_000 - experiment.same_failure_probability_ppm;
             try experiments.append(allocator, experiment);
         }
     }
+    std.mem.sort(Experiment, experiments.items, {}, struct {
+        fn lessThan(_: void, lhs: Experiment, rhs: Experiment) bool {
+            if (lhs.failure_reduction_ppm != rhs.failure_reduction_ppm)
+                return lhs.failure_reduction_ppm > rhs.failure_reduction_ppm;
+            if (lhs.choice_index != rhs.choice_index) return lhs.choice_index > rhs.choice_index;
+            return lhs.replacement_id < rhs.replacement_id;
+        }
+    }.lessThan);
+    for (experiments.items, 0..) |*experiment, rank| experiment.rank = rank + 1;
     return .{
         .allocator = allocator,
         .failure_fingerprint = failure.fingerprint,
         .config = config,
         .experiments = try experiments.toOwnedSlice(allocator),
+        .graph = graph,
     };
 }
 

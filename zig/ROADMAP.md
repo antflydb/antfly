@@ -36,9 +36,9 @@ Use these build targets for the current test split:
 - `make unit-test`
   - focused fast/unit-style buckets, storage, auth, serverless, and other
     non-chaos lanes
-- `zig build sim-test`
-  - deterministic metadata simulation and public parity suites without
-    delayed/restart/partition chaos
+- `zig build vopr-test`
+  - deterministic VOPR engine, metadata, Raft, HA, storage, application-domain,
+    and production public-HTTP suites
 - `zig build chaos-test`
   - delayed transport, restart, partition, and long-running metadata chaos
     coverage

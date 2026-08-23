@@ -134,10 +134,17 @@ pub const DurableJobLane = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    fn lifecycleUnsupported(_: *anyopaque, _: u64) anyerror!void {
+        return error.BackgroundOwnerLifecycleUnsupported;
+    }
+
     pub const VTable = struct {
         submit: *const fn (ptr: *anyopaque, job: Job) anyerror!void,
         drain_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         close_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
+        pause_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
+        resume_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
+        reopen_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
         poll: *const fn (ptr: *anyopaque, max_jobs: usize) anyerror!usize,
         executes_inline: bool = false,
     };
@@ -154,6 +161,23 @@ pub const DurableJobLane = struct {
 
     pub fn closeOwner(self: DurableJobLane, owner_id: u64) void {
         self.vtable.close_owner(self.ptr, owner_id);
+    }
+
+    /// Pausing closes admission for new jobs without canceling work that has
+    /// already committed to the lane. Drain may be used after pause to reach a
+    /// stable quiescent owner state.
+    pub fn pauseOwner(self: DurableJobLane, owner_id: u64) !void {
+        try self.vtable.pause_owner(self.ptr, owner_id);
+    }
+
+    pub fn resumeOwner(self: DurableJobLane, owner_id: u64) !void {
+        try self.vtable.resume_owner(self.ptr, owner_id);
+    }
+
+    /// Re-registers the same logical owner only after close has drained and
+    /// retired its prior generation.
+    pub fn reopenOwner(self: DurableJobLane, owner_id: u64) !void {
+        try self.vtable.reopen_owner(self.ptr, owner_id);
     }
 
     pub fn poll(self: DurableJobLane, max_jobs: usize) !usize {
@@ -209,6 +233,7 @@ fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
 const OwnerRegistry = struct {
     const State = struct {
         closing: bool = false,
+        paused: bool = false,
         in_flight: usize = 0,
     };
 
@@ -240,8 +265,17 @@ const OwnerRegistry = struct {
         defer self.mutex.unlock();
         const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
         if (state.closing) return error.BackgroundOwnerClosing;
+        if (state.paused) return error.BackgroundOwnerPaused;
         if (state.in_flight == std.math.maxInt(usize)) return error.BackgroundOwnerCapacityExceeded;
         state.in_flight += 1;
+    }
+
+    fn setPaused(self: *OwnerRegistry, owner_id: u64, paused: bool) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
+        if (state.closing) return error.BackgroundOwnerClosing;
+        state.paused = paused;
     }
 
     fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
@@ -444,6 +478,10 @@ pub const BackendRuntime = struct {
         if (self.borrowed_io) |borrowed| return borrowed.general;
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
+    }
+
+    pub fn usesBorrowedIo(self: *const BackendRuntime) bool {
+        return self.borrowed_io != null;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -736,6 +774,21 @@ const InlineDurableJobLane = struct {
         owners.close(owner_id);
     }
 
+    fn pauseOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        try owners.setPaused(owner_id, true);
+    }
+
+    fn resumeOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        try owners.setPaused(owner_id, false);
+    }
+
+    fn reopenOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        try owners.register(owner_id);
+    }
+
     fn poll(_: *anyopaque, _: usize) !usize {
         return 0;
     }
@@ -745,6 +798,9 @@ const inline_vtable = DurableJobLane.VTable{
     .submit = InlineDurableJobLane.submit,
     .drain_owner = InlineDurableJobLane.drainOwner,
     .close_owner = InlineDurableJobLane.closeOwner,
+    .pause_owner = InlineDurableJobLane.pauseOwner,
+    .resume_owner = InlineDurableJobLane.resumeOwner,
+    .reopen_owner = InlineDurableJobLane.reopenOwner,
     .poll = InlineDurableJobLane.poll,
     .executes_inline = true,
 };
@@ -772,6 +828,18 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     fn drainOwner(_: *anyopaque, _: u64) void {}
 
     fn closeOwner(_: *anyopaque, _: u64) void {}
+
+    fn pauseOwner(_: *anyopaque, _: u64) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn resumeOwner(_: *anyopaque, _: u64) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn reopenOwner(_: *anyopaque, _: u64) !void {
+        return error.UnsupportedPlatform;
+    }
 
     fn poll(_: *anyopaque, _: usize) !usize {
         return 0;
@@ -863,6 +931,21 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         self.drainMatching(owner_id);
         self.owners.waitIdle(owner_id);
         self.owners.retireClosed(owner_id);
+    }
+
+    fn pauseOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        try self.owners.setPaused(owner_id, true);
+    }
+
+    fn resumeOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        try self.owners.setPaused(owner_id, false);
+    }
+
+    fn reopenOwner(ptr: *anyopaque, owner_id: u64) !void {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        try self.owners.register(owner_id);
     }
 
     fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
@@ -982,6 +1065,9 @@ const threaded_vtable = DurableJobLane.VTable{
     .submit = ThreadedDurableJobLane.submit,
     .drain_owner = ThreadedDurableJobLane.drainOwner,
     .close_owner = ThreadedDurableJobLane.closeOwner,
+    .pause_owner = ThreadedDurableJobLane.pauseOwner,
+    .resume_owner = ThreadedDurableJobLane.resumeOwner,
+    .reopen_owner = ThreadedDurableJobLane.reopenOwner,
     .poll = ThreadedDurableJobLane.poll,
 };
 
@@ -1150,6 +1236,73 @@ test "backend runtime allocates stable nonzero owner ids" {
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime durable owner lifecycle pauses drains closes and reopens after handle relocation" {
+    const Context = struct {
+        runs: usize = 0,
+        deinits: usize = 0,
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runs += 1;
+        }
+
+        fn deinitJob(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deinits += 1;
+        }
+    };
+
+    var original = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    // The runtime itself is heap-stable; moving its owning wrapper must not
+    // invalidate lifecycle callbacks or retain the temporary wrapper address.
+    var relocated = original;
+    original = undefined;
+    defer relocated.deinit();
+
+    const owner_id = try relocated.ptr().allocOwnerId();
+    const lane = relocated.ptr().durable_jobs;
+    var context = Context{};
+    try lane.pauseOwner(owner_id);
+    try std.testing.expectError(error.BackgroundOwnerPaused, lane.submit(.{
+        .owner_id = owner_id,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), context.deinits);
+
+    try lane.resumeOwner(owner_id);
+    try lane.submit(.{
+        .owner_id = owner_id,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    });
+    lane.drainOwner(owner_id);
+    lane.closeOwner(owner_id);
+    try std.testing.expectError(error.BackgroundOwnerClosed, lane.submit(.{
+        .owner_id = owner_id,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    }));
+
+    try lane.reopenOwner(owner_id);
+    try lane.submit(.{
+        .owner_id = owner_id,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.run,
+        .deinit = Context.deinitJob,
+    });
+    lane.closeOwner(owner_id);
+    try std.testing.expectEqual(@as(usize, 2), context.runs);
+    try std.testing.expectEqual(@as(usize, 2), context.deinits);
 }
 
 test "backend runtime API lane leases expose and release the interface" {

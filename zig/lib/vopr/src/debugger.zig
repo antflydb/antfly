@@ -96,6 +96,30 @@ pub fn exportCanonical(allocator: std.mem.Allocator, artifact: *const trace.Trac
     return artifact.renderAlloc(allocator);
 }
 
+/// Render a stable, non-interactive cursor snapshot suitable for a CLI, TUI,
+/// or editor integration. Branch execution remains scenario-specific, while
+/// navigation over an artifact is fully generic.
+pub fn inspectAlloc(
+    allocator: std.mem.Allocator,
+    artifact: *const trace.Trace,
+    choice_prefix: usize,
+) ![]u8 {
+    try artifact.validate();
+    var cursor: Cursor = .{ .artifact = artifact };
+    try cursor.seek(choice_prefix);
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .format = "vopr-debug-snapshot-v1",
+        .scenario = artifact.header.scenario,
+        .scenario_version = artifact.header.scenario_version,
+        .choice_prefix = cursor.choice_prefix,
+        .choice = cursor.choice(),
+        .enabled_alternatives = cursor.enabledAlternatives(),
+        .transition_prefix = cursor.transitionPrefix(),
+        .failures = artifact.failures.items,
+        .summary = artifact.summary,
+    }, .{ .whitespace = .indent_2 });
+}
+
 fn runnerConfigFromArtifact(artifact: *const trace.Trace) runner.Config {
     return .{
         .system = artifact.header.system,
@@ -172,4 +196,8 @@ test "debugger seeks branches exact replays and collects failure moments" {
     const encoded = try exportCanonical(std.testing.allocator, &child);
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "debug.good") != null);
+    const snapshot = try inspectAlloc(std.testing.allocator, &artifact, 0);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "vopr-debug-snapshot-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "debug.good") != null);
 }

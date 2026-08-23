@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Deterministic in-memory stream network for VoprIo.
+//! Deterministic in-memory stream and datagram network for VoprIo.
 //!
 //! Writes enqueue logical packets. Packet delivery, including eligible
 //! reordering/drop/duplication, is selected by the VOPR scheduler. Blocking
@@ -51,7 +51,12 @@ const ListenerAddress = union(enum) {
     unix: []u8,
 };
 
-const SocketKind = enum { listener, stream };
+const SocketKind = enum { listener, stream, datagram };
+
+const Datagram = struct {
+    from: std.Io.net.IpAddress,
+    bytes: []u8,
+};
 
 const SocketState = struct {
     handle: std.Io.net.Socket.Handle,
@@ -63,6 +68,7 @@ const SocketState = struct {
     pending_accept: std.ArrayListUnmanaged(std.Io.net.Socket.Handle) = .empty,
     peer: ?std.Io.net.Socket.Handle = null,
     receive: std.ArrayListUnmanaged(u8) = .empty,
+    datagrams: std.ArrayListUnmanaged(Datagram) = .empty,
     read_open: bool = true,
     write_open: bool = true,
     peer_write_open: bool = true,
@@ -89,6 +95,8 @@ const Packet = struct {
     bytes: []u8,
     drop: bool,
     duplicate: bool,
+    close_write: bool = false,
+    datagram: bool = false,
 };
 
 pub const Network = struct {
@@ -100,6 +108,7 @@ pub const Network = struct {
     next_ephemeral_port: u16 = 20_000,
     sockets: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, *SocketState) = .empty,
     socket_order: std.ArrayListUnmanaged(*SocketState) = .empty,
+    open_sockets: usize = 0,
     packets: std.ArrayListUnmanaged(Packet) = .empty,
     queued_bytes: usize = 0,
     faults: Faults = .{},
@@ -115,7 +124,7 @@ pub const Network = struct {
     }
 
     pub fn deinit(self: *Network) void {
-        for (self.packets.items) |packet| self.allocator.free(packet.bytes);
+        for (self.packets.items) |packet| if (packet.bytes.len != 0) self.allocator.free(packet.bytes);
         self.packets.deinit(self.allocator);
         self.sockets.deinit(self.allocator);
         for (self.socket_order.items) |socket_state| {
@@ -125,6 +134,8 @@ pub const Network = struct {
             };
             socket_state.pending_accept.deinit(self.allocator);
             socket_state.receive.deinit(self.allocator);
+            for (socket_state.datagrams.items) |datagram| self.allocator.free(datagram.bytes);
+            socket_state.datagrams.deinit(self.allocator);
             self.allocator.destroy(socket_state);
         }
         self.socket_order.deinit(self.allocator);
@@ -162,6 +173,18 @@ pub const Network = struct {
         const listener = self.findIpListener(address.*) orelse return error.ConnectionRefused;
         const client = self.connectToListener(listener, address.*) catch |err| return mapConnectResourceError(err);
         return .{ .handle = client.handle, .address = address.* };
+    }
+
+    pub fn bindIp(self: *Network, requested: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.BindOptions) std.Io.net.IpAddress.BindError!std.Io.net.Socket {
+        if (self.faults.network_down) return error.NetworkDown;
+        if (options.mode != .dgram) return error.SocketModeUnsupported;
+        if (options.protocol) |protocol| if (protocol != .udp) return error.ProtocolUnsupportedBySystem;
+        var address = requested.*;
+        if (address.getPort() == 0)
+            address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
+        if (self.findDatagram(address) != null) return error.AddressInUse;
+        const socket_state = self.createSocket(.datagram, address) catch |err| return mapBindResourceError(err);
+        return .{ .handle = socket_state.handle, .address = address };
     }
 
     pub fn connectUnix(self: *Network, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
@@ -271,6 +294,87 @@ pub const Network = struct {
         return bytes.len;
     }
 
+    pub fn send(self: *Network, handle: std.Io.net.Socket.Handle, messages: []std.Io.net.OutgoingMessage) struct { ?std.Io.net.Socket.SendError, usize } {
+        const source = self.getSocket(handle) orelse return .{ error.SocketUnconnected, 0 };
+        if (source.kind != .datagram or source.closed) return .{ error.SocketUnconnected, 0 };
+        if (self.faults.network_down) return .{ error.NetworkDown, 0 };
+        for (messages, 0..) |*message, index| {
+            const destination = self.findDatagram(message.address.*) orelse return .{ error.ConnectionRefused, index };
+            if (message.data_len > self.config.stream_capacity -| self.queued_bytes)
+                return .{ error.SystemResources, index };
+            const bytes = self.allocator.dupe(u8, message.data_ptr[0..message.data_len]) catch
+                return .{ error.SystemResources, index };
+            const sequence = self.allocateSequence();
+            self.packets.append(self.allocator, .{
+                .id = ids.derive("sim-io.datagram", source.id, sequence),
+                .sequence = sequence,
+                .source = source.handle,
+                .destination = destination.handle,
+                .bytes = bytes,
+                .drop = takeBool(&self.faults.drop_next),
+                .duplicate = takeBool(&self.faults.duplicate_next),
+                .datagram = true,
+            }) catch {
+                self.allocator.free(bytes);
+                return .{ error.SystemResources, index };
+            };
+            self.queued_bytes += bytes.len;
+        }
+        return .{ null, messages.len };
+    }
+
+    pub fn receiveDatagrams(
+        self: *Network,
+        handle: std.Io.net.Socket.Handle,
+        message_buffer: []std.Io.net.IncomingMessage,
+        data_buffer: []u8,
+        flags: std.Io.net.ReceiveFlags,
+    ) std.Io.Cancelable!std.Io.Operation.NetReceive.Result {
+        const socket_state = self.getSocket(handle) orelse return .{ error.SocketUnconnected, 0 };
+        if (socket_state.kind != .datagram or socket_state.closed) return .{ error.SocketUnconnected, 0 };
+        while (socket_state.datagrams.items.len == 0) {
+            self.wait_port.?.wait(socket_state.readResource()) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return .{ error.SystemResources, 0 },
+            };
+            if (socket_state.closed) return .{ error.SocketUnconnected, 0 };
+            if (self.faults.network_down) return .{ error.NetworkDown, 0 };
+        }
+        var data_offset: usize = 0;
+        var count: usize = 0;
+        while (count < message_buffer.len and count < socket_state.datagrams.items.len) : (count += 1) {
+            const datagram = socket_state.datagrams.items[count];
+            const available = data_buffer.len - data_offset;
+            const copied = @min(available, datagram.bytes.len);
+            @memcpy(data_buffer[data_offset..][0..copied], datagram.bytes[0..copied]);
+            const control = message_buffer[count].control;
+            message_buffer[count] = .{
+                .from = datagram.from,
+                .data = data_buffer[data_offset..][0..copied],
+                .control = control,
+                .flags = .{
+                    .eor = true,
+                    .trunc = copied != datagram.bytes.len,
+                    .ctrunc = false,
+                    .oob = false,
+                    .errqueue = false,
+                },
+            };
+            data_offset += copied;
+            if (copied != datagram.bytes.len or data_offset == data_buffer.len) {
+                count += 1;
+                break;
+            }
+        }
+        if (!flags.peek) {
+            for (0..count) |_| {
+                const removed = socket_state.datagrams.orderedRemove(0);
+                self.allocator.free(removed.bytes);
+            }
+        }
+        return .{ null, count };
+    }
+
     pub fn shutdown(self: *Network, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
         const socket_state = self.getSocket(handle) orelse return error.SocketUnconnected;
         switch (how) {
@@ -295,6 +399,8 @@ pub const Network = struct {
                 continue;
             }
             socket_state.closed = true;
+            std.debug.assert(self.open_sockets > 0);
+            self.open_sockets -= 1;
             socket_state.read_open = false;
             self.closeWrite(socket_state) catch {};
             self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32)) catch {};
@@ -310,7 +416,7 @@ pub const Network = struct {
             if (!self.faults.reorder and self.hasEarlierPacketForLink(index, packet)) continue;
             try list.append(allocator, .{
                 .id = packet.id,
-                .name = if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver",
+                .name = packetName(packet),
                 .kind = .scheduler,
                 .actor_id = self.getSocket(packet.source).?.id,
                 .resource_id = self.getSocket(packet.destination).?.id,
@@ -324,23 +430,39 @@ pub const Network = struct {
             if (packet.id != transition_id) continue;
             const packet_len = packet.bytes.len;
             const destination = self.getSocket(packet.destination);
-            if (!packet.drop and destination != null and !destination.?.closed and destination.?.read_open) {
-                try destination.?.receive.appendSlice(self.allocator, packet.bytes);
-                if (packet.duplicate) try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+            const source = self.getSocket(packet.source);
+            if (packet.close_write) {
+                if (destination != null and !destination.?.closed) {
+                    destination.?.peer_write_open = false;
+                    try self.wait_port.?.wake(destination.?.readResource(), 1);
+                }
+            } else if (!packet.drop and destination != null and !destination.?.closed and destination.?.read_open) {
+                if (packet.datagram) {
+                    const source_address = if (source) |source_state| source_state.address else std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+                    const initial_count = destination.?.datagrams.items.len;
+                    errdefer while (destination.?.datagrams.items.len > initial_count) {
+                        const removed = destination.?.datagrams.pop().?;
+                        self.allocator.free(removed.bytes);
+                    };
+                    try self.appendDatagram(destination.?, source_address, packet.bytes);
+                    if (packet.duplicate) try self.appendDatagram(destination.?, source_address, packet.bytes);
+                } else {
+                    try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+                    if (packet.duplicate) try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+                }
                 try self.wait_port.?.wake(destination.?.readResource(), 1);
             }
-            const source = self.getSocket(packet.source);
             if (source) |source_state| try self.wait_port.?.wake(source_state.writeResource(), 1);
             self.queued_bytes -= packet_len;
-            self.allocator.free(packet.bytes);
+            if (packet.bytes.len != 0) self.allocator.free(packet.bytes);
             _ = self.packets.orderedRemove(index);
             try sink.emit(allocator, .{
                 .id = ids.derive("sim-io.packet-event", packet.id, @intFromBool(packet.drop)),
-                .kind = if (packet.drop) .injected_error else .domain,
+                .kind = if (packet.drop and !packet.close_write) .injected_error else .domain,
                 .actor_id = if (source) |s| s.id else 0,
                 .resource_id = if (destination) |d| d.id else 0,
                 .payload_digest = @intCast(packet_len),
-                .name = if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver",
+                .name = packetName(packet),
             });
             return true;
         }
@@ -370,7 +492,7 @@ pub const Network = struct {
     }
 
     fn createSocket(self: *Network, kind: SocketKind, address: std.Io.net.IpAddress) !*SocketState {
-        if (self.sockets.count() >= self.config.max_sockets) return error.ProcessFdQuotaExceeded;
+        if (self.open_sockets >= self.config.max_sockets) return error.ProcessFdQuotaExceeded;
         if (self.next_handle == std.math.maxInt(std.Io.net.Socket.Handle)) return error.ProcessFdQuotaExceeded;
         const socket_state = try self.allocator.create(SocketState);
         errdefer self.allocator.destroy(socket_state);
@@ -386,6 +508,7 @@ pub const Network = struct {
         try self.socket_order.append(self.allocator, socket_state);
         errdefer _ = self.socket_order.pop();
         try self.sockets.put(self.allocator, handle, socket_state);
+        self.open_sockets += 1;
         return socket_state;
     }
 
@@ -393,8 +516,13 @@ pub const Network = struct {
         std.debug.assert(self.socket_order.getLast() == socket_state);
         _ = self.socket_order.pop();
         _ = self.sockets.remove(socket_state.handle);
+        std.debug.assert(!socket_state.closed);
+        std.debug.assert(self.open_sockets > 0);
+        self.open_sockets -= 1;
         socket_state.pending_accept.deinit(self.allocator);
         socket_state.receive.deinit(self.allocator);
+        for (socket_state.datagrams.items) |datagram| self.allocator.free(datagram.bytes);
+        socket_state.datagrams.deinit(self.allocator);
         self.allocator.destroy(socket_state);
     }
 
@@ -402,8 +530,18 @@ pub const Network = struct {
         if (!socket_state.write_open) return;
         socket_state.write_open = false;
         if (socket_state.peer) |peer_handle| if (self.getSocket(peer_handle)) |peer| {
-            peer.peer_write_open = false;
-            try self.wait_port.?.wake(peer.readResource(), 1);
+            if (peer.closed) return;
+            const sequence = self.allocateSequence();
+            try self.packets.append(self.allocator, .{
+                .id = ids.derive("sim-io.stream-fin", socket_state.id, sequence),
+                .sequence = sequence,
+                .source = socket_state.handle,
+                .destination = peer.handle,
+                .bytes = &.{},
+                .drop = false,
+                .duplicate = false,
+                .close_write = true,
+            });
         };
     }
 
@@ -415,6 +553,20 @@ pub const Network = struct {
                 .ip => |candidate| if (ipAddressMatches(candidate, address)) return socket_state,
                 .unix => {},
             }
+        }
+        return null;
+    }
+
+    fn appendDatagram(self: *Network, destination: *SocketState, from: std.Io.net.IpAddress, bytes: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        try destination.datagrams.append(self.allocator, .{ .from = from, .bytes = owned });
+    }
+
+    fn findDatagram(self: *const Network, address: std.Io.net.IpAddress) ?*SocketState {
+        for (self.socket_order.items) |socket_state| {
+            if (socket_state.closed or socket_state.kind != .datagram) continue;
+            if (ipAddressMatches(socket_state.address, address)) return socket_state;
         }
         return null;
     }
@@ -482,6 +634,12 @@ fn takeBool(value: *bool) bool {
     return result;
 }
 
+fn packetName(packet: Packet) []const u8 {
+    if (packet.close_write) return "sim-io.stream_fin";
+    if (packet.datagram) return if (packet.drop) "sim-io.datagram_drop" else "sim-io.datagram_deliver";
+    return if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver";
+}
+
 fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddress) bool {
     if (listener.getPort() != requested.getPort()) return false;
     return switch (listener) {
@@ -497,6 +655,13 @@ fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddr
 }
 
 fn mapListenResourceError(err: anyerror) std.Io.net.IpAddress.ListenError {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapBindResourceError(err: anyerror) std.Io.net.IpAddress.BindError {
     return switch (err) {
         error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
         else => error.SystemResources,

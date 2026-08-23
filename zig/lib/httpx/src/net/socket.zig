@@ -4,7 +4,8 @@
 //!
 //! - TCP client and server socket operations via std.Io.net
 //! - UDP datagram sockets
-//! - Configurable socket options (via posix.setsockopt)
+//! - Backend-neutral logical read and write timeouts
+//! - Optional native socket tuning
 //! - Io.Reader/Io.Writer adapters for TLS integration
 
 const std = @import("std");
@@ -140,6 +141,9 @@ fn readAtLeastOne(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
 pub const Socket = struct {
     handle: net.Socket.Handle,
     io: Io,
+    recv_timeout_ms: ?u64 = null,
+    send_timeout_ms: ?u64 = null,
+    native_timeouts: bool = false,
     request_deadline_ms: ?i64 = null,
     request_cancel_cb: ?*const fn (context: ?*anyopaque) bool = null,
     request_cancel_ctx: ?*anyopaque = null,
@@ -223,17 +227,26 @@ pub const Socket = struct {
         self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
     }
 
+    /// Half-closes the write side while keeping the read side available for a
+    /// response. The operation stays on the supplied std.Io backend so virtual
+    /// transports can preserve stream ordering between queued bytes and FIN.
+    pub fn shutdownWrite(self: *Self) !void {
+        try self.io.vtable.netShutdown(self.io.userdata, self.handle, .send);
+    }
+
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
         while (true) {
             try self.checkRequestCancellation();
-            try self.applyRequestDeadline(.send);
-            const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch |err| {
+            const timeout_ms = try self.operationTimeout(.send);
+            const sent = self.netWriteWithTimeout(data, timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
-                if (err == error.Timeout or err == error.WouldBlock) {
+                if (err == error.Timeout) return error.Timeout;
+                if (err == error.WouldBlock) {
                     try self.checkRequestDeadline();
                     if (self.request_cancel_cb != null) continue;
+                    return error.Timeout;
                 }
                 return error.SendFailed;
             };
@@ -261,27 +274,18 @@ pub const Socket = struct {
         if (buffer.len == 0) return 0;
         while (true) {
             try self.checkRequestCancellation();
-            try self.applyRequestDeadline(.recv);
-            if (!is_windows) {
-                const received = posix.read(self.handle, buffer) catch |err| switch (err) {
-                    error.WouldBlock => {
-                        try self.checkRequestCancellation();
-                        try self.checkRequestDeadline();
-                        if (self.request_cancel_cb != null) continue;
-                        return error.Timeout;
-                    },
-                    else => return error.RecvFailed,
-                };
-                try self.checkRequestDeadline();
-                return received;
-            }
-            var bufs = [_][]u8{buffer};
-            const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch |err| {
+            const timeout_ms = try self.operationTimeout(.recv);
+            const received = self.netReadWithTimeout(buffer, timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout) {
                     try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null) continue;
+                    if (self.request_cancel_cb != null and self.recv_timeout_ms == null) continue;
+                    return error.Timeout;
+                }
+                if (err == error.WouldBlock) {
+                    try self.checkRequestDeadline();
+                    if (self.request_cancel_cb != null and self.recv_timeout_ms == null) continue;
                     return error.Timeout;
                 }
                 return error.RecvFailed;
@@ -306,21 +310,99 @@ pub const Socket = struct {
 
     const DeadlineOperation = enum { recv, send };
 
-    fn applyRequestDeadline(self: *Self, operation: DeadlineOperation) !void {
+    fn operationTimeout(self: *Self, operation: DeadlineOperation) !?u64 {
+        const socket_timeout_ms = switch (operation) {
+            .recv => self.recv_timeout_ms,
+            .send => self.send_timeout_ms,
+        };
         const poll_ms: ?u64 = if (self.request_cancel_cb != null) 20 else null;
         const remaining_ms: ?u64 = if (self.request_deadline_ms) |deadline_ms| blk: {
             const now_ms = common.milliTimestamp(self.io);
             if (now_ms >= deadline_ms) return error.Timeout;
             break :blk @intCast(deadline_ms - now_ms);
         } else null;
-        const timeout_ms = if (remaining_ms) |remaining|
-            if (poll_ms) |poll| @min(remaining, poll) else remaining
-        else
-            poll_ms orelse return;
-        switch (operation) {
-            .recv => self.setRecvTimeout(@max(timeout_ms, 1)) catch return error.RecvFailed,
-            .send => self.setSendTimeout(@max(timeout_ms, 1)) catch return error.SendFailed,
+        var timeout_ms = socket_timeout_ms;
+        if (remaining_ms) |remaining| {
+            timeout_ms = if (timeout_ms) |current| @min(current, remaining) else remaining;
         }
+        if (poll_ms) |poll| {
+            timeout_ms = if (timeout_ms) |current| @min(current, poll) else poll;
+        }
+        return if (timeout_ms) |timeout| @max(timeout, 1) else null;
+    }
+
+    fn netRead(self: *Self, buffer: []u8) net.Stream.Reader.Error!usize {
+        var bufs = [_][]u8{buffer};
+        return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs);
+    }
+
+    fn netWrite(self: *Self, data: []const u8) net.Stream.Writer.Error!usize {
+        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1);
+    }
+
+    fn netReadTask(self: *Self, buffer: []u8, result: *net.Stream.Reader.Error!usize) void {
+        result.* = self.netRead(buffer);
+    }
+
+    fn netWriteTask(self: *Self, data: []const u8, result: *net.Stream.Writer.Error!usize) void {
+        result.* = self.netWrite(data);
+    }
+
+    fn timeoutTask(io: Io, timeout_ms: u64) Io.Cancelable!void {
+        return Io.Timeout.sleep(.{ .duration = .{
+            .raw = .fromMilliseconds(@intCast(timeout_ms)),
+            .clock = .awake,
+        } }, io);
+    }
+
+    fn netReadWithTimeout(self: *Self, buffer: []u8, timeout_ms: ?u64) !usize {
+        const timeout = timeout_ms orelse return self.netRead(buffer);
+        const Outcome = union(enum) {
+            operation: void,
+            timer: Io.Cancelable!void,
+        };
+        var operation_result: net.Stream.Reader.Error!usize = undefined;
+        var outcomes: [2]Outcome = undefined;
+        var select = Io.Select(Outcome).init(self.io, &outcomes);
+        select.async(.operation, netReadTask, .{ self, buffer, &operation_result });
+        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        const outcome = select.await() catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+        select.cancelDiscard();
+        return switch (outcome) {
+            .operation => operation_result,
+            .timer => |result| blk: {
+                try result;
+                break :blk error.Timeout;
+            },
+        };
+    }
+
+    fn netWriteWithTimeout(self: *Self, data: []const u8, timeout_ms: ?u64) !usize {
+        const timeout = timeout_ms orelse return self.netWrite(data);
+        const Outcome = union(enum) {
+            operation: void,
+            timer: Io.Cancelable!void,
+        };
+        var operation_result: net.Stream.Writer.Error!usize = undefined;
+        var outcomes: [2]Outcome = undefined;
+        var select = Io.Select(Outcome).init(self.io, &outcomes);
+        select.async(.operation, netWriteTask, .{ self, data, &operation_result });
+        select.async(.timer, timeoutTask, .{ self.io, timeout });
+        const outcome = select.await() catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+        select.cancelDiscard();
+        return switch (outcome) {
+            .operation => operation_result,
+            .timer => |result| blk: {
+                try result;
+                break :blk error.Timeout;
+            },
+        };
     }
 
     fn checkRequestDeadline(self: *Self) !void {
@@ -341,15 +423,26 @@ pub const Socket = struct {
 
     /// Sets the receive timeout in milliseconds.
     pub fn setRecvTimeout(self: *Self, ms: u64) !void {
-        try self.setTimeout(posix.SO.RCVTIMEO, ms);
+        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.RCVTIMEO, ms);
+        self.recv_timeout_ms = if (ms == 0) null else ms;
     }
 
     /// Sets the send timeout in milliseconds.
     pub fn setSendTimeout(self: *Self, ms: u64) !void {
-        try self.setTimeout(posix.SO.SNDTIMEO, ms);
+        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
+        self.send_timeout_ms = if (ms == 0) null else ms;
     }
 
-    fn setTimeout(self: *Self, opt: u32, ms: u64) !void {
+    /// Select native socket timeout options only when the owner has proven the
+    /// handle belongs to the host backend. Reads and writes still use std.Io;
+    /// virtual handles retain the logical Select-based timeout path.
+    pub fn enableNativeTimeouts(self: *Self) void {
+        self.native_timeouts = true;
+        self.recv_timeout_ms = null;
+        self.send_timeout_ms = null;
+    }
+
+    fn setNativeTimeout(self: *Self, opt: u32, ms: u64) !void {
         if (is_windows) {
             const value_ms: u32 = @intCast(@min(ms, @as(u64, std.math.maxInt(u32))));
             try setSocketOption(self.handle, posix.SOL.SOCKET, opt, std.mem.asBytes(&value_ms));
@@ -1029,18 +1122,23 @@ pub const TcpListener = struct {
 };
 
 fn listenWithOptions(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.Server {
-    if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
-        if (options.reuse_port) return error.OptionUnsupported;
-        return try addr.listen(io, .{
-            .kernel_backlog = options.kernel_backlog,
-            // Windows SO_REUSEADDR permits a second live bind and is not the
-            // POSIX restart-only semantic promised by this API. std.Io does
-            // not expose SO_EXCLUSIVEADDRUSE for its AFD listener, so retain
-            // the secure Windows default by never enabling address reuse.
-            .reuse_address = if (comptime is_windows) false else options.reuse_address,
-        });
+    // Ordinary listeners must remain on the supplied std.Io backend. Besides
+    // making the abstraction honest, this lets deterministic backends model
+    // bind, accept, shutdown, descriptor pressure, and packet delivery. Keep
+    // the native POSIX path only for the non-portable SO_REUSEPORT extension.
+    if (options.reuse_port) {
+        if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+            return error.OptionUnsupported;
+        return try listenPosix(addr, io, options);
     }
-    return try listenPosix(addr, io, options);
+    return try addr.listen(io, .{
+        .kernel_backlog = options.kernel_backlog,
+        // Windows SO_REUSEADDR permits a second live bind and is not the
+        // POSIX restart-only semantic promised by this API. std.Io does not
+        // expose SO_EXCLUSIVEADDRUSE for its AFD listener, so retain the secure
+        // Windows default by never enabling address reuse.
+        .reuse_address = if (comptime is_windows) false else options.reuse_address,
+    });
 }
 
 const PosixAddress = extern union {
