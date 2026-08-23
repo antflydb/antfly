@@ -169,6 +169,10 @@ pub const ServerlessServer = struct {
         return if (self.listener_task) |*task| task.runtimeFailure() else null;
     }
 
+    pub fn runtimeFailure(self: *ServerlessServer) ?anyerror {
+        return self.stack.runtime.runtimeFailure();
+    }
+
     pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {
         return self.owned_http_runtime;
     }

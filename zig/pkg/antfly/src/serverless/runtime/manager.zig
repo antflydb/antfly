@@ -52,6 +52,7 @@ pub const RuntimeRunStats = struct {
 
 pub const ManagedRuntime = struct {
     alloc: Allocator,
+    io: std.Io,
     cfg: RuntimeConfig,
     catalog: *catalog_mod.CatalogService,
     publisher: build_mod.BackgroundPublisher,
@@ -61,8 +62,10 @@ pub const ManagedRuntime = struct {
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
-    thread: ?std.Thread = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    failure_mu: std.atomic.Mutex = .unlocked,
+    run_failure: ?anyerror = null,
 
     pub fn init(
         alloc: Allocator,
@@ -70,8 +73,19 @@ pub const ManagedRuntime = struct {
         catalog: *catalog_mod.CatalogService,
         pruner: build_mod.Pruner,
     ) ManagedRuntime {
+        return initWithIo(alloc, std.Options.debug_io, cfg, catalog, pruner);
+    }
+
+    pub fn initWithIo(
+        alloc: Allocator,
+        io: std.Io,
+        cfg: RuntimeConfig,
+        catalog: *catalog_mod.CatalogService,
+        pruner: build_mod.Pruner,
+    ) ManagedRuntime {
         return .{
             .alloc = alloc,
+            .io = io,
             .cfg = cfg,
             .catalog = catalog,
             .publisher = build_mod.BackgroundPublisher.init(alloc, catalog, cfg.tick_interval_ms),
@@ -87,18 +101,27 @@ pub const ManagedRuntime = struct {
     }
 
     pub fn start(self: *ManagedRuntime) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        if (self.future != null) return error.AlreadyStarted;
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        lockAtomic(&self.failure_mu);
+        self.run_failure = null;
+        self.failure_mu.unlock();
+        self.future = self.io.async(runLoop, .{self});
     }
 
     pub fn stop(self: *ManagedRuntime) void {
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        if (self.future) |*future| {
+            future.cancel(self.io);
+            self.future = null;
         }
+    }
+
+    pub fn runtimeFailure(self: *ManagedRuntime) ?anyerror {
+        lockAtomic(&self.failure_mu);
+        defer self.failure_mu.unlock();
+        return self.run_failure;
     }
 
     pub fn runOnce(self: *ManagedRuntime) !RuntimeRunStats {
@@ -255,8 +278,17 @@ pub const ManagedRuntime = struct {
 
     fn runLoop(self: *ManagedRuntime) void {
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch RuntimeRunStats{};
-            sleepMs(@max(self.cfg.tick_interval_ms, 1));
+            _ = self.runOnce() catch |err| {
+                lockAtomic(&self.failure_mu);
+                if (self.run_failure == null) self.run_failure = err;
+                self.failure_mu.unlock();
+                return;
+            };
+            std.Io.sleep(
+                self.io,
+                .fromMilliseconds(@intCast(@max(self.cfg.tick_interval_ms, 1))),
+                .awake,
+            ) catch return;
         }
     }
 };
@@ -514,7 +546,7 @@ test "managed runtime api-only role skips maintenance work" {
 
     try runtime.start();
     defer runtime.stop();
-    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.future == null);
 
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 0), stats.published_namespaces);
@@ -756,15 +788,6 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
-}
-
-fn sleepMs(ms: u64) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

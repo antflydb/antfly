@@ -6865,6 +6865,17 @@ pub fn build(b: *std.Build) void {
     );
     replication_backfill_vopr_test_step.dependOn(&run_replication_backfill_vopr_tests.step);
 
+    const supervision_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"standalone serverless supervision VOPR exact replays lifecycle failures"},
+    });
+    const run_supervision_vopr_tests = b.addRunArtifact(supervision_vopr_tests);
+    const supervision_vopr_test_step = b.step(
+        "supervision-vopr-test",
+        "Run standalone and serverless startup, failure, shutdown, deadline, and restart campaigns",
+    );
+    supervision_vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
+
     const data_server_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -7041,6 +7052,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_data_plane_vopr_tests.step);
     vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_replication_backfill_vopr_tests.step);
+    vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);

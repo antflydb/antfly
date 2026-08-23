@@ -184,6 +184,7 @@ pub fn runFromIterator(
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
         if (srv.listenerFailure()) |err| return supervisor.fail("serverless", "public-http", err);
+        if (srv.runtimeFailure()) |err| return supervisor.fail("serverless", "maintenance", err);
         if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
         // A short interruptible wait bounds graceful termination latency even
         // on platforms whose clock sleep is automatically restarted.

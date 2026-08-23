@@ -428,7 +428,7 @@ pub const OwnedStack = struct {
             self.query = query_mod.QueryRuntime.init(alloc, &self.artifacts, &self.manifests, &self.progress);
         }
         self.status = try runtimeStatusAlloc(alloc, cfg);
-        self.runtime = runtime_manager.ManagedRuntime.init(alloc, .{
+        self.runtime = runtime_manager.ManagedRuntime.initWithIo(alloc, io, .{
             .tick_interval_ms = cfg.tick_interval_ms,
             .role = cfg.role,
             .publish_enabled = cfg.publish_enabled,
