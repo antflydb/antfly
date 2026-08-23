@@ -2096,7 +2096,7 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	if !ok {
 		return viz
 	}
-	graphValue, err := graph.ValueByDiscriminator()
+	graphValue, err := antfly.DecodeGraphQueryResult(graph)
 	if err != nil {
 		return viz
 	}

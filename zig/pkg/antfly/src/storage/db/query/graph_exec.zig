@@ -223,6 +223,7 @@ const VisitState = enum { unvisited, visiting, done };
 
 pub fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.NamedGraphQuery) ![]usize {
     if (queries.len > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
+    try graph_query_mod.validateRequestOperationBudget(queries);
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (queries, 0..) |query, i| {
@@ -259,6 +260,19 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
     try std.testing.expectError(
         error.InvalidQueryRequest,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many),
+    );
+
+    var complete_match = item;
+    complete_match.query.query_type = .pattern;
+    complete_match.query.match_pattern = .{
+        .nodes = &.{.{ .alias = "anchor" }},
+        .edges = &.{},
+    };
+    const too_many_complete_matches = [_]types.NamedGraphQuery{complete_match} **
+        (graph_query_mod.max_match_queries_per_request + 1);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        sortGraphQueriesByDependencies(std.testing.allocator, &too_many_complete_matches),
     );
 
     var empty_name = item;

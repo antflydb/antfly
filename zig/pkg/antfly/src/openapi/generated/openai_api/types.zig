@@ -39,6 +39,29 @@ pub const Annotation = union(enum) {
     container_file_citation_body: ContainerFileCitationBody,
     file_path: FilePath,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "FileCitationBody")) {
+            return .{ .file_citation_body = try std.json.parseFromSliceLeaky(FileCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "UrlCitationBody")) {
+            return .{ .url_citation_body = try std.json.parseFromSliceLeaky(UrlCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ContainerFileCitationBody")) {
+            return .{ .container_file_citation_body = try std.json.parseFromSliceLeaky(ContainerFileCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FilePath")) {
+            return .{ .file_path = try std.json.parseFromSliceLeaky(FilePath, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -46,7 +69,9 @@ pub const Annotation = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -228,6 +253,26 @@ pub const ApplyPatchOperationParam = union(enum) {
     apply_patch_delete_file_operation_param: ApplyPatchDeleteFileOperationParam,
     apply_patch_update_file_operation_param: ApplyPatchUpdateFileOperationParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "ApplyPatchCreateFileOperationParam")) {
+            return .{ .apply_patch_create_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchCreateFileOperationParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchDeleteFileOperationParam")) {
+            return .{ .apply_patch_delete_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchDeleteFileOperationParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchUpdateFileOperationParam")) {
+            return .{ .apply_patch_update_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchUpdateFileOperationParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -235,7 +280,9 @@ pub const ApplyPatchOperationParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1224,6 +1271,23 @@ pub const ChatCompletionRequestAssistantMessageContentPart = union(enum) {
     chat_completion_request_message_content_part_text: ChatCompletionRequestMessageContentPartText,
     chat_completion_request_message_content_part_refusal: ChatCompletionRequestMessageContentPartRefusal,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestMessageContentPartText")) {
+            return .{ .chat_completion_request_message_content_part_text = try std.json.parseFromSliceLeaky(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestMessageContentPartRefusal")) {
+            return .{ .chat_completion_request_message_content_part_refusal = try std.json.parseFromSliceLeaky(ChatCompletionRequestMessageContentPartRefusal, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1231,7 +1295,9 @@ pub const ChatCompletionRequestAssistantMessageContentPart = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1279,6 +1345,35 @@ pub const ChatCompletionRequestMessage = union(enum) {
     chat_completion_request_tool_message: ChatCompletionRequestToolMessage,
     chat_completion_request_function_message: ChatCompletionRequestFunctionMessage,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { role: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.role orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestDeveloperMessage")) {
+            return .{ .chat_completion_request_developer_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestDeveloperMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestSystemMessage")) {
+            return .{ .chat_completion_request_system_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestSystemMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestUserMessage")) {
+            return .{ .chat_completion_request_user_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestUserMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestAssistantMessage")) {
+            return .{ .chat_completion_request_assistant_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestAssistantMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestToolMessage")) {
+            return .{ .chat_completion_request_tool_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestToolMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestFunctionMessage")) {
+            return .{ .chat_completion_request_function_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestFunctionMessage, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1286,7 +1381,9 @@ pub const ChatCompletionRequestMessage = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("role") orelse return error.MissingField;
+        const disc_val = source.object.get("role") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1747,6 +1844,23 @@ pub const ChunkingStrategyRequestParam = union(enum) {
     auto_chunking_strategy_request_param: AutoChunkingStrategyRequestParam,
     static_chunking_strategy_request_param: StaticChunkingStrategyRequestParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "AutoChunkingStrategyRequestParam")) {
+            return .{ .auto_chunking_strategy_request_param = try std.json.parseFromSliceLeaky(AutoChunkingStrategyRequestParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "StaticChunkingStrategyRequestParam")) {
+            return .{ .static_chunking_strategy_request_param = try std.json.parseFromSliceLeaky(StaticChunkingStrategyRequestParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1754,7 +1868,9 @@ pub const ChunkingStrategyRequestParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2023,6 +2139,44 @@ pub const ComputerAction = union(enum) {
     type_param: TypeParam,
     wait_param: WaitParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "ClickParam")) {
+            return .{ .click_param = try std.json.parseFromSliceLeaky(ClickParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DoubleClickAction")) {
+            return .{ .double_click_action = try std.json.parseFromSliceLeaky(DoubleClickAction, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DragParam")) {
+            return .{ .drag_param = try std.json.parseFromSliceLeaky(DragParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "KeyPressAction")) {
+            return .{ .key_press_action = try std.json.parseFromSliceLeaky(KeyPressAction, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MoveParam")) {
+            return .{ .move_param = try std.json.parseFromSliceLeaky(MoveParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScreenshotParam")) {
+            return .{ .screenshot_param = try std.json.parseFromSliceLeaky(ScreenshotParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScrollParam")) {
+            return .{ .scroll_param = try std.json.parseFromSliceLeaky(ScrollParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TypeParam")) {
+            return .{ .type_param = try std.json.parseFromSliceLeaky(TypeParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WaitParam")) {
+            return .{ .wait_param = try std.json.parseFromSliceLeaky(WaitParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2030,7 +2184,9 @@ pub const ComputerAction = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2453,6 +2609,92 @@ pub const ConversationItem = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output: CustomToolCallOutput,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "Message")) {
+            return .{ .message = try std.json.parseFromSliceLeaky(Message, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallResource")) {
+            return .{ .function_tool_call_resource = try std.json.parseFromSliceLeaky(FunctionToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2460,7 +2702,9 @@ pub const ConversationItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -4507,6 +4751,26 @@ pub const FunctionAndCustomToolCallOutput = union(enum) {
     input_image_content: InputImageContent,
     input_file_content: InputFileContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromSliceLeaky(InputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromSliceLeaky(InputImageContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromSliceLeaky(InputFileContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -4514,7 +4778,9 @@ pub const FunctionAndCustomToolCallOutput = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -4795,6 +5061,23 @@ pub const FunctionShellCallOutputOutcomeParam = union(enum) {
     function_shell_call_output_timeout_outcome_param: FunctionShellCallOutputTimeoutOutcomeParam,
     function_shell_call_output_exit_outcome_param: FunctionShellCallOutputExitOutcomeParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputTimeoutOutcomeParam")) {
+            return .{ .function_shell_call_output_timeout_outcome_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputTimeoutOutcomeParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputExitOutcomeParam")) {
+            return .{ .function_shell_call_output_exit_outcome_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputExitOutcomeParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -4802,7 +5085,9 @@ pub const FunctionShellCallOutputOutcomeParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5495,6 +5780,26 @@ pub const InputContent = union(enum) {
     input_image_content: InputImageContent,
     input_file_content: InputFileContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromSliceLeaky(InputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromSliceLeaky(InputImageContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromSliceLeaky(InputFileContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5502,7 +5807,9 @@ pub const InputContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5601,6 +5908,26 @@ pub const InputItem = union(enum) {
     item: Item,
     item_reference_param: ItemReferenceParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "EasyInputMessage")) {
+            return .{ .easy_input_message = try std.json.parseFromSliceLeaky(EasyInputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "Item")) {
+            return .{ .item = try std.json.parseFromSliceLeaky(Item, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ItemReferenceParam")) {
+            return .{ .item_reference_param = try std.json.parseFromSliceLeaky(ItemReferenceParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5608,7 +5935,9 @@ pub const InputItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5766,6 +6095,95 @@ pub const Item = union(enum) {
     custom_tool_call_output: CustomToolCallOutput,
     custom_tool_call: CustomToolCall,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return .{ .input_message = try std.json.parseFromSliceLeaky(InputMessage, allocator, input, options) };
+        };
+        if (std.mem.eql(u8, disc_str, "InputMessage")) {
+            return .{ .input_message = try std.json.parseFromSliceLeaky(InputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerCallOutputItemParam")) {
+            return .{ .computer_call_output_item_param = try std.json.parseFromSliceLeaky(ComputerCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionCallOutputItemParam")) {
+            return .{ .function_call_output_item_param = try std.json.parseFromSliceLeaky(FunctionCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCallItemParam")) {
+            return .{ .tool_search_call_item_param = try std.json.parseFromSliceLeaky(ToolSearchCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutputItemParam")) {
+            return .{ .tool_search_output_item_param = try std.json.parseFromSliceLeaky(ToolSearchOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionSummaryItemParam")) {
+            return .{ .compaction_summary_item_param = try std.json.parseFromSliceLeaky(CompactionSummaryItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallItemParam")) {
+            return .{ .function_shell_call_item_param = try std.json.parseFromSliceLeaky(FunctionShellCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputItemParam")) {
+            return .{ .function_shell_call_output_item_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallItemParam")) {
+            return .{ .apply_patch_tool_call_item_param = try std.json.parseFromSliceLeaky(ApplyPatchToolCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutputItemParam")) {
+            return .{ .apply_patch_tool_call_output_item_param = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponse")) {
+            return .{ .mcp_approval_response = try std.json.parseFromSliceLeaky(MCPApprovalResponse, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5773,7 +6191,9 @@ pub const Item = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return .{ .input_message = try std.json.parseFromValueLeaky(InputMessage, allocator, source, options) };
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5919,6 +6339,92 @@ pub const ItemField = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output: CustomToolCallOutput,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "Message")) {
+            return .{ .message = try std.json.parseFromSliceLeaky(Message, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutput")) {
+            return .{ .function_tool_call_output = try std.json.parseFromSliceLeaky(FunctionToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5926,7 +6432,9 @@ pub const ItemField = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -6076,6 +6584,95 @@ pub const ItemResource = union(enum) {
     custom_tool_call_resource: CustomToolCallResource,
     custom_tool_call_output_resource: CustomToolCallOutputResource,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "InputMessageResource")) {
+            return .{ .input_message_resource = try std.json.parseFromSliceLeaky(InputMessageResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallResource")) {
+            return .{ .function_tool_call_resource = try std.json.parseFromSliceLeaky(FunctionToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallResource")) {
+            return .{ .custom_tool_call_resource = try std.json.parseFromSliceLeaky(CustomToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutputResource")) {
+            return .{ .custom_tool_call_output_resource = try std.json.parseFromSliceLeaky(CustomToolCallOutputResource, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -6083,7 +6680,9 @@ pub const ItemResource = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7093,6 +7692,26 @@ pub const OutputContent = union(enum) {
     refusal_content: RefusalContent,
     reasoning_text_content: ReasoningTextContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "OutputTextContent")) {
+            return .{ .output_text_content = try std.json.parseFromSliceLeaky(OutputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "RefusalContent")) {
+            return .{ .refusal_content = try std.json.parseFromSliceLeaky(RefusalContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningTextContent")) {
+            return .{ .reasoning_text_content = try std.json.parseFromSliceLeaky(ReasoningTextContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -7100,7 +7719,9 @@ pub const OutputContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7153,6 +7774,92 @@ pub const OutputItem = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output_resource: CustomToolCallOutputResource,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutputResource")) {
+            return .{ .custom_tool_call_output_resource = try std.json.parseFromSliceLeaky(CustomToolCallOutputResource, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -7160,7 +7867,9 @@ pub const OutputItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7293,6 +8002,23 @@ pub const OutputMessageContent = union(enum) {
     output_text_content: OutputTextContent,
     refusal_content: RefusalContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "OutputTextContent")) {
+            return .{ .output_text_content = try std.json.parseFromSliceLeaky(OutputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "RefusalContent")) {
+            return .{ .refusal_content = try std.json.parseFromSliceLeaky(RefusalContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -7300,7 +8026,9 @@ pub const OutputMessageContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -11331,6 +12059,35 @@ pub const ThreadItem = union(enum) {
     task_item: TaskItem,
     task_group_item: TaskGroupItem,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "UserMessageItem")) {
+            return .{ .user_message_item = try std.json.parseFromSliceLeaky(UserMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "AssistantMessageItem")) {
+            return .{ .assistant_message_item = try std.json.parseFromSliceLeaky(AssistantMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WidgetMessageItem")) {
+            return .{ .widget_message_item = try std.json.parseFromSliceLeaky(WidgetMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ClientToolCallItem")) {
+            return .{ .client_tool_call_item = try std.json.parseFromSliceLeaky(ClientToolCallItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TaskItem")) {
+            return .{ .task_item = try std.json.parseFromSliceLeaky(TaskItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TaskGroupItem")) {
+            return .{ .task_group_item = try std.json.parseFromSliceLeaky(TaskGroupItem, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -11338,7 +12095,9 @@ pub const ThreadItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -11495,6 +12254,62 @@ pub const Tool = union(enum) {
     web_search_preview_tool: WebSearchPreviewTool,
     apply_patch_tool_param: ApplyPatchToolParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "FunctionTool")) {
+            return .{ .function_tool = try std.json.parseFromSliceLeaky(FunctionTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchTool")) {
+            return .{ .file_search_tool = try std.json.parseFromSliceLeaky(FileSearchTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerTool")) {
+            return .{ .computer_tool = try std.json.parseFromSliceLeaky(ComputerTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerUsePreviewTool")) {
+            return .{ .computer_use_preview_tool = try std.json.parseFromSliceLeaky(ComputerUsePreviewTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchTool")) {
+            return .{ .web_search_tool = try std.json.parseFromSliceLeaky(WebSearchTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPTool")) {
+            return .{ .mcp_tool = try std.json.parseFromSliceLeaky(MCPTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterTool")) {
+            return .{ .code_interpreter_tool = try std.json.parseFromSliceLeaky(CodeInterpreterTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenTool")) {
+            return .{ .image_gen_tool = try std.json.parseFromSliceLeaky(ImageGenTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolParam")) {
+            return .{ .local_shell_tool_param = try std.json.parseFromSliceLeaky(LocalShellToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellToolParam")) {
+            return .{ .function_shell_tool_param = try std.json.parseFromSliceLeaky(FunctionShellToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolParam")) {
+            return .{ .custom_tool_param = try std.json.parseFromSliceLeaky(CustomToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "NamespaceToolParam")) {
+            return .{ .namespace_tool_param = try std.json.parseFromSliceLeaky(NamespaceToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchToolParam")) {
+            return .{ .tool_search_tool_param = try std.json.parseFromSliceLeaky(ToolSearchToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchPreviewTool")) {
+            return .{ .web_search_preview_tool = try std.json.parseFromSliceLeaky(WebSearchPreviewTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolParam")) {
+            return .{ .apply_patch_tool_param = try std.json.parseFromSliceLeaky(ApplyPatchToolParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -11502,7 +12317,9 @@ pub const Tool = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,

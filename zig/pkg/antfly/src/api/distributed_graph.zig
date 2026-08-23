@@ -960,6 +960,17 @@ fn executeCrossRangeOnce(
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
     defer alloc.free(sorted_query_indexes);
+    // These are HTTP-query budgets, not per-operation budgets. A request may
+    // contain many named graph operations, but it must not multiply expansion
+    // work or retained distinct-identity memory by that operation count.
+    var request_work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        graph_pattern_mod.default_max_distinct_identities,
+        graph_pattern_mod.default_max_distinct_identity_bytes,
+    );
     var initialized: usize = 0;
     errdefer {
         for (results[0..initialized]) |*result| result.deinit(alloc);
@@ -979,6 +990,8 @@ fn executeCrossRangeOnce(
             results[0..initialized],
             graph_query,
             consistency,
+            &request_work_budget,
+            &request_distinct_budget,
         );
         initialized += 1;
     }
@@ -1463,6 +1476,8 @@ fn executeSingleCrossRange(
     prior_results: []const db_mod.types.GraphSearchResult,
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
     const admission_req = graphNodeAdmissionRequest(req, graph_query);
@@ -1528,6 +1543,8 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
+            request_distinct_budget,
         ),
     };
 }
@@ -1614,6 +1631,8 @@ fn executeDistributedPattern(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     // Resolve start keys.
     var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
@@ -1637,6 +1656,8 @@ fn executeDistributedPattern(
             base_result,
             admission,
             &state,
+            request_work_budget,
+            request_distinct_budget,
         );
     }
     const selector_result = base_result;
@@ -1675,6 +1696,7 @@ fn executeDistributedPattern(
             .target_required = graph_query.query.target_nodes != null,
             .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
+            .work_budget = request_work_budget,
         },
     );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
@@ -1883,6 +1905,8 @@ fn executeDistributedConjunctivePattern(
     base_result: db_mod.types.SearchResult,
     admission: *GraphNodeAdmissionContext,
     state: *QueryState,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
+    request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     const pattern = graph_query.query.match_pattern orelse return error.InvalidArgument;
     var filter_evaluator = DistributedPatternFilterEvaluator{ .admission = admission };
@@ -1891,10 +1915,6 @@ fn executeDistributedConjunctivePattern(
     // Reached graph nodes and examined edges do, across every cursor page, so
     // exact MATCH fails closed under bounded work without imposing an anchor
     // cardinality ceiling.
-    var work_budget = graph_pattern_mod.WorkBudget.init(
-        graph_pattern_mod.default_max_explored_nodes,
-        graph_pattern_mod.default_max_explored_edges,
-    );
     const base_opts = graph_pattern_mod.MatchOptions{
         .max_results = if (graph_query.query.return_limit > 0)
             std.math.add(u32, graph_query.query.return_limit, 1) catch graph_query.query.return_limit
@@ -1915,7 +1935,7 @@ fn executeDistributedConjunctivePattern(
             .paged => .prevalidated,
             .materialized => .required,
         },
-        .work_budget = &work_budget,
+        .work_budget = request_work_budget,
     };
 
     var unique_specs = std.ArrayListUnmanaged(graph_pattern_mod.CountAggregateSpec).empty;
@@ -1948,11 +1968,6 @@ fn executeDistributedConjunctivePattern(
         aggregate_accumulators[i] = .{ .distinct = spec.distinct };
         initialized_accumulators += 1;
     }
-    var distinct_budget = graph_pattern_mod.DistinctBudget.init(
-        graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_identity_bytes,
-    );
-
     var collected_matches = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
     defer {
         for (collected_matches.items) |*match| match.deinit(alloc);
@@ -2010,7 +2025,7 @@ fn executeDistributedConjunctivePattern(
             for (computed, 0..) |aggregate, i| try aggregate_accumulators[i].observe(
                 alloc,
                 aggregate,
-                &distinct_budget,
+                request_distinct_budget,
             );
         } else {
             var page_opts = base_opts;
@@ -4810,6 +4825,14 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
             .return_limit = 5000,
         },
     };
+    var request_work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        graph_pattern_mod.default_max_distinct_identities,
+        graph_pattern_mod.default_max_distinct_identity_bytes,
+    );
     var row_state = QueryState{ .name = try alloc.dupe(u8, row_query.name) };
     var rows = try executeDistributedConjunctivePattern(
         alloc,
@@ -4820,6 +4843,8 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
         base_result,
         &admission,
         &row_state,
+        &request_work_budget,
+        &request_distinct_budget,
     );
     defer rows.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4097), rows.matches.len);
@@ -4852,6 +4877,8 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
         base_result,
         &admission,
         &aggregate_state,
+        &request_work_budget,
+        &request_distinct_budget,
     );
     defer counts.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), counts.aggregates.len);
@@ -4917,6 +4944,30 @@ test "distributed graph exact distinct merge budget spans cursor pages" {
         }, &budget),
     );
     try std.testing.expectEqual(@as(u128, 1), accumulator.value);
+}
+
+test "distributed graph exact distinct budget spans named operations" {
+    const alloc = std.testing.allocator;
+    var first = AggregatePageAccumulator{ .distinct = true };
+    defer first.deinit(alloc);
+    var second = AggregatePageAccumulator{ .distinct = true };
+    defer second.deinit(alloc);
+    var request_budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+
+    const first_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:1" }};
+    try first.observe(alloc, .{
+        .value = 1,
+        .distinct_values = @constCast(first_values[0..]),
+    }, &request_budget);
+
+    const second_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:2" }};
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        second.observe(alloc, .{
+            .value = 1,
+            .distinct_values = @constCast(second_values[0..]),
+        }, &request_budget),
+    );
 }
 
 test "distributed graph canonical MATCH admission excludes retrieval predicates" {

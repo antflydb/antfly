@@ -5598,6 +5598,32 @@ test "deprecated graph search preserves its response envelope" {
     try std.testing.expectEqual(@as(i64, 12), legacy.total);
 }
 
+test "generated graph result union decodes pre-discriminator legacy responses" {
+    const raw =
+        \\{"type":"neighbors","nodes":[],"paths":[],"total":12,"took":3}
+    ;
+
+    var stdlib_parsed = try std.json.parseFromSlice(
+        indexes_openapi.GraphQueryResult,
+        std.testing.allocator,
+        raw,
+        .{},
+    );
+    defer stdlib_parsed.deinit();
+    try std.testing.expect(stdlib_parsed.value == .legacy_graph_query_result);
+    try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_query_result.total);
+
+    var simd_parsed = try ant_json.parseFromSlice(
+        indexes_openapi.GraphQueryResult,
+        std.testing.allocator,
+        raw,
+        .{},
+    );
+    defer simd_parsed.deinit();
+    try std.testing.expect(simd_parsed.value == .legacy_graph_query_result);
+    try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_query_result.total);
+}
+
 fn toOpenApiGraphNodes(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,

@@ -64,6 +64,28 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 	return result, nil
 }
 
+// DecodeGraphQueryResult returns the concrete result selected by its stable
+// discriminator. During the v0.2 compatibility window, a response without a
+// discriminator is decoded as the only schema member that permits one to be
+// absent: LegacyGraphQueryResult.
+func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
+	kind, err := result.Discriminator()
+	if err != nil {
+		return nil, err
+	}
+	if kind != "" {
+		return result.ValueByDiscriminator()
+	}
+	legacy, err := result.AsLegacyGraphQueryResult()
+	if err != nil {
+		return nil, err
+	}
+	if legacy.Type == "" {
+		return nil, fmt.Errorf("antfly: graph result is missing its discriminator")
+	}
+	return legacy, nil
+}
+
 // Range query variants share the same flat full-text shape, which makes an
 // OpenAPI oneOf impossible to discriminate reliably. Graph filters use
 // explicit numeric_range and term_range operator wrappers on the wire.
@@ -131,12 +153,6 @@ func normalizeGraphDocumentFilterRanges(value any) (any, error) {
 	default:
 		return value, nil
 	}
-}
-
-// NewGraphFilter is retained as a concise compatibility alias for
-// NewGraphDocumentFilter.
-func NewGraphFilter(filter querydsl.Query) (GraphDocumentFilter, error) {
-	return NewGraphDocumentFilter(filter)
 }
 
 func validateGraphDocumentFilterJSON(encoded []byte) error {

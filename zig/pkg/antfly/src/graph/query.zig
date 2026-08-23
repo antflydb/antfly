@@ -35,7 +35,22 @@ const algebraic_planner = @import("../storage/db/algebraic/planner.zig");
 const algebraic_path_mod = @import("../storage/db/algebraic/path.zig");
 
 pub const max_named_queries: usize = 64;
+/// Exact MATCH operations enumerate an independently filtered anchor relation.
+/// Keep that scan multiplier bounded while allowing one operation to stream an
+/// arbitrarily large relation. Multiple counts over the same pattern belong in
+/// one MATCH return object and share its scan.
+pub const max_match_queries_per_request: usize = 8;
 pub const max_query_name_codepoints: usize = 128;
+
+pub fn validateRequestOperationBudget(queries: anytype) !void {
+    var complete_matches: usize = 0;
+    for (queries) |named_query| {
+        if (named_query.query.match_pattern == null) continue;
+        complete_matches += 1;
+        if (complete_matches > max_match_queries_per_request)
+            return error.QueryCandidateBudgetExceeded;
+    }
+}
 
 pub fn isValidQueryName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_query_name_codepoints * 4) return false;

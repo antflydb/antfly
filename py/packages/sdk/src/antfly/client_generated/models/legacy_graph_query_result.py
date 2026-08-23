@@ -23,26 +23,25 @@ class LegacyGraphQueryResult:
     """Deprecated graph_searches response envelope.
 
     Attributes:
-        kind (LegacyGraphQueryResultKind): Stable discriminator for the deprecated graph result shape.
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
         nodes (list[GraphResultNode]): Result nodes.
         paths (list[Path]): Result paths.
         total (int): Deprecated graph_searches result count; use stats or a named count aggregate.
         took (int): Query execution time
+        kind (LegacyGraphQueryResultKind | Unset): Stable discriminator emitted by current servers. Optional only so
+            current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
     """
 
-    kind: LegacyGraphQueryResultKind
     type_: GraphQueryType
     nodes: list[GraphResultNode]
     paths: list[Path]
     total: int
     took: int
+    kind: LegacyGraphQueryResultKind | Unset = UNSET
     matches: list[PatternMatch] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        kind = self.kind.value
-
         type_ = self.type_.value
 
         nodes = []
@@ -59,6 +58,10 @@ class LegacyGraphQueryResult:
 
         took = self.took
 
+        kind: str | Unset = UNSET
+        if not isinstance(self.kind, Unset):
+            kind = self.kind.value
+
         matches: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.matches, Unset):
             matches = []
@@ -70,7 +73,6 @@ class LegacyGraphQueryResult:
 
         field_dict.update(
             {
-                "kind": kind,
                 "type": type_,
                 "nodes": nodes,
                 "paths": paths,
@@ -78,6 +80,8 @@ class LegacyGraphQueryResult:
                 "took": took,
             }
         )
+        if kind is not UNSET:
+            field_dict["kind"] = kind
         if matches is not UNSET:
             field_dict["matches"] = matches
 
@@ -90,8 +94,6 @@ class LegacyGraphQueryResult:
         from ..models.pattern_match import PatternMatch
 
         d = dict(src_dict)
-        kind = LegacyGraphQueryResultKind(d.pop("kind"))
-
         type_ = GraphQueryType(d.pop("type"))
 
         nodes = []
@@ -112,6 +114,13 @@ class LegacyGraphQueryResult:
 
         took = d.pop("took")
 
+        _kind = d.pop("kind", UNSET)
+        kind: LegacyGraphQueryResultKind | Unset
+        if isinstance(_kind, Unset):
+            kind = UNSET
+        else:
+            kind = LegacyGraphQueryResultKind(_kind)
+
         _matches = d.pop("matches", UNSET)
         matches: list[PatternMatch] | Unset = UNSET
         if _matches is not UNSET:
@@ -122,12 +131,12 @@ class LegacyGraphQueryResult:
                 matches.append(matches_item)
 
         legacy_graph_query_result = cls(
-            kind=kind,
             type_=type_,
             nodes=nodes,
             paths=paths,
             total=total,
             took=took,
+            kind=kind,
             matches=matches,
         )
 

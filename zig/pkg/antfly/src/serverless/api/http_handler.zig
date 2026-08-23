@@ -3101,6 +3101,18 @@ pub const HttpHandler = struct {
         const sorted_query_indexes = try public_graph_query.sortQueriesByDependencies(self.alloc, graph_queries);
         defer self.alloc.free(sorted_query_indexes);
 
+        // MATCH work and exact-distinct state are request resources, not
+        // operation resources. Sharing these counters prevents a batch of
+        // named MATCH operations from multiplying the documented bounds.
+        var request_work_budget = graph_pattern_mod.WorkBudget.init(
+            graph_pattern_mod.default_max_explored_nodes,
+            graph_pattern_mod.default_max_explored_edges,
+        );
+        var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
+            graph_pattern_mod.default_max_distinct_identities,
+            graph_pattern_mod.default_max_distinct_identity_bytes,
+        );
+
         var available_sets = std.ArrayListUnmanaged(GraphResultSet).empty;
         defer available_sets.deinit(self.alloc);
         try available_sets.appendSlice(self.alloc, initial_sets);
@@ -3113,7 +3125,14 @@ pub const HttpHandler = struct {
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
             try session.checkCancellation();
-            results[idx] = try self.executePublicGraphQueryAlloc(session, source_table, graph_queries[query_index], available_sets.items);
+            results[idx] = try self.executePublicGraphQueryAlloc(
+                session,
+                source_table,
+                graph_queries[query_index],
+                available_sets.items,
+                &request_work_budget,
+                &request_distinct_budget,
+            );
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
                 .hits = results[idx].hits,
@@ -3131,12 +3150,21 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_distinct_budget: *graph_pattern_mod.DistinctBudget,
     ) !db_types.GraphSearchResult {
         return switch (named_query.query.query_type) {
             .neighbors => try self.executePublicNeighborsQueryAlloc(session, source_table, named_query, available_sets),
             .traverse => try self.executePublicTraverseQueryAlloc(session, source_table, named_query, available_sets),
             .shortest_path => try self.executePublicShortestPathQueryAlloc(session, source_table, named_query, available_sets),
-            .pattern => try self.executePublicPatternQueryAlloc(session, source_table, named_query, available_sets),
+            .pattern => try self.executePublicPatternQueryAlloc(
+                session,
+                source_table,
+                named_query,
+                available_sets,
+                request_work_budget,
+                request_distinct_budget,
+            ),
             else => error.UnsupportedQueryRequest,
         };
     }
@@ -3360,6 +3388,8 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
+        request_distinct_budget: *graph_pattern_mod.DistinctBudget,
     ) !db_types.GraphSearchResult {
         const conjunctive_pattern = named_query.query.match_pattern;
         const target_keys = if (named_query.query.target_nodes) |selector|
@@ -3537,6 +3567,8 @@ pub const HttpHandler = struct {
                 .ctx = @ptrCast(&filter_ctx),
                 .func = publishedPatternNodeFilterEvaluator,
             } else null,
+            .work_budget = request_work_budget,
+            .distinct_budget = request_distinct_budget,
         };
 
         if (conjunctive_pattern) |pattern| {

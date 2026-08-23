@@ -294,7 +294,6 @@ type (
 
 	// Graph query types
 	GraphQuery                     = oapi.GraphQuery
-	GraphFilter                    = oapi.GraphDocumentFilter // Deprecated: use GraphDocumentFilter.
 	LegacyGraphQuery               = oapi.LegacyGraphQuery
 	LegacyGraphNodeSelector        = oapi.LegacyGraphNodeSelector
 	LegacyGraphDocumentQuery       = oapi.LegacyGraphDocumentQuery

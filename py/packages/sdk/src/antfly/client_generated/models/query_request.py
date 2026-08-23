@@ -283,7 +283,10 @@ class QueryRequest:
             `filter` is a typed, non-scoring stored-document predicate. It shares
             familiar scalar syntax with document queries but deliberately excludes
             analyzer-backed and index-only clauses. A request may contain at most
-            64 named graph operations; operation names must be 1-128 characters.
+            64 named graph operations, of which at most 8 may be named `match`
+            operations; operation names must be 1-128 characters. Put multiple
+            counts over one pattern in the same `match` return object so they
+            share one complete anchor scan.
         graph_searches (QueryRequestGraphSearches | Unset): Deprecated compatibility alias for the v0.2 graph query
             contract.
             Use `graph_queries`; requests containing both fields are rejected.

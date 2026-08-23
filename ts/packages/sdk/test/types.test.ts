@@ -16,7 +16,7 @@ import type {
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
-  GraphFilterQuery,
+  GraphDocumentFilter,
   GraphMatchQuery,
   MatchQuery,
   NumericRangeQuery,
@@ -179,8 +179,8 @@ describe("Antfly Query Type Integration", () => {
 
   describe("QueryRequest type safety", () => {
     it("keeps graph filters in the stored-document predicate subset", () => {
-      const filter: GraphFilterQuery = { term: "active", field: "status" };
-      const numeric: GraphFilterQuery = {
+      const filter: GraphDocumentFilter = { term: "active", field: "status" };
+      const numeric: GraphDocumentFilter = {
         numeric_range: { field: "score", min: 0 },
       };
       const graph: GraphMatchQuery = {
@@ -196,9 +196,9 @@ describe("Antfly Query Type Integration", () => {
 
     it("rejects analyzer-backed and full-text range shapes in graph filters", () => {
       // @ts-expect-error match requires a text index and is not a stored-document predicate.
-      const analyzerBacked: GraphFilterQuery = { match: "active", field: "status" };
+      const analyzerBacked: GraphDocumentFilter = { match: "active", field: "status" };
       // @ts-expect-error graph ranges use an explicit operator wrapper.
-      const ambiguousRange: GraphFilterQuery = { field: "score", min: 0 };
+      const ambiguousRange: GraphDocumentFilter = { field: "score", min: 0 };
 
       expect(analyzerBacked).toBeDefined();
       expect(ambiguousRange).toBeDefined();

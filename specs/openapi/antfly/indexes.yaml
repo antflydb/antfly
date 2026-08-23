@@ -3336,13 +3336,16 @@ components:
       type: object
       additionalProperties: false
       deprecated: true
-      required: [kind, type, nodes, paths, total, took]
+      required: [type, nodes, paths, total, took]
       description: Deprecated graph_searches response envelope.
       properties:
         kind:
           type: string
           enum: [legacy]
-          description: Stable discriminator for the deprecated graph result shape.
+          description: >-
+            Stable discriminator emitted by current servers. Optional only so
+            current SDKs can decode the pre-discriminator v0.2 response during
+            the compatibility release.
         type:
           deprecated: true
           $ref: "#/components/schemas/GraphQueryType"

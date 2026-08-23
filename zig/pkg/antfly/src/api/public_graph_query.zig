@@ -105,6 +105,7 @@ pub fn sortQueriesByDependencies(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
 ) ![]usize {
+    try graph_query_mod.validateRequestOperationBudget(queries);
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (queries, 0..) |query, i| {

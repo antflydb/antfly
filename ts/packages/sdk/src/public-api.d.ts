@@ -6743,7 +6743,10 @@ export interface components {
              *     `filter` is a typed, non-scoring stored-document predicate. It shares
              *     familiar scalar syntax with document queries but deliberately excludes
              *     analyzer-backed and index-only clauses. A request may contain at most
-             *     64 named graph operations; operation names must be 1-128 characters.
+             *     64 named graph operations, of which at most 8 may be named `match`
+             *     operations; operation names must be 1-128 characters. Put multiple
+             *     counts over one pattern in the same `match` return object so they
+             *     share one complete anchor scan.
              */
             graph_queries?: {
                 [key: string]: components["schemas"]["GraphQuery"];
@@ -12272,7 +12275,7 @@ export interface components {
          */
         LegacyGraphQueryResult: {
             /**
-             * @description Stable discriminator for the deprecated graph result shape. (enum property replaced by openapi-typescript)
+             * @description Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
             kind: "legacy";

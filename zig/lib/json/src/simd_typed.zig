@@ -23,7 +23,7 @@ pub fn supportsType(comptime T: type) bool {
     // walk proportional to the generated type instead of Zig's small default
     // comptime branch budget.
     @setEvalBranchQuota(100_000);
-    if (std.meta.hasFn(T, "jsonParse")) return true;
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or std.meta.hasFn(T, "jsonParse")) return true;
 
     switch (@typeInfo(T)) {
         .bool, .int, .float, .comptime_int, .comptime_float => return true,
@@ -56,7 +56,7 @@ pub fn supportsType(comptime T: type) bool {
 
 pub fn containsCustomJsonParseType(comptime T: type) bool {
     @setEvalBranchQuota(100_000);
-    if (std.meta.hasFn(T, "jsonParse")) return true;
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or std.meta.hasFn(T, "jsonParse")) return true;
 
     switch (@typeInfo(T)) {
         .optional => |info| return containsCustomJsonParseType(info.child),
@@ -161,6 +161,10 @@ const Parser = struct {
     }
 
     fn parseType(self: *Parser, comptime T: type) json.ParseError(json.Scanner)!T {
+        if (comptime std.meta.hasFn(T, "jsonParseFromSliceLeaky")) {
+            const raw = try self.captureValueSliceForStdlib();
+            return T.jsonParseFromSliceLeaky(self.allocator, raw, self.options);
+        }
         if (comptime std.meta.hasFn(T, "jsonParse")) {
             return self.parseViaStdlibSubtree(T);
         }
@@ -1285,6 +1289,33 @@ test "simd typed parser falls back per-subtree for custom jsonParse types" {
 
     try std.testing.expectEqual(@as(u32, 1), parsed.value.plain);
     try std.testing.expectEqual(@as(u32, 5), parsed.value.custom.value);
+}
+
+test "simd typed parser prefers allocation-light raw subtree parsers" {
+    const alloc = std.testing.allocator;
+    const Custom = struct {
+        value: u32,
+
+        pub fn jsonParseFromSliceLeaky(_: Allocator, input: []const u8, _: json.ParseOptions) !@This() {
+            return .{ .value = try std.fmt.parseUnsigned(u32, input, 10) };
+        }
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: json.ParseOptions) !@This() {
+            return error.TestExpectedError;
+        }
+    };
+
+    const T = struct {
+        plain: u32,
+        custom: Custom,
+    };
+    const raw = "{\"plain\":1,\"custom\":4}";
+    var structural = try simd_stage1.buildStructuralIndexAlloc(alloc, raw);
+    defer structural.deinit(alloc);
+
+    var parsed = try parseFromSlice(T, alloc, raw, .{}, structural);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.custom.value);
 }
 
 test "simd typed parser captures composite subtrees for custom jsonParse" {

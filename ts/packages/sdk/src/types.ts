@@ -189,9 +189,7 @@ export type EdgeDirection = components["schemas"]["EdgeDirection"];
 export type EdgesResponse = components["schemas"]["EdgesResponse"];
 export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
-export type GraphFilterQuery = components["schemas"]["GraphDocumentFilter"];
-/** @deprecated Use GraphFilterQuery. */
-export type GraphDocumentQuery = GraphFilterQuery;
+export type GraphDocumentFilter = components["schemas"]["GraphDocumentFilter"];
 export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
 export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
 export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];

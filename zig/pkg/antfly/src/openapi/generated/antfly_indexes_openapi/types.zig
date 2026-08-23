@@ -305,6 +305,29 @@ pub const CreateIndexRequest = union(enum) {
     create_graph_index_request: CreateGraphIndexRequest,
     create_algebraic_index_request: CreateAlgebraicIndexRequest,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .create_full_text_index_request = try std.json.parseFromSliceLeaky(CreateFullTextIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .create_embeddings_index_request = try std.json.parseFromSliceLeaky(CreateEmbeddingsIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .create_graph_index_request = try std.json.parseFromSliceLeaky(CreateGraphIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .create_algebraic_index_request = try std.json.parseFromSliceLeaky(CreateAlgebraicIndexRequest, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -312,7 +335,9 @@ pub const CreateIndexRequest = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -498,6 +523,29 @@ pub const CreatedIndex = union(enum) {
     created_graph_index: CreatedGraphIndex,
     created_algebraic_index: CreatedAlgebraicIndex,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .created_full_text_index = try std.json.parseFromSliceLeaky(CreatedFullTextIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .created_embeddings_index = try std.json.parseFromSliceLeaky(CreatedEmbeddingsIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .created_graph_index = try std.json.parseFromSliceLeaky(CreatedGraphIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .created_algebraic_index = try std.json.parseFromSliceLeaky(CreatedAlgebraicIndex, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -505,7 +553,9 @@ pub const CreatedIndex = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1894,6 +1944,29 @@ pub const GraphQueryResult = union(enum) {
     graph_nodes_result: GraphNodesResult,
     legacy_graph_query_result: LegacyGraphQueryResult,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { kind: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.kind orelse {
+            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
+        };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            return .{ .graph_bindings_result = try std.json.parseFromSliceLeaky(GraphBindingsResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            return .{ .graph_aggregates_result = try std.json.parseFromSliceLeaky(GraphAggregatesResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            return .{ .graph_nodes_result = try std.json.parseFromSliceLeaky(GraphNodesResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1901,7 +1974,9 @@ pub const GraphQueryResult = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_val = source.object.get("kind") orelse {
+            return .{ .legacy_graph_query_result = try std.json.parseFromValueLeaky(LegacyGraphQueryResult, allocator, source, options) };
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2418,6 +2493,29 @@ pub const IndexStats = union(enum) {
     graph_index_stats: GraphIndexStats,
     algebraic_index_stats: AlgebraicIndexStats,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { index_type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.index_type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromSliceLeaky(FullTextIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromSliceLeaky(EmbeddingsIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromSliceLeaky(GraphIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromSliceLeaky(AlgebraicIndexStats, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2425,7 +2523,9 @@ pub const IndexStats = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_val = source.object.get("index_type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2520,8 +2620,8 @@ pub const LegacyGraphQuery = struct {
 
 /// Deprecated graph_searches response envelope.
 pub const LegacyGraphQueryResult = struct {
-    /// Stable discriminator for the deprecated graph result shape.
-    kind: []const u8,
+    /// Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
+    kind: ?[]const u8 = null,
     type: GraphQueryType,
     /// Result nodes.
     nodes: []const GraphResultNode,

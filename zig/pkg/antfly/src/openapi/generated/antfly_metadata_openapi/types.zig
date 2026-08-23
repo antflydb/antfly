@@ -549,6 +549,23 @@ pub const BackupMetadataUnavailableError = union(enum) {
     metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
     metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { code: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.code orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromSliceLeaky(MetadataCapabilityUnavailableError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromSliceLeaky(MetadataLeaderUnavailableError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -556,7 +573,9 @@ pub const BackupMetadataUnavailableError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_val = source.object.get("code") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2357,7 +2376,7 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
@@ -2415,6 +2434,29 @@ pub const QueryUnprocessableError = union(enum) {
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { @"error": ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.@"error" orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
+            return .{ .exact_sort_error = try std.json.parseFromSliceLeaky(ExactSortError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
+            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromSliceLeaky(QueryCandidateBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2422,7 +2464,9 @@ pub const QueryUnprocessableError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("error") orelse return error.MissingField;
+        const disc_val = source.object.get("error") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2827,7 +2871,7 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
@@ -3267,6 +3311,26 @@ pub const TableBackupConflictError = union(enum) {
     table_catalog_changed_conflict: TableCatalogChangedConflict,
     backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { code: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.code orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromSliceLeaky(BackupAlreadyExistsConflict, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromSliceLeaky(TableCatalogChangedConflict, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromSliceLeaky(BackupOutcomeAmbiguousConflict, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -3274,7 +3338,9 @@ pub const TableBackupConflictError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_val = source.object.get("code") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,

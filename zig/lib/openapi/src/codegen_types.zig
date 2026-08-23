@@ -499,8 +499,17 @@ pub const TypeGenerator = struct {
         try self.w.line("pub const {s} = union(enum) {{", .{type_name});
         self.w.indent();
 
-        // Collect variant info for jsonParse generation
-        var variants = std.ArrayListUnmanaged(struct { field: []const u8, zig_type: []const u8, disc_value: []const u8 }).empty;
+        const Variant = struct {
+            field: []const u8,
+            zig_type: []const u8,
+            disc_value: []const u8,
+        };
+        // If exactly one variant's schema permits an omitted discriminator,
+        // it is the only unambiguous fallback. Multiple such variants leave
+        // the payload structurally ambiguous and deliberately disable it.
+        var variants = std.ArrayListUnmanaged(Variant).empty;
+        var fallback_variant: ?Variant = null;
+        var fallback_ambiguous = false;
 
         // Generate variant for each oneOf member
         for (schema.one_of) |member| {
@@ -520,17 +529,34 @@ pub const TypeGenerator = struct {
                         }
                         break :blk ref_name;
                     };
-                    try variants.append(self.arena, .{
+                    const variant = Variant{
                         .field = variant_name,
                         .zig_type = ref_type,
                         .disc_value = disc_value,
-                    });
+                    };
+                    try variants.append(self.arena, variant);
+                    const resolved = self.resolver.resolveSchema(member) catch null;
+                    // Resolution failures and pathological allOf recursion fail
+                    // closed: neither can safely establish an omitted-field
+                    // fallback.
+                    const discriminator_required = if (resolved) |resolved_schema|
+                        self.schemaRequiresProperty(resolved_schema, disc.property_name, 0)
+                    else
+                        true;
+                    if (!discriminator_required) {
+                        if (fallback_variant == null) {
+                            fallback_variant = variant;
+                        } else {
+                            fallback_ambiguous = true;
+                        }
+                    }
                 },
                 .schema => {
                     try self.w.line("// TODO: inline oneOf variant", .{});
                 },
             }
         }
+        if (fallback_ambiguous) fallback_variant = null;
 
         try self.w.blank();
 
@@ -538,6 +564,38 @@ pub const TypeGenerator = struct {
         if (variants.items.len == 0) {
             try self.generateEmptyUnionJsonStubs();
         } else {
+            // Raw-subtree parsers can probe only the discriminator and then
+            // parse the selected variant directly. This avoids retaining a
+            // complete std.json.Value tree beside large typed response rows.
+            const disc_field = try naming.zigFieldName(self.arena, disc.property_name);
+            try self.w.line("pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {{", .{});
+            self.w.indent();
+            try self.w.line("const Probe = struct {{ {s}: ?[]const u8 = null }};", .{disc_field});
+            try self.w.line("var probe_options = options;", .{});
+            try self.w.line("probe_options.ignore_unknown_fields = true;", .{});
+            try self.w.line("const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);", .{});
+            try self.w.line("const disc_str = probe.{s} orelse {{", .{disc_field});
+            self.w.indent();
+            if (fallback_variant) |fallback| {
+                try self.w.line("return .{{ .{s} = try std.json.parseFromSliceLeaky({s}, allocator, input, options) }};", .{ fallback.field, fallback.zig_type });
+            } else {
+                try self.w.line("return error.MissingField;", .{});
+            }
+            self.w.dedent();
+            try self.w.line("}};", .{});
+            for (variants.items) |v| {
+                try self.w.line("if (std.mem.eql(u8, disc_str, \"{s}\")) {{", .{v.disc_value});
+                self.w.indent();
+                try self.w.line("return .{{ .{s} = try std.json.parseFromSliceLeaky({s}, allocator, input, options) }};", .{ v.field, v.zig_type });
+                self.w.dedent();
+                try self.w.line("}}", .{});
+            }
+            try self.w.line("return error.UnexpectedToken;", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+
+            try self.w.blank();
+
             try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("const value = try std.json.innerParse(std.json.Value, allocator, source, options);", .{});
@@ -550,7 +608,15 @@ pub const TypeGenerator = struct {
             try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
-            try self.w.line("const disc_val = source.object.get(\"{s}\") orelse return error.MissingField;", .{disc.property_name});
+            try self.w.line("const disc_val = source.object.get(\"{s}\") orelse {{", .{disc.property_name});
+            self.w.indent();
+            if (fallback_variant) |fallback| {
+                try self.w.line("return .{{ .{s} = try std.json.parseFromValueLeaky({s}, allocator, source, options) }};", .{ fallback.field, fallback.zig_type });
+            } else {
+                try self.w.line("return error.MissingField;", .{});
+            }
+            self.w.dedent();
+            try self.w.line("}};", .{});
             try self.w.line("const disc_str = switch (disc_val) {{", .{});
             self.w.indent();
             try self.w.line(".string => |s| s,", .{});
@@ -588,6 +654,23 @@ pub const TypeGenerator = struct {
 
         self.w.dedent();
         try self.w.line("}};", .{});
+    }
+
+    fn schemaRequiresProperty(
+        self: *TypeGenerator,
+        schema: types.Schema,
+        property_name: []const u8,
+        depth: usize,
+    ) bool {
+        if (depth >= 32) return true;
+        for (schema.required) |required_field| {
+            if (std.mem.eql(u8, required_field, property_name)) return true;
+        }
+        for (schema.all_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch return true;
+            if (self.schemaRequiresProperty(resolved, property_name, depth + 1)) return true;
+        }
+        return false;
     }
 
     fn canGenerateStructuralUnion(self: *TypeGenerator, schema: types.Schema) !bool {
@@ -1218,6 +1301,70 @@ test "$ref with description sibling codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "/// Current status of the item") != null);
     // Field should reference the named type
     try std.testing.expect(std.mem.indexOf(u8, output, "status: ?Status = null,") != null);
+}
+
+test "discriminated union emits raw fast path and one optional-discriminator fallback" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var current_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try current_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"current"},
+    } });
+    var legacy_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try legacy_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"legacy"},
+    } });
+    try legacy_props.put(arena, "type", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+
+    var mapping = std.StringArrayHashMapUnmanaged([]const u8){};
+    try mapping.put(arena, "current", "#/components/schemas/Current");
+    try mapping.put(arena, "legacy", "#/components/schemas/Legacy");
+    try mapping.put(arena, "inherited", "#/components/schemas/Inherited");
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Current", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = current_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Legacy", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = legacy_props,
+        .required = &.{"type"},
+    } });
+    try schemas.put(arena, "InheritedBase", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = current_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Inherited", .{ .schema = .{
+        .all_of = &.{.{ .ref = .{ .ref_string = "#/components/schemas/InheritedBase" } }},
+    } });
+    try schemas.put(arena, "Result", .{ .schema = .{
+        .one_of = &.{
+            .{ .ref = .{ .ref_string = "#/components/schemas/Current" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/Legacy" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/Inherited" } },
+        },
+        .discriminator = .{ .property_name = "kind", .mapping = mapping },
+    } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParseFromSliceLeaky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try std.json.parseFromSliceLeaky(Legacy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try std.json.parseFromValueLeaky(Legacy") != null);
 }
 
 test "undiscriminated recursive oneOf generates structural union" {

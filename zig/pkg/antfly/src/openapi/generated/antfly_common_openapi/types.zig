@@ -176,6 +176,29 @@ pub const ConnectionConfig = union(enum) {
     external_io_connection_variant: ExternalIoConnectionVariant,
     cdc_connection_variant: CdcConnectionVariant,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { kind: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.kind orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "inference")) {
+            return .{ .inference_connection_variant = try std.json.parseFromSliceLeaky(InferenceConnectionVariant, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "web_search")) {
+            return .{ .web_search_connection_variant = try std.json.parseFromSliceLeaky(WebSearchConnectionVariant, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "external_io")) {
+            return .{ .external_io_connection_variant = try std.json.parseFromSliceLeaky(ExternalIoConnectionVariant, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "cdc")) {
+            return .{ .cdc_connection_variant = try std.json.parseFromSliceLeaky(CdcConnectionVariant, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -183,7 +206,9 @@ pub const ConnectionConfig = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_val = source.object.get("kind") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -251,6 +276,29 @@ pub const ExternalIoConnectionConfig = union(enum) {
     filesystem_external_io_config: FilesystemExternalIoConfig,
     http_external_io_config: HttpExternalIoConfig,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { protocol: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.protocol orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "s3")) {
+            return .{ .s3_external_io_config = try std.json.parseFromSliceLeaky(S3ExternalIoConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "gcs")) {
+            return .{ .gcs_external_io_config = try std.json.parseFromSliceLeaky(GcsExternalIoConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "filesystem")) {
+            return .{ .filesystem_external_io_config = try std.json.parseFromSliceLeaky(FilesystemExternalIoConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "http")) {
+            return .{ .http_external_io_config = try std.json.parseFromSliceLeaky(HttpExternalIoConfig, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -258,7 +306,9 @@ pub const ExternalIoConnectionConfig = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("protocol") orelse return error.MissingField;
+        const disc_val = source.object.get("protocol") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,

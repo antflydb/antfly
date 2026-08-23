@@ -840,6 +840,23 @@ pub const BackupMetadataUnavailableError = union(enum) {
     metadata_capability_unavailable_error: MetadataCapabilityUnavailableError,
     metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { code: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.code orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
+            return .{ .metadata_capability_unavailable_error = try std.json.parseFromSliceLeaky(MetadataCapabilityUnavailableError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "metadata_leader_unavailable")) {
+            return .{ .metadata_leader_unavailable_error = try std.json.parseFromSliceLeaky(MetadataLeaderUnavailableError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -847,7 +864,9 @@ pub const BackupMetadataUnavailableError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_val = source.object.get("code") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1938,6 +1957,29 @@ pub const CreateIndexRequest = union(enum) {
     create_graph_index_request: CreateGraphIndexRequest,
     create_algebraic_index_request: CreateAlgebraicIndexRequest,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .create_full_text_index_request = try std.json.parseFromSliceLeaky(CreateFullTextIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .create_embeddings_index_request = try std.json.parseFromSliceLeaky(CreateEmbeddingsIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .create_graph_index_request = try std.json.parseFromSliceLeaky(CreateGraphIndexRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .create_algebraic_index_request = try std.json.parseFromSliceLeaky(CreateAlgebraicIndexRequest, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1945,7 +1987,9 @@ pub const CreateIndexRequest = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2154,6 +2198,29 @@ pub const CreatedIndex = union(enum) {
     created_graph_index: CreatedGraphIndex,
     created_algebraic_index: CreatedAlgebraicIndex,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .created_full_text_index = try std.json.parseFromSliceLeaky(CreatedFullTextIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .created_embeddings_index = try std.json.parseFromSliceLeaky(CreatedEmbeddingsIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .created_graph_index = try std.json.parseFromSliceLeaky(CreatedGraphIndex, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .created_algebraic_index = try std.json.parseFromSliceLeaky(CreatedAlgebraicIndex, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2161,7 +2228,9 @@ pub const CreatedIndex = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5008,6 +5077,29 @@ pub const GraphQueryResult = union(enum) {
     graph_nodes_result: GraphNodesResult,
     legacy_graph_query_result: LegacyGraphQueryResult,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { kind: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.kind orelse {
+            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
+        };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            return .{ .graph_bindings_result = try std.json.parseFromSliceLeaky(GraphBindingsResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            return .{ .graph_aggregates_result = try std.json.parseFromSliceLeaky(GraphAggregatesResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            return .{ .graph_nodes_result = try std.json.parseFromSliceLeaky(GraphNodesResult, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            return .{ .legacy_graph_query_result = try std.json.parseFromSliceLeaky(LegacyGraphQueryResult, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5015,7 +5107,9 @@ pub const GraphQueryResult = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_val = source.object.get("kind") orelse {
+            return .{ .legacy_graph_query_result = try std.json.parseFromValueLeaky(LegacyGraphQueryResult, allocator, source, options) };
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5675,6 +5769,29 @@ pub const IndexStats = union(enum) {
     graph_index_stats: GraphIndexStats,
     algebraic_index_stats: AlgebraicIndexStats,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { index_type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.index_type orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromSliceLeaky(FullTextIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromSliceLeaky(EmbeddingsIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromSliceLeaky(GraphIndexStats, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromSliceLeaky(AlgebraicIndexStats, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5682,7 +5799,9 @@ pub const IndexStats = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_val = source.object.get("index_type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7296,8 +7415,8 @@ pub const LegacyGraphQuery = struct {
 
 /// Deprecated graph_searches response envelope.
 pub const LegacyGraphQueryResult = struct {
-    /// Stable discriminator for the deprecated graph result shape.
-    kind: []const u8,
+    /// Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
+    kind: ?[]const u8 = null,
     type: GraphQueryType,
     /// Result nodes.
     nodes: []const GraphResultNode,
@@ -8504,7 +8623,7 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -8599,6 +8718,29 @@ pub const QueryUnprocessableError = union(enum) {
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { @"error": ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.@"error" orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
+            return .{ .exact_sort_error = try std.json.parseFromSliceLeaky(ExactSortError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
+            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromSliceLeaky(QueryCandidateBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -8606,7 +8748,9 @@ pub const QueryUnprocessableError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("error") orelse return error.MissingField;
+        const disc_val = source.object.get("error") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -9104,7 +9248,7 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations; operation names must be 1-128 characters.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations; operation names must be 1-128 characters. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -9676,6 +9820,26 @@ pub const TableBackupConflictError = union(enum) {
     table_catalog_changed_conflict: TableCatalogChangedConflict,
     backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { code: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.code orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
+            return .{ .backup_already_exists_conflict = try std.json.parseFromSliceLeaky(BackupAlreadyExistsConflict, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "table_catalog_changed")) {
+            return .{ .table_catalog_changed_conflict = try std.json.parseFromSliceLeaky(TableCatalogChangedConflict, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "backup_outcome_ambiguous")) {
+            return .{ .backup_outcome_ambiguous_conflict = try std.json.parseFromSliceLeaky(BackupOutcomeAmbiguousConflict, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -9683,7 +9847,9 @@ pub const TableBackupConflictError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("code") orelse return error.MissingField;
+        const disc_val = source.object.get("code") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,

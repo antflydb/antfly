@@ -75,7 +75,7 @@ func TestGraphQueryConstructors(t *testing.T) {
 }
 
 func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
-	filter, err := NewGraphFilter(querydsl.TermQuery{Term: "beta", Field: "title"}.ToQuery())
+	filter, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "title"}.ToQuery())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	if kind != "nodes" {
 		t.Fatalf("kind = %q, want nodes", kind)
 	}
-	value, err := result.ValueByDiscriminator()
+	value, err := DecodeGraphQueryResult(result)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,10 +272,25 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		t.Fatalf("nodes kind = %q, want nodes", nodes.Kind)
 	}
 
+	if err := json.Unmarshal([]byte(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}`), &result); err != nil {
+		t.Fatal(err)
+	}
+	value, err = DecodeGraphQueryResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, ok := value.(LegacyGraphQueryResult)
+	if !ok {
+		t.Fatalf("result = %T, want LegacyGraphQueryResult", value)
+	}
+	if legacy.Type != GraphQueryTypeNeighbors {
+		t.Fatalf("legacy type = %q, want neighbors", legacy.Type)
+	}
+
 	if err := json.Unmarshal([]byte(`{"kind":"unknown"}`), &result); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := result.ValueByDiscriminator(); err == nil {
+	if _, err := DecodeGraphQueryResult(result); err == nil {
 		t.Fatal("expected unknown graph result kind to fail")
 	}
 }
