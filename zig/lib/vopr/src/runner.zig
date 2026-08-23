@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const choice = @import("choice.zig");
+const collector = @import("collector.zig");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
@@ -112,6 +113,54 @@ pub fn captureCheckpoint(
         last_digest,
         try snapshot.prefixDigest(artifact, prefix_len),
     );
+}
+
+/// Clean-replay to a choice prefix, prove the reconstructed prefix equals the
+/// artifact, then let the scenario emit pointer-free logical diagnostics.
+/// Scenarios opt in with `pub fn collect(*World, *collector.Sink) !void`.
+pub fn collectAt(
+    comptime Scenario: type,
+    allocator: std.mem.Allocator,
+    artifact: *const trace.Trace,
+    prefix_len: usize,
+    sink: *collector.Sink,
+) !void {
+    comptime scenario_contract.assertContract(Scenario);
+    if (!@hasDecl(Scenario, "collect")) return error.ScenarioCollectorsUnsupported;
+    try artifact.validate();
+    try validateCompatibility(Scenario, artifact);
+    if (prefix_len > artifact.choices.items.len or sink.choice_prefix != prefix_len)
+        return error.InvalidCollectorPrefix;
+    const config = configFromTrace(artifact);
+    var world = try initWorld(Scenario, allocator, config.scenario_context);
+    defer Scenario.deinit(&world, allocator);
+    var tracker = try property.Tracker.init(allocator, Scenario.properties);
+    defer tracker.deinit();
+    var actual = try initTrace(Scenario, allocator, config);
+    defer actual.deinit();
+    var last_digest = try recordObservation(Scenario, allocator, &world, &actual, 0);
+    var replay_source = choice.Replay{ .records = artifact.choices.items };
+    var transition_index: u64 = 0;
+    while (transition_index < prefix_len) {
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest) == .stopped)
+            return error.CollectorPrefixPastScenarioEnd;
+    }
+    actual.summary = .{
+        .transitions = transition_index,
+        .final_observation_digest = last_digest,
+        .property_failures = 0,
+    };
+    var expected = try initTraceFromArtifact(allocator, artifact);
+    defer expected.deinit();
+    try copyPrefix(&expected, artifact, prefix_len);
+    expected.summary = actual.summary;
+    const actual_bytes = try actual.renderAlloc(allocator);
+    defer allocator.free(actual_bytes);
+    const expected_bytes = try expected.renderAlloc(allocator);
+    defer allocator.free(expected_bytes);
+    if (!std.mem.eql(u8, actual_bytes, expected_bytes)) return error.CollectorPrefixArtifactDiverged;
+    try Scenario.collect(&world, sink);
+    sink.canonicalize();
 }
 
 /// Restores a validated logical checkpoint and executes a suffix source. The

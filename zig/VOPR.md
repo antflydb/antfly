@@ -2594,9 +2594,24 @@ instance backend IDs, and capability preflight rejects a scenario that requires
 instrumentation while it is disabled. Sorted hit snapshots are secondary search
 feedback and do not alter an artifact that does not select those safepoints.
 
+Bounded counterfactual search is implemented in `lib/vopr/src/causal.zig`.
+For each selected pre-failure prefix it replaces one enabled decision,
+generates a configured number of deterministic descendants, exact-replays every
+child from a clean world, and records same-fingerprint reachability and child
+artifact digests. The report includes its complete experiment configuration.
+
+Clean-replay multiverse primitives and time-travel collection are implemented
+in `lib/vopr/src/debugger.zig`, `collector.zig`, and `runner.collectAt`. A cursor
+seeks by choice prefix and lists the recorded enabled alternatives; branching
+uses the same prefix-mutation source as campaigns and exact-replays the child
+before returning it. Scenario collectors run only after reconstructing and
+byte-comparing the canonical prefix. Failure-window collection independently
+replays the moment before failure, the boundary, and a bounded diagnostic
+future, so no pointer-bearing heap or fiber-stack snapshot is treated as state.
+
 Richer storage corruption and completion-order faults, datagram networking,
-counterfactual tooling, multiverse debugging, time-travel collectors, and the
-five domain scenarios remain required work.
+the command-line interactive shell over the debugger primitives, and the five
+domain scenarios remain required work.
 
 ## Risks and Mitigations
 

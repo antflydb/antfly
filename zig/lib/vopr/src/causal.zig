@@ -7,6 +7,10 @@
 //! gives humans a reproducible place to start.
 
 const std = @import("std");
+const choice = @import("choice.zig");
+const ids = @import("id.zig");
+const replay = @import("replay.zig");
+const runner = @import("runner.zig");
 const trace = @import("trace.zig");
 
 pub const Role = enum {
@@ -46,6 +50,121 @@ pub const Report = struct {
         }, .{ .whitespace = .indent_2 });
     }
 };
+
+pub const CounterfactualConfig = struct {
+    prefix_window: usize = 16,
+    descendants_per_alternative: usize = 4,
+    suffix_seed: u64 = 0,
+};
+
+pub const Experiment = struct {
+    choice_index: usize,
+    original_id: ids.StableId,
+    replacement_id: ids.StableId,
+    trials: usize,
+    same_failure_trials: usize,
+    child_artifact_digest: u64,
+};
+
+pub const CounterfactualReport = struct {
+    allocator: std.mem.Allocator,
+    failure_fingerprint: u64,
+    config: CounterfactualConfig,
+    experiments: []Experiment,
+
+    pub fn deinit(self: *CounterfactualReport) void {
+        self.allocator.free(self.experiments);
+        self.* = undefined;
+    }
+
+    pub fn renderAlloc(self: *const CounterfactualReport, allocator: std.mem.Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(allocator, .{
+            .failure_fingerprint = self.failure_fingerprint,
+            .config = self.config,
+            .experiments = self.experiments,
+        }, .{ .whitespace = .indent_2 });
+    }
+};
+
+/// Replay bounded alternate decisions before a failure. Every child is exact
+/// replayed from a clean world before it contributes to the report.
+pub fn analyzeCounterfactual(
+    comptime Scenario: type,
+    allocator: std.mem.Allocator,
+    artifact: *const trace.Trace,
+    failure_ordinal: usize,
+    config: CounterfactualConfig,
+) !CounterfactualReport {
+    try artifact.validate();
+    if (failure_ordinal >= artifact.failures.items.len) return error.FailureOrdinalOutOfRange;
+    if (config.descendants_per_alternative == 0) return error.InvalidCounterfactualDescendantBudget;
+    const failure = artifact.failures.items[failure_ordinal];
+    const failure_choice_end = @min(artifact.choices.items.len, std.math.cast(usize, failure.index) orelse artifact.choices.items.len);
+    const choice_start = failure_choice_end -| config.prefix_window;
+    var experiments: std.ArrayListUnmanaged(Experiment) = .empty;
+    errdefer experiments.deinit(allocator);
+    for (artifact.choices.items[choice_start..failure_choice_end], choice_start..) |record, choice_index| {
+        for (record.enabled_ids) |replacement_id| {
+            if (replacement_id == record.selected_id) continue;
+            var experiment: Experiment = .{
+                .choice_index = choice_index,
+                .original_id = record.selected_id,
+                .replacement_id = replacement_id,
+                .trials = config.descendants_per_alternative,
+                .same_failure_trials = 0,
+                .child_artifact_digest = 0,
+            };
+            for (0..config.descendants_per_alternative) |trial| {
+                const seed = ids.derive(
+                    "counterfactual-suffix",
+                    config.suffix_seed ^ replacement_id,
+                    @as(u64, @intCast(choice_index)) ^ @as(u64, @intCast(trial)),
+                );
+                var source = choice.Mutating.init(artifact.choices.items, choice_index, replacement_id, seed);
+                var child = try runner.run(Scenario, allocator, source.source(), runnerConfigFromArtifact(artifact));
+                defer child.deinit();
+                var replayed = try replay.exact(Scenario, allocator, &child);
+                replayed.deinit();
+                for (child.failures.items) |child_failure| {
+                    if (child_failure.fingerprint == failure.fingerprint) {
+                        experiment.same_failure_trials += 1;
+                        break;
+                    }
+                }
+                const encoded = try child.renderAlloc(allocator);
+                defer allocator.free(encoded);
+                experiment.child_artifact_digest = ids.derive(
+                    "counterfactual-child-set",
+                    experiment.child_artifact_digest,
+                    ids.digest(encoded),
+                );
+            }
+            try experiments.append(allocator, experiment);
+        }
+    }
+    return .{
+        .allocator = allocator,
+        .failure_fingerprint = failure.fingerprint,
+        .config = config,
+        .experiments = try experiments.toOwnedSlice(allocator),
+    };
+}
+
+fn runnerConfigFromArtifact(artifact: *const trace.Trace) runner.Config {
+    return .{
+        .system = artifact.header.system,
+        .seed = artifact.config.seed,
+        .transition_budget = artifact.config.transition_budget,
+        .resource_budget = artifact.config.resource_budget,
+        .fixture_hashes = artifact.config.fixture_hashes,
+        .feature_flags = artifact.config.feature_flags,
+        .backend_ids = artifact.config.backend_ids,
+        .scenario_parameters = artifact.config.scenario_parameters,
+        .source_revision = artifact.header.source_revision,
+        .target = artifact.header.target,
+        .optimize = artifact.header.optimize,
+    };
+}
 
 pub fn analyzeAlloc(
     allocator: std.mem.Allocator,
@@ -187,4 +306,58 @@ test "causal report retains active faults outcomes and shared resources" {
     const encoded = try report.renderAlloc(std.testing.allocator);
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"failure_identity\": \"broken\"") != null);
+}
+
+test "counterfactual report exact replays alternate descendants" {
+    const transition = @import("transition.zig");
+    const event = @import("event.zig");
+    const observation = @import("observation.zig");
+    const outcome = @import("outcome.zig");
+    const property = @import("property.zig");
+    const Scenario = struct {
+        const good_id = ids.stable("transition", "counterfactual.good");
+        const bad_id = ids.stable("transition", "counterfactual.bad");
+        const property_id = ids.stable("property", "counterfactual.safe");
+        pub const name: []const u8 = "counterfactual-test";
+        pub const version: u32 = 1;
+        pub const properties = &[_]property.Declaration{.{ .id = property_id, .name = "counterfactual.safe", .kind = .always }};
+        pub const World = struct { done: bool = false, bad: bool = false };
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(world: *World, list: *transition.List, allocator: std.mem.Allocator) !void {
+            if (world.done) return;
+            try list.append(allocator, .{ .id = good_id, .name = "counterfactual.good", .kind = .workload });
+            try list.append(allocator, .{ .id = bad_id, .name = "counterfactual.bad", .kind = .fault });
+        }
+        pub fn execute(world: *World, selected: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+            world.done = true;
+            world.bad = selected.id == bad_id;
+            return .applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {
+            try builder.addNamed(allocator, "bad", @intFromBool(world.bad));
+        }
+        pub fn evaluate(world: *World, sink: *property.Sink, allocator: std.mem.Allocator) !void {
+            try sink.check(allocator, property_id, !world.bad);
+        }
+        pub fn done(world: *World) bool {
+            return world.done;
+        }
+    };
+    var script = choice.Scripted{ .selections = &.{Scenario.bad_id} };
+    var artifact = try runner.run(Scenario, std.testing.allocator, script.source(), .{ .transition_budget = 1 });
+    defer artifact.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifact.failures.items.len);
+    var report = try analyzeCounterfactual(Scenario, std.testing.allocator, &artifact, 0, .{
+        .prefix_window = 1,
+        .descendants_per_alternative = 2,
+        .suffix_seed = 7,
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.experiments.len);
+    try std.testing.expectEqual(Scenario.good_id, report.experiments[0].replacement_id);
+    try std.testing.expectEqual(@as(usize, 0), report.experiments[0].same_failure_trials);
+    try std.testing.expect(report.experiments[0].child_artifact_digest != 0);
 }
