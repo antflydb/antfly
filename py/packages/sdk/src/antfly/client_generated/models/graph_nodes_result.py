@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_nodes_result_kind import GraphNodesResultKind
+
 if TYPE_CHECKING:
     from ..models.graph_query_stats import GraphQueryStats
     from ..models.graph_result_node import GraphResultNode
@@ -19,18 +21,22 @@ class GraphNodesResult:
     """Nodes and any materialized paths from a canonical traversal or path query.
 
     Attributes:
+        kind (GraphNodesResultKind): Stable discriminator for the graph result shape.
         nodes (list[GraphResultNode]): Result nodes.
         paths (list[Path]): Materialized result paths; empty when paths were not requested or produced.
         stats (GraphQueryStats):
         took (int): Query execution time.
     """
 
+    kind: GraphNodesResultKind
     nodes: list[GraphResultNode]
     paths: list[Path]
     stats: GraphQueryStats
     took: int
 
     def to_dict(self) -> dict[str, Any]:
+        kind = self.kind.value
+
         nodes = []
         for nodes_item_data in self.nodes:
             nodes_item = nodes_item_data.to_dict()
@@ -49,6 +55,7 @@ class GraphNodesResult:
 
         field_dict.update(
             {
+                "kind": kind,
                 "nodes": nodes,
                 "paths": paths,
                 "stats": stats,
@@ -65,6 +72,8 @@ class GraphNodesResult:
         from ..models.path import Path
 
         d = dict(src_dict)
+        kind = GraphNodesResultKind(d.pop("kind"))
+
         nodes = []
         _nodes = d.pop("nodes")
         for nodes_item_data in _nodes:
@@ -84,6 +93,7 @@ class GraphNodesResult:
         took = d.pop("took")
 
         graph_nodes_result = cls(
+            kind=kind,
             nodes=nodes,
             paths=paths,
             stats=stats,

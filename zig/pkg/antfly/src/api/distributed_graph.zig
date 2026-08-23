@@ -2025,10 +2025,9 @@ fn executeDistributedConjunctivePattern(
                 page_opts,
             );
             defer graph_pattern_mod.freeMatches(alloc, page_matches);
+            try collected_matches.ensureUnusedCapacity(alloc, page_matches.len);
             for (page_matches) |*match| {
-                try collected_matches.append(alloc, match.*);
-                match.bindings = &.{};
-                match.path = &.{};
+                collected_matches.appendAssumeCapacity(match.take());
             }
             if (collected_matches.items.len >= desired) {
                 truncated = true;

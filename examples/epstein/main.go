@@ -2096,6 +2096,19 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	if !ok {
 		return viz
 	}
+	graphValue, err := graph.ValueByDiscriminator()
+	if err != nil {
+		return viz
+	}
+	var resultNodes []antfly.GraphResultNode
+	switch result := graphValue.(type) {
+	case antfly.GraphNodesResult:
+		resultNodes = result.Nodes
+	case antfly.LegacyGraphQueryResult:
+		resultNodes = result.Nodes
+	default:
+		return viz
+	}
 
 	nodeByID := map[string]int{}
 	addNode := func(node GraphNode) {
@@ -2136,7 +2149,7 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 		viz.Edges = append(viz.Edges, edge)
 	}
 
-	for _, resultNode := range graph.Nodes {
+	for _, resultNode := range resultNodes {
 		addNode(graphNodeFromResult(resultNode))
 		for _, edge := range resultNode.PathEdges {
 			addEdge(GraphEdge{

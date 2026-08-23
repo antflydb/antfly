@@ -297,42 +297,50 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 }
 
 func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
+	var graphResult antfly.GraphQueryResult
+	err := graphResult.FromGraphNodesResult(antfly.GraphNodesResult{
+		Kind: antfly.GraphNodesResultKindNodes,
+		Nodes: []antfly.GraphResultNode{
+			{
+				Key:   "doc-a",
+				Depth: 0,
+				Document: map[string]any{
+					"title": "Alpha page",
+					"url":   "http://example.test/a.pdf",
+					"metadata": map[string]any{
+						"source_file": "court/source.pdf",
+						"page_number": float64(12),
+					},
+				},
+			},
+			{
+				Key:   "doc-b",
+				Depth: 1,
+				Document: map[string]any{
+					"title": "Beta page",
+				},
+				PathEdges: []antfly.PathEdge{
+					{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
+				},
+			},
+			{
+				Key:      "Jeffrey Epstein",
+				Depth:    1,
+				Distance: 0.5,
+				Path:     []string{"doc-a", "Jeffrey Epstein"},
+			},
+		},
+		Paths: []antfly.Path{},
+		Stats: antfly.GraphQueryStats{ReturnedItems: 3, Truncated: false},
+	})
+	if err != nil {
+		t.Fatalf("construct graph result: %v", err)
+	}
 	resp := antfly.QueryResponses{
 		Responses: []antfly.QueryResult{
 			{
 				GraphResults: map[string]antfly.GraphQueryResult{
-					"relations": {
-						Nodes: []antfly.GraphResultNode{
-							{
-								Key:   "doc-a",
-								Depth: 0,
-								Document: map[string]any{
-									"title": "Alpha page",
-									"url":   "http://example.test/a.pdf",
-									"metadata": map[string]any{
-										"source_file": "court/source.pdf",
-										"page_number": float64(12),
-									},
-								},
-							},
-							{
-								Key:   "doc-b",
-								Depth: 1,
-								Document: map[string]any{
-									"title": "Beta page",
-								},
-								PathEdges: []antfly.PathEdge{
-									{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
-								},
-							},
-							{
-								Key:      "Jeffrey Epstein",
-								Depth:    1,
-								Distance: 0.5,
-								Path:     []string{"doc-a", "Jeffrey Epstein"},
-							},
-						},
-					},
+					"relations": graphResult,
 				},
 			},
 		},

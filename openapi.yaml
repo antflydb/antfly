@@ -23161,11 +23161,17 @@ components:
       type: object
       additionalProperties: false
       required:
+        - kind
         - rows
         - stats
         - took
       description: Complete projected bindings from a canonical graph MATCH query.
       properties:
+        kind:
+          type: string
+          enum:
+            - bindings
+          description: Stable discriminator for the graph result shape.
         rows:
           type: array
           items:
@@ -23194,11 +23200,17 @@ components:
       type: object
       additionalProperties: false
       required:
+        - kind
         - aggregates
         - stats
         - took
       description: Complete exact aggregates from a canonical graph MATCH query.
       properties:
+        kind:
+          type: string
+          enum:
+            - aggregates
+          description: Stable discriminator for the graph result shape.
         aggregates:
           type: object
           additionalProperties:
@@ -23215,12 +23227,18 @@ components:
       type: object
       additionalProperties: false
       required:
+        - kind
         - nodes
         - paths
         - stats
         - took
       description: Nodes and any materialized paths from a canonical traversal or path query.
       properties:
+        kind:
+          type: string
+          enum:
+            - nodes
+          description: Stable discriminator for the graph result shape.
         nodes:
           type: array
           items:
@@ -23261,6 +23279,7 @@ components:
       additionalProperties: false
       deprecated: true
       required:
+        - kind
         - type
         - nodes
         - paths
@@ -23268,6 +23287,11 @@ components:
         - took
       description: Deprecated graph_searches response envelope.
       properties:
+        kind:
+          type: string
+          enum:
+            - legacy
+          description: Stable discriminator for the deprecated graph result shape.
         type:
           deprecated: true
           $ref: '#/components/schemas/GraphQueryType'
@@ -23309,6 +23333,13 @@ components:
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
         - $ref: '#/components/schemas/LegacyGraphQueryResult'
+      discriminator:
+        propertyName: kind
+        mapping:
+          bindings: '#/components/schemas/GraphBindingsResult'
+          aggregates: '#/components/schemas/GraphAggregatesResult'
+          nodes: '#/components/schemas/GraphNodesResult'
+          legacy: '#/components/schemas/LegacyGraphQueryResult'
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true

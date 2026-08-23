@@ -305,6 +305,7 @@ from .google_generator_config import GoogleGeneratorConfig
 from .graph_aggregate_value import GraphAggregateValue
 from .graph_aggregates_result import GraphAggregatesResult
 from .graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
+from .graph_aggregates_result_kind import GraphAggregatesResultKind
 from .graph_aggregates_return import GraphAggregatesReturn
 from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
@@ -326,6 +327,7 @@ from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from .graph_bindings_result import GraphBindingsResult
+from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
@@ -373,6 +375,7 @@ from .graph_match_node import GraphMatchNode
 from .graph_match_nodes import GraphMatchNodes
 from .graph_match_query import GraphMatchQuery
 from .graph_nodes_result import GraphNodesResult
+from .graph_nodes_result_kind import GraphNodesResultKind
 from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
@@ -608,6 +611,7 @@ from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
 from .legacy_graph_query_result import LegacyGraphQueryResult
+from .legacy_graph_query_result_kind import LegacyGraphQueryResultKind
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -1194,6 +1198,7 @@ __all__ = (
     "GoogleGeneratorConfig",
     "GraphAggregatesResult",
     "GraphAggregatesResultAggregates",
+    "GraphAggregatesResultKind",
     "GraphAggregatesReturn",
     "GraphAggregatesReturnAggregates",
     "GraphAggregateValue",
@@ -1216,6 +1221,7 @@ __all__ = (
     "GraphArtifactSourceConfigFormat",
     "GraphArtifactSourceConfigKind",
     "GraphBindingsResult",
+    "GraphBindingsResultKind",
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
@@ -1263,6 +1269,7 @@ __all__ = (
     "GraphMatchNodes",
     "GraphMatchQuery",
     "GraphNodesResult",
+    "GraphNodesResultKind",
     "GraphNotEqualPredicate",
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
@@ -1496,6 +1503,7 @@ __all__ = (
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
     "LegacyGraphQueryResult",
+    "LegacyGraphQueryResultKind",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",

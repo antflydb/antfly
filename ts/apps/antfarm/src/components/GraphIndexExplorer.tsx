@@ -55,6 +55,15 @@ type ExplorerEdge = GraphEdge & {
   pathEdge?: boolean;
 };
 
+type GraphVisualizationWireResult = {
+  kind?: "nodes" | "legacy";
+  type?: string;
+  nodes?: Extract<GraphQueryResult, { kind: "nodes" }>["nodes"];
+  paths?: Extract<GraphQueryResult, { kind: "nodes" }>["paths"];
+  stats?: { returned_items: number };
+  total?: number;
+};
+
 type ExplorerGraph = Omit<GraphData<ExplorerNodeMeta>, "edges"> & {
   edges: ExplorerEdge[];
 };
@@ -153,13 +162,32 @@ function addNode(
   });
 }
 
+function graphVisualizationResult(
+  result: GraphQueryResult | null
+): GraphVisualizationWireResult | null {
+  if (!result) return null;
+  if (result.kind === "nodes" || result.kind === "legacy") return result;
+
+  // Transitional compatibility for graph result envelopes emitted before the
+  // stable `kind` discriminator was introduced.
+  const legacy = result as unknown as GraphVisualizationWireResult;
+  if (legacy.kind === undefined && (legacy.nodes !== undefined || legacy.paths !== undefined)) {
+    return legacy;
+  }
+  return null;
+}
+
 function buildGraph(result: GraphQueryResult | null, startKey: string): ExplorerGraph {
   const nodes = new Map<string, GraphNode<ExplorerNodeMeta>>();
   const edges = new Map<string, ExplorerEdge>();
 
   if (startKey) addNode(nodes, startKey, { depth: 0 });
 
-  for (const node of result?.nodes ?? []) {
+  // The explorer renders traversal/path results. Bindings and aggregates are
+  // valid graph-query results, but do not have a node/path visualization.
+  const graphResult = graphVisualizationResult(result);
+
+  for (const node of graphResult?.nodes ?? []) {
     if (!node.key) continue;
     addNode(nodes, node.key, {
       depth: node.depth,
@@ -188,7 +216,7 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
     }
   }
 
-  for (const path of result?.paths ?? []) {
+  for (const path of graphResult?.paths ?? []) {
     for (const key of path.nodes ?? []) addNode(nodes, key, { resultCount: 1 });
     for (const edge of path.edges ?? []) {
       if (!edge.source || !edge.target) continue;
@@ -222,10 +250,29 @@ function nodeTypeColors() {
 
 function resultSummary(result: GraphQueryResult | null) {
   if (!result) return { total: 0, paths: 0 };
-  return {
-    total: result.nodes?.length ?? result.paths?.length ?? result.rows?.length ?? 0,
-    paths: result.paths?.length ?? 0,
-  };
+  const wireResult = result as GraphQueryResult & { kind?: GraphQueryResult["kind"] };
+  if (wireResult.kind === undefined) {
+    const legacy = graphVisualizationResult(result);
+    return {
+      total:
+        legacy?.total ??
+        legacy?.stats?.returned_items ??
+        legacy?.nodes?.length ??
+        legacy?.paths?.length ??
+        0,
+      paths: legacy?.paths?.length ?? 0,
+    };
+  }
+  switch (result.kind) {
+    case "nodes":
+      return { total: result.stats.returned_items, paths: result.paths.length };
+    case "bindings":
+      return { total: result.rows.length, paths: 0 };
+    case "aggregates":
+      return { total: Object.keys(result.aggregates).length, paths: 0 };
+    case "legacy":
+      return { total: result.total, paths: result.paths.length };
+  }
 }
 
 function coerceInteger(value: string, fallback: number, min: number, max: number) {

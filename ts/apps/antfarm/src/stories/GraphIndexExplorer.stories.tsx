@@ -60,6 +60,7 @@ const graphIndex = {
 } as unknown as IndexStatus;
 
 const traversalResult: GraphQueryResult = {
+  kind: "nodes",
   nodes: [
     {
       key: "paper:vector-db",
@@ -121,9 +122,14 @@ const traversalResult: GraphQueryResult = {
       ],
     },
   ],
+  paths: [],
+  stats: { returned_items: 4, truncated: false },
+  took: 2,
 };
 
 const shortestPathResult: GraphQueryResult = {
+  kind: "nodes",
+  nodes: [],
   paths: [
     {
       nodes: ["paper:graph-rag", "paper:agent-memory", "paper:entity-links"],
@@ -139,6 +145,8 @@ const shortestPathResult: GraphQueryResult = {
       total_weight: 0.63,
     },
   ],
+  stats: { returned_items: 1, truncated: false },
+  took: 1,
 };
 
 function graphResultFor(request: QueryRequest): GraphQueryResult {

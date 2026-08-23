@@ -88,6 +88,15 @@ pub const PatternMatch = struct {
     /// semantics.
     null_aliases: [][]u8 = &.{},
 
+    /// Transfer every owned slice out of this match and leave it safe to
+    /// deinitialize. Keeping the move operation with the owning type prevents
+    /// callers from overlooking newly added owned fields.
+    pub fn take(self: *PatternMatch) PatternMatch {
+        const owned = self.*;
+        self.* = .{ .bindings = &.{}, .path = &.{}, .null_aliases = &.{} };
+        return owned;
+    }
+
     pub fn deinit(self: *PatternMatch, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
@@ -97,6 +106,26 @@ pub const PatternMatch = struct {
         self.* = undefined;
     }
 };
+
+test "pattern match take transfers optional null alias ownership" {
+    const alloc = std.testing.allocator;
+    const null_aliases = try alloc.alloc([]u8, 1);
+    null_aliases[0] = try alloc.dupe(u8, "optional_alias");
+
+    var source: PatternMatch = .{
+        .bindings = @constCast((&[_]PatternBinding{})[0..]),
+        .path = @constCast((&[_]paths_mod.PathEdge{})[0..]),
+        .null_aliases = null_aliases,
+    };
+    var owned = source.take();
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), source.bindings.len);
+    try std.testing.expectEqual(@as(usize, 0), source.path.len);
+    try std.testing.expectEqual(@as(usize, 0), source.null_aliases.len);
+    try std.testing.expectEqualStrings("optional_alias", owned.null_aliases[0]);
+    source.deinit(alloc);
+}
 
 pub const MatchNode = struct {
     alias: []const u8,

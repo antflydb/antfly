@@ -6487,7 +6487,7 @@ test "retrieval agent supports inline tree search" {
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
                 ),
             };
         }
@@ -6534,7 +6534,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
                 ),
             };
         }
@@ -6616,7 +6616,7 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
                 ),
             };
         }
@@ -7246,7 +7246,7 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
     const alloc = std.testing.allocator;
 
     const response_json =
-        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[
+        \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[
         \\{"key":"doc:b","depth":1,"document":{"title":"branch b"}},
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
@@ -7892,7 +7892,7 @@ test "retrieval agent streaming emits go-shaped tree search progress" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"stats":{"returned_items":1,"truncated":false},"took":1}}}]}
                 ),
             };
         }

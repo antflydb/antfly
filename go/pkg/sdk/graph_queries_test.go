@@ -247,6 +247,39 @@ func TestGraphAggregateConstructorAllowsDuplicateExpressionsUnderDifferentNames(
 	}
 }
 
+func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
+	var result GraphQueryResult
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"took":1}`), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	kind, err := result.Discriminator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != "nodes" {
+		t.Fatalf("kind = %q, want nodes", kind)
+	}
+	value, err := result.ValueByDiscriminator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, ok := value.(GraphNodesResult)
+	if !ok {
+		t.Fatalf("result = %T, want GraphNodesResult", value)
+	}
+	if nodes.Kind != GraphNodesResultKindNodes {
+		t.Fatalf("nodes kind = %q, want nodes", nodes.Kind)
+	}
+
+	if err := json.Unmarshal([]byte(`{"kind":"unknown"}`), &result); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := result.ValueByDiscriminator(); err == nil {
+		t.Fatal("expected unknown graph result kind to fail")
+	}
+}
+
 func TestGraphMatchConstructorRequiresDeclaredSourceAnchor(t *testing.T) {
 	graphReturn, err := NewGraphBindingsReturn([]string{"a"}, GraphBindingsOptions{})
 	if err != nil {

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.graph_query_type import GraphQueryType
+from ..models.legacy_graph_query_result_kind import LegacyGraphQueryResultKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ class LegacyGraphQueryResult:
     """Deprecated graph_searches response envelope.
 
     Attributes:
+        kind (LegacyGraphQueryResultKind): Stable discriminator for the deprecated graph result shape.
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
         nodes (list[GraphResultNode]): Result nodes.
         paths (list[Path]): Result paths.
@@ -30,6 +32,7 @@ class LegacyGraphQueryResult:
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
     """
 
+    kind: LegacyGraphQueryResultKind
     type_: GraphQueryType
     nodes: list[GraphResultNode]
     paths: list[Path]
@@ -38,6 +41,8 @@ class LegacyGraphQueryResult:
     matches: list[PatternMatch] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        kind = self.kind.value
+
         type_ = self.type_.value
 
         nodes = []
@@ -65,6 +70,7 @@ class LegacyGraphQueryResult:
 
         field_dict.update(
             {
+                "kind": kind,
                 "type": type_,
                 "nodes": nodes,
                 "paths": paths,
@@ -84,6 +90,8 @@ class LegacyGraphQueryResult:
         from ..models.pattern_match import PatternMatch
 
         d = dict(src_dict)
+        kind = LegacyGraphQueryResultKind(d.pop("kind"))
+
         type_ = GraphQueryType(d.pop("type"))
 
         nodes = []
@@ -114,6 +122,7 @@ class LegacyGraphQueryResult:
                 matches.append(matches_item)
 
         legacy_graph_query_result = cls(
+            kind=kind,
             type_=type_,
             nodes=nodes,
             paths=paths,

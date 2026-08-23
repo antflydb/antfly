@@ -12203,6 +12203,11 @@ export interface components {
         };
         /** @description Complete projected bindings from a canonical graph MATCH query. */
         GraphBindingsResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "bindings";
             rows: components["schemas"]["GraphResultRow"][];
             stats: components["schemas"]["GraphQueryStats"];
             /**
@@ -12218,6 +12223,11 @@ export interface components {
         };
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "aggregates";
             aggregates: {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
@@ -12230,6 +12240,11 @@ export interface components {
         };
         /** @description Nodes and any materialized paths from a canonical traversal or path query. */
         GraphNodesResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "nodes";
             /** @description Result nodes. */
             nodes: components["schemas"]["GraphResultNode"][];
             /** @description Materialized result paths; empty when paths were not requested or produced. */
@@ -12256,6 +12271,11 @@ export interface components {
          * @description Deprecated graph_searches response envelope.
          */
         LegacyGraphQueryResult: {
+            /**
+             * @description Stable discriminator for the deprecated graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "legacy";
             /** @deprecated */
             type: components["schemas"]["GraphQueryType"];
             /** @description Result nodes. */

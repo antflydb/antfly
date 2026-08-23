@@ -1181,6 +1181,8 @@ pub const GraphAggregateValue = struct {
 
 /// Complete exact aggregates from a canonical graph MATCH query.
 pub const GraphAggregatesResult = struct {
+    /// Stable discriminator for the graph result shape.
+    kind: []const u8,
     aggregates: std.json.ArrayHashMap(GraphAggregateValue),
     stats: GraphQueryStats,
     /// Query execution time.
@@ -1248,6 +1250,8 @@ pub const GraphArtifactSourceConfig = struct {
 
 /// Complete projected bindings from a canonical graph MATCH query.
 pub const GraphBindingsResult = struct {
+    /// Stable discriminator for the graph result shape.
+    kind: []const u8,
     rows: []const GraphResultRow,
     stats: GraphQueryStats,
     /// Query execution time.
@@ -1765,6 +1769,8 @@ pub const GraphNodeSelector = union(enum) {
 
 /// Nodes and any materialized paths from a canonical traversal or path query.
 pub const GraphNodesResult = struct {
+    /// Stable discriminator for the graph result shape.
+    kind: []const u8,
     /// Result nodes.
     nodes: []const GraphResultNode,
     /// Materialized result paths; empty when paths were not requested or produced.
@@ -1883,27 +1889,10 @@ pub const GraphQueryParams = struct {
 
 /// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
 pub const GraphQueryResult = union(enum) {
-    legacy_graph_query_result: *LegacyGraphQueryResult,
-    graph_nodes_result: *GraphNodesResult,
-    graph_aggregates_result: *GraphAggregatesResult,
-    graph_bindings_result: *GraphBindingsResult,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
+    graph_bindings_result: GraphBindingsResult,
+    graph_aggregates_result: GraphAggregatesResult,
+    graph_nodes_result: GraphNodesResult,
+    legacy_graph_query_result: LegacyGraphQueryResult,
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -1912,47 +1901,32 @@ pub const GraphQueryResult = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "nodes",
-            "paths",
-            "matches",
-            "total",
-            "took",
-        })) {
-            if (try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options)) |parsed| return .{ .legacy_graph_query_result = parsed };
+        const disc_val = source.object.get("kind") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            return .{ .graph_bindings_result = try std.json.parseFromValueLeaky(GraphBindingsResult, allocator, source, options) };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "nodes",
-            "paths",
-            "stats",
-            "took",
-        })) {
-            if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            return .{ .graph_aggregates_result = try std.json.parseFromValueLeaky(GraphAggregatesResult, allocator, source, options) };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "aggregates",
-            "stats",
-            "took",
-        })) {
-            if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            return .{ .graph_nodes_result = try std.json.parseFromValueLeaky(GraphNodesResult, allocator, source, options) };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "rows",
-            "stats",
-            "took",
-        })) {
-            if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            return .{ .legacy_graph_query_result = try std.json.parseFromValueLeaky(LegacyGraphQueryResult, allocator, source, options) };
         }
         return error.UnexpectedToken;
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
-            .legacy_graph_query_result => |v| try jw.write(v.*),
-            .graph_nodes_result => |v| try jw.write(v.*),
-            .graph_aggregates_result => |v| try jw.write(v.*),
-            .graph_bindings_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v),
+            .graph_aggregates_result => |v| try jw.write(v),
+            .graph_nodes_result => |v| try jw.write(v),
+            .legacy_graph_query_result => |v| try jw.write(v),
         }
     }
 };
@@ -2546,6 +2520,8 @@ pub const LegacyGraphQuery = struct {
 
 /// Deprecated graph_searches response envelope.
 pub const LegacyGraphQueryResult = struct {
+    /// Stable discriminator for the deprecated graph result shape.
+    kind: []const u8,
     type: GraphQueryType,
     /// Result nodes.
     nodes: []const GraphResultNode,

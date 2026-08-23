@@ -17874,7 +17874,7 @@ test "parseRemoteSearchResult preserves grouped hierarchy matches" {
 test "parseRemoteSearchResult preserves typed graph rows and hydrated documents" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"messages"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"kind":"bindings","rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"messages"}]}
     );
     defer result.deinit();
 

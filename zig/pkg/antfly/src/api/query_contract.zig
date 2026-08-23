@@ -5289,8 +5289,8 @@ fn toOpenApiGraphQueryResult(
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
     if (query.legacy_response) {
-        const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
-        response.* = .{
+        const response: indexes_openapi.LegacyGraphQueryResult = .{
+            .kind = "legacy",
             .type = legacyGraphQueryType(query.query_type),
             .nodes = try toOpenApiGraphNodes(alloc, graph_result),
             .paths = try toOpenApiPaths(alloc, graph_result.paths),
@@ -5306,8 +5306,8 @@ fn toOpenApiGraphQueryResult(
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
         const rows = try toOpenApiGraphRows(alloc, graph_result);
-        const response = try alloc.create(indexes_openapi.GraphBindingsResult);
-        response.* = .{
+        const response: indexes_openapi.GraphBindingsResult = .{
+            .kind = "bindings",
             .rows = rows,
             .stats = .{
                 .returned_items = @intCast(rows.len),
@@ -5319,8 +5319,8 @@ fn toOpenApiGraphQueryResult(
     }
     if (query.aggregates.len > 0) {
         const aggregates = try toOpenApiGraphAggregates(alloc, query, graph_result);
-        const response = try alloc.create(indexes_openapi.GraphAggregatesResult);
-        response.* = .{
+        const response: indexes_openapi.GraphAggregatesResult = .{
+            .kind = "aggregates",
             .aggregates = aggregates,
             .stats = .{
                 .returned_items = @intCast(aggregates.map.count()),
@@ -5333,8 +5333,8 @@ fn toOpenApiGraphQueryResult(
 
     const nodes = try toOpenApiGraphNodes(alloc, graph_result);
     const paths = try toOpenApiPaths(alloc, graph_result.paths);
-    const response = try alloc.create(indexes_openapi.GraphNodesResult);
-    response.* = .{
+    const response: indexes_openapi.GraphNodesResult = .{
+        .kind = "nodes",
         .nodes = nodes,
         .paths = paths,
         .stats = .{

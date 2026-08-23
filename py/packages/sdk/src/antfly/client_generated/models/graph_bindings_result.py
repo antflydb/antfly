@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_bindings_result_kind import GraphBindingsResultKind
+
 if TYPE_CHECKING:
     from ..models.graph_query_stats import GraphQueryStats
     from ..models.graph_result_row import GraphResultRow
@@ -18,16 +20,20 @@ class GraphBindingsResult:
     """Complete projected bindings from a canonical graph MATCH query.
 
     Attributes:
+        kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
         rows (list[GraphResultRow]):
         stats (GraphQueryStats):
         took (int): Query execution time.
     """
 
+    kind: GraphBindingsResultKind
     rows: list[GraphResultRow]
     stats: GraphQueryStats
     took: int
 
     def to_dict(self) -> dict[str, Any]:
+        kind = self.kind.value
+
         rows = []
         for rows_item_data in self.rows:
             rows_item = rows_item_data.to_dict()
@@ -41,6 +47,7 @@ class GraphBindingsResult:
 
         field_dict.update(
             {
+                "kind": kind,
                 "rows": rows,
                 "stats": stats,
                 "took": took,
@@ -55,6 +62,8 @@ class GraphBindingsResult:
         from ..models.graph_result_row import GraphResultRow
 
         d = dict(src_dict)
+        kind = GraphBindingsResultKind(d.pop("kind"))
+
         rows = []
         _rows = d.pop("rows")
         for rows_item_data in _rows:
@@ -67,6 +76,7 @@ class GraphBindingsResult:
         took = d.pop("took")
 
         graph_bindings_result = cls(
+            kind=kind,
             rows=rows,
             stats=stats,
             took=took,

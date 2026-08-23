@@ -304,6 +304,14 @@ type (
 	PatternEdgeStep                = oapi.PatternEdgeStep
 	PatternMatch                   = oapi.PatternMatch
 	GraphQueryResult               = oapi.GraphQueryResult
+	GraphBindingsResult            = oapi.GraphBindingsResult
+	GraphBindingsResultKind        = oapi.GraphBindingsResultKind
+	GraphAggregatesResult          = oapi.GraphAggregatesResult
+	GraphAggregatesResultKind      = oapi.GraphAggregatesResultKind
+	GraphNodesResult               = oapi.GraphNodesResult
+	GraphNodesResultKind           = oapi.GraphNodesResultKind
+	LegacyGraphQueryResult         = oapi.LegacyGraphQueryResult
+	LegacyGraphQueryResultKind     = oapi.LegacyGraphQueryResultKind
 	GraphQueryStats                = oapi.GraphQueryStats
 	GraphNodeSelector              = oapi.GraphNodeSelector
 	GraphKeyNodeSelector           = oapi.GraphKeyNodeSelector
@@ -480,6 +488,11 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 const (
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
+
+	GraphBindingsResultKindBindings     = oapi.GraphBindingsResultKindBindings
+	GraphAggregatesResultKindAggregates = oapi.GraphAggregatesResultKindAggregates
+	GraphNodesResultKindNodes           = oapi.GraphNodesResultKindNodes
+	LegacyGraphQueryResultKindLegacy    = oapi.LegacyGraphQueryResultKindLegacy
 
 	HierarchyArtifactKindAsset           = oapi.HierarchyArtifactKindAsset
 	HierarchyArtifactKindChunk           = oapi.HierarchyArtifactKindChunk
