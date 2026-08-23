@@ -800,8 +800,12 @@ retry, publication, reconciliation, and client crash. Object-backed WAL append
 now also accepts a durable caller-supplied operation identity: retry after an
 ambiguous timeout returns the original LSN, conflicting reuse fails closed,
 and the identity survives read and truncation. Stores that cannot uphold the
-contract reject idempotent append instead of silently degrading it. Next,
-reuse `ScriptedFaultClient` in the full backup/restore workflow.
+contract reject idempotent append instead of silently degrading it. The full
+HA seed backup/restore workflow uses the same provider: a committed chunk with
+a lost response is reconciled by a restarted publisher, repeated publication
+selects the same generation, cancellation before restore staging is harmless,
+and retry downloads and verifies the complete chunked artifact. Extend these
+protocol campaigns when new production object-store consumers are introduced.
 
 ### 5. Admission and Resource Pressure
 
