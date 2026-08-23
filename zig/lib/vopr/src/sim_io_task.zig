@@ -31,6 +31,7 @@ pub const Status = enum {
     waiting_group,
     waiting_sleep,
     waiting_futex,
+    waiting_external,
     finished,
 };
 
@@ -57,6 +58,12 @@ const FutexIdentity = struct {
     id: ids.StableId,
 };
 
+const ExternalWake = struct {
+    resource_id: ids.StableId,
+    remaining: u32,
+    sequence: u64,
+};
+
 const Task = struct {
     kernel: *Kernel,
     id: ids.StableId,
@@ -76,6 +83,7 @@ const Task = struct {
     waiting_on_group: ?*GroupState = null,
     sleep: ?Sleep = null,
     futex_ptr: ?*const u32 = null,
+    external_id: ?ids.StableId = null,
     futex_uncancelable: bool = false,
     cancel_requested: bool = false,
     cancel_acknowledged: bool = false,
@@ -99,6 +107,7 @@ const Task = struct {
         self.status = .runnable;
         self.sleep = null;
         self.futex_ptr = null;
+        self.external_id = null;
         self.futex_uncancelable = false;
         self.resume_generation +|= 1;
     }
@@ -152,7 +161,7 @@ const Entry = struct {
 pub const Execution = struct {
     task_id: ids.StableId,
     completed: bool,
-    kind: enum { task, futex_wake },
+    kind: enum { task, futex_wake, external_wake },
 };
 
 pub const Kernel = struct {
@@ -165,6 +174,7 @@ pub const Kernel = struct {
     groups: std.ArrayListUnmanaged(*GroupState) = .empty,
     futex_wakes: std.ArrayListUnmanaged(FutexWake) = .empty,
     futex_identities: std.ArrayListUnmanaged(FutexIdentity) = .empty,
+    external_wakes: std.ArrayListUnmanaged(ExternalWake) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Kernel {
         if (config.stack_size < 64 * 1024) return error.SimIoStackTooSmall;
@@ -183,6 +193,7 @@ pub const Kernel = struct {
         self.groups.deinit(self.allocator);
         self.futex_wakes.deinit(self.allocator);
         self.futex_identities.deinit(self.allocator);
+        self.external_wakes.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -198,7 +209,9 @@ pub const Kernel = struct {
 
     pub fn isQuiescent(self: *const Kernel) bool {
         for (self.tasks.items) |task| if (task.status != .finished) return false;
-        return self.futex_wakes.items.len == 0;
+        for (self.futex_wakes.items) |wake| if (self.hasFutexWaiter(wake.ptr)) return false;
+        for (self.external_wakes.items) |wake| if (self.hasExternalWaiter(wake.resource_id)) return false;
+        return true;
     }
 
     pub fn async(
@@ -402,13 +415,36 @@ pub const Kernel = struct {
     }
 
     pub fn futexWake(self: *Kernel, ptr: *const u32, max_waiters: u32) !void {
-        if (max_waiters == 0) return;
+        if (max_waiters == 0 or !self.hasFutexWaiter(ptr)) return;
         _ = try self.ensureFutexIdentity(ptr);
         const sequence = try self.allocateSequence();
         try self.futex_wakes.append(self.allocator, .{
             .ptr = ptr,
             .remaining = max_waiters,
             .sequence = sequence,
+        });
+    }
+
+    /// Park the current fiber on a simulator-owned logical resource. The
+    /// resource ID must be derived from stable modeled state, never a pointer.
+    pub fn waitExternal(self: *Kernel, resource_id: ids.StableId) !void {
+        const task = self.current orelse return error.SimIoOperationOutsideTask;
+        try task.checkCancel();
+        task.external_id = resource_id;
+        task.status = .waiting_external;
+        self.yieldCurrent(task);
+        try task.checkCancel();
+    }
+
+    /// Make waking an external waiter a scheduler-visible choice. A wake with
+    /// no current waiter is intentionally discarded; modeled resources retain
+    /// their own readiness state, so a later consumer observes it immediately.
+    pub fn wakeExternal(self: *Kernel, resource_id: ids.StableId, max_waiters: u32) !void {
+        if (max_waiters == 0 or !self.hasExternalWaiter(resource_id)) return;
+        try self.external_wakes.append(self.allocator, .{
+            .resource_id = resource_id,
+            .remaining = max_waiters,
+            .sequence = try self.allocateSequence(),
         });
     }
 
@@ -437,9 +473,23 @@ pub const Kernel = struct {
                 });
             }
         }
+        for (self.external_wakes.items) |wake| {
+            for (self.tasks.items) |task| {
+                if (task.status != .waiting_external or task.external_id != wake.resource_id) continue;
+                try list.append(allocator, .{
+                    .id = ids.derive("sim-io.external-wake", task.id, wake.sequence),
+                    .name = "sim-io.external_wake",
+                    .kind = .scheduler,
+                    .actor_id = task.id,
+                    .resource_id = wake.resource_id,
+                    .parameter = wake.remaining,
+                });
+            }
+        }
     }
 
     pub fn executeReady(self: *Kernel, transition_id: ids.StableId) !?Execution {
+        self.pruneStaleWakes();
         for (self.tasks.items) |task| {
             if (task.status != .runnable or task.transitionId() != transition_id) continue;
             task.status = .running;
@@ -465,6 +515,18 @@ pub const Kernel = struct {
                     _ = self.futex_wakes.orderedRemove(wake_index);
                 }
                 return .{ .task_id = task_id, .completed = false, .kind = .futex_wake };
+            }
+        }
+        for (self.external_wakes.items, 0..) |*wake, wake_index| {
+            for (self.tasks.items) |task| {
+                if (task.status != .waiting_external or task.external_id != wake.resource_id or
+                    ids.derive("sim-io.external-wake", task.id, wake.sequence) != transition_id) continue;
+                task.makeRunnable();
+                const task_id = task.id;
+                wake.remaining -= 1;
+                if (wake.remaining == 0 or !self.hasExternalWaiter(wake.resource_id))
+                    _ = self.external_wakes.orderedRemove(wake_index);
+                return .{ .task_id = task_id, .completed = false, .kind = .external_wake };
             }
         }
         return null;
@@ -639,6 +701,28 @@ pub const Kernel = struct {
             if (task.status == .waiting_futex and task.futex_ptr == ptr) return true;
         }
         return false;
+    }
+
+    fn hasExternalWaiter(self: *const Kernel, resource_id: ids.StableId) bool {
+        for (self.tasks.items) |task| {
+            if (task.status == .waiting_external and task.external_id == resource_id) return true;
+        }
+        return false;
+    }
+
+    fn pruneStaleWakes(self: *Kernel) void {
+        var futex_index: usize = 0;
+        while (futex_index < self.futex_wakes.items.len) {
+            if (!self.hasFutexWaiter(self.futex_wakes.items[futex_index].ptr)) {
+                _ = self.futex_wakes.orderedRemove(futex_index);
+            } else futex_index += 1;
+        }
+        var external_index: usize = 0;
+        while (external_index < self.external_wakes.items.len) {
+            if (!self.hasExternalWaiter(self.external_wakes.items[external_index].resource_id)) {
+                _ = self.external_wakes.orderedRemove(external_index);
+            } else external_index += 1;
+        }
     }
 
     fn ensureFutexIdentity(self: *Kernel, ptr: *const u32) !ids.StableId {

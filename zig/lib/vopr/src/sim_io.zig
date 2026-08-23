@@ -17,6 +17,7 @@ const event = @import("event.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
 const file_mod = @import("sim_io_file.zig");
+const net_mod = @import("sim_io_net.zig");
 const task_mod = @import("sim_io_task.zig");
 const transition = @import("transition.zig");
 
@@ -77,6 +78,7 @@ pub const supported_capabilities = CapabilitySet.of(&.{
     .synchronization,
     .sleep,
     .files,
+    .sockets,
 });
 
 pub const Metadata = struct {
@@ -182,6 +184,8 @@ pub const Config = struct {
     tasks: task_mod.Config = .{},
     file_allocator: std.mem.Allocator = std.heap.page_allocator,
     files: file_mod.Config = .{},
+    net_allocator: std.mem.Allocator = std.heap.page_allocator,
+    network: net_mod.Config = .{},
 };
 
 pub const InitError = error{
@@ -190,6 +194,8 @@ pub const InitError = error{
     SimIoStackTooSmall,
     InvalidSimIoTaskLimit,
     InvalidSimIoFileHandleLimit,
+    InvalidSimIoSocketLimit,
+    InvalidSimIoStreamCapacity,
 };
 
 pub const SimIo = struct {
@@ -205,6 +211,7 @@ pub const SimIo = struct {
     first_violation: ?CapabilityViolation = null,
     tasks: task_mod.Kernel,
     files: file_mod.FileSystem,
+    network: net_mod.Network,
 
     pub fn init(config: Config) InitError!SimIo {
         if (!supported_capabilities.containsAll(config.required)) {
@@ -215,6 +222,11 @@ pub const SimIo = struct {
             else => return error.OutOfMemory,
         };
         errdefer files.deinit();
+        var network = net_mod.Network.init(config.net_allocator, config.network) catch |err| switch (err) {
+            error.InvalidSimIoSocketLimit => return error.InvalidSimIoSocketLimit,
+            error.InvalidSimIoStreamCapacity => return error.InvalidSimIoStreamCapacity,
+        };
+        errdefer network.deinit();
         return .{
             .prng = std.Random.DefaultPrng.init(config.seed),
             .monotonic_ns = config.monotonic_ns,
@@ -223,20 +235,24 @@ pub const SimIo = struct {
             .thread_cpu_ns = config.thread_cpu_ns,
             .tasks = try task_mod.Kernel.init(config.task_allocator, config.tasks),
             .files = files,
+            .network = network,
         };
     }
 
     pub fn deinit(self: *SimIo) void {
         self.tasks.deinit();
         self.files.deinit();
+        self.network.deinit();
         self.* = undefined;
     }
 
     pub fn io(self: *SimIo) std.Io {
+        self.bindNetwork();
         return .{ .userdata = self, .vtable = &vtable };
     }
 
     pub fn scheduler(self: *SimIo) runtime_mod.SchedulerPort {
+        self.bindNetwork();
         return .{ .ptr = self, .vtable = &scheduler_vtable };
     }
 
@@ -298,6 +314,25 @@ pub const SimIo = struct {
     fn timeAdvanceId(delta_ns: u64) ids.StableId {
         return ids.derive("sim-io.time-advance", ids.stable("sim-io", "global-time"), delta_ns);
     }
+
+    fn bindNetwork(self: *SimIo) void {
+        self.network.bindWaitPort(.{ .ptr = &self.tasks, .vtable = &network_wait_vtable });
+    }
+};
+
+fn networkWait(ptr: *anyopaque, resource_id: ids.StableId) !void {
+    const kernel: *task_mod.Kernel = @ptrCast(@alignCast(ptr));
+    return kernel.waitExternal(resource_id);
+}
+
+fn networkWake(ptr: *anyopaque, resource_id: ids.StableId, max_waiters: u32) !void {
+    const kernel: *task_mod.Kernel = @ptrCast(@alignCast(ptr));
+    return kernel.wakeExternal(resource_id, max_waiters);
+}
+
+const network_wait_vtable: net_mod.WaitPort.VTable = .{
+    .wait = networkWait,
+    .wake = networkWake,
 };
 
 fn state(userdata: ?*anyopaque) *SimIo {
@@ -780,23 +815,110 @@ fn randomSecure(userdata: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!vo
     random(userdata, buffer);
 }
 
+fn netListenIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ListenOptions) std.Io.net.IpAddress.ListenError!std.Io.net.Socket {
+    return state(userdata).network.listenIp(address, options);
+}
+
+fn netAccept(userdata: ?*anyopaque, server: std.Io.net.Socket.Handle, _: std.Io.net.Server.AcceptOptions) std.Io.net.Server.AcceptError!std.Io.net.Socket {
+    return state(userdata).network.accept(server);
+}
+
+fn netBindIp(userdata: ?*anyopaque, _: *const std.Io.net.IpAddress, _: std.Io.net.IpAddress.BindOptions) std.Io.net.IpAddress.BindError!std.Io.net.Socket {
+    state(userdata).latch(.network_send);
+    return error.OptionUnsupported;
+}
+
+fn netConnectIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+    return state(userdata).network.connectIp(address, options);
+}
+
+fn netListenUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress, options: std.Io.net.UnixAddress.ListenOptions) std.Io.net.UnixAddress.ListenError!std.Io.net.Socket.Handle {
+    return state(userdata).network.listenUnix(address, options);
+}
+
+fn netConnectUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
+    return state(userdata).network.connectUnix(address);
+}
+
+fn netSocketCreatePair(userdata: ?*anyopaque, options: std.Io.net.Socket.CreatePairOptions) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
+    return state(userdata).network.createPair(options);
+}
+
 fn netSend(userdata: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []std.Io.net.OutgoingMessage, _: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {
     state(userdata).latch(.network_send);
     return .{ error.NetworkDown, 0 };
 }
 
-fn netClose(userdata: ?*anyopaque, _: []const std.Io.net.Socket.Handle) void {
-    state(userdata).latch(.network_close);
+fn netRead(userdata: ?*anyopaque, source: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+    return state(userdata).network.read(source, data);
 }
 
-fn netInterfaceName(userdata: ?*anyopaque, _: std.Io.net.Interface) std.Io.net.Interface.NameError!std.Io.net.Interface.Name {
-    state(userdata).latch(.network_interface_name);
+fn netWrite(userdata: ?*anyopaque, destination: std.Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
+    return state(userdata).network.write(destination, header, data, splat);
+}
+
+fn netWriteFile(userdata: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u8, _: *std.Io.File.Reader, _: std.Io.Limit) std.Io.net.Stream.Writer.WriteFileError!usize {
+    state(userdata).latch(.network_send);
+    return error.NetworkDown;
+}
+
+fn netClose(userdata: ?*anyopaque, handles: []const std.Io.net.Socket.Handle) void {
+    const self = state(userdata);
+    if (!self.network.close(handles)) self.latch(.network_close);
+}
+
+fn netShutdown(userdata: ?*anyopaque, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+    return state(userdata).network.shutdown(handle, how);
+}
+
+fn netInterfaceNameResolve(_: ?*anyopaque, name: *const std.Io.net.Interface.Name) std.Io.net.Interface.Name.ResolveError!std.Io.net.Interface {
+    if (std.mem.eql(u8, name.toSlice(), "lo")) return .{ .index = 1 };
     return error.InterfaceNotFound;
+}
+
+fn netInterfaceName(_: ?*anyopaque, interface: std.Io.net.Interface) std.Io.net.Interface.NameError!std.Io.net.Interface.Name {
+    if (interface.index != 1) return error.InterfaceNotFound;
+    return std.Io.net.Interface.Name.fromSlice("lo") catch return error.NameTooLong;
+}
+
+fn netLookup(userdata: ?*anyopaque, host_name: std.Io.net.HostName, resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult), options: std.Io.net.HostName.LookupOptions) std.Io.net.HostName.LookupError!void {
+    const self = state(userdata);
+    const io = self.io();
+    defer resolved.close(io);
+    const address: std.Io.net.IpAddress = blk: {
+        if (std.Io.net.IpAddress.parseIp4(host_name.bytes, options.port)) |parsed| {
+            if (options.family == .ip6) return error.UnknownHostName;
+            break :blk parsed;
+        } else |_| {}
+        if (std.Io.net.IpAddress.parseIp6(host_name.bytes, options.port)) |parsed| {
+            if (options.family == .ip4) return error.UnknownHostName;
+            break :blk parsed;
+        } else |_| {}
+        if (!std.ascii.eqlIgnoreCase(host_name.bytes, "localhost") and
+            !std.ascii.eqlIgnoreCase(host_name.bytes, "localhost.")) return error.UnknownHostName;
+        break :blk if (options.family == .ip6)
+            .{ .ip6 = .loopback(options.port) }
+        else
+            .{ .ip4 = .loopback(options.port) };
+    };
+    resolved.putOne(io, .{ .address = address }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => unreachable,
+    };
+    if (options.canonical_name_buffer) |buffer| {
+        const name = if (std.ascii.endsWithIgnoreCase(host_name.bytes, ".")) host_name.bytes[0 .. host_name.bytes.len - 1] else host_name.bytes;
+        @memcpy(buffer[0..name.len], name);
+        resolved.putOne(io, .{ .canonical_name = std.Io.net.HostName.init(buffer[0..name.len]) catch unreachable }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => unreachable,
+        };
+    }
 }
 
 fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Allocator) !void {
     const self: *SimIo = @ptrCast(@alignCast(ptr));
     try self.tasks.enumerateReady(list, allocator);
+    try self.network.enumerateReady(list, allocator);
     if (self.tasks.nextWakeDelta(self.monotonic_ns, self.realtime_ns)) |delta_ns| {
         if (delta_ns == 0) return error.SimIoDueTimerNotWoken;
         try list.append(allocator, .{
@@ -817,15 +939,22 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
             .id = ids.stable("event", switch (execution.kind) {
                 .task => if (execution.completed) "sim-io.task_completed" else "sim-io.task_parked",
                 .futex_wake => "sim-io.futex_waiter_selected",
+                .external_wake => "sim-io.external_waiter_selected",
             }),
             .name = switch (execution.kind) {
                 .task => if (execution.completed) "sim-io.task_completed" else "sim-io.task_parked",
                 .futex_wake => "sim-io.futex_waiter_selected",
+                .external_wake => "sim-io.external_waiter_selected",
             },
             .kind = .state_change,
             .actor_id = execution.task_id,
             .resource_id = execution.task_id,
         });
+        return;
+    }
+
+    if (try self.network.executeReady(transition_id, sink, allocator)) {
+        try self.ensureNoCapabilityViolation();
         return;
     }
 
@@ -845,7 +974,7 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
 
 fn quiescent(ptr: *anyopaque) bool {
     const self: *SimIo = @ptrCast(@alignCast(ptr));
-    return self.tasks.isQuiescent();
+    return self.tasks.isQuiescent() and self.network.isQuiescent();
 }
 
 const scheduler_vtable: runtime_mod.SchedulerPort.VTable = .{
@@ -943,20 +1072,33 @@ const vtable: std.Io.VTable = blk: {
     result.sleep = sleep;
     result.random = random;
     result.randomSecure = randomSecure;
+    result.netListenIp = netListenIp;
+    result.netAccept = netAccept;
+    result.netBindIp = netBindIp;
+    result.netConnectIp = netConnectIp;
+    result.netListenUnix = netListenUnix;
+    result.netConnectUnix = netConnectUnix;
+    result.netSocketCreatePair = netSocketCreatePair;
     result.netSend = netSend;
+    result.netRead = netRead;
+    result.netWrite = netWrite;
+    result.netWriteFile = netWriteFile;
     result.netClose = netClose;
+    result.netShutdown = netShutdown;
+    result.netInterfaceNameResolve = netInterfaceNameResolve;
     result.netInterfaceName = netInterfaceName;
+    result.netLookup = netLookup;
     break :blk result;
 };
 
 test "SimIo capability construction fails before exposing unsupported services" {
-    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files }));
+    try SimIo.require(.of(&.{ .clock_read, .deterministic_entropy, .files, .sockets }));
     try std.testing.expectError(
         error.UnsupportedSimIoCapabilities,
-        SimIo.init(.{ .required = .of(&.{.sockets}) }),
+        SimIo.init(.{ .required = .of(&.{.processes}) }),
     );
     try std.testing.expectEqual(
-        CapabilitySet.of(&.{ .sockets, .processes }).bits,
+        CapabilitySet.of(&.{.processes}).bits,
         SimIo.missingCapabilities(.of(&.{ .clock_read, .files, .sockets, .processes })).bits,
     );
 }
@@ -1013,8 +1155,8 @@ test "SimIo unsupported operations latch a deterministic harness violation" {
     try std.testing.expectError(error.SimIoCapabilityViolation, sim.ensureNoCapabilityViolation());
 
     sim.clearCapabilityViolation();
-    io.vtable.netClose(io.userdata, &.{});
-    try std.testing.expectEqual(ViolationOperation.network_close, sim.firstCapabilityViolation().?.operation);
+    _ = io.vtable.netSend(io.userdata, 0, &.{}, .{});
+    try std.testing.expectEqual(ViolationOperation.network_send, sim.firstCapabilityViolation().?.operation);
 }
 
 test "SimIo vtable contains no std.Io.Threaded handlers" {
@@ -1113,6 +1255,7 @@ test "SimIo groups and futex wake ordering remain scheduler visible" {
             var group: std.Io.Group = .init;
             group.async(self.io, waiter, .{self});
             group.async(self.io, waiter, .{self});
+            std.Io.sleep(self.io, .fromNanoseconds(1), .awake) catch unreachable;
             std.Io.futexWake(self.io, u32, &self.futex, 1);
             std.Io.futexWake(self.io, u32, &self.futex, 1);
             group.await(self.io) catch unreachable;
@@ -1138,7 +1281,14 @@ test "SimIo groups and futex wake ordering remain scheduler visible" {
         try enabled.canonicalize();
         if (enabled.items.items.len > 1) saw_choice = true;
         try std.testing.expect(enabled.items.items.len != 0);
-        try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+        var selected = enabled.items.items[0];
+        for (enabled.items.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                selected = candidate;
+                break;
+            }
+        }
+        try scheduler.executeReady(selected.id, &sink, std.testing.allocator);
     }
     try std.testing.expect(saw_choice);
     try std.testing.expectEqual(@as(u32, 2), shared.completed);
@@ -1341,5 +1491,78 @@ test "SimIo modeled file surface supports deterministic iteration atomic replace
     var published_bytes: [5]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 5), try published.readPositionalAll(io, &published_bytes, 0));
     try std.testing.expectEqualStrings("ready", &published_bytes);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "SimIo stream sockets expose packet delivery and waiter wake choices" {
+    const Shared = struct {
+        io: std.Io,
+        server: *std.Io.net.Server,
+        client: std.Io.net.Stream,
+        server_received: [4]u8 = undefined,
+        client_received: [4]u8 = undefined,
+        server_done: bool = false,
+        client_done: bool = false,
+
+        fn serve(self: *@This()) void {
+            const stream = self.server.accept(self.io) catch unreachable;
+            defer stream.close(self.io);
+            var read_buffer: [16]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            reader.interface.readSliceAll(&self.server_received) catch unreachable;
+            var write_buffer: [16]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+            writer.interface.writeAll("pong") catch unreachable;
+            writer.interface.flush() catch unreachable;
+            stream.shutdown(self.io, .send) catch unreachable;
+            self.server_done = true;
+        }
+
+        fn request(self: *@This()) void {
+            defer self.client.close(self.io);
+            var write_buffer: [16]u8 = undefined;
+            var writer = self.client.writer(self.io, &write_buffer);
+            writer.interface.writeAll("ping") catch unreachable;
+            writer.interface.flush() catch unreachable;
+            var read_buffer: [16]u8 = undefined;
+            var reader = self.client.reader(self.io, &read_buffer);
+            reader.interface.readSliceAll(&self.client_received) catch unreachable;
+            self.client_done = true;
+        }
+    };
+
+    var sim = try SimIo.init(.{ .required = .of(&.{.sockets}) });
+    defer sim.deinit();
+    const io = sim.io();
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31_337) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const client = try address.connect(io, .{ .mode = .stream });
+    var shared: Shared = .{ .io = io, .server = &server, .client = client };
+    _ = io.async(Shared.serve, .{&shared});
+    _ = io.async(Shared.request, .{&shared});
+
+    const scheduler = sim.scheduler();
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    var saw_packet_delivery = false;
+    var saw_external_wake = false;
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        const selected = enabled.items.items[0];
+        saw_packet_delivery = saw_packet_delivery or std.mem.eql(u8, selected.name, "sim-io.packet_deliver");
+        saw_external_wake = saw_external_wake or std.mem.eql(u8, selected.name, "sim-io.external_wake");
+        try scheduler.executeReady(selected.id, &sink, std.testing.allocator);
+    }
+    try std.testing.expect(shared.server_done and shared.client_done);
+    try std.testing.expectEqualStrings("ping", &shared.server_received);
+    try std.testing.expectEqualStrings("pong", &shared.client_received);
+    try std.testing.expect(saw_packet_delivery);
+    try std.testing.expect(saw_external_wake);
     try sim.ensureNoCapabilityViolation();
 }

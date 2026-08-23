@@ -2559,10 +2559,22 @@ directory, file, atomic-file, lock, and memory-map APIs. Symlinks, hard links,
 and optimized file-to-file transfer deliberately fail closed and latch a
 harness capability violation; no operation delegates to a host filesystem.
 
-Virtual sockets, registered processes/resources, richer storage corruption and
-completion-order faults, instrumentation, counterfactual tooling, and the five
-domain scenarios remain required work; the partial capability set does not
-advertise those capabilities.
+The first virtual stream-socket capability is implemented in
+`lib/vopr/src/sim_io_net.zig`. IP and Unix listen/connect/accept, socket pairs,
+stream reads and writes, half-close, close, deterministic loopback DNS/interface
+resolution, bounded send queues, partial writes, and packet delivery all stay
+in memory. Delivery is a stable scheduler transition; waiter wake selection is
+a separate transition. Per-packet drop and duplication, cross-packet reorder,
+global outage, paused delivery (jam), and directional handle-to-handle
+partitions are explicit model state. Leaving a packet enabled while other work
+runs models arbitrary delay; bounded queues model clog and backpressure.
+Datagrams and accelerated file-to-socket transfer currently fail closed and
+latch a harness violation rather than reaching host networking.
+
+Registered processes/resources, richer storage corruption and completion-order
+faults, datagram networking, instrumentation, counterfactual tooling, and the
+five domain scenarios remain required work; the partial capability set does
+not advertise those later capabilities.
 
 ## Risks and Mitigations
 

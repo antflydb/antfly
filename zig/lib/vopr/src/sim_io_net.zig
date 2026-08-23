@@ -1,0 +1,555 @@
+// Copyright 2026 Antfly, Inc.
+// Licensed under the Elastic License 2.0 (ELv2).
+
+//! Deterministic in-memory stream network for SimIo.
+//!
+//! Writes enqueue logical packets. Packet delivery, including eligible
+//! reordering/drop/duplication, is selected by the VOPR scheduler. Blocking
+//! accept/read/backpressure parks the calling fiber on stable resource IDs.
+
+const std = @import("std");
+const event = @import("event.zig");
+const ids = @import("id.zig");
+const transition = @import("transition.zig");
+
+pub const Config = struct {
+    max_sockets: usize = 4096,
+    stream_capacity: usize = 1024 * 1024,
+};
+
+pub const Faults = struct {
+    network_down: bool = false,
+    delivery_paused: bool = false,
+    partition_source: ?std.Io.net.Socket.Handle = null,
+    partition_destination: ?std.Io.net.Socket.Handle = null,
+    drop_next: bool = false,
+    duplicate_next: bool = false,
+    reorder: bool = false,
+    partial_write_limit: ?usize = null,
+};
+
+pub const WaitPort = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        wait: *const fn (*anyopaque, ids.StableId) anyerror!void,
+        wake: *const fn (*anyopaque, ids.StableId, u32) anyerror!void,
+    };
+
+    fn wait(self: WaitPort, resource_id: ids.StableId) !void {
+        return self.vtable.wait(self.ptr, resource_id);
+    }
+
+    fn wake(self: WaitPort, resource_id: ids.StableId, max_waiters: u32) !void {
+        return self.vtable.wake(self.ptr, resource_id, max_waiters);
+    }
+};
+
+const ListenerAddress = union(enum) {
+    ip: std.Io.net.IpAddress,
+    unix: []u8,
+};
+
+const SocketKind = enum { listener, stream };
+
+const SocketState = struct {
+    handle: std.Io.net.Socket.Handle,
+    id: ids.StableId,
+    kind: SocketKind,
+    address: std.Io.net.IpAddress,
+    listener_address: ?ListenerAddress = null,
+    backlog: usize = 0,
+    pending_accept: std.ArrayListUnmanaged(std.Io.net.Socket.Handle) = .empty,
+    peer: ?std.Io.net.Socket.Handle = null,
+    receive: std.ArrayListUnmanaged(u8) = .empty,
+    read_open: bool = true,
+    write_open: bool = true,
+    peer_write_open: bool = true,
+    closed: bool = false,
+
+    fn readResource(self: *const SocketState) ids.StableId {
+        return ids.derive("sim-io.socket-read", self.id, 0);
+    }
+
+    fn writeResource(self: *const SocketState) ids.StableId {
+        return ids.derive("sim-io.socket-write", self.id, 0);
+    }
+
+    fn acceptResource(self: *const SocketState) ids.StableId {
+        return ids.derive("sim-io.socket-accept", self.id, 0);
+    }
+};
+
+const Packet = struct {
+    id: ids.StableId,
+    sequence: u64,
+    source: std.Io.net.Socket.Handle,
+    destination: std.Io.net.Socket.Handle,
+    bytes: []u8,
+    drop: bool,
+    duplicate: bool,
+};
+
+pub const Network = struct {
+    allocator: std.mem.Allocator,
+    config: Config,
+    wait_port: ?WaitPort = null,
+    next_handle: std.Io.net.Socket.Handle = 0x5000_0000,
+    next_sequence: u64 = 1,
+    next_ephemeral_port: u16 = 20_000,
+    sockets: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, *SocketState) = .empty,
+    socket_order: std.ArrayListUnmanaged(*SocketState) = .empty,
+    packets: std.ArrayListUnmanaged(Packet) = .empty,
+    queued_bytes: usize = 0,
+    faults: Faults = .{},
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Network {
+        if (config.max_sockets == 0) return error.InvalidSimIoSocketLimit;
+        if (config.stream_capacity == 0) return error.InvalidSimIoStreamCapacity;
+        return .{ .allocator = allocator, .config = config };
+    }
+
+    pub fn bindWaitPort(self: *Network, wait_port: WaitPort) void {
+        self.wait_port = wait_port;
+    }
+
+    pub fn deinit(self: *Network) void {
+        for (self.packets.items) |packet| self.allocator.free(packet.bytes);
+        self.packets.deinit(self.allocator);
+        self.sockets.deinit(self.allocator);
+        for (self.socket_order.items) |socket_state| {
+            if (socket_state.listener_address) |address| switch (address) {
+                .ip => {},
+                .unix => |path| self.allocator.free(path),
+            };
+            socket_state.pending_accept.deinit(self.allocator);
+            socket_state.receive.deinit(self.allocator);
+            self.allocator.destroy(socket_state);
+        }
+        self.socket_order.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn listenIp(self: *Network, requested: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ListenOptions) std.Io.net.IpAddress.ListenError!std.Io.net.Socket {
+        if (self.faults.network_down) return error.NetworkDown;
+        if (options.mode != .stream) return error.SocketModeUnsupported;
+        var address = requested.*;
+        if (address.getPort() == 0) {
+            address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
+        }
+        if (self.findIpListener(address) != null) return error.AddressInUse;
+        const listener = self.createSocket(.listener, address) catch |err| return mapListenResourceError(err);
+        listener.listener_address = .{ .ip = address };
+        listener.backlog = options.kernel_backlog;
+        return .{ .handle = listener.handle, .address = address };
+    }
+
+    pub fn listenUnix(self: *Network, requested: *const std.Io.net.UnixAddress, options: std.Io.net.UnixAddress.ListenOptions) std.Io.net.UnixAddress.ListenError!std.Io.net.Socket.Handle {
+        if (self.faults.network_down) return error.NetworkDown;
+        if (self.findUnixListener(requested.path) != null) return error.AddressInUse;
+        const listener = self.createSocket(.listener, .{ .ip4 = .loopback(0) }) catch |err|
+            return mapUnixListenResourceError(err);
+        errdefer self.destroyLastSocket(listener);
+        listener.listener_address = .{ .unix = self.allocator.dupe(u8, requested.path) catch return error.SystemResources };
+        listener.backlog = options.kernel_backlog;
+        return listener.handle;
+    }
+
+    pub fn connectIp(self: *Network, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+        if (self.faults.network_down) return error.NetworkDown;
+        if (options.mode != .stream) return error.SocketModeUnsupported;
+        const listener = self.findIpListener(address.*) orelse return error.ConnectionRefused;
+        const client = self.connectToListener(listener, address.*) catch |err| return mapConnectResourceError(err);
+        return .{ .handle = client.handle, .address = address.* };
+    }
+
+    pub fn connectUnix(self: *Network, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
+        if (self.faults.network_down) return error.NetworkDown;
+        const listener = self.findUnixListener(address.path) orelse return error.FileNotFound;
+        const client = self.connectToListener(listener, .{ .ip4 = .loopback(0) }) catch |err|
+            return mapUnixConnectResourceError(err);
+        return client.handle;
+    }
+
+    pub fn createPair(self: *Network, options: std.Io.net.Socket.CreatePairOptions) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
+        if (options.mode != .stream) return error.SocketModeUnsupported;
+        const address: std.Io.net.IpAddress = switch (options.family) {
+            .ip4 => .{ .ip4 = .loopback(0) },
+            .ip6 => .{ .ip6 = .loopback(0) },
+        };
+        const left = self.createSocket(.stream, address) catch |err| return mapPairResourceError(err);
+        errdefer self.destroyLastSocket(left);
+        const right = self.createSocket(.stream, address) catch |err| return mapPairResourceError(err);
+        left.peer = right.handle;
+        right.peer = left.handle;
+        return .{
+            .{ .handle = left.handle, .address = address },
+            .{ .handle = right.handle, .address = address },
+        };
+    }
+
+    pub fn accept(self: *Network, handle: std.Io.net.Socket.Handle) std.Io.net.Server.AcceptError!std.Io.net.Socket {
+        const listener = self.getSocket(handle) orelse return error.SocketNotListening;
+        if (listener.kind != .listener or listener.closed) return error.SocketNotListening;
+        while (listener.pending_accept.items.len == 0) {
+            self.wait_port.?.wait(listener.acceptResource()) catch |err| return mapWaitAcceptError(err);
+            if (listener.closed) return error.SocketNotListening;
+            if (self.faults.network_down) return error.NetworkDown;
+        }
+        const accepted_handle = listener.pending_accept.orderedRemove(0);
+        const accepted = self.getSocket(accepted_handle).?;
+        return .{ .handle = accepted.handle, .address = accepted.address };
+    }
+
+    pub fn read(self: *Network, handle: std.Io.net.Socket.Handle, buffers: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+        const socket_state = self.getSocket(handle) orelse return error.SocketUnconnected;
+        if (socket_state.kind != .stream or socket_state.closed or !socket_state.read_open)
+            return error.SocketUnconnected;
+        while (socket_state.receive.items.len == 0) {
+            if (!socket_state.peer_write_open) return 0;
+            self.wait_port.?.wait(socket_state.readResource()) catch |err| return mapWaitReadError(err);
+            if (socket_state.closed or !socket_state.read_open) return error.SocketUnconnected;
+            if (self.faults.network_down) return error.NetworkDown;
+        }
+        var consumed: usize = 0;
+        for (buffers) |buffer| {
+            const count = @min(buffer.len, socket_state.receive.items.len - consumed);
+            @memcpy(buffer[0..count], socket_state.receive.items[consumed..][0..count]);
+            consumed += count;
+            if (consumed == socket_state.receive.items.len or count != buffer.len) break;
+        }
+        std.mem.copyForwards(u8, socket_state.receive.items[0 .. socket_state.receive.items.len - consumed], socket_state.receive.items[consumed..]);
+        socket_state.receive.items.len -= consumed;
+        return consumed;
+    }
+
+    pub fn write(self: *Network, handle: std.Io.net.Socket.Handle, header: []const u8, buffers: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
+        const source = self.getSocket(handle) orelse return error.SocketUnconnected;
+        if (source.kind != .stream or source.closed or !source.write_open or source.peer == null)
+            return error.SocketUnconnected;
+        if (self.faults.network_down) return error.NetworkDown;
+        const destination = self.getSocket(source.peer.?) orelse return error.ConnectionResetByPeer;
+        if (self.linkBlocked(source.handle, destination.handle)) return error.NetworkDown;
+        if (destination.closed or !destination.read_open) return error.ConnectionResetByPeer;
+
+        var requested = header.len;
+        for (0..splat) |_| {
+            for (buffers) |buffer| {
+                requested = std.math.add(usize, requested, buffer.len) catch return error.SystemResources;
+            }
+        }
+        while (self.queued_bytes >= self.config.stream_capacity) {
+            self.wait_port.?.wait(source.writeResource()) catch |err| return mapWaitWriteError(err);
+            if (source.closed or !source.write_open) return error.SocketUnconnected;
+            if (self.faults.network_down) return error.NetworkDown;
+        }
+        var allowed = @min(requested, self.config.stream_capacity - self.queued_bytes);
+        if (self.faults.partial_write_limit) |limit| {
+            allowed = @min(allowed, limit);
+            self.faults.partial_write_limit = null;
+        }
+        if (allowed == 0) return error.SystemResources;
+        const bytes = self.allocator.alloc(u8, allowed) catch return error.SystemResources;
+        errdefer self.allocator.free(bytes);
+        var written = copyLimited(bytes, header, 0);
+        outer: for (0..splat) |_| for (buffers) |buffer| {
+            written += copyLimited(bytes, buffer, written);
+            if (written == bytes.len) break :outer;
+        };
+        const sequence = self.allocateSequence();
+        self.packets.append(self.allocator, .{
+            .id = ids.derive("sim-io.packet", source.id, sequence),
+            .sequence = sequence,
+            .source = source.handle,
+            .destination = destination.handle,
+            .bytes = bytes,
+            .drop = takeBool(&self.faults.drop_next),
+            .duplicate = takeBool(&self.faults.duplicate_next),
+        }) catch return error.SystemResources;
+        self.queued_bytes += bytes.len;
+        return bytes.len;
+    }
+
+    pub fn shutdown(self: *Network, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+        const socket_state = self.getSocket(handle) orelse return error.SocketUnconnected;
+        switch (how) {
+            .recv => socket_state.read_open = false,
+            .send => self.closeWrite(socket_state) catch return error.Unexpected,
+            .both => {
+                socket_state.read_open = false;
+                self.closeWrite(socket_state) catch return error.Unexpected;
+            },
+        }
+    }
+
+    pub fn close(self: *Network, handles: []const std.Io.net.Socket.Handle) bool {
+        var valid = true;
+        for (handles) |handle| {
+            const socket_state = self.getSocket(handle) orelse {
+                valid = false;
+                continue;
+            };
+            if (socket_state.closed) {
+                valid = false;
+                continue;
+            }
+            socket_state.closed = true;
+            socket_state.read_open = false;
+            self.closeWrite(socket_state) catch {};
+            self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32)) catch {};
+            self.wait_port.?.wake(socket_state.acceptResource(), std.math.maxInt(u32)) catch {};
+        }
+        return valid;
+    }
+
+    pub fn enumerateReady(self: *const Network, list: *transition.List, allocator: std.mem.Allocator) !void {
+        if (self.faults.network_down or self.faults.delivery_paused) return;
+        for (self.packets.items, 0..) |packet, index| {
+            if (self.linkBlocked(packet.source, packet.destination)) continue;
+            if (!self.faults.reorder and self.hasEarlierPacketForLink(index, packet)) continue;
+            try list.append(allocator, .{
+                .id = packet.id,
+                .name = if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver",
+                .kind = .scheduler,
+                .actor_id = self.getSocket(packet.source).?.id,
+                .resource_id = self.getSocket(packet.destination).?.id,
+                .parameter = @intCast(packet.bytes.len),
+            });
+        }
+    }
+
+    pub fn executeReady(self: *Network, transition_id: ids.StableId, sink: *event.Sink, allocator: std.mem.Allocator) !bool {
+        for (self.packets.items, 0..) |packet, index| {
+            if (packet.id != transition_id) continue;
+            const packet_len = packet.bytes.len;
+            const destination = self.getSocket(packet.destination);
+            if (!packet.drop and destination != null and !destination.?.closed and destination.?.read_open) {
+                try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+                if (packet.duplicate) try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+                try self.wait_port.?.wake(destination.?.readResource(), 1);
+            }
+            const source = self.getSocket(packet.source);
+            if (source) |source_state| try self.wait_port.?.wake(source_state.writeResource(), 1);
+            self.queued_bytes -= packet_len;
+            self.allocator.free(packet.bytes);
+            _ = self.packets.orderedRemove(index);
+            try sink.emit(allocator, .{
+                .id = ids.derive("sim-io.packet-event", packet.id, @intFromBool(packet.drop)),
+                .kind = if (packet.drop) .injected_error else .domain,
+                .actor_id = if (source) |s| s.id else 0,
+                .resource_id = if (destination) |d| d.id else 0,
+                .payload_digest = @intCast(packet_len),
+                .name = if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver",
+            });
+            return true;
+        }
+        return false;
+    }
+
+    pub fn isQuiescent(self: *const Network) bool {
+        return self.packets.items.len == 0;
+    }
+
+    fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress) !*SocketState {
+        if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
+        const client = try self.createSocket(.stream, address);
+        const server = self.createSocket(.stream, address) catch |err| {
+            self.destroyLastSocket(client);
+            return err;
+        };
+        client.peer = server.handle;
+        server.peer = client.handle;
+        listener.pending_accept.append(self.allocator, server.handle) catch |err| {
+            self.destroyLastSocket(server);
+            self.destroyLastSocket(client);
+            return err;
+        };
+        try self.wait_port.?.wake(listener.acceptResource(), 1);
+        return client;
+    }
+
+    fn createSocket(self: *Network, kind: SocketKind, address: std.Io.net.IpAddress) !*SocketState {
+        if (self.sockets.count() >= self.config.max_sockets) return error.ProcessFdQuotaExceeded;
+        if (self.next_handle == std.math.maxInt(std.Io.net.Socket.Handle)) return error.ProcessFdQuotaExceeded;
+        const socket_state = try self.allocator.create(SocketState);
+        errdefer self.allocator.destroy(socket_state);
+        const handle = self.next_handle;
+        self.next_handle += 1;
+        const sequence = self.allocateSequence();
+        socket_state.* = .{
+            .handle = handle,
+            .id = ids.derive("sim-io.socket", network_id, sequence),
+            .kind = kind,
+            .address = address,
+        };
+        try self.socket_order.append(self.allocator, socket_state);
+        errdefer _ = self.socket_order.pop();
+        try self.sockets.put(self.allocator, handle, socket_state);
+        return socket_state;
+    }
+
+    fn destroyLastSocket(self: *Network, socket_state: *SocketState) void {
+        std.debug.assert(self.socket_order.getLast() == socket_state);
+        _ = self.socket_order.pop();
+        _ = self.sockets.remove(socket_state.handle);
+        socket_state.pending_accept.deinit(self.allocator);
+        socket_state.receive.deinit(self.allocator);
+        self.allocator.destroy(socket_state);
+    }
+
+    fn closeWrite(self: *Network, socket_state: *SocketState) !void {
+        if (!socket_state.write_open) return;
+        socket_state.write_open = false;
+        if (socket_state.peer) |peer_handle| if (self.getSocket(peer_handle)) |peer| {
+            peer.peer_write_open = false;
+            try self.wait_port.?.wake(peer.readResource(), 1);
+        };
+    }
+
+    fn findIpListener(self: *const Network, address: std.Io.net.IpAddress) ?*SocketState {
+        for (self.socket_order.items) |socket_state| {
+            if (socket_state.closed or socket_state.kind != .listener) continue;
+            const listener_address = socket_state.listener_address orelse continue;
+            switch (listener_address) {
+                .ip => |candidate| if (ipAddressMatches(candidate, address)) return socket_state,
+                .unix => {},
+            }
+        }
+        return null;
+    }
+
+    fn findUnixListener(self: *const Network, path: []const u8) ?*SocketState {
+        for (self.socket_order.items) |socket_state| {
+            if (socket_state.closed or socket_state.kind != .listener) continue;
+            const listener_address = socket_state.listener_address orelse continue;
+            switch (listener_address) {
+                .ip => {},
+                .unix => |candidate| if (std.mem.eql(u8, candidate, path)) return socket_state,
+            }
+        }
+        return null;
+    }
+
+    fn hasEarlierPacketForLink(self: *const Network, index: usize, packet: Packet) bool {
+        for (self.packets.items[0..index]) |earlier| {
+            if (earlier.source == packet.source and earlier.destination == packet.destination) return true;
+        }
+        return false;
+    }
+
+    fn linkBlocked(self: *const Network, source: std.Io.net.Socket.Handle, destination: std.Io.net.Socket.Handle) bool {
+        const blocked_source = self.faults.partition_source orelse return false;
+        const blocked_destination = self.faults.partition_destination orelse return false;
+        return source == blocked_source and destination == blocked_destination;
+    }
+
+    fn getSocket(self: *const Network, handle: std.Io.net.Socket.Handle) ?*SocketState {
+        return self.sockets.get(handle);
+    }
+
+    fn allocateSequence(self: *Network) u64 {
+        const result = self.next_sequence;
+        self.next_sequence +|= 1;
+        return result;
+    }
+
+    fn allocateEphemeralPort(self: *Network) !u16 {
+        var attempts: usize = 0;
+        while (attempts < std.math.maxInt(u16)) : (attempts += 1) {
+            const candidate = self.next_ephemeral_port;
+            self.next_ephemeral_port +%= 1;
+            if (self.next_ephemeral_port < 20_000) self.next_ephemeral_port = 20_000;
+            const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(candidate) };
+            if (self.findIpListener(address) == null) return candidate;
+        }
+        return error.AddressInUse;
+    }
+
+    const network_id = ids.stable("sim-io", "network-v1");
+};
+
+fn copyLimited(destination: []u8, source: []const u8, offset: usize) usize {
+    if (offset >= destination.len) return 0;
+    const count = @min(destination.len - offset, source.len);
+    @memcpy(destination[offset..][0..count], source[0..count]);
+    return count;
+}
+
+fn takeBool(value: *bool) bool {
+    const result = value.*;
+    value.* = false;
+    return result;
+}
+
+fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddress) bool {
+    if (listener.getPort() != requested.getPort()) return false;
+    return switch (listener) {
+        .ip4 => |left| switch (requested) {
+            .ip4 => |right| std.mem.allEqual(u8, &left.bytes, 0) or std.mem.eql(u8, &left.bytes, &right.bytes),
+            .ip6 => false,
+        },
+        .ip6 => |left| switch (requested) {
+            .ip4 => false,
+            .ip6 => |right| std.mem.allEqual(u8, &left.bytes, 0) or std.mem.eql(u8, &left.bytes, &right.bytes),
+        },
+    };
+}
+
+fn mapListenResourceError(err: anyerror) std.Io.net.IpAddress.ListenError {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapUnixListenResourceError(err: anyerror) std.Io.net.UnixAddress.ListenError {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapConnectResourceError(err: anyerror) std.Io.net.IpAddress.ConnectError {
+    return switch (err) {
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapUnixConnectResourceError(err: anyerror) std.Io.net.UnixAddress.ConnectError {
+    return switch (err) {
+        error.ConnectionRefused => error.AccessDenied,
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapPairResourceError(err: anyerror) std.Io.net.Socket.CreatePairError {
+    return switch (err) {
+        error.ProcessFdQuotaExceeded => error.ProcessFdQuotaExceeded,
+        else => error.SystemResources,
+    };
+}
+
+fn mapWaitAcceptError(err: anyerror) std.Io.net.Server.AcceptError {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.Unexpected,
+    };
+}
+
+fn mapWaitReadError(err: anyerror) std.Io.net.Stream.Reader.Error {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.Unexpected,
+    };
+}
+
+fn mapWaitWriteError(err: anyerror) std.Io.net.Stream.Writer.Error {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.Unexpected,
+    };
+}
