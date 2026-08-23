@@ -6160,6 +6160,8 @@ pub fn build(b: *std.Build) void {
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
+            "managed structural catch-up does not delegate an empty producer handoff",
+            "managed create publication handoff ignores unrelated index debt",
             "db managed vector admission captures writes while durable repair is pending",
             "db managed algebraic admission builds and reopens",
             "db algebraic generation build yields and resumes from its durable source cursor",

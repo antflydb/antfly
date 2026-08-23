@@ -153,6 +153,20 @@ pub const NamedArtifactPublicationAction = struct {
     }
 };
 
+/// Desired public index-definition publication state plus the durable private
+/// identity, when that index kind has one. The identity is intentionally kept
+/// out of the public config JSON and is exposed only through readiness.
+pub const IndexConfigPublicationStatus = struct {
+    name: []u8,
+    action: ArtifactPublicationAction,
+    incarnation: ?u64 = null,
+
+    pub fn deinit(self: *IndexConfigPublicationStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const NamespacePolicy = struct {
     default_query_view: DefaultQueryView = .published,
     keep_latest_versions: usize = 2,
@@ -257,7 +271,7 @@ pub const BuildStatus = struct {
     artifact_actions: ArtifactPublicationActions = .{},
     /// Exact desired-name/config publication state, independent of whether a
     /// compatible physical artifact can be reused for the next table head.
-    index_config_actions: []NamedArtifactPublicationAction = &.{},
+    index_config_actions: []IndexConfigPublicationStatus = &.{},
     full_text_index_actions: []FullTextIndexPublicationAction = &.{},
     vector_index_actions: []NamedArtifactPublicationAction = &.{},
     sparse_index_actions: []NamedArtifactPublicationAction = &.{},
