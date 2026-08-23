@@ -1670,22 +1670,10 @@ pub const Reader = struct {
     }
 
     pub fn extractPageTextAlloc(self: *Reader, page_num: usize) ![]u8 {
-        var page = try self.readPageObject(page_num);
-        defer page.deinit(self.alloc);
-
-        const fonts = try self.collectPageFontsAlloc(&page);
-        defer {
-            for (fonts) |*font| font.deinit(self.alloc);
-            self.alloc.free(fonts);
-        }
-        const forms = try self.collectPageFormsAlloc(&page);
-        defer {
-            for (forms) |*form| form.deinit(self.alloc);
-            self.alloc.free(forms);
-        }
-
-        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
-        return try self.extractContentsTextAlloc(contents, fonts, forms);
+        const analysis = try self.extractPageTextAnalysisAlloc(page_num);
+        for (analysis.runs) |*run| run.deinit(self.alloc);
+        if (analysis.runs.len > 0) self.alloc.free(analysis.runs);
+        return analysis.text;
     }
 
     /// Extracts canonical page text and positioned text runs while sharing the
@@ -2446,8 +2434,17 @@ pub const Reader = struct {
             try extractTextRunsFromContentAppend(self.alloc, &runs, decoded, fonts, gstates, forms);
         }
 
-        const owned_text = try text.toOwnedSlice(self.alloc);
+        var owned_text = try text.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_text);
+        if (runs.items.len > 0) {
+            const reconstructed = try reconstructTextFromRunsAlloc(self.alloc, runs.items);
+            if (sameNonWhitespaceBytes(owned_text, reconstructed)) {
+                self.alloc.free(owned_text);
+                owned_text = reconstructed;
+            } else {
+                self.alloc.free(reconstructed);
+            }
+        }
         const owned_runs = try runs.toOwnedSlice(self.alloc);
         return .{ .text = owned_text, .runs = owned_runs };
     }
@@ -8392,6 +8389,103 @@ fn measureSfntAdvanceAlloc(
     return advance;
 }
 
+fn sameNonWhitespaceBytes(left: []const u8, right: []const u8) bool {
+    var left_index: usize = 0;
+    var right_index: usize = 0;
+    while (true) {
+        while (left_index < left.len and std.ascii.isWhitespace(left[left_index])) left_index += 1;
+        while (right_index < right.len and std.ascii.isWhitespace(right[right_index])) right_index += 1;
+        if (left_index == left.len or right_index == right.len) {
+            while (left_index < left.len and std.ascii.isWhitespace(left[left_index])) left_index += 1;
+            while (right_index < right.len and std.ascii.isWhitespace(right[right_index])) right_index += 1;
+            return left_index == left.len and right_index == right.len;
+        }
+        if (left[left_index] != right[right_index]) return false;
+        left_index += 1;
+        right_index += 1;
+    }
+}
+
+fn textRunAxisLength(run: TextRun) f64 {
+    return @sqrt(run.a * run.a + run.b * run.b);
+}
+
+fn textRunVerticalScale(run: TextRun) f64 {
+    return @sqrt(run.c * run.c + run.d * run.d);
+}
+
+fn textRunsShareLine(previous: TextRun, current: TextRun) bool {
+    const previous_axis = textRunAxisLength(previous);
+    const current_axis = textRunAxisLength(current);
+    if (previous_axis <= 0.000001 or current_axis <= 0.000001) return false;
+    const direction_alignment =
+        (previous.a * current.a + previous.b * current.b) /
+        (previous_axis * current_axis);
+    if (direction_alignment < 0.8) return false;
+
+    const delta_x = current.x - previous.x;
+    const delta_y = current.y - previous.y;
+    const cross_axis_gap = @abs(
+        delta_x * (-previous.b / previous_axis) +
+            delta_y * (previous.a / previous_axis),
+    );
+    const previous_height = @abs(previous.font_size) * textRunVerticalScale(previous);
+    const current_height = @abs(current.font_size) * textRunVerticalScale(current);
+    const line_tolerance = @max(1.0, @max(previous_height, current_height) * 0.45);
+    return cross_axis_gap <= line_tolerance;
+}
+
+fn textRunForwardGap(previous: TextRun, current: TextRun) f64 {
+    const axis = textRunAxisLength(previous);
+    if (axis <= 0.000001) return 0;
+    const previous_end_x = previous.x + previous.a * previous.advance_width;
+    const previous_end_y = previous.y + previous.b * previous.advance_width;
+    return (current.x - previous_end_x) * (previous.a / axis) +
+        (current.y - previous_end_y) * (previous.b / axis);
+}
+
+fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8)) !void {
+    while (out.items.len > 0 and
+        (out.items[out.items.len - 1] == ' ' or
+            out.items[out.items.len - 1] == '\t' or
+            out.items[out.items.len - 1] == '\r'))
+    {
+        _ = out.pop();
+    }
+    try appendNewline(alloc, out);
+}
+
+fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: []const TextRun) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var previous: ?TextRun = null;
+    for (runs) |run| {
+        if (run.text.len == 0) continue;
+        if (previous) |prior| {
+            if (!textRunsShareLine(prior, run)) {
+                try appendLayoutNewline(alloc, &out);
+            } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
+                !std.ascii.isWhitespace(run.text[0]))
+            {
+                const axis = textRunAxisLength(prior);
+                const font_scale = @abs(prior.font_size) * axis;
+                const gap = textRunForwardGap(prior, run);
+                const word_gap = @max(0.5, font_scale * 0.12);
+                const operator_overlap_tolerance = font_scale * 0.15;
+                if (gap > word_gap or
+                    (prior.paint_order != run.paint_order and gap > -operator_overlap_tolerance))
+                {
+                    try out.append(alloc, ' ');
+                }
+            }
+        }
+        try out.appendSlice(alloc, run.text);
+        previous = run;
+    }
+    try appendNewline(alloc, &out);
+    return try out.toOwnedSlice(alloc);
+}
+
 fn appendNewline(alloc: Allocator, out: *std.ArrayList(u8)) !void {
     if (out.items.len == 0) return;
     if (out.items[out.items.len - 1] == '\n') return;
@@ -10606,6 +10700,22 @@ test "reader caches shared page fonts across text analysis" {
     try std.testing.expectEqualStrings("SECOND PAGE", std.mem.trim(u8, second.text, &std.ascii.whitespace));
 }
 
+test "reader reconstructs spaces and lines from positioned text runs" {
+    const alloc = std.testing.allocator;
+    const runs = [_]TextRun{
+        .{ .text = "Max", .x = 0, .y = 100, .font_size = 10, .advance_width = 15, .paint_order = 0 },
+        .{ .text = "Length", .x = 17, .y = 100, .font_size = 10, .advance_width = 30, .paint_order = 0 },
+        .{ .text = "Avg", .x = 46.5, .y = 100, .font_size = 10, .advance_width = 14, .paint_order = 1 },
+        .{ .text = "Multi-v", .x = 0, .y = 80, .font_size = 10, .advance_width = 30, .paint_order = 2 },
+        .{ .text = "ec", .x = 30.5, .y = 80, .font_size = 10, .advance_width = 8, .paint_order = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Max Length Avg\nMulti-vec\n", text);
+    try std.testing.expect(sameNonWhitespaceBytes("MaxLengthAvg Multi-vec", text));
+    try std.testing.expect(!sameNonWhitespaceBytes("MaxLengthAvg Multi-vector", text));
+}
+
 test "reader extracts positioned text runs from text matrix operators" {
     const alloc = std.testing.allocator;
     const content = "BT\n/F1 12 Tf\n1 0 0 1 72 720 Tm\n(Top) Tj\n0 -24 Td\n(Bottom) Tj\nET\n";
@@ -10642,6 +10752,10 @@ test "reader extracts positioned text runs from text matrix operators" {
 
     var reader = try Reader.init(alloc, sample);
     defer reader.deinit();
+
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Top\nBottom", std.mem.trim(u8, text, &std.ascii.whitespace));
 
     const runs = try reader.extractPageTextRunsAlloc(1);
     defer {
