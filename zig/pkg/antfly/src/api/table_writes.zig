@@ -5306,14 +5306,11 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         fn handoffDeferredRepairDebt(self: *@This(), owner: *ProvisionedTableWriteSource) void {
-            // Transfer status authority before waking repair. This closes the
-            // gap where reconciliation had released its table fence but the
-            // repair owner had not yet made the replacement generation's
-            // replay debt visible.
-            owner.transferStructuralReconcileStatusToRepair(
-                self.table_name,
-                self.deferred_repair_group_ids.items,
-            );
+            // Each shard acquires handoff authority before its structural
+            // operation releases. The table reservation can therefore be
+            // released without creating a clear-edge gap, even when repair of
+            // an earlier shard completed while later shards reconciled.
+            owner.releaseStructuralReconcileStatus(self.table_name);
             self.publishDeferredRepairDebt(owner);
         }
 
@@ -5530,11 +5527,10 @@ pub const ProvisionedTableWriteSource = struct {
         // already-ready snapshot immediately before the worker appends more
         // replay work.
         structural_reconcile_status_pending: usize = 0,
-        // A targeted structural request transfers its status reservation to
-        // each affected shard before waking deferred generation repair. This
-        // does not reserve write admission; it only makes cached status
-        // non-authoritative until the repaired generation publishes its final
-        // visibility boundary.
+        // Each affected shard acquires status authority before its compatible
+        // structural operation releases. This does not reserve write
+        // admission; it only makes cached status non-authoritative until the
+        // repaired generation publishes its final visibility boundary.
         repair_handoff_status_pending: usize = 0,
         repair_handoff_clear_observed: bool = false,
         restore_preparations: usize = 0,
@@ -5978,6 +5974,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn applyRuntimeHooksToUncachedDb(
         self: *ProvisionedTableWriteSource,
         db: *db_mod.DB,
+        table_name: []const u8,
         group_id: u64,
         owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
     ) void {
@@ -5988,6 +5985,10 @@ pub const ProvisionedTableWriteSource = struct {
             .leadership_source = self.promotion_leadership_source,
         };
         db.setPromotionOwner(owner_state.owner());
+        // Cold repair owners must report the same durable pending/clear edges
+        // as resident writers. DB.close() clears this hook with a callback
+        // barrier before table_name leaves the caller's scope.
+        db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table_name, group_id, db));
     }
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
@@ -6473,31 +6474,24 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_ready.broadcast(io);
     }
 
-    fn transferStructuralReconcileStatusToRepair(
+    fn ensureStructuralRepairHandoffStatus(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
-        group_ids: []const u64,
+        group_id: u64,
     ) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-
         const table_index = self.findTableActivityLocked(table_name, null) orelse return;
-        const table_entry = &self.active_table_activities.items[table_index];
-        std.debug.assert(table_entry.structural_reconcile_status_pending > 0);
-        // activityEntryLocked may grow the backing array, so consume the table
-        // entry before creating shard entries. The mutex keeps the transfer
-        // atomic to status admission.
-        table_entry.structural_reconcile_status_pending -= 1;
-        for (group_ids) |group_id| {
-            const group_entry = self.activityEntryLocked(table_name, group_id);
-            group_entry.repair_handoff_status_pending += 1;
-            // A new handoff must observe its own durable clear edge. A final
-            // publication from older foreground work cannot settle it.
+        std.debug.assert(self.active_table_activities.items[table_index].structural_reconcile_status_pending > 0);
+        const group_entry = self.activityEntryLocked(table_name, group_id);
+        // Repair debt is group-wide. One post-clear publication settles every
+        // structural request that observed the same outstanding generation,
+        // so coalescing here is both sufficient and allocation-free.
+        if (group_entry.repair_handoff_status_pending == 0) {
+            group_entry.repair_handoff_status_pending = 1;
             group_entry.repair_handoff_clear_observed = false;
         }
-        self.pruneTableActivityLocked(table_name, null);
-        self.table_activity_ready.broadcast(io);
     }
 
     fn settleRepairHandoffStatusBestEffort(
@@ -6542,9 +6536,21 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        const index = self.findTableActivityLocked(table_name, group_id) orelse return;
-        const entry = &self.active_table_activities.items[index];
-        if (entry.repair_handoff_status_pending == 0) return;
+        if (self.findTableActivityLocked(table_name, group_id)) |index| {
+            const entry = &self.active_table_activities.items[index];
+            if (entry.repair_handoff_status_pending > 0) {
+                entry.repair_handoff_clear_observed = false;
+                return;
+            }
+        }
+        // An unrelated shard can discover repair debt while another index's
+        // structural request owns the table status fence. Give that exact edge
+        // its own shard authority before it becomes scheduler-visible; the
+        // table reservation will release independently at request handoff.
+        const table_index = self.findTableActivityLocked(table_name, null) orelse return;
+        if (self.active_table_activities.items[table_index].structural_reconcile_status_pending == 0) return;
+        const entry = self.activityEntryLocked(table_name, group_id);
+        entry.repair_handoff_status_pending = 1;
         entry.repair_handoff_clear_observed = false;
     }
 
@@ -9500,7 +9506,7 @@ pub const ProvisionedTableWriteSource = struct {
                 };
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
-            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, group_id, &uncached_promotion_owner_state);
+            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
             try uncached_db.?.drainResolverBackfill();
             break :db_blk &uncached_db.?;
         };
@@ -12245,6 +12251,13 @@ pub const ProvisionedTableWriteSource = struct {
             observations.deinit(alloc);
         }
         try observations.ensureTotalCapacity(alloc, structural_reconcile_groups_per_quantum);
+        // Once a shard installs its handoff-status fence, recording that shard
+        // in the request must be allocation-free. Otherwise OOM between the
+        // durable repair edge and request ownership could strand the fence.
+        try request.deferred_repair_group_ids.ensureUnusedCapacity(
+            alloc,
+            structural_reconcile_groups_per_quantum,
+        );
 
         var attempted: usize = 0;
         var made_progress = false;
@@ -12267,11 +12280,10 @@ pub const ProvisionedTableWriteSource = struct {
             switch (outcome) {
                 .busy => plan.markCurrentBusy(),
                 .repair_pending => {
-                    // Durable repair owns reconstruction, retry, and final
-                    // authoritative status publication from this point. The
-                    // structural request must relinquish the table reservation
-                    // before waking that owner, otherwise the wake is
-                    // guaranteed to collide and incur a scheduler retry.
+                    // Shard handoff authority was installed before its group
+                    // operation released. Retain the exact group so final
+                    // request handoff can issue the runnable wake after
+                    // releasing the table-wide status reservation.
                     try request.deferRepairDebt(alloc, group.range.group_id);
                     made_progress = true;
                     lifecycle_transition = true;
@@ -12551,6 +12563,10 @@ pub const ProvisionedTableWriteSource = struct {
                                 cached_active = false;
                                 return err;
                             };
+                            // Install shard authority before the compatible
+                            // group operation releases. Repair may now overlap
+                            // later shards without outrunning its clear edge.
+                            self.ensureStructuralRepairHandoffStatus(table_name, group_id);
                             return .repair_pending;
                         }
                     } else {
@@ -12595,6 +12611,7 @@ pub const ProvisionedTableWriteSource = struct {
                                 cached_active = false;
                                 return err;
                             };
+                            self.ensureStructuralRepairHandoffStatus(table_name, group_id);
                             return .repair_pending;
                         },
                     }
@@ -12699,6 +12716,7 @@ pub const ProvisionedTableWriteSource = struct {
                             .artifact_rebuild,
                             observations,
                         );
+                        self.ensureStructuralRepairHandoffStatus(table_name, group_id);
                         return .repair_pending;
                     }
                 } else {
@@ -12730,6 +12748,7 @@ pub const ProvisionedTableWriteSource = struct {
                             .artifact_rebuild,
                             observations,
                         );
+                        self.ensureStructuralRepairHandoffStatus(table_name, group_id);
                         return .repair_pending;
                     },
                 }
@@ -33587,6 +33606,8 @@ test "structural repair handoff keeps status fenced through final shard visibili
         .table_name = try alloc.dupe(u8, "docs"),
     };
     defer request.deinit(alloc);
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.ensureStructuralRepairHandoffStatus("docs", 7002);
     try request.deferRepairDebt(alloc, 7001);
     try request.deferRepairDebt(alloc, 7002);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
@@ -33610,6 +33631,26 @@ test "structural repair handoff keeps status fenced through final shard visibili
     try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
     try std.testing.expectEqual(@as(usize, 0), debt_capture.runnable_enqueue_calls);
     try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
+
+    // Repair of an early shard may finish while the structural request is
+    // still reconciling later shards. Its clear and authoritative observation
+    // must settle shard authority without opening the table-wide status fence.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .index_repair_cleared,
+    );
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .status,
+    );
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
     request.handoffDeferredRepairDebt(&source);
     try std.testing.expectEqual(@as(usize, 4), debt_capture.enqueue_calls);
     try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
@@ -33622,22 +33663,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
     source.endTableRequest("docs");
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
-        &source,
-        "docs",
-        7001,
-        null,
-        .publish_blocking,
-    );
-    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
-        &source,
-        "docs",
-        7001,
-        null,
-        .index_repair_cleared,
-    );
-    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    // The completed early shard must not be re-fenced by final handoff.
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -33655,12 +33681,27 @@ test "structural repair handoff keeps status fenced through final shard visibili
         .index_repair_cleared,
     );
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
-    // A post-clear status observation settles this shard without waiting for
-    // unrelated dense or enrichment workers to become globally idle.
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
         7002,
+        null,
+        .status,
+    );
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    // Unrelated debt discovered under the table reservation owns its exact
+    // shard fence and settles independently after its post-clear observation.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7003,
+        null,
+        .index_repair_cleared,
+    );
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7003,
         null,
         .status,
     );
@@ -33693,6 +33734,7 @@ test "repair handoff status settles after authoritative cached publication" {
         .table_name = try alloc.dupe(u8, "docs"),
     };
     defer request.deinit(alloc);
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
     try request.deferRepairDebt(alloc, 7001);
     request.handoffDeferredRepairDebt(&source);
     source.markRepairHandoffClearBestEffort("docs", 7001);
@@ -33921,7 +33963,6 @@ test "structural reconcile publishes durable index repair debt once per group" {
     request.publishDeferredRepairDebt(&source);
     try std.testing.expectEqual(@as(usize, 2), capture.enqueue_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.runnable_enqueue_calls);
-    const first_pass_enqueue_calls = capture.enqueue_calls;
 
     var attempted_repair = false;
     var repaired = false;
@@ -33931,25 +33972,19 @@ test "structural reconcile publishes durable index repair debt once per group" {
         // cache entry is retired between structural handoff and repair.
         try source.clearWriteCache();
         try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
-        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
         const status = source.beginStatusRequest("docs");
-        var status_active = true;
-        defer if (status_active) source.endStatusRequest("docs", status);
-        try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, status);
+        try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, status);
+        source.endStatusRequest("docs", status);
         const RepairWorker = struct {
             source: *ProvisionedTableWriteSource,
             indexes_json: []const u8,
             namespace: doc_identity.Namespace,
-            completed: std.atomic.Value(bool) = .init(false),
             attempted_repair: bool = false,
             repaired: bool = false,
             repair_passes: usize = 0,
             err: ?anyerror = null,
 
             fn run(self: *@This()) void {
-                defer self.completed.store(true, .release);
                 for (0..16) |_| {
                     const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
                         .indexes_json = self.indexes_json,
@@ -33975,35 +34010,11 @@ test "structural reconcile publishes durable index repair debt once per group" {
             .indexes_json = indexes_json,
             .namespace = namespace,
         };
-        var repair_future = try std.Io.concurrent(io, RepairWorker.run, .{&worker});
-        var repair_awaited = false;
-        defer if (!repair_awaited) {
-            if (status_active) {
-                source.endStatusRequest("docs", status);
-                status_active = false;
-            }
-            repair_future.await(io);
-        };
-
-        // Cold repair queues an exclusive operation behind live status. Model
-        // the production callers as concurrent tasks and release status once
-        // the repair is queued; holding both on this thread makes repair wait
-        // on its own status lease.
-        var repair_waiter_observed = false;
-        for (0..10_000) |_| {
-            if (source.testingGroupOperationWaiterCount("docs", 7001) > 0) {
-                repair_waiter_observed = true;
-                break;
-            }
-            if (worker.completed.load(.acquire)) break;
-            try io.sleep(.fromMilliseconds(1), .awake);
-        }
-        source.endStatusRequest("docs", status);
-        status_active = false;
-        repair_future.await(io);
-        repair_awaited = true;
+        // Snapshot-only status is observational and cannot delay the cold
+        // repair owner. The repair's clear plus final cached publication must
+        // retire shard authority without another structural pass.
+        worker.run();
         if (worker.err) |err| return err;
-        try std.testing.expect(repair_waiter_observed);
         attempted_repair = worker.attempted_repair;
         repaired = worker.repaired;
         repair_passes = worker.repair_passes;
@@ -34011,12 +34022,17 @@ test "structural reconcile publishes durable index repair debt once per group" {
     try std.testing.expect(repair_passes >= 2);
     try std.testing.expect(attempted_repair);
     try std.testing.expect(repaired);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    // Repair's visibility hook may repeat the idempotent exact-debt enqueue as
+    // each bounded pass discovers the durable intent. Only a subsequent
+    // structural pass must remain silent after this baseline.
+    const post_repair_enqueue_calls = capture.enqueue_calls;
 
     try std.testing.expectEqual(
         ProvisionedTableWriteSource.StructuralReconcileOutcome.complete,
         try source.reconcileTableStructureStep(alloc, &request),
     );
-    try std.testing.expectEqual(first_pass_enqueue_calls, capture.enqueue_calls);
+    try std.testing.expectEqual(post_repair_enqueue_calls, capture.enqueue_calls);
     // Queue retirement belongs to the aggregate DataServer scheduler after it
     // verifies that no other named index intent remains in this group.
 }
