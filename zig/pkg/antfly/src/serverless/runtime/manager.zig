@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const api_mod = @import("../api/mod.zig");
@@ -106,10 +107,10 @@ pub const ManagedRuntime = struct {
         return try self.runOnceWithCancellation(.none);
     }
 
-    fn runOnceWithCancellation(self: *ManagedRuntime, cancellation: CancellationToken) !RuntimeRunStats {
+    pub fn runOnceWithCancellation(self: *ManagedRuntime, cancellation: CancellationToken) !RuntimeRunStats {
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return RuntimeRunStats{};
         try cancellation.check();
-        lockAtomic(&self.run_mu);
+        try lockAtomicWithCancellation(&self.run_mu, cancellation);
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
@@ -777,4 +778,11 @@ fn sleepMs(ms: u64) void {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: CancellationToken) !void {
+    while (!mutex.tryLock()) {
+        try cancellation.check();
+        platform_time.yieldBriefly();
+    }
 }

@@ -22,6 +22,7 @@ pub const freeSegment = types.freeSegment;
 pub const artifactNameAlloc = types.artifactNameAlloc;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const encodeAllocWithCancellation = codec.encodeAllocWithCancellation;
+pub const encodeAllocWithCancellationAndLimit = codec.encodeAllocWithCancellationAndLimit;
 pub const encodedSize = codec.encodedSize;
 pub const encodedSizeWithCancellation = codec.encodedSizeWithCancellation;
 pub const decodeAlloc = codec.decodeAlloc;

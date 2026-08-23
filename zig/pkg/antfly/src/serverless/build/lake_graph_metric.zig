@@ -683,11 +683,17 @@ fn encodeMetricResultAlloc(
     var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
     scores_owned = false;
     defer segment.deinit(alloc);
-    const encoded_size = try metric_segment.encodedSizeWithCancellation(segment, options.cancellation);
-    if (encoded_size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
-    if (options.batch_budget) |budget| try budget.chargePayload(encoded_size);
-    const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, options.cancellation);
+    const payload = metric_segment.encodeAllocWithCancellationAndLimit(
+        alloc,
+        segment,
+        options.cancellation,
+        options.limits.max_metric_payload_bytes,
+    ) catch |err| switch (err) {
+        error.GraphMetricSegmentTooLarge => return error.GraphMetricBuildBudgetExceeded,
+        else => return err,
+    };
     errdefer alloc.free(payload);
+    if (options.batch_budget) |budget| try budget.chargePayload(payload.len);
     const name = try artifactNameAlloc(alloc, options.graph_index_name, options.config.name);
     errdefer alloc.free(name);
     const artifact_id = try std.fmt.allocPrint(alloc, "lake-graph-metric:{d}:{s}:{d}", .{ name.len, name, payload.len });

@@ -798,9 +798,18 @@ pub const CatalogService = struct {
     }
 
     pub fn buildTable(self: *CatalogService, table_name: []const u8) !builder_mod.BuildResult {
+        return try self.buildTableWithCancellation(table_name, .none);
+    }
+
+    pub fn buildTableWithCancellation(
+        self: *CatalogService,
+        table_name: []const u8,
+        cancellation: CancellationToken,
+    ) !builder_mod.BuildResult {
+        try cancellation.check();
         const namespace = try self.resolveTableNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
-        return try self.buildNamespace(namespace);
+        return try self.buildNamespaceWithCancellation(namespace, cancellation);
     }
 
     pub fn tableBuildStatus(self: *CatalogService, table_name: []const u8) !catalog_types.BuildStatus {

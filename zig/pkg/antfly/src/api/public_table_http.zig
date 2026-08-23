@@ -2599,6 +2599,40 @@ test "public table batch handler identifies committed repair-required writes" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"committed_repair_required\"") != null);
 }
 
+test "serverless public table batch handler identifies committed graph metric rejections" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{ .ptr = undefined, .request = .{}, .vtable = &.{
+                .execute_table_batch = executeTableBatch,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            return error.CommittedGraphMetricMaterializationRejected;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expect(resp.json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"status\":\"committed_graph_metric_materialization_rejected\",\"inserted\":1,\"deleted\":0,\"transformed\":0}",
+        resp.body,
+    );
+}
+
 test "public table batch handler preserves ambiguous write outcomes" {
     const Backend = struct {
         fn iface() TableApi {

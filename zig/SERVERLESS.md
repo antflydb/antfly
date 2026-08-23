@@ -676,15 +676,17 @@ release in two phases:
 1. Roll out the new query/API binaries everywhere while leaving
    `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=12` (the default).
 2. After every reader is on the new release, set
-   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=15` on maintenance or combined
+   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=17` on maintenance or combined
    publishers.
 
 Graph metric materialization remains dormant while the gate is at version 12.
-Once version 15 is enabled, catalog reconciliation detects configured metrics
+Once version 17 is enabled, catalog reconciliation detects configured metrics
 without artifacts and schedules their publication. Readers remain backward
-compatible with version 12 manifests throughout the rollout. Setting any value
-other than 12 or the current version fails startup rather than risking a
-partially compatible deployment.
+compatible with version 12 manifests throughout the rollout. Versions 15 and
+16 remain accepted only for compatibility with deployments that already used
+the earlier graph-metric layouts; new graph-metric publications require version
+17 so every reader understands the authenticated ranked-score blocks. Other
+values fail startup rather than risking a partially compatible deployment.
 
 ## Image And CI Path
 

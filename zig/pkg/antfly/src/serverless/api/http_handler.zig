@@ -68,6 +68,20 @@ const graph_segment_mod = @import("../graph_segment/mod.zig");
 const graph_metric_segment_mod = @import("../graph_metric_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const query_execution = @import("query_execution.zig");
+
+const SyncWaitCancellation = struct {
+    upstream: CancellationToken,
+    deadline_ns: u64,
+
+    fn token(self: *const @This()) CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const state: *const @This() = @ptrCast(@alignCast(ptr));
+        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+    }
+};
 const json_helpers = @import("../../api/json_helpers.zig");
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
@@ -1029,13 +1043,16 @@ pub const HttpHandler = struct {
         var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(cancellation));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            201 => blk: {
+            201, 202 => blk: {
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, 201, parsed);
+                break :blk try jsonResponse(self.alloc, resp.status, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => if (resp.json)
+                try jsonSliceResponse(self.alloc, resp.status, resp.body)
+            else
+                try textResponse(self.alloc, resp.status, resp.body),
         };
     }
 
@@ -5036,9 +5053,16 @@ pub const HttpHandler = struct {
         }
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
+        const deadline_ns = start_ns +| timeout_ns;
+        const sync_cancellation_state = SyncWaitCancellation{
+            .upstream = cancellation,
+            .deadline_ns = deadline_ns,
+        };
+        const sync_cancellation = sync_cancellation_state.token();
         while (true) {
-            cancellation.check() catch return error.CommittedPending;
-            const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
+            sync_cancellation.check() catch return error.CommittedPending;
+            const build_result = self.catalog.buildTableWithCancellation(table_name, sync_cancellation) catch |err| switch (err) {
+                error.Canceled => return error.CommittedPending,
                 error.NamespaceNotFound => return error.CommittedRepairRequired,
                 error.HeadChanged => null,
                 else => {
@@ -5052,9 +5076,12 @@ pub const HttpHandler = struct {
             }
 
             if (self.runtime_metrics) |runtime| {
-                _ = runtime.runOnce() catch |err| {
-                    std.log.err("serverless public table batch maintenance run failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.CommittedRepairRequired;
+                _ = runtime.runOnceWithCancellation(sync_cancellation) catch |err| switch (err) {
+                    error.Canceled => return error.CommittedPending,
+                    else => {
+                        std.log.err("serverless public table batch maintenance run failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
+                        return error.CommittedRepairRequired;
+                    },
                 };
             }
 
@@ -5069,7 +5096,8 @@ pub const HttpHandler = struct {
 
             if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.CommittedGraphMetricMaterializationRejected;
             if (tableSyncLevelSatisfied(sync_level, end_lsn, status)) return;
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) {
+            if (cancellation.isCancelled()) return error.CommittedPending;
+            if (platform_time.monotonicNs() >= deadline_ns) {
                 std.log.err(
                     "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} graph_metrics_configured={} graph_metrics_pending={} graph_metrics_rejected={} active_stage={any}",
                     .{
@@ -10427,6 +10455,23 @@ test "serverless full_index sync waits for enrichment and index publication" {
 
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));
+}
+
+test "serverless sync wait cancellation combines request cancellation and deadline" {
+    var upstream_signal = std.atomic.Value(bool).init(false);
+    const expired = SyncWaitCancellation{
+        .upstream = CancellationToken.fromAtomic(&upstream_signal),
+        .deadline_ns = 0,
+    };
+    try std.testing.expect(expired.token().isCancelled());
+
+    const upstream_only = SyncWaitCancellation{
+        .upstream = CancellationToken.fromAtomic(&upstream_signal),
+        .deadline_ns = std.math.maxInt(u64),
+    };
+    try std.testing.expect(!upstream_only.token().isCancelled());
+    upstream_signal.store(true, .release);
+    try std.testing.expect(upstream_only.token().isCancelled());
 }
 
 test "serverless full_index graph metric preflight fails before commit" {
