@@ -21,6 +21,7 @@
 const std = @import("std");
 const ml = @import("ml");
 const runtime = @import("../runtime/root.zig");
+const a4b_qualification = @import("../runtime/moe/a4b_qualification.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
@@ -70,12 +71,12 @@ pub const A4bExpertGeometry = struct {
 /// This is deliberately a single-entry qualification table. Supporting a
 /// shape is a release claim, not a best-effort dispatch decision.
 pub const qualified_a4b_geometries = [_]A4bExpertGeometry{.{
-    .moe_layer_count = 30,
-    .expert_count = 128,
-    .top_k = 8,
-    .hidden_size = 2816,
-    .expert_intermediate_size = 704,
-    .encoded_expert_bytes = 3_345_408,
+    .moe_layer_count = a4b_qualification.moe_layer_count,
+    .expert_count = a4b_qualification.expert_count,
+    .top_k = a4b_qualification.top_k,
+    .hidden_size = a4b_qualification.hidden_size,
+    .expert_intermediate_size = a4b_qualification.expert_intermediate_size,
+    .encoded_expert_bytes = a4b_qualification.encoded_expert_bytes,
 }};
 
 pub const A4bInferenceConfig = struct {

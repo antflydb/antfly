@@ -5584,10 +5584,7 @@ pub const ModelManager = struct {
             model_dir,
             self.session_manager.preferred_backends,
             true,
-            .{
-                .a4b_request = self.session_manager.a4b_inference_request,
-                .accept_default_alias = true,
-            },
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
         );
     }
 
@@ -5601,16 +5598,19 @@ pub const ModelManager = struct {
             model_dir,
             preferred_backends,
             cache_default_alias,
-            .{
-                .a4b_request = self.session_manager.a4b_inference_request,
-                .accept_default_alias = true,
-            },
+            inheritedA4bCachePolicy(
+                self.session_manager.a4b_inference_request,
+                cache_default_alias,
+            ),
         );
     }
 
     /// Acquire a model using an immutable A4B policy for this load. Explicit
     /// policies do not accept an existing unqualified alias: the qualified
-    /// cache key must match before a model can be reused.
+    /// cache key must match before a model can be reused. A newly qualified
+    /// preload may still publish the default alias so later policy-free
+    /// requests reuse the warmed session; its policy-specific variant key
+    /// remains the ownership key.
     pub fn acquireFromDirWithA4bRequest(
         self: *ModelManager,
         model_dir: []const u8,
@@ -6260,6 +6260,16 @@ const ModelLoadCachePolicy = struct {
     accept_default_alias: bool = true,
 };
 
+fn inheritedA4bCachePolicy(
+    request: ?backend_contracts.A4bInferenceRequest,
+    accept_default_alias: bool,
+) ModelLoadCachePolicy {
+    return .{
+        .a4b_request = request,
+        .accept_default_alias = accept_default_alias,
+    };
+}
+
 fn loadedModelUsesPreferredBackend(
     model: *const LoadedModel,
     preferred_backends: []const backends.BackendType,
@@ -6314,6 +6324,17 @@ test "A4B model cache keys isolate residency policies" {
     try std.testing.expect(!std.mem.eql(u8, default_key, streamed_key));
     try std.testing.expect(!std.mem.eql(u8, streamed_key, resident_key));
     try std.testing.expect(std.mem.endsWith(u8, streamed_key, "a4b=streamed:4096"));
+}
+
+test "preferred-backend cache isolation also rejects the default alias" {
+    const request = backend_contracts.A4bInferenceRequest{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    };
+    const isolated = inheritedA4bCachePolicy(request, false);
+    try std.testing.expectEqual(request, isolated.a4b_request.?);
+    try std.testing.expect(!isolated.accept_default_alias);
+    try std.testing.expect(inheritedA4bCachePolicy(null, true).accept_default_alias);
 }
 
 test "explicit backend lookup reuses only a matching default alias" {

@@ -34620,7 +34620,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
 // tensors remain mmap-backed shared buffers and routes never leave the GPU.
 // Binding a complete mapped tensor can make Metal establish residency for the
 // full resource, so this entry point deliberately rejects every layer except
-// layer zero until the residency oracle has qualified a wider rollout.
+// layer zero and every shape except single-row decode until the residency and
+// batching oracles have qualified a wider rollout.
 int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
     termite_metal_decode_runtime *runtime,
     size_t layer_index,
@@ -34658,7 +34659,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_layer0_device(
         runtime->moe_slot_reduce_pipeline == nil ||
         (selected_expert_prefetch != 0u && runtime->mapped_selected_expert_page_touch_pipeline == nil)) return -2;
     if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil) return -3;
-    if (rows == 0 || rows > UINT32_MAX || hidden_size == 0 || hidden_size > UINT32_MAX ||
+    if (rows != 1 || hidden_size == 0 || hidden_size > UINT32_MAX ||
         inter_size == 0 || inter_size > UINT32_MAX || num_experts == 0 || num_experts > UINT32_MAX ||
         top_k == 0 || top_k > 8u || top_k > num_experts ||
         (hidden_size % 32u) != 0u || (inter_size % 32u) != 0u) return -4;
@@ -34968,7 +34969,8 @@ int termite_metal_decode_runtime_finish_moe_checkpoint(
 // previously published per-layer slot directory on the same encoder. Passing
 // null for both host outputs selects the optimistic checkpoint mode: no frame
 // flush or route memcpy occurs and the per-layer miss count is recorded in the
-// checkpoint ledger for inspection after the frame's terminal wait.
+// checkpoint ledger for inspection after the frame's terminal wait. That
+// ledger owns one counter per layer, so optimistic mode is decode-row-only.
 static int termite_metal_decode_runtime_select_moe_routes_device_impl(
     termite_metal_decode_runtime *runtime,
     size_t layer_index,
@@ -34993,7 +34995,8 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
     if (no_host_output &&
         (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil)) return -3;
     if (optimistic &&
-        (runtime->moe_checkpoint_layer_miss_buffer == nil ||
+        (rows != 1 ||
+         runtime->moe_checkpoint_layer_miss_buffer == nil ||
          layer_index >= runtime->moe_checkpoint_layer_count)) return -3;
     runtime->moe_route_select_attempt_count = termite_metal_u64_saturating_add(runtime->moe_route_select_attempt_count, 1);
     if (rows > UINT32_MAX || num_experts > UINT32_MAX || !isfinite(logit_scale) || logit_scale <= 0.0f) return -4;

@@ -31,6 +31,7 @@ pub const max_slots: usize = 128;
 pub const max_route_width: usize = 8;
 pub const invalid_expert: u16 = std.math.maxInt(u16);
 pub const invalid_slot: u8 = std.math.maxInt(u8);
+const use_count_decay_interval: u64 = 1024;
 
 pub const ArenaError = error{
     InvalidCapacity,
@@ -56,6 +57,18 @@ pub const Observation = struct {
     }
 };
 
+pub const LayerSnapshot = struct {
+    epoch: u64,
+    expert_for_slot: [max_slots]u16,
+    slot_for_expert: [max_experts]u8,
+    use_count: [max_slots]u64,
+    last_access_epoch: [max_slots]u64,
+    layer_observation_count: u64,
+};
+
+/// Mutating operations are not thread-safe. An arena belongs to one compute
+/// executor, and callers must serialize route observation, device publication,
+/// and rollback as one transaction.
 pub const ExpertSlotArena = struct {
     active_slots: u8,
     epoch: u64 = 0,
@@ -67,10 +80,37 @@ pub const ExpertSlotArena = struct {
         [_][max_slots]u64{[_]u64{0} ** max_slots} ** max_layers,
     last_access_epoch: [max_layers][max_slots]u64 =
         [_][max_slots]u64{[_]u64{0} ** max_slots} ** max_layers,
+    layer_observation_count: [max_layers]u64 = [_]u64{0} ** max_layers,
 
     pub fn init(active_slots: usize) ArenaError!ExpertSlotArena {
         if (active_slots == 0 or active_slots > max_slots) return error.InvalidCapacity;
         return .{ .active_slots = @intCast(active_slots) };
+    }
+
+    pub fn snapshotLayer(self: *const ExpertSlotArena, layer: usize) ArenaError!LayerSnapshot {
+        if (layer >= max_layers) return error.LayerOutOfRange;
+        return .{
+            .epoch = self.epoch,
+            .expert_for_slot = self.expert_for_slot[layer],
+            .slot_for_expert = self.slot_for_expert[layer],
+            .use_count = self.use_count[layer],
+            .last_access_epoch = self.last_access_epoch[layer],
+            .layer_observation_count = self.layer_observation_count[layer],
+        };
+    }
+
+    pub fn restoreLayer(
+        self: *ExpertSlotArena,
+        layer: usize,
+        snapshot: LayerSnapshot,
+    ) ArenaError!void {
+        if (layer >= max_layers) return error.LayerOutOfRange;
+        self.epoch = snapshot.epoch;
+        self.expert_for_slot[layer] = snapshot.expert_for_slot;
+        self.slot_for_expert[layer] = snapshot.slot_for_expert;
+        self.use_count[layer] = snapshot.use_count;
+        self.last_access_epoch[layer] = snapshot.last_access_epoch;
+        self.layer_observation_count[layer] = snapshot.layer_observation_count;
     }
 
     pub fn observeRoute(
@@ -92,6 +132,10 @@ pub const ExpertSlotArena = struct {
         }
 
         self.epoch +|= 1;
+        self.layer_observation_count[layer] +|= 1;
+        if (self.layer_observation_count[layer] % use_count_decay_interval == 0) {
+            for (self.use_count[layer][0..self.active_slots]) |*count| count.* >>= 1;
+        }
         var result = Observation{ .count = experts.len };
         var pinned = [_]bool{false} ** max_slots;
 
@@ -245,6 +289,31 @@ test "expert slot arena repairs one miss without evicting current hits" {
     try arena.writeExpertToSlotMap(4, 128, &map);
     for (changed) |expert| try std.testing.expect(map[expert] < 8);
     try std.testing.expectEqual(std.math.maxInt(u32), map[7]);
+}
+
+test "expert slot arena restores one transactional layer without a full arena copy" {
+    try std.testing.expect(@sizeOf(LayerSnapshot) * 16 < @sizeOf(ExpertSlotArena));
+    var arena = try ExpertSlotArena.init(8);
+    const original = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    _ = try arena.observeRoute(4, 128, &original);
+    const snapshot = try arena.snapshotLayer(4);
+    _ = try arena.observeRoute(4, 128, &.{ 0, 1, 2, 3, 4, 5, 6, 99 });
+    try arena.restoreLayer(4, snapshot);
+
+    const restored = try arena.observeRoute(4, 128, &original);
+    try std.testing.expect(restored.all_hit_before_update);
+    try std.testing.expectEqual(@as(usize, 0), restored.miss_count);
+}
+
+test "expert slot arena periodically decays historical LFU bias" {
+    var arena = try ExpertSlotArena.init(8);
+    const route = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    _ = try arena.observeRoute(0, 128, &route);
+    arena.use_count[0][0] = 64;
+    arena.layer_observation_count[0] = use_count_decay_interval - 1;
+
+    _ = try arena.observeRoute(0, 128, &route);
+    try std.testing.expectEqual(@as(u64, 33), arena.use_count[0][0]);
 }
 
 test "expert slot arena isolates layers and rejects duplicate routes" {

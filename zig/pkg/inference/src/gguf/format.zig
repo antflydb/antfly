@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const tensor_types = @import("tensor_types.zig");
+const a4b_qualification = @import("../runtime/moe/a4b_qualification.zig");
 
 pub const magic = "GGUF";
 pub const default_alignment: u64 = 32;
@@ -301,13 +302,15 @@ pub const SupportMetadata = struct {
     /// layouts before publishing a session.
     pub fn isQualifiedGemma4A4b(self: SupportMetadata) bool {
         return self.architecture != null and
-            std.mem.eql(u8, self.architecture.?, "gemma4") and
-            self.block_count == 30 and
-            self.expert_count == 128 and
-            self.expert_used_count == 8 and
-            self.embedding_length == 2816 and
-            self.expert_feed_forward_length == 704 and
-            self.file_type == 2;
+            std.mem.eql(u8, self.architecture.?, a4b_qualification.architecture) and
+            a4b_qualification.matchesGeometry(
+                self.block_count,
+                self.expert_count,
+                self.expert_used_count,
+                self.embedding_length,
+                self.expert_feed_forward_length,
+            ) and
+            self.file_type == a4b_qualification.gguf_file_type;
     }
 };
 

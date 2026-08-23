@@ -501,15 +501,7 @@ pub fn resolveA4bInferenceConfigForModelListing(
         if (request != null) return error.A4bUnsupportedGeometry;
         return null;
     };
-    if (!gemma4_runtime.isQualifiedA4bArchitecture(config)) {
-        if (request != null) return error.A4bUnsupportedGeometry;
-        return null;
-    }
-    if (!qualifiedA4bArtifact(report)) return error.A4bUnsupportedArtifact;
-    return try backend_contracts.buildA4bInferenceConfig(
-        request orelse .{},
-        backend_contracts.qualified_a4b_geometries[0],
-    );
+    return resolveA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
 }
 
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
@@ -3900,11 +3892,22 @@ fn resolveA4bInferenceConfig(
             return null;
         },
     };
+    return resolveA4bGptInferenceConfig(gpt_config, request, artifact_qualified);
+}
+
+fn resolveA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
     if (!gemma4_runtime.isQualifiedA4bArchitecture(gpt_config)) {
         if (request != null) return error.A4bUnsupportedGeometry;
         return null;
     }
-    if (!artifact_qualified) return error.A4bUnsupportedArtifact;
+    if (!artifact_qualified) {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    }
     return try backend_contracts.buildA4bInferenceConfig(
         request orelse .{},
         backend_contracts.qualified_a4b_geometries[0],
@@ -4041,6 +4044,34 @@ test "A4B artifact qualification requires the complete Q4_0 expert set" {
     try std.testing.expect(qualifiedA4bArtifact(report));
     report.packed_moe_q4_0_tensor_count -= 1;
     try std.testing.expect(!qualifiedA4bArtifact(report));
+}
+
+test "A4B geometry does not opt an unqualified artifact into A4B inference" {
+    const matching_geometry = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        false,
+    )) == null);
+    try std.testing.expectError(error.A4bUnsupportedArtifact, resolveA4bGptInferenceConfig(
+        matching_geometry,
+        .{},
+        false,
+    ));
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )) != null);
 }
 
 test "A4B configured GGUF passes metadata-only production qualification" {

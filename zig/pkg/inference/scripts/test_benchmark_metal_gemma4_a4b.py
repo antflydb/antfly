@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from benchmark_metal_gemma4_a4b import (  # noqa: E402
     BenchmarkContractError,
     METADATA_SCHEMA,
+    _resolve_gguf,
     build_summary,
     parse_sample,
 )
@@ -120,6 +121,85 @@ class ParseSampleTests(unittest.TestCase):
                     expected_output_sha256=digest(OUTPUT_IDS),
                     max_rss_mb=2304,
                 )
+
+    def test_rejects_each_release_contract_class(self) -> None:
+        cases = {
+            "non-metal backend": (
+                lambda value: value.update(backend="native"),
+                lambda value: value,
+            ),
+            "wrong output contract": (
+                lambda value: value.update(tokens=2),
+                lambda value: value,
+            ),
+            "wrong device": (
+                lambda value: value["metal"].update(device="Apple M3"),
+                lambda value: value,
+            ),
+            "mapped preparation failure": (
+                lambda value: value["metal"]["residency"].update(
+                    runtime_mapped_failures=1
+                ),
+                lambda value: value,
+            ),
+            "missing routed dispatch": (
+                lambda value: value["metal"]["residency"].update(
+                    a4b_pair_attempts=0, a4b_pair_successes=0
+                ),
+                lambda value: value,
+            ),
+            "invalid timing": (
+                lambda value: value["timing_ms"].update(decode_inner=0),
+                lambda value: value,
+            ),
+            "wrong runtime policy": (
+                lambda value: value,
+                lambda value: value.replace("mode=streamed", "mode=resident"),
+            ),
+            "excess RSS": (
+                lambda value: value,
+                lambda value: value.replace(
+                    str(1900 * 1024 * 1024), str(2400 * 1024 * 1024)
+                ),
+            ),
+        }
+        for name, (mutate_payload, mutate_log) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                sample_payload = payload(100, 40, 60)
+                mutate_payload(sample_payload)
+                json_path = root / "sample.json"
+                log_path = root / "sample.log"
+                json_path.write_text(json.dumps(sample_payload))
+                log_path.write_text(mutate_log(log("streamed", 2048)))
+                with self.assertRaises(BenchmarkContractError):
+                    parse_sample(
+                        json_path,
+                        log_path,
+                        expected_mode="streamed",
+                        expected_budget_mb=2048,
+                        expected_device="Apple M4",
+                        expected_prompt_tokens=2,
+                        expected_prompt_sha256=digest(PROMPT_IDS),
+                        expected_output_tokens=3,
+                        expected_output_sha256=digest(OUTPUT_IDS),
+                        max_rss_mb=2304,
+                    )
+
+
+class GgufResolutionTests(unittest.TestCase):
+    def test_directory_requires_exactly_one_decoder_gguf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first.gguf"
+            second = root / "second.gguf"
+            projector = root / "mmproj.gguf"
+            first.write_bytes(b"small")
+            projector.write_bytes(b"projector")
+            self.assertEqual(first.resolve(), _resolve_gguf(root, None))
+            second.write_bytes(b"larger decoder")
+            with self.assertRaisesRegex(BenchmarkContractError, "exactly one"):
+                _resolve_gguf(root, None)
 
 
 class SummaryTests(unittest.TestCase):

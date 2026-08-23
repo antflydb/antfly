@@ -316,11 +316,33 @@ fn activePagedSlotAttentionDeferredEnabled(a4b_runtime: bool) bool {
     );
 }
 
+fn sameMetalRuntime(expected: ?*anyopaque, actual: ?*anyopaque) bool {
+    return expected != null and expected == actual;
+}
+
+fn shouldPublishMoeSlotDirectory(repaired_count: usize, already_published: bool) bool {
+    return repaired_count != 0 or !already_published;
+}
+
 test "metal active paged-slot attention deferred completion policy" {
     try std.testing.expect(activePagedSlotAttentionDeferredPolicy(true, false, false));
     try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(false, false, false));
     try std.testing.expect(activePagedSlotAttentionDeferredPolicy(false, true, false));
     try std.testing.expect(!activePagedSlotAttentionDeferredPolicy(true, true, true));
+}
+
+test "deferred paged-slot attention requires one producer-consumer runtime" {
+    var producer: u8 = 0;
+    var other: u8 = 0;
+    try std.testing.expect(sameMetalRuntime(&producer, &producer));
+    try std.testing.expect(!sameMetalRuntime(&producer, &other));
+    try std.testing.expect(!sameMetalRuntime(null, &producer));
+}
+
+test "all-hit expert routes keep an already published slot directory" {
+    try std.testing.expect(shouldPublishMoeSlotDirectory(0, false));
+    try std.testing.expect(shouldPublishMoeSlotDirectory(1, true));
+    try std.testing.expect(!shouldPublishMoeSlotDirectory(0, true));
 }
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
@@ -875,6 +897,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // current host dispatch remains authoritative until weight bytes are
     // copied into these slots and route-slot kernels can replay misses.
     a4b_expert_slot_arena: ?runtime_root.moe.expert_slot_arena.ExpertSlotArena = null,
+    a4b_moe_slot_directory_published: [runtime_root.moe.expert_slot_arena.max_layers]bool =
+        [_]bool{false} ** runtime_root.moe.expert_slot_arena.max_layers,
     a4b_projected_arena_telemetry_requested: ?bool = null,
     a4b_projected_arena_telemetry: ?*A4bProjectedArenaTelemetry = null,
     a4b_moe_checkpoint_active: bool = false,
@@ -5289,7 +5313,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
         }
         const arena = &self.a4b_expert_slot_arena.?;
-        const prior_arena = arena.*;
+        const prior_layer = arena.snapshotLayer(request.layer_index) catch {
+            self.timing_stats.a4b_moe_slot_arena_failures += 1;
+            return error.A4bMetalRouteUnavailable;
+        };
         const observation = arena.observeRoute(
             request.layer_index,
             request.num_experts,
@@ -5302,10 +5329,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var repaired_slots: [runtime_root.moe.expert_slot_arena.max_route_width]u32 = undefined;
         var repaired_count: usize = 0;
         const upload_len = std.math.mul(usize, observation.miss_count, layout.expert_stride) catch {
-            arena.* = prior_arena;
+            arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
             return error.OutOfMemory;
         };
-        const upload = try self.allocator.alloc(u8, upload_len);
+        const upload = self.allocator.alloc(u8, upload_len) catch |err| {
+            arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
+            return err;
+        };
         defer self.allocator.free(upload);
         @memset(upload, 0);
         for (routes.expert_ids[0..request.top_k], 0..) |expert, route_index| {
@@ -5318,7 +5348,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.inter_size,
                 upload[base + layout.gate_offset ..][0..layout.gate_bytes],
             ) catch |err| {
-                arena.* = prior_arena;
+                arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
                 return err;
             };
             copyPackedMoeQ4Projection(
@@ -5328,7 +5358,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.inter_size,
                 upload[base + layout.up_offset ..][0..layout.gate_bytes],
             ) catch |err| {
-                arena.* = prior_arena;
+                arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
                 return err;
             };
             copyPackedMoeQ4Projection(
@@ -5338,29 +5368,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.hidden_size,
                 upload[base + layout.down_offset ..][0..layout.down_bytes],
             ) catch |err| {
-                arena.* = prior_arena;
+                arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
                 return err;
             };
             repaired_slots[repaired_count] = observation.route_slots[route_index];
             repaired_count += 1;
         }
         std.debug.assert(repaired_count == observation.miss_count);
-        if (!self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts)) {
-            arena.* = prior_arena;
-            self.timing_stats.a4b_moe_slot_map_publish_failures += 1;
-            self.timing_stats.a4b_moe_slot_arena_failures += 1;
-            return error.A4bMetalRouteUnavailable;
+        if (shouldPublishMoeSlotDirectory(
+            repaired_count,
+            self.a4b_moe_slot_directory_published[request.layer_index],
+        )) {
+            if (!self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts)) {
+                arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
+                self.a4b_moe_slot_directory_published[request.layer_index] = false;
+                self.timing_stats.a4b_moe_slot_map_publish_failures += 1;
+                self.timing_stats.a4b_moe_slot_arena_failures += 1;
+                return error.A4bMetalRouteUnavailable;
+            }
+            self.a4b_moe_slot_directory_published[request.layer_index] = true;
+            self.timing_stats.a4b_moe_slot_map_publications += 1;
         }
-        self.timing_stats.a4b_moe_slot_map_publications += 1;
-        if (!metal_runtime.decoderRuntimeUploadMoeQ4_0Slots(
+        if (repaired_count != 0 and !metal_runtime.decoderRuntimeUploadMoeQ4_0Slots(
             self.provider_impl,
             request.layer_index,
             repaired_slots[0..repaired_count],
             upload,
             layout.expert_stride,
         )) {
-            arena.* = prior_arena;
-            _ = self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts);
+            arena.restoreLayer(request.layer_index, prior_layer) catch unreachable;
+            self.a4b_moe_slot_directory_published[request.layer_index] =
+                self.publishMoeSlotDirectory(arena, request.layer_index, request.num_experts);
             self.timing_stats.a4b_moe_slot_arena_failures += 1;
             return error.A4bMetalRouteDispatchFailed;
         }
@@ -14936,7 +14974,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
             if (device_written and !attention.skip_kv_write and attention.attn_or_mask == null) {
                 if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
-                    if (pagedSlotAttentionSupported(paged_layer)) {
+                    const provider_runtime: ?*anyopaque = if (self.provider_impl.raw_decode_runtime) |runtime|
+                        @ptrCast(runtime)
+                    else
+                        null;
+                    if (pagedSlotAttentionSupported(paged_layer) and
+                        sameMetalRuntime(provider_runtime, paged_layer.runtime))
+                    {
                         const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
                         defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                         if (block_offsets_opt) |block_offsets_result| {

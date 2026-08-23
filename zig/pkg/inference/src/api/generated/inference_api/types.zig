@@ -5,6 +5,35 @@ const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+pub const A4bResidencyMode = enum {
+    auto,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Process-local foreground request admission settings.
 pub const AdmissionConfig = struct {
     inference: ?RequestAdmissionConfig = null,
@@ -918,8 +947,8 @@ pub const ModelRef = struct {
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
-    residency_mode: ?[]const u8 = null,
-    /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load.
+    residency_mode: ?A4bResidencyMode = null,
+    /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
     memory_budget_mb: ?i64 = null,
 };
 

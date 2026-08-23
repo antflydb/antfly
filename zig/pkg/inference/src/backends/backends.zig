@@ -195,6 +195,10 @@ pub const SessionManager = struct {
         var first_err: ?anyerror = null;
 
         for (effective_backends) |backend| {
+            if (!backendAcceptsA4bRequest(backend, self.a4b_inference_request)) {
+                first_err = first_err orelse error.A4bRequiresMetal;
+                continue;
+            }
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
@@ -413,6 +417,13 @@ fn backendAcceptsQualifiedProfile(backend: BackendType, model_path: []const u8) 
     return backend == .metal and !isOnnxFilePath(model_path);
 }
 
+fn backendAcceptsA4bRequest(
+    backend: BackendType,
+    request: ?backend_contracts.A4bInferenceRequest,
+) bool {
+    return request == null or backend == .metal;
+}
+
 test "onnx artifact routes graph execution for direct compute backends" {
     try std.testing.expect(isOnnxFilePath("model.onnx"));
     try std.testing.expect(!isOnnxFilePath("model.gguf"));
@@ -422,6 +433,13 @@ test "qualified workload profiles select direct Metal sessions only" {
     try std.testing.expect(backendAcceptsQualifiedProfile(.metal, "model.gguf"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.metal, "model.onnx"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.cuda, "model.gguf"));
+}
+
+test "explicit A4B requests select Metal without generic backend fallback" {
+    try std.testing.expect(backendAcceptsA4bRequest(.metal, .{}));
+    try std.testing.expect(!backendAcceptsA4bRequest(.native, .{}));
+    try std.testing.expect(!backendAcceptsA4bRequest(.cuda, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.native, null));
 }
 
 test "onnx backend availability follows linked onnx runtime" {

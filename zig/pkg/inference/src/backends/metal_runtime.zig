@@ -75,6 +75,19 @@ fn finishDeviceOutput(output: *MetalTensor, rc: c_int) ?MetalTensor {
     return output.*;
 }
 
+fn finishDeviceOutputPair(
+    first: *MetalTensor,
+    second: *MetalTensor,
+    rc: c_int,
+) ?PackedMoeLinearPairResult {
+    if (rc != 0) {
+        second.deinit();
+        first.deinit();
+        return null;
+    }
+    return .{ .first = first.*, .second = second.* };
+}
+
 fn finishHostOutput(output: []f32, shape: []const i32, rc: c_int) ?MetalTensor {
     if (rc != 0) {
         std.heap.c_allocator.free(output);
@@ -5193,7 +5206,7 @@ pub fn decoderRuntimeSelectMoeRoutesOptimisticDevice(
 ) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or !logits.isDevice()) return false;
-    if (layer_index >= 32 or rows == 0 or num_experts == 0 or num_experts > 128 or top_k == 0 or top_k > 8 or top_k > num_experts) return false;
+    if (layer_index >= 32 or rows != 1 or num_experts == 0 or num_experts > 128 or top_k == 0 or top_k > 8 or top_k > num_experts) return false;
     const logits_count = std.math.mul(usize, rows, num_experts) catch return false;
     if (logits.elemCount() != logits_count) return false;
     return termite_metal_decode_runtime_select_moe_routes_device(
@@ -5378,7 +5391,7 @@ pub fn decoderRuntimeMoeForwardQ4_0MappedLayer0Device(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
-    if (layer_index != 0 or gate.format != .q4_0 or up.format != .q4_0 or down.format != .q4_0) return null;
+    if (layer_index != 0 or rows != 1 or gate.format != .q4_0 or up.format != .q4_0 or down.format != .q4_0) return null;
     if (gate.expert_count != num_experts or up.expert_count != num_experts or down.expert_count != num_experts) return null;
     if (expert_scale) |scale| if (!scale.isDevice() or scale.elemCount() != num_experts) return null;
     const output_count = std.math.mul(usize, rows, hidden_size) catch return null;
@@ -21646,8 +21659,7 @@ pub fn decoderRuntimeApplyPackedMoeLinear(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyPackedMoeLinearPair(
@@ -21696,8 +21708,7 @@ pub fn decoderRuntimeApplyPackedMoeLinearPair(
         second.deviceHandle(),
         second.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return .{ .first = first, .second = second };
+    return finishDeviceOutputPair(&first, &second, rc);
 }
 
 pub fn decoderRuntimeMoeScatterAdd(
@@ -21733,8 +21744,7 @@ pub fn decoderRuntimeMoeScatterAdd(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 test "A4B Metal Q4_0 expert-id linear and routed scatter match host reference" {
@@ -36950,11 +36960,34 @@ test "A4B Metal optimistic route checkpoint preserves frame and reports layer mi
     const logits_data = [_]f32{ 0.0, 3.0, 0.5, 2.0 };
     var logits = try testDeviceTensorFromSlice(runtime, &logits_data, &[_]i32{ 1, num_experts });
     defer logits.deinit();
+    const batched_logits_data = logits_data ++ logits_data;
+    var batched_logits = try testDeviceTensorFromSlice(
+        runtime,
+        &batched_logits_data,
+        &[_]i32{ 2, num_experts },
+    );
+    defer batched_logits.deinit();
     var all_hit_map = [_]u32{std.math.maxInt(u32)} ** num_experts;
     all_hit_map[1] = 0;
     all_hit_map[3] = 1;
     try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 0, &all_hit_map));
     try std.testing.expect(decoderRuntimePublishMoeExpertSlotMap(&provider, 1, &all_hit_map));
+
+    try beginFrame(runtime);
+    try std.testing.expect(decoderRuntimeBeginMoeCheckpoint(&provider, layer_count));
+    try std.testing.expectEqual(@as(c_int, -3), termite_metal_decode_runtime_select_moe_routes_device(
+        runtime,
+        0,
+        batched_logits.deviceHandle(),
+        batched_logits.deviceByteOffset(),
+        2,
+        num_experts,
+        top_k,
+        1.0,
+        null,
+        null,
+    ));
+    try cancelFrame(runtime);
 
     const before = runtimeMemorySnapshot(runtime);
     try beginFrame(runtime);

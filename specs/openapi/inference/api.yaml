@@ -2999,6 +2999,13 @@ components:
         - q4_k
         - q8
         - fp16
+    A4bResidencyMode:
+      type: string
+      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+      enum:
+        - auto
+        - streamed
+        - resident
     BackendPriorityEntry:
       type: string
       description: |
@@ -3039,8 +3046,7 @@ components:
         quantization:
           $ref: '#/components/schemas/ModelQuantization'
         residency_mode:
-          type: string
-          enum: [auto, streamed, resident]
+          $ref: '#/components/schemas/A4bResidencyMode'
           default: auto
           description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
         memory_budget_mb:
@@ -3049,7 +3055,7 @@ components:
           minimum: 0
           maximum: 1048576
           default: 0
-          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load.
+          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
     PromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

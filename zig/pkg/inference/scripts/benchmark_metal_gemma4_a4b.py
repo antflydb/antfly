@@ -98,7 +98,12 @@ def _resolve_gguf(model: Path, explicit: Path | None) -> Path:
         ]
         if not candidates:
             raise BenchmarkContractError(f"no decoder GGUF found under {model}")
-        result = max(candidates, key=lambda path: path.stat().st_size).resolve()
+        if len(candidates) != 1:
+            rendered = ", ".join(str(path.resolve()) for path in sorted(candidates))
+            raise BenchmarkContractError(
+                f"model directory must contain exactly one decoder GGUF; found {rendered}"
+            )
+        result = candidates[0].resolve()
     if not result.is_file():
         raise BenchmarkContractError(f"GGUF does not exist: {result}")
     return result

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import sys
+import time
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -60,6 +63,93 @@ class ResourceParserTests(unittest.TestCase):
         self.assertEqual(12345, acceptance.parse_process_rss_kib(" 12345\n"))
         with self.assertRaisesRegex(acceptance.AcceptanceError, "numeric RSS"):
             acceptance.parse_process_rss_kib("-")
+
+
+class ResourceMonitorTests(unittest.TestCase):
+    class RunningProcess:
+        pid = 4242
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    def wait_for(self, predicate: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.001)
+        self.fail("resource monitor did not publish a result")
+
+    @mock.patch.object(acceptance, "_process_rss_mib", return_value=512.0)
+    @mock.patch.object(acceptance, "_swapout_bytes", return_value=1024)
+    @mock.patch.object(acceptance, "_memory_free_percent", return_value=70)
+    def test_thread_samples_and_stops_cleanly(self, *_: object) -> None:
+        monitor = acceptance.ResourceMonitor(
+            self.RunningProcess(),
+            baseline_swapout_bytes=1024,
+            min_free_percent=10,
+            max_rss_mib=2048,
+            max_swapout_growth_mib=0,
+            interval_seconds=0.001,
+        )
+        monitor.start()
+        self.wait_for(lambda: bool(monitor.samples))
+        monitor.stop()
+        monitor.check()
+        self.assertGreaterEqual(monitor.summary()["sample_count"], 1)
+
+    @mock.patch.object(acceptance.os, "killpg")
+    @mock.patch.object(acceptance, "_process_rss_mib", return_value=512.0)
+    @mock.patch.object(acceptance, "_swapout_bytes", return_value=1024)
+    @mock.patch.object(acceptance, "_memory_free_percent", return_value=4)
+    def test_violation_terminates_server_and_fails_closed(
+        self,
+        _free: object,
+        _swap: object,
+        _rss: object,
+        killpg: mock.Mock,
+    ) -> None:
+        monitor = acceptance.ResourceMonitor(
+            self.RunningProcess(),
+            baseline_swapout_bytes=1024,
+            min_free_percent=5,
+            max_rss_mib=2048,
+            max_swapout_growth_mib=0,
+            interval_seconds=0.001,
+        )
+        monitor.start()
+        self.wait_for(lambda: monitor.violation is not None)
+        monitor.stop()
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "fell below"):
+            monitor.check()
+        killpg.assert_called_once_with(self.RunningProcess.pid, acceptance.signal.SIGTERM)
+
+    @mock.patch.object(acceptance.os, "killpg")
+    @mock.patch.object(
+        acceptance,
+        "_memory_free_percent",
+        side_effect=acceptance.AcceptanceError("probe unavailable"),
+    )
+    def test_probe_failure_terminates_server_and_fails_closed(
+        self,
+        _free: object,
+        killpg: mock.Mock,
+    ) -> None:
+        monitor = acceptance.ResourceMonitor(
+            self.RunningProcess(),
+            baseline_swapout_bytes=0,
+            min_free_percent=5,
+            max_rss_mib=2048,
+            max_swapout_growth_mib=0,
+            interval_seconds=0.001,
+        )
+        monitor.start()
+        self.wait_for(lambda: monitor.probe_failure is not None)
+        monitor.stop()
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "failed closed"):
+            monitor.check()
+        killpg.assert_called_once_with(self.RunningProcess.pid, acceptance.signal.SIGTERM)
 
 
 class ContractTests(unittest.TestCase):
