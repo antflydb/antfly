@@ -1052,6 +1052,10 @@ class IsolationAwareScheduling(LoadGroupScheduling):
 
         workload = self.assigned_work.pop(node)
         if not self._pending_of(workload):
+            # Removing the worker may have released persistent process slots.
+            # Let existing ready workers use that capacity immediately instead
+            # of waiting for a replacement to start and finish collection.
+            self._reschedule_all()
             return None
 
         # Preserve xdist's crash-reporting contract while delaying assignment

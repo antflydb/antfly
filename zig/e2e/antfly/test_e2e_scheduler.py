@@ -1498,3 +1498,39 @@ def test_crash_recovery_preserves_global_duration_priority(tmp_path: Path) -> No
     assert list(scheduler.workqueue) == [transient_scope]
     assert scheduler._persistent_processes[clean] == {"runtime_b"}
     assert scheduler._reserved_process_slots() == 2
+
+
+def test_completed_worker_removal_immediately_reuses_released_process_slot(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 1
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker(exitstatus=2)
+    clean = FakeWorker()
+    owner_nodeid = "test_a.py::test_done"
+    queued_nodeid = "test_b.py::test_waiting"
+    owner_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_a--module--done"
+    queued_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}runtime_b--module--waiting"
+    collection = [owner_nodeid, queued_nodeid]
+    scheduler._retiring_nodes = set()
+    scheduler._starting_replacements = set()
+    scheduler._collecting_nodes = set()
+    scheduler._transient_handoffs = set()
+    scheduler._persistent_processes = {owner: {"runtime_a"}}
+    scheduler.assigned_work = {
+        owner: {owner_scope: {owner_nodeid: True}},
+        clean: {},
+    }
+    scheduler.registered_collections = {
+        owner: collection,
+        clean: collection,
+    }
+    scheduler.workqueue = OrderedDict({queued_scope: {queued_nodeid: False}})
+
+    assert scheduler.remove_node(owner) is None
+
+    assert clean.sent == [[1]]
+    assert scheduler.workqueue == {}
+    assert scheduler._persistent_processes == {clean: {"runtime_b"}}
+    assert scheduler._reserved_process_slots() == 1
