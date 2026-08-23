@@ -32,7 +32,7 @@ means the behavior has an executable test or command path.
 | Metadata replay stability across build modes | A dedicated 100-consecutive-replay acceptance test | `zig build metadata-vopr-replay-stability-test` and the same command with `-Doptimize=ReleaseSafe` |
 | Distributed acknowledged-data durability | Real public API, split, partition/restart, modeled device crash/recovery, merge, and reference model | `zig build lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling and durability interleavings | Real `RawNode` cluster with selected delivery/drop, deferred persistence/apply, restart, partition, proposal, and compaction transitions | `zig build raft-vopr-test` in Debug and ReleaseSafe |
-| Storage differential and real-backend campaigns | C-versus-Zig LMDB, memory-versus-real-LSM, generated maintenance, crash recovery, and typed storage faults | `zig build lmdb-vopr-test lsm-vopr-test` in Debug and ReleaseSafe |
+| Storage differential and real-backend campaigns | WAL, C-versus-Zig LMDB, memory-versus-real-LSM, real PersistentIndex, split IndexManager, and full DB split worlds with generated maintenance, crash recovery, and typed storage faults | `zig build storage-vopr-test` in Debug and ReleaseSafe; `zig build sim-registry-test` for cross-domain registry parity |
 | HA crash, replication, fencing, promotion, retention, and rejoin lifecycle | Real primary/standby logs and progress WALs, slot store, fence store, promotion and rejoin assessment under generated and scripted histories | `zig build ha-vopr-test ha-chaos-test` in Debug and ReleaseSafe |
 
 The reusable package is Antfly-independent. The physical distributed-data
@@ -498,9 +498,9 @@ cancellation, or teardown. Entropy is deliberately absent from `Runtime`;
 simulation entropy remains an explicit `ChoiceSource` decision.
 
 A production adapter may dispatch `Executor` tasks through `std.Io.Threaded`.
-A future `SimRuntime` instead queues tasks and timers and exposes them through
-`SchedulerPort` as stable transitions. Application code receives `Runtime`,
-never `SchedulerPort`, so it cannot drive or inspect the simulator.
+The implemented `SimRuntime` instead queues tasks and timers and exposes them
+through `SchedulerPort` as stable transitions. Application code receives
+`Runtime`, never `SchedulerPort`, so it cannot drive or inspect the simulator.
 
 An actual `std.Io` backend is optional future work for dependencies that truly
 require the complete interface. It must have a reviewed capability matrix and
@@ -1306,10 +1306,12 @@ existing differential trace corpus and compare selected histories with etcd.
 
 ### Modeled Storage
 
-Status: partially implemented. WAL, LMDB, and LSM use the common runner.
-Persistent index, DB split, and index manager have modeled VOPR build gates but
-still need common artifact/CLI parity. The focused LSM fault matrix remains a
-required complementary gate for specialized split and full-text behavior.
+Status: implemented. WAL, LMDB, LSM, persistent index, index manager, and DB
+split all use the common runner and versioned artifact. Each is registered for
+CLI run, replay, reduce, migrate, promotion routing, persistent-corpus campaign
+mutation/splicing, and exact-replay-before-retention. Their older fixture
+parsers and focused fault matrices remain required complementary gates for
+specialized publication, split, and full-text behavior.
 
 Adapt WAL, LMDB, persistent index, DB split, index manager, and LSM campaigns to
 the common trace/property interface. Preserve their focused reference models
@@ -1406,11 +1408,14 @@ pkg/antfly/src/sim/
     distributed-data/
     transaction/
     raft/              # promoted-fixture namespace
-    wal/               # planned promoted-fixture namespace
+    wal/               # promoted-fixture namespace
+    persistent/        # promoted-fixture namespace
+    index-manager/     # promoted-fixture namespace
+    db-split/          # promoted-fixture namespace
     lmdb/              # promoted-fixture namespace
     lsm/               # promoted-fixture namespace
     ha/                # promoted-fixture namespace
-  scenarios/           # planned registry/consolidation; adapters may stay by domain
+  scenarios/           # optional registry extraction; adapters may stay by domain
     metadata.zig
     raft.zig
     wal.zig
@@ -1422,6 +1427,9 @@ pkg/antfly/src/metadata/
   sim_harness.zig # metadata and distributed-data scenario adapters
 pkg/antfly/src/storage/
   wal_vopr.zig
+  persistent_vopr.zig
+  index_manager_vopr.zig
+  db_split_vopr.zig
   lmdb_vopr.zig
   lsm_vopr.zig
   ha/vopr.zig
@@ -1444,9 +1452,12 @@ live real backend against the memory oracle with generated KV operations,
 explicit compaction/maintenance, crash recovery, and modeled storage faults.
 HA wraps the real durable replication lifecycle with independent replication,
 apply, progress, crash, partition, retention, backup, fencing, promotion, and
-rejoin choices. The remaining focused suites keep their existing runners and
-oracles as complementary specialization gates while their action unions gain
-common artifact and CLI parity.
+rejoin choices. Persistent index, index manager, and DB split now wrap their
+existing real modeled worlds and reference summaries one action at a time,
+including reopen, split/handoff, and final modeled crash recovery. Focused
+suites keep their existing runners and oracles as complementary specialization
+gates; common artifact and CLI parity no longer depends on those legacy fixture
+formats.
 
 The CLI is a standalone command surface, not additional behavior in Antfly's
 ordinary unit-test runner. Its scenario implementations intentionally use
@@ -1520,6 +1531,14 @@ zig build sim-campaign -- \
   --workers 8 \
   --artifact-dir /tmp/antfly-sim
 
+# The same exact-replay-before-retention campaign registry accepts every
+# context-free domain, for example HA or persistent index.
+zig build sim-campaign -- \
+  --scenario persistent \
+  --histories 100 \
+  --workers 4 \
+  --artifact-dir /tmp/antfly-sim/persistent
+
 # Compare baseline and checkpoint-resumed search in deterministic work units.
 zig build vopr-benchmark
 ```
@@ -1540,7 +1559,8 @@ and campaign must remain distinct operations.
 
 - bounded transition- or history-count campaigns
 - deterministic base corpus and search configuration
-- metadata, LSM, and HA scenarios as they migrate
+- metadata, Raft, WAL, LMDB, LSM, persistent index, index manager, DB split,
+  and HA scenarios
 - labeled progress and failure artifact paths
 
 `chaos-soak-test`:
@@ -2018,6 +2038,25 @@ byte-for-byte replay. This is the first storage suite using the common runner;
 the older schedule fixtures remain supported as seed/regression inputs during
 the migration.
 
+PersistentIndex, IndexManager, and DB split now have equivalent live adapters
+rather than build-gate labels around legacy fixtures. Their harnesses own the
+same real domain objects and `ModeledDevice` instances used by the focused
+suites. VOPR selects individual document/segment, reopen, split/handoff, and
+crash/recovery transitions; named properties compare every observation with
+the existing reference-summary oracle and require acknowledged state to
+survive recovery. Each adapter records and repeatedly exact-replays clean
+worlds in its existing focused build gate. The standalone registry exposes
+them as `persistent`, `index-manager`, and `db-split`; `wal` now has matching
+CLI parity as well.
+
+Campaign dispatch is scenario-generic rather than metadata-only. It records
+and exact-replays all registered domains, reloads only matching persistent
+corpus entries, mutates a recorded structured choice by rerunning the owning
+scenario, and splices compatible observation joins under the original
+decision budget. A bounded two-worker persistent-index campaign proves both
+mutation and successful splicing, and `sim-registry-test` records and
+clean-world replays every context-free domain through this dispatch table.
+
 The Phase 4 exit scenario is implemented as `metadata VOPR distributed data
 survives split partition node restart and modeled storage crash`, with the
 focused `zig build lib-metadata-vopr-data-test` gate and inclusion in
@@ -2125,7 +2164,7 @@ delay or complete one selected stable completion ID, and can advance virtual
 time without draining unrelated work. Tests prove that two operations due at
 the same time can complete in either selected order without changing their
 identity. This is the storage analogue of selected network delivery and is the
-seam future LMDB/LSM adapters should consume.
+completion seam used by the migrated modeled-storage adapters.
 
 Eligible metadata VOPR artifacts can also be exact-replayed with a formal Raft
 sidecar through `zig build sim-tla -- --trace ... --domain raft --out ...`.

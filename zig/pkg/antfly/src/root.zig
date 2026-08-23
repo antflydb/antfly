@@ -163,7 +163,9 @@ pub const hbc = @import("storage/hbc_adapter.zig");
 pub const ha = @import("storage/ha/mod.zig");
 pub const ha_vopr = @import("storage/ha/vopr.zig");
 pub const wal = @import("storage/wal.zig");
+pub const wal_vopr = @import("storage/wal_vopr.zig");
 pub const persistent = @import("storage/persistent.zig");
+pub const persistent_vopr = @import("storage/persistent_vopr.zig");
 pub const docstore = @import("storage/docstore.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
@@ -176,6 +178,8 @@ pub const transactions = @import("storage/transactions.zig");
 pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
+pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
+pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
     // Storage shard builds compile this authoritative discovery root and then
@@ -322,7 +326,9 @@ test {
     _ = ha;
     _ = ha_vopr;
     _ = wal;
+    _ = wal_vopr;
     _ = persistent;
+    _ = persistent_vopr;
     _ = docstore;
     _ = backup_codec;
     _ = portable_backup;
@@ -345,4 +351,6 @@ test {
     _ = lsm_backend_sim_test;
     _ = lsm_vopr;
     _ = db;
+    _ = index_manager_vopr;
+    _ = db_split_vopr;
 }

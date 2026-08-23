@@ -19605,6 +19605,7 @@ var open_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 
 const IndexManagerSimAction = index_manager_sim_fixture.Action;
 const IndexManagerSimDocSpec = index_manager_sim_fixture.DocSpec;
+pub const VoprAction = IndexManagerSimAction;
 const IndexManagerSimCrashOutcome = index_manager_sim_fixture.CrashOutcome;
 var index_manager_tmp_nonce: u64 = 0;
 
@@ -19615,7 +19616,7 @@ fn nextIndexManagerTmpNonce() u64 {
 const index_manager_sim_index_name = "ft_v1";
 const index_manager_sim_split_key = "doc:m";
 
-const IndexManagerSimSummary = struct {
+pub const VoprSummary = struct {
     source_doc_count: u32 = 0,
     dest_doc_count: u32 = 0,
     source_alpha_hits: u32 = 0,
@@ -19625,6 +19626,7 @@ const IndexManagerSimSummary = struct {
     dest_beta_hits: u32 = 0,
     dest_gamma_hits: u32 = 0,
 };
+const IndexManagerSimSummary = VoprSummary;
 
 const IndexManagerTerm = enum {
     alpha,
@@ -19969,6 +19971,79 @@ const IndexManagerSimRuntime = struct {
     }
 };
 
+/// Live modeled-index-manager seam used by the common VOPR adapter.
+pub const VoprHarness = struct {
+    alloc: Allocator,
+    source_path_buf: [256]u8,
+    dest_path_buf: [256]u8,
+    source_path: [*:0]const u8,
+    dest_path: [*:0]const u8,
+    modeled_device: storage_sim.ModeledDevice,
+    backend_options: db_config.IndexBackendOptions,
+    runtime: IndexManagerSimRuntime,
+    actions: std.ArrayListUnmanaged(VoprAction) = .empty,
+    recovered: bool = false,
+
+    pub fn init(alloc: Allocator) !*VoprHarness {
+        const self = try alloc.create(VoprHarness);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.source_path = indexManagerTmpPathWithSuffix(&self.source_path_buf, "vopr-src");
+        self.dest_path = indexManagerTmpPathWithSuffix(&self.dest_path_buf, "vopr-dst");
+        errdefer cleanupIndexManagerDir(self.source_path);
+        errdefer cleanupIndexManagerDir(self.dest_path);
+        self.modeled_device = storage_sim.ModeledDevice.init(alloc);
+        errdefer self.modeled_device.deinit();
+        self.backend_options = .{
+            .text_main_backend = .lsm,
+            .text_lsm_storage = self.modeled_device.storage(),
+            .dense_storage_backend = .lsm,
+            .dense_lsm_storage = self.modeled_device.storage(),
+            .graph_reverse_backend = .lsm,
+            .graph_lsm_storage = self.modeled_device.storage(),
+        };
+        self.runtime = try IndexManagerSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.backend_options);
+        self.actions = .empty;
+        self.recovered = false;
+        return self;
+    }
+
+    pub fn deinit(self: *VoprHarness) void {
+        self.runtime.deinit();
+        self.actions.deinit(self.alloc);
+        self.modeled_device.deinit();
+        cleanupIndexManagerDir(self.source_path);
+        cleanupIndexManagerDir(self.dest_path);
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn apply(self: *VoprHarness, action: VoprAction) !void {
+        try self.runtime.applyReplayAction(action, self.actions.items.len);
+        try self.actions.append(self.alloc, action);
+    }
+
+    pub fn crashAndRecover(self: *VoprHarness) !void {
+        self.runtime.prepareForModeledCrash();
+        try self.modeled_device.device().crash();
+        try self.runtime.reopenAfterModeledCrash();
+        self.recovered = true;
+    }
+
+    pub fn summary(self: *VoprHarness) !VoprSummary {
+        return self.runtime.summary(self.alloc);
+    }
+
+    pub fn expected(self: *const VoprHarness) !VoprSummary {
+        return expectedIndexManagerSummaryAlloc(self.alloc, self.actions.items);
+    }
+
+    pub fn splitActive(self: *const VoprHarness) bool {
+        return self.runtime.split_active;
+    }
+};
+
 fn indexManagerSimTextConfig() types.IndexConfig {
     return .{
         .name = index_manager_sim_index_name,
@@ -20005,8 +20080,12 @@ fn indexManagerWrite(alloc: Allocator, prefix: []const u8, step: usize, term: []
 }
 
 fn expectedIndexManagerSummary(actions: []const IndexManagerSimAction) !IndexManagerSimSummary {
+    return expectedIndexManagerSummaryAlloc(std.testing.allocator, actions);
+}
+
+fn expectedIndexManagerSummaryAlloc(alloc: Allocator, actions: []const IndexManagerSimAction) !IndexManagerSimSummary {
     var docs = std.StringHashMapUnmanaged(IndexManagerExpectedDoc).empty;
-    defer docs.deinit(std.testing.allocator);
+    defer docs.deinit(alloc);
 
     var split_active = false;
     for (actions, 0..) |action, step| {
@@ -20022,16 +20101,16 @@ fn expectedIndexManagerSummary(actions: []const IndexManagerSimAction) !IndexMan
                 }
             },
             .add_doc => |spec| {
-                const writes = try buildIndexManagerWrites(std.testing.allocator, spec, step);
+                const writes = try buildIndexManagerWrites(alloc, spec, step);
                 defer {
-                    for (writes) |*write| write.deinit(std.testing.allocator);
-                    std.testing.allocator.free(writes);
+                    for (writes) |*write| write.deinit(alloc);
+                    alloc.free(writes);
                 }
 
                 for (writes) |write| {
-                    const gop = try docs.getOrPut(std.testing.allocator, write.key);
+                    const gop = try docs.getOrPut(alloc, write.key);
                     if (!gop.found_existing) {
-                        gop.key_ptr.* = try std.testing.allocator.dupe(u8, write.key);
+                        gop.key_ptr.* = try alloc.dupe(u8, write.key);
                     }
                     gop.value_ptr.* = .{
                         .side = if (split_active and std.mem.order(u8, write.key, index_manager_sim_split_key) != .lt) .dest else .source,
@@ -20066,7 +20145,7 @@ fn expectedIndexManagerSummary(actions: []const IndexManagerSimAction) !IndexMan
     }
 
     var cleanup_it = docs.keyIterator();
-    while (cleanup_it.next()) |key| std.testing.allocator.free(key.*);
+    while (cleanup_it.next()) |key| alloc.free(key.*);
     return summary;
 }
 

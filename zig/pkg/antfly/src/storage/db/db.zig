@@ -44364,6 +44364,7 @@ const GateSparseEmbedder = struct {
 
 const DbSplitSimAction = db_split_sim_fixture.Action;
 const DbSplitSimDocSpec = db_split_sim_fixture.DocSpec;
+pub const VoprSplitAction = DbSplitSimAction;
 const db_split_sim_index_name = "ft_v1";
 const db_split_sim_split_key = "doc:m";
 
@@ -44373,7 +44374,7 @@ const DbSplitTerm = enum {
     gamma,
 };
 
-const DbSplitSimSummary = struct {
+pub const VoprSplitSummary = struct {
     source_doc_count: u32 = 0,
     dest_doc_count: u32 = 0,
     source_alpha_hits: u32 = 0,
@@ -44383,6 +44384,7 @@ const DbSplitSimSummary = struct {
     dest_beta_hits: u32 = 0,
     dest_gamma_hits: u32 = 0,
 };
+const DbSplitSimSummary = VoprSplitSummary;
 
 const DbSplitExpectedDoc = struct {
     side: enum { source, dest },
@@ -44494,7 +44496,7 @@ const DbSplitSimRuntime = struct {
         }
 
         if (!self.split_complete) {
-            try applyDbSplitWritesToDb(&self.source_db.?, writes);
+            try applyDbSplitWritesToDb(self.alloc, &self.source_db.?, writes);
             return;
         }
 
@@ -44526,6 +44528,85 @@ const DbSplitSimRuntime = struct {
     }
 };
 
+/// Live DB split seam for the common VOPR adapter. The harness owns the real
+/// DBs and their shared ModeledDevice; the adapter owns exploration policy.
+pub const VoprSplitHarness = struct {
+    alloc: Allocator,
+    source_path_buf: [256]u8,
+    dest_path_buf: [256]u8,
+    source_path: [*:0]const u8,
+    dest_path: [*:0]const u8,
+    modeled_device: storage_sim.ModeledDevice,
+    open_options: OpenOptions,
+    runtime: DbSplitSimRuntime,
+    runtime_open: bool,
+    actions: std.ArrayListUnmanaged(VoprSplitAction) = .empty,
+    recovered_summary: VoprSplitSummary = .{},
+    recovered: bool = false,
+
+    pub fn init(alloc: Allocator) !*VoprSplitHarness {
+        const self = try alloc.create(VoprSplitHarness);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.source_path = tempPath(&self.source_path_buf);
+        self.dest_path = tempPath(&self.dest_path_buf);
+        errdefer cleanupTempDir(self.source_path);
+        errdefer cleanupTempDir(self.dest_path);
+        try ensureDirPath(std.mem.span(self.source_path));
+        try ensureDirPath(std.mem.span(self.dest_path));
+        self.modeled_device = storage_sim.ModeledDevice.init(alloc);
+        errdefer self.modeled_device.deinit();
+        self.open_options = dbSplitModeledOpenOptions(&self.modeled_device);
+        self.runtime = try DbSplitSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.open_options);
+        self.runtime_open = true;
+        self.actions = .empty;
+        self.recovered_summary = .{};
+        self.recovered = false;
+        return self;
+    }
+
+    pub fn deinit(self: *VoprSplitHarness) void {
+        if (self.runtime_open) self.runtime.deinit();
+        self.actions.deinit(self.alloc);
+        self.modeled_device.deinit();
+        cleanupTempDir(self.source_path);
+        cleanupTempDir(self.dest_path);
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn apply(self: *VoprSplitHarness, action: VoprSplitAction) !void {
+        try self.runtime.applyAction(action, self.actions.items.len);
+        try self.actions.append(self.alloc, action);
+    }
+
+    pub fn crashAndRecover(self: *VoprSplitHarness) !void {
+        self.runtime.deinit();
+        self.runtime_open = false;
+        try self.modeled_device.device().crash();
+        self.recovered_summary = try summarizeDbSplitPathsWithOptions(
+            self.alloc,
+            self.source_path,
+            self.dest_path,
+            self.open_options,
+        );
+        self.recovered = true;
+    }
+
+    pub fn summary(self: *VoprSplitHarness) !VoprSplitSummary {
+        return if (self.recovered) self.recovered_summary else self.runtime.summary(self.alloc);
+    }
+
+    pub fn expected(self: *const VoprSplitHarness) !VoprSplitSummary {
+        return expectedDbSplitSummaryAlloc(self.alloc, self.actions.items);
+    }
+
+    pub fn splitComplete(self: *const VoprSplitHarness) bool {
+        return if (self.recovered) true else self.runtime.split_complete;
+    }
+};
+
 fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !DbSplitSimSummary {
     const source_text = source_db.core.textIndex(db_split_sim_index_name).?;
     const source_snapshot = source_text.snapshot();
@@ -44546,11 +44627,11 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
     };
 }
 
-fn applyDbSplitWritesToDb(db: *DB, writes: []const DbSplitOwnedWrite) !void {
+fn applyDbSplitWritesToDb(alloc: Allocator, db: *DB, writes: []const DbSplitOwnedWrite) !void {
     var batch_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer batch_writes.deinit(std.testing.allocator);
+    defer batch_writes.deinit(alloc);
     for (writes) |write| {
-        try batch_writes.append(std.testing.allocator, .{
+        try batch_writes.append(alloc, .{
             .key = write.key,
             .value = write.value,
         });
@@ -44590,8 +44671,12 @@ fn dbSplitWrite(alloc: Allocator, prefix: []const u8, step: usize, term: []const
 }
 
 fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary {
+    return expectedDbSplitSummaryAlloc(std.testing.allocator, actions);
+}
+
+fn expectedDbSplitSummaryAlloc(alloc: Allocator, actions: []const DbSplitSimAction) !DbSplitSimSummary {
     var docs = std.StringHashMapUnmanaged(DbSplitExpectedDoc).empty;
-    defer docs.deinit(std.testing.allocator);
+    defer docs.deinit(alloc);
 
     var split_complete = false;
     for (actions, 0..) |action, step| {
@@ -44606,16 +44691,16 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
                 }
             },
             .add_doc => |spec| {
-                const writes = try buildDbSplitWrites(std.testing.allocator, spec, step);
+                const writes = try buildDbSplitWrites(alloc, spec, step);
                 defer {
-                    for (writes) |*write| write.deinit(std.testing.allocator);
-                    std.testing.allocator.free(writes);
+                    for (writes) |*write| write.deinit(alloc);
+                    alloc.free(writes);
                 }
 
                 for (writes) |write| {
-                    const gop = try docs.getOrPut(std.testing.allocator, write.key);
+                    const gop = try docs.getOrPut(alloc, write.key);
                     if (!gop.found_existing) {
-                        gop.key_ptr.* = try std.testing.allocator.dupe(u8, write.key);
+                        gop.key_ptr.* = try alloc.dupe(u8, write.key);
                     }
                     gop.value_ptr.* = .{
                         .side = if (split_complete and std.mem.order(u8, write.key, db_split_sim_split_key) != .lt) .dest else .source,
@@ -44650,7 +44735,7 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
     }
 
     var cleanup_it = docs.keyIterator();
-    while (cleanup_it.next()) |key| std.testing.allocator.free(key.*);
+    while (cleanup_it.next()) |key| alloc.free(key.*);
     return summary;
 }
 

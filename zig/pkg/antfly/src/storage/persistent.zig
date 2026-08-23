@@ -4793,16 +4793,18 @@ test "crash rollback fence disarms retained segment cleanup" {
 }
 
 const PersistentSimAction = persistent_sim_fixture.Action;
+pub const VoprAction = PersistentSimAction;
 const PersistentCrashOutcome = persistent_sim_fixture.CrashOutcome;
 const PersistentSimSegmentSpec = persistent_sim_fixture.SegmentSpec;
 
-const PersistentSimSummary = struct {
+pub const VoprSummary = struct {
     doc_count: u32,
     segment_count: usize,
     alpha_hits: usize,
     beta_hits: usize,
     gamma_hits: usize,
 };
+const PersistentSimSummary = VoprSummary;
 
 fn persistentSimOptionsToIndexOptions(
     path: [*:0]const u8,
@@ -5685,6 +5687,82 @@ fn crashReopenModeledPersistentIndex(
     try device_model.device().crash();
     pi.* = try PersistentIndex.open(alloc, opts);
 }
+
+/// Narrow live-world seam for the common VOPR adapter. It deliberately owns
+/// the same modeled device/runtime and real PersistentIndex used by the
+/// focused fixture suite; exploration policy remains outside this domain.
+pub const VoprHarness = struct {
+    alloc: Allocator,
+    runtime: storage_sim.Runtime,
+    device_model: storage_sim.ModeledDevice,
+    opts: PersistentIndexOptions,
+    index: PersistentIndex,
+    index_open: bool,
+    actions: std.ArrayListUnmanaged(VoprAction) = .empty,
+    recovered: bool = false,
+
+    pub fn init(alloc: Allocator) !*VoprHarness {
+        const self = try alloc.create(VoprHarness);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.runtime = storage_sim.Runtime.init(alloc);
+        errdefer self.runtime.deinit();
+        self.device_model = storage_sim.ModeledDevice.init(alloc);
+        errdefer self.device_model.deinit();
+        self.opts = persistentModeledOptionsToIndexOptions("/persistent-vopr", .{
+            .main_commit_backend = .async_io,
+            .wal_commit_backend = .worker_thread,
+        }, &self.device_model, &self.runtime);
+        self.index = try PersistentIndex.open(alloc, self.opts);
+        self.index_open = true;
+        self.actions = .empty;
+        self.recovered = false;
+        return self;
+    }
+
+    pub fn deinit(self: *VoprHarness) void {
+        if (self.index_open) self.index.close();
+        self.actions.deinit(self.alloc);
+        self.device_model.deinit();
+        self.runtime.deinit();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn apply(self: *VoprHarness, action: VoprAction) !void {
+        const step = self.actions.items.len;
+        switch (action) {
+            .reopen => try self.reopen(),
+            else => try applyPersistentReplayAction(&self.index, self.alloc, action, step),
+        }
+        try self.actions.append(self.alloc, action);
+    }
+
+    pub fn crashAndRecover(self: *VoprHarness) !void {
+        self.index.close();
+        self.index_open = false;
+        try self.device_model.device().crash();
+        self.index = try PersistentIndex.open(self.alloc, self.opts);
+        self.index_open = true;
+        self.recovered = true;
+    }
+
+    pub fn summary(self: *VoprHarness) !VoprSummary {
+        return persistentSimSummaryFromIndex(self.alloc, &self.index);
+    }
+
+    pub fn expected(self: *const VoprHarness) VoprSummary {
+        return expectedPersistentSummary(self.actions.items);
+    }
+
+    fn reopen(self: *VoprHarness) !void {
+        self.index.close();
+        self.index_open = false;
+        self.index = try PersistentIndex.open(self.alloc, self.opts);
+        self.index_open = true;
+    }
+};
 
 fn buildCompactedTextSegment(alloc: Allocator) ![]u8 {
     return try buildMultiDocSegment(alloc, &.{

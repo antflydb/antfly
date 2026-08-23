@@ -9,6 +9,7 @@
 //! on a host path, process ID, wall clock, or hidden PRNG.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vopr = @import("vopr");
 const wal_mod = @import("wal.zig");
 const storage_sim = @import("sim_runtime.zig");
@@ -41,7 +42,7 @@ const model_property_id = vopr.id.stable("property", "storage.wal.visible_state_
 const durable_property_id = vopr.id.stable("property", "storage.wal.acknowledged_entries_survive_crash");
 const recovered_property_id = vopr.id.stable("property", "storage.wal.modeled_crash_recovery_reached");
 
-fn ModeledWalScenario(comptime action_budget: u64) type {
+pub fn Scenario(comptime action_budget: u64) type {
     return struct {
         const Self = @This();
 
@@ -356,6 +357,24 @@ fn ModeledWalScenario(comptime action_budget: u64) type {
     };
 }
 
+pub const CliScenario = Scenario(24);
+
+pub fn record(allocator: Allocator, seed: u64) !vopr.trace.Trace {
+    var seeded = vopr.choice.Seeded.init(seed);
+    return vopr.runner.run(CliScenario, allocator, seeded.source(), .{
+        .system = "antfly",
+        .seed = seed,
+        .transition_budget = 25,
+        .source_revision = "wal-vopr-cli",
+        .target = "native",
+        .optimize = @tagName(builtin.mode),
+    });
+}
+
+pub fn replay(allocator: Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
+    return vopr.replay.exact(CliScenario, allocator, artifact);
+}
+
 fn appendOne(state: anytype, events: *vopr.event.Sink, allocator: Allocator, slot: usize) !void {
     const payload = try payloadAlloc(state.allocator, state.decisions, slot);
     errdefer state.allocator.free(payload);
@@ -548,9 +567,9 @@ fn unpackPair(encoded_pair: u64) Pair {
 }
 
 fn runRecordReplay(comptime action_budget: u64, seed: u64) !void {
-    const Scenario = ModeledWalScenario(action_budget);
+    const WalScenario = Scenario(action_budget);
     var seeded = vopr.choice.Seeded.init(seed);
-    var recorded = try vopr.runner.run(Scenario, std.testing.allocator, seeded.source(), .{
+    var recorded = try vopr.runner.run(WalScenario, std.testing.allocator, seeded.source(), .{
         .system = "antfly",
         .seed = seed,
         .transition_budget = action_budget + 1,
@@ -568,7 +587,7 @@ fn runRecordReplay(comptime action_budget: u64, seed: u64) !void {
     defer std.testing.allocator.free(encoded);
     var parsed = try vopr.trace.parseAlloc(std.testing.allocator, encoded);
     defer parsed.deinit();
-    var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &parsed);
+    var replayed = try vopr.replay.exact(WalScenario, std.testing.allocator, &parsed);
     replayed.deinit();
 }
 
@@ -578,7 +597,7 @@ test "modeled WAL campaign records and exactly replays VOPR traces" {
 }
 
 test "modeled WAL VOPR classifies injected write and sync outcomes" {
-    const Scenario = ModeledWalScenario(6);
+    const WalScenario = Scenario(6);
     const FaultSequence = struct {
         phase: usize = 0,
 
@@ -610,7 +629,7 @@ test "modeled WAL VOPR classifies injected write and sync outcomes" {
     };
 
     var sequence = FaultSequence{};
-    var recorded = try vopr.runner.run(Scenario, std.testing.allocator, sequence.source(), .{
+    var recorded = try vopr.runner.run(WalScenario, std.testing.allocator, sequence.source(), .{
         .system = "antfly",
         .seed = 0xA17F_FA17,
         .transition_budget = 7,
@@ -623,12 +642,12 @@ test "modeled WAL VOPR classifies injected write and sync outcomes" {
     for (recorded.events.items) |event| rejected += @intFromBool(std.mem.eql(u8, event.name, "storage.wal.append_rejected"));
     try std.testing.expectEqual(@as(usize, 3), rejected);
 
-    var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
+    var replayed = try vopr.replay.exact(WalScenario, std.testing.allocator, &recorded);
     replayed.deinit();
 }
 
 test "modeled WAL VOPR constrains partial-write and dropped-sync recovery outcomes" {
-    const Scenario = ModeledWalScenario(2);
+    const WalScenario = Scenario(2);
     const Sequence = struct {
         fault_name: []const u8,
         phase: usize = 0,
@@ -660,7 +679,7 @@ test "modeled WAL VOPR constrains partial-write and dropped-sync recovery outcom
     };
 
     var partial_sequence = Sequence{ .fault_name = "storage.wal.inject_partial_write" };
-    var partial = try vopr.runner.run(Scenario, std.testing.allocator, partial_sequence.source(), .{
+    var partial = try vopr.runner.run(WalScenario, std.testing.allocator, partial_sequence.source(), .{
         .system = "antfly",
         .seed = 0xA17F_7A11,
         .transition_budget = 3,
@@ -668,11 +687,11 @@ test "modeled WAL VOPR constrains partial-write and dropped-sync recovery outcom
     defer partial.deinit();
     try std.testing.expectEqual(@as(u64, 0), partial.summary.?.property_failures);
     try expectEventCount(&partial, "storage.wal.append_rejected", 1);
-    var partial_replay = try vopr.replay.exact(Scenario, std.testing.allocator, &partial);
+    var partial_replay = try vopr.replay.exact(WalScenario, std.testing.allocator, &partial);
     partial_replay.deinit();
 
     var dropped_sequence = Sequence{ .fault_name = "storage.wal.inject_dropped_sync" };
-    var dropped = try vopr.runner.run(Scenario, std.testing.allocator, dropped_sequence.source(), .{
+    var dropped = try vopr.runner.run(WalScenario, std.testing.allocator, dropped_sequence.source(), .{
         .system = "antfly",
         .seed = 0xA17F_DA07,
         .transition_budget = 3,
@@ -683,7 +702,7 @@ test "modeled WAL VOPR constrains partial-write and dropped-sync recovery outcom
     const recovered_outcomes = countEvents(&dropped, "storage.wal.recovered") +
         countEvents(&dropped, "storage.wal.recovery_rejected_uncertain_state");
     try std.testing.expectEqual(@as(usize, 1), recovered_outcomes);
-    var dropped_replay = try vopr.replay.exact(Scenario, std.testing.allocator, &dropped);
+    var dropped_replay = try vopr.replay.exact(WalScenario, std.testing.allocator, &dropped);
     dropped_replay.deinit();
 }
 

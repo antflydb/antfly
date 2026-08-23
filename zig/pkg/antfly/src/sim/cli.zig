@@ -42,6 +42,10 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             if (!std.mem.eql(u8, scenario, "metadata") and
                 !std.mem.eql(u8, scenario, "transaction") and
                 !std.mem.eql(u8, scenario, "distributed-data") and
+                !std.mem.eql(u8, scenario, "wal") and
+                !std.mem.eql(u8, scenario, "persistent") and
+                !std.mem.eql(u8, scenario, "index-manager") and
+                !std.mem.eql(u8, scenario, "db-split") and
                 !std.mem.eql(u8, scenario, "raft") and
                 !std.mem.eql(u8, scenario, "lmdb") and
                 !std.mem.eql(u8, scenario, "lsm") and
@@ -63,6 +67,14 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         64
     else if (std.mem.eql(u8, scenario, "distributed-data"))
         4
+    else if (std.mem.eql(u8, scenario, "wal"))
+        25
+    else if (std.mem.eql(u8, scenario, "persistent"))
+        17
+    else if (std.mem.eql(u8, scenario, "index-manager"))
+        11
+    else if (std.mem.eql(u8, scenario, "db-split"))
+        12
     else if (std.mem.eql(u8, scenario, "raft"))
         33
     else if (std.mem.eql(u8, scenario, "lmdb"))
@@ -93,6 +105,18 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
             .seed = seed,
             .table_id = table_id,
         });
+    } else if (std.mem.eql(u8, scenario, "wal")) blk: {
+        if (transition_budget != 25) return error.WalScenarioRequiresTwentyFiveTransitions;
+        break :blk try antfly.wal_vopr.record(alloc, seed);
+    } else if (std.mem.eql(u8, scenario, "persistent")) blk: {
+        if (transition_budget != 17) return error.PersistentScenarioRequiresSeventeenTransitions;
+        break :blk try antfly.persistent_vopr.record(alloc, seed);
+    } else if (std.mem.eql(u8, scenario, "index-manager")) blk: {
+        if (transition_budget != 11) return error.IndexManagerScenarioRequiresElevenTransitions;
+        break :blk try antfly.index_manager_vopr.record(alloc, seed);
+    } else if (std.mem.eql(u8, scenario, "db-split")) blk: {
+        if (transition_budget != 12) return error.DbSplitScenarioRequiresTwelveTransitions;
+        break :blk try antfly.db_split_vopr.record(alloc, seed);
     } else if (std.mem.eql(u8, scenario, "raft")) blk: {
         if (transition_budget != 33) return error.RaftScenarioRequiresThirtyThreeTransitions;
         break :blk try antfly.raft_vopr.record(alloc, seed);
@@ -145,6 +169,14 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.metadata_sim_harness.replayDistributedDataVoprCampaign(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return antfly.transaction_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
+        return antfly.wal_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
+        return antfly.persistent_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
+        return antfly.index_manager_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
+        return antfly.db_split_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return antfly.raft_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
@@ -154,6 +186,129 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return antfly.ha_vopr.replay(alloc, recorded);
     return error.UnsupportedScenario;
+}
+
+fn runContextFreeWithChoices(
+    comptime Scenario: type,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    return vopr.runner.run(Scenario, alloc, source, .{
+        .system = recorded.header.system,
+        .seed = recorded.config.seed,
+        .transition_budget = recorded.config.transition_budget,
+        .resource_budget = recorded.config.resource_budget,
+        .fixture_hashes = recorded.config.fixture_hashes,
+        .feature_flags = recorded.config.feature_flags,
+        .backend_ids = recorded.config.backend_ids,
+        .scenario_parameters = recorded.config.scenario_parameters,
+        .source_revision = recorded.header.source_revision,
+        .target = recorded.header.target,
+        .optimize = recorded.header.optimize,
+    });
+}
+
+fn runKnownScenarioWithChoices(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
+        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(recorded);
+        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source);
+    }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
+        const cfg = try antfly.metadata_sim_harness.DistributedDataVoprCampaignConfig.fromTrace(recorded);
+        return antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source);
+    }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
+        return runContextFreeWithChoices(antfly.transaction_vopr.Scenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.wal_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.persistent_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.index_manager_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.db_split_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.raft_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.lmdb_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.lsm_vopr.CliScenario, alloc, recorded, source);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
+        return runContextFreeWithChoices(antfly.ha_vopr.CliScenario, alloc, recorded, source);
+    return error.UnsupportedScenario;
+}
+
+fn defaultCampaignTransitions(scenario: []const u8) !usize {
+    if (std.mem.eql(u8, scenario, "metadata")) return 64;
+    if (std.mem.eql(u8, scenario, "distributed-data")) return 4;
+    if (std.mem.eql(u8, scenario, "transaction")) return 3;
+    if (std.mem.eql(u8, scenario, "wal")) return 25;
+    if (std.mem.eql(u8, scenario, "persistent")) return 17;
+    if (std.mem.eql(u8, scenario, "index-manager")) return 11;
+    if (std.mem.eql(u8, scenario, "db-split")) return 12;
+    if (std.mem.eql(u8, scenario, "raft")) return 33;
+    if (std.mem.eql(u8, scenario, "lmdb")) return 13;
+    if (std.mem.eql(u8, scenario, "lsm")) return 49;
+    if (std.mem.eql(u8, scenario, "ha")) return 33;
+    return error.UnsupportedScenario;
+}
+
+fn validateCampaignTransitions(scenario: []const u8, transitions: usize) !void {
+    if (std.mem.eql(u8, scenario, "metadata")) return;
+    if (transitions != try defaultCampaignTransitions(scenario)) return error.ScenarioRequiresFixedTransitionBudget;
+}
+
+fn recordCampaignScenario(
+    alloc: std.mem.Allocator,
+    scenario: []const u8,
+    seed: u64,
+    transitions: usize,
+    campaign_seed: u64,
+) !vopr.trace.Trace {
+    if (std.mem.eql(u8, scenario, "metadata")) {
+        const base_id = 10_000 + campaign_seed % 1_000_000;
+        return antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+            .seed = seed,
+            .operation_count = transitions,
+            .metadata_group_id = base_id,
+            .table_id = base_id + 1,
+            .range_group_id = base_id + 2,
+            .split_group_id = base_id + 3,
+            .split_transition_id = base_id + 4,
+        });
+    }
+    if (std.mem.eql(u8, scenario, "distributed-data"))
+        return antfly.metadata_sim_harness.recordDistributedDataVoprCampaign(alloc, .{ .seed = seed, .table_id = 10_000 + campaign_seed % 100_000 });
+    if (std.mem.eql(u8, scenario, "transaction")) return antfly.transaction_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "wal")) return antfly.wal_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "persistent")) return antfly.persistent_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "index-manager")) return antfly.index_manager_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "db-split")) return antfly.db_split_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "raft")) return antfly.raft_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "lmdb")) return antfly.lmdb_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "lsm")) return antfly.lsm_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "ha")) return antfly.ha_vopr.record(alloc, seed);
+    return error.UnsupportedScenario;
+}
+
+fn artifactMatchesScenario(artifact: *const vopr.trace.Trace, scenario: []const u8) bool {
+    if (std.mem.eql(u8, scenario, "metadata")) return std.mem.eql(u8, artifact.header.scenario, "metadata-vopr");
+    if (std.mem.eql(u8, scenario, "distributed-data")) return std.mem.eql(u8, artifact.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name);
+    if (std.mem.eql(u8, scenario, "transaction")) return std.mem.eql(u8, artifact.header.scenario, antfly.transaction_vopr.Scenario.name);
+    if (std.mem.eql(u8, scenario, "wal")) return std.mem.eql(u8, artifact.header.scenario, antfly.wal_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "persistent")) return std.mem.eql(u8, artifact.header.scenario, antfly.persistent_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "index-manager")) return std.mem.eql(u8, artifact.header.scenario, antfly.index_manager_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "db-split")) return std.mem.eql(u8, artifact.header.scenario, antfly.db_split_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "raft")) return std.mem.eql(u8, artifact.header.scenario, antfly.raft_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "lmdb")) return std.mem.eql(u8, artifact.header.scenario, antfly.lmdb_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "lsm")) return std.mem.eql(u8, artifact.header.scenario, antfly.lsm_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "ha")) return std.mem.eql(u8, artifact.header.scenario, antfly.ha_vopr.CliScenario.name);
+    return false;
 }
 
 fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -281,35 +436,46 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
 
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var histories: u64 = 100;
-    var transitions: usize = 64;
+    var requested_transitions: ?usize = null;
     var workers: usize = 1;
     var seed: u64 = 0xa17f_1000;
-    var artifact_dir: []const u8 = "/tmp/antfly-sim/metadata";
+    var scenario: []const u8 = "metadata";
+    var requested_artifact_dir: ?[]const u8 = null;
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--scenario")) {
-            if (!std.mem.eql(u8, try nextValue(args, &index), "metadata")) return error.UnsupportedScenario;
+            scenario = try nextValue(args, &index);
+            _ = try defaultCampaignTransitions(scenario);
         } else if (std.mem.eql(u8, arg, "--histories")) {
             histories = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
-            transitions = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+            requested_transitions = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--workers")) {
             workers = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--artifact-dir")) {
-            artifact_dir = try nextValue(args, &index);
+            requested_artifact_dir = try nextValue(args, &index);
         } else return error.UnknownArgument;
         index += 1;
     }
+    const transitions = requested_transitions orelse try defaultCampaignTransitions(scenario);
+    const owned_artifact_dir = if (requested_artifact_dir == null)
+        try std.fmt.allocPrint(alloc, "/tmp/antfly-sim/{s}", .{scenario})
+    else
+        null;
+    defer if (owned_artifact_dir) |path| alloc.free(path);
+    const artifact_dir = requested_artifact_dir orelse owned_artifact_dir.?;
     if (histories == 0 or transitions == 0 or workers == 0) return error.InvalidCampaignBudget;
+    try validateCampaignTransitions(scenario, transitions);
     try ensureDir(io, artifact_dir);
 
     var context = CampaignContext{
         .io = io,
         .histories = histories,
         .transitions = transitions,
+        .scenario = scenario,
         .base_seed = seed,
         .artifact_dir = artifact_dir,
         .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
@@ -417,6 +583,36 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name)) {
+        const target = if (recorded.failures.items.len > 0)
+            recorded.failures.items[0].fingerprint
+        else
+            return error.FailingTraceRequired;
+        var reduced = try vopr.reducer.reduce(
+            antfly.wal_vopr.CliScenario,
+            alloc,
+            &recorded,
+            target,
+            .{ .max_attempts = attempts },
+        );
+        defer reduced.deinit();
+        return writeReducedArtifact(
+            alloc,
+            io,
+            output,
+            &reduced.artifact,
+            reduced.report.original_transitions,
+            reduced.report.reduced_transitions,
+            reduced.report.attempts,
+            reduced.report.target_fingerprint,
+        );
+    }
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
+        return reduceContextFree(antfly.persistent_vopr.CliScenario, alloc, io, output, &recorded, attempts);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
+        return reduceContextFree(antfly.index_manager_vopr.CliScenario, alloc, io, output, &recorded, attempts);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
+        return reduceContextFree(antfly.db_split_vopr.CliScenario, alloc, io, output, &recorded, attempts);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name)) {
         const target = if (recorded.failures.items.len > 0)
             recorded.failures.items[0].fingerprint
@@ -526,6 +722,32 @@ fn writeReducedArtifact(
     );
 }
 
+fn reduceContextFree(
+    comptime Scenario: type,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    recorded: *const vopr.trace.Trace,
+    attempts: u64,
+) !void {
+    const target = if (recorded.failures.items.len > 0)
+        recorded.failures.items[0].fingerprint
+    else
+        return error.FailingTraceRequired;
+    var reduced = try vopr.reducer.reduce(Scenario, alloc, recorded, target, .{ .max_attempts = attempts });
+    defer reduced.deinit();
+    return writeReducedArtifact(
+        alloc,
+        io,
+        output,
+        &reduced.artifact,
+        reduced.report.original_transitions,
+        reduced.report.reduced_transitions,
+        reduced.report.attempts,
+        reduced.report.target_fingerprint,
+    );
+}
+
 fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var trace_path: ?[]const u8 = null;
     var fixture_name: ?[]const u8 = null;
@@ -626,6 +848,14 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/sim/fixtures/distributed-data";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return "pkg/antfly/src/sim/fixtures/transaction";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/wal";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/persistent";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/index-manager";
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
+        return "pkg/antfly/src/sim/fixtures/db-split";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
         return "pkg/antfly/src/sim/fixtures/raft";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
@@ -694,6 +924,7 @@ const CampaignContext = struct {
     io: std.Io,
     histories: u64,
     transitions: usize,
+    scenario: []const u8,
     base_seed: u64,
     artifact_dir: []const u8,
     worker_count: usize = 0,
@@ -758,23 +989,14 @@ const CampaignContext = struct {
             // Keep semantic identities stable across a campaign. The history
             // seed still varies scheduling, while stable IDs allow compatible
             // observation states from independent histories to be spliced.
-            const base_id = 10_000 + self.base_seed % 1_000_000;
             break :blk Candidate{
-                .artifact = try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
-                    .seed = seed,
-                    .operation_count = self.transitions,
-                    .metadata_group_id = base_id,
-                    .table_id = base_id + 1,
-                    .range_group_id = base_id + 2,
-                    .split_group_id = base_id + 3,
-                    .split_transition_id = base_id + 4,
-                }),
+                .artifact = try recordCampaignScenario(alloc, self.scenario, seed, self.transitions, self.base_seed),
             };
         };
         var artifact = candidate.artifact;
         defer artifact.deinit();
 
-        var replayed = antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact) catch |err| {
+        var replayed = replayKnownScenario(alloc, &artifact) catch |err| {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             self.replay_divergences += 1;
@@ -898,8 +1120,9 @@ const CampaignContext = struct {
         var productive: usize = 0;
         for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
         std.debug.print(
-            "VOPR campaign histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
+            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} workers={d} artifacts={s}\n",
             .{
+                self.scenario,
                 self.histories,
                 self.transitions_executed,
                 self.clean_histories,
@@ -1006,9 +1229,8 @@ const CampaignContext = struct {
             }
             replacement_ordinal -= 1;
         }
-        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(&parent);
         var source = vopr.choice.Mutating.init(parent.choices.items, mutation_index, replacement, seed);
-        const artifact = antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
+        const artifact = runKnownScenarioWithChoices(alloc, &parent, source.source()) catch |err| switch (err) {
             error.MutationPointNotReached,
             error.MutationPointOutOfRange,
             error.MutationPrefixExhausted,
@@ -1069,8 +1291,8 @@ const CampaignContext = struct {
         var usable: usize = 0;
         for (points) |point| {
             const combined = point.left_choice_count + right.choices.items.len - point.right_choice_start;
-            // The metadata driver has a fixed operation count plus quiet
-            // suffix. Preserve its total choice count while joining states.
+            // A splice preserves the original decision budget while joining
+            // two compatible logical states.
             usable += @intFromBool(combined == left.choices.items.len);
         }
         if (usable == 0) {
@@ -1084,9 +1306,8 @@ const CampaignContext = struct {
             if (ordinal == 0) break candidate;
             ordinal -= 1;
         } else unreachable;
-        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(&left);
         var source = try vopr.splice.Source.init(left.choices.items, right.choices.items, point);
-        var artifact = antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source.source()) catch |err| switch (err) {
+        var artifact = runKnownScenarioWithChoices(alloc, &left, source.source()) catch |err| switch (err) {
             error.SpliceChoiceExhausted,
             error.SpliceChoiceSiteDiverged,
             error.SpliceEnabledSetDiverged,
@@ -1099,7 +1320,7 @@ const CampaignContext = struct {
             else => return err,
         };
         errdefer artifact.deinit();
-        var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact);
+        var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();
         try self.recordSpliceResult(true);
         return .{
@@ -1146,8 +1367,9 @@ const CampaignContext = struct {
             defer alloc.free(encoded);
             var artifact = try vopr.trace.parseAlloc(alloc, encoded);
             defer artifact.deinit();
+            if (!artifactMatchesScenario(&artifact, self.scenario)) continue;
             // Corpus files must still be executable under the current ABI.
-            var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &artifact);
+            var replayed = try replayKnownScenario(alloc, &artifact);
             replayed.deinit();
             const novelty = try self.coverage.observe(&artifact);
             const added = try self.corpus.add(&artifact, novelty);
@@ -1190,9 +1412,9 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata|transaction|distributed-data|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction|distributed-data|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata --histories <n> --transitions <n> --workers <n> --artifact-dir <path>
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr migrate --trace <path> --out <path> [--force]
@@ -1258,6 +1480,7 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
         .io = io,
         .histories = 1,
         .transitions = 2,
+        .scenario = "metadata",
         .base_seed = 1,
         .artifact_dir = corpus_path,
         .coverage = vopr.coverage.Tracker.init(alloc),
@@ -1288,4 +1511,28 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try validateTransactionTraceNdjson(alloc, transaction_ndjson.written());
     try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"InitTransaction\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transaction_ndjson.written(), "\"name\":\"WriteIntentOnShard\"") != null);
+}
+
+test "VOPR scenario registry records and exactly replays every context-free domain" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "transaction",
+        "wal",
+        "persistent",
+        "index-manager",
+        "db-split",
+        "raft",
+        "lmdb",
+        "lsm",
+        "ha",
+    };
+    for (cases, 0..) |scenario, index| {
+        const transitions = try defaultCampaignTransitions(scenario);
+        var artifact = try recordCampaignScenario(alloc, scenario, 0xA17F_C000 + index, transitions, 0xA17F_C000);
+        defer artifact.deinit();
+        try std.testing.expect(artifactMatchesScenario(&artifact, scenario));
+        try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
+        var replayed = try replayKnownScenario(alloc, &artifact);
+        replayed.deinit();
+    }
 }

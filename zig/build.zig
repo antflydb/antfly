@@ -6738,6 +6738,13 @@ pub fn build(b: *std.Build) void {
     const run_sim_cli_meta_tests = b.addRunArtifact(sim_cli_meta_tests);
     const sim_meta_test_step = b.step("sim-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
     sim_meta_test_step.dependOn(&run_sim_cli_meta_tests.step);
+    const sim_cli_registry_tests = b.addTest(.{
+        .root_module = sim_cli_mod,
+        .filters = &.{"VOPR scenario registry"},
+    });
+    const run_sim_cli_registry_tests = b.addRunArtifact(sim_cli_registry_tests);
+    const sim_registry_test_step = b.step("sim-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
+    sim_registry_test_step.dependOn(&run_sim_cli_registry_tests.step);
 
     const transaction_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6814,6 +6821,7 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
     sim_test_step.dependOn(&run_sim_cli_meta_tests.step);
+    sim_test_step.dependOn(&run_sim_cli_registry_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
@@ -7325,6 +7333,7 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
+    persistent_test_mod.addImport("vopr", vopr_mod);
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .test_runner = .{
@@ -7371,6 +7380,7 @@ pub fn build(b: *std.Build) void {
             "persistent modeled replay fixtures stay green",
             "persistent modeled sim workload stays green",
             "persistent modeled full-text compaction publish faults stay green",
+            "persistent VOPR",
         },
     });
     const run_persistent_vopr_tests = addFilteredTestRunArtifact(b, persistent_vopr_tests);
@@ -7408,6 +7418,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
+    index_manager_test_mod.addImport("vopr", vopr_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
         .filters = selectTestFilters(b, &.{}),
@@ -7450,6 +7461,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "index manager modeled replay fixtures stay green",
             "index manager modeled crash fixtures stay green",
+            "index manager VOPR",
         },
     });
     const run_index_manager_vopr_tests = addFilteredTestRunArtifact(b, index_manager_vopr_tests);
@@ -7486,6 +7498,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
     db_test_mod.addImport("structlog", structlog_mod);
+    db_test_mod.addImport("vopr", vopr_mod);
 
     const db_split_sim_default_filters = [_][]const u8{
         "db split sim default workload stays green",
@@ -7504,6 +7517,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db split modeled replay fixtures stay green",
             "db split modeled sim workloads stay green",
+            "DB split VOPR",
         },
     });
     const run_db_split_vopr_tests = addFilteredTestRunArtifact(b, db_split_vopr_tests);
