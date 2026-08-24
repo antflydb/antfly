@@ -340,11 +340,19 @@ pub const CatalogService = struct {
         const enrichment_completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
         const pipeline = enrichment_pipeline.builtinPipelineForPolicy(effective_policy);
         const enrichment_active_stage = chooseActiveEnrichmentStage(pipeline, enrichment_completion);
-        const enrichment_head_version = if (enrichment_active_stage) |stage|
+        const atomic_enrichment_progress = if (enrichment_active_stage) |stage|
+            try self.progress.getEnrichmentStageProgress(namespace, stage)
+        else
+            null;
+        const enrichment_head_version = if (atomic_enrichment_progress) |value|
+            value.head_version
+        else if (enrichment_active_stage) |stage|
             try self.progress.getEnrichmentStageHeadVersion(namespace, stage)
         else
             null;
-        const enrichment_doc_offset = if (enrichment_active_stage) |stage|
+        const enrichment_doc_offset = if (atomic_enrichment_progress) |value|
+            value.doc_offset
+        else if (enrichment_active_stage) |stage|
             (try self.progress.getEnrichmentStageDocOffset(namespace, stage)) orelse 0
         else
             0;

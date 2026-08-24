@@ -36,6 +36,7 @@ pub const FsStore = fs_store.FsStore;
 pub const ObjectStore = object_store.ObjectStore;
 pub const RemoteStore = remote_store.RemoteStore;
 pub const ProgressStore = progress_store.ProgressStore;
+pub const EnrichmentStageProgress = progress_store.EnrichmentStageProgress;
 pub const FsProgressStore = fs_progress_store.FsProgressStore;
 pub const RemoteProgressStore = remote_progress_store.RemoteProgressStore;
 pub const CatalogService = service.CatalogService;
@@ -64,6 +65,7 @@ test "serverless catalog module compiles" {
     _ = ObjectStore;
     _ = RemoteStore;
     _ = ProgressStore;
+    _ = EnrichmentStageProgress;
     _ = FsProgressStore;
     _ = RemoteProgressStore;
     _ = CatalogService;

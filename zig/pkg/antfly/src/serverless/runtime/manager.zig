@@ -238,7 +238,7 @@ pub const ManagedRuntime = struct {
                         .model_preference = stage_spec.model_preference,
                         .failure_policy = policy.enrichment_failure_policy,
                     }, self.cancellationToken()) catch |err| switch (err) {
-                        error.FileNotFound => continue,
+                        error.FileNotFound, error.EnrichmentProgressChanged => continue,
                         else => return err,
                     };
                     stats.enriched_namespaces += enrichment.enriched_namespaces;

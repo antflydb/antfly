@@ -25,6 +25,7 @@ pub const WalStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
         append_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8) anyerror!u64 = null,
+        append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
         read_from_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror![]wal_types.Record,
         latest_lsn: *const fn (*anyopaque, []const u8) anyerror!u64,
         truncate_prefix: *const fn (*anyopaque, []const u8, u64) anyerror!u64,
@@ -55,6 +56,33 @@ pub const WalStore = struct {
 
     pub fn supportsIdempotentAppend(self: *const WalStore) bool {
         return self.vtable.append_idempotent != null;
+    }
+
+    /// Append exactly once only if no WAL record has landed since the caller's
+    /// snapshot. The latest-LSN check and append must share the store's atomic
+    /// write primitive; returning null means the snapshot fence was lost.
+    pub fn appendIdempotentIfLatest(
+        self: *WalStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        const append_fn = self.vtable.append_idempotent_if_latest orelse
+            return error.ConditionalIdempotentAppendUnsupported;
+        return try append_fn(
+            self.ptr,
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
+    }
+
+    pub fn supportsConditionalIdempotentAppend(self: *const WalStore) bool {
+        return self.vtable.append_idempotent_if_latest != null;
     }
 
     pub fn readFromAlloc(self: *WalStore, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
