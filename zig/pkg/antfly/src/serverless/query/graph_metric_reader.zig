@@ -37,45 +37,12 @@ pub const Limits = struct {
     max_result_bytes: usize = 64 * 1024 * 1024,
 };
 
-pub const RejectionDiagnostic = struct {
-    graph_index_name: [256]u8 = undefined,
-    graph_index_name_len: u16 = 0,
-    metric_name: [128]u8 = undefined,
-    metric_name_len: u8 = 0,
-    materializer_fingerprint: u64 = 0,
-    reason: metric_segment.RejectionReason = .none,
-
-    pub fn graphIndexName(self: *const RejectionDiagnostic) []const u8 {
-        return self.graph_index_name[0..self.graph_index_name_len];
-    }
-
-    pub fn metricName(self: *const RejectionDiagnostic) []const u8 {
-        return self.metric_name[0..self.metric_name_len];
-    }
-};
-
-threadlocal var last_rejection: ?RejectionDiagnostic = null;
-
-pub fn clearLastRejectionDiagnostic() void {
-    last_rejection = null;
-}
-
-pub fn peekLastRejectionDiagnostic() ?RejectionDiagnostic {
-    return last_rejection;
-}
-
-fn recordRejectionDiagnostic(segment: anytype) void {
-    var diagnostic = RejectionDiagnostic{
-        .materializer_fingerprint = segment.materializer_fingerprint,
-        .reason = segment.rejection_reason,
-    };
-    const graph_len = @min(segment.graph_index_name.len, diagnostic.graph_index_name.len);
-    @memcpy(diagnostic.graph_index_name[0..graph_len], segment.graph_index_name[0..graph_len]);
-    diagnostic.graph_index_name_len = @intCast(graph_len);
-    const metric_len = @min(segment.metric_name.len, diagnostic.metric_name.len);
-    @memcpy(diagnostic.metric_name[0..metric_len], segment.metric_name[0..metric_len]);
-    diagnostic.metric_name_len = @intCast(metric_len);
-    last_rejection = diagnostic;
+fn recordRejectionDiagnostic(session: *runtime_mod.QuerySession, segment: anytype) void {
+    session.recordGraphMetricRejection(
+        segment.graph_index_name,
+        segment.metric_name,
+        segment.materializer_fingerprint,
+    );
 }
 
 pub const Score = struct {
@@ -177,7 +144,6 @@ pub fn scoresAlloc(
     metric_name: []const u8,
     node_ids: []const []const u8,
 ) !PointScoresResult {
-    clearLastRejectionDiagnostic();
     try session.checkCancellation();
     if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     for (node_ids) |node_id| {
@@ -207,7 +173,7 @@ pub fn scoresAlloc(
     const control = try metric_segment.decodeControl(control_bytes, config.edge_filter);
     try validateControl(control.header, graph_index_name, metric_name, graph_artifact, config);
     if (control.header.materialization_state == .rejected) {
-        recordRejectionDiagnostic(control.header);
+        recordRejectionDiagnostic(session, control.header);
         return error.GraphMetricMaterializationRejected;
     }
 
@@ -539,7 +505,6 @@ pub fn topAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_inde
 pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, top_k: usize, limits: Limits) !Result {
     if (top_k > limits.max_top_k or limits.max_top_k == 0 or limits.max_result_bytes == 0) return error.GraphMetricQueryBudgetExceeded;
 
-    clearLastRejectionDiagnostic();
     try session.checkCancellation();
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
     defer graph_metric_config.freeIndexSpecs(alloc, specs);
@@ -563,7 +528,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     const control = try metric_segment.decodeControl(control_bytes, config.edge_filter);
     try validateControl(control.header, graph_index_name, metric_name, graph_artifact, config);
     if (control.header.materialization_state == .rejected) {
-        recordRejectionDiagnostic(control.header);
+        recordRejectionDiagnostic(session, control.header);
         return error.GraphMetricMaterializationRejected;
     }
     // Preserve rolling-upgrade support for the old contiguous vector layout.
@@ -794,7 +759,6 @@ fn validateControl(
 }
 
 fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8) !metric_segment.Segment {
-    clearLastRejectionDiagnostic();
     try session.checkCancellation();
     const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
     defer graph_metric_config.freeIndexSpecs(alloc, specs);
@@ -821,7 +785,7 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     if (segment.materializer_fingerprint != graph_metric_policy.materializerFingerprint(.{})) return error.GraphMetricPolicyStale;
     if (segment.materialization_state == .rejected) return switch (segment.rejection_reason) {
         .build_budget_exceeded => {
-            recordRejectionDiagnostic(segment);
+            recordRejectionDiagnostic(session, segment);
             return error.GraphMetricMaterializationRejected;
         },
         .none => error.InvalidGraphMetricSegment,

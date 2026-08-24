@@ -23,7 +23,8 @@ const cache_mod = @import("cache.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const operation = @import("../../api/operation.zig");
+const CancellationToken = operation.CancellationToken;
 
 pub const QueryExecutionMetrics = struct {
     total_queries: u64 = 0,
@@ -171,6 +172,7 @@ pub const QuerySession = struct {
     cache: ?*cache_mod.QueryCache = null,
     manifest: manifest_mod.Manifest,
     cancellation: CancellationToken = .none,
+    diagnostics: ?*operation.RequestDiagnostics = null,
 
     pub fn deinit(self: *QuerySession) void {
         self.manifest.deinit(self.alloc);
@@ -196,6 +198,20 @@ pub const QuerySession = struct {
 
     pub fn setCancellation(self: *QuerySession, cancellation: CancellationToken) void {
         self.cancellation = cancellation;
+    }
+
+    pub fn setDiagnostics(self: *QuerySession, diagnostics: ?*operation.RequestDiagnostics) void {
+        self.diagnostics = diagnostics;
+    }
+
+    pub fn recordGraphMetricRejection(
+        self: *QuerySession,
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: u64,
+    ) void {
+        const diagnostics = self.diagnostics orelse return;
+        diagnostics.recordGraphMetricRejection(graph_index_name, metric_name, materializer_fingerprint);
     }
 
     pub fn checkCancellation(self: *const QuerySession) !void {

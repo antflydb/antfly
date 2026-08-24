@@ -105,3 +105,46 @@ pub fn artifactNameAlloc(alloc: Allocator, graph_index_name: []const u8, metric_
     if (graph_index_name.len == 0 or metric_name.len == 0) return error.InvalidGraphMetricArtifactName;
     return try std.fmt.allocPrint(alloc, "{d}:{s}{d}:{s}", .{ graph_index_name.len, graph_index_name, metric_name.len, metric_name });
 }
+
+pub const ParsedArtifactName = struct {
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+};
+
+/// Parse the length-prefixed artifact name without allocation. Validating both
+/// components avoids separator ambiguity and makes manifest recovery safe for
+/// arbitrary user-supplied index and metric names.
+pub fn parseArtifactName(name: []const u8) !ParsedArtifactName {
+    const graph_separator = std.mem.indexOfScalar(u8, name, ':') orelse return error.InvalidGraphMetricArtifactName;
+    if (graph_separator == 0) return error.InvalidGraphMetricArtifactName;
+    const graph_len = std.fmt.parseInt(usize, name[0..graph_separator], 10) catch return error.InvalidGraphMetricArtifactName;
+    if (graph_len == 0) return error.InvalidGraphMetricArtifactName;
+    const graph_start = graph_separator + 1;
+    const graph_end = std.math.add(usize, graph_start, graph_len) catch return error.InvalidGraphMetricArtifactName;
+    if (graph_end >= name.len) return error.InvalidGraphMetricArtifactName;
+
+    const metric_separator_relative = std.mem.indexOfScalar(u8, name[graph_end..], ':') orelse return error.InvalidGraphMetricArtifactName;
+    if (metric_separator_relative == 0) return error.InvalidGraphMetricArtifactName;
+    const metric_separator = graph_end + metric_separator_relative;
+    const metric_len = std.fmt.parseInt(usize, name[graph_end..metric_separator], 10) catch return error.InvalidGraphMetricArtifactName;
+    if (metric_len == 0) return error.InvalidGraphMetricArtifactName;
+    const metric_start = metric_separator + 1;
+    const metric_end = std.math.add(usize, metric_start, metric_len) catch return error.InvalidGraphMetricArtifactName;
+    if (metric_end != name.len) return error.InvalidGraphMetricArtifactName;
+
+    return .{
+        .graph_index_name = name[graph_start..graph_end],
+        .metric_name = name[metric_start..metric_end],
+    };
+}
+
+test "serverless graph metric artifact names round trip without separator ambiguity" {
+    const alloc = std.testing.allocator;
+    const encoded = try artifactNameAlloc(alloc, "graph:west", "rank:daily");
+    defer alloc.free(encoded);
+
+    const parsed = try parseArtifactName(encoded);
+    try std.testing.expectEqualStrings("graph:west", parsed.graph_index_name);
+    try std.testing.expectEqualStrings("rank:daily", parsed.metric_name);
+    try std.testing.expectError(error.InvalidGraphMetricArtifactName, parseArtifactName("5:short4:no"));
+}

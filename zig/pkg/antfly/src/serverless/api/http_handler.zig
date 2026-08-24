@@ -1268,7 +1268,14 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8, cancellation: CancellationToken) !SearchExecution {
+    fn executePublishedSearch(
+        self: *HttpHandler,
+        namespace: []const u8,
+        table_name: ?[]const u8,
+        body: []const u8,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) !SearchExecution {
         try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
@@ -1298,6 +1305,7 @@ pub const HttpHandler = struct {
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
+        session.setDiagnostics(diagnostics);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
         const hits = try query_mod.searchIndexedPlanWithStatsAlloc(self.alloc, &session, plan, &execution_stats);
@@ -1316,7 +1324,13 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePublicTableQueryJsonAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) anyerror![]u8 {
         try cancellation.check();
         if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
@@ -1334,10 +1348,10 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, diagnostics);
         }
 
-        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation);
+        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation, diagnostics);
     }
 
     fn executeForeignPublicTableQueryJsonAlloc(
@@ -1691,7 +1705,13 @@ pub const HttpHandler = struct {
         return hits;
     }
 
-    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePlainPublicTableQueryJsonAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) anyerror![]u8 {
         try cancellation.check();
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -1702,7 +1722,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation)) |owned_response| {
+        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation, diagnostics)) |owned_response| {
             var response = owned_response;
             defer response.deinit(self.alloc);
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
@@ -1713,7 +1733,7 @@ pub const HttpHandler = struct {
             };
         }
 
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, diagnostics) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -2330,6 +2350,7 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
         cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
     ) anyerror![]u8 {
         try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -2344,7 +2365,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation);
+        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation, diagnostics);
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -2750,19 +2771,18 @@ pub const HttpHandler = struct {
 
     fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         try cancellation.check();
-        query_mod.clearLastGraphMetricRejectionDiagnostic();
+        var diagnostics = api_operation.RequestDiagnostics{};
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
             body,
             null,
-            self.tableApi(cancellation),
+            self.tableApiWithDiagnostics(cancellation, &diagnostics),
         );
         defer resp.deinit(self.alloc);
         try cancellation.check();
         if (resp.status == 422) {
-            if (query_mod.peekLastGraphMetricRejectionDiagnostic()) |diagnostic_value| {
-                var diagnostic = diagnostic_value;
+            if (diagnostics.graph_metric_rejection) |*diagnostic| {
                 const rejection_body = try public_table_http.graphMetricMaterializationRejectedBodyWithContext(
                     self.alloc,
                     diagnostic.graphIndexName(),
@@ -2785,6 +2805,7 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         body: []const u8,
         cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
     ) !?HttpResponse {
         try cancellation.check();
         public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
@@ -2847,7 +2868,7 @@ pub const HttpHandler = struct {
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation, diagnostics) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2902,6 +2923,7 @@ pub const HttpHandler = struct {
             };
             session_initialized = true;
             session.setCancellation(cancellation);
+            session.setDiagnostics(diagnostics);
         }
 
         var graph_metric_rerank_status: ?db_types.GraphMetricStatus = null;
@@ -3299,7 +3321,7 @@ pub const HttpHandler = struct {
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest,
@@ -3392,7 +3414,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.UnsupportedQueryRequest,
             error.EmbeddingIndexNotFound,
@@ -4927,9 +4949,17 @@ pub const HttpHandler = struct {
     }
 
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
+        return self.tableApiWithDiagnostics(cancellation, null);
+    }
+
+    fn tableApiWithDiagnostics(
+        self: *HttpHandler,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) public_table_http.TableApi {
         return .{
             .ptr = self,
-            .request = .{ .cancellation = cancellation },
+            .request = .{ .cancellation = cancellation, .diagnostics = diagnostics },
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -5212,7 +5242,7 @@ pub const HttpHandler = struct {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
+        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation, request.diagnostics) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -11337,12 +11367,14 @@ test "serverless public graph query rejects exact sort controls" {
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
         .none,
+        null,
     ));
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
+        null,
     ));
 }
 

@@ -386,6 +386,9 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        if (!self.manifests.supportsArtifactProvenance()) {
+            clearArtifactProvenanceForRollingWriter(graph_refs);
+        }
         const graph_metric_specs = if (targets.include_graph and self.manifests.supportsArtifactKind(.graph_metric_segment))
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
@@ -637,6 +640,9 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        if (!self.manifests.supportsArtifactProvenance()) {
+            clearArtifactProvenanceForRollingWriter(graph_refs);
+        }
         const graph_metric_specs = if (targets.include_graph and self.manifests.supportsArtifactKind(.graph_metric_segment))
             try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
         else
@@ -3494,6 +3500,82 @@ fn stampGraphTopologyGenerationsAlloc(
         }
         graph_ref.edge_generation = inferred_generation orelse manifest.version;
     }
+}
+
+/// A writer-gate rollback must be able to republish graph artifacts cloned
+/// from a newer manifest. Wire v12 has no provenance fields, so normalize the
+/// retained references instead of making rollback publication fail.
+fn clearArtifactProvenanceForRollingWriter(refs: []manifest_mod.ArtifactRef) void {
+    for (refs) |*ref| {
+        ref.metadata_version = 0;
+        ref.published_generation = 0;
+        ref.edge_generation = 0;
+        ref.computed_at_ms = 0;
+        ref.materializer_fingerprint = 0;
+        ref.graph_metric_control_len = 0;
+        ref.graph_metric_routing_footer_len = 0;
+        ref.graph_metric_control_checksum = @splat(0);
+        ref.graph_metric_routing_checksum = @splat(0);
+        ref.graph_metric_config_fingerprint = 0;
+        ref.graph_metric_source_checksum = @splat(0);
+        ref.graph_metric_materialization_state = .ready;
+        ref.graph_metric_rejection_reason = .none;
+    }
+}
+
+test "serverless rolling writer rollback clears retained graph provenance" {
+    var refs = [_]manifest_mod.ArtifactRef{.{
+        .kind = .graph_segment,
+        .name = "graph_idx",
+        .artifact_id = "graph-object",
+        .byte_len = 123,
+        .checksum = "checksum",
+        .metadata_version = 6,
+        .published_generation = 9,
+        .edge_generation = 7,
+        .computed_at_ms = 42,
+        .materializer_fingerprint = 11,
+        .graph_metric_control_len = 10,
+        .graph_metric_routing_footer_len = 20,
+        .graph_metric_control_checksum = @splat(1),
+        .graph_metric_routing_checksum = @splat(2),
+        .graph_metric_config_fingerprint = 13,
+        .graph_metric_source_checksum = @splat(3),
+        .graph_metric_materialization_state = .rejected,
+        .graph_metric_rejection_reason = .build_budget_exceeded,
+    }};
+
+    clearArtifactProvenanceForRollingWriter(&refs);
+
+    try std.testing.expectEqualStrings("graph-object", refs[0].artifact_id);
+    try std.testing.expectEqual(@as(u16, 0), refs[0].metadata_version);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].published_generation);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].edge_generation);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].materializer_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), refs[0].graph_metric_control_len);
+    try std.testing.expectEqual(@as(u32, 0), refs[0].graph_metric_routing_footer_len);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), refs[0].graph_metric_control_checksum);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), refs[0].graph_metric_routing_checksum);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].graph_metric_config_fingerprint);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), refs[0].graph_metric_source_checksum);
+    try std.testing.expectEqual(.ready, refs[0].graph_metric_materialization_state);
+    try std.testing.expectEqual(.none, refs[0].graph_metric_rejection_reason);
+
+    const encoded = try manifest_mod.codec.encodeForVersionAlloc(std.testing.allocator, .{
+        .namespace = "docs",
+        .version = 10,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{ .graph_segment_count = 1 },
+        .artifacts = &refs,
+    }, manifest_mod.codec.rolling_compatible_write_version);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqual(
+        manifest_mod.codec.rolling_compatible_write_version,
+        std.mem.readInt(u16, encoded[4..6], .little),
+    );
 }
 
 fn buildGraphMetricArtifactRefsAlloc(

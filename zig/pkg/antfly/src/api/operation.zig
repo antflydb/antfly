@@ -61,6 +61,47 @@ pub const AdmissionReservation = struct {
     }
 };
 
+/// Bounded, request-owned diagnostic context. Operations may populate this
+/// while unwinding an error so ingress adapters can return actionable details
+/// without thread-local state or heap allocation.
+pub const GraphMetricRejectionDiagnostic = struct {
+    graph_index_name: [256]u8 = undefined,
+    graph_index_name_len: u16 = 0,
+    metric_name: [128]u8 = undefined,
+    metric_name_len: u8 = 0,
+    materializer_fingerprint: u64 = 0,
+
+    pub fn graphIndexName(self: *const GraphMetricRejectionDiagnostic) []const u8 {
+        return self.graph_index_name[0..self.graph_index_name_len];
+    }
+
+    pub fn metricName(self: *const GraphMetricRejectionDiagnostic) []const u8 {
+        return self.metric_name[0..self.metric_name_len];
+    }
+};
+
+pub const RequestDiagnostics = struct {
+    graph_metric_rejection: ?GraphMetricRejectionDiagnostic = null,
+
+    pub fn recordGraphMetricRejection(
+        self: *RequestDiagnostics,
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: u64,
+    ) void {
+        var diagnostic = GraphMetricRejectionDiagnostic{
+            .materializer_fingerprint = materializer_fingerprint,
+        };
+        const graph_len = @min(graph_index_name.len, diagnostic.graph_index_name.len);
+        @memcpy(diagnostic.graph_index_name[0..graph_len], graph_index_name[0..graph_len]);
+        diagnostic.graph_index_name_len = @intCast(graph_len);
+        const metric_len = @min(metric_name.len, diagnostic.metric_name.len);
+        @memcpy(diagnostic.metric_name[0..metric_len], metric_name[0..metric_len]);
+        diagnostic.metric_name_len = @intCast(metric_len);
+        self.graph_metric_rejection = diagnostic;
+    }
+};
+
 pub const RequestContext = struct {
     cancellation: CancellationToken = .none,
     /// Absolute monotonic deadline. This deliberately does not use a wall
@@ -71,6 +112,9 @@ pub const RequestContext = struct {
     request_id: []const u8 = "",
     principal: ?Principal = null,
     admission: ?*AdmissionReservation = null,
+    /// Borrowed for the duration of the operation. This is deliberately
+    /// request-scoped: std.Io tasks may resume on a different worker thread.
+    diagnostics: ?*RequestDiagnostics = null,
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;
@@ -162,4 +206,21 @@ test "admission reservation releases exactly once" {
     reservation.release();
     reservation.release();
     try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
+test "serverless request diagnostics remain isolated across interleaved operations" {
+    var first = RequestDiagnostics{};
+    var second = RequestDiagnostics{};
+
+    first.recordGraphMetricRejection("graph-a", "pagerank", 11);
+    second.recordGraphMetricRejection("graph-b", "degree", 22);
+
+    const first_rejection = first.graph_metric_rejection.?;
+    const second_rejection = second.graph_metric_rejection.?;
+    try std.testing.expectEqualStrings("graph-a", first_rejection.graphIndexName());
+    try std.testing.expectEqualStrings("pagerank", first_rejection.metricName());
+    try std.testing.expectEqual(@as(u64, 11), first_rejection.materializer_fingerprint);
+    try std.testing.expectEqualStrings("graph-b", second_rejection.graphIndexName());
+    try std.testing.expectEqualStrings("degree", second_rejection.metricName());
+    try std.testing.expectEqual(@as(u64, 22), second_rejection.materializer_fingerprint);
 }

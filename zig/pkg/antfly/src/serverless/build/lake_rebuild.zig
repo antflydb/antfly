@@ -596,7 +596,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     try declarations.ensureUnusedCapacity(alloc, base_declarations.len);
     for (base_declarations) |declaration| declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
     if (specs.len > 0) {
-        try stampExternalGraphTopologyGenerationsAlloc(alloc, declarations.items, published_declarations, specs, provenance.edge_generation);
+        stampExternalGraphTopologyGenerations(declarations.items, published_declarations, specs, provenance.edge_generation);
     }
 
     const graph_metric_limits = lake_graph_metric.Limits{};
@@ -777,15 +777,22 @@ fn findDeclaration(
     return null;
 }
 
-fn stampExternalGraphTopologyGenerationsAlloc(
-    alloc: Allocator,
+fn stampExternalGraphTopologyGenerations(
     declarations: []sidecar_manifest.DeclaredArtifact,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     specs: []const graph_metric_config.IndexSpec,
     next_generation: u64,
-) !void {
+) void {
     for (declarations) |*declaration| {
         if (declaration.binding.sidecar_kind != .graph or declaration.artifact.kind != .graph_segment) continue;
+        var configured = false;
+        for (specs) |spec| {
+            if (spec.configs.len > 0 and std.mem.eql(u8, spec.index_name, declaration.name)) {
+                configured = true;
+                break;
+            }
+        }
+        if (!configured) continue;
         declaration.artifact.edge_generation = next_generation;
         const previous_graph = findDeclaration(published_declarations, declaration.name) orelse continue;
         if (previous_graph.binding.sidecar_kind != .graph or
@@ -798,22 +805,20 @@ fn stampExternalGraphTopologyGenerationsAlloc(
         }
 
         // Recover topology identity from metric sidecars written before graph
-        // declarations carried provenance themselves.
+        // declarations carried provenance themselves. Scan all prior metrics
+        // for this graph, including names removed by the current definition.
         var inferred_generation: ?u64 = null;
-        for (specs) |spec| {
-            if (!std.mem.eql(u8, spec.index_name, declaration.name)) continue;
-            for (spec.configs) |config| {
-                const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
-                defer alloc.free(metric_name);
-                const metric = findDeclaration(published_declarations, metric_name) orelse continue;
-                if (metric.binding.sidecar_kind != .graph_metric or
-                    !source_binding.sameSourceSnapshot(metric.binding, previous_graph.binding) or
-                    metric.artifact.edge_generation == 0) continue;
-                inferred_generation = if (inferred_generation) |existing|
-                    @min(existing, metric.artifact.edge_generation)
-                else
-                    metric.artifact.edge_generation;
-            }
+        for (published_declarations) |metric| {
+            if (metric.binding.sidecar_kind != .graph_metric or
+                metric.artifact.kind != .graph_metric_segment or
+                !source_binding.sameSourceSnapshot(metric.binding, previous_graph.binding) or
+                metric.artifact.edge_generation == 0) continue;
+            const parsed_name = graph_metric_segment.parseArtifactName(metric.name) catch continue;
+            if (!std.mem.eql(u8, parsed_name.graph_index_name, declaration.name)) continue;
+            inferred_generation = if (inferred_generation) |existing|
+                @min(existing, metric.artifact.edge_generation)
+            else
+                metric.artifact.edge_generation;
         }
         declaration.artifact.edge_generation = inferred_generation orelse next_generation;
     }
@@ -3054,6 +3059,36 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     try std.testing.expectEqual(degree_declaration.artifact.computed_at_ms, updated_degree.artifact.computed_at_ms);
     try std.testing.expectEqual(@as(u64, 2), updated_centrality.artifact.published_generation);
     try std.testing.expectEqual(graph_declaration.artifact.edge_generation, updated_centrality.artifact.edge_generation);
+
+    // Simulate a legacy graph declaration whose topology generation was not
+    // persisted, then replace every existing metric name. Recovery must use a
+    // prior sibling metric instead of treating the unchanged graph as new.
+    for (updated.artifacts) |*published| {
+        if (published.binding.sidecar_kind == .graph and std.mem.eql(u8, published.name, "graph_idx")) {
+            published.artifact.edge_generation = 0;
+        }
+    }
+    var replaced = try reconcileResolvedExternalSourceSidecarsAlloc(
+        alloc,
+        &artifacts,
+        source_provider.provider(),
+        base_source,
+        inventory,
+        .{
+            .table_name = "docs",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"replacement\":{\"kind\":\"degree\"}}}}",
+        },
+        updated.artifacts,
+        .{ .published_generation = 3, .edge_generation = 3, .computed_at_ms = 3 },
+    );
+    defer replaced.deinit(alloc);
+
+    const replacement_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "replacement");
+    defer alloc.free(replacement_name);
+    const replaced_graph = replaced.find("graph_idx").?;
+    const replacement_metric = replaced.find(replacement_name).?;
+    try std.testing.expectEqual(graph_declaration.artifact.edge_generation, replaced_graph.artifact.edge_generation);
+    try std.testing.expectEqual(replaced_graph.artifact.edge_generation, replacement_metric.artifact.edge_generation);
 }
 
 test "lake rebuild operation planner preserves reuse and drop artifacts" {

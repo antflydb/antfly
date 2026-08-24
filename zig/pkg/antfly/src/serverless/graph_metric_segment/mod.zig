@@ -20,6 +20,7 @@ pub const MaterializationState = types.MaterializationState;
 pub const RejectionReason = types.RejectionReason;
 pub const freeSegment = types.freeSegment;
 pub const artifactNameAlloc = types.artifactNameAlloc;
+pub const parseArtifactName = types.parseArtifactName;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const encodeAllocWithCancellation = codec.encodeAllocWithCancellation;
 pub const encodeAllocWithCancellationAndLimit = codec.encodeAllocWithCancellationAndLimit;

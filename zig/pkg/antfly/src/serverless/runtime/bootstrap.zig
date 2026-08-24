@@ -432,7 +432,13 @@ pub const OwnedStack = struct {
             self.query_cache = null;
             self.query = query_mod.QueryRuntime.init(alloc, &self.artifacts, &self.manifests, &self.progress);
         }
+        var query_cache_owned = self.query_cache != null;
+        errdefer if (query_cache_owned) self.query_cache.?.deinit();
+        var query_owned = true;
+        errdefer if (query_owned) self.query.deinit();
         self.status = try runtimeStatusAlloc(alloc, cfg);
+        var status_owned = true;
+        errdefer if (status_owned) self.status.deinit(alloc);
         self.runtime = runtime_manager.ManagedRuntime.init(alloc, .{
             .tick_interval_ms = cfg.tick_interval_ms,
             .role = cfg.role,
@@ -441,6 +447,8 @@ pub const OwnedStack = struct {
             .prune_enabled = cfg.prune_enabled,
             .enrichment_enabled = cfg.enrichment_enabled,
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
+        var runtime_owned = true;
+        errdefer if (runtime_owned) self.runtime.deinit();
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         var enricher_owned = true;
@@ -524,6 +532,10 @@ pub const OwnedStack = struct {
             self.handler.setManagedDenseQueryEmbedder(query_embedder, self.dense_query_index_name.?);
         }
         self.handler.setRuntimeMetrics(&self.runtime);
+        runtime_owned = false;
+        status_owned = false;
+        query_owned = false;
+        query_cache_owned = false;
     }
 
     pub fn deinit(self: *OwnedStack) void {
@@ -740,6 +752,62 @@ test "runtime bootstrap assembles serverless stack from uri config" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"table_name\":\"docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"doc_id\":\"doc-a\"") != null);
+}
+
+test "serverless runtime bootstrap failure unwinds query cache and runtime ownership" {
+    const alloc = std.testing.allocator;
+
+    var artifacts_buf: [256]u8 = undefined;
+    var manifests_buf: [256]u8 = undefined;
+    var wal_buf: [256]u8 = undefined;
+    var progress_buf: [256]u8 = undefined;
+    var catalog_buf: [256]u8 = undefined;
+    var cache_buf: [256]u8 = undefined;
+    const artifacts_root = tmpPath(&artifacts_buf, "bootstrap-failure-artifacts");
+    const manifests_root = tmpPath(&manifests_buf, "bootstrap-failure-manifests");
+    const wal_root = tmpPath(&wal_buf, "bootstrap-failure-wal");
+    const progress_root = tmpPath(&progress_buf, "bootstrap-failure-progress");
+    const catalog_root = tmpPath(&catalog_buf, "bootstrap-failure-catalog");
+    const cache_root = tmpPath(&cache_buf, "bootstrap-failure-cache");
+    defer cleanupTmp(artifacts_root);
+    defer cleanupTmp(manifests_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(progress_root);
+    defer cleanupTmp(catalog_root);
+    defer cleanupTmp(cache_root);
+
+    const artifacts_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(artifacts_root)});
+    defer alloc.free(artifacts_uri);
+    const manifests_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(manifests_root)});
+    defer alloc.free(manifests_uri);
+    const wal_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(wal_root)});
+    defer alloc.free(wal_uri);
+    const progress_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(progress_root)});
+    defer alloc.free(progress_uri);
+    const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
+    defer alloc.free(catalog_uri);
+
+    const base = BootstrapConfig{
+        .artifacts_uri = artifacts_uri,
+        .manifests_uri = manifests_uri,
+        .wal_uri = wal_uri,
+        .progress_uri = progress_uri,
+        .catalog_uri = catalog_uri,
+        .query_cache_dir = std.mem.span(cache_root),
+        .query_cache_max_bytes = 1024 * 1024,
+        .query_cache_payload_max_bytes = 256 * 1024,
+        .tick_interval_ms = 1,
+    };
+    var invalid = base;
+    invalid.embedding_indexes_json = "{";
+
+    var failed_stack: OwnedStack = undefined;
+    try std.testing.expectError(error.UnexpectedEndOfInput, failed_stack.init(alloc, invalid, std.testing.io));
+
+    // A clean retry exercises file/lease release as well as allocator cleanup.
+    var retry_stack: OwnedStack = undefined;
+    try retry_stack.init(alloc, base, std.testing.io);
+    retry_stack.deinit();
 }
 
 test "runtime bootstrap wires foreign registry into public join handler" {

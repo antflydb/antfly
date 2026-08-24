@@ -101,4 +101,8 @@ pub const ManifestStore = struct {
             else => true,
         };
     }
+
+    pub fn supportsArtifactProvenance(self: *const ManifestStore) bool {
+        return self.write_version >= artifact_ref.graph_metric_min_manifest_wire_version;
+    }
 };
