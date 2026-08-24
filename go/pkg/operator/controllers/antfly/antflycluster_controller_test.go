@@ -14413,7 +14413,7 @@ func TestReconcileStandaloneStatefulSetPreservesExactLivePromotedProcess(t *test
 	g.Expect(*observedStatefulSet.Spec.UpdateStrategy.RollingUpdate.Partition).To(Equal(int32(0)))
 }
 
-func TestPromotedStandaloneRolloutRequiresExactReceiptAndReadyOwnedPod(t *testing.T) {
+func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
@@ -14445,8 +14445,17 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndReadyOwnedPod(t *testin
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeTrue())
+
+	// Lease transfer deliberately makes readiness fail closed while the same
+	// process adopts its successor bootstrap receipt. That transient must not
+	// turn the primary template publication into a process replacement.
 	pod.Status.Conditions[0].Status = corev1.ConditionFalse
 	g.Expect(client.Status().Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+
+	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = "not-a-canonical-receipt"
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeFalse())

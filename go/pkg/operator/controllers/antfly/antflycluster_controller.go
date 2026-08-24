@@ -4193,7 +4193,7 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
 		return false, nil
 	}
-	if strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation]) == "" {
+	if !isLowerHexDigest(strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])) {
 		return false, nil
 	}
 	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
@@ -4212,8 +4212,7 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	if pod.DeletionTimestamp != nil ||
 		!isPodControlledByStatefulSet(pod, statefulSet.Name) ||
 		pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole ||
-		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) ||
-		isUnhealthyPod(pod) {
+		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) {
 		return false, nil
 	}
 	return true, nil
