@@ -3459,11 +3459,48 @@ fn findArtifactRefByName(
     return null;
 }
 
+fn stampGraphTopologyGenerationsAlloc(
+    alloc: Allocator,
+    graph_refs: []manifest_mod.ArtifactRef,
+    current: ?manifest_mod.Manifest,
+    previous_specs: []const graph_metric_config.IndexSpec,
+    next_generation: u64,
+) !void {
+    for (graph_refs) |*graph_ref| {
+        graph_ref.edge_generation = next_generation;
+        const manifest = current orelse continue;
+        const previous_graph = findArtifactRefByName(manifest.artifacts, .graph_segment, graph_ref.name) orelse continue;
+        if (!artifactRefsIdentifySamePayload(previous_graph, graph_ref.*)) continue;
+
+        if (previous_graph.edge_generation != 0) {
+            graph_ref.edge_generation = previous_graph.edge_generation;
+            continue;
+        }
+
+        // Pre-provenance manifests did not stamp graph artifacts. Recover the
+        // topology generation from any metric already bound to this graph so a
+        // newly configured sibling receives the same snapshot identity.
+        var inferred_generation: ?u64 = null;
+        for (previous_specs) |spec| {
+            if (!std.mem.eql(u8, spec.index_name, graph_ref.name)) continue;
+            for (spec.configs) |config| {
+                const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                defer alloc.free(artifact_name);
+                const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name) orelse continue;
+                const candidate = manifest.artifacts[metric_index].edge_generation;
+                if (candidate == 0) continue;
+                inferred_generation = if (inferred_generation) |existing| @min(existing, candidate) else candidate;
+            }
+        }
+        graph_ref.edge_generation = inferred_generation orelse manifest.version;
+    }
+}
+
 fn buildGraphMetricArtifactRefsAlloc(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     current: ?manifest_mod.Manifest,
-    graph_refs: []const manifest_mod.ArtifactRef,
+    graph_refs: []manifest_mod.ArtifactRef,
     specs: []const graph_metric_config.IndexSpec,
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
@@ -3483,6 +3520,12 @@ fn buildGraphMetricArtifactRefsAlloc(
         try alloc.alloc(graph_metric_config.IndexSpec, 0);
     defer graph_metric_config.freeIndexSpecs(alloc, previous_specs);
 
+    // Provenance fields require the graph-metric manifest wire generation.
+    // Leave graph-only publications compatible with the rolling writer.
+    if (specs.len > 0) {
+        try stampGraphTopologyGenerationsAlloc(alloc, graph_refs, current, previous_specs, provenance.edge_generation);
+    }
+
     const graph_metric_limits = lake_graph_metric.Limits{};
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
     // Named graph indexes produced from materialized documents intentionally
@@ -3498,6 +3541,8 @@ fn buildGraphMetricArtifactRefsAlloc(
             const previous_graph_ref = findArtifactRefByName(manifest.artifacts, .graph_segment, spec.index_name) orelse break :topology false;
             break :topology artifactRefsIdentifySamePayload(previous_graph_ref, graph_ref);
         } else false;
+        var effective_provenance = provenance;
+        effective_provenance.edge_generation = graph_ref.edge_generation;
 
         // Resolve every configured metric independently. A missing or stale
         // sibling must not consume rebuild budget or replace a healthy metric
@@ -3526,9 +3571,9 @@ fn buildGraphMetricArtifactRefsAlloc(
                         const metric_ref = manifest.artifacts[metric_index];
                         if (try graphMetricArtifactReusable(alloc, artifacts, metric_ref, spec.index_name, config, graph_ref, cancellation)) {
                             var cloned = try cloneArtifactRefAlloc(alloc, metric_ref);
-                            if (cloned.published_generation == 0) cloned.published_generation = provenance.published_generation;
-                            if (cloned.edge_generation == 0) cloned.edge_generation = provenance.edge_generation;
-                            if (cloned.computed_at_ms == 0) cloned.computed_at_ms = provenance.computed_at_ms;
+                            if (cloned.published_generation == 0) cloned.published_generation = effective_provenance.published_generation;
+                            if (cloned.edge_generation == 0) cloned.edge_generation = effective_provenance.edge_generation;
+                            if (cloned.computed_at_ms == 0) cloned.computed_at_ms = effective_provenance.computed_at_ms;
                             if (cloned.materializer_fingerprint == 0) cloned.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
                             resolved[config_index] = cloned;
                             reused = true;
@@ -3561,7 +3606,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                 cancellation,
                 .build_budget_exceeded,
                 graph_metric_limits,
-                provenance,
+                effective_provenance,
             );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_ref)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
@@ -3582,7 +3627,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                         cancellation,
                         .build_budget_exceeded,
                         graph_metric_limits,
-                        provenance,
+                        effective_provenance,
                     ),
                     else => return err,
                 };
@@ -3597,7 +3642,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                 graph_metric_limits,
                 &graph_metric_budget,
                 &prepared_graph.?,
-                provenance,
+                effective_provenance,
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,
@@ -3608,7 +3653,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                     cancellation,
                     .build_budget_exceeded,
                     graph_metric_limits,
-                    provenance,
+                    effective_provenance,
                 ),
                 else => return err,
             };
@@ -5560,6 +5605,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     defer alloc.free(degree_metric_name);
     const first_graph = first.artifacts[findNamedArtifactIndex(first, .graph_segment, "graph_idx").?];
     const first_metric = first.artifacts[findNamedArtifactIndex(first, .graph_metric_segment, metric_name).?];
+    try std.testing.expectEqual(@as(u64, 1), first_graph.edge_generation);
     try std.testing.expectEqual(graph_metric_segment_mod.wire_version, first_metric.metadata_version);
     try std.testing.expectEqual(@as(u64, 1), first_metric.published_generation);
     try std.testing.expectEqual(@as(u64, 1), first_metric.edge_generation);
@@ -5581,6 +5627,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const second_graph = second.artifacts[findNamedArtifactIndex(second, .graph_segment, "graph_idx").?];
     const second_metric = second.artifacts[findNamedArtifactIndex(second, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqualStrings(first_graph.artifact_id, second_graph.artifact_id);
+    try std.testing.expectEqual(first_graph.edge_generation, second_graph.edge_generation);
     try std.testing.expectEqualStrings(first_metric.artifact_id, second_metric.artifact_id);
     try std.testing.expectEqual(first_metric.metadata_version, second_metric.metadata_version);
     try std.testing.expectEqual(first_metric.published_generation, second_metric.published_generation);
@@ -5604,6 +5651,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const third_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, metric_name).?];
     const third_degree_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, degree_metric_name).?];
     try std.testing.expect(!std.mem.eql(u8, second_graph.artifact_id, third_graph.artifact_id));
+    try std.testing.expectEqual(@as(u64, 3), third_graph.edge_generation);
     try std.testing.expect(!std.mem.eql(u8, second_metric.artifact_id, third_metric.artifact_id));
     try std.testing.expectEqual(@as(u64, 3), third_metric.published_generation);
     try std.testing.expectEqual(@as(u64, 3), third_metric.edge_generation);
@@ -5642,6 +5690,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const fourth_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, metric_name).?];
     const fourth_degree_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, degree_metric_name).?];
     try std.testing.expectEqualStrings(third_graph.artifact_id, fourth_graph.artifact_id);
+    try std.testing.expectEqual(third_graph.edge_generation, fourth_graph.edge_generation);
     try std.testing.expect(!std.mem.eql(u8, third_metric.artifact_id, fourth_metric.artifact_id));
     try std.testing.expectEqual(@as(u64, 4), fourth_metric.published_generation);
     try std.testing.expectEqual(third_metric.edge_generation, fourth_metric.edge_generation);
@@ -5649,6 +5698,32 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     try std.testing.expectEqual(third_degree_metric.published_generation, fourth_degree_metric.published_generation);
     try std.testing.expectEqual(third_degree_metric.edge_generation, fourth_degree_metric.edge_generation);
     try std.testing.expectEqual(third_degree_metric.computed_at_ms, fourth_degree_metric.computed_at_ms);
+
+    const expanded_indexes_json = try alloc.dupe(u8,
+        \\{"graph_idx":{"type":"graph","metrics":{"degree":{"kind":"degree"},"rank":{"kind":"pagerank","max_iterations":40},"centrality":{"kind":"eigenvector"}}}}
+    );
+    defer alloc.free(expanded_indexes_json);
+    var fifth_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, .{
+        .targets = plan.targets,
+        .table_definition = .{ .indexes_json = expanded_indexes_json },
+        .metadata_republish = .{ .artifact_families_changed = true },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .reuse, .sparse_vector = .reuse, .graph = .reuse },
+    });
+    defer fifth_result.deinit(alloc);
+    var fifth = try manifest_store.getAlloc("docs", 5);
+    defer fifth.deinit(alloc);
+    const centrality_metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "centrality");
+    defer alloc.free(centrality_metric_name);
+    const fifth_graph = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_segment, "graph_idx").?];
+    const fifth_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, metric_name).?];
+    const fifth_degree_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, degree_metric_name).?];
+    const fifth_centrality_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, centrality_metric_name).?];
+    try std.testing.expectEqualStrings(fourth_graph.artifact_id, fifth_graph.artifact_id);
+    try std.testing.expectEqual(fourth_graph.edge_generation, fifth_graph.edge_generation);
+    try std.testing.expectEqualStrings(fourth_metric.artifact_id, fifth_metric.artifact_id);
+    try std.testing.expectEqualStrings(fourth_degree_metric.artifact_id, fifth_degree_metric.artifact_id);
+    try std.testing.expectEqual(@as(u64, 5), fifth_centrality_metric.published_generation);
+    try std.testing.expectEqual(fourth_graph.edge_generation, fifth_centrality_metric.edge_generation);
 }
 
 test "builder reuses graph artifact when wal updates do not change graph projection" {

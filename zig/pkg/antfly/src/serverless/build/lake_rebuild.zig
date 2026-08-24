@@ -595,6 +595,9 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     }
     try declarations.ensureUnusedCapacity(alloc, base_declarations.len);
     for (base_declarations) |declaration| declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
+    if (specs.len > 0) {
+        try stampExternalGraphTopologyGenerationsAlloc(alloc, declarations.items, published_declarations, specs, provenance.edge_generation);
+    }
 
     const graph_metric_limits = lake_graph_metric.Limits{};
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
@@ -602,13 +605,15 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     defer if (prepared_graph) |*prepared| prepared.deinit(alloc);
     for (specs) |spec| {
         try cancellation.check();
-        const graph_declaration = findDeclaration(base_declarations, spec.index_name) orelse continue;
+        const graph_declaration = findDeclaration(declarations.items, spec.index_name) orelse continue;
         if (graph_declaration.binding.sidecar_kind != .graph or graph_declaration.artifact.kind != .graph_segment) return error.SidecarArtifactKindMismatch;
         const topology_unchanged = if (findDeclaration(published_declarations, spec.index_name)) |previous_graph|
             previous_graph.binding.sidecar_kind == .graph and
                 artifactRefsIdentifySamePayload(previous_graph.artifact, graph_declaration.artifact)
         else
             false;
+        var effective_provenance = provenance;
+        effective_provenance.edge_generation = graph_declaration.artifact.edge_generation;
 
         const resolved = try alloc.alloc(?sidecar_manifest.DeclaredArtifact, spec.configs.len);
         defer alloc.free(resolved);
@@ -634,9 +639,9 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                         try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, spec.index_name, config, graph_declaration.artifact, cancellation))
                     {
                         var cloned = try cloneDeclarationAlloc(alloc, existing);
-                        if (cloned.artifact.published_generation == 0) cloned.artifact.published_generation = provenance.published_generation;
-                        if (cloned.artifact.edge_generation == 0) cloned.artifact.edge_generation = provenance.edge_generation;
-                        if (cloned.artifact.computed_at_ms == 0) cloned.artifact.computed_at_ms = provenance.computed_at_ms;
+                        if (cloned.artifact.published_generation == 0) cloned.artifact.published_generation = effective_provenance.published_generation;
+                        if (cloned.artifact.edge_generation == 0) cloned.artifact.edge_generation = effective_provenance.edge_generation;
+                        if (cloned.artifact.computed_at_ms == 0) cloned.artifact.computed_at_ms = effective_provenance.computed_at_ms;
                         if (cloned.artifact.materializer_fingerprint == 0) cloned.artifact.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
                         resolved[config_index] = cloned;
                         reused = true;
@@ -672,7 +677,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 cancellation,
                 .build_budget_exceeded,
                 graph_metric_limits,
-                provenance,
+                effective_provenance,
             );
             if (prepared_graph == null or !prepared_graph.?.identifies(graph_declaration.artifact)) {
                 if (prepared_graph) |*prepared| prepared.deinit(alloc);
@@ -693,7 +698,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                         cancellation,
                         .build_budget_exceeded,
                         graph_metric_limits,
-                        provenance,
+                        effective_provenance,
                     ),
                     else => return err,
                 };
@@ -708,7 +713,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                 graph_metric_limits,
                 &graph_metric_budget,
                 &prepared_graph.?,
-                provenance,
+                effective_provenance,
             ) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
                     alloc,
@@ -719,7 +724,7 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                     cancellation,
                     .build_budget_exceeded,
                     graph_metric_limits,
-                    provenance,
+                    effective_provenance,
                 ),
                 else => return err,
             };
@@ -770,6 +775,48 @@ fn findDeclaration(
 ) ?sidecar_manifest.DeclaredArtifact {
     for (declarations) |declaration| if (std.mem.eql(u8, declaration.name, name)) return declaration;
     return null;
+}
+
+fn stampExternalGraphTopologyGenerationsAlloc(
+    alloc: Allocator,
+    declarations: []sidecar_manifest.DeclaredArtifact,
+    published_declarations: []const sidecar_manifest.DeclaredArtifact,
+    specs: []const graph_metric_config.IndexSpec,
+    next_generation: u64,
+) !void {
+    for (declarations) |*declaration| {
+        if (declaration.binding.sidecar_kind != .graph or declaration.artifact.kind != .graph_segment) continue;
+        declaration.artifact.edge_generation = next_generation;
+        const previous_graph = findDeclaration(published_declarations, declaration.name) orelse continue;
+        if (previous_graph.binding.sidecar_kind != .graph or
+            previous_graph.artifact.kind != .graph_segment or
+            !artifactRefsIdentifySamePayload(previous_graph.artifact, declaration.artifact)) continue;
+
+        if (previous_graph.artifact.edge_generation != 0) {
+            declaration.artifact.edge_generation = previous_graph.artifact.edge_generation;
+            continue;
+        }
+
+        // Recover topology identity from metric sidecars written before graph
+        // declarations carried provenance themselves.
+        var inferred_generation: ?u64 = null;
+        for (specs) |spec| {
+            if (!std.mem.eql(u8, spec.index_name, declaration.name)) continue;
+            for (spec.configs) |config| {
+                const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+                defer alloc.free(metric_name);
+                const metric = findDeclaration(published_declarations, metric_name) orelse continue;
+                if (metric.binding.sidecar_kind != .graph_metric or
+                    !source_binding.sameSourceSnapshot(metric.binding, previous_graph.binding) or
+                    metric.artifact.edge_generation == 0) continue;
+                inferred_generation = if (inferred_generation) |existing|
+                    @min(existing, metric.artifact.edge_generation)
+                else
+                    metric.artifact.edge_generation;
+            }
+        }
+        declaration.artifact.edge_generation = inferred_generation orelse next_generation;
+    }
 }
 
 fn graphMetricDeclarationAlloc(
@@ -2953,6 +3000,7 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     try std.testing.expect(stored.len > 0);
 
     const graph_declaration = reconciled.find("graph_idx").?;
+    try std.testing.expectEqual(@as(u64, 1), graph_declaration.artifact.edge_generation);
     const metric_artifact_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "rank");
     defer alloc.free(metric_artifact_name);
     const metric_declaration = reconciled.find(metric_artifact_name).?;
@@ -2981,15 +3029,22 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
         inventory,
         .{
             .table_name = "docs",
-            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40},\"centrality\":{\"kind\":\"eigenvector\"}}}}",
         },
         reconciled.artifacts,
         .{ .published_generation = 2, .edge_generation = 2, .computed_at_ms = 2 },
     );
     defer updated.deinit(alloc);
 
+    try std.testing.expectEqual(@as(usize, 5), updated.artifacts.len);
+    const updated_graph = updated.find("graph_idx").?;
     const updated_metric = updated.find(metric_artifact_name).?;
     const updated_degree = updated.find(degree_artifact_name).?;
+    const centrality_artifact_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "centrality");
+    defer alloc.free(centrality_artifact_name);
+    const updated_centrality = updated.find(centrality_artifact_name).?;
+    try std.testing.expectEqualStrings(graph_declaration.artifact.artifact_id, updated_graph.artifact.artifact_id);
+    try std.testing.expectEqual(graph_declaration.artifact.edge_generation, updated_graph.artifact.edge_generation);
     try std.testing.expect(!std.mem.eql(u8, metric_declaration.artifact.artifact_id, updated_metric.artifact.artifact_id));
     try std.testing.expectEqual(@as(u64, 2), updated_metric.artifact.published_generation);
     try std.testing.expectEqual(metric_declaration.artifact.edge_generation, updated_metric.artifact.edge_generation);
@@ -2997,6 +3052,8 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     try std.testing.expectEqual(degree_declaration.artifact.published_generation, updated_degree.artifact.published_generation);
     try std.testing.expectEqual(degree_declaration.artifact.edge_generation, updated_degree.artifact.edge_generation);
     try std.testing.expectEqual(degree_declaration.artifact.computed_at_ms, updated_degree.artifact.computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 2), updated_centrality.artifact.published_generation);
+    try std.testing.expectEqual(graph_declaration.artifact.edge_generation, updated_centrality.artifact.edge_generation);
 }
 
 test "lake rebuild operation planner preserves reuse and drop artifacts" {

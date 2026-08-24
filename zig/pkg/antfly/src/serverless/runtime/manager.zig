@@ -250,31 +250,39 @@ pub const ManagedRuntime = struct {
             var table = table_record;
             defer table.deinit(self.alloc);
 
-            // Parse the table definition once per namespace/stage rather than
-            // once for each managed embedder. Keep created embedders owned by
-            // this scope until the enricher transaction commits.
-            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-            defer parsed.deinit();
-
-            if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
-                const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
-                var embedder_owned = true;
-                errdefer if (embedder_owned) sparse_embedder.deinit(self.alloc);
-                try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
-                embedder_owned = false;
-            } else {
-                enricher.clearSparseEmbedder();
-            }
-
-            if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
-                const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
-                const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
-                var embedder_owned = true;
-                errdefer if (embedder_owned) dense_embedder.deinit(self.alloc);
-                try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
-                embedder_owned = false;
-            } else {
-                enricher.clearChunkEmbedder();
+            // Only model-backed stages need an embedder. Parse once and build
+            // only the relevant provider set so deterministic stages avoid
+            // configuration churn and an unrelated provider cannot block the
+            // active stage.
+            switch (stage) {
+                .lexical_sparse => {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                    defer parsed.deinit();
+                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, parsed.value, .{})) |sparse_embedder| {
+                        const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
+                        var embedder_owned = true;
+                        errdefer if (embedder_owned) sparse_embedder.deinit(self.alloc);
+                        try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
+                        embedder_owned = false;
+                    } else {
+                        enricher.clearSparseEmbedder();
+                    }
+                },
+                .chunk_embeddings => {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                    defer parsed.deinit();
+                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, parsed.value, .{})) |dense_embedder| {
+                        const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
+                        const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
+                        var embedder_owned = true;
+                        errdefer if (embedder_owned) dense_embedder.deinit(self.alloc);
+                        try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
+                        embedder_owned = false;
+                    } else {
+                        enricher.clearChunkEmbedder();
+                    }
+                },
+                .chunk_preview, .rerank_terms => {},
             }
         } else {
             // Namespace-only records predate the table catalog. Preserve their

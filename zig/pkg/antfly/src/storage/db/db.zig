@@ -20593,13 +20593,18 @@ pub const DB = struct {
         };
     }
 
+    pub const GeneratedEnrichmentReplayAppendResult = struct {
+        generated_ref_count: usize = 0,
+        target_sequence: u64 = 0,
+    };
+
     fn appendGeneratedEnrichmentsFromStoredDocs(
         self: *DB,
         alloc: Allocator,
         force_generated_artifact_names: []const []const u8,
         skip_terminally_covered: bool,
-    ) !usize {
-        if (self.enrichment_runtime == null) return 0;
+    ) !GeneratedEnrichmentReplayAppendResult {
+        if (self.enrichment_runtime == null) return .{};
 
         const chunk_size: usize = 128;
         const initial_lower = try self.core.documentRangeLowerAlloc("");
@@ -20638,11 +20643,14 @@ pub const DB = struct {
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(latest_sequence);
             self.notifyResolverReplayRuntimes(latest_sequence);
         }
-        return generated_ref_count;
+        return .{
+            .generated_ref_count = generated_ref_count,
+            .target_sequence = latest_sequence,
+        };
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true);
+        return (try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true)).generated_ref_count;
     }
 
     pub fn reprocessGeneratedEnrichmentFromStoredDocs(
@@ -20650,6 +20658,14 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_name: ?[]const u8,
     ) !usize {
+        return (try self.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(alloc, artifact_name)).generated_ref_count;
+    }
+
+    pub fn reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: ?[]const u8,
+    ) !GeneratedEnrichmentReplayAppendResult {
         if (artifact_name) |name| {
             const force_artifacts = [_][]const u8{name};
             return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);

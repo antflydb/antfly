@@ -9803,6 +9803,28 @@ export interface components {
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        /**
+         * @description Authoritative query-readiness state for the desired index incarnation.
+         * @enum {string}
+         */
+        IndexReadinessState: "pending" | "ready" | "failed";
+        IndexReadinessStatus: {
+            state: components["schemas"]["IndexReadinessState"];
+            /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
+            incarnation?: string;
+            /**
+             * Format: uint64
+             * @description Highest captured source/replay revision required by this readiness observation.
+             */
+            target_revision?: number;
+            /**
+             * Format: uint64
+             * @description Highest revision published to the query-visible index represented by this observation.
+             */
+            published_revision?: number;
+            /** @description Stable, machine-readable blockers. Empty when state is ready. */
+            pending_reasons: string[];
+        };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
             /**
@@ -9819,6 +9841,7 @@ export interface components {
              * @enum {string}
              */
             index_type: "full_text";
+            readiness?: components["schemas"]["IndexReadinessStatus"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -10102,6 +10125,7 @@ export interface components {
              * @enum {string}
              */
             index_type: "embeddings";
+            readiness?: components["schemas"]["IndexReadinessStatus"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -10343,6 +10367,7 @@ export interface components {
              * @enum {string}
              */
             index_type: "graph";
+            readiness?: components["schemas"]["IndexReadinessStatus"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -10487,6 +10512,7 @@ export interface components {
              * @enum {string}
              */
             index_type: "algebraic";
+            readiness?: components["schemas"]["IndexReadinessStatus"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**

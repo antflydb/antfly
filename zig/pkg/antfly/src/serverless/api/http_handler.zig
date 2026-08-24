@@ -6444,6 +6444,10 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 }
 
 const ServerlessIndexStatus = struct {
+    readiness_ready: bool,
+    readiness_incarnation: ?u64,
+    readiness_target_revision: u64,
+    readiness_published_revision: ?u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -6602,7 +6606,24 @@ fn appendServerlessIndexStatusJson(
     status: ServerlessIndexStatus,
     graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !void {
-    try out.appendSlice(alloc, "{\"rebuilding\":");
+    try out.appendSlice(alloc, "{\"readiness\":{\"state\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
+    if (status.readiness_incarnation) |incarnation| {
+        try out.print(alloc, ",\"incarnation\":\"g-{x:0>16}\"", .{incarnation});
+    }
+    try out.print(alloc, ",\"target_revision\":{}", .{status.readiness_target_revision});
+    if (status.readiness_published_revision) |published_revision| {
+        try out.print(alloc, ",\"published_revision\":{}", .{published_revision});
+    }
+    try out.appendSlice(alloc, ",\"pending_reasons\":");
+    if (status.readiness_ready) {
+        try out.appendSlice(alloc, "[]}");
+    } else if (status.materialization_blocked) {
+        try out.appendSlice(alloc, "[\"materialization\",\"publication\"]}");
+    } else {
+        try out.appendSlice(alloc, "[\"publication\"]}");
+    }
+    try out.appendSlice(alloc, ",\"rebuilding\":");
     try out.appendSlice(alloc, if (status.rebuilding) "true" else "false");
     try out.appendSlice(alloc, ",\"backfill_active\":");
     try out.appendSlice(alloc, if (status.backfill_active) "true" else "false");
@@ -6777,6 +6798,8 @@ fn serverlessIndexStatus(
     const head_sparse_action = findNamedArtifactPublicationAction(status.head_sparse_index_actions, index_name);
     const graph_action = findNamedArtifactPublicationAction(status.graph_index_actions, index_name);
     const head_graph_action = findNamedArtifactPublicationAction(status.head_graph_index_actions, index_name);
+    const config_action = findIndexConfigPublicationStatus(status.index_config_actions, index_name);
+    const config_published = if (config_action) |action| action.action == .reuse else false;
     const built = if (std.mem.eql(u8, kind, "full_text")) blk: {
         if (full_text_action) |action| {
             break :blk action.action == .reuse;
@@ -6803,7 +6826,7 @@ fn serverlessIndexStatus(
         }
         break :blk status.head_version != 0;
     } else if (std.mem.eql(u8, kind, "algebraic")) blk: {
-        break :blk status.head_version != 0;
+        break :blk config_published;
     } else return error.InvalidTableIndexMetadata;
 
     const doc_count: u64 = if (built)
@@ -6842,7 +6865,12 @@ fn serverlessIndexStatus(
     else
         null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
+    const readiness_ready = config_published and built and materialization_blocker == null;
     return .{
+        .readiness_ready = readiness_ready,
+        .readiness_incarnation = if (config_action) |action| action.incarnation else null,
+        .readiness_target_revision = if (readiness_ready) status.head_version else status.next_version,
+        .readiness_published_revision = if (config_published and status.head_version != 0) status.head_version else null,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -6864,6 +6892,8 @@ fn serverlessIndexStatus(
                 null;
         } else if (std.mem.eql(u8, kind, "graph"))
             if (graph_action) |action| action.action else null
+        else if (std.mem.eql(u8, kind, "algebraic"))
+            if (config_action) |action| action.action else null
         else
             null,
         .head_publication_action = if (std.mem.eql(u8, kind, "full_text"))
@@ -6930,6 +6960,42 @@ fn findNamedArtifactPublicationAction(
         if (std.mem.eql(u8, entry.name, index_name)) return entry;
     }
     return null;
+}
+
+fn findIndexConfigPublicationStatus(
+    actions: []const catalog_types.IndexConfigPublicationStatus,
+    index_name: []const u8,
+) ?catalog_types.IndexConfigPublicationStatus {
+    var low: usize = 0;
+    var high = actions.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = std.mem.order(u8, actions[mid].name, index_name);
+        switch (order) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return actions[mid],
+        }
+    }
+    return null;
+}
+
+test "serverless readiness serializes durable incarnation as an opaque token" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendServerlessIndexStatusJson(alloc, &encoded, .{
+        .readiness_ready = true,
+        .readiness_incarnation = 42,
+        .readiness_target_revision = 7,
+        .readiness_published_revision = 7,
+        .rebuilding = false,
+        .backfill_active = false,
+        .doc_count = 0,
+        .total_indexed = 0,
+    }, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"incarnation\":\"g-000000000000002a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "_coverage_incarnation") == null);
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
@@ -7428,6 +7494,13 @@ fn testJoinProfileFieldValue(response: anytype, field: []const u8) ?std.json.Val
 
 const ServerlessIndexStatusTestResponse = struct {
     const Status = struct {
+        readiness: ?struct {
+            state: []const u8,
+            incarnation: ?[]const u8 = null,
+            target_revision: ?u64 = null,
+            published_revision: ?u64 = null,
+            pending_reasons: []const []const u8,
+        } = null,
         rebuilding: ?bool = null,
         backfill_active: ?bool = null,
         doc_count: ?u64 = null,
@@ -9042,7 +9115,7 @@ test "http handler index status exposes lexical sparse blocker for sparse index"
     try std.testing.expectEqualStrings("lexical_sparse", parsed_sparse_index.value.status.materialization_blocker.?);
 }
 
-test "http handler index status exposes graph publication actions" {
+test "serverless http handler index status exposes graph publication actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -9128,6 +9201,13 @@ test "http handler index status exposes graph publication actions" {
     var parsed_planned = try parseServerlessIndexStatusTestResponse(alloc, planned.body, "graph_idx");
     defer parsed_planned.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_planned.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_planned.value.status.readiness.?.state);
+    try std.testing.expect(parsed_planned.value.status.readiness.?.pending_reasons.len > 0);
+    // Graph indexes do not yet persist a private incarnation. Omitting the
+    // optional token is safer than deriving one from redacted response JSON.
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_planned.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_planned.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_planned.value.status.readiness.?.published_revision);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -9142,6 +9222,13 @@ test "http handler index status exposes graph publication actions" {
     var parsed_head = try parseServerlessIndexStatusTestResponse(alloc, head.body, "graph_idx");
     defer parsed_head.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_head.value.status.head_publication_action.?);
+    try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_head.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(
+        parsed_head.value.status.readiness.?.target_revision,
+        parsed_head.value.status.readiness.?.published_revision,
+    );
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {
@@ -9249,7 +9336,7 @@ test "http handler index status predicts graph reuse and rebuild before publish"
     try std.testing.expectEqualStrings("rebuild", parsed_graph_rebuild.value.status.planned_publication_action.?);
 }
 
-test "http handler create index expands schema-derived algebraic config" {
+test "serverless http handler create index expands schema-derived algebraic config" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -9309,6 +9396,16 @@ test "http handler create index expands schema-derived algebraic config" {
         "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
     ));
 
+    const initial_docs = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "order-1", .body = "{\"customer\":\"acme\",\"amount\":42,\"created_at\":\"2026-01-01T00:00:00Z\"}" },
+    };
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 150, .mutations = &initial_docs });
+    defer ingest.deinit(alloc);
+
+    var initial_build = try catalog.buildTable("docs");
+    defer initial_build.deinit(alloc);
+    try std.testing.expect(initial_build.published);
+
     var create = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/indexes/sales_rollup",
@@ -9337,7 +9434,32 @@ test "http handler create index expands schema-derived algebraic config" {
     defer detail.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), detail.status);
     try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"derive_from_schema\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"group_fields\"") != null);
+    var parsed_detail = try parseServerlessIndexStatusTestResponse(alloc, detail.body, "sales_rollup");
+    defer parsed_detail.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_detail.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_detail.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
+
+    var algebraic_build = try catalog.buildTable("docs");
+    defer algebraic_build.deinit(alloc);
+    try std.testing.expect(algebraic_build.published);
+
+    var published_detail = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/sales_rollup",
+    });
+    defer published_detail.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), published_detail.status);
+    var parsed_published = try parseServerlessIndexStatusTestResponse(alloc, published_detail.body, "sales_rollup");
+    defer parsed_published.deinit();
+    try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_published.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(
+        parsed_published.value.status.readiness.?.target_revision,
+        parsed_published.value.status.readiness.?.published_revision,
+    );
 }
 
 test "serverless create index normalization resolves and persists one probed embedding dimension" {

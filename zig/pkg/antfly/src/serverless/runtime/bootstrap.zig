@@ -445,41 +445,55 @@ pub const OwnedStack = struct {
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         var enricher_owned = true;
         errdefer if (enricher_owned) enricher.deinit();
+        var pending_query_embedder: ?managed_embedder.ManagedEmbedder = null;
+        errdefer if (pending_query_embedder) |*query_embedder| query_embedder.deinit();
+        var pending_dense_query_index_name: ?[]u8 = null;
+        errdefer if (pending_dense_query_index_name) |index_name| alloc.free(index_name);
         if (cfg.embedding_indexes_json) |indexes_json| {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
                 .remote_content = cfg.remote_content,
             };
-            var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+            defer parsed.deinit();
+            var query_embedder = try managed_embedder.ManagedEmbedder.initDenseFromIndexValueObjectWithOptions(alloc, parsed.value, embedder_options);
             var query_embedder_owned = true;
             errdefer if (query_embedder_owned) query_embedder.deinit();
             if (query_embedder.hasDenseEntries()) {
-                self.managed_query_embedder = query_embedder;
-                self.dense_query_index_name = try alloc.dupe(u8, cfg.chunk_embedding_index_name);
+                pending_query_embedder = query_embedder;
                 query_embedder_owned = false;
+                pending_dense_query_index_name = try alloc.dupe(u8, cfg.chunk_embedding_index_name);
             } else {
                 query_embedder.deinit();
                 query_embedder_owned = false;
-                self.managed_query_embedder = null;
-                self.dense_query_index_name = null;
             }
-            if (try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |sparse_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(alloc, parsed.value, embedder_options)) |sparse_embedder| {
                 var embedder_owned = true;
                 errdefer if (embedder_owned) sparse_embedder.deinit(alloc);
                 try enricher.setSparseEmbedder(sparse_embedder, cfg.sparse_embedding_index_name);
                 embedder_owned = false;
             }
-            if (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |dense_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, embedder_options)) |dense_embedder| {
                 var embedder_owned = true;
                 errdefer if (embedder_owned) dense_embedder.deinit(alloc);
                 try enricher.setChunkEmbedder(dense_embedder, cfg.chunk_embedding_index_name, cfg.chunk_embedding_dimensions);
                 embedder_owned = false;
             }
-        } else {
-            self.managed_query_embedder = null;
-            self.dense_query_index_name = null;
         }
-        self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
+        const sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
+        var sparse_query_index_name_owned = true;
+        errdefer if (sparse_query_index_name_owned) alloc.free(sparse_query_index_name);
+
+        // Commit the interdependent runtime resources only after every
+        // fallible allocation and provider construction has succeeded. This
+        // keeps init failure cleanup local and prevents partially initialized
+        // fields from leaking or being observed by the handler.
+        self.managed_query_embedder = pending_query_embedder;
+        pending_query_embedder = null;
+        self.dense_query_index_name = pending_dense_query_index_name;
+        pending_dense_query_index_name = null;
+        self.sparse_query_index_name = sparse_query_index_name;
+        sparse_query_index_name_owned = false;
         self.runtime.setEnricher(enricher);
         enricher_owned = false;
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);

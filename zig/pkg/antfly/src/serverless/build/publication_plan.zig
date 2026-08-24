@@ -82,6 +82,7 @@ pub const NamedArtifactAction = struct {
 
 pub const MetadataRepublishReasons = struct {
     read_schema_migration: bool = false,
+    index_definitions_changed: bool = false,
     published_search_sources_changed: bool = false,
     artifact_families_changed: bool = false,
     chunk_preview_policy_changed: bool = false,
@@ -91,6 +92,7 @@ pub const MetadataRepublishReasons = struct {
 
     pub fn any(self: MetadataRepublishReasons) bool {
         return self.read_schema_migration or
+            self.index_definitions_changed or
             self.published_search_sources_changed or
             self.artifact_families_changed or
             self.chunk_preview_policy_changed or
@@ -374,6 +376,7 @@ fn requiredJsonString(object: anytype, name: []const u8) ![]const u8 {
 
 test "metadata republish reasons report when any flag is set" {
     try std.testing.expect(!(MetadataRepublishReasons{}).any());
+    try std.testing.expect((MetadataRepublishReasons{ .index_definitions_changed = true }).any());
     try std.testing.expect((MetadataRepublishReasons{ .published_search_sources_changed = true }).any());
 }
 

@@ -401,6 +401,7 @@ pub const AlgebraicIndexStatsIndexType = enum {
 pub const AlgebraicIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: AlgebraicIndexStatsIndexType,
+    readiness: ?IndexReadinessStatus = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents reflected in the algebraic sidecar
@@ -3056,6 +3057,7 @@ pub const EmbeddingsIndexStatsIndexType = enum {
 pub const EmbeddingsIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: EmbeddingsIndexStatsIndexType,
+    readiness: ?IndexReadinessStatus = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
@@ -4007,6 +4009,7 @@ pub const FullTextIndexStatsIndexType = enum {
 pub const FullTextIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: FullTextIndexStatsIndexType,
+    readiness: ?IndexReadinessStatus = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents in the index
@@ -4379,6 +4382,7 @@ pub const GraphIndexStatsIndexType = enum {
 pub const GraphIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: GraphIndexStatsIndexType,
+    readiness: ?IndexReadinessStatus = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Total number of edges in the graph
@@ -5203,6 +5207,47 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+};
+
+/// Authoritative query-readiness state for the desired index incarnation.
+pub const IndexReadinessState = enum {
+    pending,
+    ready,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pending => "pending",
+            .ready => "ready",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pending", .pending },
+            .{ "ready", .ready },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexReadinessStatus = struct {
+    state: IndexReadinessState,
+    /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
+    incarnation: ?[]const u8 = null,
+    /// Highest captured source/replay revision required by this readiness observation.
+    target_revision: ?i64 = null,
+    /// Highest revision published to the query-visible index represented by this observation.
+    published_revision: ?i64 = null,
+    /// Stable, machine-readable blockers. Empty when state is ready.
+    pending_reasons: []const []const u8,
 };
 
 /// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
