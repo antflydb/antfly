@@ -487,16 +487,6 @@ pub fn getCachedQuantizedClone(self: anytype, node_id: u64) !?QuantizedSet {
     return null;
 }
 
-pub fn getCachedVector(self: anytype, vector_id: u64) ?[]const f32 {
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
-    if (self.vector_cache.get(vector_id)) |cached| {
-        touchClock(self.vector_clock_refs, self.vector_cache_slots, vector_id);
-        return cached;
-    }
-    return null;
-}
-
 pub fn getCachedMetadata(self: anytype, vector_id: u64) ?[]const u8 {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();

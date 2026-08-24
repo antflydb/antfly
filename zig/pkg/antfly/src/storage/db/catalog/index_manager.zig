@@ -1724,6 +1724,7 @@ pub const IndexManager = struct {
         cache_raw_values: bool = true,
         cache_vectors: bool = true,
         block_cache_admission: backend_types.Namespace.BlockCacheAdmission = .retain,
+        decoded_residency_lease: ?hbc_mod.DecodedVectorResidencyLease = null,
 
         const DefaultRawReadLimitBytes: u64 = 32 * 1024 * 1024;
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
@@ -1753,7 +1754,32 @@ pub const IndexManager = struct {
             while (vector_it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
             self.vector_cache.deinit(self.context.manager.alloc);
             if (self.read_txn) |*txn| txn.abort();
+            if (self.decoded_residency_lease) |*lease| lease.deinit();
             self.* = undefined;
+        }
+
+        fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
+            const lease = if (self.decoded_residency_lease) |*value| value else return;
+            _ = index.cacheVectorForResidencyLease(lease, vector_id, vector) catch {};
+        }
+
+        fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
+            const lease = if (self.decoded_residency_lease) |*value| value else return;
+            const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+            if (lease.remainingBytes() >= required_bytes) return;
+            // A degraded/stale payload can require more exact loads than the
+            // normal rerank bound reserved at query admission. Switch before
+            // the read, while no returned transaction views are live, so the
+            // remainder of the request is coherently LSM-owned.
+            self.useLsmResidency();
+        }
+
+        fn useLsmResidency(self: *@This()) void {
+            if (self.decoded_residency_lease) |*lease| lease.deinit();
+            self.decoded_residency_lease = null;
+            if (self.block_cache_admission == .retain) return;
+            self.recycleRawReadState();
+            self.block_cache_admission = .retain;
         }
 
         fn rawReadLimitBytes(self: *const @This()) u64 {
@@ -7799,12 +7825,14 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
-                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7825,12 +7853,14 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
-                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7852,13 +7882,15 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidency(req.filter_ids.len);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = false,
-                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7935,7 +7967,7 @@ pub const IndexManager = struct {
                 metadata_start + exact_dense_metadata_batch_size,
                 unique_candidate_ids.len,
             );
-            try entry.index.getMetadataManySortedInTxn(
+            try entry.index.getMetadataManySortedInTxnUncached(
                 &txn,
                 unique_candidate_ids[metadata_start..metadata_end],
                 candidate_metadata[metadata_start..metadata_end],
@@ -15912,6 +15944,7 @@ pub const IndexManager = struct {
         };
         if (load_session) |session| {
             if (session.getVector(vector_id)) |cached| return try alloc.dupe(f32, cached);
+            session.ensureDecodedResidencyCapacity(1, entry.dims);
         }
 
         const vector = blk: {
@@ -15933,7 +15966,10 @@ pub const IndexManager = struct {
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
-        if (load_session) |session| try session.cacheVector(vector_id, vector);
+        if (load_session) |session| {
+            try session.cacheVector(vector_id, vector);
+            session.cacheDecodedVector(&entry.index, vector_id, vector);
+        }
         return vector;
     }
 
@@ -15949,16 +15985,23 @@ pub const IndexManager = struct {
         };
         if (load_session) |session| {
             if (session.getVector(vector_id)) |cached| return cached;
+            session.ensureDecodedResidencyCapacity(1, entry.dims);
         }
 
         if (entry.embedding_name) |embedding_name| {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, embedding_name, load_session, scratch);
-            if (load_session) |session| try session.cacheVector(vector_id, vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_id, vector);
+                session.cacheDecodedVector(&entry.index, vector_id, vector);
+            }
             return vector;
         }
         if (entry.external) {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, entry.config.name, load_session, scratch);
-            if (load_session) |session| try session.cacheVector(vector_id, vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_id, vector);
+                session.cacheDecodedVector(&entry.index, vector_id, vector);
+            }
             return vector;
         }
 
@@ -16048,6 +16091,7 @@ pub const IndexManager = struct {
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             // Exact reranking is a sorted point-read workload. A broad runtime
@@ -16084,7 +16128,10 @@ pub const IndexManager = struct {
             };
             if (vector.len != dims) return error.InvalidVectorDimensions;
             vector_views[slot] = vector;
-            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_ids[slot], vector);
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            }
         }
     }
 
@@ -16162,6 +16209,7 @@ pub const IndexManager = struct {
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             // The transformed matrix retains the useful representation. Do
@@ -16200,7 +16248,10 @@ pub const IndexManager = struct {
             const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
             if (matrix_end > matrix.len) return error.BufferTooSmall;
             _ = transform(index, vector, matrix[matrix_start..matrix_end]);
-            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_ids[slot], vector);
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            }
         }
     }
 
@@ -16325,6 +16376,7 @@ pub const IndexManager = struct {
         const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             // This is a sorted point-read workload; avoid a broad primary LSM
@@ -16445,9 +16497,13 @@ pub const IndexManager = struct {
             if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
             if (vector.len != dims) return error.InvalidVectorDimensions;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
-            cache_positions[cache_count] = slot;
-            cache_vectors[cache_count] = vector;
-            cache_count += 1;
+            if (load_session) |session| {
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            } else {
+                cache_positions[cache_count] = slot;
+                cache_vectors[cache_count] = vector;
+                cache_count += 1;
+            }
             const distance_start = platform_time.monotonicNs();
             distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
             if (profile) |p| {
@@ -16523,6 +16579,9 @@ pub const IndexManager = struct {
         const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
+            // Primary-document fallback is not replaceable by decoded-vector
+            // residency, so retain its blocks and keep one reusable owner.
+            session.useLsmResidency();
             try session.getManySorted(store, keys, values);
         } else {
             var txn = try store.beginProbeTxn();
@@ -16560,9 +16619,13 @@ pub const IndexManager = struct {
             if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
             if (vector.len != dims) continue;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
-            cache_positions[cache_count] = slot;
-            cache_vectors[cache_count] = vector;
-            cache_count += 1;
+            if (load_session) |session| {
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            } else {
+                cache_positions[cache_count] = slot;
+                cache_vectors[cache_count] = vector;
+                cache_count += 1;
+            }
             const distance_start = platform_time.monotonicNs();
             distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
             if (profile) |p| {
@@ -16641,7 +16704,10 @@ pub const IndexManager = struct {
         alloc: Allocator,
     ) ![]const u8 {
         _ = self;
-        if (load_session) |session| return try session.get(store, doc_store_key);
+        if (load_session) |session| {
+            session.useLsmResidency();
+            return try session.get(store, doc_store_key);
+        }
         return try store.get(alloc, doc_store_key);
     }
 
@@ -24404,6 +24470,56 @@ test "dense vector load session caches decoded vectors and tracks bytes" {
     try std.testing.expectEqual(@as(u64, 0), session.vector_cache_misses);
 }
 
+test "dense vector load session switches to retained LSM ownership before reservation overrun" {
+    const alloc = std.testing.allocator;
+    const dims: usize = 4;
+    const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes,
+        .hard_limit_bytes = vector_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+
+    var manager = try IndexManager.initWithOptions(alloc, ".", .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
+    defer manager.deinit();
+    const context = try alloc.create(IndexManager.DenseVectorLoadContext);
+    defer context.deinit(alloc);
+    context.* = .{
+        .manager = &manager,
+        .index_name = try alloc.dupe(u8, "dv_v1"),
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/residency-fallback", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z, .{ .dims = dims, .max_cached_vectors = 8 });
+    defer index.close();
+    index.attachResourceManager(&resource_manager);
+    index.attachSharedCache(&hbc_cache);
+    const lease = index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = context,
+        .block_cache_admission = .transient,
+        .decoded_residency_lease = lease,
+    };
+    defer session.deinit();
+    session.ensureDecodedResidencyCapacity(2, dims);
+    try std.testing.expect(session.decoded_residency_lease == null);
+    try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.retain, session.block_cache_admission);
+}
+
 test "dense vector load session is bounded by the shared apply working-set budget" {
     const alloc = std.testing.allocator;
 
@@ -25516,7 +25632,7 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
-    try std.testing.expect(!entry.index.prefersDecodedVectorResidency());
+    try std.testing.expect(entry.index.acquireDecodedVectorResidency(1) == null);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
 }
 
@@ -25579,9 +25695,11 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "semantic_idx", writes, .{ .mode = .bulk_ingest });
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
-    try std.testing.expect(entry.index.prefersDecodedVectorResidency());
+    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.TestUnexpectedResult;
+    residency_probe.deinit();
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
+    const metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
 
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
@@ -25617,6 +25735,7 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.request_vector_cache_entries);
     try std.testing.expectEqual(@as(usize, 0), vector_namespace_probes.count);
     try std.testing.expect(entry.index.hbcCacheStats().vector.used_bytes > 0);
+    try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
     try std.testing.expectEqual(@as(u64, 1), outcome.profile.missing_vectors);
     try std.testing.expect(outcome.profile.workspace_bytes > 0);
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);
