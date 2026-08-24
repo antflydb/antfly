@@ -69,6 +69,8 @@ MAX_RSS_TO_BUDGET_RATIO="${RESOURCE_CACHE_MATRIX_MAX_RSS_TO_BUDGET_RATIO:-1.25}"
 MAX_SEARCH_HEALTH_LATENCY_MS="${RESOURCE_CACHE_MATRIX_MAX_SEARCH_HEALTH_LATENCY_MS:-20}"
 MIN_SOURCE_RECALL_AT_K="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_RECALL_AT_K:-1.0}"
 MIN_SOURCE_TOP1_RECALL="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_TOP1_RECALL:-0.95}"
+EXACT_RECALL_SAMPLES="${RESOURCE_CACHE_MATRIX_EXACT_RECALL_SAMPLES:-1}"
+MIN_EXACT_RECALL_AT_K="${RESOURCE_CACHE_MATRIX_MIN_EXACT_RECALL_AT_K:-0.90}"
 
 mkdir -p "$OUT"
 STATUS_FILE="$OUT/status.tsv"
@@ -93,8 +95,8 @@ fi
   printf 'run_endpoints=%s\nrun_maintenance=%s\n' "$RUN_ENDPOINTS" "$RUN_MAINTENANCE"
   printf 'optimize=%s\n' "$OPTIMIZE"
   printf 'resume=%s\n' "$RESUME"
-  printf 'dims=%s\nqueries=%s\nrepeats=%s\nk=%s\nbatch_size=%s\nsearch_threads=%s\n' \
-    "$DIMS" "$QUERIES" "$REPEATS" "$K" "$BATCH_SIZE" "$SEARCH_THREADS"
+  printf 'dims=%s\nqueries=%s\nrepeats=%s\nk=%s\nbatch_size=%s\nsearch_threads=%s\nexact_recall_samples=%s\nmin_exact_recall_at_k=%s\n' \
+    "$DIMS" "$QUERIES" "$REPEATS" "$K" "$BATCH_SIZE" "$SEARCH_THREADS" "$EXACT_RECALL_SAMPLES" "$MIN_EXACT_RECALL_AT_K"
   git -C "$ROOT" rev-parse HEAD
   git -C "$ROOT" status --short
   uname -a
@@ -148,6 +150,9 @@ run_case() {
   )
   if [[ "$shape" == "dense-filter" ]]; then
     cmd+=(--filter-selectivity-percent "$filter_selectivity")
+  fi
+  if [[ "$docs" == "1000000" ]] && [[ "$shape" == "dense" || "$shape" == "dense-filter" ]]; then
+    cmd+=(--exact-recall-samples "$EXACT_RECALL_SAMPLES")
   fi
   if [[ "$shape" == "graph-expand" ]]; then
     cmd+=(--with-graph)
@@ -270,6 +275,10 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
       dense_1m_top1_recall="$(summary_value "dense-1000000-m${budget_mb}" source_top1_recall)"
       filtered_1m_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_recall_at_k)"
       filtered_1m_top1_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_top1_recall)"
+      dense_1m_exact_recall="$(summary_value "dense-1000000-m${budget_mb}" exact_recall_at_k)"
+      filtered_1m_exact_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" exact_recall_at_k)"
+      dense_1m_exact_recall_samples="$(summary_value "dense-1000000-m${budget_mb}" exact_recall_samples)"
+      filtered_1m_exact_recall_samples="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" exact_recall_samples)"
       load_rss_bytes="$(summary_budget_max "$budget_mb" load_rss_peak_bytes)"
       search_rss_bytes="$(summary_budget_max "$budget_mb" search_rss_peak_bytes)"
       hbc_accounted_bytes="$(summary_budget_max "$budget_mb" hbc_accounted_bytes)"
@@ -321,6 +330,15 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
         printf 'gate failed: matched source-vector recall dense_at_k=%s filtered_at_k=%s dense_top1=%s filtered_top1=%s minimum_at_k=%s minimum_top1=%s budget_mb=%s\n' \
           "$dense_1m_recall" "$filtered_1m_recall" "$dense_1m_top1_recall" "$filtered_1m_top1_recall" \
           "$MIN_SOURCE_RECALL_AT_K" "$MIN_SOURCE_TOP1_RECALL" "$budget_mb" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
+      if ! gate_float_ge "$dense_1m_exact_recall_samples" "$EXACT_RECALL_SAMPLES" ||
+        ! gate_float_ge "$filtered_1m_exact_recall_samples" "$EXACT_RECALL_SAMPLES" ||
+        ! gate_float_ge "$dense_1m_exact_recall" "$MIN_EXACT_RECALL_AT_K" ||
+        ! gate_float_ge "$filtered_1m_exact_recall" "$MIN_EXACT_RECALL_AT_K"; then
+        printf 'gate failed: exact ground-truth recall dense_at_k=%s filtered_at_k=%s dense_samples=%s filtered_samples=%s minimum_at_k=%s required_samples=%s budget_mb=%s\n' \
+          "$dense_1m_exact_recall" "$filtered_1m_exact_recall" "$dense_1m_exact_recall_samples" "$filtered_1m_exact_recall_samples" \
+          "$MIN_EXACT_RECALL_AT_K" "$EXACT_RECALL_SAMPLES" "$budget_mb" >&2
         FAILURES=$((FAILURES + 1))
       fi
       if ! gate_float_le "$load_rss_bytes" "$allowed_rss_bytes"; then

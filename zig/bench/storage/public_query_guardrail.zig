@@ -221,6 +221,7 @@ const Config = struct {
     queries: usize = 25,
     repeats: usize = 10,
     k: usize = 100,
+    exact_recall_samples: usize = 0,
     batch_size: usize = 250,
     search_threads: usize = 5,
     search_thread_sweep: bool = false,
@@ -425,6 +426,9 @@ const QueryBenchStats = struct {
     dense_recall_queries: u64 = 0,
     dense_source_hit_count: u64 = 0,
     dense_source_top1_count: u64 = 0,
+    dense_exact_recall_hits: u64 = 0,
+    dense_exact_recall_expected: u64 = 0,
+    dense_exact_recall_samples: u64 = 0,
     response_filter_match_count: u64 = 0,
     response_sort_tuple_count: u64 = 0,
     response_sort_tuple_valid_count: u64 = 0,
@@ -1447,7 +1451,7 @@ fn runLocalBench(
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-query\n", .{});
-    const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
+    var http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     const profile_stats = if (http_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
         db_stats
     else
@@ -1465,6 +1469,7 @@ fn runLocalBench(
 
     try enforceGuardrails(cfg, concurrent.polls);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
+    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -1712,6 +1717,8 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
         cfg.repeats = try parseNextUsize(args, "--repeats");
     } else if (std.mem.eql(u8, arg, "--k")) {
         cfg.k = try parseNextUsize(args, "--k");
+    } else if (std.mem.eql(u8, arg, "--exact-recall-samples")) {
+        cfg.exact_recall_samples = try parseNextUsize(args, "--exact-recall-samples");
     } else if (std.mem.eql(u8, arg, "--batch-size")) {
         cfg.batch_size = try parseNextUsize(args, "--batch-size");
     } else if (std.mem.eql(u8, arg, "--search-threads")) {
@@ -2962,6 +2969,127 @@ fn makeQueries(alloc: std.mem.Allocator, dataset: []const f32, cfg: Config) ![]f
     return queries;
 }
 
+const ExactRecallNeighbor = struct {
+    doc_idx: usize,
+    distance: f32,
+};
+
+fn exactRecallWorseThan(_: void, a: ExactRecallNeighbor, b: ExactRecallNeighbor) std.math.Order {
+    const primary = std.math.order(b.distance, a.distance);
+    if (primary != .eq) return primary;
+    return std.math.order(b.doc_idx, a.doc_idx);
+}
+
+fn supportsExactDenseRecall(cfg: Config) bool {
+    return cfg.query_shape == .dense or cfg.query_shape == .dense_filter;
+}
+
+fn exactDenseRecallCandidateEligible(cfg: Config, source_doc_idx: usize, candidate_doc_idx: usize) bool {
+    if (cfg.query_shape.usesFilter()) {
+        const divisor = filterSelectivityDivisor(cfg);
+        if (candidate_doc_idx % divisor != source_doc_idx % divisor) return false;
+    }
+    if (cfg.query_shape.usesExclusion() and
+        std.mem.eql(u8, docCategory(candidate_doc_idx), docExcludedCategory(source_doc_idx))) return false;
+    return true;
+}
+
+fn calculateExactDenseRecallTruth(
+    alloc: std.mem.Allocator,
+    dataset: []const f32,
+    query_idx: usize,
+    cfg: Config,
+) ![]usize {
+    if (!supportsExactDenseRecall(cfg) or cfg.k == 0) return try alloc.alloc(usize, 0);
+    const source_doc_idx = querySourceDocIndex(query_idx, cfg);
+    const query = dataset[source_doc_idx * cfg.dims ..][0..cfg.dims];
+    var nearest = std.PriorityQueue(ExactRecallNeighbor, void, exactRecallWorseThan).initContext({});
+    defer nearest.deinit(alloc);
+    try nearest.ensureTotalCapacity(alloc, @min(cfg.k, cfg.docs));
+
+    for (0..cfg.docs) |doc_idx| {
+        if (!exactDenseRecallCandidateEligible(cfg, source_doc_idx, doc_idx)) continue;
+        const candidate = dataset[doc_idx * cfg.dims ..][0..cfg.dims];
+        const neighbor = ExactRecallNeighbor{
+            .doc_idx = doc_idx,
+            // The generated vectors are normalized, so L2 and cosine produce
+            // the same ordering used by both local and standalone indexes.
+            .distance = antfly.vector.distance(query, candidate, .l2_squared),
+        };
+        if (nearest.items.len < cfg.k) {
+            try nearest.push(alloc, neighbor);
+            continue;
+        }
+        const worst = nearest.peek() orelse continue;
+        if (neighbor.distance < worst.distance or
+            (neighbor.distance == worst.distance and neighbor.doc_idx < worst.doc_idx))
+        {
+            _ = nearest.pop();
+            try nearest.push(alloc, neighbor);
+        }
+    }
+
+    const truth = try alloc.alloc(usize, nearest.items.len);
+    for (nearest.items, 0..) |neighbor, i| truth[i] = neighbor.doc_idx;
+    return truth;
+}
+
+fn validateSampledExactDenseRecall(
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    dataset: []const f32,
+    query_bodies: []const []const u8,
+    cfg: Config,
+    stats: *QueryBenchStats,
+) !void {
+    if (!supportsExactDenseRecall(cfg) or cfg.exact_recall_samples == 0) return;
+    const sample_count = @min(cfg.exact_recall_samples, cfg.queries);
+    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+    var client = api.ApiHttpClient.init(alloc, executor.executor());
+
+    for (0..sample_count) |sample_idx| {
+        // Use the midpoint of deterministic query strata instead of sampling
+        // only query zero. This remains reproducible across memory envelopes.
+        const query_idx = @min(
+            cfg.queries - 1,
+            ((sample_idx * 2 + 1) * cfg.queries) / (sample_count * 2),
+        );
+        const truth = try calculateExactDenseRecallTruth(alloc, dataset, query_idx, cfg);
+        defer alloc.free(truth);
+        if (truth.len == 0) return error.InvalidRecallGroundTruth;
+
+        var resp = try client.fetchQuery(base_uri, table_name, query_bodies[query_idx]);
+        defer resp.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(QueryResponseWire, alloc, resp.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.responses.len == 0) return error.InvalidQueryResponse;
+        const hits = parsed.value.responses[0].hits.hits orelse return error.InvalidQueryResponse;
+
+        var matched: u64 = 0;
+        for (truth) |truth_doc_idx| {
+            for (hits) |hit| {
+                const returned_doc_idx = benchmarkDocIndexFromKey(hit._id) orelse continue;
+                if (returned_doc_idx != truth_doc_idx) continue;
+                matched += 1;
+                break;
+            }
+        }
+        stats.dense_exact_recall_hits += matched;
+        stats.dense_exact_recall_expected += @intCast(truth.len);
+        stats.dense_exact_recall_samples += 1;
+    }
+    std.debug.print(
+        "public_query_exact_recall samples={d} hits={d} expected={d} recall_at_k={d:.6}\n",
+        .{
+            stats.dense_exact_recall_samples,
+            stats.dense_exact_recall_hits,
+            stats.dense_exact_recall_expected,
+            rate(stats.dense_exact_recall_hits, stats.dense_exact_recall_expected),
+        },
+    );
+}
+
 fn makeQueryBodies(alloc: std.mem.Allocator, queries: []const f32, cfg: Config) ![]const []const u8 {
     const out = try alloc.alloc([]const u8, cfg.queries);
     errdefer alloc.free(out);
@@ -3035,7 +3163,7 @@ fn runStandaloneBench(
     printMemoryBreakdown("post_load", load_memory);
 
     std.debug.print("public-query guardrail stage=http-query\n", .{});
-    const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
+    var http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
     try enforceExactSortGuardrail(cfg, http_stats);
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
@@ -3047,6 +3175,9 @@ fn runStandaloneBench(
         std.debug.print("public-query guardrail memory_breakdown_err phase=post_search err={s}\n", .{@errorName(err)});
         break :blk MemoryBreakdown{};
     };
+    // Keep exact ground-truth work and validation requests outside every
+    // latency, QPS, cache-residency, and process-RSS measurement above.
+    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_http_ns = http_stats.avgNs();
     const avg_profile_ns = http_stats.avgProfileNs();
@@ -4427,7 +4558,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
         .{
             nsToMs(load.polls.health_max_latency_ns),
             nsToMs(load.polls.metrics_max_latency_ns),
@@ -4437,6 +4568,8 @@ fn printPublicQueryGuardrailSummaryJson(
             nsToMs(search_polls.status_max_latency_ns),
             rate(http_stats.dense_source_hit_count, http_stats.dense_recall_queries),
             rate(http_stats.dense_source_top1_count, http_stats.dense_recall_queries),
+            rate(http_stats.dense_exact_recall_hits, http_stats.dense_exact_recall_expected),
+            http_stats.dense_exact_recall_samples,
             avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_cache_hits),
             avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_vectors_loaded),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
