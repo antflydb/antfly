@@ -422,8 +422,21 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) == currentReceipt {
 			return nil
 		}
+		proofBoundary := lease.Spec.RenewTime.Time
+		incarnationBoundary := lease
+		if committedSuccessor && lease.Spec.AcquireTime != nil {
+			// The former holder may keep a committed transfer alive while Colony
+			// publishes the successor CR or finishes physical isolation. Those
+			// handoff renewals do not change the holder or Lease generation and must
+			// not continually invalidate the successor's proof or restart its
+			// process-incarnation grace. AcquireTime is the immutable transfer
+			// boundary at which this successor first became the exact holder.
+			proofBoundary = lease.Spec.AcquireTime.Time
+			incarnationBoundary = lease.DeepCopy()
+			incarnationBoundary.Spec.RenewTime = lease.Spec.AcquireTime.DeepCopy()
+		}
 		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
-			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, false,
+			ctx, cluster, currentHolder, uint64(transitions), proofBoundary, false,
 		)
 		if err != nil || !ready {
 			return err
@@ -434,7 +447,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		}
 		unboundInitialBootstrap := currentProcess == "" && bootstrapUnknownBoundary && scope.primaryLSN == 0
 		if !unboundInitialBootstrap && currentProcess != proof.ProcessBootID && currentProcess != currentReceipt &&
-			!r.haProcessIncarnationBarrierElapsed(cluster, lease, currentProcess, proof.ProcessBootID) {
+			!r.haProcessIncarnationBarrierElapsed(cluster, incarnationBoundary, currentProcess, proof.ProcessBootID) {
 			return nil
 		}
 		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = currentReceipt

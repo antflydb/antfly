@@ -388,7 +388,7 @@ func TestProcessIncarnationFenceBoundaryRestartsOnOldProcessRenewal(t *testing.T
 	}
 }
 
-func TestCommittedTransferBindsSuccessorProcessAtCommittedBoundary(t *testing.T) {
+func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *testing.T) {
 	leaseTime := time.Date(2026, 8, 24, 4, 50, 31, 0, time.UTC)
 	parent := haClusterWithAutomaticKubernetesLeaseFailover()
 	parent.Spec.HighAvailability.Identity.ShardID = 10
@@ -408,7 +408,11 @@ func TestCommittedTransferBindsSuccessorProcessAtCommittedBoundary(t *testing.T)
 	successor.Spec.HighAvailability.Identity.TimelineID++
 	successor.Spec.HighAvailability.Identity.Epoch++
 	successor.Spec.HighAvailability.Runtime.NodeID = "standby-a"
-	proofTime := leaseTime.Add(time.Second)
+	// The successor observed the committed holder/generation after AcquireTime,
+	// then the former holder advanced only RenewTime through its narrow handoff
+	// bridge. That later renewal must not move the successor compare boundary.
+	proofTime := leaseTime.Add(4 * time.Second)
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: leaseTime.Add(5 * time.Second)}
 	successor.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
 		PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
@@ -416,7 +420,7 @@ func TestCommittedTransferBindsSuccessorProcessAtCommittedBoundary(t *testing.T)
 	}
 	pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
 	reconciler := testHAReconciler(t, lease, pod)
-	now := leaseTime.Add(2 * time.Second)
+	now := leaseTime.Add(6 * time.Second)
 	reconciler.Now = func() time.Time { return now }
 	monotonicNow := time.Now()
 	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
