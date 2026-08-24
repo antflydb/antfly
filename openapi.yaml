@@ -1739,7 +1739,9 @@ tags:
       1. **Embedding API Unavailable**
          - Enrichment retries automatically when service recovers
          - Documents remain indexed (without embeddings) for full-text search
-         - Use `sync_level: enrichments` for synchronous embedding (fails write if embedding fails)
+         - Use `sync_level: enrichments` to wait for synchronous embedding.
+           The document commit is retained if enrichment later fails.
+           Terminal failures return `committed_repair_required` and require operator repair.
 
       2. **Rate Limiting**
          - Automatic backoff and retry
@@ -9929,8 +9931,9 @@ components:
 
         - "full_text": Wait for full-text index WAL write
 
-        - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-
+        - "enrichments": Wait for synchronous enrichment generation after the document commit.
+          A terminal producer failure retains the committed document and returns
+          `committed_repair_required`.
         - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig:
       type: object
