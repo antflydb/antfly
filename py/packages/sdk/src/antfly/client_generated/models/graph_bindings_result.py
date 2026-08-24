@@ -24,13 +24,11 @@ class GraphBindingsResult:
             kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
             rows (list[GraphResultRow]):
             stats (GraphQueryStats):
-            took (int): Query execution time.
     """
 
     kind: GraphBindingsResultKind
     rows: list[GraphResultRow]
     stats: GraphQueryStats
-    took: int
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -42,8 +40,6 @@ class GraphBindingsResult:
 
         stats = self.stats.to_dict()
 
-        took = self.took
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -51,7 +47,6 @@ class GraphBindingsResult:
                 "kind": kind,
                 "rows": rows,
                 "stats": stats,
-                "took": took,
             }
         )
 
@@ -74,13 +69,10 @@ class GraphBindingsResult:
 
         stats = GraphQueryStats.from_dict(d.pop("stats"))
 
-        took = d.pop("took")
-
         graph_bindings_result = cls(
             kind=kind,
             rows=rows,
             stats=stats,
-            took=took,
         )
 
         return graph_bindings_result

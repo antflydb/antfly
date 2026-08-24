@@ -17980,7 +17980,7 @@ test "parseRemoteSearchResult preserves grouped hierarchy matches" {
 test "parseRemoteSearchResult preserves typed graph rows and hydrated documents" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"kind":"bindings","rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"messages"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"kind":"bindings","rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"messages"}]}
     );
     defer result.deinit();
 
@@ -18003,7 +18003,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -26314,16 +26314,16 @@ test "unsupported graph query modes fail closed" {
             .pattern = &legacy_pattern,
         },
     }};
-    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, .{
+    try rejectUnsupportedGraphQueryMode(2, .{
         .graph_queries = &legacy_pattern_queries,
-    }));
-    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
+    });
+    try rejectUnsupportedGraphQueryMode(1, .{
         .graph_queries = &legacy_pattern_queries,
         .graph_table_read_authorizer = .{
             .ctx = null,
             .authorize_table = Authorizer.authorize,
         },
-    }));
+    });
     try rejectUnsupportedGraphQueryMode(2, .{});
 }
 

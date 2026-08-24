@@ -4530,6 +4530,7 @@ components:
         - $unset
         - $inc
         - $push
+        - $pull
         - $addToSet
         - $min
         - $max
@@ -4539,6 +4540,7 @@ components:
         - UNSET
         - INC
         - PUSH
+        - PULL
         - ADD_TO_SET
         - MIN
         - MAX
@@ -4556,7 +4558,11 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: "$.views"
         value:
-          description: Value for operation (not required for $unset). Type depends on the supported operator.
+          description: >-
+            Value for operation (not required for $unset). Type depends on the
+            supported operator. `$pull` removes every array element exactly
+            equal to this JSON value; projected graph-edge values identify the
+            relationship by `target`.
 
     Transform:
       type: object
@@ -4735,12 +4741,12 @@ components:
             Transform operations allow you to modify documents without read-modify-write races:
             - Operations are applied atomically on the server
             - Multiple operations per document are applied in sequence
-            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
 
             Common use cases:
             - Increment counters (views, likes, votes)
             - Update timestamps ($set)
-            - Add unique array values ($addToSet)
+            - Add or remove array values ($addToSet, $pull)
             - Update nested fields without overwriting the entire document
           items:
             $ref: "#/components/schemas/Transform"
@@ -8750,7 +8756,7 @@ components:
         op:
           type: string
           description: |
-            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`.
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
             `$delete_document` (delete entire Antfly doc, `on_delete` only).
           example: "$set"

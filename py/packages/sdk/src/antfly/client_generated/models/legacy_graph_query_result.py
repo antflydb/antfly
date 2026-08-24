@@ -31,7 +31,8 @@ class LegacyGraphQueryResult:
         nodes (list[LegacyGraphResultNode] | Unset): Result nodes. Optional for compatibility with v0.2 responses.
         paths (list[Path] | Unset): Result paths. Optional for compatibility with v0.2 responses.
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
-        took (int | Unset): Query execution time; optional for compatibility with v0.2 responses
+        took (int | Unset): Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses.
+            Use the parent query result's took field.
     """
 
     type_: GraphQueryType

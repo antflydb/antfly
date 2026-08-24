@@ -23,13 +23,11 @@ class GraphAggregatesResult:
         kind (GraphAggregatesResultKind): Stable discriminator for the graph result shape.
         aggregates (GraphAggregatesResultAggregates):
         stats (GraphQueryStats):
-        took (int): Query execution time.
     """
 
     kind: GraphAggregatesResultKind
     aggregates: GraphAggregatesResultAggregates
     stats: GraphQueryStats
-    took: int
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -38,8 +36,6 @@ class GraphAggregatesResult:
 
         stats = self.stats.to_dict()
 
-        took = self.took
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -47,7 +43,6 @@ class GraphAggregatesResult:
                 "kind": kind,
                 "aggregates": aggregates,
                 "stats": stats,
-                "took": took,
             }
         )
 
@@ -65,13 +60,10 @@ class GraphAggregatesResult:
 
         stats = GraphQueryStats.from_dict(d.pop("stats"))
 
-        took = d.pop("took")
-
         graph_aggregates_result = cls(
             kind=kind,
             aggregates=aggregates,
             stats=stats,
-            took=took,
         )
 
         return graph_aggregates_result

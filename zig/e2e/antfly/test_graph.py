@@ -1290,7 +1290,10 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
 def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
     """Exercise the nine authoritative LSQB patterns through the public graph DSL."""
     table_name = f"graph_lsqb_{time.time_ns()}"
-    created = _create_stateful_table(backup_api, table_name, num_shards=1)
+    # Reverse MATCH expansion is source-shard-local internally; running the
+    # conformance corpus across two shards guards against target-owner-only
+    # implementations that silently undercount after a split.
+    created = _create_stateful_table(backup_api, table_name, num_shards=2)
     assert created["name"] == table_name
 
     edge_types = [

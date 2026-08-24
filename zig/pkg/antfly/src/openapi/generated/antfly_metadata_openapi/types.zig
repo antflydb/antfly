@@ -626,7 +626,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -2722,7 +2722,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -3913,7 +3913,7 @@ pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset). Type depends on the supported operator.
+    /// Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`.
     value: ?std.json.Value = null,
 };
 
@@ -3924,6 +3924,7 @@ pub const TransformOpType = enum {
     @"$unset",
     @"$inc",
     @"$push",
+    @"$pull",
     @"$add_to_set",
     @"$min",
     @"$max",
@@ -3935,6 +3936,7 @@ pub const TransformOpType = enum {
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
             .@"$push" => "$push",
+            .@"$pull" => "$pull",
             .@"$add_to_set" => "$addToSet",
             .@"$min" => "$min",
             .@"$max" => "$max",
@@ -3953,6 +3955,7 @@ pub const TransformOpType = enum {
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
+            .{ "$pull", .@"$pull" },
             .{ "$addToSet", .@"$add_to_set" },
             .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },

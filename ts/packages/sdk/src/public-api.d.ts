@@ -4746,7 +4746,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$addToSet" | "$min" | "$max";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$min" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -4754,7 +4754,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`. */
             value?: unknown;
         };
         /**
@@ -4963,12 +4963,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+             *     - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
              *     - Update timestamps ($set)
-             *     - Add unique array values ($addToSet)
+             *     - Add or remove array values ($addToSet, $pull)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -8127,7 +8127,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -12343,11 +12343,6 @@ export interface components {
             kind: "bindings";
             rows: components["schemas"]["GraphResultRow"][];
             stats: components["schemas"]["GraphQueryStats"];
-            /**
-             * Format: int64
-             * @description Query execution time.
-             */
-            took: number;
         };
         GraphAggregateValue: {
             /** @description Decimal string so counts remain lossless in JavaScript. */
@@ -12369,11 +12364,6 @@ export interface components {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
             stats: components["schemas"]["GraphQueryStats"];
-            /**
-             * Format: int64
-             * @description Query execution time.
-             */
-            took: number;
         };
         /** @description An ordered canonical graph path with table-qualified node identities. */
         GraphPath: {
@@ -12397,11 +12387,6 @@ export interface components {
             /** @description Materialized result paths; empty when paths were not requested or produced. */
             paths: components["schemas"]["GraphPath"][];
             stats: components["schemas"]["GraphQueryStats"];
-            /**
-             * Format: int64
-             * @description Query execution time.
-             */
-            took: number;
         };
         /**
          * @deprecated
@@ -12474,7 +12459,8 @@ export interface components {
             total: number;
             /**
              * Format: int64
-             * @description Query execution time; optional for compatibility with v0.2 responses
+             * @deprecated
+             * @description Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
              */
             took?: number;
         };

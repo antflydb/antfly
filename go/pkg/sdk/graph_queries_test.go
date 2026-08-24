@@ -274,7 +274,7 @@ func TestGraphAggregateConstructorAllowsDuplicateExpressionsUnderDifferentNames(
 
 func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	var result GraphQueryResult
-	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"took":1}`), &result); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {
 		t.Fatal(err)
 	}
 

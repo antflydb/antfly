@@ -11216,6 +11216,7 @@ components:
         - $unset
         - $inc
         - $push
+        - $pull
         - $addToSet
         - $min
         - $max
@@ -11225,6 +11226,7 @@ components:
         - UNSET
         - INC
         - PUSH
+        - PULL
         - ADD_TO_SET
         - MIN
         - MAX
@@ -11243,6 +11245,8 @@ components:
           example: $.views
         value:
           description: Value for operation (not required for $unset). Type depends on the supported operator.
+            `$pull` removes every array element exactly equal to this JSON value; projected graph-edge
+            values identify the relationship by `target`.
     Transform:
       type: object
       required:
@@ -11487,7 +11491,7 @@ components:
 
             - Multiple operations per document are applied in sequence
 
-            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet)
+            - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull)
 
 
             Common use cases:
@@ -11496,7 +11500,7 @@ components:
 
             - Update timestamps ($set)
 
-            - Add unique array values ($addToSet)
+            - Add or remove array values ($addToSet, $pull)
 
             - Update nested fields without overwriting the entire document
           items:
@@ -16583,8 +16587,8 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`,
-            `$min`, `$max`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`,
+            `$addToSet`, `$min`, `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
 
@@ -23442,7 +23446,6 @@ components:
         - kind
         - rows
         - stats
-        - took
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query.
         Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
@@ -23457,11 +23460,6 @@ components:
             $ref: '#/components/schemas/GraphResultRow'
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     GraphAggregateValue:
       type: object
       required:
@@ -23485,7 +23483,6 @@ components:
         - kind
         - aggregates
         - stats
-        - took
       description: Complete exact aggregates from a canonical graph MATCH query.
       properties:
         kind:
@@ -23499,11 +23496,6 @@ components:
             $ref: '#/components/schemas/GraphAggregateValue'
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     GraphPath:
       type: object
       additionalProperties: false
@@ -23538,7 +23530,6 @@ components:
         - nodes
         - paths
         - stats
-        - took
       description: Composable result nodes and any materialized paths from a canonical traversal or path
         query.
       properties:
@@ -23561,11 +23552,6 @@ components:
           description: Materialized result paths; empty when paths were not requested or produced.
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     LegacyGraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -23690,8 +23676,9 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: int64
-          x-go-type: time.Duration
-          description: Query execution time; optional for compatibility with v0.2 responses
+          deprecated: true
+          description: Whole-query execution time in milliseconds; optional for compatibility with v0.2
+            responses. Use the parent query result's took field.
     GraphQueryResult:
       description: A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path
         results cannot be confused with the deprecated graph_searches envelope.

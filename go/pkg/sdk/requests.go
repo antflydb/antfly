@@ -41,7 +41,7 @@ type BatchRequest struct {
 	// Transform operations allow you to modify documents without read-modify-write races:
 	// - Operations are applied atomically on the server
 	// - Multiple operations per document are applied in sequence
-	// - Supports $set, $setOnInsert, $unset, $inc, $addToSet, $min, and $max
+	// - Supports $set, $setOnInsert, $unset, $inc, $push, $pull, $addToSet, $min, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
 	// SyncLevel Synchronization level for the batch operation:

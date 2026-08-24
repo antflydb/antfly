@@ -588,6 +588,21 @@ const GraphHydrateFanoutSlot = struct {
     }
 };
 
+const GraphEdgesFanoutSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    result: ?GraphEdgesResponse = null,
+    err: ?anyerror = null,
+
+    fn init() GraphEdgesFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    }
+
+    fn deinit(self: *GraphEdgesFanoutSlot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 const GraphExpandRequestJson = struct {
     name: []const u8,
     index_name: []const u8,
@@ -724,13 +739,6 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
             },
             .pattern => {
                 if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
-                // Legacy linear patterns carry direction on each edge step,
-                // independently of the request-level traversal parameters.
-                // Incoming adjacency is source-shard-local, so accepting one
-                // here would silently omit edges owned by other shards.
-                for (graph_query.query.pattern) |step| {
-                    if (step.edge.direction != .out) return false;
-                }
             },
         }
     }
@@ -1598,51 +1606,243 @@ const DistributedEdgeReader = struct {
         // instead of turning an explicit multi-hop traversal into IndexNotFound.
         if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
             return try a.alloc(graph_mod.Edge, 0);
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
-            a,
-            self.catalog,
-            table_name,
-            key,
-            table_state.topology_epoch,
-        )) orelse return error.TableNotFound;
 
+        // Outgoing adjacency is colocated with its source and needs one routed
+        // read. Incoming adjacency is deliberately source-shard-local, so an
+        // exact reverse expansion must consult every source shard in the pinned
+        // topology. Never substitute the target owner's partial reverse index:
+        // doing so silently loses bindings after a table split.
+        if (direction == .out) {
+            const group_id = (try table_catalog.resolveGroupForKeyPinned(
+                a,
+                self.catalog,
+                table_name,
+                key,
+                table_state.topology_epoch,
+            )) orelse return error.TableNotFound;
+            var resp = try self.getEdgesFromGroup(a, table_name, table_state, group_id, key, edge_types, .out);
+            const edges = resp.edges;
+            resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
+            resp.deinit(a);
+            return edges;
+        }
+
+        // The current MATCH contract does not declare a source table per alias.
+        // Consequently an external-table reverse hop cannot identify which
+        // table owns the source-sharded reverse index. Fail closed instead of
+        // returning an incomplete result; same-table reverse expansion is exact.
+        if (!std.mem.eql(u8, table_name, self.source_table))
+            return error.UnsupportedQueryRequest;
+
+        const routed = try table_catalog.routedSpanSnapshot(a, self.catalog, table_name, "", "");
+        defer a.free(routed.group_ids);
+        if (table_state.topology_epoch != 0 and routed.topology_epoch != table_state.topology_epoch)
+            return error.TopologyChanged;
+        if (routed.group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
+
+        var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+        errdefer {
+            for (edges.items) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+            edges.deinit(a);
+        }
+        var seen_edges = GraphEdgeIdentitySet.empty;
+        defer seen_edges.deinit(a);
+        const requested_direction: graph_mod.EdgeDirection = if (direction == .both) .both else .in;
+        const fanout_io = self.worker.fanoutIo();
+        const plan = planGraphFanout(fanout_io != null, self.worker.fanoutWidthCap(), routed.group_ids.len);
+
+        if (fanout_io) |io| {
+            if (plan.parallel) {
+                const slots = try a.alloc(GraphEdgesFanoutSlot, routed.group_ids.len);
+                defer {
+                    for (slots) |*slot| slot.deinit();
+                    a.free(slots);
+                }
+                for (slots) |*slot| slot.* = .init();
+
+                const Fiber = struct {
+                    fn run(
+                        reader: DistributedEdgeReader,
+                        slot: *GraphEdgesFanoutSlot,
+                        table_name_inner: []const u8,
+                        table_state_inner: *const GraphAdmissionTableState,
+                        group_id: u64,
+                        key_inner: []const u8,
+                        edge_types_inner: []const []const u8,
+                        direction_inner: graph_mod.EdgeDirection,
+                    ) void {
+                        slot.result = reader.getEdgesFromGroup(
+                            slot.arena.allocator(),
+                            table_name_inner,
+                            table_state_inner,
+                            group_id,
+                            key_inner,
+                            edge_types_inner,
+                            direction_inner,
+                        ) catch |err| {
+                            slot.err = err;
+                            return;
+                        };
+                    }
+                };
+
+                var start: usize = 0;
+                while (start < routed.group_ids.len) : (start += plan.width) {
+                    const end = @min(start + plan.width, routed.group_ids.len);
+                    var group: std.Io.Group = .init;
+                    for (routed.group_ids[start..end], start..end) |group_id, i| {
+                        group.async(io, Fiber.run, .{
+                            self,
+                            &slots[i],
+                            table_name,
+                            table_state,
+                            group_id,
+                            key,
+                            edge_types,
+                            requested_direction,
+                        });
+                    }
+                    group.await(io) catch {};
+                }
+                for (slots) |slot| if (slot.err) |err| return err;
+                for (slots) |slot| {
+                    for (slot.result.?.edges) |edge| {
+                        if (direction == .both and seen_edges.contains(graphEdgeIdentity(edge))) continue;
+                        const cloned = try cloneOwnedGraphEdge(a, edge);
+                        var cloned_owned = true;
+                        errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(a, cloned);
+                        try edges.append(a, cloned);
+                        cloned_owned = false;
+                        if (direction == .both) try seen_edges.put(a, graphEdgeIdentity(cloned), {});
+                    }
+                }
+                return try edges.toOwnedSlice(a);
+            }
+        }
+
+        for (routed.group_ids) |group_id| {
+            var resp = try self.getEdgesFromGroup(
+                a,
+                table_name,
+                table_state,
+                group_id,
+                key,
+                edge_types,
+                requested_direction,
+            );
+            defer resp.deinit(a);
+            try edges.ensureUnusedCapacity(a, resp.edges.len);
+            for (resp.edges) |edge| {
+                if (direction == .both and seen_edges.contains(graphEdgeIdentity(edge))) {
+                    graph_mod.GraphIndex.freeEdge(a, edge);
+                    continue;
+                }
+                if (direction == .both) try seen_edges.put(a, graphEdgeIdentity(edge), {});
+                edges.appendAssumeCapacity(edge);
+            }
+            a.free(resp.edges);
+            resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+        return try edges.toOwnedSlice(a);
+    }
+
+    fn getEdgesFromGroup(
+        self: @This(),
+        a: std.mem.Allocator,
+        table_name: []const u8,
+        table_state: *const GraphAdmissionTableState,
+        group_id: u64,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) !GraphEdgesResponse {
+        var request_owns_fields = false;
         const index_name = try a.dupe(u8, self.index_name);
-        errdefer a.free(index_name);
+        errdefer if (!request_owns_fields) a.free(index_name);
         const owned_key = try a.dupe(u8, key);
-        errdefer a.free(owned_key);
+        errdefer if (!request_owns_fields) a.free(owned_key);
+        const owned_edge_types = try dupConstStrings(a, edge_types);
+        errdefer if (!request_owns_fields) freeConstStrings(a, owned_edge_types);
         var tensor_access_path = try cloneGraphTensorAccessPathAlloc(
             a,
             algebraic_ir.graphEdgeAccessPath(self.index_name),
         );
-        errdefer tensor_access_path.deinit(a);
+        errdefer if (!request_owns_fields) tensor_access_path.deinit(a);
         var tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(a, self.index_name);
-        errdefer tensor_program.deinit(a);
-
+        errdefer if (!request_owns_fields) tensor_program.deinit(a);
         var req = GraphEdgesRequest{
             .index_name = index_name,
             .key = owned_key,
-            .edge_types = try dupConstStrings(a, edge_types),
+            .edge_types = owned_edge_types,
             .direction = direction,
             .tensor_access_path = tensor_access_path,
             .tensor_program = tensor_program,
             .topology_epoch = table_state.topology_epoch,
             .identity_read_generation = try table_state.generationForGroup(group_id),
         };
+        request_owns_fields = true;
         defer req.deinit(a);
-
-        var resp = try self.worker.executeGraphGetEdges(a, group_id, table_name, req, self.consistency);
-
-        // Transfer ownership of edges to caller — don't free them in response deinit.
-        const edges = resp.edges;
-        resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
-        resp.deinit(a);
-        return edges;
+        return try self.worker.executeGraphGetEdges(a, group_id, table_name, req, self.consistency);
     }
 
     pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
         graph_mod.GraphIndex.freeEdges(a, edges);
     }
 };
+
+const GraphEdgeIdentity = struct {
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+};
+
+const GraphEdgeIdentityContext = struct {
+    pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(value.source);
+        hasher.update("\x00");
+        hasher.update(value.target);
+        hasher.update("\x00");
+        hasher.update(value.edge_type);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), left: GraphEdgeIdentity, right: GraphEdgeIdentity) bool {
+        return std.mem.eql(u8, left.source, right.source) and
+            std.mem.eql(u8, left.target, right.target) and
+            std.mem.eql(u8, left.edge_type, right.edge_type);
+    }
+};
+
+const GraphEdgeIdentitySet = std.HashMapUnmanaged(
+    GraphEdgeIdentity,
+    void,
+    GraphEdgeIdentityContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn graphEdgeIdentity(edge: graph_mod.Edge) GraphEdgeIdentity {
+    return .{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type };
+}
+
+fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mod.Edge {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+        .created_at = edge.created_at,
+        .updated_at = edge.updated_at,
+        .metadata = metadata,
+    };
+}
 
 fn executeDistributedPattern(
     alloc: std.mem.Allocator,
@@ -8278,7 +8478,7 @@ test "distributed graph edges request preserves typed graph edge access path" {
     try std.testing.expectError(error.InvalidQueryRequest, encodeGraphEdgesRequest(alloc, parsed));
 }
 
-test "distributed graph edge reader carries identity generation" {
+test "distributed graph edge reader routes outgoing and fans out incoming adjacency" {
     const alloc = std.testing.allocator;
 
     const FakeCatalog = struct {
@@ -8292,13 +8492,22 @@ test "distributed graph edge reader carries identity generation" {
             .replication_sources_json = "[]",
             .placement_role = "data",
         }};
-        const ranges = [_]metadata_table_manager.RangeRecord{.{
-            .group_id = 11,
-            .table_id = 7,
-            .range_id = 11,
-            .start_key = "",
-            .end_key = null,
-        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = 11,
+                .table_id = 7,
+                .range_id = 11,
+                .start_key = "",
+                .end_key = "doc:m",
+            },
+            .{
+                .group_id = 12,
+                .table_id = 7,
+                .range_id = 12,
+                .start_key = "doc:m",
+                .end_key = null,
+            },
+        };
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -8365,7 +8574,7 @@ test "distributed graph edge reader carries identity generation" {
 
         fn executeGraphGetEdges(
             ptr: *anyopaque,
-            _: std.mem.Allocator,
+            a: std.mem.Allocator,
             group_id: u64,
             table_name: []const u8,
             req: GraphEdgesRequest,
@@ -8373,17 +8582,42 @@ test "distributed graph edge reader carries identity generation" {
         ) !GraphEdgesResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             state.calls += 1;
-            try std.testing.expectEqual(@as(u64, 11), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
-            try std.testing.expectEqualStrings("doc:a", req.key);
             try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
             try std.testing.expectEqualStrings("links", req.edge_types[0]);
-            try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
             try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-            return .{ .edges = @constCast((&[_]graph_mod.Edge{})[0..]) };
+            if (req.direction == .out) {
+                try std.testing.expectEqual(@as(u64, 11), group_id);
+                try std.testing.expectEqualStrings("doc:a", req.key);
+                return .{ .edges = try a.alloc(graph_mod.Edge, 0) };
+            }
+            try std.testing.expect(req.direction == .in or req.direction == .both);
+            try std.testing.expectEqualStrings("doc:z", req.key);
+            try std.testing.expect(group_id == 11 or group_id == 12);
+            const result = try a.alloc(graph_mod.Edge, if (req.direction == .both and group_id == 11) 2 else 1);
+            var initialized: usize = 0;
+            errdefer {
+                for (result[0..initialized]) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+                a.free(result);
+            }
+            result[0] = try cloneOwnedGraphEdge(a, .{
+                .source = if (group_id == 11) "doc:a" else "doc:n",
+                .target = "doc:z",
+                .edge_type = "links",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            });
+            initialized += 1;
+            if (result.len == 2) {
+                result[1] = try cloneOwnedGraphEdge(a, result[0]);
+                initialized += 1;
+            }
+            return .{ .edges = result };
         }
     };
 
@@ -8415,6 +8649,16 @@ test "distributed graph edge reader carries identity generation" {
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
     try std.testing.expectEqual(@as(u32, 1), state.calls);
+
+    const incoming = try reader.getEdges(alloc, null, "doc:z", &.{"links"}, .in);
+    defer reader.freeEdges(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 2), incoming.len);
+    try std.testing.expectEqual(@as(u32, 3), state.calls);
+
+    const both = try reader.getEdges(alloc, null, "doc:z", &.{"links"}, .both);
+    defer reader.freeEdges(alloc, both);
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+    try std.testing.expectEqual(@as(u32, 5), state.calls);
 }
 
 test "distributed graph edges response round trips owned edges" {
@@ -9096,7 +9340,7 @@ test "distributed graph supports cross-range traverse target selectors" {
     try std.testing.expect(!supportsCrossRange(unsupported_weight_mode));
 }
 
-test "distributed graph rejects legacy pattern step reverse directions" {
+test "distributed graph supports legacy pattern step reverse directions exactly" {
     const outgoing_steps = [_]graph_pattern_mod.PatternStep{
         .{ .alias = "a" },
         .{ .alias = "b", .edge = .{ .direction = .out } },
@@ -9121,11 +9365,11 @@ test "distributed graph rejects legacy pattern step reverse directions" {
 
     query.pattern = &incoming_steps;
     named[0].query = query;
-    try std.testing.expect(!supportsCrossRange(.{ .graph_queries = &named }));
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
 
     query.pattern = &both_steps;
     named[0].query = query;
-    try std.testing.expect(!supportsCrossRange(.{ .graph_queries = &named }));
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
 }
 
 test "distributed graph rejects doc identity rebuild before cross-range fanout" {

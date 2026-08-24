@@ -2250,6 +2250,8 @@ fn mapTransformOpType(op_name: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op_name, "$setOnInsert")) return .set_on_insert;
     if (std.mem.eql(u8, op_name, "$unset")) return .unset;
     if (std.mem.eql(u8, op_name, "$inc")) return .inc;
+    if (std.mem.eql(u8, op_name, "$push")) return .push;
+    if (std.mem.eql(u8, op_name, "$pull")) return .pull;
     if (std.mem.eql(u8, op_name, "$addToSet")) return .add_to_set;
     if (std.mem.eql(u8, op_name, "$min")) return .min;
     if (std.mem.eql(u8, op_name, "$max")) return .max;

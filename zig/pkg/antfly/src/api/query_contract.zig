@@ -5378,7 +5378,6 @@ fn toOpenApiGraphQueryResult(
                 .returned_items = @intCast(rows.len),
                 .truncated = graph_result.truncated,
             },
-            .took = meta.took_ms,
         };
         return .{ .graph_bindings_result = response };
     }
@@ -5393,7 +5392,6 @@ fn toOpenApiGraphQueryResult(
                 .returned_items = @intCast(aggregates.map.count()),
                 .truncated = graph_result.truncated,
             },
-            .took = meta.took_ms,
         };
         return .{ .graph_aggregates_result = response };
     }
@@ -5410,7 +5408,6 @@ fn toOpenApiGraphQueryResult(
             .returned_items = @intCast(if (paths.len > 0) paths.len else nodes.len),
             .truncated = graph_result.truncated,
         },
-        .took = meta.took_ms,
     };
     return .{ .graph_nodes_result = response };
 }
@@ -5704,6 +5701,7 @@ test "deprecated graph search preserves its response envelope" {
     try std.testing.expect(legacy.kind == null);
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
     try std.testing.expectEqual(@as(i64, 12), legacy.total);
+    try std.testing.expectEqual(@as(?i64, 3), legacy.took);
 
     const named_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",

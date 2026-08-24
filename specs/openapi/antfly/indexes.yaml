@@ -3441,7 +3441,7 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
-      required: [kind, rows, stats, took]
+      required: [kind, rows, stats]
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
         kind:
@@ -3452,16 +3452,11 @@ components:
           type: array
           items: { $ref: '#/components/schemas/GraphResultRow' }
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     GraphAggregatesResult:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
-      required: [kind, aggregates, stats, took]
+      required: [kind, aggregates, stats]
       description: Complete exact aggregates from a canonical graph MATCH query.
       properties:
         kind:
@@ -3473,16 +3468,11 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/GraphAggregateValue'
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     GraphNodesResult:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
-      required: [kind, nodes, paths, stats, took]
+      required: [kind, nodes, paths, stats]
       description: Composable result nodes and any materialized paths from a canonical traversal or path query.
       properties:
         kind:
@@ -3501,11 +3491,6 @@ components:
           items: { $ref: '#/components/schemas/GraphPath' }
           description: Materialized result paths; empty when paths were not requested or produced.
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
-        took:
-          type: integer
-          format: int64
-          x-go-type: time.Duration
-          description: Query execution time.
     LegacyGraphQueryResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3551,8 +3536,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: int64
-          x-go-type: time.Duration
-          description: "Query execution time; optional for compatibility with v0.2 responses"
+          deprecated: true
+          description: "Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field."
     GraphQueryResult:
       description: >-
         A structurally distinct graph result. Canonical bindings, exact

@@ -1239,8 +1239,6 @@ pub const GraphAggregatesResult = struct {
     kind: []const u8,
     aggregates: std.json.ArrayHashMap(GraphAggregateValue),
     stats: GraphQueryStats,
-    /// Query execution time.
-    took: i64,
 };
 
 pub const GraphAggregatesReturn = struct {
@@ -1309,8 +1307,6 @@ pub const GraphBindingsResult = struct {
     kind: []const u8,
     rows: []const GraphResultRow,
     stats: GraphQueryStats,
-    /// Query execution time.
-    took: i64,
 };
 
 pub const GraphBindingsReturn = struct {
@@ -1835,8 +1831,6 @@ pub const GraphNodesResult = struct {
     /// Materialized result paths; empty when paths were not requested or produced.
     paths: []const GraphPath,
     stats: GraphQueryStats,
-    /// Query execution time.
-    took: i64,
 };
 
 pub const GraphNotEqualPredicate = struct {
@@ -2036,7 +2030,6 @@ pub const GraphQueryResult = union(enum) {
             "nodes",
             "paths",
             "stats",
-            "took",
         })) {
             if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
         }
@@ -2044,7 +2037,6 @@ pub const GraphQueryResult = union(enum) {
             "kind",
             "aggregates",
             "stats",
-            "took",
         })) {
             if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
         }
@@ -2052,7 +2044,6 @@ pub const GraphQueryResult = union(enum) {
             "kind",
             "rows",
             "stats",
-            "took",
         })) {
             if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
         }
@@ -2735,7 +2726,7 @@ pub const LegacyGraphQueryResult = struct {
     matches: ?[]const PatternMatch = null,
     /// Deprecated graph_searches result count; use stats or a named count aggregate.
     total: i64,
-    /// Query execution time; optional for compatibility with v0.2 responses
+    /// Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
     took: ?i64 = null,
 };
 

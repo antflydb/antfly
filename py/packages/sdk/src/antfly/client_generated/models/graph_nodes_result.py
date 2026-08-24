@@ -26,14 +26,12 @@ class GraphNodesResult:
             returned path; inspect paths[].nodes for complete path membership.
         paths (list[GraphPath]): Materialized result paths; empty when paths were not requested or produced.
         stats (GraphQueryStats):
-        took (int): Query execution time.
     """
 
     kind: GraphNodesResultKind
     nodes: list[GraphResultNode]
     paths: list[GraphPath]
     stats: GraphQueryStats
-    took: int
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -50,8 +48,6 @@ class GraphNodesResult:
 
         stats = self.stats.to_dict()
 
-        took = self.took
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -60,7 +56,6 @@ class GraphNodesResult:
                 "nodes": nodes,
                 "paths": paths,
                 "stats": stats,
-                "took": took,
             }
         )
 
@@ -91,14 +86,11 @@ class GraphNodesResult:
 
         stats = GraphQueryStats.from_dict(d.pop("stats"))
 
-        took = d.pop("took")
-
         graph_nodes_result = cls(
             kind=kind,
             nodes=nodes,
             paths=paths,
             stats=stats,
-            took=took,
         )
 
         return graph_nodes_result

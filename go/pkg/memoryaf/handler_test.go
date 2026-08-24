@@ -205,16 +205,19 @@ func TestStoreMemory_WithExtractor(t *testing.T) {
 		t.Error("expected non-empty ID")
 	}
 
-	// Wait for async entity extraction to complete.
-	h.Close()
-
 	mc.mu.Lock()
-	// 1 batch for the memory insert + 1 atomic entity/edge materialization batch.
-	if len(mc.batches) != 2 {
-		t.Errorf("expected 2 batches (insert + symmetric entity graph), got %d", len(mc.batches))
+	// Entity extraction is reflected in one lifecycle-complete batch.
+	if len(mc.batches) != 1 {
+		t.Errorf("expected 1 memory/entity graph batch, got %d", len(mc.batches))
 	}
-	if len(mc.batches) >= 2 {
-		for _, transform := range mc.batches[1].Transforms {
+	if len(mc.batches) == 1 {
+		if len(mc.batches[0].Transforms) != 2 {
+			t.Errorf("expected 2 entity transforms, got %d", len(mc.batches[0].Transforms))
+		}
+		for _, transform := range mc.batches[0].Transforms {
+			if !transform.Upsert {
+				t.Errorf("entity transform %q must upsert its entity node", transform.Key)
+			}
 			var foundReverseMention bool
 			for _, operation := range transform.Operations {
 				if operation.Op == client.TransformOpTypeAddToSet && operation.Path == "$._edges.memory_graph.mentions" {
@@ -227,6 +230,23 @@ func TestStoreMemory_WithExtractor(t *testing.T) {
 		}
 	}
 	mc.mu.Unlock()
+}
+
+func TestStoreMemory_ExtractionFailureDoesNotWritePartialMemory(t *testing.T) {
+	mc := newMockClient()
+	h := newTestHandler(mc, &mockExtractor{extractFn: func(context.Context, []string, ExtractOptions) ([]Extraction, error) {
+		return nil, fmt.Errorf("extractor unavailable")
+	}})
+
+	_, err := h.StoreMemory(context.Background(), StoreMemoryArgs{Content: "Go uses goroutines"}, defaultUctx())
+	if err == nil || !strings.Contains(err.Error(), "extract entities") {
+		t.Fatalf("expected extraction failure, got %v", err)
+	}
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if len(mc.batches) != 0 {
+		t.Fatalf("extraction failure wrote %d partial batches", len(mc.batches))
+	}
 }
 
 func TestGetMemory(t *testing.T) {
@@ -688,6 +708,52 @@ func TestExtractEntities_NormalizesAndDedupes(t *testing.T) {
 	if entities[1].Text != "Apache Kafka" {
 		t.Fatalf("second entity text = %q, want Apache Kafka", entities[1].Text)
 	}
+}
+
+func TestEntityGraphTransformsMaintainLifecycle(t *testing.T) {
+	previous := []Entity{
+		{Text: "Go", Label: "technology", Score: 0.8},
+		{Text: "Kafka", Label: "technology", Score: 0.9},
+	}
+	current := []Entity{
+		{Text: "Go", Label: "technology", Score: 0.95},
+		{Text: "Rust", Label: "technology", Score: 0.85},
+	}
+	doc := map[string]any{}
+	transforms := applyMemoryEntityGraph(doc, "memory-1", current, previous, "2026-08-24T00:00:00Z")
+
+	if len(transforms) != 3 {
+		t.Fatalf("expected retained, added, and removed transforms; got %d", len(transforms))
+	}
+	edges := doc["_edges"].(map[string]any)[graphIndex].(map[string][]map[string]any)["mentions"]
+	if len(edges) != 2 || edges[0]["weight"] != 0.95 || edges[1]["weight"] != 0.85 {
+		t.Fatalf("unexpected forward edges: %#v", edges)
+	}
+
+	byKey := make(map[string]client.Transform, len(transforms))
+	for _, transform := range transforms {
+		byKey[transform.Key] = transform
+	}
+	assertHasOp := func(key string, op client.TransformOpType, want bool) {
+		t.Helper()
+		found := false
+		for _, operation := range byKey[key].Operations {
+			if operation.Op == op {
+				found = true
+			}
+		}
+		if found != want {
+			t.Fatalf("transform %q op %q: got %v, want %v", key, op, found, want)
+		}
+	}
+	goKey := entityKey("technology", "Go")
+	rustKey := entityKey("technology", "Rust")
+	kafkaKey := entityKey("technology", "Kafka")
+	assertHasOp(goKey, client.TransformOpTypeAddToSet, true)
+	assertHasOp(goKey, client.TransformOpTypeInc, false)
+	assertHasOp(rustKey, client.TransformOpTypeInc, true)
+	assertHasOp(kafkaKey, client.TransformOpTypePull, true)
+	assertHasOp(kafkaKey, client.TransformOpTypeMax, true)
 }
 
 func TestEnsureNamespace_Idempotent(t *testing.T) {
