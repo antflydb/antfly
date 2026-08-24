@@ -4300,6 +4300,7 @@ pub const Node = struct {
             allocator.free(schemas);
         }
 
+        // This parser bounds max_tokens before resolver or media work begins.
         var options = try parseExtractionOptionsJson(allocator, request.options_json);
         defer options.deinit();
         const config = extraction_mod.ExtractionConfig{
@@ -4338,9 +4339,6 @@ pub const Node = struct {
         defer parsed_inputs.deinit();
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
         if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        if (parsed_inputs.max_tokens) |max_tokens| {
-            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
-        }
         if (parsed_inputs.images.items.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
@@ -4442,11 +4440,7 @@ pub const Node = struct {
                 defer if (relation_entity_labels) |values| allocator.free(values);
                 const extracted = try pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels);
                 defer {
-                    for (extracted.entities) |entities| {
-                        for (entities) |entity| allocator.free(entity.text);
-                        allocator.free(entities);
-                    }
-                    allocator.free(extracted.entities);
+                    freeBorrowedLabelEntityBatches(allocator, extracted.entities);
                     for (extracted.relations) |relations| {
                         for (relations) |*relation| relation.deinit(allocator);
                         allocator.free(relations);
@@ -4462,7 +4456,7 @@ pub const Node = struct {
             }
 
             const all_entities = try pipeline.recognizeBatch(texts, labels);
-            defer freeEntityBatches(allocator, all_entities);
+            defer freeBorrowedLabelEntityBatches(allocator, all_entities);
             const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
             defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
             const entities_for_response = cleaned_entities orelse all_entities;
@@ -4478,7 +4472,7 @@ pub const Node = struct {
         var pipeline = model.nerPipeline(allocator);
         pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
         const all_entities = try pipeline.recognizeBatch(texts);
-        defer freeEntityBatches(allocator, all_entities);
+        defer freeBorrowedLabelEntityBatches(allocator, all_entities);
         const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
@@ -9018,13 +9012,7 @@ pub const Node = struct {
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -9222,11 +9210,7 @@ pub const Node = struct {
             const extracted = pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |e| ctx.allocator.free(e.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
+                freeBorrowedLabelEntityBatches(ctx.allocator, extracted.entities);
 
                 for (extracted.relations) |relations| {
                     for (relations) |*relation| relation.deinit(ctx.allocator);
@@ -9246,13 +9230,7 @@ pub const Node = struct {
 
         const all_entities = pipeline.recognizeBatch(texts, labels) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -11974,6 +11952,20 @@ fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@impo
     allocator.free(all_entities);
 }
 
+/// Release raw NER/GLiNER results. Their span text and batch containers are
+/// owned by the caller, while labels borrow model configuration or request
+/// schema storage and must remain untouched.
+fn freeBorrowedLabelEntityBatches(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
+    for (all_entities) |entities| {
+        for (entities) |entity| allocator.free(entity.text);
+        allocator.free(entities);
+    }
+    allocator.free(all_entities);
+}
+
 fn appendPromMetric(writer: *std.Io.Writer, name: []const u8, metric_type: []const u8, help: []const u8, value: u64) !void {
     try writer.print("# HELP {s} {s}\n# TYPE {s} {s}\n{s} {d}\n", .{ name, help, name, metric_type, name, value });
 }
@@ -14572,6 +14564,35 @@ test "text extraction preserves multipart text as one input" {
     try std.testing.expectEqualStrings("Grace Hopper\nbuilt compilers.", parsed.texts.items[0]);
 }
 
+test "structured extraction validates generation options before resolver and media work" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]
+        ,
+    }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.InvalidMaxTokens, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{"name":"string"}}}}
+            ,
+            .options_json = "{\"max_tokens\":0}",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
 test "valid direct entity failures release admission and partial model state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -14659,6 +14680,24 @@ test "direct entity extraction response populates requested canonical fields" {
             \\}
         , json);
     }
+}
+
+test "raw entity cleanup preserves borrowed labels" {
+    const allocator = std.testing.allocator;
+    const ner = @import("../pipelines/ner.zig");
+    const borrowed_label = "person";
+    const batches = try allocator.alloc([]ner.Entity, 1);
+    batches[0] = try allocator.alloc(ner.Entity, 1);
+    batches[0][0] = .{
+        .text = try allocator.dupe(u8, "Grace Hopper"),
+        .label = borrowed_label,
+        .start = 0,
+        .end = 12,
+        .score = 0.889,
+    };
+
+    freeBorrowedLabelEntityBatches(allocator, batches);
+    try std.testing.expectEqualStrings("person", borrowed_label);
 }
 
 test "canonical structure schemas preserve field types and choices" {
