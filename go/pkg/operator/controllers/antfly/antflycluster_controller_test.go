@@ -14337,6 +14337,121 @@ func TestReconcileStandaloneStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	}))
 }
 
+func TestReconcileStandaloneStatefulSetPreservesExactLivePromotedProcess(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	cluster.Labels = map[string]string{cloudHARoleLabel: "primary"}
+	cluster.Annotations = map[string]string{
+		cloudHAPromotionReceiptAnnotation:   strings.Repeat("a", 64),
+		cloudHATopologyGenerationAnnotation: "2",
+	}
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, ShardID: 10, TableID: 20, TimelineID: 2, Epoch: 2,
+			CurrentPrimaryID: "standby-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role:   antflyv1.HARuntimeRolePrimary,
+			NodeID: "standby-a",
+		},
+	}
+	controller := true
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-standalone-standalone", Namespace: "default", UID: types.UID("sts-uid"),
+			Annotations: map[string]string{annotationStorageEngine: "local"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: serviceSelectorLabels(cluster.Name, "standalone")},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      statefulSet.Name + "-0",
+			Namespace: statefulSet.Namespace,
+			UID:       types.UID("live-promoted-process-uid"),
+			Labels: map[string]string{
+				cloudHARoleLabel: cloudHAStandbyRole,
+			},
+			Annotations: map[string]string{haNodeIDAnnotation: "standby-a"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "StatefulSet", Name: statefulSet.Name,
+				UID: statefulSet.UID, Controller: &controller,
+			}},
+		},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	client := newHAControllerTestClient(t, s, cluster, statefulSet, pod)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	observedStatefulSet := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+	g.Expect(observedStatefulSet.Spec.Template.Labels).To(HaveKeyWithValue(cloudHARoleLabel, "primary"))
+	g.Expect(observedStatefulSet.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--ha-primary-log"))
+	observedPod := &corev1.Pod{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, observedPod)).To(Succeed())
+	g.Expect(observedPod.UID).To(Equal(pod.UID))
+
+	// Once Kubernetes observes the primary template, normal rolling updates
+	// resume so later image and configuration changes retain their usual UX.
+	observedPod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), observedPod)).To(Succeed())
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.RollingUpdateStatefulSetStrategyType))
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.RollingUpdate).NotTo(BeNil())
+	g.Expect(*observedStatefulSet.Spec.UpdateStrategy.RollingUpdate.Partition).To(Equal(int32(0)))
+}
+
+func TestPromotedStandaloneRolloutRequiresExactReceiptAndReadyOwnedPod(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := baseStandaloneControllerCluster()
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode:    antflyv1.HAModeHotStandby,
+		Runtime: &antflyv1.HARuntimeSpec{Role: antflyv1.HARuntimeRolePrimary, NodeID: "standby-a"},
+	}
+	statefulSet := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-standalone-standalone", Namespace: "default", UID: types.UID("sts-uid")}}
+	controller := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace,
+		Labels:          map[string]string{cloudHARoleLabel: cloudHAStandbyRole},
+		Annotations:     map[string]string{haNodeIDAnnotation: "standby-a"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: statefulSet.Name, UID: statefulSet.UID, Controller: &controller}},
+	}, Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	client := newHAControllerTestClient(t, s, cluster, statefulSet, pod)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	deferRollout, err := reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeFalse())
+	cluster.Annotations = map[string]string{
+		cloudHAPromotionReceiptAnnotation:   strings.Repeat("a", 64),
+		cloudHATopologyGenerationAnnotation: "2",
+	}
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	pod.Status.Conditions[0].Status = corev1.ConditionFalse
+	g.Expect(client.Status().Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeFalse())
+}
+
 func TestReconcileStandaloneStatefulSetStartupGatePrecreatesTargetPVCAndStaysSuspended(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()

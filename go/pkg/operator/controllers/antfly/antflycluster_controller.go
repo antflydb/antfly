@@ -154,6 +154,10 @@ const (
 	haSeedLiveMetadataPath                  = "/antflydb/metadata"
 	haSeedLiveExtensionsPath                = "/antflydb/extensions"
 	haSeedActivationRelativeRoot            = ".antfly-ha/active"
+	cloudHAPromotionReceiptAnnotation       = "cloud.antfly.io/ha-promotion-receipt"
+	cloudHATopologyGenerationAnnotation     = "cloud.antfly.io/ha-topology-generation"
+	cloudHARoleLabel                        = "cloud.antfly.io/ha-role"
+	cloudHAStandbyRole                      = "standby"
 
 	haAdminJobPhaseWaitingDependency   = "WaitingDependency"
 	haAdminJobPhaseWaitingPrerequisite = "WaitingPrerequisite"
@@ -4001,6 +4005,28 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+		deferPromotionRollout, err := r.shouldDeferPromotedStandaloneRollout(ctx, cluster, statefulSet)
+		if err != nil {
+			return err
+		}
+		if deferPromotionRollout {
+			// The runtime promotion API has already converted this exact live
+			// standby process into the Lease-authorized primary. Keep its open
+			// connections and in-memory promotion handoff while publishing the
+			// restart-safe primary template. StatefulSet OnDelete creates any
+			// replacement from that new template without killing the live writer.
+			statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			}
+		} else {
+			zero := int32(0)
+			statefulSet.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					Partition: &zero,
+				},
+			}
+		}
 		podAnnotations := r.buildPodAnnotations(ctx, cache, cluster, envFromSources)
 		if activatedSeedGate {
 			podAnnotations = maps.Clone(podAnnotations)
@@ -4160,6 +4186,37 @@ exec /antfly standalone --id %d --config /config/config.json \
 	})
 
 	return err
+}
+
+func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx context.Context, cluster *antflyv1.AntflyCluster, statefulSet *appsv1.StatefulSet) (bool, error) {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return false, nil
+	}
+	if strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation]) == "" {
+		return false, nil
+	}
+	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
+	if err != nil || topologyGeneration < 2 {
+		return false, nil
+	}
+
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace}
+	if err := r.Get(ctx, key, pod); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("observe promoted standalone Pod before rollout: %w", err)
+	}
+	if pod.DeletionTimestamp != nil ||
+		!isPodControlledByStatefulSet(pod, statefulSet.Name) ||
+		pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole ||
+		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) ||
+		isUnhealthyPod(pod) {
+		return false, nil
+	}
+	return true, nil
 }
 
 const generatedConfigHashAnnotation = "antfly.io/config-hash"
