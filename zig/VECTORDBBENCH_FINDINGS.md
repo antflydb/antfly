@@ -1504,6 +1504,36 @@ checksum, allocation, and read-stat paths and caps concurrent buffers at the
 configured point-read ceiling. Its latency effect must be measured against the
 preserved complete 1M generation before another fresh load qualification.
 
+That preserved-generation A/B kept recall exactly 0.98535, exact rerank work
+exactly 447.478 vectors per query, and approximate work exactly 237,596 vectors
+per query across the same 1,000 public API queries. The bounded four-read
+pipeline reduced client mean latency from 85.71 to 54.21 ms and p95 from
+153.46 to 95.07 ms. Server-attributed artifact reads fell from 72.01 to 41.77
+ms mean and from 138.21 to 81.38 ms p95. This is a 36.8% end-to-end mean
+improvement and 42.0% artifact-read improvement without changing search work
+or quality. Post-query demand was 1.12 GB versus 1.30 GB in the earlier run;
+RSS was higher at 1.74 GB versus 1.46 GB because the merged cache governor
+retained more reclaimable node metadata, so that one-sample cache-inclusive
+difference is not attributed to the read pipeline.
+
+After merging current `origin/main`, the stale sibling VectorDBBench checkout
+failed before search because it POSTed the removed legacy
+`/api/v1/tables/{name}` contract and received HTTP 405. The canonical runner
+preserves that failed result, supports an explicitly labeled diagnostic-profile
+mode, and accepts an explicit VectorDBBench checkout so the API-compatible
+adapter can run the official lifecycle. Diagnostic profiles are not
+publication-equivalent substitutes for the official client lifecycle.
+
+The API-compatible checkout then completed the official reopened 1M serial
+lifecycle. Cold recall was 0.9854 with 54.9/114.1/163.6 ms p50/p95/p99; the
+immediate warm repeat held 0.9854 recall at 53.3/109.8/150.2 ms. The earlier
+same-generation official run before sparse pipelining measured
+140.7/466.7/731.4 ms cold and 87.4/214.8/319.3 ms warm. A detailed 1,000-query
+profile after the official warm pass measured 48.52 ms mean, 86.08 ms p95,
+102.86 ms p99, and 36.03 ms mean artifact-read time. Its post-phase sample was
+1.22 GB demand, 1.20 GB physical-footprint ledger peak, and 1.57 GB RSS under
+the same explicit 2 GiB process envelope.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

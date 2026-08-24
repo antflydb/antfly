@@ -2,7 +2,22 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 RUN_ROOT PORT HEALTH_PORT" >&2
+  echo "usage: $0 RUN_ROOT PORT HEALTH_PORT [OPTIONS]" >&2
+  echo "" >&2
+  echo "Options:" >&2
+  echo "  --case NAME              VectorDBBench case" >&2
+  echo "  --vdbbench-root PATH     VectorDBBench checkout" >&2
+  echo "  --batch N                Public insert batch size" >&2
+  echo "  --workers N              Requested load workers when supported" >&2
+  echo "  --query-concurrency CSV  Query concurrencies" >&2
+  echo "  --query-seconds N        Seconds per query concurrency" >&2
+  echo "  --memory-budget-mb N     Explicit Antfly process envelope" >&2
+  echo "  --profile-count N        Detailed public-API query count" >&2
+  echo "  --profile-dataset PATH   Dataset directory for detailed profiling" >&2
+  echo "  --native-hbc             Enable the HBC native posting WAL/segment store" >&2
+  echo "  --resume                 Restart/query an existing run root" >&2
+  echo "  --diagnostic-profile-only  Skip the official client lifecycle during a resume A/B" >&2
+  echo "  --label-suffix SUFFIX    Unique suffix required by --resume" >&2
   echo "" >&2
   echo "Environment:" >&2
   echo "  ANTFLY_BIN       Antfly binary (default: zig/zig-out/bin/antfly)" >&2
@@ -20,11 +35,12 @@ usage() {
   exit 2
 }
 
-[[ $# -eq 3 ]] || usage
+[[ $# -ge 3 ]] || usage
 
 run_root=$1
 port=$2
 health_port=$3
+shift 3
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 common_git_dir=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)
@@ -45,6 +61,33 @@ supports_load_concurrency=false
 supports_serial_cooldown=false
 resume_after_live=${VDBBENCH_RESUME_AFTER_LIVE:-0}
 label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
+native_hbc=0
+diagnostic_profile_only=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --case) [[ $# -ge 2 ]] || usage; vdbbench_case=$2; shift 2 ;;
+    --vdbbench-root) [[ $# -ge 2 ]] || usage; vdbbench_root=$2; shift 2 ;;
+    --batch) [[ $# -ge 2 ]] || usage; batch_size=$2; shift 2 ;;
+    --workers) [[ $# -ge 2 ]] || usage; load_workers=$2; shift 2 ;;
+    --query-concurrency) [[ $# -ge 2 ]] || usage; query_concurrency=$2; shift 2 ;;
+    --query-seconds) [[ $# -ge 2 ]] || usage; query_seconds=$2; shift 2 ;;
+    --memory-budget-mb) [[ $# -ge 2 ]] || usage; process_memory_budget_mb=$2; shift 2 ;;
+    --profile-count) [[ $# -ge 2 ]] || usage; profile_count=$2; shift 2 ;;
+    --profile-dataset) [[ $# -ge 2 ]] || usage; profile_dataset=$2; shift 2 ;;
+    --native-hbc) native_hbc=1; shift ;;
+    --resume) resume_after_live=1; shift ;;
+    --diagnostic-profile-only) diagnostic_profile_only=1; shift ;;
+    --label-suffix) [[ $# -ge 2 ]] || usage; label_suffix=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+if [[ "$native_hbc" == "1" ]]; then
+  export ANTFLY_HBC_POSTING_SIDECAR=1
+  export ANTFLY_HBC_POSTING_WAL_STORE=1
+fi
+
 live_label="antfly-qualification-online-live${label_suffix}"
 cold_label="antfly-qualification-reopened-cold${label_suffix}"
 warm_label="antfly-qualification-reopened-warm${label_suffix}"
@@ -81,6 +124,10 @@ if [[ "$resume_after_live" == "1" && -z "$label_suffix" ]]; then
   echo "VDBBENCH_LABEL_SUFFIX is required for a resume run to preserve existing evidence" >&2
   exit 2
 fi
+if [[ "$diagnostic_profile_only" == "1" && "$resume_after_live" != "1" ]]; then
+  echo "--diagnostic-profile-only requires --resume" >&2
+  exit 2
+fi
 for required in "$antfly_bin" "$vdbbench_root/.venv/bin/python" "$sampler"; do
   if [[ ! -e "$required" ]]; then
     echo "missing required path: $required" >&2
@@ -94,7 +141,7 @@ done
 # current public CLI.
 vdbbench_help=$(
   cd "$vdbbench_root"
-  .venv/bin/python -m vectordb_bench.cli.vectordbbench antflyaknn --help
+  LOG_FILE=/dev/null .venv/bin/python -m vectordb_bench.cli.vectordbbench antflyaknn --help
 )
 if [[ "$vdbbench_help" == *"--load-concurrency"* ]]; then
   supports_load_concurrency=true
@@ -107,7 +154,7 @@ fi
 
 mkdir -p "$run_root/results"
 if [[ "$resume_after_live" != "1" ]]; then
-  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" <<'PY'
+  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$native_hbc" <<'PY'
 import json
 import subprocess
 import sys
@@ -124,6 +171,7 @@ import sys
     memory_budget_mb,
     profile_count,
     profile_dataset,
+    native_hbc,
 ) = sys.argv[1:]
 antfly_git_head = subprocess.check_output(
     ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
@@ -145,6 +193,7 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "process_memory_budget_mb": int(memory_budget_mb) if memory_budget_mb else None,
             "public_profile_count": int(profile_count),
             "public_profile_dataset": profile_dataset,
+            "native_hbc_posting_store": native_hbc == "1",
             "load_lifecycle": "public_api_online_incremental",
             "builder": "server_selected; do not assume recursive from client batch size",
         },
@@ -156,7 +205,7 @@ with open(out_path, "w", encoding="utf-8") as handle:
 PY
   python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
 else
-  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$cold_label" "$warm_label" <<'PY'
+  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$cold_label" "$warm_label" "$native_hbc" "$diagnostic_profile_only" <<'PY'
 import json
 import subprocess
 import sys
@@ -165,11 +214,14 @@ import sys
     out_path,
     repo_root,
     antfly_bin,
+    vdbbench_root,
     memory_budget_mb,
     profile_count,
     profile_dataset,
     cold_label,
     warm_label,
+    native_hbc,
+    diagnostic_profile_only,
 ) = sys.argv[1:]
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(
@@ -178,6 +230,7 @@ with open(out_path, "w", encoding="utf-8") as handle:
                 ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
             ).strip(),
             "antfly_bin": antfly_bin,
+            "vdbbench_root": vdbbench_root,
             "process_memory_budget_mb": (
                 int(memory_budget_mb) if memory_budget_mb else None
             ),
@@ -185,6 +238,8 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "public_profile_dataset": profile_dataset,
             "cold_label": cold_label,
             "warm_label": warm_label,
+            "native_hbc_posting_store": native_hbc == "1",
+            "diagnostic_profile_only": diagnostic_profile_only == "1",
         },
         handle,
         indent=2,
@@ -349,6 +404,7 @@ run_vdbbench() {
     NUM_PER_BATCH="$batch_size" \
     IR_DATASETS_HOME=${IR_DATASETS_HOME:-/private/tmp/vdbbench-ir} \
     IR_DATASETS_TMP=${IR_DATASETS_TMP:-/private/tmp/vdbbench-ir-tmp} \
+    LOG_FILE="$run_root/vdbbench-framework.log" \
     PYTHONPATH=. \
     .venv/bin/python -m vectordb_bench.cli.vectordbbench "${cli_args[@]}" "$@"
   )
@@ -403,14 +459,16 @@ if [[ "$resume_after_live" == "1" ]]; then
   mark_phase restart_begin
   start_server "antfly-reopened${label_suffix}.log"
   mark_phase restart_ready
-  run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
-    >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
-  validate_vdbbench_result "$cold_label" 0 1
-  mark_phase reopened_cold_query_end
-  run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
-    >"$run_root/vdbbench-reopened-warm${label_suffix}.log" 2>&1
-  validate_vdbbench_result "$warm_label" 0 1
-  mark_phase reopened_warm_query_end
+  if [[ "$diagnostic_profile_only" != "1" ]]; then
+    run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+      >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
+    validate_vdbbench_result "$cold_label" 0 1
+    mark_phase reopened_cold_query_end
+    run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+      >"$run_root/vdbbench-reopened-warm${label_suffix}.log" 2>&1
+    validate_vdbbench_result "$warm_label" 0 1
+    mark_phase reopened_warm_query_end
+  fi
   run_public_profile "$label_suffix"
   curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart${label_suffix}.txt"
   curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart${label_suffix}.json"
@@ -419,7 +477,9 @@ if [[ "$resume_after_live" == "1" ]]; then
     "$run_root/footprint-restart${label_suffix}.jsonl" \
     "$run_root/footprint-restart${label_suffix}.log" \
     "$run_root/wired-baseline${label_suffix}.json"
-  python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
+  if [[ "$diagnostic_profile_only" != "1" ]]; then
+    python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
+  fi
   exit 0
 fi
 
