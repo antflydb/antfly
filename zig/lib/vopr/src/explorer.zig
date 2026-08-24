@@ -7,6 +7,7 @@ const std = @import("std");
 const choice = @import("choice.zig");
 const corpus_mod = @import("corpus.zig");
 const coverage_mod = @import("coverage.zig");
+const flight_recorder = @import("flight_recorder.zig");
 const replay = @import("replay.zig");
 const runner = @import("runner.zig");
 const ids = @import("id.zig");
@@ -26,10 +27,13 @@ pub const Config = struct {
     targets: []const coverage_mod.Target = &.{},
     replay_command: []const u8 = "vopr replay --trace <artifact>",
     reduction_command: []const u8 = "vopr reduce --trace <artifact> --out <reduced-artifact>",
+    flight_recorder_capacity: usize = 1_024,
+    retained_flight_recordings: usize = 64,
 
     pub fn validate(self: Config) !void {
         if (self.histories == 0) return error.InvalidHistoryBudget;
         if (self.transition_budget == 0) return error.InvalidTransitionBudget;
+        if (self.flight_recorder_capacity == 0) return error.InvalidFlightRecorderCapacity;
         if (self.uniform_percent > 100 or self.splice_percent > 100 or self.checkpoint_percent > 100 or
             @as(u16, self.uniform_percent) + @as(u16, self.splice_percent) > 100)
             return error.InvalidExplorationPercent;
@@ -67,6 +71,9 @@ pub const Report = struct {
     productive_corpus_inputs: usize = 0,
     distinct_failure_fingerprints: usize = 0,
     target_hits: u64 = 0,
+    flight_recordings: u64 = 0,
+    flight_records: u64 = 0,
+    flight_records_dropped: u64 = 0,
 };
 
 pub const PropertyCatalogStatus = struct {
@@ -108,6 +115,7 @@ pub fn Campaign(comptime Scenario: type) type {
         fault_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
         workload_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
         failure_examples: std.AutoHashMapUnmanaged(u64, FailureExample) = .empty,
+        flight_recordings: std.ArrayListUnmanaged(flight_recorder.Snapshot) = .empty,
         property_catalog: []PropertyCatalogStatus,
         report: Report = .{},
 
@@ -140,6 +148,8 @@ pub fn Campaign(comptime Scenario: type) type {
             self.fault_ids.deinit(self.allocator);
             self.workload_ids.deinit(self.allocator);
             self.failure_examples.deinit(self.allocator);
+            for (self.flight_recordings.items) |*recording| recording.deinit();
+            self.flight_recordings.deinit(self.allocator);
             self.allocator.free(self.property_catalog);
             self.corpus.deinit();
             self.coverage.deinit();
@@ -208,9 +218,12 @@ pub fn Campaign(comptime Scenario: type) type {
                 ordinal -= 1;
             } else unreachable;
             var source = try splice.Source.init(left.choices.items, right.choices.items, selected_point);
+            var flight = try flight_recorder.Recorder.init(self.allocator, self.config.flight_recorder_capacity);
+            defer flight.deinit();
             var artifact = runner.run(Scenario, self.allocator, source.source(), .{
                 .system = self.config.system,
                 .transition_budget = @intCast(source.combinedLength()),
+                .flight_recorder = &flight,
             }) catch |err| switch (err) {
                 error.SpliceChoiceExhausted,
                 error.SpliceChoiceSiteDiverged,
@@ -236,16 +249,19 @@ pub fn Campaign(comptime Scenario: type) type {
             self.report.exact_replay_checks += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions *| 2;
             self.report.spliced += 1;
-            try self.consider(&artifact, left_index, false);
+            try self.retainFlight(&flight, try self.consider(&artifact, left_index, false));
             return true;
         }
 
         fn runGenerated(self: *Self, seed: u64) !void {
             var seeded = choice.Seeded.init(seed);
+            var flight = try flight_recorder.Recorder.init(self.allocator, self.config.flight_recorder_capacity);
+            defer flight.deinit();
             var artifact = runner.run(Scenario, self.allocator, seeded.source(), .{
                 .system = self.config.system,
                 .seed = seed,
                 .transition_budget = self.config.transition_budget,
+                .flight_recorder = &flight,
             }) catch |err| {
                 self.report.harness_errors += 1;
                 return err;
@@ -253,7 +269,7 @@ pub fn Campaign(comptime Scenario: type) type {
             defer artifact.deinit();
             self.report.generated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
-            try self.consider(&artifact, null, false);
+            try self.retainFlight(&flight, try self.consider(&artifact, null, false));
         }
 
         fn runMutation(self: *Self, parent_index: usize) !bool {
@@ -287,6 +303,9 @@ pub fn Campaign(comptime Scenario: type) type {
                 replacement_ordinal -= 1;
             }
             if (try self.checkpointForMutation(&parent, mutation_index)) |checkpoint| {
+                var flight = try flight_recorder.Recorder.init(self.allocator, self.config.flight_recorder_capacity);
+                defer flight.deinit();
+                try recordPrefix(&flight, &parent, mutation_index);
                 var mutating = choice.Mutating.initAt(
                     parent.choices.items,
                     mutation_index,
@@ -294,7 +313,7 @@ pub fn Campaign(comptime Scenario: type) type {
                     self.prng.random().int(u64),
                     mutation_index,
                 );
-                var artifact = runner.resumeFromCheckpoint(Scenario, self.allocator, &parent, checkpoint, mutating.source()) catch |err| {
+                var artifact = runner.resumeFromCheckpointWithRecorder(Scenario, self.allocator, &parent, checkpoint, mutating.source(), &flight) catch |err| {
                     self.report.harness_errors += 1;
                     return err;
                 };
@@ -303,13 +322,16 @@ pub fn Campaign(comptime Scenario: type) type {
                 self.report.checkpoint_transitions_avoided +|= mutation_index;
                 self.report.transition_work_units +|= artifact.summary.?.transitions - mutation_index;
                 self.report.mutated += 1;
-                try self.consider(&artifact, parent_index, true);
+                try self.retainFlight(&flight, try self.consider(&artifact, parent_index, true));
                 return true;
             }
             var mutating = choice.Mutating.init(parent.choices.items, mutation_index, replacement, self.prng.random().int(u64));
+            var flight = try flight_recorder.Recorder.init(self.allocator, self.config.flight_recorder_capacity);
+            defer flight.deinit();
             var artifact = runner.run(Scenario, self.allocator, mutating.source(), .{
                 .system = self.config.system,
                 .transition_budget = self.config.transition_budget,
+                .flight_recorder = &flight,
             }) catch |err| {
                 self.report.harness_errors += 1;
                 return err;
@@ -317,7 +339,7 @@ pub fn Campaign(comptime Scenario: type) type {
             defer artifact.deinit();
             self.report.mutated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
-            try self.consider(&artifact, parent_index, false);
+            try self.retainFlight(&flight, try self.consider(&artifact, parent_index, false));
             return true;
         }
 
@@ -348,12 +370,14 @@ pub fn Campaign(comptime Scenario: type) type {
             }
         }
 
+        const Retention = enum { none, novelty, failure };
+
         fn consider(
             self: *Self,
             artifact: *const trace.Trace,
             parent_index: ?usize,
             exact_replay_before_retention: bool,
-        ) !void {
+        ) !Retention {
             self.report.transitions_executed +|= artifact.summary.?.transitions;
             for (artifact.observations.items) |record| try self.semantic_states.put(self.allocator, record.digest, {});
             for (artifact.transitions.items) |record| {
@@ -421,12 +445,33 @@ pub fn Campaign(comptime Scenario: type) type {
             }
             if (novelty.target_score > 0) self.report.target_hits += 1;
             if (failed) self.report.failures += 1;
-            if (novelty.discovered == 0 and novelty.target_score == 0 and !failed and self.corpus.entries.items.len > 0) return;
+            const flight_retention: Retention = if (failed)
+                .failure
+            else if (novelty.discovered > 0 or novelty.target_score > 0)
+                .novelty
+            else
+                .none;
+            if (novelty.discovered == 0 and novelty.target_score == 0 and !failed and self.corpus.entries.items.len > 0) return flight_retention;
             const added = try self.corpus.add(artifact, novelty);
             if (added.inserted) {
                 self.report.retained += 1;
                 if (parent_index) |index| try self.corpus.markProductive(index);
             }
+            return flight_retention;
+        }
+
+        fn retainFlight(self: *Self, recorder: *const flight_recorder.Recorder, retention: Retention) !void {
+            if (retention == .none or self.flight_recordings.items.len >= self.config.retained_flight_recordings) return;
+            var snapshot_value = try recorder.materialize(self.allocator, switch (retention) {
+                .failure => .failure,
+                .novelty => .novelty,
+                .none => unreachable,
+            });
+            errdefer snapshot_value.deinit();
+            self.report.flight_recordings += 1;
+            self.report.flight_records +|= snapshot_value.records.len;
+            self.report.flight_records_dropped +|= snapshot_value.dropped;
+            try self.flight_recordings.append(self.allocator, snapshot_value);
         }
 
         fn propertyStatus(self: *Self, property_id: ids.StableId) ?*PropertyCatalogStatus {
@@ -440,6 +485,22 @@ fn traceDigest(allocator: std.mem.Allocator, artifact: *const trace.Trace) !u64 
     const bytes = try artifact.renderAlloc(allocator);
     defer allocator.free(bytes);
     return ids.digest(bytes);
+}
+
+fn recordPrefix(recorder: *flight_recorder.Recorder, artifact: *const trace.Trace, choice_count: usize) !void {
+    for (artifact.events.items) |record| {
+        if (record.index > choice_count) break;
+        try recorder.record(.{
+            .index = record.index,
+            .ordinal = record.ordinal,
+            .id = record.id,
+            .name = record.name,
+            .kind = record.kind,
+            .actor_id = record.actor_id,
+            .resource_id = record.resource_id,
+            .payload_digest = record.payload_digest,
+        });
+    }
 }
 
 test "campaign generates, mutates, and retains semantic histories" {
@@ -467,6 +528,8 @@ test "campaign generates, mutates, and retains semantic histories" {
     try std.testing.expectEqual(campaign.report.histories, campaign.report.clean_histories + campaign.report.property_failure_histories + campaign.report.non_property_failure_histories);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.harness_errors);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.replay_divergences);
+    try std.testing.expect(campaign.report.flight_recordings > 0);
+    try std.testing.expectEqual(campaign.report.flight_recordings, campaign.flight_recordings.items.len);
 }
 
 test "campaign exact-replays compatible splices before retention" {
@@ -508,6 +571,8 @@ test "campaign selects validates and deduplicates logical checkpoints" {
     try std.testing.expect(campaign.report.checkpoints_inserted > 0);
     try std.testing.expect(campaign.report.checkpoint_resumes > 0);
     try std.testing.expect(campaign.report.checkpoint_transitions_avoided > 0);
+    try std.testing.expect(campaign.report.flight_recordings > 0);
+    try std.testing.expect(campaign.report.flight_records > 0);
     try std.testing.expectEqual(campaign.checkpoints.checkpoints.items.len, campaign.report.checkpoints_inserted);
     for (campaign.corpus.entries.items) |entry| {
         var artifact = try trace.parseAlloc(std.testing.allocator, entry.bytes);

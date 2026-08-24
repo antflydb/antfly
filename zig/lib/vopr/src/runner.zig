@@ -177,6 +177,17 @@ pub fn resumeFromCheckpoint(
     checkpoint: snapshot.Logical,
     suffix_source: choice.Source,
 ) !trace.Trace {
+    return resumeFromCheckpointWithRecorder(Scenario, allocator, artifact, checkpoint, suffix_source, null);
+}
+
+pub fn resumeFromCheckpointWithRecorder(
+    comptime Scenario: type,
+    allocator: std.mem.Allocator,
+    artifact: *const trace.Trace,
+    checkpoint: snapshot.Logical,
+    suffix_source: choice.Source,
+    recorder: ?*flight_recorder.Recorder,
+) !trace.Trace {
     comptime scenario_contract.assertContract(Scenario);
     comptime snapshot.assertContract(Scenario);
     try artifact.validate();
@@ -207,7 +218,7 @@ pub fn resumeFromCheckpoint(
         &result,
         checkpoint.transition_index,
         checkpoint.observation_digest,
-        null,
+        recorder,
     );
 }
 
