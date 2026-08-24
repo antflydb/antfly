@@ -822,6 +822,7 @@ const LocalStandaloneMetadata = struct {
                 .replace_table_definition = replaceTableDefinition,
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
+                .drop_table_expected = dropTableExpected,
                 .update_schema = updateSchema,
                 .update_schema_versioned = updateSchemaVersioned,
                 .create_index = createIndex,
@@ -1105,6 +1106,24 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         _ = self.manager.removeTableTopology(table.table_id);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
+    fn dropTableExpected(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+        expected_table_id: u64,
+    ) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.findTableByNameLocked(table_name) orelse return error.TableGenerationChanged;
+        if (table.table_id != expected_table_id) return error.TableGenerationChanged;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        _ = self.manager.removeTableTopology(expected_table_id);
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -7481,6 +7500,31 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqualStrings("docs", snapshot.tables[0].name);
 }
 
+test "standalone metadata conditional drop preserves a replacement identity" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-conditional-drop-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{ .table_id = 8, .name = "docs" });
+
+    const source = metadata.statusSource();
+    try std.testing.expect(source.supportsExpectedTableDrop());
+    try std.testing.expectError(error.TableGenerationChanged, source.dropTableExpected(alloc, "docs", 7));
+    try std.testing.expectEqual(@as(u64, 8), metadata.findTableByNameLocked("docs").?.table_id);
+}
+
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7594,6 +7638,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
                 .grace_ns = 10 * std.time.ns_per_s,
                 .sentinel_path = "/tmp/lease-fenced",
             }, null, null),
+            .io = std.testing.io,
             .executor = undefined,
             .uri = undefined,
             .token_path = "",

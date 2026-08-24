@@ -171,19 +171,48 @@ pub const SparseEnricher = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
         try maintenance_cancellation.check(cancellation);
 
+        // Loading and materializing the immutable manifest can be expensive.
+        // Do not initialize progress or emit work if publication moved while
+        // it was in flight. The monotonic stage-head CAS below closes the race
+        // where HEAD changes immediately after this check.
+        if ((try self.progress.getHead(namespace)) != head)
+            return error.EnrichmentProgressChanged;
+
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
-        if (stored_head != head) {
-            if (!(try self.progress.compareAndSwapEnrichmentStageHeadVersion(namespace, cfg.stage, stored_head, head)))
-                return error.EnrichmentProgressChanged;
-            const old_offset = try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage);
-            if (old_offset != null and old_offset.? != 0 and !(try self.progress.compareAndSwapEnrichmentStageDocOffset(
+        if (stored_head) |version| {
+            if (version > head) return error.EnrichmentProgressChanged;
+        }
+        var scoped_offset = try self.progress.getEnrichmentStageHeadDocOffset(namespace, cfg.stage, head);
+        if (scoped_offset == null) {
+            // Migrate an offset written before progress became head-scoped
+            // only when it belongs to this exact head. A future head always
+            // starts at zero and is initialized before it becomes visible.
+            const initial_offset = if (stored_head == head)
+                (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0
+            else
+                0;
+            if (try self.progress.compareAndSwapEnrichmentStageHeadDocOffset(
                 namespace,
                 cfg.stage,
-                old_offset,
-                0,
-            ))) return error.EnrichmentProgressChanged;
+                head,
+                null,
+                initial_offset,
+            )) {
+                scoped_offset = initial_offset;
+            } else {
+                scoped_offset = (try self.progress.getEnrichmentStageHeadDocOffset(namespace, cfg.stage, head)) orelse
+                    return error.EnrichmentProgressChanged;
+            }
         }
-        const start_offset: usize = @intCast((try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0);
+        if (stored_head != head) {
+            // The target offset is durable before the head CAS. A crash before
+            // the CAS leaves an unreachable zero offset; a crash after it
+            // leaves a complete, usable (head, offset) pair. Overlapping old
+            // workers can only advance the key for their own head.
+            if (!(try self.progress.compareAndSwapEnrichmentStageHeadVersion(namespace, cfg.stage, stored_head, head)))
+                return error.EnrichmentProgressChanged;
+        }
+        const start_offset: usize = @intCast(scoped_offset.?);
         if (start_offset >= docs.len) {
             return .{ .idle_namespaces = 1 };
         }
@@ -235,12 +264,18 @@ pub const SparseEnricher = struct {
         try maintenance_cancellation.check(cancellation);
         if ((try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage)) != head)
             return error.EnrichmentProgressChanged;
-        const previous_offset = try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage);
+        const previous_offset = try self.progress.getEnrichmentStageHeadDocOffset(namespace, cfg.stage, head);
         const durable_next: u64 = @intCast(next_offset);
         // Concurrent workers may already have advanced this stage. Never let
         // a slower completion move durable progress backwards.
         if ((previous_offset orelse 0) < durable_next and
-            !(try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, durable_next)))
+            !(try self.progress.compareAndSwapEnrichmentStageHeadDocOffset(
+                namespace,
+                cfg.stage,
+                head,
+                previous_offset,
+                durable_next,
+            )))
         {
             return error.EnrichmentProgressChanged;
         }

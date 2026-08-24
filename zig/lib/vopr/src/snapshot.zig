@@ -6,6 +6,7 @@
 //! optimization only: every retained artifact must still replay from init.
 
 const std = @import("std");
+const health = @import("health.zig");
 const ids = @import("id.zig");
 const property = @import("property.zig");
 const trace = @import("trace.zig");
@@ -19,6 +20,9 @@ pub const Logical = struct {
     state_digest: u64,
     bytes: []u8,
     property_statuses: []property.Status,
+    /// Path-dependent diagnostic state sampled while reconstructing this
+    /// prefix. It does not affect checkpoint or canonical trace identity.
+    health_recorder: ?health.Recorder = null,
 
     pub fn deinit(self: *Logical, allocator: std.mem.Allocator) void {
         allocator.free(self.property_statuses);
