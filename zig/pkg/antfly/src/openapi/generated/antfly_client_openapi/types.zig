@@ -4434,7 +4434,7 @@ pub const GraphBindingsResult = struct {
 pub const GraphBindingsReturn = struct {
     bindings: []const []const u8,
     limit: ?i64 = null,
-    /// Hydrate documents for projected non-null bindings.
+    /// Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
     include_documents: ?bool = null,
     /// Document fields to hydrate. Requires include_documents=true; omit to include all fields.
     fields: ?[]const []const u8 = null,

@@ -3832,7 +3832,7 @@ pub fn build(b: *std.Build) void {
         "db graph search filters result nodes and hidden traversal intermediates",
         "db graph shortest path searches through admitted alternatives",
         "db graph artifact external node targets return ids without document hydration",
-        "db graph hydration fails closed for a not-yet-promoted entity node",
+        "db graph hydration rejects table-qualified entity nodes in local snapshots",
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
         "cross-range graph diagnostics identify the rejected operation constraint",

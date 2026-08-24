@@ -306,8 +306,11 @@ const Factory = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
     peers: []const raft_engine.core.types.NodeId,
+    split_runtime: metadata_sim.SimSplitRuntime = .{},
+    merge_runtime: metadata_sim.SimMergeRuntime = .{},
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
     primary_group_id: ?u64 = null,
+    active_descriptors: usize = 0,
 
     fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
         return .{
@@ -341,6 +344,7 @@ const Factory = struct {
         errdefer self.alloc.free(peers);
         var bootstrap = try raft_catalog.runtimeBootstrapFromRecord(self.alloc, record);
         errdefer raft_catalog.freeRuntimeBootstrap(self.alloc, &bootstrap);
+        self.active_descriptors += 1;
         return .{
             .group = .{
                 .group_id = record.group_id,
@@ -364,6 +368,12 @@ const Factory = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         raft_catalog.freeRuntimeBootstrap(alloc, &desc.bootstrap);
         self.alloc.free(desc.group.raft_config.peers);
+        std.debug.assert(self.active_descriptors > 0);
+        self.active_descriptors -= 1;
+        if (self.active_descriptors == 0) {
+            self.split_runtime.deinit();
+            self.merge_runtime.deinit();
+        }
     }
 };
 
@@ -397,6 +407,12 @@ fn makeHostSimDeps(factory: *Factory) raft_sim.ManagedHttpHostSimulationDeps {
                 .host = .{
                     .descriptor_factory = factory.iface(),
                 },
+            },
+        },
+        .service = .{
+            .transition_runtime = .{
+                .split = factory.split_runtime.iface(),
+                .merge = factory.merge_runtime.iface(),
             },
         },
     };
@@ -806,6 +822,9 @@ const GraphTopologyChurnExecutor = struct {
     forward: http_common.RequestExecutor,
     cluster: *metadata_sim.MetadataHttpClusterSimulation,
     metadata_apis: *const [4][]const u8,
+    api_base_uris: *const [4][]const u8,
+    left_batch_body: []const u8,
+    right_batch_body: []const u8,
     mode: GraphChurnMode,
     trigger_count: u32 = 0,
 
@@ -824,18 +843,34 @@ const GraphTopologyChurnExecutor = struct {
             switch (self.mode) {
                 .merge_once => if (self.trigger_count == 0) {
                     try injectDocsMerge(alloc, self.forward, self.cluster, self.metadata_apis, 990001);
+                    try self.mirrorDocsToCurrentTopology(alloc);
                     self.trigger_count += 1;
                 },
                 .merge_then_split => if (self.trigger_count == 0) {
                     try injectDocsMerge(alloc, self.forward, self.cluster, self.metadata_apis, 990001);
+                    try self.mirrorDocsToCurrentTopology(alloc);
                     self.trigger_count += 1;
                 } else if (self.trigger_count == 1) {
                     try injectDocsSplit(alloc, self.forward, self.cluster, self.metadata_apis, 990002, "doc:m");
+                    try self.mirrorDocsToCurrentTopology(alloc);
                     self.trigger_count += 1;
                 },
             }
         }
         return try self.forward.execute(alloc, req);
+    }
+
+    fn mirrorDocsToCurrentTopology(self: *@This(), alloc: std.mem.Allocator) !void {
+        const leader_index = currentMetadataLeaderIndex(self.cluster) orelse return error.TestExpectedEqual;
+        var snapshot = try self.cluster.node(leader_index).adminSnapshot();
+        defer self.cluster.node(leader_index).freeAdminSnapshot(&snapshot);
+        const table = findAdminTableByName(&snapshot, "docs") orelse return error.TableNotFound;
+        const left_group = findRangeForKey(snapshot.ranges, table.table_id, "doc:a") orelse return error.RangeNotFound;
+        const right_group = findRangeForKey(snapshot.ranges, table.table_id, "doc:z") orelse return error.RangeNotFound;
+
+        var client = api_http_client.ApiHttpClient.init(alloc, self.forward);
+        try metadata_sim.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], left_group, "docs", self.left_batch_body);
+        try metadata_sim.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], right_group, "docs", self.right_batch_body);
     }
 };
 
@@ -918,8 +953,11 @@ fn injectDocsMerge(
         }
     }
     try std.testing.expect(finalized);
-    try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(cluster) orelse leader_index]);
-    try cluster.stepAll();
+    const reconcile_index = currentMetadataLeaderIndex(cluster) orelse leader_index;
+    var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
+    _ = try metadata_sim.retireFinalizedMergeTransition(cluster.node(reconcile_index), workflow.controlLoop());
 }
 
 fn injectDocsSplit(
@@ -959,8 +997,11 @@ fn injectDocsSplit(
         }
     }
     try std.testing.expect(finalized);
-    try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(cluster) orelse leader_index]);
-    try cluster.stepAll();
+    const reconcile_index = currentMetadataLeaderIndex(cluster) orelse leader_index;
+    var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
+    _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 }
 
 fn currentMetadataLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation) ?usize {
@@ -977,6 +1018,13 @@ fn currentGroupLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation,
         if (sim.leaderId(group_id)) |leader_id| {
             if (leader_id == cluster.cluster.configs[index].host.http.host.local_node_id) return index;
         }
+    }
+    return null;
+}
+
+fn currentGroupNonHostIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation, group_id: u64) ?usize {
+    for (0..cluster.cluster.nodes.len) |index| {
+        if (cluster.node(index).status(group_id) != .active) return index;
     }
     return null;
 }
@@ -1163,7 +1211,13 @@ fn ensureGroupGraphIndex(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root_dir, group_id);
         defer std.testing.allocator.free(path);
 
-        var db = db_mod.DB.open(std.testing.allocator, path, .{}) catch |err| switch (err) {
+        // Readiness probes must not compete with the resident runtime for the
+        // LSM writer lock. Query-readonly opens load index state while
+        // remaining side-effect free.
+        var db = db_mod.DB.open(std.testing.allocator, path, .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+        }) catch |err| switch (err) {
             error.PathAlreadyExists, error.FileNotFound => {
                 try cluster.stepAll();
                 continue;
@@ -1206,7 +1260,7 @@ fn expectGraphNodeKeys(
 
 fn expectGraphNodesResult(result: indexes_openapi.GraphQueryResult) !indexes_openapi.GraphNodesResult {
     return switch (result) {
-        .graph_nodes_result => |nodes| nodes,
+        .graph_nodes_result => |nodes| nodes.*,
         else => error.TestUnexpectedResult,
     };
 }
@@ -1254,7 +1308,7 @@ fn expectGraphNodePath(
     const path = node.path orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected_path.len, path.len);
     for (expected_path, path) |expected, actual| {
-        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expectEqualStrings(expected, actual.key);
     }
 
     const path_edges = node.path_edges orelse return error.TestExpectedEqual;
@@ -6652,6 +6706,14 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     var bootstrap_write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var bootstrap_api_base_uris: [4][]const u8 = undefined;
     const roots = [_][]const u8{ root_a, root_b, root_c, root_d };
+    factory_a.split_runtime.replica_root_dir = root_a;
+    factory_b.split_runtime.replica_root_dir = root_b;
+    factory_c.split_runtime.replica_root_dir = root_c;
+    factory_d.split_runtime.replica_root_dir = root_d;
+    factory_a.merge_runtime.replica_root_dir = root_a;
+    factory_b.merge_runtime.replica_root_dir = root_b;
+    factory_c.merge_runtime.replica_root_dir = root_c;
+    factory_d.merge_runtime.replica_root_dir = root_d;
 
     var bootstrap_forward_executor: std_http_executor.StdHttpExecutor = undefined;
     bootstrap_forward_executor.initInPlace(std.heap.page_allocator, .{});
@@ -6686,9 +6748,24 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, projected_ranges);
         if (projected_ranges.len == 0) continue;
         source_group_id = projected_ranges[0].group_id;
-        if (cluster.node(0).status(source_group_id) == .active or cluster.node(1).status(source_group_id) == .active or cluster.node(2).status(source_group_id) == .active) break;
+
+        var active_count: usize = 0;
+        for (0..4) |i| {
+            if (cluster.node(i).status(source_group_id) == .active) active_count += 1;
+        }
+        if (active_count == 3) break;
     }
     try std.testing.expect(source_group_id != 0);
+
+    const source_identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+        &cluster,
+        cluster.node(source_identity_status_node),
+        &roots,
+        "docs",
+        &.{source_group_id},
+    );
+    try cluster.stepAll();
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":619001,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
         source_group_id,
@@ -6697,19 +6774,14 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     defer std.testing.allocator.free(split_body);
     try metadata_client.requestTableSplit(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index], "docs", split_body);
 
-    var split_finalized = false;
-    rounds = 0;
-    while (rounds < 64) : (rounds += 1) {
-        try cluster.stepAll();
-        const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-        if (try cluster.node(query_index).observeSplitTransition(619001)) |observation| {
-            if (observation.status.phase == .finalized) {
-                split_finalized = true;
-                break;
-            }
-        }
+    try std.testing.expect(try metadata_sim.waitForSplitTransitionFinalized(&cluster, 619001, null, leader_index, 192));
+    {
+        const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+        var split_workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+        defer split_workflow.deinit();
+        try split_workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
+        _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
     }
-    try std.testing.expect(split_finalized);
     try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index]);
     try cluster.stepAll();
 
@@ -6737,26 +6809,44 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     try std.testing.expect(right_group != 0);
     try std.testing.expect(left_group != right_group);
 
+    const left_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"doc:a":{"title":"alpha","body":"hello left side","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}}}}
+    );
+    defer std.heap.page_allocator.free(left_batch_body);
+    const right_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{
+        \\  "doc:z":{"title":"zeta","body":"hello right side","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},
+        \\  "doc:y":{"title":"yotta","body":"right neighbor"}
+        \\}}
+    );
+    defer std.heap.page_allocator.free(right_batch_body);
+    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
+    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
+
     const left_leader_index = currentGroupLeaderIndex(&cluster, left_group) orelse return error.TestExpectedEqual;
     const right_leader_index = currentGroupLeaderIndex(&cluster, right_group) orelse return error.TestExpectedEqual;
     try ensureGroupGraphIndex(&cluster, roots[left_leader_index], left_group, "graph_idx", 40);
     try ensureGroupGraphIndex(&cluster, roots[right_leader_index], right_group, "graph_idx", 40);
 
-    const pre_query_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
-        \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"hello left side","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}},
-        \\  "doc:z":{"title":"zeta","body":"hello right side","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},
-        \\  "doc:y":{"title":"yotta","body":"right neighbor"}
-        \\}}
+    // Split materialization assigns the child ranges' durable identity
+    // namespaces. Publish those runtime facts before routing writes across the
+    // new topology so admission compares against the authoritative values.
+    const identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+        &cluster,
+        cluster.node(identity_status_node),
+        &roots,
+        "docs",
+        &.{ left_group, right_group },
     );
-    defer std.heap.page_allocator.free(pre_query_batch_body);
-    var pre_query_batch = try client.fetchBatch(bootstrap_api_base_uris[0], "docs", pre_query_batch_body);
-    defer pre_query_batch.deinit(std.heap.page_allocator);
 
     var churn_executor = GraphTopologyChurnExecutor{
         .forward = client_executor.executor(),
         .cluster = &cluster,
         .metadata_apis = &metadata_apis,
+        .api_base_uris = &bootstrap_api_base_uris,
+        .left_batch_body = left_batch_body,
+        .right_batch_body = right_batch_body,
         .mode = .merge_once,
     };
     var listeners: [4]api_http_test_runtime.Runtime = undefined;
@@ -6784,7 +6874,9 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
-    const client_base = api_base_uris[non_host_index orelse return error.TestExpectedEqual];
+    // The merge receiver is the left group. Route through a non-host so the
+    // fresh-snapshot retry cannot bypass the coordinator's remote path.
+    const client_base = api_base_uris[currentGroupNonHostIndex(&cluster, left_group) orelse return error.TestExpectedEqual];
     const graph_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
         std.heap.page_allocator,
         "walk",
@@ -6890,6 +6982,14 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     var bootstrap_write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var bootstrap_api_base_uris: [4][]const u8 = undefined;
     const roots = [_][]const u8{ root_a, root_b, root_c, root_d };
+    factory_a.split_runtime.replica_root_dir = root_a;
+    factory_b.split_runtime.replica_root_dir = root_b;
+    factory_c.split_runtime.replica_root_dir = root_c;
+    factory_d.split_runtime.replica_root_dir = root_d;
+    factory_a.merge_runtime.replica_root_dir = root_a;
+    factory_b.merge_runtime.replica_root_dir = root_b;
+    factory_c.merge_runtime.replica_root_dir = root_c;
+    factory_d.merge_runtime.replica_root_dir = root_d;
 
     var bootstrap_forward_executor: std_http_executor.StdHttpExecutor = undefined;
     bootstrap_forward_executor.initInPlace(std.heap.page_allocator, .{});
@@ -6924,9 +7024,24 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         defer cluster.node(query_index).freeProjectedRanges(std.testing.allocator, projected_ranges);
         if (projected_ranges.len == 0) continue;
         source_group_id = projected_ranges[0].group_id;
-        if (source_group_id != 0) break;
+
+        var active_count: usize = 0;
+        for (0..4) |i| {
+            if (cluster.node(i).status(source_group_id) == .active) active_count += 1;
+        }
+        if (active_count == 3) break;
     }
     try std.testing.expect(source_group_id != 0);
+
+    const source_identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+        &cluster,
+        cluster.node(source_identity_status_node),
+        &roots,
+        "docs",
+        &.{source_group_id},
+    );
+    try cluster.stepAll();
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":619101,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
         source_group_id,
@@ -6935,19 +7050,14 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     defer std.testing.allocator.free(split_body);
     try metadata_client.requestTableSplit(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index], "docs", split_body);
 
-    var split_finalized = false;
-    rounds = 0;
-    while (rounds < 64) : (rounds += 1) {
-        try cluster.stepAll();
-        const query_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-        if (try cluster.node(query_index).observeSplitTransition(619101)) |observation| {
-            if (observation.status.phase == .finalized) {
-                split_finalized = true;
-                break;
-            }
-        }
+    try std.testing.expect(try metadata_sim.waitForSplitTransitionFinalized(&cluster, 619101, null, leader_index, 192));
+    {
+        const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+        var split_workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+        defer split_workflow.deinit();
+        try split_workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
+        _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
     }
-    try std.testing.expect(split_finalized);
     try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index]);
     try cluster.stepAll();
 
@@ -6973,27 +7083,43 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     }
     try std.testing.expect(left_group != 0);
     try std.testing.expect(right_group != 0);
+    try std.testing.expect(left_group != right_group);
+
+    const left_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"doc:a":{"title":"alpha","body":"hello left side","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}}}}
+    );
+    defer std.heap.page_allocator.free(left_batch_body);
+    const right_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{
+        \\  "doc:z":{"title":"zeta","body":"hello right side","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},
+        \\  "doc:y":{"title":"yotta","body":"right neighbor"}
+        \\}}
+    );
+    defer std.heap.page_allocator.free(right_batch_body);
+    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
+    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
 
     const left_leader_index = currentGroupLeaderIndex(&cluster, left_group) orelse return error.TestExpectedEqual;
     const right_leader_index = currentGroupLeaderIndex(&cluster, right_group) orelse return error.TestExpectedEqual;
     try ensureGroupGraphIndex(&cluster, roots[left_leader_index], left_group, "graph_idx", 40);
     try ensureGroupGraphIndex(&cluster, roots[right_leader_index], right_group, "graph_idx", 40);
 
-    const pre_query_batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
-        \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"hello left side","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}},
-        \\  "doc:z":{"title":"zeta","body":"hello right side","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},
-        \\  "doc:y":{"title":"yotta","body":"right neighbor"}
-        \\}}
+    const identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
+    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+        &cluster,
+        cluster.node(identity_status_node),
+        &roots,
+        "docs",
+        &.{ left_group, right_group },
     );
-    defer std.heap.page_allocator.free(pre_query_batch_body);
-    var pre_query_batch = try client.fetchBatch(bootstrap_api_base_uris[0], "docs", pre_query_batch_body);
-    defer pre_query_batch.deinit(std.heap.page_allocator);
 
     var churn_executor = GraphTopologyChurnExecutor{
         .forward = client_executor.executor(),
         .cluster = &cluster,
         .metadata_apis = &metadata_apis,
+        .api_base_uris = &bootstrap_api_base_uris,
+        .left_batch_body = left_batch_body,
+        .right_batch_body = right_batch_body,
         .mode = .merge_then_split,
     };
     var listeners: [4]api_http_test_runtime.Runtime = undefined;
@@ -7021,7 +7147,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     defer for (&listeners) |*listener| listener.deinit();
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
 
-    const client_base = api_base_uris[non_host_index orelse return error.TestExpectedEqual];
+    const client_base = api_base_uris[currentGroupNonHostIndex(&cluster, left_group) orelse return error.TestExpectedEqual];
     const graph_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
         std.heap.page_allocator,
         "walk",

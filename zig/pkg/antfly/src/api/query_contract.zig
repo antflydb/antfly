@@ -5282,24 +5282,82 @@ fn findGraphQuery(
     return null;
 }
 
+const GraphDocumentLookup = struct {
+    const Entry = struct { document: ?std.json.Value };
+
+    enabled: bool,
+    remaining_bindings: usize = public_limits.max_graph_hydrated_bindings,
+    entries: graph_node_identity.Map(Entry) = .{},
+
+    fn init(
+        alloc: std.mem.Allocator,
+        hits: []const db_mod.types.SearchHit,
+        enabled: bool,
+    ) !GraphDocumentLookup {
+        var self = GraphDocumentLookup{ .enabled = enabled };
+        errdefer self.deinit(alloc);
+        if (!enabled) return self;
+
+        for (hits) |hit| {
+            const identity = graph_node_identity.Ref{
+                .table = hit.source_table,
+                .key = hit.id,
+            };
+            if (self.entries.contains(identity)) continue;
+            const parsed_document = if (hit.stored_data) |stored_data|
+                ant_json.parseFromSliceLeaky(std.json.Value, alloc, stored_data, .{}) catch
+                    return error.InvalidRemoteResponse
+            else
+                null;
+            _ = try self.entries.putIfAbsent(alloc, identity, .{ .document = parsed_document });
+        }
+        return self;
+    }
+
+    fn document(
+        self: *GraphDocumentLookup,
+        key: []const u8,
+        table: ?[]const u8,
+    ) !?std.json.Value {
+        if (!self.enabled) return null;
+        if (self.remaining_bindings == 0) return error.QueryCandidateBudgetExceeded;
+        self.remaining_bindings -= 1;
+        const entry = self.entries.get(.{ .table = table, .key = key }) orelse return null;
+        return entry.document;
+    }
+
+    fn deinit(self: *GraphDocumentLookup, alloc: std.mem.Allocator) void {
+        self.entries.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 fn toOpenApiGraphQueryResult(
     alloc: std.mem.Allocator,
     query: graph_query_mod.GraphQuery,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
+    var document_lookup = try GraphDocumentLookup.init(
+        alloc,
+        graph_result.hits,
+        query.include_documents,
+    );
+    defer document_lookup.deinit(alloc);
+
     if (query.legacy_response) {
         const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
         errdefer alloc.destroy(response);
         response.* = .{
             .kind = "legacy",
             .type = legacyGraphQueryType(query.query_type),
-            .nodes = try toOpenApiLegacyGraphNodes(alloc, graph_result),
+            .nodes = try toOpenApiLegacyGraphNodes(alloc, graph_result, &document_lookup),
             .paths = try toOpenApiPaths(alloc, graph_result.paths),
             .matches = try toOpenApiLegacyPatternMatches(
                 alloc,
                 graph_result,
                 query.params.include_paths,
+                &document_lookup,
             ),
             .total = @intCast(graph_result.total_hits),
             .took = meta.took_ms,
@@ -5307,7 +5365,7 @@ fn toOpenApiGraphQueryResult(
         return .{ .legacy_graph_query_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
-        const rows = try toOpenApiGraphRows(alloc, graph_result);
+        const rows = try toOpenApiGraphRows(alloc, graph_result, &document_lookup);
         const response = try alloc.create(indexes_openapi.GraphBindingsResult);
         errdefer alloc.destroy(response);
         response.* = .{
@@ -5337,7 +5395,7 @@ fn toOpenApiGraphQueryResult(
         return .{ .graph_aggregates_result = response };
     }
 
-    const nodes = try toOpenApiGraphNodes(alloc, graph_result);
+    const nodes = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
     const paths = try toOpenApiGraphPaths(alloc, graph_result.paths);
     const response = try alloc.create(indexes_openapi.GraphNodesResult);
     errdefer alloc.destroy(response);
@@ -5368,6 +5426,7 @@ fn toOpenApiLegacyPatternMatches(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
     include_paths: bool,
+    document_lookup: *GraphDocumentLookup,
 ) !?[]const indexes_openapi.PatternMatch {
     if (graph_result.matches.len == 0) return null;
     const out = try alloc.alloc(indexes_openapi.PatternMatch, graph_result.matches.len);
@@ -5380,9 +5439,7 @@ fn toOpenApiLegacyPatternMatches(
                 .table = binding.node.table,
                 .depth = @intCast(binding.node.depth),
                 .distance = binding.node.distance,
-                .document = findGraphDocument(
-                    alloc,
-                    graph_result.hits,
+                .document = try document_lookup.document(
                     binding.node.key,
                     binding.node.table,
                 ),
@@ -5404,6 +5461,7 @@ fn toOpenApiLegacyPatternMatches(
 fn toOpenApiGraphRows(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
+    document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.GraphResultRow {
     const out = try alloc.alloc(indexes_openapi.GraphResultRow, graph_result.matches.len);
     for (graph_result.matches, 0..) |match, i| {
@@ -5415,9 +5473,7 @@ fn toOpenApiGraphRows(
                 .table = binding.node.table,
                 .depth = @intCast(binding.node.depth),
                 .distance = binding.node.distance,
-                .document = findGraphDocument(
-                    alloc,
-                    graph_result.hits,
+                .document = try document_lookup.document(
                     binding.node.key,
                     binding.node.table,
                 ),
@@ -5492,7 +5548,9 @@ test "pattern response omits paths unless requested" {
         .total_hits = 1,
     };
 
-    const rows = try toOpenApiGraphRows(alloc, graph_result);
+    var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
+    defer document_lookup.deinit(alloc);
+    const rows = try toOpenApiGraphRows(alloc, graph_result, &document_lookup);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expect(rows[0].map.get("node") != null);
 }
@@ -5673,6 +5731,7 @@ test "generated graph result union decodes pre-discriminator legacy responses" {
 fn toOpenApiGraphNodes(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
+    document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.GraphResultNode {
     const nodes = try alloc.alloc(indexes_openapi.GraphResultNode, graph_result.nodes.len);
     for (graph_result.nodes, 0..) |node, i| {
@@ -5681,7 +5740,7 @@ fn toOpenApiGraphNodes(
             .table = node.table,
             .depth = @intCast(node.depth),
             .distance = node.distance,
-            .document = findGraphDocument(alloc, graph_result.hits, node.key, node.table),
+            .document = try document_lookup.document(node.key, node.table),
             .path = try toOpenApiGraphNodePath(alloc, node),
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
@@ -5695,6 +5754,7 @@ fn toOpenApiGraphNodes(
 fn toOpenApiLegacyGraphNodes(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
+    document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.LegacyGraphResultNode {
     const nodes = try alloc.alloc(indexes_openapi.LegacyGraphResultNode, graph_result.nodes.len);
     for (graph_result.nodes, 0..) |node, i| {
@@ -5703,7 +5763,7 @@ fn toOpenApiLegacyGraphNodes(
             .table = node.table,
             .depth = @intCast(node.depth),
             .distance = node.distance,
-            .document = findGraphDocument(alloc, graph_result.hits, node.key, node.table),
+            .document = try document_lookup.document(node.key, node.table),
             .path = node.path,
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
@@ -5731,25 +5791,6 @@ fn toOpenApiGraphNodePath(
         };
     }
     return out;
-}
-
-fn findGraphDocument(
-    alloc: std.mem.Allocator,
-    hits: []const db_mod.types.SearchHit,
-    key: []const u8,
-    table: ?[]const u8,
-) ?std.json.Value {
-    for (hits) |hit| {
-        if (!std.mem.eql(u8, hit.id, key)) continue;
-        if ((hit.source_table == null) != (table == null)) continue;
-        if (table) |table_name| {
-            if (!std.mem.eql(u8, hit.source_table.?, table_name)) continue;
-        }
-        const stored_data = hit.stored_data orelse return null;
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, stored_data, .{}) catch return null;
-        return parsed.value;
-    }
-    return null;
 }
 
 fn toOpenApiPaths(
@@ -5944,7 +5985,9 @@ test "api query contract preserves algebraic graph path provenance" {
         .total_hits = 1,
     };
 
-    const encoded = try toOpenApiGraphNodes(alloc, graph_result);
+    var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
+    defer document_lookup.deinit(alloc);
+    const encoded = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
     defer {
         if (encoded[0].path) |items| alloc.free(items);
         if (encoded[0].path_edges) |items| alloc.free(items);
@@ -5977,7 +6020,7 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
     try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
 
-    const legacy_encoded = try toOpenApiLegacyGraphNodes(alloc, graph_result);
+    const legacy_encoded = try toOpenApiLegacyGraphNodes(alloc, graph_result, &document_lookup);
     defer alloc.free(legacy_encoded);
     try std.testing.expectEqualStrings("A", legacy_encoded[0].path.?[0]);
     try std.testing.expectEqualStrings("C", legacy_encoded[0].path.?[2]);
@@ -5999,19 +6042,66 @@ test "api query contract hydrates equal graph keys from their table namespace" {
         },
     };
 
-    const local = findGraphDocument(alloc, &hits, "shared", null) orelse
+    var document_lookup = try GraphDocumentLookup.init(alloc, &hits, true);
+    defer document_lookup.deinit(alloc);
+
+    const local = (try document_lookup.document("shared", null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(
         "docs",
         local.object.get("origin").?.string,
     );
-    const external = findGraphDocument(alloc, &hits, "shared", "entities") orelse
+    const external = (try document_lookup.document("shared", "entities")) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(
         "entities",
         external.object.get("origin").?.string,
     );
-    try std.testing.expect(findGraphDocument(alloc, &hits, "shared", "missing") == null);
+    try std.testing.expect(try document_lookup.document("shared", "missing") == null);
+}
+
+test "api query contract bounds hydrated graph binding cells" {
+    const body =
+        \\{
+        \\  "graph_queries": {
+        \\    "too_wide": {
+        \\      "index": "graph",
+        \\      "match": {
+        \\        "anchor": "a",
+        \\        "nodes": {"a": {}, "b": {}},
+        \\        "edges": [{"from": "a", "to": "b"}]
+        \\      },
+        \\      "return": {
+        \\        "bindings": ["a", "b"],
+        \\        "limit": 5001,
+        \\        "include_documents": true
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseQueryRequest(std.testing.allocator, null, "docs", body),
+    );
+}
+
+test "graph document lookup enforces its defensive hydration budget" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+    const hits = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("doc:a"),
+        .stored_data = @constCast("{\"title\":\"a\"}"),
+    }};
+    var lookup = try GraphDocumentLookup.init(alloc, &hits, true);
+    defer lookup.deinit(alloc);
+    lookup.remaining_bindings = 1;
+    try std.testing.expect((try lookup.document("doc:a", null)) != null);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        lookup.document("doc:a", null),
+    );
 }
 
 fn buildProfileValue(
@@ -9160,6 +9250,15 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     if (bindings_return) |return_value| {
         if (return_value.fields != null and return_value.include_documents != true)
             return error.InvalidQueryRequest;
+        if (return_value.include_documents == true) {
+            const hydrated_bindings = std.math.mul(
+                usize,
+                @as(usize, limit),
+                return_value.bindings.len,
+            ) catch return error.InvalidQueryRequest;
+            if (hydrated_bindings > public_limits.max_graph_hydrated_bindings)
+                return error.InvalidQueryRequest;
+        }
     }
     const fields = if (bindings_return) |return_value|
         if (return_value.fields) |items| try cloneFields(alloc, items) else &.{}

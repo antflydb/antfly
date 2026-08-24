@@ -242,12 +242,12 @@ pub const GraphResultNode = struct {
     key: []const u8,
     depth: u32,
     distance: f64,
-    path: ?[]const []const u8,
+    path: ?[]const []const u8 = null,
     /// Table provenance parallel to `path`. Null means every path node belongs
     /// to the query table. When present, null entries still mean query-table
     /// nodes and non-null entries are owned table qualifiers.
     path_tables: ?[]const ?[]const u8 = null,
-    path_edges: ?[]const PathEdgeInfo,
+    path_edges: ?[]const PathEdgeInfo = null,
     provenance: ?[]const []const u8 = null,
     /// Table the node's document lives in, when an edge reaching it declared a
     /// cross-table endpoint (`target_table` in its metadata). Null means the

@@ -1912,7 +1912,10 @@ test "query parser accepts graph queries" {
     try std.testing.expectEqualStrings("graph_idx", owned.req.graph_queries[0].query.index_name);
     try std.testing.expect(owned.req.graph_queries[0].query.query_type == .traverse);
     switch (owned.req.graph_queries[0].query.start_nodes) {
-        .keys => |keys| try std.testing.expectEqualStrings("doc:a", keys[0]),
+        .identities => |identities| {
+            try std.testing.expectEqualStrings("doc:a", identities[0].key);
+            try std.testing.expect(identities[0].table == null);
+        },
         else => return error.TestUnexpectedResult,
     }
 }
@@ -2300,6 +2303,7 @@ test "query encoder emits graph results" {
                     .query_type = .neighbors,
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .include_documents = true,
                 },
             },
         },
@@ -3335,7 +3339,15 @@ fn expectGraphTableProvenanceMerge(alloc: std.mem.Allocator) !void {
         .graph_results = &graph_results,
     };
 
-    var merged = try mergeSearchResults(alloc, .{}, &.{input}, 0, 0);
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "related",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+        },
+    }};
+    var merged = try mergeSearchResults(alloc, .{ .graph_queries = &queries }, &.{input}, 0, 0);
     defer merged.deinit();
 
     const graph_result = merged.graph_results[0];

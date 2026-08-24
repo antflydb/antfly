@@ -15266,6 +15266,17 @@ pub const DB = struct {
     fn rebuildGraphDerivedState(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
+        // Portable restore imports graph edge artifacts before the table's
+        // configured indexes are opened. Materialize those durable artifacts
+        // before repairing reverse edges; rebuilding reverse state alone would
+        // silently publish an empty graph for an otherwise valid backup.
+        try applySplitGraphArtifactsInRange(
+            self.alloc,
+            self.getRange().start,
+            self.getRange().end,
+            self.core.store,
+            self.core.index_manager,
+        );
         return try self.core.index_manager.rebuildGraphSplitDestination(
             self.getRange().start,
             self.getRange().end,
@@ -15861,6 +15872,10 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
+        var work_budget = graph_pattern_mod.WorkBudget.init(
+            graph_pattern_mod.default_max_explored_nodes,
+            graph_pattern_mod.default_max_explored_edges,
+        );
         return try self.matchPatternWithNodeAdmission(
             alloc,
             index_name,
@@ -15872,6 +15887,7 @@ pub const DB = struct {
             false,
             true,
             null,
+            &work_budget,
         );
     }
 
@@ -15887,6 +15903,7 @@ pub const DB = struct {
         target_required: bool,
         include_paths: bool,
         node_admission: ?NodeAdmission,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -15902,6 +15919,7 @@ pub const DB = struct {
                 .func = patternNodeFilterEvaluator,
             },
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 
@@ -15914,6 +15932,7 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
         node_admission: ?NodeAdmission,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -15924,6 +15943,7 @@ pub const DB = struct {
             .include_paths = false,
             .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 
@@ -15933,6 +15953,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_keys: []const []const u8,
         node_admission: ?NodeAdmission,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) ![]types.GraphAggregateResult {
         if (start_keys.len == 0) {
             const empty = try alloc.alloc(types.GraphAggregateResult, named.query.aggregates.len);
@@ -15965,6 +15986,8 @@ pub const DB = struct {
             .{
                 .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
                 .node_admission = node_admission,
+                .work_budget = budgets.work,
+                .distinct_budget = budgets.distinct,
             },
         );
         defer {
@@ -25134,6 +25157,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) !types.GraphSearchResult {
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
@@ -25150,6 +25174,7 @@ pub const DB = struct {
                 named_sets,
                 &execution,
                 predicate_aware,
+                budgets,
             ),
             else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
                 .ctx = self,
@@ -25259,9 +25284,10 @@ pub const DB = struct {
         req: types.SearchRequest,
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror!types.GraphSearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.executeSingleGraphQueryWithSets(alloc, req, named, named_sets);
+        return try self.executeSingleGraphQueryWithSets(alloc, req, named, named_sets, budgets);
     }
 
     fn executeSinglePatternQueryWithSets(
@@ -25270,6 +25296,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) !types.GraphSearchResult {
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
@@ -25285,6 +25312,7 @@ pub const DB = struct {
             named_sets,
             &execution,
             predicate_aware,
+            budgets,
         );
     }
 
@@ -25296,6 +25324,7 @@ pub const DB = struct {
         named_sets: []const NamedResultSet,
         execution: *GraphPredicateExecutionContext,
         predicate_aware: bool,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) !types.GraphSearchResult {
         return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
             .ctx = self,
@@ -25318,7 +25347,7 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .filter_keys = filterGraphKeysCallback,
-        });
+        }, budgets);
     }
 
     fn filterGraphKeysCallback(
@@ -25617,6 +25646,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchPatternWithNodeAdmission(
@@ -25630,6 +25660,7 @@ pub const DB = struct {
             named.query.target_nodes != null,
             named.query.params.include_paths,
             null,
+            budgets.work,
         );
     }
 
@@ -25639,6 +25670,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchPatternWithNodeAdmission(
@@ -25652,6 +25684,7 @@ pub const DB = struct {
             named.query.target_nodes != null,
             named.query.params.include_paths,
             execution.admission.iface(),
+            budgets.work,
         );
     }
 
@@ -25660,6 +25693,7 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchConjunctivePatternWithNodeAdmission(
@@ -25670,6 +25704,7 @@ pub const DB = struct {
             conjunctiveShardResultLimit(named.query),
             named.query.return_aliases,
             null,
+            budgets.work,
         );
     }
 
@@ -25678,6 +25713,7 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchConjunctivePatternWithNodeAdmission(
@@ -25688,6 +25724,7 @@ pub const DB = struct {
             conjunctiveShardResultLimit(named.query),
             named.query.return_aliases,
             execution.admission.iface(),
+            budgets.work,
         );
     }
 
@@ -25696,9 +25733,10 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]types.GraphAggregateResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null);
+        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null, budgets);
     }
 
     fn executeConjunctiveAggregateWithAdmissionCallback(
@@ -25706,9 +25744,16 @@ pub const DB = struct {
         alloc: Allocator,
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
+        budgets: db_query_graph.RequestGraphBudgets,
     ) anyerror![]types.GraphAggregateResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try execution.db.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, execution.admission.iface());
+        return try execution.db.aggregateConjunctivePatternWithNodeAdmission(
+            alloc,
+            named,
+            start_key_refs,
+            execution.admission.iface(),
+            budgets,
+        );
     }
 
     fn conjunctiveShardResultLimit(query: graph_query_mod.GraphQuery) u32 {
@@ -25976,7 +26021,21 @@ pub const DB = struct {
             };
             const graph_results = try alloc.alloc(types.GraphSearchResult, 1);
             errdefer alloc.free(graph_results);
-            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, req, &named_query, named_sets);
+            var work_budget = graph_pattern_mod.WorkBudget.init(
+                graph_pattern_mod.default_max_explored_nodes,
+                graph_pattern_mod.default_max_explored_edges,
+            );
+            var distinct_budget = graph_pattern_mod.DistinctBudget.init(
+                graph_pattern_mod.default_max_distinct_identities,
+                graph_pattern_mod.default_max_distinct_identity_bytes,
+            );
+            graph_results[0] = try self.executeSinglePatternQueryWithSets(
+                alloc,
+                req,
+                &named_query,
+                named_sets,
+                .{ .work = &work_budget, .distinct = &distinct_budget },
+            );
             return .{
                 .alloc = alloc,
                 .hits = &.{},
@@ -52309,7 +52368,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
     }
 }
 
-test "db graph hydration fails closed for a not-yet-promoted entity node" {
+test "db graph hydration rejects table-qualified entity nodes in local snapshots" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -52377,27 +52436,13 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         }),
     );
 
-    // The mention edge points at person/ada_lovelace, but that entity document
-    // has not been promoted into this store: the node is returned as a graph
-    // result with its key, hydrated to nothing (fail closed), never fabricated.
-    {
-        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
-        defer result.deinit();
-        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
-        const hits = result.graph_results[0].hits;
-        try std.testing.expectEqual(@as(usize, 1), hits.len);
-        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
-        try std.testing.expect(hits[0].stored_data == null);
-
-        // The reached node records its home table (from the mention edge's
-        // `target_table` metadata) so the api can route hydration to the
-        // entities table instead of failing closed against the query table.
-        const nodes = result.graph_results[0].nodes;
-        try std.testing.expectEqual(@as(usize, 1), nodes.len);
-        try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
-        try std.testing.expect(nodes[0].table != null);
-        try std.testing.expectEqualStrings("entities", nodes[0].table.?);
-    }
+    // A table-local DB snapshot cannot hydrate the entity binding. Reject the
+    // request instead of returning a successful response with a missing
+    // document; coordinator-backed execution owns cross-table hydration.
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} }),
+    );
 
     // Resolver targets are cross-table even when the graph's default node model
     // is document. Reverse traversal admits that external start by edge role,
@@ -52445,8 +52490,8 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].key);
     }
 
-    // Once the entity document exists (promoter wrote it; here co-located for the
-    // single-store test), the same node hydrates instead of failing closed.
+    // Even a coincidentally equal key in the source table must not satisfy an
+    // entities-qualified identity. The coordinator must read the named table.
     try db.batch(.{
         .writes = &.{.{ .key = "person/ada_lovelace", .value =
         \\{"entity_type":"person","canonical_name":"Ada Lovelace"}
@@ -52454,15 +52499,10 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         .sync_level = .write,
     });
     try db.runUntilIdle();
-    {
-        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
-        defer result.deinit();
-        const hits = result.graph_results[0].hits;
-        try std.testing.expectEqual(@as(usize, 1), hits.len);
-        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
-        try std.testing.expect(hits[0].stored_data != null);
-        try std.testing.expect(std.mem.indexOf(u8, hits[0].stored_data.?, "Ada Lovelace") != null);
-    }
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} }),
+    );
 }
 
 test "db graph relation artifact materializer uses mapping templates" {

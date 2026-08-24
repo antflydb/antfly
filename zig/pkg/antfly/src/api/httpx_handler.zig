@@ -1817,7 +1817,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphExpand(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, @errorName(err)) else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphExpandResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalGraphHydrate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1829,7 +1831,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphHydrate(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphHydrateResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalGraphEdges(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1841,7 +1845,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphEdges(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphEdgesResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

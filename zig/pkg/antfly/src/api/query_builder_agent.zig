@@ -2936,6 +2936,9 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
     if (try metadataValidateGraphSearchResultRefs(alloc, seed_query_request, parsed.value.graph_queries)) |feedback| {
         return .{ .feedback = feedback };
     }
+    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, parsed.value.graph_queries)) |feedback| {
+        return .{ .feedback = feedback };
+    }
     if (plan_validator) |validator| {
         if (try validator.validateGraphSearches(alloc, request, parsed.value.graph_queries)) |feedback| {
             return .{ .feedback = feedback };
@@ -3695,7 +3698,10 @@ fn validateGeneratedGraphNodeSelector(selector: indexes_openapi.GraphNodeSelecto
             }
         },
         .graph_result_ref_node_selector => |value| {
-            if (!isAllowedGeneratedGraphResultRef(value.result_ref)) return error.InvalidQueryBuilderGeneration;
+            // Dependency validation below owns the supported-ref vocabulary so
+            // it can return specific repair feedback instead of collapsing an
+            // actionable bad ref into a generic generation failure.
+            if (value.result_ref.len == 0) return error.InvalidQueryBuilderGeneration;
             if (value.limit) |limit| {
                 if (limit <= 0 or limit > 10_000) return error.InvalidQueryBuilderGeneration;
             }
@@ -6870,7 +6876,7 @@ test "query builder metadata validator accepts executable graph node filters" {
     try std.testing.expect(feedback == null);
 }
 
-test "query builder metadata validator rejects graph result refs without seed results" {
+test "query builder metadata validator accepts the canonical ranked result ref" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
         \\  "graph_queries": {
@@ -6889,9 +6895,7 @@ test "query builder metadata validator rejects graph result refs without seed re
     const feedback = try metadataValidateQueryRequestAgainstContext(std.testing.allocator, &context, parsed.value, null);
     defer if (feedback) |value| std.testing.allocator.free(value);
 
-    try std.testing.expect(feedback != null);
-    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "$query_results") != null);
-    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "full_text_search is absent") != null);
+    try std.testing.expect(feedback == null);
 }
 
 test "query builder preflight reports metadata diagnostics" {
@@ -8377,7 +8381,7 @@ test "query builder uses generated graph specialist when runner is provided" {
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    try std.testing.expectEqualStrings("Expands from lexical matches through reference edges.", result.explanation.?);
+    try std.testing.expectEqualStrings("Expands from ranked matches through reference edges.", result.explanation.?);
     try std.testing.expectEqual(@as(f64, 0.87), result.confidence.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
@@ -8518,7 +8522,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
 
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("graph", result.specialist.?);
-    try std.testing.expectEqualStrings("Repaired to use the available lexical seed.", result.explanation.?);
+    try std.testing.expectEqualStrings("Repaired to use the ranked query seed.", result.explanation.?);
     const graph_query = result.query_request.?.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("$query_results", graph_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
 }

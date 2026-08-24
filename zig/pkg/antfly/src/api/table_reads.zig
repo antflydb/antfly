@@ -2776,7 +2776,7 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
     ) !PreparedKeyRead {
         var attempt: usize = 0;
-        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+        while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
@@ -3108,9 +3108,7 @@ pub const ProvisionedTableReadSource = struct {
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+            const base_req = graphCoordinatorBaseRequest(req);
             var merged = queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -4125,6 +4123,28 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        // A graph retry re-runs its base scan and every shard fanout. Keep the
+        // public retry budget to one fresh topology snapshot so churn cannot
+        // amplify an expensive query up to the generic point-read limit.
+        const attempt_limit: usize = if (req.graph_queries.len > 0) 2 else ProvisionedTableReadSource.topology_read_attempt_limit;
+        var attempt: usize = 0;
+        while (attempt < attempt_limit) : (attempt += 1) {
+            checkQueryDeadline(req) catch |err| return err;
+            return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn queryAttempt(
+        self: *HostedProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -4157,10 +4177,23 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
 
-        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+        var needs_graph_coordinator = requiresDistributedGraphCoordinator(group_ids.len, req);
+        if (!needs_graph_coordinator and group_ids.len == 1 and req.graph_queries.len > 0) {
+            var graph_route = (try table_router.resolveGroupRoute(
+                alloc,
+                self.catalog,
+                self.router,
+                group_ids[0],
+                routePolicyForConsistency(consistency),
+            )) orelse return null;
+            defer graph_route.deinit(alloc);
+            needs_graph_coordinator = switch (graph_route) {
+                .local => false,
+                .remote => true,
+            };
+        }
+        if (needs_graph_coordinator) {
+            const base_req = graphCoordinatorBaseRequest(req);
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
@@ -6727,6 +6760,33 @@ fn requiresDistributedGraphCoordinator(
             req.graph_table_read_authorizer != null or
             distributed_graph.requiresCompleteMatchAnchors(req) or
             graphRequestHasQualifiedIdentity(req));
+}
+
+/// Remove graph operations before shard fanout. Graph-only public requests do
+/// not imply a retrieval lane, even though the storage request's scalar query
+/// field defaults to match_all. An explicit match-none preserves that contract
+/// on the generic shard wire and obtains only the snapshot-generation stamp.
+fn graphCoordinatorBaseRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    var base = req;
+    base.graph_queries = &.{};
+    base.expand_strategy = null;
+    if (!graphRequestHasRetrievalLane(req)) base.query = .{ .match_none = {} };
+    return base;
+}
+
+fn graphRequestHasRetrievalLane(req: db_mod.types.SearchRequest) bool {
+    if (req.full_text != null or
+        req.filter_text != null or
+        req.dense != null or
+        req.sparse != null or
+        req.full_text_queries.len > 0 or
+        req.dense_queries.len > 0 or
+        req.sparse_queries.len > 0)
+        return true;
+    return switch (req.query) {
+        .match_all => false,
+        else => true,
+    };
 }
 
 /// Graph results cannot be merged from independently evaluated shard-local
@@ -16569,6 +16629,10 @@ fn encodeScanRequest(
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    // Graph operations have dedicated typed worker envelopes. Serializing them
+    // through the generic query endpoint previously emitted the deprecated
+    // graph_searches shape under the canonical graph_queries name.
+    if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -16649,9 +16713,6 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.exclusion_text) |exclusion_text| {
         try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
-    if (req.graph_queries.len > 0) {
-        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
-    }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
             .@"union" => "union",
@@ -16673,6 +16734,21 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "generic shard query wire rejects graph operations" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        encodeQueryRequest(std.testing.allocator, .{ .graph_queries = &graph_queries }),
+    );
 }
 
 fn appendQueryHierarchyField(
@@ -16914,118 +16990,6 @@ fn appendPrunerField(
     if (pruner.std_dev_threshold > 0) {
         try appendJsonFieldF64(alloc, out, &pruner_first, "std_dev_threshold", pruner.std_dev_threshold);
     }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueriesField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    graph_queries: []const db_mod.types.NamedGraphQuery,
-) !void {
-    try appendJsonFieldName(alloc, out, first, "graph_queries");
-    try out.append(alloc, '{');
-    for (graph_queries, 0..) |graph_query, i| {
-        if (i > 0) try out.append(alloc, ',');
-        try appendJsonString(alloc, out, graph_query.name);
-        try out.append(alloc, ':');
-        try appendGraphQueryValue(alloc, out, graph_query.query);
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueryValue(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    query: graph_query_mod.GraphQuery,
-) !void {
-    try out.append(alloc, '{');
-    var first = true;
-    try appendJsonFieldString(alloc, out, &first, "type", switch (query.query_type) {
-        .traverse => "traverse",
-        .neighbors => "neighbors",
-        .shortest_path => "shortest_path",
-        .k_shortest_paths => "k_shortest_paths",
-        .pattern => "pattern",
-    });
-    try appendJsonFieldString(alloc, out, &first, "index_name", query.index_name);
-    try appendGraphNodeSelectorField(alloc, out, &first, "start_nodes", query.start_nodes);
-    if (query.target_nodes) |target_nodes| {
-        try appendGraphNodeSelectorField(alloc, out, &first, "target_nodes", target_nodes);
-    }
-    try appendGraphQueryParamsField(alloc, out, &first, query.params, query.k);
-    try out.append(alloc, '}');
-}
-
-fn appendGraphNodeSelectorField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    name: []const u8,
-    selector: graph_query_mod.NodeSelector,
-) !void {
-    try appendJsonFieldName(alloc, out, first, name);
-    try out.append(alloc, '{');
-    var selector_first = true;
-    switch (selector) {
-        .keys => |keys| {
-            try appendJsonFieldName(alloc, out, &selector_first, "keys");
-            try out.append(alloc, '[');
-            for (keys, 0..) |key, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try appendJsonString(alloc, out, key);
-            }
-            try out.append(alloc, ']');
-        },
-        .identities => |identities| {
-            try appendJsonFieldName(alloc, out, &selector_first, "identities");
-            try out.append(alloc, '[');
-            for (identities, 0..) |identity, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try out.append(alloc, '{');
-                var identity_first = true;
-                try appendJsonFieldString(alloc, out, &identity_first, "key", identity.key);
-                if (identity.table) |table| try appendJsonFieldString(alloc, out, &identity_first, "table", table);
-                try out.append(alloc, '}');
-            }
-            try out.append(alloc, ']');
-        },
-        .result_ref => |result_ref| {
-            try appendJsonFieldString(alloc, out, &selector_first, "result_ref", result_ref.ref);
-            if (result_ref.limit > 0) try appendJsonFieldU32(alloc, out, &selector_first, "limit", result_ref.limit);
-        },
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueryParamsField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    params: graph_query_mod.QueryParams,
-    k: u32,
-) !void {
-    try appendJsonFieldName(alloc, out, first, "params");
-    try out.append(alloc, '{');
-    var params_first = true;
-    if (params.edge_types.len > 0) try appendJsonFieldNames(alloc, out, &params_first, "edge_types", params.edge_types);
-    if (params.direction != .out) try appendJsonFieldString(alloc, out, &params_first, "direction", switch (params.direction) {
-        .out => "out",
-        .in => "in",
-        .both => "both",
-    });
-    if (params.max_depth != 1) try appendJsonFieldU32(alloc, out, &params_first, "max_depth", params.max_depth);
-    if (params.min_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "min_weight", params.min_weight);
-    if (params.max_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "max_weight", params.max_weight);
-    if (params.max_results != 100) try appendJsonFieldU32(alloc, out, &params_first, "max_results", params.max_results);
-    if (!params.deduplicate) try appendJsonFieldBool(alloc, out, &params_first, "deduplicate_nodes", false);
-    if (params.include_paths) try appendJsonFieldBool(alloc, out, &params_first, "include_paths", true);
-    if (params.weight_mode != .min_hops) try appendJsonFieldString(alloc, out, &params_first, "weight_mode", switch (params.weight_mode) {
-        .min_hops => "min_hops",
-        .min_weight => "min_weight",
-        .max_weight => "max_weight",
-    });
-    if (k > 1) try appendJsonFieldU32(alloc, out, &params_first, "k", k);
     try out.append(alloc, '}');
 }
 
@@ -26044,6 +26008,33 @@ test "authenticated single-group graph queries require distributed coordination"
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
 }
 
+test "graph coordinator base request avoids an implicit retrieval scan" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{},
+        },
+    }};
+
+    const graph_only = graphCoordinatorBaseRequest(.{
+        .graph_queries = &graph_queries,
+        .expand_strategy = .@"union",
+    });
+    try std.testing.expectEqual(@as(usize, 0), graph_only.graph_queries.len);
+    try std.testing.expectEqual(@as(?graph_query_mod.ExpandStrategy, null), graph_only.expand_strategy);
+    try std.testing.expect(graph_only.query == .match_none);
+    try std.testing.expect(graph_only.full_text == null);
+
+    const retrieval = graphCoordinatorBaseRequest(.{
+        .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+        .graph_queries = &graph_queries,
+    });
+    try std.testing.expect(retrieval.full_text.? == .match);
+}
+
 test "unsupported cross-range graph modes fail closed" {
     const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "links",
@@ -26114,15 +26105,22 @@ test "hosted cross-range graph query expands explicit local start keys" {
         \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
     ;
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+    });
     defer left_db.close();
     try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try left_db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"left\"}" },
+            .{ .key = "entity:ada", .value = "{\"title\":\"Ada\"}" },
+        },
         .sync_level = .write,
     });
 
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+    });
     defer right_db.close();
     try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try right_db.batch(.{
@@ -26130,7 +26128,7 @@ test "hosted cross-range graph query expands explicit local start keys" {
         .sync_level = .write,
     });
     const graph_entry = right_db.core.graphIndex("relations_graph") orelse return error.IndexNotFound;
-    try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{}");
 
     const FakeCatalog = struct {
         const statuses = [_]metadata_reconciler.MergedGroupStatus{

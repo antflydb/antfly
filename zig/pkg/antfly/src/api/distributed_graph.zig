@@ -7080,6 +7080,7 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:c", "doc:n" } },
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },
@@ -7109,7 +7110,8 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
 
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls);
     // Two start-admission batches, two expansion-admission batches, and two
-    // final hydration batches. Per-frontier admission would make seven calls.
+    // final document hydration batches. Per-frontier admission would make
+    // seven calls.
     try std.testing.expectEqual(@as(u32, 6), state.hydrate_calls);
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqual(@as(usize, 3), results[0].hits.len);
@@ -9270,6 +9272,7 @@ test "distributed graph traverse target nodes filter returned nodes without prun
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
                     .target_nodes = .{ .keys = &[_][]const u8{"doc:c"} },
                     .params = .{ .max_depth = 2 },
+                    .include_documents = true,
                 },
             },
         },
@@ -9639,6 +9642,7 @@ test "distributed graph traverse routes cross-table frontier by table generation
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
                     .target_nodes = .{ .keys = &[_][]const u8{"doc:c"} },
                     .params = .{ .max_depth = 2 },
+                    .include_documents = true,
                 },
             },
         },
@@ -9836,6 +9840,7 @@ test "distributed graph retries once on topology change and succeeds" {
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },
@@ -10165,6 +10170,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
                     .params = .{},
+                    .include_documents = true,
                 },
             },
         },

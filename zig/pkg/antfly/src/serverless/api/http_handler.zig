@@ -3751,9 +3751,13 @@ pub const HttpHandler = struct {
 
         for (matches) |match| {
             for (match.bindings) |binding| {
-                // SearchHit has no table identity. Returning a qualified
-                // binding here would alias it into the source table.
-                if (binding.node.table != null) continue;
+                // This request cache owns one source-table snapshot. Fail
+                // closed when document hydration would require a different
+                // snapshot rather than returning a partial response.
+                if (binding.node.table != null) {
+                    if (query.include_documents) return error.UnsupportedQueryRequest;
+                    continue;
+                }
                 if (seen.contains(binding.node.key)) continue;
                 try seen.put(self.alloc, try self.alloc.dupe(u8, binding.node.key), {});
                 const body = if (query.include_documents)
@@ -3795,9 +3799,10 @@ pub const HttpHandler = struct {
             null;
         defer freeFields(self.alloc, projected_fields);
         for (nodes) |node| {
-            // Qualified identities are represented in graph nodes. The
-            // table-local SearchHit compatibility view cannot carry them.
-            if (node.table != null) continue;
+            // This request cache owns one source-table snapshot. Qualified
+            // nodes remain valid graph results, but their documents cannot be
+            // hydrated safely here.
+            if (node.table != null) return error.UnsupportedQueryRequest;
             const stored_data = if (try request_cache.documentBody(node.key)) |body|
                 if (query.include_all_fields)
                     try self.alloc.dupe(u8, body)

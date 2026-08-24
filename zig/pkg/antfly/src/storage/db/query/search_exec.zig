@@ -11417,6 +11417,10 @@ pub fn searchTextQuery(
     const total_start_ns = if (bench_query_profile or collect_score_profile) platform_time.monotonicNs() else 0;
     const text_entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse return switch (text_query) {
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
+        // Match-none is an index-independent empty relation. Requiring a text
+        // index here makes graph-only coordinator snapshot probes fail on
+        // tables that intentionally define only a graph index.
+        .match_none => emptySearchResult(alloc),
         else => error.IndexNotFound,
     };
     text_entry.lockAnalysisShared();

@@ -11918,7 +11918,7 @@ export interface components {
             /** @default 100 */
             limit?: number;
             /**
-             * @description Hydrate documents for projected non-null bindings.
+             * @description Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
              * @default false
              */
             include_documents?: boolean;

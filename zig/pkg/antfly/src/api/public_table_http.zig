@@ -114,6 +114,7 @@ pub const TableApi = struct {
         GraphMatchOperationLimitExceeded,
         GraphCrossRangeModeUnsupported,
         HierarchyCursorStale,
+        TopologyChanged,
         QueryEmbeddingInputTooLarge,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
@@ -686,6 +687,16 @@ pub fn hierarchyCursorStaleBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn topologyChangedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = 409,
+        .@"error" = "topology_changed",
+        .message = "the table topology changed while the query was running",
+        .action = "retry_query",
+        .retryable = true,
+    }, .{});
+}
+
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
     return switch (err) {
         error.InvalidManifest,
@@ -1157,6 +1168,14 @@ pub fn handleTableQueryRequest(
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
                 return .{ .status = 409, .body = try hierarchyCursorStaleBody(alloc), .json = true };
+            },
+            error.TopologyChanged => {
+                std.log.info("public table query topology changed after retry table={s}", .{table_name});
+                return .{
+                    .status = 409,
+                    .body = try topologyChangedBody(alloc),
+                    .json = true,
+                };
             },
             error.QueryEmbeddingInputTooLarge => {
                 return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
@@ -3395,7 +3414,7 @@ test "public table query handler maps candidate budget exhaustion" {
 }
 
 test "public table query handler maps exact graph execution failures" {
-    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, cross_range_mode };
+    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, cross_range_mode, topology_changed };
     const Backend = struct {
         fn iface(kind: *Kind) TableApi {
             return .{
@@ -3429,6 +3448,7 @@ test "public table query handler maps exact graph execution failures" {
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
                 .cross_range_mode => error.GraphCrossRangeModeUnsupported,
+                .topology_changed => error.TopologyChanged,
             };
         }
     };
@@ -3539,6 +3559,22 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqualStrings("incoming", cross_range_error.operation);
     try std.testing.expectEqualStrings("traverse", cross_range_error.mode);
     try std.testing.expectEqualStrings("direction_must_be_out", cross_range_error.reason);
+
+    kind = .topology_changed;
+    var topology_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"graph_queries\":{\"neighbors\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]}}}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer topology_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), topology_resp.status);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":409,\"error\":\"topology_changed\",\"action\":\"retry_query\",\"retryable\":true}",
+        topology_resp.body,
+    );
 
     const legacy_limit_body =
         \\{"graph_searches":{"first":{"type":"pattern"},"neighbors":{"type":"neighbors"},"second":{"type":"pattern"}}}

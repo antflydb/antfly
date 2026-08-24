@@ -696,10 +696,11 @@ pub fn encodeMatchGraphTraverseFromResultRefQueryRequest(
 
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
+    var start = indexes_openapi.GraphResultRefNodeSelector{ .result_ref = result_ref };
     var query = indexes_openapi.GraphTraverseQuery{
         .index = index_name,
         .traverse = .{
-            .start = .{ .result_ref = result_ref },
+            .start = .{ .graph_result_ref_node_selector = &start },
             .max_depth = max_depth,
             .limit = limit,
         },

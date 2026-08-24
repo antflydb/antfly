@@ -16,7 +16,10 @@ class GraphBindingsReturn:
     Attributes:
         bindings (list[str]):
         limit (int | Unset):  Default: 100.
-        include_documents (bool | Unset): Hydrate documents for projected non-null bindings. Default: False.
+        include_documents (bool | Unset): Hydrate documents for projected non-null bindings. The product of `limit` and
+            the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-
+            backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting
+            the document. Default: False.
         fields (list[str] | Unset): Document fields to hydrate. Requires include_documents=true; omit to include all
             fields.
     """
