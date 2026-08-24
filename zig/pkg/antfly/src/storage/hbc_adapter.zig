@@ -11771,6 +11771,7 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     var distances: [2]f32 = undefined;
     var vector_ids: [2]u64 = undefined;
     var metadata: [2]?[]const u8 = undefined;
+    var vector_views: [2][]const f32 = undefined;
     var lookups: [2]FixedKeyLookup = undefined;
     var key_views: [2][]const u8 = undefined;
     var values: [2]?[]const u8 = undefined;
@@ -11786,6 +11787,7 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
         &distances,
         &vector_ids,
         &metadata,
+        &vector_views,
         &lookups,
         &key_views,
         &values,

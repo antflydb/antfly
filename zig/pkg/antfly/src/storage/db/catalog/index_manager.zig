@@ -25742,7 +25742,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     try manager.addAllNoBackfill(&store, &.{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true,\"rerank_policy\":\"always\"}",
     }});
 
     const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, candidate_count);
@@ -25864,6 +25864,50 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);
     try std.testing.expectEqual(@as(usize, 10), outcome.results.getHits().len);
     try std.testing.expectEqual(candidate_ids[candidate_count - 1], outcome.results.getHits()[0].vector_id);
+
+    // Drive the complete production HBC search path through more than one
+    // 128-entry external rerank batch. This catches regressions in batching,
+    // output-slot restoration, profile composition, and loader wiring that a
+    // direct two-candidate adapter call cannot observe.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    var first_sorted_idx: usize = 0;
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (vector_id < candidate_ids[first_sorted_idx]) first_sorted_idx = i;
+    }
+    var preload_lease = entry.index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer preload_lease.deinit();
+    _ = try entry.index.cacheVectorForResidencyLease(
+        &preload_lease,
+        candidate_ids[first_sorted_idx],
+        vectors[first_sorted_idx * dims ..][0..dims],
+    );
+    var preloaded = entry.index.borrowCachedVector(candidate_ids[first_sorted_idx]) orelse return error.TestUnexpectedResult;
+    preloaded.deinit();
+    var full_profiled = try entry.index.searchProfiledRequest(.{
+        .query = vectors[(candidate_count - 1) * dims ..][0..dims],
+        .k = candidate_count,
+        .rerank_k = candidate_count,
+        .search_width = @intCast(candidate_count),
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer full_profiled.results.deinit();
+
+    try std.testing.expect(full_profiled.profile.approx_candidate_count > 128);
+    try std.testing.expect(full_profiled.profile.rerank_candidate_count > 128);
+    try std.testing.expect(full_profiled.profile.rerank_batches >= 2);
+    try std.testing.expectEqual(@as(u64, 128), full_profiled.profile.rerank_max_batch_size);
+    try std.testing.expect(full_profiled.profile.rerank_artifact_cache_hits > 0);
+    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 128);
+    try std.testing.expectEqual(
+        full_profiled.profile.rerank_artifact_vectors_loaded,
+        full_profiled.profile.rerank_metadata_vectors_loaded,
+    );
+    // The approximate result shell retains the candidate-local missing entry
+    // at infinite distance when k spans the entire corpus.
+    try std.testing.expectEqual(candidate_count, full_profiled.results.getHits().len);
+    try std.testing.expectEqual(candidate_ids[candidate_count - 1], full_profiled.results.getHits()[0].vector_id);
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {

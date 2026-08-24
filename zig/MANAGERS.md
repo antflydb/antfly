@@ -830,14 +830,19 @@ driver fails production runs below 150 QPS at 50k/1%, below 150 QPS for either
 selectivity regresses below 70% of the matched 10% lane, when the maximum
 thread lane fails to exceed one-thread QPS by 25%, when the search health probe
 exceeds 20 ms (invalidating a contaminated-host result), when the exact source
-vector is not returned at k or top-1 source recall falls below 95%, when
+vector is not returned at k, top-1 source recall falls below 95%, or sampled
+exact ground-truth recall@k falls below 90%, when
 the maximum load or search RSS across successful recorded cases exceeds 125%
 of the explicit process envelope, when their maximum HBC-accounted bytes
 exceed that envelope, when the maintenance soak falls below 70% of its
 base lane, or without separately populated cold/warm phases. All thresholds
 remain environment-overridable for an explicitly different resource envelope.
-The release-blocker recall suite and the per-lane matched source-vector recall
-canary run before a result is accepted as evidence.
+The release-blocker recall suite, per-lane source-vector canary, and sampled
+exact top-k ground truth run before a result is accepted as evidence. Exact
+ground-truth scans and their validation requests run after every timed QPS,
+latency, cache-residency, and RSS measurement so validation cannot warm or
+otherwise improve the reported performance lane. The sample count and minimum
+recall remain environment-overridable for longer qualification runs.
 Run the reduced
 endpoint/integration check before the evidence-producing matrix:
 
