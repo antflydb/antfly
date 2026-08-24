@@ -441,7 +441,11 @@ pub const Network = struct {
         if (self.faults.network_down or self.faults.delivery_paused) return;
         for (self.packets.items, 0..) |packet, index| {
             if (self.linkBlocked(packet.source, packet.destination)) continue;
-            if (!self.faults.reorder and self.hasEarlierPacketForLink(index, packet)) continue;
+            const has_earlier = self.hasEarlierPacketForLink(index, packet);
+            // TCP may reorder network packets internally, but EOF is visible
+            // to the application only after every earlier stream byte has
+            // either arrived or been dropped. Never let FIN overtake payload.
+            if (has_earlier and (!self.faults.reorder or packet.close_write)) continue;
             try list.append(allocator, .{
                 .id = packet.id,
                 .name = packetName(packet),
@@ -745,4 +749,50 @@ fn mapWaitWriteError(err: anyerror) std.Io.net.Stream.Writer.Error {
         error.Canceled => error.Canceled,
         else => error.Unexpected,
     };
+}
+
+test "stream FIN never overtakes earlier payload when reordering is enabled" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+
+    var network = try Network.init(std.testing.allocator, .{});
+    defer network.deinit();
+    var wait_context: u8 = 0;
+    network.bindWaitPort(.{ .ptr = &wait_context, .vtable = &NoopWaitPort.vtable });
+    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream });
+    try std.testing.expectEqual(
+        @as(usize, "payload".len),
+        try network.write(pair[0].handle, "", &.{"payload"}, 1),
+    );
+    try network.shutdown(pair[0].handle, .send);
+    network.faults.reorder = true;
+
+    var ready: transition.List = .{};
+    defer ready.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("sim-io.packet_deliver", ready.items.items[0].name);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+
+    ready.items.clearRetainingCapacity();
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("sim-io.stream_fin", ready.items.items[0].name);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+
+    var bytes: [16]u8 = undefined;
+    var buffers = [_][]u8{bytes[0..]};
+    const received = try network.read(pair[1].handle, &buffers);
+    try std.testing.expectEqualStrings("payload", bytes[0..received]);
+    try std.testing.expectEqual(@as(usize, 0), try network.read(pair[1].handle, &buffers));
 }

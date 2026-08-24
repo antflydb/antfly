@@ -1469,7 +1469,7 @@ pub const Server = struct {
         const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        var listener = try TcpListener.initWithOptions(addr, http_runtime_lease.connectionIo(), .{
+        var listener = try TcpListener.initWithOptions(addr, listenerSocketIo(&http_runtime_lease), .{
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
             .reuse_port = self.config.reuse_port,
@@ -1568,8 +1568,6 @@ pub const Server = struct {
                     .h1_request_cancellation = &connection.h1_request_cancellation,
                 },
             };
-            if ((self.config.http_runtime orelse &self.owned_http_runtime).supportsNativeSocketTimeouts())
-                connection.socket.enableNativeTimeouts();
             self.registerConnection(&connection.control) catch {
                 connection.socket.close();
                 self.allocator.destroy(connection);
@@ -1666,7 +1664,10 @@ pub const Server = struct {
                 addr = .{ .ip6 = .loopback(ip6.port) };
             },
         }
-        var wake_socket = Socket.connect(addr, self.listenerIo()) catch return;
+        // The listener socket is created in the connection lane. Borrowed I/O
+        // lanes may have disjoint virtual handle spaces, so its wakeup must use
+        // that same lane even though the accept task runs on listenerIo().
+        var wake_socket = Socket.connect(addr, listenerSocketIo(&self.http_runtime_lease)) catch return;
         wake_socket.close();
     }
 
@@ -3079,6 +3080,13 @@ pub const Server = struct {
     }
 };
 
+/// Socket creation and listener wakeups must share an I/O handle namespace.
+/// Keep this selection in one place so execution-lane changes cannot split
+/// the bind and wake paths again.
+fn listenerSocketIo(lease: *const HttpRuntime.ListenerLease) Io {
+    return lease.connectionIo();
+}
+
 /// RFC 7540 §8.1.2.2: Connection-specific headers are forbidden in HTTP/2.
 /// Returns true if the header must be rejected.
 fn isH2ForbiddenHeader(name: []const u8, value: []const u8) bool {
@@ -4211,6 +4219,36 @@ test "requestStop only publishes synchronized listener-thread work" {
     try std.testing.expect(server.running);
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "listener bind and wake share the borrowed connection lane" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var listener_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer listener_io_impl.deinit();
+    var connection_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer connection_io_impl.deinit();
+    var runtime = HttpRuntime.init(std.testing.allocator, .{
+        .max_active_h1_requests = 0,
+        .max_active_connections = 1,
+        .max_active_requests = 1,
+        .borrowed_io = .{
+            .listener = listener_io_impl.io(),
+            .connection = connection_io_impl.io(),
+        },
+    });
+    defer runtime.deinit();
+    var lease = try runtime.acquireListener(.{
+        .max_h1_requests = 0,
+        .max_connections = 1,
+        .max_requests = 1,
+    });
+    defer lease.release();
+
+    const socket_io = listenerSocketIo(&lease);
+    try std.testing.expect(socket_io.userdata == connection_io_impl.io().userdata);
+    try std.testing.expect(socket_io.vtable == connection_io_impl.io().vtable);
+    try std.testing.expect(socket_io.userdata != listener_io_impl.io().userdata);
 }
 
 test "repeated stop requests do not inflate connection admission permits" {

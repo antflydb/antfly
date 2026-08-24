@@ -236,16 +236,16 @@ pub const Socket = struct {
 
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
+        const operation_deadline_ms = self.socketOperationDeadline(.send);
         while (true) {
             try self.checkRequestCancellation();
-            const timeout_ms = try self.operationTimeout(.send);
-            const sent = self.netWriteWithTimeout(data, timeout_ms) catch |err| {
+            const wait = try self.operationWait(operation_deadline_ms);
+            const sent = self.netWriteWithTimeout(data, wait.timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
-                if (err == error.Timeout) return error.Timeout;
-                if (err == error.WouldBlock) {
+                if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null) continue;
+                    if (wait.poll_only) continue;
                     return error.Timeout;
                 }
                 return error.SendFailed;
@@ -272,20 +272,16 @@ pub const Socket = struct {
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
         if (buffer.len == 0) return 0;
+        const operation_deadline_ms = self.socketOperationDeadline(.recv);
         while (true) {
             try self.checkRequestCancellation();
-            const timeout_ms = try self.operationTimeout(.recv);
-            const received = self.netReadWithTimeout(buffer, timeout_ms) catch |err| {
+            const wait = try self.operationWait(operation_deadline_ms);
+            const received = self.netReadWithTimeout(buffer, wait.timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
-                if (err == error.Timeout) {
+                if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null and self.recv_timeout_ms == null) continue;
-                    return error.Timeout;
-                }
-                if (err == error.WouldBlock) {
-                    try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null and self.recv_timeout_ms == null) continue;
+                    if (wait.poll_only) continue;
                     return error.Timeout;
                 }
                 return error.RecvFailed;
@@ -310,25 +306,49 @@ pub const Socket = struct {
 
     const DeadlineOperation = enum { recv, send };
 
-    fn operationTimeout(self: *Self, operation: DeadlineOperation) !?u64 {
+    const OperationWait = struct {
+        timeout_ms: ?u64,
+        /// True when the timer only exists to poll request cancellation. A
+        /// poll expiry is retryable; socket and request deadline expiries are
+        /// terminal.
+        poll_only: bool,
+    };
+
+    fn socketOperationDeadline(self: *Self, operation: DeadlineOperation) ?i64 {
         const socket_timeout_ms = switch (operation) {
             .recv => self.recv_timeout_ms,
             .send => self.send_timeout_ms,
         };
-        const poll_ms: ?u64 = if (self.request_cancel_cb != null) 20 else null;
-        const remaining_ms: ?u64 = if (self.request_deadline_ms) |deadline_ms| blk: {
-            const now_ms = common.milliTimestamp(self.io);
+        const timeout_ms = socket_timeout_ms orelse return null;
+        const now_ms = common.milliTimestamp(self.io);
+        const deadline = @as(i128, now_ms) + @as(i128, timeout_ms);
+        return @intCast(@min(deadline, std.math.maxInt(i64)));
+    }
+
+    fn operationWait(self: *Self, socket_deadline_ms: ?i64) !OperationWait {
+        const now_ms = common.milliTimestamp(self.io);
+        var terminal_timeout_ms: ?u64 = null;
+        const deadlines = [_]?i64{ socket_deadline_ms, self.request_deadline_ms };
+        for (deadlines) |maybe_deadline| {
+            const deadline_ms = maybe_deadline orelse continue;
             if (now_ms >= deadline_ms) return error.Timeout;
-            break :blk @intCast(deadline_ms - now_ms);
-        } else null;
-        var timeout_ms = socket_timeout_ms;
-        if (remaining_ms) |remaining| {
-            timeout_ms = if (timeout_ms) |current| @min(current, remaining) else remaining;
+            const remaining_ms: u64 = @intCast(deadline_ms - now_ms);
+            terminal_timeout_ms = if (terminal_timeout_ms) |current|
+                @min(current, remaining_ms)
+            else
+                remaining_ms;
         }
-        if (poll_ms) |poll| {
-            timeout_ms = if (timeout_ms) |current| @min(current, poll) else poll;
+
+        if (self.request_cancel_cb != null) {
+            const cancellation_poll_ms: u64 = 20;
+            if (terminal_timeout_ms == null or cancellation_poll_ms < terminal_timeout_ms.?) {
+                return .{ .timeout_ms = cancellation_poll_ms, .poll_only = true };
+            }
         }
-        return if (timeout_ms) |timeout| @max(timeout, 1) else null;
+        return .{
+            .timeout_ms = if (terminal_timeout_ms) |timeout| @max(timeout, 1) else null,
+            .poll_only = false,
+        };
     }
 
     fn netRead(self: *Self, buffer: []u8) net.Stream.Reader.Error!usize {
@@ -1489,6 +1509,40 @@ test "Socket recv timeout returns error.Timeout" {
 
     var recv_buf: [8]u8 = undefined;
     try std.testing.expectError(error.Timeout, accepted.socket.recv(&recv_buf));
+}
+
+test "Socket cancellation polling preserves the configured receive timeout" {
+    if (is_windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+
+    const DelayedSender = struct {
+        fn run(task_io: Io, target: *TcpListener) anyerror!void {
+            var accepted = try target.accept();
+            defer accepted.socket.close();
+            try task_io.sleep(Io.Duration.fromMilliseconds(60), .awake);
+            try accepted.socket.sendAll("ready");
+        }
+    };
+    var sender = try io.concurrent(DelayedSender.run, .{ io, &listener });
+    errdefer _ = sender.cancel(io) catch {};
+
+    var client = try Socket.connect(listener.getLocalAddress(), io);
+    defer client.close();
+    try client.setRecvTimeout(500);
+    client.setRequestCancellation(struct {
+        fn requested(_: ?*anyopaque) bool {
+            return false;
+        }
+    }.requested, null);
+
+    var recv_buf: [8]u8 = undefined;
+    const received = try client.recv(&recv_buf);
+    try std.testing.expectEqualStrings("ready", recv_buf[0..received]);
+    try sender.await(io);
 }
 
 test "SliceIoReader skips leading empty buffers" {

@@ -1341,11 +1341,13 @@ const TtlCleanupContext = struct {
     identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
 };
 
-/// Stable indirection for transaction recovery callbacks. `DB.open` returns
-/// the wrapper by value, so an address captured while open is still building
-/// may not be the address eventually owned by the caller.
+/// Stable owner for transaction recovery callbacks. `DB.open` returns its
+/// public wrapper by value, so a background worker must never retain the
+/// address of that movable wrapper. The recovery-only snapshot is allocated
+/// after startup has initialized every shared subsystem and remains at a fixed
+/// address until the worker has joined during close.
 const TransactionRecoveryLocalContext = struct {
-    owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
+    stable_owner: ?*DB = null,
 };
 
 const ManagedSyncTargets = struct {
@@ -2983,7 +2985,7 @@ pub const DB = struct {
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     index_backends: db_config.IndexBackendOptions,
-    core: db_core.DBCore,
+    core: *db_core.DBCore,
     /// Durable identity of the physical DB root. Unlike `core.root_generation`,
     /// this survives process restart and changes whenever a root is rebound.
     root_incarnation: u128 = 0,
@@ -3366,6 +3368,13 @@ pub const DB = struct {
                 bind_cache_resource_manager,
                 effective_index_backends,
             );
+            const core_owner = try alloc.create(db_core.DBCore);
+            var core_owner_initialized = false;
+            var core_owner_transferred = false;
+            errdefer if (!core_owner_transferred) {
+                if (core_owner_initialized) core_owner.deinit();
+                alloc.destroy(core_owner);
+            };
             const open_primary_started_ns = monotonicTimeNs();
             const opened_primary = try openPrimaryStore(alloc, path, core_opts);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
@@ -3390,6 +3399,8 @@ pub const DB = struct {
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
+            core_owner.* = db_core.DBCore.fromOpened(alloc, core);
+            core_owner_initialized = true;
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -3412,7 +3423,7 @@ pub const DB = struct {
                 .primary_backend = stored_primary_backend,
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
                 .index_backends = resolved_config.index_backends,
-                .core = db_core.DBCore.fromOpened(alloc, core),
+                .core = core_owner,
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
@@ -3445,6 +3456,7 @@ pub const DB = struct {
                 .sparse_compaction_runtime = null,
                 .shadow = null,
             };
+            core_owner_transferred = true;
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
             var executor_ready = false;
@@ -3698,7 +3710,6 @@ pub const DB = struct {
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
         if (hook != null) {
             self.bindTtlIdentityVisibilityOwner();
-            self.bindTransactionRecoveryOwner();
         }
         var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
@@ -3749,9 +3760,30 @@ pub const DB = struct {
         }
     }
 
-    fn bindTransactionRecoveryOwner(self: *DB) void {
+    fn prepareTransactionRecoveryOwner(self: *DB) !void {
         const ctx = self.transaction_recovery_local_context orelse return;
-        ctx.owner.store(self, .release);
+        if (ctx.stable_owner != null) return;
+        const stable_owner = try self.runtime_alloc.create(DB);
+        stable_owner.* = self.*;
+        // The snapshot shares durable/core/runtime pointers, but it must not
+        // alias wrapper-owned caches, maps, or mutex state. Recovery never
+        // participates in caller bulk-ingest sessions and rebuilds visibility
+        // from the shared store when needed.
+        stable_owner.bulk_ingest_coalescer = .{};
+        stable_owner.flushing_bulk_ingest_coalescer = false;
+        stable_owner.bulk_ingest_identity_all_new = false;
+        stable_owner.bulk_ingest_identity_state = .{};
+        stable_owner.bulk_ingest_seen_doc_keys = .{};
+        stable_owner.identity_visibility_summary_cache = null;
+        stable_owner.live_doc_set_cache_mutex = .unlocked;
+        stable_owner.live_doc_set_cache_generation = null;
+        stable_owner.live_doc_set_cache_set = null;
+        stable_owner.nonvisible_doc_set_cache_mutex = .unlocked;
+        stable_owner.nonvisible_doc_set_cache_generation = null;
+        stable_owner.nonvisible_doc_set_cache_set = null;
+        stable_owner.nonvisible_doc_set_cache_overflow = false;
+        stable_owner.nonvisible_doc_set_cache_entries = AtomicU64.init(0);
+        ctx.stable_owner = stable_owner;
     }
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
@@ -4228,6 +4260,7 @@ pub const DB = struct {
         }
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| {
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
@@ -4240,9 +4273,9 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.transaction_runtime != null) return;
         try self.initOptionalTransactionRuntime(cfg);
-        self.bindTransactionRecoveryOwner();
         if (self.optional_runtime_workers_enabled) {
             const runtime = self.transaction_runtime.?;
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
     }
@@ -4313,13 +4346,13 @@ pub const DB = struct {
         // index state they may inspect.
         self.stopArtifactRepairMetadataWorker();
         self.stopQuarantineRetryWorker();
-        if (self.transaction_recovery_local_context) |ctx| ctx.owner.store(null, .release);
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
             self.transaction_runtime = null;
         }
         if (self.transaction_recovery_local_context) |ctx| {
+            if (ctx.stable_owner) |owner| self.runtime_alloc.destroy(owner);
             self.runtime_alloc.destroy(ctx);
             self.transaction_recovery_local_context = null;
         }
@@ -4393,7 +4426,9 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        self.core.deinit();
+        const core = self.core;
+        core.deinit();
+        self.alloc.destroy(core);
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.async_context);
@@ -5203,7 +5238,6 @@ pub const DB = struct {
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
-        self.bindTransactionRecoveryOwner();
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, .{});
@@ -8208,7 +8242,6 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        self.bindTransactionRecoveryOwner();
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         return try self.core.getStoreValue(alloc, store_key);
@@ -15605,7 +15638,6 @@ pub const DB = struct {
     }
 
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
-        self.bindTransactionRecoveryOwner();
         return try self.core.getTransactionStatus(txn_id);
     }
 
@@ -21240,7 +21272,6 @@ pub const DB = struct {
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
-        self.bindTransactionRecoveryOwner();
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -21579,7 +21610,6 @@ pub const DB = struct {
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
-        self.bindTransactionRecoveryOwner();
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -22476,7 +22506,6 @@ pub const DB = struct {
     }
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        self.bindTransactionRecoveryOwner();
         return try self.searchWithExecutionContext(alloc, req, .{});
     }
 
@@ -23352,10 +23381,10 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
         _ = exec_ctx;
-        try planning_bindings_mod.validateSearchRequestBindings(&self.core, self.alloc, req);
+        try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
             alloc,
-            &self.core,
+            self.core,
             self,
             planningStatsSearchRequestCallback,
             req,
@@ -44051,7 +44080,7 @@ fn resolveRecoveredLocalTransaction(
     commit_version: u64,
 ) anyerror!void {
     const local_ctx: *TransactionRecoveryLocalContext = @ptrCast(@alignCast(ctx));
-    const db = local_ctx.owner.load(.acquire) orelse return error.TransactionRecoveryOwnerUnbound;
+    const db = local_ctx.stable_owner orelse return error.TransactionRecoveryOwnerUnbound;
     try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
 }
 
@@ -46999,7 +47028,8 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
         @intFromPtr(local_ctx),
         @intFromPtr(db.transaction_runtime.?.config.local_resolution_ctx.?),
     );
-    try std.testing.expect(local_ctx.owner.load(.acquire) == &db);
+    try std.testing.expect(local_ctx.stable_owner != null);
+    try std.testing.expect(local_ctx.stable_owner.? != &db);
 
     try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
     try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
@@ -87377,10 +87407,28 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     });
     defer db.close();
 
-    var cleaned = false;
+    // Do not call a DB wrapper method while waiting. Recovery must be able to
+    // resolve the orphan from its stable heap owner without a caller first
+    // publishing the address of this by-value handle.
+    const recovered_store_key = try encodeStoreLookupKeyAlloc(alloc, "doc:recovered_orphan");
+    defer alloc.free(recovered_store_key);
+    var recovered_without_api_call = false;
     var attempts: usize = 0;
     while (attempts < 500) : (attempts += 1) {
-        const status = db.getTransactionStatus(txn_id);
+        const raw = try db.core.getStoreValue(alloc, recovered_store_key);
+        if (raw) |value| {
+            alloc.free(value);
+            recovered_without_api_call = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    if (!recovered_without_api_call) return error.TransactionRecoveryLocalResolutionTimeout;
+
+    var cleaned = false;
+    attempts = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.core.getTransactionStatus(txn_id);
         if (status) |_| {} else |err| {
             if (err == transactions_mod.TxnError.TxnNotFound) {
                 cleaned = true;

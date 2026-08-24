@@ -241,10 +241,6 @@ pub const HttpRuntime = struct {
         return self.borrowed_io == null;
     }
 
-    pub fn supportsNativeSocketTimeouts(self: *const HttpRuntime) bool {
-        return self.borrowed_io == null;
-    }
-
     pub fn recordBorrowedH1HardDisconnect(self: *HttpRuntime) void {
         _ = self.borrowed_hard_disconnect_cancellations_total.fetchAdd(1, .monotonic);
     }
