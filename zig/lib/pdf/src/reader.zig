@@ -186,16 +186,6 @@ const FontDecoder = struct {
                     defer alloc.free(fallback);
                     try out.appendSlice(alloc, fallback);
                 }
-            } else if (rawCodeLooksLikePdfDocText(raw[code_start..i])) {
-                // In malformed content arrays a multibyte font selected by an
-                // earlier stream can remain active for a later stream whose
-                // bytes are ordinary PDF text. An incomplete ToUnicode map
-                // must not silently discard those printable words. Preserve
-                // them through the same PDFDoc fallback used when no font is
-                // selected; mapped multibyte codes still take precedence.
-                const fallback = try text_encoding.pdfDocDecodeAlloc(alloc, raw[code_start..i]);
-                defer alloc.free(fallback);
-                try out.appendSlice(alloc, fallback);
             }
         }
 
@@ -223,15 +213,6 @@ const FontDecoder = struct {
         return @min(self.code_bytes, remaining.len);
     }
 };
-
-fn rawCodeLooksLikePdfDocText(raw: []const u8) bool {
-    var has_alphanumeric = false;
-    for (raw) |byte| {
-        if (!std.ascii.isPrint(byte) and !std.ascii.isWhitespace(byte)) return false;
-        has_alphanumeric = has_alphanumeric or std.ascii.isAlphanumeric(byte);
-    }
-    return has_alphanumeric;
-}
 
 const PageFont = struct {
     name: []u8,
@@ -10802,37 +10783,6 @@ test "reader uses ToUnicode codespacerange for multibyte text extraction" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("\u{03A9}\n", text);
-}
-
-test "reader preserves unmapped multibyte text with PDFDoc fallback" {
-    const alloc = std.testing.allocator;
-    const entries = [_]ToUnicodeEntry{.{
-        .src = 0x0102,
-        .src_len = 2,
-        .dst = @constCast("\u{03A9}"),
-    }};
-    const ranges = [_]CodeSpaceRange{.{
-        .lo = 0,
-        .hi = 0xffff,
-        .len = 2,
-    }};
-    const decoder = FontDecoder{
-        .code_bytes = 2,
-        .to_unicode = @constCast(&entries),
-        .codespace_ranges = @constCast(&ranges),
-    };
-
-    const mapped = try decoder.decodeAlloc(alloc, &.{ 0x01, 0x02 });
-    defer alloc.free(mapped);
-    try std.testing.expectEqualStrings("\u{03A9}", mapped);
-
-    const fallback = try decoder.decodeAlloc(alloc, "FOURTH EDITION");
-    defer alloc.free(fallback);
-    try std.testing.expectEqualStrings("FOURTH EDITION", fallback);
-
-    const binary = try decoder.decodeAlloc(alloc, &.{ 0x00, 0x03 });
-    defer alloc.free(binary);
-    try std.testing.expectEqualStrings("", binary);
 }
 
 test "reader uses multiline ToUnicode bfrange arrays" {
