@@ -23,6 +23,9 @@ pub const RerankLookup = struct {
     item_index: usize,
     vector_id: u64,
     key: [10]u8,
+    // Captured before the authoritative read. Adapters with generation-safe
+    // vector caching use it to reject a fill that crossed a write boundary.
+    vector_cache_fill_epoch: ?u64 = null,
 };
 
 pub const SearchScratch = struct {
