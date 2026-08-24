@@ -32,6 +32,8 @@ const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
 
 fn isExpectedControlRoundError(err: anyerror) bool {
     return antfly.metadata.authority.isRetryableError(err);
@@ -886,6 +888,18 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const internal_service_secret = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_secret_key,
+    );
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_issuer = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_issuer_key,
+    );
+    defer if (internal_service_issuer) |value| alloc.free(value);
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -957,6 +971,8 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = remote_content,

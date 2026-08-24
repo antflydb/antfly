@@ -5343,6 +5343,12 @@ pub fn build(b: *std.Build) void {
         "query builder runtime preflight injects mandatory row filter",
         "stored destination envelopes cannot be forged and validate on resume",
         "api http client forwards bounded raft batch routing context without allocation",
+        "api http client authenticates only the internal API namespace",
+        "MCP document sampling pushes mandatory row filters into storage scans",
+        "internal service credentials cannot authorize public inference routes",
+        "legacy restore jobs resume only when backed-up definitions are sink free",
+        "usermgr api key permission intersection narrows owner and key wildcards",
+        "httpx internal control routes call typed operations directly",
     };
     const authorization_sink_tests = b.addTest(.{
         .root_module = lib_test_mod,

@@ -37,6 +37,7 @@ const mcp = @import("antfly_mcp");
 const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
+const internal_service_auth = @import("internal_service_auth.zig");
 const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_client = @import("http_client.zig");
 const repair_jobs = @import("repair_jobs.zig");
@@ -113,22 +114,10 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
-fn injectRowFilterIntoScanRequest(
-    alloc: std.mem.Allocator,
-    req: *http_route_helpers.OwnedScanKeysRequest,
-    row_filter_json: []const u8,
-) !void {
-    const effective = if (req.filter_query_json.len == 0)
-        try alloc.dupe(u8, row_filter_json)
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "{{\"conjuncts\":[{s},{s}]}}",
-            .{ req.filter_query_json, row_filter_json },
-        );
-    if (req.filter_query_json.len > 0) alloc.free(@constCast(req.filter_query_json));
-    req.filter_query_json = effective;
-    req.opts.filter_query_json = effective;
+fn requiresInternalServicePrincipal(path: []const u8) bool {
+    return std.mem.eql(u8, path, routes.internal_capabilities) or
+        std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+        std.mem.startsWith(u8, path, routes.internal_tables_prefix);
 }
 
 fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
@@ -255,6 +244,7 @@ pub const AntflyApiHandler = struct {
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
         try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
+        try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
     }
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
@@ -271,6 +261,31 @@ pub const AntflyApiHandler = struct {
         return next.call(ctx);
     }
 
+    /// Raw data-node routes bypass public table planning and RBAC by design, so
+    /// they share one non-optional service-identity boundary before dispatch.
+    /// The HA namespace retains its independent replication credential.
+    fn enforceInternalServiceAuth(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        return next.call(ctx);
+    }
+
+    fn internalServiceAuthRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
+        if (!requiresInternalServicePrincipal(ctx.request.uri.path)) return null;
+        const secret = self.api_server.cfg.internal_service_secret orelse
+            self.api_server.cfg.trusted_principal_secret orelse
+            return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
+        if (secret.len == 0)
+            return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
+        const token = ctx.header(internal_service_auth.header_name) orelse
+            return @as(?httpx.Response, try unauthorizedResponse(ctx));
+        var identity = self.api_server.authenticateInternalServiceRequest(token) catch
+            return @as(?httpx.Response, try unauthorizedResponse(ctx));
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service)
+            return @as(?httpx.Response, try jsonErrorResponse(ctx, 403, "internal service credential required"));
+        return null;
+    }
+
     /// Dispatch one route through the application-owned ingress policy.
     ///
     /// Direct registrations install the same policy as `httpx` middleware.
@@ -282,6 +297,7 @@ pub const AntflyApiHandler = struct {
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
         if (try self.haMutationRejection(ctx)) |response| return response;
+        if (try self.internalServiceAuthRejection(ctx)) |response| return response;
         return route_handler.invoke(ctx) catch |err| mapIngressError(ctx, err);
     }
 
@@ -880,28 +896,6 @@ pub const AntflyApiHandler = struct {
         return null;
     }
 
-    /// Internal group mutations are raw storage RPCs, not public table-write
-    /// APIs. They fail closed unless the caller presents a signed trusted
-    /// principal token; Basic and API-key identities are never accepted.
-    fn authorizeInternalServiceRequest(
-        self: *AntflyApiHandler,
-        ctx: *httpx.Context,
-        identity: *?AuthenticatedIdentity,
-    ) !?httpx.Response {
-        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null)
-            return null;
-        if (self.api_server.cfg.trusted_principal_secret == null or
-            self.api_server.cfg.trusted_principal_secret.?.len == 0)
-            return try jsonErrorResponse(ctx, 403, "internal service authentication is not configured");
-        const token = ctx.header(http_server_mod.trusted_principal_header) orelse
-            return try unauthorizedResponse(ctx);
-        identity.* = self.api_server.authenticateRequest(.{ .trusted_principal = token }) catch
-            return try unauthorizedResponse(ctx);
-        if (!identity.*.?.is_internal_service)
-            return try jsonErrorResponse(ctx, 403, "forbidden");
-        return null;
-    }
-
     fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
         return .{
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
@@ -1130,6 +1124,10 @@ pub const AntflyApiHandler = struct {
                         if (base_uri) |uri| {
                             const executor = server.cfg.session_executor orelse return error.Unavailable;
                             var client = http_client.ApiHttpClient.init(alloc, executor);
+                            _ = client.withInternalServiceAuth(
+                                server.cfg.internal_service_secret orelse server.cfg.trusted_principal_secret,
+                                server.cfg.internal_service_issuer orelse server.cfg.trusted_principal_issuer,
+                            );
                             return client.fetchTableRepairCancelRequested(uri, table_name, job_id, attempt_id);
                         }
                         const encoded = try server.repair_job_store.loadJobAlloc(alloc, job_id);
@@ -1692,13 +1690,6 @@ pub const AntflyApiHandler = struct {
     fn internalGroupBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
-        if (try self.authorizeInternalServiceRequest(ctx, &authenticated_identity)) |response| return response;
-        if (authenticated_identity) |identity| {
-            if (!http_server_mod.permissionsAllow(identity.permissions, .table, params.table_name, .write))
-                return jsonErrorResponse(ctx, 403, "forbidden");
-        }
         if (self.api_server.cfg.routed_raft_batch_writer != null)
             return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
         const forwarding = internal_batch_forwarding.parseValues(
@@ -2008,13 +1999,6 @@ pub const AntflyApiHandler = struct {
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
-        if (try self.authorizeInternalServiceRequest(ctx, &authenticated_identity)) |response| return response;
-        if (authenticated_identity) |identity| {
-            if (!http_server_mod.permissionsAllow(identity.permissions, .table, params.table_name, .write))
-                return jsonErrorResponse(ctx, 403, "forbidden");
-        }
         const forwarding = internal_batch_forwarding.parseValues(
             ctx.header(internal_batch_forwarding.remaining_ms_header),
             ctx.header(internal_batch_forwarding.forwards_remaining_header),
@@ -4510,7 +4494,7 @@ pub const AntflyApiHandler = struct {
 
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
-        if (row_filter_json) |value| try injectRowFilterIntoScanRequest(alloc, &scan_req, value);
+        if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
 
         if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
         defer self.releasePublicOperation("scanKeys");
@@ -6537,7 +6521,12 @@ test "httpx internal control routes call typed operations directly" {
     };
 
     var source = AuthStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{ .shard_db_adapter = Fake.shardDb() }, source.iface(), Fake.reads(), null);
+    const service_secret = "httpx-internal-control-test-secret";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .shard_db_adapter = Fake.shardDb(),
+        .internal_service_secret = service_secret,
+        .internal_service_issuer = "httpx-test",
+    }, source.iface(), Fake.reads(), null);
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -6548,10 +6537,20 @@ test "httpx internal control routes call typed operations directly" {
     defer client.deinit();
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
+    const service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = service_secret,
+        .issuer = "httpx-test",
+        .subject = "node:test",
+    }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(service_token);
+    const headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ internal_service_auth.header_name, service_token },
+    };
 
     const lookup_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title&read_consistency=stale", .{base_url});
     defer alloc.free(lookup_url);
-    var lookup = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
+    var lookup = try getWithRetry(&client, client_io.io(), lookup_url, &headers, 20);
     defer lookup.deinit();
     try std.testing.expectEqual(@as(u16, 200), lookup.status.code);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", lookup.body.?);
@@ -6559,14 +6558,13 @@ test "httpx internal control routes call typed operations directly" {
 
     const median_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/db/median-key", .{base_url});
     defer alloc.free(median_url);
-    var median = try getWithRetry(&client, client_io.io(), median_url, null, 20);
+    var median = try getWithRetry(&client, client_io.io(), median_url, &headers, 20);
     defer median.deinit();
     try std.testing.expectEqual(@as(u16, 200), median.status.code);
     try std.testing.expectEqualStrings("{\"median_key\":\"doc:m\"}", median.body.?);
 
     const join_state_url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/join-job-state", .{base_url});
     defer alloc.free(join_state_url);
-    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
     var invalid_join_state = try requestWithRetry(&client, client_io.io(), .POST, join_state_url, "{}", &headers, 20);
     defer invalid_join_state.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid_join_state.status.code);
@@ -6639,13 +6637,6 @@ test "httpx internal control routes call typed operations directly" {
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
     }
-
-    const retrieval_url = try std.fmt.allocPrint(alloc, "{s}/agents/retrieval", .{base_url});
-    defer alloc.free(retrieval_url);
-    var invalid_retrieval = try requestWithRetry(&client, client_io.io(), .POST, retrieval_url, "[]", &headers, 20);
-    defer invalid_retrieval.deinit();
-    try std.testing.expectEqual(@as(u16, 400), invalid_retrieval.status.code);
-    try std.testing.expectEqualStrings("invalid retrieval agent request", invalid_retrieval.body.?);
 
     inline for (.{
         .{ "graph-expand", "invalid graph expand request" },

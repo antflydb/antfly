@@ -359,6 +359,8 @@ const DataRaftBatchForwardState = struct {
 };
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
 
 fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     var cfg: raft_engine.runtime.RuntimeConfig = .{};
@@ -7349,6 +7351,10 @@ pub const DataServer = struct {
 
         const raft = self.data_raft orelse return 0;
         var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
+        _ = client.withInternalServiceAuth(
+            self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
+            self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
+        );
         const version = client.fetchDataRaftBatchProtocolVersion(
             raft_url,
             @min(dataRaftBatchHttpTimeoutMs(deadline_ns), data_raft_protocol_capability_probe_timeout_ms),
@@ -7824,8 +7830,8 @@ pub const DataServer = struct {
                                 defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
                                 _ = client.withInternalServiceAuth(
-                                    self.api_server_cfg.trusted_principal_secret,
-                                    self.api_server_cfg.trusted_principal_issuer,
+                                    self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
+                                    self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
                                 );
                                 const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
@@ -8019,8 +8025,8 @@ pub const DataServer = struct {
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(
-            self.api_server_cfg.trusted_principal_secret,
-            self.api_server_cfg.trusted_principal_issuer,
+            self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
+            self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
         );
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
@@ -17654,6 +17660,18 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const internal_service_secret = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_secret_key,
+    );
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_issuer = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_issuer_key,
+    );
+    defer if (internal_service_issuer) |value| alloc.free(value);
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -17727,6 +17745,8 @@ pub fn runFromIterator(
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",

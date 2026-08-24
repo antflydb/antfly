@@ -12,6 +12,7 @@ pub const audience = "antfly-internal-v1";
 pub const principal_kind = "service";
 pub const default_subject = "antfly-node";
 pub const token_ttl_seconds: i64 = 60;
+pub const header_name = "X-Antfly-Trusted-Principal";
 
 pub const Config = struct {
     secret: []const u8,

@@ -16853,6 +16853,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn httpClient(self: *HostedProvisionedTableWriteSource, alloc: std.mem.Allocator) http_client.ApiHttpClient {
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
+    }
+
     pub fn withDestinationAuthorization(
         self: *HostedProvisionedTableWriteSource,
         authorizer: ?stored_destination_authorization.Authorizer,
@@ -16920,6 +16926,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const alloc = std.heap.page_allocator;
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try distributed_txn.resolveParticipant(alloc, worker.worker(), participant, txn_id, status, commit_version);
     }
 
@@ -17402,8 +17409,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+                        var client = self.httpClient(alloc);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -17525,6 +17531,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
         defer alloc.free(participant);
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
             .txn_id = txn_id,
             .participant = participant,
@@ -17544,6 +17551,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
@@ -17599,7 +17607,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
                 defer alloc.free(body);
 
-                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
                 response.deinit(alloc);
 
@@ -17840,7 +17848,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             return switch (route.*) {
                 .local => try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name),
                 .remote => |remote| blk: {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactReprocess(remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -17910,7 +17918,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 var group_result = switch (route.*) {
                     .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue,
                     .remote => |remote| blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupDocumentArtifactRangeReprocess(remote.base_uri, group_id, table_name, artifact_name, body) catch |err| switch (err) {
                             error.NotFound, error.UnexpectedHttpStatus => continue,
                             else => return err,
@@ -17994,7 +18002,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 break :blk switch (route.*) {
                     .local => (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
                     .remote => |remote| remote_blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairIssues(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18112,7 +18120,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         }
                         const body = try std.json.Stringify.valueAlloc(alloc, remote_req, .{ .emit_null_optional_fields = false });
                         defer alloc.free(body);
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18156,7 +18164,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try std.json.Stringify.valueAlloc(alloc, update, .{ .emit_null_optional_fields = false });
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangePlacementUpdate(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -18187,7 +18195,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try encodeRemoteDocumentArtifactChildRangeApplyBatch(alloc, child_batch);
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangeBatchApply(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,

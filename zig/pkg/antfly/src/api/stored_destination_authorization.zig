@@ -103,6 +103,65 @@ pub fn destinationConfigFingerprintMatches(
     return std.mem.eql(u8, &hex, expected);
 }
 
+/// Legacy restore jobs predate durable destination grants. They may resume
+/// automatically only when the backed-up definition cannot write to another
+/// table. This parser is intentionally shared with sealing so schema drift
+/// fails closed instead of silently classifying a new sink form as harmless.
+pub fn configurationHasDestinations(
+    alloc: std.mem.Allocator,
+    replication_sources_json: []const u8,
+    indexes_json: []const u8,
+) !bool {
+    var parsed_sources = try std.json.parseFromSlice(std.json.Value, alloc, replication_sources_json, .{});
+    defer parsed_sources.deinit();
+    if (parsed_sources.value != .array) return error.InvalidStoredDestinationConfig;
+    for (parsed_sources.value.array.items) |source| {
+        if (source != .object) return error.InvalidStoredDestinationConfig;
+        var destinations = std.ArrayListUnmanaged([]const u8).empty;
+        collectRouteDestinations(alloc, source, &destinations) catch |err| {
+            destinations.deinit(alloc);
+            return err;
+        };
+        const has_destinations = destinations.items.len > 0;
+        destinations.deinit(alloc);
+        if (has_destinations) return true;
+    }
+
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed_indexes.deinit();
+    if (parsed_indexes.value != .object) return error.InvalidStoredDestinationConfig;
+    return try valueHasResolverDestination(parsed_indexes.value);
+}
+
+fn valueHasResolverDestination(value: std.json.Value) !bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers| {
+                if (resolvers != .array) return error.InvalidStoredDestinationConfig;
+                for (resolvers.array.items) |resolver| {
+                    if (resolver == .string) continue;
+                    if (resolver != .object) return error.InvalidStoredDestinationConfig;
+                    const table = resolver.object.get("table") orelse
+                        return error.InvalidStoredDestinationConfig;
+                    if (table != .string or table.string.len == 0)
+                        return error.InvalidStoredDestinationConfig;
+                    return true;
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (try valueHasResolverDestination(entry.value_ptr.*)) return true;
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            if (try valueHasResolverDestination(item)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
 pub fn sealReplicationSourcesJsonAlloc(alloc: std.mem.Allocator, json: []const u8) ![]u8 {
     return try sealReplicationSourcesJsonForPrincipalAlloc(alloc, json, catalog_service_principal);
 }
