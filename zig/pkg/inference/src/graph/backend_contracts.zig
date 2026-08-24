@@ -862,6 +862,20 @@ pub const RunGatedFfnResidualRequest = struct {
     planned_layer_contract: PlannedLayerContract = .{},
 };
 
+/// Backend-owned gated FFN without a residual epilogue. This is useful for
+/// parallel/shared-expert branches whose post norm and residual are applied
+/// only after multiple branches have been combined.
+pub const GatedFfnNoBiasRequest = struct {
+    input: CT,
+    gate_weight: CT,
+    up_weight: CT,
+    down_weight: CT,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    activation: DecoderRuntimeActivationKind,
+};
+
 pub const RunAttentionRequest = struct {
     q: CT,
     k: CT,
@@ -1069,12 +1083,24 @@ pub const DecoderRuntimePrepareReuseResult = struct {
 
 pub const DecoderRuntimeDecodeContract = enum(u8) {
     gemma4_gated_ple_shared_kv,
+    /// Qualified Gemma 4 26B-A4B qLen=1 decode. The backend owns the packed
+    /// expert descriptors and immutable norm vectors for the full token
+    /// frame. This text-only GGUF has no per-layer embedding channel.
+    gemma4_a4b_shared_kv,
     gliner_deberta_encoder,
     qwen3_dense_text_embedding,
 };
 
 pub const DecoderRuntimeDecodeMode = enum(u8) {
     greedy_argmax,
+};
+
+pub const DecoderRuntimeMoeLayerSpec = struct {
+    expert_intermediate_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    router_linear_slot: usize,
+    router_logit_scale: f32,
 };
 
 pub const DecoderRuntimeLayerSpec = struct {
@@ -1108,6 +1134,7 @@ pub const DecoderRuntimeLayerSpec = struct {
     ple_proj_linear_slot: ?usize = null,
     ple_post_norm_slot: ?usize = null,
     output_scale_value: ?f32 = null,
+    moe: ?DecoderRuntimeMoeLayerSpec = null,
 };
 
 pub const DecoderRuntimeDecodeItem = struct {

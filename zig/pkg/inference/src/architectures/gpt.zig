@@ -4978,6 +4978,8 @@ fn decoderBlockImpl(
     trace_sink: ?*ActivationTraceSink,
 ) !CT {
     const attn_started_at = monotonicNowNs();
+    var compute_region_scope = try cb.decoderRuntimePushComputeRegion(.attention);
+    defer compute_region_scope.deinit();
     const hidden_size = config.hidden_size;
     const num_heads = config.num_attention_heads;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -5779,49 +5781,91 @@ fn decoderBlockImpl(
                 // Gemma 4 three-sublayer block: attention → shared expert FFN → MoE routed experts.
                 // Each sublayer has its own pre/post norms and residual connection.
 
+                compute_region_scope.deinit();
+                compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn);
+
                 // Gemma 4 parallel FFN: shared expert and MoE both branch from attn_out,
                 // their outputs are summed, then an overall post-norm + residual is applied.
                 //
                 // Shared expert path: RMSNorm → dense FFN → RMSNorm
                 var norm_started_at = monotonicNowNs();
-                const shared_normed = try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
-                defer cb.free(shared_normed);
+                const parallel_ffn_norms = try applyGemmaParallelFfnPreNorms(cb, allocator, config, sa_out, layer);
+                defer if (parallel_ffn_norms) |norms| {
+                    cb.free(norms.first);
+                    cb.free(norms.second);
+                    cb.free(norms.third);
+                };
+                const shared_normed = if (parallel_ffn_norms) |norms|
+                    norms.first
+                else
+                    try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
+                defer if (parallel_ffn_norms == null) cb.free(shared_normed);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-shared-pre", shared_normed, hidden_size);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
                 const shared_ffn_started_at = monotonicNowNs();
                 const shared_out = try denseFeedForward(cb, allocator, config, shared_normed, total, layer, &name_buf);
                 defer cb.free(shared_out);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-shared", shared_out, hidden_size);
                 const shared_ffn_elapsed = monotonicNowNs() - shared_ffn_started_at;
                 debug_timing_stats.ffn_nanos += @intCast(shared_ffn_elapsed);
                 debug_timing_stats.shared_expert_ffn_nanos += @intCast(shared_ffn_elapsed);
-                norm_started_at = monotonicNowNs();
-                const shared_post = try applyGemmaSharedFfnPostNorm(cb, allocator, config, shared_out, layer, &name_buf);
-                defer if (shared_post != shared_out) cb.free(shared_post);
 
                 // MoE routed expert path: RMSNorm → MoE → RMSNorm (branches from sa_out too)
-                const moe_normed = try applyGemmaMoeFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
-                defer cb.free(moe_normed);
+                const moe_normed = if (parallel_ffn_norms) |norms|
+                    norms.second
+                else
+                    try applyGemmaMoeFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
+                defer if (parallel_ffn_norms == null) cb.free(moe_normed);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-routed-pre", moe_normed, hidden_size);
+                if (parallel_ffn_norms) |norms| {
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-router-pre", norms.third, hidden_size);
+                }
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
                 const moe_started_at = monotonicNowNs();
-                const moe_out = try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, sa_out, total, layer, &name_buf, decode_context);
+                const precomputed_router_input: ?CT = if (parallel_ffn_norms) |norms| norms.third else null;
+                const moe_out = try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, sa_out, precomputed_router_input, total, layer, &name_buf, decode_context);
                 defer cb.free(moe_out);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-routed", moe_out, hidden_size);
                 debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - moe_started_at);
-                norm_started_at = monotonicNowNs();
-                const moe_post = try applyGemmaMoeFfnPostNorm(cb, allocator, config, moe_out, layer, &name_buf);
-                defer if (moe_post != moe_out) cb.free(moe_post);
-
-                // Combine: shared + MoE, then overall FFN post-norm, then residual
-                const combined = try cb.add(shared_post, moe_post);
-                defer cb.free(combined);
-                const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
-                defer if (combined_normed != combined) cb.free(combined_normed);
-                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
                 var layer_result_output_scaled = false;
                 const use_branch_output_scale = config.family == .gemma and branchGemma4LayerOutputScaleDebug();
-                var layer_result = if (config.hasPle() or !use_branch_output_scale)
-                    try cb.add(combined_normed, sa_out)
-                else
-                    try addLayerOutputScaledBranch(cb, allocator, config, combined_normed, sa_out, total, hidden_size, layer);
+                norm_started_at = monotonicNowNs();
+                var layer_result = blk_parallel_post: {
+                    if (allowGemmaRmsNormAddResidualFusion(trace_sink) and
+                        (config.hasPle() or !use_branch_output_scale))
+                    {
+                        if (try applyGemmaParallelFfnPostResidual(
+                            cb,
+                            allocator,
+                            config,
+                            shared_out,
+                            moe_out,
+                            sa_out,
+                            layer,
+                        )) |fused| break :blk_parallel_post fused;
+                    }
+
+                    const shared_post = try applyGemmaSharedFfnPostNorm(cb, allocator, config, shared_out, layer, &name_buf);
+                    defer if (shared_post != shared_out) cb.free(shared_post);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-shared-post", shared_post, hidden_size);
+                    const moe_post = try applyGemmaMoeFfnPostNorm(cb, allocator, config, moe_out, layer, &name_buf);
+                    defer if (moe_post != moe_out) cb.free(moe_post);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-routed-post", moe_post, hidden_size);
+
+                    // Combine: shared + MoE, then overall FFN post-norm, then residual.
+                    const combined = try cb.add(shared_post, moe_post);
+                    defer cb.free(combined);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-combined", combined, hidden_size);
+                    const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
+                    defer if (combined_normed != combined) cb.free(combined_normed);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-combined-post", combined_normed, hidden_size);
+                    break :blk_parallel_post if (config.hasPle() or !use_branch_output_scale)
+                        try cb.add(combined_normed, sa_out)
+                    else
+                        try addLayerOutputScaledBranch(cb, allocator, config, combined_normed, sa_out, total, hidden_size, layer);
+                };
+                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
                 cb.free(sa_out);
 
                 if (config.hasPle()) {
@@ -6418,6 +6462,19 @@ fn shouldScaleGemma4QBeforeAttention(config: Config, qk_already_roped: bool) boo
 fn getenvBool(comptime name: [*:0]const u8) bool {
     if (comptime is_freestanding) return false;
     return platform.env.getenvBool(name);
+}
+
+fn a4bHighMemoryFastPathEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
+        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
+}
+
+fn a4bHighMemoryFeatureEnabled(
+    comptime enable_name: [*:0]const u8,
+    comptime disable_name: [*:0]const u8,
+) bool {
+    return (a4bHighMemoryFastPathEnabled() or getenvBool(enable_name)) and
+        !getenvBool(disable_name);
 }
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
@@ -7957,11 +8014,24 @@ fn denseFeedForward(
 
     const gate_w = try getFFNWeight(cb, config, layer, "gate", name_buf);
     defer cb.free(gate_w);
-    const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
-    defer cb.free(gate_proj);
-
     const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
     defer cb.free(up_w);
+    const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
+    defer cb.free(down_w);
+
+    if (try cb.gatedFfnNoBias(&.{
+        .input = input,
+        .gate_weight = gate_w,
+        .up_weight = up_w,
+        .down_weight = down_w,
+        .rows = total,
+        .hidden_size = hidden_size,
+        .intermediate_size = inter_size,
+        .activation = decoderRuntimeActivationKind(config.activation),
+    })) |fused| return fused;
+
+    const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
+    defer cb.free(gate_proj);
     const up_proj = try cb.linearNoBias(input, up_w, total, hidden_size, inter_size);
     defer cb.free(up_proj);
 
@@ -7979,8 +8049,6 @@ fn denseFeedForward(
     };
     defer cb.free(gated);
 
-    const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
-    defer cb.free(down_w);
     return cb.linearNoBias(gated, down_w, total, inter_size, hidden_size);
 }
 
@@ -8256,7 +8324,7 @@ fn moeFeedForward(
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, null, total, layer, name_buf, decode_context, false);
+    return moeFeedForwardInner(cb, allocator, config, input, null, null, total, layer, name_buf, decode_context, false);
 }
 
 /// MoE feed-forward that skips the shared expert addition (used when the caller
@@ -8269,12 +8337,13 @@ fn moeFeedForwardRoutedOnly(
     config: Config,
     input: CT,
     router_source: CT,
+    precomputed_router_input: ?CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, router_source, total, layer, name_buf, decode_context, true);
+    return moeFeedForwardInner(cb, allocator, config, input, router_source, precomputed_router_input, total, layer, name_buf, decode_context, true);
 }
 
 fn moeFeedForwardInner(
@@ -8283,6 +8352,7 @@ fn moeFeedForwardInner(
     config: Config,
     input: CT,
     router_source: ?CT,
+    precomputed_router_input: ?CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
@@ -8308,12 +8378,14 @@ fn moeFeedForwardInner(
         1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)))
     else
         1.0;
-    const router_input = try scaleMoeRouterInput(cb, config, raw_router_input, hidden_size, layer, name_buf, !defer_router_hidden_scale);
-    defer if (router_input != raw_router_input) cb.free(router_input);
+    const router_input = precomputed_router_input orelse
+        try scaleMoeRouterInput(cb, config, raw_router_input, hidden_size, layer, name_buf, !defer_router_hidden_scale);
+    defer if (precomputed_router_input == null and router_input != raw_router_input) cb.free(router_input);
 
     const router_proj_started_at = monotonicNowNs();
     const router_logits_ct = try cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts);
     defer cb.free(router_logits_ct);
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-router-logits", router_logits_ct, num_experts);
     debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
 
     // Backends own the exact activation/geometry qualification for this
@@ -9454,6 +9526,77 @@ fn applyGemmaMoeFfnPreNorm(
     })) orelse error.MissingLayerNormWeight;
 }
 
+fn applyGemmaParallelFfnPreNorms(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    layer: usize,
+) !?ops.RmsNormTripleResult {
+    if (cb.kind() != .metal or
+        !a4bHighMemoryFeatureEnabled(
+            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
+            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
+        )) return null;
+
+    var shared_primary_buf: [256]u8 = undefined;
+    var shared_fallback_buf: [256]u8 = undefined;
+    const shared_primary = std.fmt.bufPrint(
+        &shared_primary_buf,
+        "model.layers.{d}.pre_feedforward_layernorm.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const shared_fallback = std.fmt.bufPrint(
+        &shared_fallback_buf,
+        "model.layers.{d}.post_attention_layernorm.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const shared_weight = (try getAdjustedNormWeightByNames(
+        cb,
+        allocator,
+        config,
+        config.hidden_size,
+        &.{ shared_primary, shared_fallback },
+    )) orelse return null;
+    defer cb.free(shared_weight);
+
+    var routed_buf: [256]u8 = undefined;
+    const routed_name = std.fmt.bufPrint(
+        &routed_buf,
+        "model.layers.{d}.pre_feedforward_layernorm_2.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const routed_weight = (try getAdjustedNormWeightByNames(
+        cb,
+        allocator,
+        config,
+        config.hidden_size,
+        &.{routed_name},
+    )) orelse return null;
+    defer cb.free(routed_weight);
+
+    var router_buf: [256]u8 = undefined;
+    const router_name = std.fmt.bufPrint(
+        &router_buf,
+        "model.layers.{d}.block_sparse_moe.gate.input_scale",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const router_weight = getModelWeight(cb, config, router_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(router_weight);
+
+    return cb.rmsNormTriple(
+        hidden,
+        shared_weight,
+        routed_weight,
+        router_weight,
+        config.hidden_size,
+        config.norm_eps,
+    );
+}
+
 /// Gemma 4: post-norm for the MoE routed expert sublayer (post_ffw_norm_2).
 fn applyGemmaMoeFfnPostNorm(
     cb: *const ComputeBackend,
@@ -9468,6 +9611,84 @@ fn applyGemmaMoeFfnPostNorm(
     })) orelse hidden;
 }
 
+fn applyGemmaParallelFfnPostResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    shared: CT,
+    routed: CT,
+    residual: CT,
+    layer: usize,
+) !?CT {
+    if (cb.kind() != .metal or
+        !a4bHighMemoryFeatureEnabled(
+            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION",
+            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_POST_FUSION",
+        )) return null;
+
+    var shared_primary_buf: [256]u8 = undefined;
+    var shared_fallback_buf: [256]u8 = undefined;
+    const shared_primary = std.fmt.bufPrint(
+        &shared_primary_buf,
+        "model.layers.{d}.post_feedforward_layernorm_1.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const shared_fallback = std.fmt.bufPrint(
+        &shared_fallback_buf,
+        "model.layers.{d}.post_feedforward_layernorm.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const shared_weight = (try getAdjustedNormWeightByNames(
+        cb,
+        allocator,
+        config,
+        config.hidden_size,
+        &.{ shared_primary, shared_fallback },
+    )) orelse return null;
+    defer cb.free(shared_weight);
+
+    var routed_buf: [256]u8 = undefined;
+    const routed_name = std.fmt.bufPrint(
+        &routed_buf,
+        "model.layers.{d}.post_feedforward_layernorm_2.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const routed_weight = (try getAdjustedNormWeightByNames(
+        cb,
+        allocator,
+        config,
+        config.hidden_size,
+        &.{routed_name},
+    )) orelse return null;
+    defer cb.free(routed_weight);
+
+    var combined_buf: [256]u8 = undefined;
+    const combined_name = std.fmt.bufPrint(
+        &combined_buf,
+        "model.layers.{d}.post_feedforward_layernorm.weight",
+        .{layer},
+    ) catch return error.NameTooLong;
+    const combined_weight = (try getAdjustedNormWeightByNames(
+        cb,
+        allocator,
+        config,
+        config.hidden_size,
+        &.{combined_name},
+    )) orelse return null;
+    defer cb.free(combined_weight);
+
+    return cb.parallelFfnPostResidual(&.{
+        .shared = shared,
+        .shared_weight = shared_weight,
+        .routed = routed,
+        .routed_weight = routed_weight,
+        .combined_weight = combined_weight,
+        .residual = residual,
+        .dim = config.hidden_size,
+        .eps = config.norm_eps,
+    });
+}
+
 fn applyOptionalAdjustedRmsNormByNames(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -9476,15 +9697,29 @@ fn applyOptionalAdjustedRmsNormByNames(
     dim: usize,
     names: []const []const u8,
 ) !?CT {
+    const weight = (try getAdjustedNormWeightByNames(cb, allocator, config, dim, names)) orelse return null;
+    defer cb.free(weight);
+    return try cb.rmsNorm(hidden, weight, dim, config.norm_eps);
+}
+
+fn getAdjustedNormWeightByNames(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    dim: usize,
+    names: []const []const u8,
+) !?CT {
     for (names) |name| {
-        const base_w = getModelWeight(cb, config, name) catch |err| switch (err) {
+        const base_weight = getModelWeight(cb, config, name) catch |err| switch (err) {
             error.MissingWeight, error.WeightNotFound => continue,
             else => return err,
         };
-        defer cb.free(base_w);
-        const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
-        defer if (w != base_w) cb.free(w);
-        return try cb.rmsNorm(hidden, w, dim, config.norm_eps);
+        const adjusted_weight = maybeAdjustNormWeight(cb, allocator, config, base_weight, dim) catch |err| {
+            cb.free(base_weight);
+            return err;
+        };
+        if (adjusted_weight != base_weight) cb.free(base_weight);
+        return adjusted_weight;
     }
     return null;
 }

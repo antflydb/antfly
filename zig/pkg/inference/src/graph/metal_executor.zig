@@ -2134,6 +2134,10 @@ pub fn prewarmSharedDecoderRuntime(
         try prewarmA4bMappedLayer0(&cb, gpt_config);
         return true;
     }
+    // Multi-row prefill and the prepared A4B decoder share the provider's
+    // fixed-capacity weight-slot directory. Install A4B only after canonical
+    // prefill has published its dynamic slots.
+    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config)) return false;
 
     const configured_layer_count = gpt_config.num_hidden_layers;
     const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
@@ -2218,6 +2222,7 @@ fn runtimePrepare(
         return true;
     }
     if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
+    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config)) return false;
 
     const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
     const prepare_started_at = monotonicNowNs();
@@ -2302,8 +2307,16 @@ fn runtimePrefill(
     const prepare_started_at = monotonicNowNs();
     const decode_context = try runtime_ctx.preparePrefill(request.seq_len, request.query_seq_len, request.attention_mode);
     timing_stats.prefill_prepare_nanos += @intCast(monotonicNowNs() - prepare_started_at);
+    // The qualified A4B fast path owns qLen=1 decode only. Let canonical
+    // prefill establish its dynamic packed-weight slots first, then install
+    // the fixed decode plan on the first generated token. Preparing in the
+    // opposite order leaves too little shared slot-directory capacity for
+    // the canonical multi-row MoE prefill.
+    const defer_a4b_decode_prepare = gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config);
     const decoder_runtime_ready = if (request.force_host_logits)
         false
+    else if (defer_a4b_decode_prepare)
+        runtime_ctx.decoderRuntimeExecutorEnabled()
     else if (decoderRuntimePrefillAfterPrepareRequested())
         runtime_ctx.decoderRuntimeExecutorEnabled() and (try runtime_ctx.ensureDecoderRuntimePrepared())
     else blk: {

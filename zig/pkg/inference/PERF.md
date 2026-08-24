@@ -1,5 +1,111 @@
 # Gemma 4 26B-A4B Performance Analysis
 
+## 2026-08-24 Q4_0 high-memory Metal qualification
+
+**Status**: correctness PASS; throughput improved substantially, but llama.cpp
+parity is not yet reached.
+
+**Hardware**: Mac mini (Mac16,11), Apple M4 Pro, 12 CPU cores, 24 GB unified
+memory
+
+**Model**: `gemma-4-26B_q4_0-it.gguf`, 14,439,363,584 bytes,
+SHA-256 `3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d`
+
+**Build**: Zig 0.16.0, `ReleaseFast`, Metal enabled
+
+**Comparator**: llama.cpp build 10342 at `38278078c`, built by Unsloth
+
+The qualified lane is enabled by one umbrella flag:
+
+```sh
+TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH=1 \
+  ./zig-out/bin/antfly-inference generate "$MODEL" "$PROMPT" \
+  --backend metal --mode compiled --compiled-target whole-model \
+  --cache-dtype f16 --a4b-residency-mode resident \
+  --a4b-memory-budget-mb 16384 --backend-budget-mb 16384 \
+  --combined-budget-mb 16384 --raw-prompt --temperature 0 \
+  --ignore-eos --max-tokens 128
+```
+
+The flag bundles only the measured wins: one no-copy model-wide Metal buffer
+with a residency set, mapped routed-expert weights, fused expert gate/up
+activation, cached adjusted norm weights, zero-bias elision, shared-FFN
+fusion, SIMD-group RMSNorm/head-RoPE kernels, triple parallel-FFN pre-norm,
+parallel-FFN post/residual fusion, RMSNorm/residual fusion, and the qualified
+M4 Q4_0 NR4/NSG4 row-one schedule. Every bundled component has a
+`TERMITE_METAL_DISABLE_A4B_*` rollback override. The umbrella remains off by
+default.
+
+### Paired deterministic decode result
+
+All measurements use the same raw 29-token Gemma chat prompt, greedy decode,
+F16 KV, ignored EOS, 128 generated tokens, and a fresh process per sample.
+The throughput metric is decode-only and covers 127 timed decode steps after
+the first generated token.
+
+| Runtime | Samples (tok/s) | Median | ms/token | Relative to llama.cpp |
+|---|---:|---:|---:|---:|
+| Antfly branch baseline | 8.516867 | 8.516867 | 117.414 | 12.37% |
+| Antfly high-memory lane | 39.481801, 39.530574, 39.433148 | **39.481801** | 25.328 | **57.33%** |
+| llama.cpp | 69.21, 68.73, 68.87 | **68.87** | 14.520 | 100% |
+
+This is a **4.636x** speedup over the paired Antfly baseline (+363.6%), while
+the remaining median gap to llama.cpp is 29.39 tok/s.
+
+The three Antfly runs emitted the same 128 token IDs. The SHA-256 of the
+space-separated IDs without a trailing newline is
+`d4ee583f092062e7177069de1f35a9cefbaac24848d11d09b64237bc9209b68e`.
+The visible answer also matches llama.cpp:
+
+> LSM trees are optimized for write-heavy workloads because they transform
+> random writes into sequential I/O by buffering data in memory and flushing
+> it to disk in sorted runs. This approach avoids the expensive, immediate
+> disk seeks required by B-trees, significantly increasing overall write
+> throughput.
+
+The final run reported zero Metal frame and quant-kernel fallbacks, zero
+mapped-weight fallbacks or failures, and the qualified Q4_0 NR4/NSG4 route for
+all 18,415 row-one Q4_0 dispatches.
+
+### Memory and bottleneck profile
+
+The model-wide no-copy Metal allocation is 14,302,248,960 bytes. The complete
+Metal residency set contains 10 allocations totaling 15,542,992,896 bytes
+(14.48 GiB), rather than the old roughly 2 GiB compact envelope.
+
+Five sampled decode frames on the final source average:
+
+| Stage | Average per token |
+|---|---:|
+| GPU total | 21.296 ms |
+| FFN | 14.678 ms |
+| Attention | 6.545 ms |
+| Tail | 0.068 ms |
+| Host/submit gap to wall time | about 4.032 ms |
+
+llama.cpp averages 14.520 ms/token end-to-end and reports 126 reused decode
+graphs. More residency alone therefore cannot close the remaining gap. The
+next high-impact work is persistent decode graph/command reuse plus faster
+routed Q4_0 FFN and paged-GQA kernels. A direct fused expert-down/reduce
+prototype preserved exact output but measured 0.28% slower and was removed;
+future fusion work must beat the separate down and reduction kernels on GPU
+time, not merely reduce dispatch count.
+
+### Verification
+
+- `zig build -Doptimize=ReleaseFast -Dmetal=true`: PASS
+- Full inference suite with loopback sockets enabled: 3,151 passed, 19 skipped
+- Gemma4 benchmark-contract suites: 17/17 and 43/43 PASS
+- Final post-cleanup 128-token Metal guard: PASS, exact token hash above
+- `git diff --check`: PASS
+
+Raw timing JSON and llama.cpp logs are retained in
+`/private/tmp/gemma4-a4b-parity-20260824/` for this machine-local run.
+
+---
+
+## Historical report: 2026-04-08 Q5_K_M lane
+
 **Date**: 2026-04-08
 **Commit**: dfaca28
 **Model**: gemma-4-26B-A4B-it Q5_K_M GGUF

@@ -80,6 +80,26 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+pub const RmsNormTripleResult = struct {
+    first: CT,
+    second: CT,
+    third: CT,
+};
+
+/// Gemma 4's parallel FFN epilogue normalizes the shared and routed branches,
+/// adds them, normalizes the sum, then adds the attention residual. Backends
+/// may execute the full chain without materializing its four intermediates.
+pub const ParallelFfnPostResidualRequest = struct {
+    shared: CT,
+    shared_weight: CT,
+    routed: CT,
+    routed_weight: CT,
+    combined_weight: CT,
+    residual: CT,
+    dim: usize,
+    eps: f32,
+};
+
 pub const DotGeneral2DManyRequest = struct {
     allocator: std.mem.Allocator,
     lhs: []const CT,
@@ -530,6 +550,7 @@ pub const DecoderRuntimeApplyMultiplyAddRequest = backend_contracts.DecoderRunti
 pub const DecoderRuntimeApplyMultiplyAdd2Request = backend_contracts.DecoderRuntimeApplyMultiplyAdd2Request;
 pub const RunDenseFfnResidualRequest = backend_contracts.RunDenseFfnResidualRequest;
 pub const RunGatedFfnResidualRequest = backend_contracts.RunGatedFfnResidualRequest;
+pub const GatedFfnNoBiasRequest = backend_contracts.GatedFfnNoBiasRequest;
 pub const RunAttentionRequest = backend_contracts.RunAttentionRequest;
 pub const DeepSeekV4CompressedAttentionPath = backend_contracts.DeepSeekV4CompressedAttentionPath;
 pub const DeepSeekV4CompressedComponentRequest = backend_contracts.DeepSeekV4CompressedComponentRequest;
@@ -585,6 +606,35 @@ pub const DecoderRuntimeFrameRegime = enum(u8) {
     decode = 2,
 };
 
+/// Semantic region for operations encoded into a backend-owned decoder frame.
+/// Backends may use this for profiling and workload-specific kernel policy; it
+/// must not change results or require callers to know backend implementation
+/// details.
+pub const DecoderRuntimeComputeRegion = enum(u8) {
+    attention = 0,
+    attention_project = 1,
+    ffn_norm = 2,
+    ffn = 3,
+    ple = 4,
+    tail = 5,
+    embedding = 6,
+    layer = 7,
+    other = 8,
+};
+
+pub const DecoderRuntimeComputeRegionScope = struct {
+    backend: ?*const ComputeBackend = null,
+    previous: usize = @intFromEnum(DecoderRuntimeComputeRegion.other),
+    active: bool = false,
+
+    pub fn deinit(self: *DecoderRuntimeComputeRegionScope) void {
+        if (!self.active) return;
+        self.active = false;
+        const backend = self.backend orelse return;
+        backend.decoderRuntimePopComputeRegion(self.previous) catch {};
+    }
+};
+
 /// Candidate bounded expert-arena capacities evaluated by the Metal route
 /// shadow. These counters are diagnostic only: the authoritative route and
 /// weight path are unchanged.
@@ -609,6 +659,15 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_mapped_layer0_attempts: u64 = 0,
     a4b_moe_mapped_layer0_successes: u64 = 0,
     a4b_moe_mapped_layer0_failures: u64 = 0,
+    a4b_moe_resident_mapped_attempts: u64 = 0,
+    a4b_moe_resident_mapped_successes: u64 = 0,
+    a4b_moe_resident_mapped_failures: u64 = 0,
+    a4b_moe_resident_fused_gate_up_attempts: u64 = 0,
+    a4b_moe_resident_fused_gate_up_successes: u64 = 0,
+    a4b_moe_resident_fused_gate_up_failures: u64 = 0,
+    a4b_moe_resident_split_gate_up_attempts: u64 = 0,
+    a4b_moe_resident_split_gate_up_successes: u64 = 0,
+    a4b_moe_resident_split_gate_up_failures: u64 = 0,
     a4b_moe_mapped_layer0_selected_prefetch_attempts: u64 = 0,
     a4b_moe_mapped_layer0_selected_prefetch_successes: u64 = 0,
     a4b_moe_mapped_layer0_selected_prefetch_failures: u64 = 0,
@@ -721,6 +780,20 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_dense_linear_f16_slots: u64 = 0,
     metal_runtime_dense_qkv_packed_bytes: u64 = 0,
     metal_runtime_quant_linear_bytes: u64 = 0,
+    metal_runtime_mapped_moe_split_gate_up_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_fused_gate_up_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_down_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_reduce_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_broadcast_dispatches: u64 = 0,
+    metal_runtime_mapped_model_prepare_attempts: u64 = 0,
+    metal_runtime_mapped_model_prepare_successes: u64 = 0,
+    metal_runtime_mapped_model_prepare_failures: u64 = 0,
+    metal_runtime_mapped_model_logical_bytes: u64 = 0,
+    metal_runtime_mapped_model_allocated_bytes: u64 = 0,
+    metal_runtime_mapped_moe_residency_allocation_count: u64 = 0,
+    metal_runtime_mapped_moe_residency_allocated_bytes: u64 = 0,
+    metal_runtime_mapped_moe_residency_commit_count: u64 = 0,
+    metal_runtime_mapped_moe_residency_request_count: u64 = 0,
     metal_runtime_scratch_bytes: u64 = 0,
     metal_runtime_scratch_pool_bytes: u64 = 0,
     metal_runtime_scratch_pool_slots: u64 = 0,
@@ -1519,6 +1592,14 @@ pub const ComputeBackend = struct {
         /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
         rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT = null,
 
+        /// Applies three RMSNorm weights to the same input. Backends may share
+        /// the denominator reduction used by parallel FFN/router branches.
+        rmsNormTriple: ?*const fn (ctx: *anyopaque, input: CT, first_weight: CT, second_weight: CT, third_weight: CT, dim: usize, eps: f32) anyerror!?RmsNormTripleResult = null,
+
+        /// Fuses the parallel-FFN post norms, branch add, final RMSNorm, and
+        /// residual add used by Gemma 4 A4B decode.
+        parallelFfnPostResidual: ?*const fn (ctx: *anyopaque, request: *const ParallelFfnPostResidualRequest) anyerror!?CT = null,
+
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
@@ -2171,6 +2252,11 @@ pub const ComputeBackend = struct {
         /// This must not alter dispatch or command-buffer topology.
         decoderRuntimeSetActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
 
+        /// Push/pop a semantic region for work encoded into an active decoder
+        /// frame. The returned token restores the prior nested region.
+        decoderRuntimePushComputeRegion: ?*const fn (ctx: *anyopaque, region: DecoderRuntimeComputeRegion) anyerror!?usize = null,
+        decoderRuntimePopComputeRegion: ?*const fn (ctx: *anyopaque, previous: usize) anyerror!void = null,
+
         /// Return true when a backend-owned decoder frame is already active.
         decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
 
@@ -2384,6 +2470,10 @@ pub const ComputeBackend = struct {
         /// owned whole-token submission and return the post-residual
         /// [1, hidden_size] tensor.
         runGatedFfnResidual: ?*const fn (ctx: *anyopaque, request: *const RunGatedFfnResidualRequest) anyerror!?CT = null,
+
+        /// Apply a gated FFN strip without a residual epilogue. Backends may
+        /// fuse gate/up projection, activation/multiply, and down projection.
+        gatedFfnNoBias: ?*const fn (ctx: *anyopaque, request: *const GatedFfnNoBiasRequest) anyerror!?CT = null,
 
         /// Execute a qLen=1 decoder attention step for the backend-owned
         /// path. Backends may return null to fall back to the ordinary
@@ -3239,6 +3329,18 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn rmsNormTriple(self: *const ComputeBackend, input: CT, first_weight: CT, second_weight: CT, third_weight: CT, dim: usize, eps: f32) !?RmsNormTripleResult {
+        if (self.vtable.rmsNormTriple) |f| {
+            return f(self.ptr, input, first_weight, second_weight, third_weight, dim, eps);
+        }
+        return null;
+    }
+
+    pub fn parallelFfnPostResidual(self: *const ComputeBackend, request: *const ParallelFfnPostResidualRequest) !?CT {
+        if (self.vtable.parallelFfnPostResidual) |f| return f(self.ptr, request);
+        return null;
+    }
+
     pub fn gelu(self: *const ComputeBackend, input: CT) !CT {
         return self.vtable.gelu(self.ptr, input);
     }
@@ -3994,6 +4096,21 @@ pub const ComputeBackend = struct {
         }
     }
 
+    pub fn decoderRuntimePushComputeRegion(
+        self: *const ComputeBackend,
+        region: DecoderRuntimeComputeRegion,
+    ) !DecoderRuntimeComputeRegionScope {
+        const op = self.vtable.decoderRuntimePushComputeRegion orelse return .{};
+        const previous = (try op(self.ptr, region)) orelse return .{};
+        return .{ .backend = self, .previous = previous, .active = true };
+    }
+
+    pub fn decoderRuntimePopComputeRegion(self: *const ComputeBackend, previous: usize) !void {
+        if (self.vtable.decoderRuntimePopComputeRegion) |op| {
+            try op(self.ptr, previous);
+        }
+    }
+
     pub fn decoderRuntimeHasActiveFrame(self: *const ComputeBackend) bool {
         if (self.vtable.decoderRuntimeHasActiveFrame) |op| {
             return op(self.ptr);
@@ -4365,6 +4482,13 @@ pub const ComputeBackend = struct {
 
     pub fn runGatedFfnResidual(self: *const ComputeBackend, request: *const RunGatedFfnResidualRequest) !?CT {
         if (self.vtable.runGatedFfnResidual) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gatedFfnNoBias(self: *const ComputeBackend, request: *const GatedFfnNoBiasRequest) !?CT {
+        if (self.vtable.gatedFfnNoBias) |op| {
             return op(self.ptr, request);
         }
         return null;

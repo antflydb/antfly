@@ -3810,6 +3810,72 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"resident_mapped":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"fused_gate_up":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d}
+        \\}},
+        \\"split_gate_up":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d}
+        \\}},
+        \\"dispatches":{{
+        \\"split_gate_up":{d},
+        \\"fused_gate_up":{d},
+        \\"down":{d},
+        \\"reduce":{d},
+        \\"broadcast":{d}
+        \\}},
+        \\"model_buffer":{{
+        \\"prepare_attempts":{d},
+        \\"prepare_successes":{d},
+        \\"prepare_failures":{d},
+        \\"logical_bytes":{d},
+        \\"allocated_bytes":{d}
+        \\}},
+        \\"residency_set":{{
+        \\"allocation_count":{d},
+        \\"allocated_bytes":{d},
+        \\"commit_count":{d},
+        \\"request_count":{d}
+        \\}}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_resident_mapped_attempts,
+            provider.a4b_moe_resident_mapped_successes,
+            provider.a4b_moe_resident_mapped_failures,
+            provider.a4b_moe_resident_fused_gate_up_attempts,
+            provider.a4b_moe_resident_fused_gate_up_successes,
+            provider.a4b_moe_resident_fused_gate_up_failures,
+            provider.a4b_moe_resident_split_gate_up_attempts,
+            provider.a4b_moe_resident_split_gate_up_successes,
+            provider.a4b_moe_resident_split_gate_up_failures,
+            provider.metal_runtime_mapped_moe_split_gate_up_dispatches,
+            provider.metal_runtime_mapped_moe_fused_gate_up_dispatches,
+            provider.metal_runtime_mapped_moe_down_dispatches,
+            provider.metal_runtime_mapped_moe_reduce_dispatches,
+            provider.metal_runtime_mapped_moe_broadcast_dispatches,
+            provider.metal_runtime_mapped_model_prepare_attempts,
+            provider.metal_runtime_mapped_model_prepare_successes,
+            provider.metal_runtime_mapped_model_prepare_failures,
+            provider.metal_runtime_mapped_model_logical_bytes,
+            provider.metal_runtime_mapped_model_allocated_bytes,
+            provider.metal_runtime_mapped_moe_residency_allocation_count,
+            provider.metal_runtime_mapped_moe_residency_allocated_bytes,
+            provider.metal_runtime_mapped_moe_residency_commit_count,
+            provider.metal_runtime_mapped_moe_residency_request_count,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
         \\"residency":{{
         \\"quantized_slots":{d},
         \\"quantized_prepared_bytes":{d},
@@ -5657,6 +5723,39 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.a4b_moe_checkpoint_replays,
             metal_snapshot.provider.a4b_moe_slot_uploads,
             metal_snapshot.provider.a4b_moe_slot_upload_bytes,
+        },
+    );
+    print(
+        "metal_a4b_resident_mapped: attempts={d} successes={d} failures={d} fused_attempts={d} fused_successes={d} fused_failures={d} split_attempts={d} split_successes={d} split_failures={d}\n",
+        .{
+            metal_snapshot.provider.a4b_moe_resident_mapped_attempts,
+            metal_snapshot.provider.a4b_moe_resident_mapped_successes,
+            metal_snapshot.provider.a4b_moe_resident_mapped_failures,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_attempts,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_successes,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_failures,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_attempts,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_successes,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_failures,
+        },
+    );
+    print(
+        "metal_a4b_resident_runtime: split_gate_up_dispatches={d} fused_gate_up_dispatches={d} down_dispatches={d} reduce_dispatches={d} broadcast_dispatches={d} model_prepare_attempts={d} model_prepare_successes={d} model_prepare_failures={d} model_logical_bytes={d} model_allocated_bytes={d} residency_allocations={d} residency_allocated_bytes={d} residency_commits={d} residency_requests={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_mapped_moe_split_gate_up_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_fused_gate_up_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_down_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_reduce_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_broadcast_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_attempts,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_successes,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_failures,
+            metal_snapshot.provider.metal_runtime_mapped_model_logical_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_model_allocated_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_allocation_count,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_allocated_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_commit_count,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_request_count,
         },
     );
     for (ops.a4b_projected_slot_capacities, 0..) |capacity, projection| {
