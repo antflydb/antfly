@@ -261,6 +261,7 @@ pub const FsProgressStore = struct {
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
+        .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
@@ -288,6 +289,16 @@ pub const FsProgressStore = struct {
     fn erasedCompareAndSwapHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapHead(namespace, expected, version);
+    }
+
+    fn erasedCompareAndSwapHeadFenced(
+        _: *anyopaque,
+        _: []const u8,
+        _: ?u64,
+        _: u64,
+        _: progress_store.PublicationFence,
+    ) !bool {
+        return error.PublicationFenceUnsupported;
     }
 
     fn erasedGetGcWatermark(ptr: *anyopaque, namespace: []const u8) !?u64 {

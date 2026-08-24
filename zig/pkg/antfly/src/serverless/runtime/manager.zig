@@ -21,6 +21,7 @@ const catalog_mod = @import("../catalog/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
+const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
 
 pub const RuntimeConfig = struct {
     tick_interval_ms: u64 = 25,
@@ -66,6 +67,7 @@ pub const ManagedRuntime = struct {
     cumulative_stats: RuntimeRunStats = .{},
     future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    stop_wake: std.Io.Event = .unset,
     failure_mu: std.atomic.Mutex = .unlocked,
     run_failure: ?anyerror = null,
     work_lease_provider: ?build_mod.work_lease.Provider = null,
@@ -115,15 +117,25 @@ pub const ManagedRuntime = struct {
         if (self.future != null) return error.AlreadyStarted;
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
+        self.stop_wake.reset();
         lockAtomic(&self.failure_mu);
         self.run_failure = null;
         self.failure_mu.unlock();
-        self.future = self.io.async(runLoop, .{self});
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *ManagedRuntime) void {
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn stopWithDeadline(self: *ManagedRuntime, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stop_requested.store(true, .monotonic);
+        self.stop_wake.set(self.io);
         if (self.future) |*future| {
+            // Wake an idle runtime immediately instead of consuming the rest
+            // of the shutdown budget in the configured tick interval. The
+            // shared process watchdog remains responsible for in-flight work.
+            _ = deadline.remainingMilliseconds();
             _ = future.await(self.io);
             self.future = null;
         }
@@ -344,11 +356,14 @@ pub const ManagedRuntime = struct {
                 self.failure_mu.unlock();
                 return;
             };
-            std.Io.sleep(
-                self.io,
-                .fromMilliseconds(@intCast(@max(self.cfg.tick_interval_ms, 1))),
-                .awake,
-            ) catch return;
+            self.stop_wake.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@max(self.cfg.tick_interval_ms, 1))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+            return;
         }
     }
 };

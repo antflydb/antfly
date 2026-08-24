@@ -9,6 +9,7 @@
 //! changing durable visibility without depending on a particular lease store.
 
 const std = @import("std");
+const head_coordination = @import("../head_coordination.zig");
 
 pub const Acquisition = struct {
     fencing_token: u64,
@@ -123,9 +124,16 @@ pub const Provider = struct {
 pub const PublicationGuard = struct {
     ptr: *anyopaque,
     check_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    prepare_fn: *const fn (*anyopaque, []const u8) anyerror!head_coordination.Fence,
 
     pub fn check(self: PublicationGuard, namespace: []const u8) !void {
         try self.check_fn(self.ptr, namespace);
+    }
+
+    /// Renews ownership and returns the proof that the progress backend must
+    /// compare atomically with the visible-head update.
+    pub fn preparePublication(self: PublicationGuard, namespace: []const u8) !head_coordination.Fence {
+        return try self.prepare_fn(self.ptr, namespace);
     }
 };
 
@@ -142,7 +150,11 @@ pub const HeldLease = struct {
     released: bool = false,
 
     pub fn guard(self: *HeldLease) PublicationGuard {
-        return .{ .ptr = self, .check_fn = checkPublication };
+        return .{
+            .ptr = self,
+            .check_fn = checkPublication,
+            .prepare_fn = preparePublication,
+        };
     }
 
     pub fn validate(self: *HeldLease) !void {
@@ -181,6 +193,10 @@ pub const HeldLease = struct {
     }
 
     fn checkPublication(ptr: *anyopaque, namespace: []const u8) !void {
+        _ = try preparePublication(ptr, namespace);
+    }
+
+    fn preparePublication(ptr: *anyopaque, namespace: []const u8) !head_coordination.Fence {
         const self: *HeldLease = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, namespace, self.namespace)) {
             return error.WorkLeaseNamespaceMismatch;
@@ -189,6 +205,10 @@ pub const HeldLease = struct {
         // owner/token. It lets long builds finish when merely overdue while a
         // true takeover still changes the token and rejects this cutover.
         try self.renew(self.ttl_ns);
+        return .{
+            .owner_id = self.owner_id,
+            .fencing_token = self.acquisition.fencing_token,
+        };
     }
 };
 

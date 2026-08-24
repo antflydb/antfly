@@ -459,8 +459,13 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
-        if (publication_guard) |guard| try guard.check(namespace);
-        const published = try self.progress.compareAndSwapHead(namespace, if (current_head == 0) null else current_head, next_version);
+        const published = try compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            if (current_head == 0) null else current_head,
+            next_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{
@@ -490,11 +495,12 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
-        if (publication_guard) |guard| try guard.check(namespace);
-        const published = try self.progress.compareAndSwapHead(
+        const published = try compareAndSwapHeadGuarded(
+            self.progress,
             namespace,
             if (current_head == 0) null else current_head,
             version,
+            publication_guard,
         );
         if (!published) return error.HeadChanged;
 
@@ -690,8 +696,13 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
-        if (publication_guard) |guard| try guard.check(namespace);
-        const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
+        const published = try compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            current_head,
+            next_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{
@@ -888,6 +899,20 @@ pub const Builder = struct {
         };
     }
 };
+
+pub fn compareAndSwapHeadGuarded(
+    progress: *catalog_mod.ProgressStore,
+    namespace: []const u8,
+    expected: ?u64,
+    version: u64,
+    publication_guard: ?work_lease.PublicationGuard,
+) !bool {
+    if (publication_guard) |guard| {
+        const fence = try guard.preparePublication(namespace);
+        return try progress.compareAndSwapHeadFenced(namespace, expected, version, fence);
+    }
+    return try progress.compareAndSwapHead(namespace, expected, version);
+}
 
 fn buildManifestAlloc(
     alloc: Allocator,

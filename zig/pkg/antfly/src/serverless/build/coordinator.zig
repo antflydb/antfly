@@ -33,6 +33,8 @@ pub const BackgroundPublisher = struct {
     poll_interval_ms: u64,
     future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    stop_wake: std.Io.Event = .unset,
+    idle_waiting: std.atomic.Value(bool) = .init(false),
     failure_mu: std.atomic.Mutex = .unlocked,
     run_failure: ?anyerror = null,
     lease_provider: ?work_lease.Provider = null,
@@ -66,15 +68,20 @@ pub const BackgroundPublisher = struct {
     pub fn start(self: *BackgroundPublisher) !void {
         if (self.future != null) return error.AlreadyStarted;
         self.stop_requested.store(false, .monotonic);
+        self.idle_waiting.store(false, .monotonic);
+        self.stop_wake.reset();
         lockAtomic(&self.failure_mu);
         self.run_failure = null;
         self.failure_mu.unlock();
-        self.future = self.io.async(runLoop, .{self});
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *BackgroundPublisher) void {
         self.stop_requested.store(true, .monotonic);
+        self.stop_wake.set(self.io);
         if (self.future) |*future| {
+            // Wake the idle wait explicitly. Awaiting preserves cleanup in an
+            // in-flight publication while avoiding the configured interval.
             _ = future.await(self.io);
             self.future = null;
         }
@@ -177,16 +184,21 @@ pub const BackgroundPublisher = struct {
                 self.failure_mu.unlock();
                 return;
             };
-            std.Io.sleep(
-                self.io,
-                .fromMilliseconds(@intCast(@max(self.poll_interval_ms, 1))),
-                .awake,
-            ) catch return;
+            self.idle_waiting.store(true, .release);
+            defer self.idle_waiting.store(false, .release);
+            self.stop_wake.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@max(self.poll_interval_ms, 1))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+            return;
         }
     }
 };
 
-test "background publisher runOnce publishes namespaces with pending WAL" {
+test "serverless background publisher publishes once and stop wakes a long idle wait" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -238,11 +250,26 @@ test "background publisher runOnce publishes namespaces with pending WAL" {
     });
     defer ingest.deinit(alloc);
 
-    var publisher = BackgroundPublisher.init(alloc, &catalog, 1);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var publisher = BackgroundPublisher.initWithIo(
+        alloc,
+        io_impl.io(),
+        &catalog,
+        std.math.maxInt(u32),
+    );
+    defer publisher.deinit();
     const published = try publisher.runOnce();
     try std.testing.expectEqual(@as(usize, 1), published.published_namespaces);
     try std.testing.expectEqual(@as(usize, 0), published.head_conflicts);
     try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+
+    try publisher.start();
+    var attempts: usize = 0;
+    while (!publisher.idle_waiting.load(.acquire) and attempts < 50) : (attempts += 1) sleepMs(5);
+    try std.testing.expect(publisher.idle_waiting.load(.acquire));
+    publisher.stop();
+    try std.testing.expect(publisher.future == null);
 }
 
 test "background publisher loop publishes asynchronously and latest reads remain valid" {

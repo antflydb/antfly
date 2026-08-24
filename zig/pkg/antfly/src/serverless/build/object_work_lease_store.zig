@@ -7,28 +7,20 @@
 const std = @import("std");
 const objectstore = @import("objectstore");
 const work_lease = @import("work_lease.zig");
+const head_coordination = @import("../head_coordination.zig");
 
 const Allocator = std.mem.Allocator;
 
-const persisted_format_version: u32 = 1;
-
-const PersistedLease = struct {
-    format_version: u32 = persisted_format_version,
-    owner_id: []const u8,
-    fencing_token: u64,
-    expires_at_unix_ns: u64,
-    released: bool = false,
-};
-
 const CurrentLease = struct {
-    owner_id: []u8,
+    head_version: u64,
+    owner_id: ?[]u8,
     fencing_token: u64,
     expires_at_unix_ns: u64,
     released: bool,
     etag: []u8,
 
     fn deinit(self: *CurrentLease, alloc: Allocator) void {
-        alloc.free(self.owner_id);
+        if (self.owner_id) |owner_id| alloc.free(owner_id);
         alloc.free(self.etag);
         self.* = undefined;
     }
@@ -88,21 +80,25 @@ pub const ObjectWorkLeaseStore = struct {
         var fencing_token: u64 = 1;
         if (current) |value| {
             if (!value.released and value.expires_at_unix_ns > now_unix_ns and
-                !std.mem.eql(u8, value.owner_id, owner_id))
+                (value.owner_id == null or !std.mem.eql(u8, value.owner_id.?, owner_id)))
             {
                 return null;
             }
             if (value.released or value.expires_at_unix_ns <= now_unix_ns) {
-                fencing_token = std.math.add(u64, value.fencing_token, 1) catch {
-                    return error.LeaseFencingTokenExhausted;
-                };
+                fencing_token = if (value.fencing_token == 0)
+                    1
+                else
+                    std.math.add(u64, value.fencing_token, 1) catch {
+                        return error.LeaseFencingTokenExhausted;
+                    };
                 took_over = !value.released;
             } else {
                 fencing_token = value.fencing_token;
             }
         }
 
-        const proposed = PersistedLease{
+        const proposed = head_coordination.Record{
+            .head_version = if (current) |value| value.head_version else 0,
             .owner_id = owner_id,
             .fencing_token = fencing_token,
             .expires_at_unix_ns = expires_at,
@@ -147,7 +143,8 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(key);
         var current = (try self.readCurrentAlloc(key)) orelse return error.WorkLeaseLost;
         defer current.deinit(self.alloc);
-        if (!std.mem.eql(u8, current.owner_id, owner_id) or
+        if (current.owner_id == null or
+            !std.mem.eql(u8, current.owner_id.?, owner_id) or
             current.fencing_token != fencing_token or
             current.released or
             current.expires_at_unix_ns <= now_unix_ns)
@@ -171,14 +168,16 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(key);
         var current = (try self.readCurrentAlloc(key)) orelse return error.WorkLeaseLost;
         defer current.deinit(self.alloc);
-        if (!std.mem.eql(u8, current.owner_id, owner_id) or
+        if (current.owner_id == null or
+            !std.mem.eql(u8, current.owner_id.?, owner_id) or
             current.fencing_token != fencing_token or
             current.released)
         {
             return error.WorkLeaseLost;
         }
 
-        const proposed = PersistedLease{
+        const proposed = head_coordination.Record{
+            .head_version = current.head_version,
             .owner_id = owner_id,
             .fencing_token = fencing_token,
             .expires_at_unix_ns = expires_at,
@@ -210,13 +209,15 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(key);
         var current = (try self.readCurrentAlloc(key)) orelse return false;
         defer current.deinit(self.alloc);
-        if (!std.mem.eql(u8, current.owner_id, owner_id) or
+        if (current.owner_id == null or
+            !std.mem.eql(u8, current.owner_id.?, owner_id) or
             current.fencing_token != fencing_token)
         {
             return false;
         }
 
-        const released_record = PersistedLease{
+        const released_record = head_coordination.Record{
+            .head_version = current.head_version,
             .owner_id = owner_id,
             .fencing_token = fencing_token,
             .expires_at_unix_ns = 0,
@@ -245,32 +246,47 @@ pub const ObjectWorkLeaseStore = struct {
         };
         defer result.deinit(self.alloc);
         const etag = result.metadata.etag orelse return error.MissingLeaseObjectEtag;
-        var parsed = try std.json.parseFromSlice(PersistedLease, self.alloc, result.body, .{
-            .ignore_unknown_fields = false,
-        });
-        defer parsed.deinit();
-        if (parsed.value.format_version != persisted_format_version or
-            parsed.value.owner_id.len == 0 or
-            parsed.value.fencing_token == 0)
-        {
-            return error.InvalidWorkLeaseRecord;
+        const trimmed = std.mem.trim(u8, result.body, " \t\r\n");
+        var record: head_coordination.Record = undefined;
+        var owner_id: ?[]u8 = null;
+        if (trimmed.len != 0 and trimmed[0] == '{') {
+            var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
+                .ignore_unknown_fields = false,
+            });
+            defer parsed.deinit();
+            if (parsed.value.format_version != head_coordination.format_version)
+                return error.InvalidWorkLeaseRecord;
+            if (parsed.value.owner_id) |borrowed_owner_id| {
+                if (borrowed_owner_id.len == 0 or parsed.value.fencing_token == 0)
+                    return error.InvalidWorkLeaseRecord;
+                owner_id = try self.alloc.dupe(u8, borrowed_owner_id);
+            } else if (parsed.value.fencing_token != 0 or !parsed.value.released) {
+                return error.InvalidWorkLeaseRecord;
+            }
+            record = parsed.value;
+        } else {
+            record = head_coordination.Record.fromLegacyHead(
+                try std.fmt.parseInt(u64, trimmed, 10),
+            );
         }
-        const owner_id = try self.alloc.dupe(u8, parsed.value.owner_id);
-        errdefer self.alloc.free(owner_id);
+        errdefer if (owner_id) |owned| self.alloc.free(owned);
         const owned_etag = try self.alloc.dupe(u8, etag);
         return .{
+            .head_version = record.head_version,
             .owner_id = owner_id,
-            .fencing_token = parsed.value.fencing_token,
-            .expires_at_unix_ns = parsed.value.expires_at_unix_ns,
-            .released = parsed.value.released,
+            .fencing_token = record.fencing_token,
+            .expires_at_unix_ns = record.expires_at_unix_ns,
+            .released = record.released,
             .etag = owned_etag,
         };
     }
 
-    fn recordMatches(self: *ObjectWorkLeaseStore, key: []const u8, expected: PersistedLease) !bool {
+    fn recordMatches(self: *ObjectWorkLeaseStore, key: []const u8, expected: head_coordination.Record) !bool {
         var current = (try self.readCurrentAlloc(key)) orelse return false;
         defer current.deinit(self.alloc);
-        return std.mem.eql(u8, current.owner_id, expected.owner_id) and
+        return current.owner_id != null and
+            expected.owner_id != null and
+            std.mem.eql(u8, current.owner_id.?, expected.owner_id.?) and
             current.fencing_token == expected.fencing_token and
             current.expires_at_unix_ns == expected.expires_at_unix_ns and
             current.released == expected.released;
@@ -336,9 +352,9 @@ pub const ObjectWorkLeaseStore = struct {
 
 fn keyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
     if (prefix.len == 0) {
-        return try std.fmt.allocPrint(alloc, "{s}/WORKFLOW_LEASE", .{namespace});
+        return try std.fmt.allocPrint(alloc, "{s}/HEAD", .{namespace});
     }
-    return try std.fmt.allocPrint(alloc, "{s}/{s}/WORKFLOW_LEASE", .{ prefix, namespace });
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD", .{ prefix, namespace });
 }
 
 test "serverless object work lease fences stale owners and reconciles ambiguous acquisition" {
@@ -379,4 +395,43 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
     const third = (try provider.acquire("docs", "worker-c", 112, 10)).?;
     try std.testing.expectEqual(@as(u64, 3), third.fencing_token);
     try std.testing.expect(!third.took_over);
+}
+
+test "serverless head publication atomically rejects a stale fencing token" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer leases.deinit();
+    const provider = leases.provider();
+
+    const stale = (try provider.acquire("docs", "worker-a", 100, 10)).?;
+    const replacement = (try provider.acquire("docs", "worker-b", 110, 100)).?;
+    try std.testing.expect(replacement.fencing_token > stale.fencing_token);
+    try std.testing.expectError(
+        error.WorkLeaseLost,
+        progress.compareAndSwapHeadFenced("docs", null, 1, .{
+            .owner_id = "worker-a",
+            .fencing_token = stale.fencing_token,
+        }),
+    );
+    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", null, 1, .{
+        .owner_id = "worker-b",
+        .fencing_token = replacement.fencing_token,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
 }

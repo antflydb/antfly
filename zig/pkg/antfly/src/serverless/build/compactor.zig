@@ -212,8 +212,13 @@ pub const Compactor = struct {
         defer manifest.deinit(self.alloc);
 
         try self.manifests.put(manifest);
-        if (publication_guard) |guard| try guard.check(namespace);
-        const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
+        const published = try builder_mod.compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            current_head,
+            next_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{

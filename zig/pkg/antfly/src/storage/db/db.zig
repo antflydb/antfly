@@ -1348,6 +1348,10 @@ const TtlCleanupContext = struct {
 /// address until the worker has joined during close.
 const TransactionRecoveryLocalContext = struct {
     stable_owner: ?*DB = null,
+    /// Borrowed split state published under the core apply lock. The public DB
+    /// wrapper is movable, so its `shadow` field is not a stable source for the
+    /// recovery owner allocated during open.
+    split_shadow: ?ShadowState = null,
 };
 
 const ManagedSyncTargets = struct {
@@ -3763,6 +3767,7 @@ pub const DB = struct {
     fn prepareTransactionRecoveryOwner(self: *DB) !void {
         const ctx = self.transaction_recovery_local_context orelse return;
         if (ctx.stable_owner != null) return;
+        ctx.split_shadow = self.shadow;
         const stable_owner = try self.runtime_alloc.create(DB);
         stable_owner.* = self.*;
         // The snapshot shares durable/core/runtime pointers, but it must not
@@ -14774,13 +14779,25 @@ pub const DB = struct {
             .range_start = shadow_start,
             .range_end = shadow_end,
         };
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = self.shadow;
+        }
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.closeShadowIndexManagerLocked();
+    }
+
+    fn closeShadowIndexManagerLocked(self: *DB) !void {
         const shadow = self.shadow orelse return;
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = null;
+        }
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
         self.alloc.free(shadow.base_path);
@@ -41413,7 +41430,13 @@ fn startAsyncWorkers(self: *DB) !void {
 }
 
 fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatch) !void {
-    const shadow = self.shadow orelse return;
+    // Recovery runs through a stable heap owner whose wrapper fields were
+    // captured during open. Split ownership is mutable, so recovery reads the
+    // shared context updated by the serving wrapper under this same apply lock.
+    const shadow = if (self.transaction_recovery_local_context) |ctx|
+        ctx.split_shadow orelse return
+    else
+        self.shadow orelse return;
     const state = self.core.splitState() orelse return;
     if (state.phase != .splitting) return;
 
@@ -42492,7 +42515,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     try self.core.finalizeSplitState();
     try self.refreshManagedIndexWorkersLocked();
-    try self.closeShadowIndexManager();
+    try self.closeShadowIndexManagerLocked();
     try self.refreshManagedIndexWorkersLocked();
 }
 
@@ -87506,6 +87529,42 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:recovered_orphan", result.hits[0].id);
+}
+
+test "db transaction recovery stable owner observes split shadow lifetime" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery_ctx = db.transaction_recovery_local_context orelse
+        return error.TransactionRecoveryOwnerUnbound;
+    try std.testing.expect(recovery_ctx.stable_owner != null);
+    try std.testing.expect(recovery_ctx.stable_owner.?.shadow == null);
+
+    try db.addIndex(.{
+        .name = "ft_split_recovery",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.createShadowIndexManager("doc:m", "");
+    try std.testing.expect(recovery_ctx.split_shadow != null);
+    try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
+
+    try db.closeShadowIndexManager();
+    try std.testing.expect(recovery_ctx.split_shadow == null);
 }
 
 test "db batch enforces optimistic version predicates" {

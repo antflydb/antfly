@@ -17,6 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
+const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
 
@@ -152,13 +153,88 @@ pub const ObjectProgressStore = struct {
     pub fn getHead(self: *ObjectProgressStore, namespace: []const u8) !u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        return try self.readValue(key);
+        var current = (try self.tryReadHeadCurrent(key)) orelse return error.FileNotFound;
+        defer current.deinit(self.alloc);
+        if (current.record.head_version == 0) return error.FileNotFound;
+        return current.record.head_version;
     }
 
     pub fn compareAndSwapHead(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
+        return try self.compareAndSwapHeadMaybeFenced(namespace, expected, version, null);
+    }
+
+    pub fn compareAndSwapHeadFenced(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: progress_store.PublicationFence,
+    ) !bool {
+        return try self.compareAndSwapHeadMaybeFenced(namespace, expected, version, fence);
+    }
+
+    fn compareAndSwapHeadMaybeFenced(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: ?progress_store.PublicationFence,
+    ) !bool {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        return try self.compareAndSwap(key, expected, version);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        var current = try self.tryReadHeadCurrent(key);
+        defer if (current) |*entry| entry.deinit(self.alloc);
+        const current_version: ?u64 = if (current) |entry|
+            if (entry.record.head_version == 0) null else entry.record.head_version
+        else
+            null;
+        if (current_version != expected) return false;
+        if (fence) |required| {
+            const entry = current orelse return error.WorkLeaseLost;
+            if (entry.record.released or
+                entry.record.fencing_token != required.fencing_token or
+                entry.record.owner_id == null or
+                !std.mem.eql(u8, entry.record.owner_id.?, required.owner_id))
+            {
+                return error.WorkLeaseLost;
+            }
+        }
+
+        var proposed = if (current) |entry|
+            entry.record
+        else
+            head_coordination.Record{};
+        proposed.head_version = version;
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        defer self.alloc.free(payload);
+
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = "application/json",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |entry| entry.etag else null,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                if (fence) |required| {
+                    var winner = try self.tryReadHeadCurrent(key);
+                    defer if (winner) |*entry| entry.deinit(self.alloc);
+                    const entry = winner orelse return error.WorkLeaseLost;
+                    if (entry.record.released or
+                        entry.record.fencing_token != required.fencing_token or
+                        entry.record.owner_id == null or
+                        !std.mem.eql(u8, entry.record.owner_id.?, required.owner_id))
+                    {
+                        return error.WorkLeaseLost;
+                    }
+                }
+                return false;
+            },
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return true;
     }
 
     pub fn getGcWatermark(self: *ObjectProgressStore, namespace: []const u8) !?u64 {
@@ -287,6 +363,57 @@ pub const ObjectProgressStore = struct {
         etag: ?[]u8,
     };
 
+    const CurrentHead = struct {
+        record: head_coordination.Record,
+        owned_owner_id: ?[]u8 = null,
+        etag: ?[]u8 = null,
+
+        fn deinit(self: *CurrentHead, alloc: std.mem.Allocator) void {
+            if (self.owned_owner_id) |owner_id| alloc.free(owner_id);
+            if (self.etag) |etag| alloc.free(etag);
+            self.* = undefined;
+        }
+    };
+
+    fn tryReadHeadCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentHead {
+        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+
+        const trimmed = std.mem.trim(u8, result.body, " \t\r\n");
+        var record: head_coordination.Record = undefined;
+        var owned_owner_id: ?[]u8 = null;
+        if (trimmed.len != 0 and trimmed[0] == '{') {
+            var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
+                .ignore_unknown_fields = false,
+            });
+            defer parsed.deinit();
+            if (parsed.value.format_version != head_coordination.format_version)
+                return error.InvalidHeadCoordinationRecord;
+            if (parsed.value.owner_id) |owner_id| {
+                if (owner_id.len == 0 or parsed.value.fencing_token == 0)
+                    return error.InvalidHeadCoordinationRecord;
+                owned_owner_id = try self.alloc.dupe(u8, owner_id);
+            } else if (parsed.value.fencing_token != 0 or !parsed.value.released) {
+                return error.InvalidHeadCoordinationRecord;
+            }
+            record = parsed.value;
+            record.owner_id = owned_owner_id;
+        } else {
+            record = head_coordination.Record.fromLegacyHead(
+                try std.fmt.parseInt(u64, trimmed, 10),
+            );
+        }
+        errdefer if (owned_owner_id) |owner_id| self.alloc.free(owner_id);
+        return .{
+            .record = record,
+            .owned_owner_id = owned_owner_id,
+            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
+        };
+    }
+
     fn tryReadCurrent(self: *ObjectProgressStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentValue {
         var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -303,6 +430,7 @@ pub const ObjectProgressStore = struct {
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
+        .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
@@ -330,6 +458,17 @@ pub const ObjectProgressStore = struct {
     fn erasedCompareAndSwapHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapHead(namespace, expected, version);
+    }
+
+    fn erasedCompareAndSwapHeadFenced(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: progress_store.PublicationFence,
+    ) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapHeadFenced(namespace, expected, version, fence);
     }
 
     fn erasedGetGcWatermark(ptr: *anyopaque, namespace: []const u8) !?u64 {

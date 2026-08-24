@@ -181,8 +181,8 @@ pub const Scenario = struct {
             self.lease_impl = try build_mod.ObjectWorkLeaseStore.initWithClient(
                 alloc,
                 self.lease_faults.client(),
-                "workflow-leases",
-                "tenant",
+                self.progress_impl.bucket,
+                self.progress_impl.prefix,
             );
             errdefer self.lease_impl.deinit();
 

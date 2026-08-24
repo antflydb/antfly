@@ -131,7 +131,7 @@ pub const ServerlessServer = struct {
 
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopListenerWithDeadline(deadline);
-        self.stack.runtime.stop();
+        self.stack.runtime.stopWithDeadline(deadline);
     }
 
     pub fn baseUri(self: *ServerlessServer, alloc: std.mem.Allocator) ![]u8 {

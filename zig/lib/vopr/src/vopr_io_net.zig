@@ -442,10 +442,10 @@ pub const Network = struct {
         for (self.packets.items, 0..) |packet, index| {
             if (self.linkBlocked(packet.source, packet.destination)) continue;
             const has_earlier = self.hasEarlierPacketForLink(index, packet);
-            // TCP may reorder network packets internally, but EOF is visible
-            // to the application only after every earlier stream byte has
-            // either arrived or been dropped. Never let FIN overtake payload.
-            if (has_earlier and (!self.faults.reorder or packet.close_write)) continue;
+            // Datagram order is observable and scheduler-controlled. TCP may
+            // reorder packets internally, but the socket API exposes an ordered
+            // byte stream, including FIN after all preceding bytes.
+            if (has_earlier and (!self.faults.reorder or !packet.datagram)) continue;
             try list.append(allocator, .{
                 .id = packet.id,
                 .name = packetName(packet),
@@ -463,6 +463,20 @@ pub const Network = struct {
             const packet_len = packet.bytes.len;
             const destination = self.getSocket(packet.destination);
             const source = self.getSocket(packet.source);
+            if (packet.drop and !packet.datagram and !packet.close_write) {
+                // Model a lost TCP packet as a scheduler-visible retransmission
+                // delay. The receiver must never observe a hole in the stream.
+                self.packets.items[index].drop = false;
+                try sink.emit(allocator, .{
+                    .id = ids.derive("sim-io.packet-event", packet.id, 1),
+                    .kind = .injected_error,
+                    .actor_id = if (source) |s| s.id else 0,
+                    .resource_id = if (destination) |d| d.id else 0,
+                    .payload_digest = @intCast(packet_len),
+                    .name = packetName(packet),
+                });
+                return true;
+            }
             if (packet.close_write) {
                 if (destination != null and !destination.?.closed) {
                     destination.?.peer_write_open = false;
@@ -480,7 +494,7 @@ pub const Network = struct {
                     if (packet.duplicate) try self.appendDatagram(destination.?, source_address, packet.bytes);
                 } else {
                     try destination.?.receive.appendSlice(self.allocator, packet.bytes);
-                    if (packet.duplicate) try destination.?.receive.appendSlice(self.allocator, packet.bytes);
+                    // Duplicate TCP packets are removed by stream reassembly.
                 }
                 try self.wait_port.?.wake(destination.?.readResource(), 1);
             }
@@ -795,4 +809,52 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     const received = try network.read(pair[1].handle, &buffers);
     try std.testing.expectEqualStrings("payload", bytes[0..received]);
     try std.testing.expectEqual(@as(usize, 0), try network.read(pair[1].handle, &buffers));
+}
+
+test "stream delivery preserves bytes across reorder drop and duplicate faults" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+
+    var network = try Network.init(std.testing.allocator, .{});
+    defer network.deinit();
+    var wait_context: u8 = 0;
+    network.bindWaitPort(.{ .ptr = &wait_context, .vtable = &NoopWaitPort.vtable });
+    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream });
+    network.faults.drop_next = true;
+    network.faults.duplicate_next = true;
+    try std.testing.expectEqual(@as(usize, 5), try network.write(pair[0].handle, "", &.{"first"}, 1));
+    try std.testing.expectEqual(@as(usize, 6), try network.write(pair[0].handle, "", &.{"second"}, 1));
+    network.faults.reorder = true;
+
+    var ready: transition.List = .{};
+    defer ready.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+
+    // The first transition loses a TCP packet but retains it for retransmit.
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+
+    // Retransmission delivers once; the later write remains ordered behind it.
+    ready.items.clearRetainingCapacity();
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+    ready.items.clearRetainingCapacity();
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+
+    var bytes: [16]u8 = undefined;
+    var buffers = [_][]u8{bytes[0..]};
+    const received = try network.read(pair[1].handle, &buffers);
+    try std.testing.expectEqualStrings("firstsecond", bytes[0..received]);
 }

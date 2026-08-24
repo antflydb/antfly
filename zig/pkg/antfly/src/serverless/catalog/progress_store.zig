@@ -15,6 +15,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
+const head_coordination = @import("../head_coordination.zig");
+
+pub const PublicationFence = head_coordination.Fence;
 
 pub const ProgressStore = struct {
     allocator: Allocator,
@@ -25,6 +28,7 @@ pub const ProgressStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
+        compare_and_swap_head_fenced: *const fn (*anyopaque, []const u8, ?u64, u64, PublicationFence) anyerror!bool,
         get_gc_watermark: *const fn (*anyopaque, []const u8) anyerror!?u64,
         compare_and_swap_gc_watermark: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         get_enrichment_head_version: *const fn (*anyopaque, []const u8) anyerror!?u64,
@@ -50,6 +54,25 @@ pub const ProgressStore = struct {
 
     pub fn compareAndSwapHead(self: *ProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
         return try self.vtable.compare_and_swap_head(self.ptr, namespace, expected, version);
+    }
+
+    /// Publishes a head only while the exact durable fencing token still owns
+    /// the same coordination record. Backends that cannot provide this atomic
+    /// guarantee fail closed rather than degrading to a check-then-CAS race.
+    pub fn compareAndSwapHeadFenced(
+        self: *ProgressStore,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: PublicationFence,
+    ) !bool {
+        return try self.vtable.compare_and_swap_head_fenced(
+            self.ptr,
+            namespace,
+            expected,
+            version,
+            fence,
+        );
     }
 
     pub fn getGcWatermark(self: *ProgressStore, namespace: []const u8) !?u64 {

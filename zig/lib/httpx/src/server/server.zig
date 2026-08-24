@@ -1150,6 +1150,10 @@ pub const Server = struct {
     /// Acquired before publishing a bound socket so transport cancellation is
     /// startable whenever callers advertise the listener as ready.
     http_runtime_lease: HttpRuntime.ListenerLease = .{},
+    /// Immutable after bind and published before `listen_started`. Stop paths
+    /// use this copy so observing a running listener pins no mutable lease that
+    /// the listener thread may concurrently release.
+    listener_wake_io: ?Io = null,
 
     const Self = @This();
 
@@ -1469,7 +1473,8 @@ pub const Server = struct {
         const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        var listener = try TcpListener.initWithOptions(addr, listenerSocketIo(&http_runtime_lease), .{
+        const socket_io = listenerSocketIo(&http_runtime_lease);
+        var listener = try TcpListener.initWithOptions(addr, socket_io, .{
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
             .reuse_port = self.config.reuse_port,
@@ -1482,6 +1487,7 @@ pub const Server = struct {
         };
         self.wake_port.store(port, .release);
         self.http_runtime_lease = http_runtime_lease;
+        self.listener_wake_io = socket_io;
         self.listener = listener;
     }
 
@@ -1644,12 +1650,13 @@ pub const Server = struct {
         // been released after listen returned). A concurrent stop still wins:
         // listen() checks shutdown_mode on both sides of bind/startup.
         if (!self.listen_started.load(.acquire)) return;
+        const wake_io = self.listener_wake_io orelse return;
 
         // Only publish a permit when the listener has announced that it may
         // block in the admission gate. The listener consumes this permit before
         // leaving, so repeated stop/listen cycles cannot inflate capacity.
         if (self.waiting_for_connection_permit.swap(false, .acq_rel)) {
-            self.conn_semaphore.post(self.connectionIo());
+            self.conn_semaphore.post(wake_io);
         }
 
         const published_port = self.wake_port.load(.acquire);
@@ -1667,7 +1674,7 @@ pub const Server = struct {
         // The listener socket is created in the connection lane. Borrowed I/O
         // lanes may have disjoint virtual handle spaces, so its wakeup must use
         // that same lane even though the accept task runs on listenerIo().
-        var wake_socket = Socket.connect(addr, listenerSocketIo(&self.http_runtime_lease)) catch return;
+        var wake_socket = Socket.connect(addr, wake_io) catch return;
         wake_socket.close();
     }
 
@@ -4219,6 +4226,25 @@ test "requestStop only publishes synchronized listener-thread work" {
     try std.testing.expect(server.running);
     try std.testing.expectEqual(@as(u8, 2), server.shutdown_mode.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "listener wake does not dereference a concurrently released lease" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+    });
+    defer server.deinit();
+
+    // Model a stopper that observed listen_started before the listener's
+    // deferred lease release. The immutable wake lane remains usable after the
+    // lease itself has been cleared.
+    server.listener_wake_io = std.testing.io;
+    server.listen_started.store(true, .release);
+    server.waiting_for_connection_permit.store(true, .release);
+    server.http_runtime_lease.release();
+    server.requestStop();
+    try std.testing.expect(!server.waiting_for_connection_permit.load(.acquire));
 }
 
 test "listener bind and wake share the borrowed connection lane" {
