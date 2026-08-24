@@ -570,6 +570,20 @@ therefore warm over time without turning a full cache into an insert/evict lock
 convoy. Routing nodes and quantized payloads use retained handles and may warm
 during concurrent search.
 
+External-vector queries make one residency decision before opening their
+primary-store transaction. They atomically reserve decoded-cache headroom for
+the bounded exact/rerank load count; a successful lease uses transient LSM
+block admission and guarantees every coherent decoded miss is eligible for
+publication without per-vector sampling. If the reservation is unavailable,
+the complete request retains LSM blocks and suppresses decoded-cache writes.
+If a stale or missing quantized payload expands exact work beyond the admitted
+bound, the session releases the remaining lease, closes the transient
+transaction, and switches to retained LSM admission before the additional
+read. Direct-primary-document compatibility fallback makes the same switch.
+Thus policy changes and cache saturation cannot leave a request with neither
+reusable representation, and concurrent queries cannot overbook decoded
+headroom.
+
 Shared CLOCK reference bits are atomic. Node, quantized, vector, and metadata
 borrow/hit paths refresh recency while holding the shared map lock, without an
 exclusive lock upgrade. Exact-vector publication uses 256 striped single-flight
@@ -662,13 +676,14 @@ that compatibility path. A single reusable batch workspace is charged to
 `dense_search_working_set` for its lifetime, while retained transaction pages
 are observed once after each multi-get. Because exact scoring is single-pass,
 its request-local decoded-vector cache is disabled; a governed shared-vector
-cache may still admit a value when its policy enables that cache.
-Shared-cache admission is consulted for this route even though it does not
-enter the HBC traversal epoch, so a full target samples exact-route misses
-instead of cloning and evicting on every candidate. Metadata cache reads never
-escape as unretained slices: result attachment uses retained leases, while
-batched filtering and exact-candidate preparation keep transaction-owned views
-for the transaction lifetime.
+cache may still own the request when the complete candidate batch fits an
+up-front decoded-residency lease. Otherwise the primary-store transaction uses
+normal retained block admission and does not populate decoded vectors.
+Metadata cache reads never escape as unretained slices: result attachment uses
+retained leases, while batched filtering keeps transaction-owned views for the
+transaction lifetime. Exact-candidate preparation additionally bypasses both
+metadata-cache lookup and population, avoiding a clone/lock/eviction cycle for
+single-pass entries that the route never reuses.
 
 The exact/HBC route is a cost decision, not a corpus-percentage threshold. The
 planner compares storage-equivalent work for candidate full-vector reads with
@@ -703,7 +718,10 @@ and then weighted by the observed hit rate. The planner incorporates the
 ResourceManager HBC slice's current pressure and residency and retains the
 prior route inside a 20% hysteresis band; exact wins an equal-cost tie. The
 dimension-aware component budget remains authoritative. Profiles expose both
-storage-equivalent estimates and `estimated_*_work_ns` values.
+storage-equivalent estimates and `estimated_*_work_ns` values. External-vector
+distance time appears in both the generic rerank total and its artifact
+breakdown for profile compatibility; adaptive route learning selects the
+artifact-specific value when present and never adds the same interval twice.
 
 Filtered HBC treats resolved search width as a ceiling. The existing candidate
 frontier is consumed in adaptive waves whose next size is based on observed
@@ -733,7 +751,8 @@ artifact reads. Batch count, maximum batch size, and candidates skipped by the
 proof are public profile fields.
 
 Permanent coverage includes generation-crossing stale-fill rejection,
-request-owned miss results, pre-admitted LSM retention with transient fallback,
+request-owned miss results, query-bounded decoded-residency leases, pre-read
+handoff to retained LSM ownership when a lease cannot cover degraded work,
 idempotent manager reattachment and ledger transfer, dynamic policy derivation,
 envelope-based provisioned sizing, cross-namespace aggregate eviction, class-aware reclaim,
 shared-cache warming during concurrent search, CLOCK hit refresh, exact byte
@@ -743,13 +762,15 @@ and at least two explicit memory envelopes. Report cache bytes and miss ratios
 with QPS; QPS alone cannot distinguish cache capacity from search quality or
 CPU saturation.
 
-When retained decoded-vector caching is active, HBC marks exact-vector LSM
+When a request owns a decoded-residency lease, HBC marks its exact-vector LSM
 reads as transient. The LSM still retains indexes and bloom filters, and it may
 reuse a block already resident for another reader, but a vector miss does not
 publish a second serialized copy into the LSM block cache. If decoded-vector
-caching is disabled, bypassed, or unavailable, HBC restores normal LSM block
-admission. `policy_bypasses` distinguishes this deliberate ownership choice
-from pressure-denied `transient_serves`.
+caching is disabled, bypassed, pressured, lacks headroom for the bounded query,
+or cannot cover a degraded-path expansion, HBC uses normal retained LSM block
+admission and suppresses decoded writes for those reads. `policy_bypasses`
+distinguishes this deliberate ownership choice from pressure-denied
+`transient_serves`.
 
 Reclaim dispatch apportions work among registered cache owners by weight and
 rotates its starting owner. The shared HBC cache similarly computes weighted

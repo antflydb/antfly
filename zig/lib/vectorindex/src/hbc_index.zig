@@ -1740,6 +1740,32 @@ pub fn getMetadataManySortedInTxn(self: anytype, txn: anytype, vector_ids: []con
     try getMetadataManySortedInTxnWithScratch(self, txn, vector_ids, out_metadata, lookups, key_views, values);
 }
 
+/// Return transaction-owned metadata views without consulting or populating
+/// the retained metadata cache. Single-pass callers such as exact scoring keep
+/// the transaction alive for the complete scan and would otherwise pay a
+/// clone/lock/eviction cycle for entries they never reuse.
+pub fn getMetadataManySortedInTxnUncached(self: anytype, txn: anytype, vector_ids: []const u64, out_metadata: []?[]const u8) !void {
+    const lookups = try self.alloc.alloc(FixedKeyLookup, vector_ids.len);
+    defer self.alloc.free(lookups);
+    const key_views = try self.alloc.alloc([]const u8, vector_ids.len);
+    defer self.alloc.free(key_views);
+    const values = try self.alloc.alloc(?[]const u8, vector_ids.len);
+    defer self.alloc.free(values);
+    try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookups,
+        key_views,
+        values,
+        false,
+        null,
+        null,
+        null,
+    );
+}
+
 pub fn getMetadataManySortedInTxnWithScratch(
     self: anytype,
     txn: anytype,
@@ -1757,6 +1783,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
         lookup_storage,
         key_views_storage,
         values_storage,
+        true,
         null,
         null,
         null,
@@ -1771,6 +1798,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     lookup_storage: []FixedKeyLookup,
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
+    use_cache: bool,
     profile: ?*search_types.SearchProfile,
     now_fn_u64: ?*const fn () u64,
     elapsed_fn_u64: ?*const fn (u64) u64,
@@ -1789,7 +1817,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
         // the function returns, so retained-cache adapters must use the
         // transaction-owned ordered read. Result population uses borrowed
         // handles where the lifetime is naturally bounded.
-        if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+        if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
             if (self.getCachedMetadata(vector_id)) |cached| {
                 if (profile) |p| p.metadata_cache_hits += 1;
                 out_metadata[index] = cached;
@@ -1829,7 +1857,10 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     if (profile) |p| p.metadata_cache_miss_ns += elapsed_fn_u64.?(miss_start);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        out_metadata[lookups[i].item_index] = try self.cacheMetadata(lookups[i].vector_id, value);
+        out_metadata[lookups[i].item_index] = if (use_cache)
+            try self.cacheMetadata(lookups[i].vector_id, value)
+        else
+            value;
     }
 }
 
@@ -2498,6 +2529,7 @@ fn scoreLeafMemberIds(
             scratch.lookups[0..filtered_count],
             scratch.key_views[0..filtered_count],
             scratch.values[0..filtered_count],
+            true,
             profile,
             now_fn_u64,
             elapsed_fn_u64,
