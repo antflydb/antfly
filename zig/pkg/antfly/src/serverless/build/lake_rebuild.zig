@@ -596,7 +596,15 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     try declarations.ensureUnusedCapacity(alloc, base_declarations.len);
     for (base_declarations) |declaration| declarations.appendAssumeCapacity(try cloneDeclarationAlloc(alloc, declaration));
     if (specs.len > 0) {
-        stampExternalGraphTopologyGenerations(declarations.items, published_declarations, specs, provenance.edge_generation);
+        try stampExternalGraphTopologyGenerations(
+            alloc,
+            artifacts,
+            declarations.items,
+            published_declarations,
+            specs,
+            provenance.edge_generation,
+            cancellation,
+        );
     }
 
     const graph_metric_limits = lake_graph_metric.Limits{};
@@ -778,12 +786,16 @@ fn findDeclaration(
 }
 
 fn stampExternalGraphTopologyGenerations(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
     declarations: []sidecar_manifest.DeclaredArtifact,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     specs: []const graph_metric_config.IndexSpec,
     next_generation: u64,
-) void {
+    cancellation: CancellationToken,
+) !void {
     for (declarations) |*declaration| {
+        try cancellation.check();
         if (declaration.binding.sidecar_kind != .graph or declaration.artifact.kind != .graph_segment) continue;
         var configured = false;
         for (specs) |spec| {
@@ -807,21 +819,83 @@ fn stampExternalGraphTopologyGenerations(
         // Recover topology identity from metric sidecars written before graph
         // declarations carried provenance themselves. Scan all prior metrics
         // for this graph, including names removed by the current definition.
+        // Modern manifests bind this without I/O. Legacy manifests omitted the
+        // digest, so authenticate their bounded segment header before trusting
+        // provenance from it.
+        const source_digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = source: {
+            artifact_store.validateSha256ArtifactIdentity(
+                previous_graph.artifact.artifact_id,
+                previous_graph.artifact.checksum,
+            ) catch break :source null;
+            break :source artifact_store.sha256DigestFromChecksum(previous_graph.artifact.checksum) catch null;
+        };
+        const zero_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
         var inferred_generation: ?u64 = null;
         for (published_declarations) |metric| {
+            try cancellation.check();
             if (metric.binding.sidecar_kind != .graph_metric or
                 metric.artifact.kind != .graph_metric_segment or
                 !source_binding.sameSourceSnapshot(metric.binding, previous_graph.binding) or
                 metric.artifact.edge_generation == 0) continue;
             const parsed_name = graph_metric_segment.parseArtifactName(metric.name) catch continue;
             if (!std.mem.eql(u8, parsed_name.graph_index_name, declaration.name)) continue;
+            if (!std.mem.eql(u8, &metric.artifact.graph_metric_source_checksum, &zero_digest)) {
+                const expected_digest = source_digest orelse continue;
+                if (!std.mem.eql(u8, &metric.artifact.graph_metric_source_checksum, &expected_digest)) continue;
+            } else if (!try graphMetricArtifactBoundToGraphAlloc(
+                alloc,
+                artifacts,
+                metric.artifact,
+                parsed_name.graph_index_name,
+                parsed_name.metric_name,
+                previous_graph.artifact,
+                cancellation,
+            )) continue;
             inferred_generation = if (inferred_generation) |existing|
                 @min(existing, metric.artifact.edge_generation)
             else
                 metric.artifact.edge_generation;
+            if (inferred_generation.? == 1) break;
         }
         declaration.artifact.edge_generation = inferred_generation orelse next_generation;
     }
+}
+
+fn graphMetricArtifactBoundToGraphAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    metric_ref: manifest_artifact.ArtifactRef,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    graph_ref: manifest_artifact.ArtifactRef,
+    cancellation: CancellationToken,
+) !bool {
+    const prefix_len = graph_metric_segment.headerProbeLen(
+        metric_ref.byte_len,
+        graph_index_name,
+        metric_name,
+        graph_ref.artifact_id,
+        graph_ref.checksum,
+    ) catch return false;
+    const prefix = artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        metric_ref.artifact_id,
+        metric_ref.byte_len,
+        metric_ref.checksum,
+        0,
+        prefix_len,
+        cancellation,
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return false,
+        else => return err,
+    };
+    defer alloc.free(prefix);
+    const header = graph_metric_segment.decodeHeader(prefix) catch return false;
+    return std.mem.eql(u8, header.graph_index_name, graph_index_name) and
+        std.mem.eql(u8, header.metric_name, metric_name) and
+        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+        std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
 fn graphMetricDeclarationAlloc(
@@ -3060,12 +3134,20 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     try std.testing.expectEqual(@as(u64, 2), updated_centrality.artifact.published_generation);
     try std.testing.expectEqual(graph_declaration.artifact.edge_generation, updated_centrality.artifact.edge_generation);
 
-    // Simulate a legacy graph declaration whose topology generation was not
-    // persisted, then replace every existing metric name. Recovery must use a
-    // prior sibling metric instead of treating the unchanged graph as new.
+    // Simulate a legacy graph declaration whose topology generation and metric
+    // source digests were not persisted, then replace every existing metric
+    // name. Recovery must authenticate the legacy headers and ignore a stale
+    // metric whose manifest digest names a different source graph.
     for (updated.artifacts) |*published| {
         if (published.binding.sidecar_kind == .graph and std.mem.eql(u8, published.name, "graph_idx")) {
             published.artifact.edge_generation = 0;
+        } else if (published.binding.sidecar_kind == .graph_metric) {
+            published.artifact.edge_generation = 2;
+            published.artifact.graph_metric_source_checksum = @splat(0);
+            if (std.mem.eql(u8, published.name, centrality_artifact_name)) {
+                published.artifact.edge_generation = 1;
+                published.artifact.graph_metric_source_checksum = @splat(0xbb);
+            }
         }
     }
     var replaced = try reconcileResolvedExternalSourceSidecarsAlloc(
@@ -3087,7 +3169,7 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     defer alloc.free(replacement_name);
     const replaced_graph = replaced.find("graph_idx").?;
     const replacement_metric = replaced.find(replacement_name).?;
-    try std.testing.expectEqual(graph_declaration.artifact.edge_generation, replaced_graph.artifact.edge_generation);
+    try std.testing.expectEqual(@as(u64, 2), replaced_graph.artifact.edge_generation);
     try std.testing.expectEqual(replaced_graph.artifact.edge_generation, replacement_metric.artifact.edge_generation);
 }
 

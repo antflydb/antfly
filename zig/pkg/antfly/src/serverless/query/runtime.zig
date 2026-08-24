@@ -19,6 +19,7 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
 const cache_mod = @import("cache.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
@@ -173,10 +174,30 @@ pub const QuerySession = struct {
     manifest: manifest_mod.Manifest,
     cancellation: CancellationToken = .none,
     diagnostics: ?*operation.RequestDiagnostics = null,
+    graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
 
     pub fn deinit(self: *QuerySession) void {
+        self.clearGraphMetricSpecs();
         self.manifest.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Lazily parses graph metric configuration once for this pinned request.
+    /// QuerySession is request-owned and, like its other mutable caches, must
+    /// not be accessed concurrently without external synchronization.
+    pub fn graphMetricSpecs(self: *QuerySession) ![]const graph_metric_config.IndexSpec {
+        if (self.graph_metric_specs == null) {
+            self.graph_metric_specs = try graph_metric_config.parseIndexSpecsAlloc(
+                self.alloc,
+                self.manifest.stats.indexes_json,
+            );
+        }
+        return self.graph_metric_specs.?;
+    }
+
+    pub fn clearGraphMetricSpecs(self: *QuerySession) void {
+        if (self.graph_metric_specs) |specs| graph_metric_config.freeIndexSpecs(self.alloc, specs);
+        self.graph_metric_specs = null;
     }
 
     pub fn namespace(self: *const QuerySession) []const u8 {

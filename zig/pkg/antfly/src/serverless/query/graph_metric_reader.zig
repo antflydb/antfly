@@ -150,8 +150,7 @@ pub fn scoresAlloc(
         if (node_id.len == 0 or node_id.len > metric_segment.codec.max_score_node_id_bytes) return error.InvalidGraphMetricNodeId;
     }
 
-    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
-    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    const specs = try session.graphMetricSpecs();
     const config = findConfig(specs, graph_index_name, metric_name) orelse return error.MetricNotConfigured;
     const graph_index = session.findNamedArtifactIndex(.graph_segment, graph_index_name) orelse return error.GraphSegmentNotFound;
     const graph_artifact = session.artifactRef(graph_index).?;
@@ -506,8 +505,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     if (top_k > limits.max_top_k or limits.max_top_k == 0 or limits.max_result_bytes == 0) return error.GraphMetricQueryBudgetExceeded;
 
     try session.checkCancellation();
-    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
-    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    const specs = try session.graphMetricSpecs();
     const config = findConfig(specs, graph_index_name, metric_name) orelse return error.MetricNotConfigured;
     const graph_index = session.findNamedArtifactIndex(.graph_segment, graph_index_name) orelse return error.GraphSegmentNotFound;
     const graph_artifact = session.artifactRef(graph_index).?;
@@ -727,7 +725,7 @@ fn topLegacyWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession
 }
 
 fn findConfig(
-    specs: []graph_metric_config.IndexSpec,
+    specs: []const graph_metric_config.IndexSpec,
     graph_index_name: []const u8,
     metric_name: []const u8,
 ) ?graph_mod.GraphMetricConfig {
@@ -760,8 +758,7 @@ fn validateControl(
 
 fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8) !metric_segment.Segment {
     try session.checkCancellation();
-    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, session.manifest.stats.indexes_json);
-    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    const specs = try session.graphMetricSpecs();
     const config = findConfig(specs, graph_index_name, metric_name) orelse return error.MetricNotConfigured;
     const graph_index = session.findNamedArtifactIndex(.graph_segment, graph_index_name) orelse return error.GraphSegmentNotFound;
     const graph_artifact = session.artifactRef(graph_index).?;
@@ -893,6 +890,10 @@ test "serverless graph metric point reads authenticate before fetching ranges" {
             .artifacts = &refs,
         },
     };
+    defer session.clearGraphMetricSpecs();
+    const cached_specs = try session.graphMetricSpecs();
+    const cached_specs_again = try session.graphMetricSpecs();
+    try std.testing.expect(cached_specs.ptr == cached_specs_again.ptr);
     const node_ids = [_][]const u8{"node"};
     try std.testing.expectError(error.ArtifactIntegrityMismatch, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
     try std.testing.expectEqual(@as(usize, 1), state.verify_calls);
@@ -1021,6 +1022,10 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
             .artifacts = &refs,
         },
     };
+    defer session.clearGraphMetricSpecs();
+    const cached_specs = try session.graphMetricSpecs();
+    const cached_specs_again = try session.graphMetricSpecs();
+    try std.testing.expect(cached_specs.ptr == cached_specs_again.ptr);
     const node_ids = [_][]const u8{"node:1024"};
     var result = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
     defer result.deinit(alloc);
