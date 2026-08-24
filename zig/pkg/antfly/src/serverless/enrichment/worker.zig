@@ -162,6 +162,10 @@ pub const SparseEnricher = struct {
         if (latest_lsn != manifest.wal_end_lsn) {
             return .{ .idle_namespaces = 1 };
         }
+        // Enrichment progress is a second durable write after WAL append.
+        // Without a caller identity, a crash in that gap makes replay
+        // ambiguous, so unsupported stores must fail before producing work.
+        if (!self.wal.supportsIdempotentAppend()) return error.IdempotentAppendUnsupported;
 
         const docs = try self.loadPublishedDocsAlloc(manifest);
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
@@ -169,13 +173,15 @@ pub const SparseEnricher = struct {
 
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
         if (stored_head != head) {
-            _ = try self.progress.compareAndSwapEnrichmentStageHeadVersion(namespace, cfg.stage, stored_head, head);
-            _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(
+            if (!(try self.progress.compareAndSwapEnrichmentStageHeadVersion(namespace, cfg.stage, stored_head, head)))
+                return error.EnrichmentProgressChanged;
+            const old_offset = try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage);
+            if (old_offset != null and old_offset.? != 0 and !(try self.progress.compareAndSwapEnrichmentStageDocOffset(
                 namespace,
                 cfg.stage,
-                try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage),
+                old_offset,
                 0,
-            );
+            ))) return error.EnrichmentProgressChanged;
         }
         const start_offset: usize = @intCast((try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0);
         if (start_offset >= docs.len) {
@@ -184,8 +190,6 @@ pub const SparseEnricher = struct {
 
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
-        var persisted_offset: u64 = @intCast(start_offset);
-        const idempotent_wal = self.wal.supportsIdempotentAppend();
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
             try maintenance_cancellation.check(cancellation);
             next_offset = doc_index + 1;
@@ -212,32 +216,15 @@ pub const SparseEnricher = struct {
             defer self.alloc.free(encoded);
             const timestamp_ns = std.math.add(u64, doc.last_timestamp_ns, 1) catch
                 return error.EnrichmentTimestampOverflow;
-            if (idempotent_wal) {
-                var operation_id_buf: [128]u8 = undefined;
-                const operation_id = try enrichmentOperationId(
-                    &operation_id_buf,
-                    head,
-                    cfg.stage,
-                    doc_index,
-                    cfg.pipeline_version,
-                );
-                _ = try self.wal.appendIdempotent(namespace, timestamp_ns, encoded, operation_id);
-            } else {
-                // Stores without durable append identities must checkpoint the
-                // source offset in the same uninterrupted section as the
-                // append. In particular, do not observe cancellation between
-                // these two writes: a retry would otherwise append the same
-                // non-idempotent mutation again.
-                _ = try self.wal.append(namespace, timestamp_ns, encoded);
-                const durable_next: u64 = @intCast(next_offset);
-                if (!(try self.progress.compareAndSwapEnrichmentStageDocOffset(
-                    namespace,
-                    cfg.stage,
-                    persisted_offset,
-                    durable_next,
-                ))) return error.EnrichmentProgressChanged;
-                persisted_offset = durable_next;
-            }
+            var operation_id_buf: [128]u8 = undefined;
+            const operation_id = try enrichmentOperationId(
+                &operation_id_buf,
+                head,
+                cfg.stage,
+                doc_index,
+                cfg.pipeline_version,
+            );
+            _ = try self.wal.appendIdempotent(namespace, timestamp_ns, encoded, operation_id);
             stats.enriched_documents += 1;
             stats.wal_appends += 1;
             if (derived.used_model) stats.model_documents += 1;
@@ -246,9 +233,13 @@ pub const SparseEnricher = struct {
         }
 
         try maintenance_cancellation.check(cancellation);
-        const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
+        if ((try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage)) != head)
+            return error.EnrichmentProgressChanged;
+        const previous_offset = try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage);
         const durable_next: u64 = @intCast(next_offset);
-        if (previous_offset != durable_next and
+        // Concurrent workers may already have advanced this stage. Never let
+        // a slower completion move durable progress backwards.
+        if ((previous_offset orelse 0) < durable_next and
             !(try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, durable_next)))
         {
             return error.EnrichmentProgressChanged;
@@ -1244,7 +1235,7 @@ test "sparse enricher appends derived sparse mutation when published docs lack s
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"lexical_sparse_version\":1") != null);
 }
 
-test "serverless enrichment cancellation after non-idempotent append checkpoints its offset" {
+test "serverless enrichment fails closed before a non-idempotent append" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1288,25 +1279,14 @@ test "serverless enrichment cancellation after non-idempotent append checkpoints
     defer canceling_wal.deinit();
     var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &canceling_wal);
     try std.testing.expectError(
-        error.Canceled,
-        enricher.runNamespaceWithConfigUntil("docs", .{
+        error.IdempotentAppendUnsupported,
+        enricher.runNamespaceWithConfig("docs", .{
             .batch_size = 4,
             .pipeline_version = lexical_sparse_enrichment_version,
-        }, .{
-            .io = std.Options.debug_io,
-            .requested = &requested,
         }),
     );
-    try std.testing.expectEqual(@as(?u64, 1), try progress_store.getEnrichmentDocOffset("docs"));
-    try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
-
-    requested.store(false, .release);
-    const retry = try enricher.runNamespaceWithConfig("docs", .{
-        .batch_size = 4,
-        .pipeline_version = lexical_sparse_enrichment_version,
-    });
-    try std.testing.expectEqual(@as(usize, 1), retry.idle_namespaces);
-    try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
+    try std.testing.expectEqual(@as(?u64, null), try progress_store.getEnrichmentDocOffset("docs"));
+    try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn("docs"));
 }
 
 test "serverless object enrichment writes a stable idempotent WAL identity" {

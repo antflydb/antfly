@@ -68,12 +68,13 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
 
     const cluster_count = desiredClusterCount(dims, entries.len, policy);
     const centroids = try alloc.alloc([]f32, cluster_count);
+    var centroids_initialized: usize = 0;
     defer {
-        for (centroids) |centroid| alloc.free(centroid);
+        for (centroids[0..centroids_initialized]) |centroid| alloc.free(centroid);
         alloc.free(centroids);
     }
 
-    try initializeCentroids(alloc, metric, centroids, entries, cancellation);
+    try initializeCentroids(alloc, metric, centroids, &centroids_initialized, entries, cancellation);
 
     const cluster_ids = try alloc.alloc(u32, entries.len);
     defer alloc.free(cluster_ids);
@@ -123,9 +124,13 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
 
     const sorted_entries = try alloc.alloc(vector_segment_mod.Entry, entries.len);
     errdefer alloc.free(sorted_entries);
-    var sorted_init: usize = 0;
+    const sorted_initialized = try alloc.alloc(bool, entries.len);
+    defer alloc.free(sorted_initialized);
+    @memset(sorted_initialized, false);
     errdefer {
-        for (sorted_entries[0..sorted_init]) |*entry| entry.deinit(alloc);
+        for (sorted_entries, sorted_initialized) |*entry, initialized| {
+            if (initialized) entry.deinit(alloc);
+        }
     }
 
     const write_offsets = try alloc.alloc(u32, cluster_count);
@@ -137,11 +142,8 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
         const cluster_idx: usize = cluster_ids[idx];
         const dst = write_offsets[cluster_idx];
         write_offsets[cluster_idx] += 1;
-        sorted_entries[dst] = .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .vector = try alloc.dupe(f32, entry.vector),
-        };
-        sorted_init += 1;
+        sorted_entries[dst] = try cloneEntryAlloc(alloc, entry);
+        sorted_initialized[dst] = true;
     }
 
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, dim_count, 42, metric);
@@ -281,16 +283,28 @@ fn initializeCentroids(
     alloc: Allocator,
     metric: vector_types.DistanceMetric,
     centroids: [][]f32,
+    initialized: *usize,
     entries: []const vector_segment_mod.Entry,
     cancellation: ?maintenance_cancellation.Token,
 ) !void {
     if (centroids.len == 0) return;
     centroids[0] = try centroidCopyAlloc(alloc, metric, entries[0].vector);
+    initialized.* = 1;
     for (1..centroids.len) |idx| {
         try maintenance_cancellation.check(cancellation);
         const selected = try selectFarthestEntryIndex(metric, entries, centroids[0..idx], cancellation);
         centroids[idx] = try centroidCopyAlloc(alloc, metric, entries[selected].vector);
+        initialized.* = idx + 1;
     }
+}
+
+fn cloneEntryAlloc(alloc: Allocator, entry: vector_segment_mod.Entry) !vector_segment_mod.Entry {
+    const doc_id = try alloc.dupe(u8, entry.doc_id);
+    errdefer alloc.free(doc_id);
+    return .{
+        .doc_id = doc_id,
+        .vector = try alloc.dupe(f32, entry.vector),
+    };
 }
 
 fn selectFarthestEntryIndex(
@@ -441,31 +455,30 @@ test "serverless vector builder observes cancellation inside clustering loops" {
     }
 
     var requested = std.atomic.Value(bool).init(false);
-    const CancelAfterTwoChecks = struct {
-        requested: *std.atomic.Value(bool),
+    const FailAfterPartialCentroidInitialization = struct {
         checks: usize = 0,
 
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.checks += 1;
-            if (self.checks == 2) self.requested.store(true, .release);
+            if (self.checks == 2) return error.InjectedCancellation;
         }
     };
-    var cancel_state = CancelAfterTwoChecks{ .requested = &requested };
+    var cancel_state = FailAfterPartialCentroidInitialization{};
     const cancellation = (maintenance_cancellation.Token{
         .io = std.testing.io,
         .requested = &requested,
-    }).withCheckpoint(&cancel_state, CancelAfterTwoChecks.checkpoint);
+    }).withCheckpoint(&cancel_state, FailAfterPartialCentroidInitialization.checkpoint);
     const result = buildClusteredSegmentWithPolicyAllocUntil(
         alloc,
-        .cosine,
+        .l2_squared,
         4,
         entries,
         .{},
         cancellation,
     );
     entries_owned = false;
-    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectError(error.InjectedCancellation, result);
 }
 
 test "vector builder scales cluster count beyond four for larger corpora" {

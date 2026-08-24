@@ -378,7 +378,7 @@ pub const ObjectStore = struct {
     }
 };
 
-fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payload: []const u8) ![]u8 {
+pub fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payload: []const u8) ![]u8 {
     // The high length bit identifies records carrying an operation ID. Keep
     // newly written legacy records below that boundary so both encodings are
     // unambiguous to the shared parser.
@@ -395,10 +395,10 @@ fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, payl
     return buf;
 }
 
-const idempotent_record_flag: u32 = @as(u32, 1) << 31;
-const idempotent_payload_max: usize = idempotent_record_flag - 1;
+pub const idempotent_record_flag: u32 = @as(u32, 1) << 31;
+pub const idempotent_payload_max: usize = idempotent_record_flag - 1;
 
-fn encodeIdempotentRecordAlloc(
+pub fn encodeIdempotentRecordAlloc(
     alloc: std.mem.Allocator,
     lsn: u64,
     timestamp_ns: u64,
@@ -424,7 +424,7 @@ fn encodeIdempotentRecordAlloc(
     return buf;
 }
 
-fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Record) ![]u8 {
+pub fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Record) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     for (records) |record| {
@@ -438,7 +438,7 @@ fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Recor
     return try out.toOwnedSlice(alloc);
 }
 
-const ParsedRecord = struct {
+pub const ParsedRecord = struct {
     lsn: u64,
     timestamp_ns: u64,
     payload: []const u8,
@@ -446,7 +446,7 @@ const ParsedRecord = struct {
     next_cursor: usize,
 };
 
-fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
+pub fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
     var cursor = start;
     if (cursor + 8 + 8 + 4 > raw.len) return error.InvalidWal;
     const lsn = std.mem.readInt(u64, raw[cursor..][0..8], .little);
@@ -478,7 +478,7 @@ fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
     };
 }
 
-fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: u64) ![]wal_types.Record {
+pub fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: u64) ![]wal_types.Record {
     var cursor: usize = 0;
     var out = std.ArrayListUnmanaged(wal_types.Record).empty;
     errdefer {
@@ -505,7 +505,7 @@ fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_lsn: 
     return try out.toOwnedSlice(alloc);
 }
 
-fn lastLsn(raw: []const u8) !u64 {
+pub fn lastLsn(raw: []const u8) !u64 {
     var cursor: usize = 0;
     var latest: u64 = 0;
     while (cursor < raw.len) {
@@ -516,7 +516,7 @@ fn lastLsn(raw: []const u8) !u64 {
     return latest;
 }
 
-fn findOperation(raw: []const u8, operation_id: []const u8) !?ParsedRecord {
+pub fn findOperation(raw: []const u8, operation_id: []const u8) !?ParsedRecord {
     var cursor: usize = 0;
     while (cursor < raw.len) {
         const parsed = try parseRecord(raw, cursor);

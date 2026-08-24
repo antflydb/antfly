@@ -497,6 +497,7 @@ pub const Builder = struct {
         const published_version = try putManifestForPublication(
             self.manifests,
             &manifest,
+            if (current_head == 0) null else current_head,
         );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
@@ -536,6 +537,7 @@ pub const Builder = struct {
         const published_version = try putManifestForPublication(
             self.manifests,
             &manifest,
+            if (current_head == 0) null else current_head,
         );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
@@ -750,6 +752,7 @@ pub const Builder = struct {
         const published_version = try putManifestForPublication(
             self.manifests,
             &manifest,
+            current_head,
         );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
@@ -976,7 +979,10 @@ pub fn compareAndSwapHeadGuarded(
 pub fn putManifestForPublication(
     manifests: *manifest_mod.ManifestStore,
     manifest: *manifest_mod.Manifest,
+    expected_head: ?u64,
 ) !u64 {
+    manifest.publication_lineage_tracked = true;
+    manifest.publication_parent_version = expected_head;
     while (true) {
         manifests.put(manifest.*) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => {
@@ -1031,10 +1037,12 @@ test "serverless publication advances past a conflicting orphan manifest" {
     };
     try std.testing.expectEqual(
         @as(u64, 2),
-        try putManifestForPublication(&manifests, &candidate),
+        try putManifestForPublication(&manifests, &candidate, null),
     );
     try std.testing.expectEqual(@as(u64, 2), candidate.version);
     try std.testing.expectEqual(@as(u64, 2), candidate.stats.document_base_version);
+    try std.testing.expect(candidate.publication_lineage_tracked);
+    try std.testing.expectEqual(@as(?u64, null), candidate.publication_parent_version);
     var stored = try manifests.getAlloc("docs", 2);
     defer stored.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), stored.stats.document_count);
