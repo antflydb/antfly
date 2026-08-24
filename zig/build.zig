@@ -3436,7 +3436,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
     const api_cluster_secret_status_tests = b.addTest(.{
         .root_module = api_cluster_secret_status_test_mod,
-        .filters = &.{"cluster status carries non-secret"},
+        .filters = &.{ "cluster status carries non-secret", "cluster topology owns snapshot data" },
     });
     const run_api_cluster_secret_status_tests = addFilteredTestRunArtifact(b, api_cluster_secret_status_tests);
     lib_common_secrets_test_step.dependOn(&run_api_cluster_secret_status_tests.step);
@@ -4543,8 +4543,10 @@ pub fn build(b: *std.Build) void {
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
+            "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
             "generated text provider config is validated while parsing extraction config",
+            "PDF text regions use reconstructed output spans",
             "public enrichment validation rejects invalid execution and producer config",
             "enrichment runtime document extraction manifest uses v2 range and merge shape",
             "enrichment runtime document extraction state parses byte-array keys",
