@@ -43,7 +43,7 @@ const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") el
 const ha_runtime = if (unit_options.unit == .distributed) @import("cmd/ha.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
-const serverless_runtime = if (unit_options.unit == .distributed) @import("cmd/serverless.zig") else struct {};
+const serverless_runtime = if (unit_options.unit == .serverless) @import("cmd/serverless.zig") else struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
 // Standalone adds about 35 seconds when co-generated with the server roles but
 // costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
@@ -287,10 +287,12 @@ comptime {
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+        },
+        .serverless => {
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
         },
         .inference => {
             exportInternal(&standaloneInferenceGetFunctionTable, "antfly_standalone_inference_get_function_table");

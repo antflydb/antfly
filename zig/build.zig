@@ -45,6 +45,10 @@ const RuntimeArtifactRole = enum {
 const RuntimeLibraryUnit = enum {
     api_kernel,
     distributed,
+    // Serverless/lake execution is a large, independently deployable graph.
+    // Keep it out of the PIC storage kernel so LLVM never has to optimize the
+    // two closures as one ARM64 ReleaseFast compilation unit.
+    serverless,
     inference,
     // Remote/client commands do not own storage or server runtimes.
     cli,
@@ -57,6 +61,7 @@ const RuntimeLibraryUnit = enum {
 // graph construction, not the final link's dependency topology.
 const runtime_library_link_order = [_]RuntimeLibraryUnit{
     .cli,
+    .serverless,
     .distributed,
     .api_kernel,
     .inference,
@@ -10127,19 +10132,24 @@ pub fn build(b: *std.Build) void {
                 // Claims conservatively cover clean production ReleaseFast
                 // peaks measured for both aarch64-linux-musl and explicit
                 // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A 48 GiB
-                // budget can overlap all four units while a smaller cgroup
+                // scheduling reservations, not hard process limits. A larger
+                // budget can overlap more units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
                 // platform frameworks. Linux ARM64 reached 4.99 GB in the
                 // v0.2.1-rc0 release build, so reserve 6 GiB rather than
                 // forcing the scheduler to discard a completed 4 GiB claim.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
-                // Keep the
-                // tighter Linux reservation, where CI remains below 8 GiB.
+                // Before the serverless split, clean aarch64-macOS ReleaseFast
+                // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
+                // conservative reservations until both release runners have
+                // measured the smaller storage-only closure.
                 .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // This is deliberately a separate non-PIC product unit. The
+                // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
+                // the 10 GiB reservation keeps it serialized with the macOS
+                // storage kernel until both release runners confirm that.
+                .serverless => 10 * 1024 * 1024 * 1024,
                 // The broad aarch64-macOS ReleaseFast inference root now
                 // reaches roughly 13.6 GB after storage/runtime integration.
                 // Reserve enough headroom for mode-dependent IR; the build
@@ -10151,6 +10161,11 @@ pub fn build(b: *std.Build) void {
                 .cli => 3 * 1024 * 1024 * 1024,
             },
         });
+        const runtime_unit_step = b.step(
+            b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
+            b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
+        );
+        runtime_unit_step.dependOn(&role_artifact.step);
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
         if (unit == .distributed) {
             // The executable and C ABI libraries share this one optimized

@@ -1,0 +1,132 @@
+name: Diagnose Darwin ARM64 release packaging
+
+# Run this expensive release reproduction from the Actions UI, or before a PR
+# merges by applying the `ci:darwin-release` label. Ordinary PR updates do not
+# schedule the 20 GiB ReleaseFast build.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
+  MACOS_SDK_VERSION: "15.5"
+  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
+
+jobs:
+  darwin-release:
+    name: Darwin ARM64 ReleaseFast archive
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'ci:darwin-release' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: arc-antfly-publish
+    timeout-minutes: 180
+    steps:
+      - name: Checkout requested revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: true
+
+      - name: Verify x86_64 host
+        run: test "$(uname -m)" = x86_64
+
+      - name: Verify runtime boundaries and bounded runner
+        run: |
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
+          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
+          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
+          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
+
+      - name: Install Zig
+        run: |
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Install pinned macOS cross-compilation SDK
+        run: |
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
+
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Build production Darwin ARM64 archive
+        run: |
+          mkdir -p dist/release-archives
+          /usr/bin/time -v -o "$RUNNER_TEMP/darwin-arm64-release.time" \
+            scripts/packaging/build_zig_release_archive.sh \
+            --version 0.0.0-diagnostic \
+            --target aarch64-macos \
+            --optimize ReleaseFast \
+            --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
+            --out-dir dist/release-archives \
+            --metal true \
+            --system-blas true
+
+      - name: Verify Darwin ARM64 archive
+        run: |
+          archive=dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
+          extract_root="$RUNNER_TEMP/darwin-arm64-archive"
+          mkdir -p "$extract_root"
+          tar -xzf "$archive" -C "$extract_root"
+
+          binary="$extract_root/antfly"
+          library="$extract_root/lib/libantfly.dylib"
+          test -x "$binary"
+          test -f "$library"
+          test -f "$extract_root/include/antfly.h"
+          file "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-file"
+          file "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-file"
+          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.binary-file"
+          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.capi-file"
+          stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-size"
+          stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-size"
+          library_size=$(stat -c '%s' "$library")
+          if [ "$library_size" -ge 20971520 ]; then
+            echo "libantfly.dylib exceeded the 20MiB retained-code budget: $library_size bytes" >&2
+            exit 1
+          fi
+
+      - name: Report compiler memory
+        if: ${{ always() }}
+        run: cat "$RUNNER_TEMP/darwin-arm64-release.time" || true
+
+      - name: Upload diagnostic result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-darwin-arm64-release-fast
+          path: |
+            dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
+            ${{ runner.temp }}/antfly-zig-release-aarch64-macos
+            ${{ runner.temp }}/darwin-arm64-release.time
+            ${{ runner.temp }}/darwin-arm64.binary-file
+            ${{ runner.temp }}/darwin-arm64.binary-size
+            ${{ runner.temp }}/darwin-arm64.capi-file
+            ${{ runner.temp }}/darwin-arm64.capi-size
+          if-no-files-found: warn
