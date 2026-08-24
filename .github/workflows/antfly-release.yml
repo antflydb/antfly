@@ -231,6 +231,8 @@ jobs:
 
       - name: Set up Zig
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils
           curl --fail --location --retry 3 \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
