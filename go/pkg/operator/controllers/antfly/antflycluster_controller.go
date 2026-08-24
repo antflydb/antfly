@@ -429,12 +429,35 @@ func haStartupGateActivationReceiptMatches(
 		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
 		return false, "ActivationReceiptDigestMismatch"
 	}
-	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
-	if identity == nil || receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
-		receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+	if !haSeedReceiptMatchesRuntimeLineage(cluster, receipt.ClusterID, receipt.ShardID, receipt.TableID, receipt.TimelineID, receipt.Epoch) {
 		return false, "ActivationReceiptReplicationIdentityMismatch"
 	}
 	return true, "ExactActivationReceiptMatched"
+}
+
+// haSeedReceiptMatchesRuntimeLineage distinguishes standby startup authority
+// from promoted-primary storage provenance. A standby may only start from a
+// receipt on its exact current replication boundary. Once that same runtime is
+// promoted, its materialized receipt necessarily belongs to the predecessor
+// boundary; accept it only when the database identity is unchanged and the new
+// authority boundary is monotonically later (never equal, incomparable, or in
+// the future).
+func haSeedReceiptMatchesRuntimeLineage(
+	cluster *antflyv1.AntflyCluster,
+	clusterID, shardID, tableID, timelineID, epoch uint64,
+) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || clusterID != identity.ClusterID || shardID != identity.ShardID || tableID != identity.TableID {
+		return false
+	}
+	if cluster.Spec.HighAvailability.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return timelineID == identity.TimelineID && epoch == identity.Epoch
+	}
+	return timelineID <= identity.TimelineID && epoch <= identity.Epoch &&
+		(timelineID < identity.TimelineID || epoch < identity.Epoch)
 }
 
 func haStartupGateReceiptHash(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) string {
@@ -5644,8 +5667,7 @@ func (r *AntflyClusterReconciler) updateHAStartupGateStatus(ctx context.Context,
 				continue
 			}
 			receipt := action.SeedArtifactReceipt
-			if receipt.ClusterID != identity.ClusterID || receipt.ShardID != identity.ShardID ||
-				receipt.TableID != identity.TableID || receipt.TimelineID != identity.TimelineID || receipt.Epoch != identity.Epoch {
+			if !haSeedReceiptMatchesRuntimeLineage(cluster, receipt.ClusterID, receipt.ShardID, receipt.TableID, receipt.TimelineID, receipt.Epoch) {
 				continue
 			}
 			activationReceipt := &antflyv1.HASeedActivationReceiptStatus{

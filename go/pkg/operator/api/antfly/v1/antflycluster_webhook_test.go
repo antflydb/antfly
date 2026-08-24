@@ -2350,6 +2350,37 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected exact activated-seed startup gate to be valid: %v", err)
 	}
+	// Promotion advances authority but must retain the exact materialized PVC
+	// binding even though the old standby slot is no longer in the new topology.
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	standby := cluster.DeepCopy()
+	cluster.Spec.HighAvailability.Identity.TimelineID = 2
+	cluster.Spec.HighAvailability.Identity.Epoch = 2
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Standbys = nil
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected promoted primary to retain exact activated-volume provenance: %v", err)
+	}
+	if err := cluster.ValidateUpdate(standby); err != nil {
+		t.Fatalf("expected promotion to retain the unchanged activated-volume binding: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = ""
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "targetPVCUID is required for runtime.role Primary") {
+		t.Fatalf("expected promoted primary without exact PVC incarnation to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "standby-pvc-uid"
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "runtime.role Primary requires runtimeEligible=true") {
+		t.Fatalf("expected promoted primary with a declaratively closed retained gate to be rejected, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "different-generation"
+	if err := cluster.ValidateUpdate(standby); err == nil || !strings.Contains(err.Error(), "activated-volume binding is immutable") {
+		t.Fatalf("expected promotion to reject a changed activated-volume binding, got: %v", err)
+	}
 }
 
 func TestValidateCreate_HighAvailabilityAllowsSharedTopologyAnnotationAcrossRuntimeCRs(t *testing.T) {

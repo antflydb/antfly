@@ -14557,6 +14557,26 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+
+	// The activation receipt remains exact storage provenance after this runtime
+	// becomes primary, while the promoted authority moves to a later boundary.
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 3
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "pvc-uid-1"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Identity.TimelineID = 2
+	cluster.Spec.HighAvailability.Identity.Epoch = 2
+	cluster.Spec.HighAvailability.Standbys = nil
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)), "a promoted primary must retain access to its activated volume")
+
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TimelineID = 3
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
+	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)), "a receipt from a future or incomparable boundary must fail closed")
 }
 
 func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing.T) {

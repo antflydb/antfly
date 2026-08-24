@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -51,7 +52,37 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 	if err := r.ValidateImmutability(oldCluster); err != nil {
 		return err
 	}
-	return r.ValidateAntflyCluster()
+	if err := r.ValidateAntflyCluster(); err != nil {
+		return err
+	}
+	return r.validateHAPromotedPrimaryStorageBinding(oldCluster)
+}
+
+// validateHAPromotedPrimaryStorageBinding makes the activated PVC binding
+// immutable across and after promotion. Changing or dropping it would either
+// close the new writer after authority moved or remount a different volume
+// under an already-promoted identity.
+func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyCluster) error {
+	if old == nil || old.Spec.HighAvailability == nil || old.Spec.HighAvailability.Runtime == nil ||
+		r.Spec.HighAvailability == nil || r.Spec.HighAvailability.Runtime == nil {
+		return nil
+	}
+	oldRuntime := old.Spec.HighAvailability.Runtime
+	newRuntime := r.Spec.HighAvailability.Runtime
+	oldGate := oldRuntime.StartupGate
+	newGate := newRuntime.StartupGate
+	oldBoundPrimary := oldRuntime.Role == HARuntimeRolePrimary && oldGate != nil && oldGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	newBoundPrimary := newRuntime.Role == HARuntimeRolePrimary && newGate != nil && newGate.Policy == HAStartupGatePolicyRequireActivatedSeed
+	// A physically fenced primary may subsequently be rewritten as a standby
+	// with a repair/suspension gate. Immutability applies only while entering or
+	// remaining in the Primary role.
+	if newRuntime.Role != HARuntimeRolePrimary || (!oldBoundPrimary && !newBoundPrimary) {
+		return nil
+	}
+	if !reflect.DeepEqual(oldGate, newGate) {
+		return fmt.Errorf("spec.highAvailability.runtime.startupGate activated-volume binding is immutable across and after promotion")
+	}
+	return nil
 }
 
 // Default applies admission defaults to AntflyCluster.
@@ -1656,10 +1687,10 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	gate := ha.Runtime.StartupGate
 	fieldPath := "spec.highAvailability.runtime.startupGate"
 	var errors []string
-	if ha.Runtime.Role != HARuntimeRoleStandby {
-		errors = append(errors, fieldPath+" requires runtime.role Standby")
-	}
 	if gate.Policy == HAStartupGatePolicySuspend {
+		if ha.Runtime.Role != HARuntimeRoleStandby {
+			errors = append(errors, fieldPath+".policy Suspend requires runtime.role Standby")
+		}
 		if gate.RuntimeEligible {
 			errors = append(errors, fieldPath+".policy Suspend requires runtimeEligible=false")
 		}
@@ -1673,6 +1704,9 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	}
 	if gate.Policy != HAStartupGatePolicyRequireActivatedSeed {
 		errors = append(errors, fieldPath+".policy must be Suspend or RequireActivatedSeed")
+	}
+	if ha.Runtime.Role == HARuntimeRolePrimary && !gate.RuntimeEligible {
+		errors = append(errors, fieldPath+" on runtime.role Primary requires runtimeEligible=true")
 	}
 	if gate.ReceiptMatchPolicy != HAReceiptMatchPolicyExact {
 		errors = append(errors, fieldPath+".receiptMatchPolicy must be Exact for RequireActivatedSeed")
@@ -1713,7 +1747,8 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 	if strings.TrimSpace(required.NodeID) != strings.TrimSpace(ha.Runtime.NodeID) {
 		errors = append(errors, fieldPath+".requiredReceipt.nodeID must match runtime.nodeID")
 	}
-	if ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName) {
+	if ha.Runtime.Role == HARuntimeRoleStandby &&
+		(ha.Runtime.Standby == nil || strings.TrimSpace(required.SlotName) != strings.TrimSpace(ha.Runtime.Standby.SlotName)) {
 		errors = append(errors, fieldPath+".requiredReceipt.slotName must match runtime.standby.slotName")
 	}
 
@@ -1726,26 +1761,39 @@ func (r *AntflyCluster) validateHAStartupGate(ha *HighAvailabilitySpec) []string
 		errors = append(errors, fmt.Sprintf("%s.requiredReceipt.targetPVCName %q is invalid: %s", fieldPath, targetPVCName, strings.Join(nameErrs, "; ")))
 	}
 
-	var artifact *HASeedArtifactSpec
-	for i := range ha.Standbys {
-		standby := &ha.Standbys[i]
-		slotName := strings.TrimSpace(standby.SlotName)
-		if slotName == "" {
-			slotName = strings.TrimSpace(standby.Name)
+	if ha.Runtime.Role == HARuntimeRolePrimary {
+		// A promoted seeded runtime keeps the exact gate as durable storage
+		// provenance after its standby slot leaves the new primary topology.
+		// Require incarnation-level bindings so it can never fall back to a
+		// newly-created empty claim if that retained volume disappears.
+		if required.TopologyGeneration <= 0 {
+			errors = append(errors, fieldPath+".requiredReceipt.topologyGeneration must be greater than zero for runtime.role Primary")
 		}
-		if slotName == strings.TrimSpace(required.SlotName) {
-			artifact = standby.SeedArtifact
-			break
+		if strings.TrimSpace(required.TargetPVCUID) == "" {
+			errors = append(errors, fieldPath+".requiredReceipt.targetPVCUID is required for runtime.role Primary")
 		}
-	}
-	if artifact == nil {
-		errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
 	} else {
-		if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
-			errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+		var artifact *HASeedArtifactSpec
+		for i := range ha.Standbys {
+			standby := &ha.Standbys[i]
+			slotName := strings.TrimSpace(standby.SlotName)
+			if slotName == "" {
+				slotName = strings.TrimSpace(standby.Name)
+			}
+			if slotName == strings.TrimSpace(required.SlotName) {
+				artifact = standby.SeedArtifact
+				break
+			}
 		}
-		if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
-			errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+		if artifact == nil {
+			errors = append(errors, fieldPath+".requiredReceipt.slotName must reference a standby with seedArtifact")
+		} else {
+			if strings.TrimSpace(required.Generation) != strings.TrimSpace(artifact.Generation) {
+				errors = append(errors, fieldPath+".requiredReceipt.generation must match seedArtifact.generation")
+			}
+			if artifact.TargetPVC == nil || targetPVCName != strings.TrimSpace(artifact.TargetPVC.ClaimName) {
+				errors = append(errors, fieldPath+".requiredReceipt.targetPVCName must match seedArtifact.targetPVC.claimName")
+			}
 		}
 	}
 

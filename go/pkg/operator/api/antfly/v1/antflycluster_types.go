@@ -867,8 +867,10 @@ type HARuntimeFencingLeaseSpec struct {
 }
 
 // HAStartupGateSpec declares the exact receipt required before a runtime may
-// start. runtimeEligible is a declarative suspension fence: false always keeps
-// replicas at zero, while true remains subject to policy-specific verification.
+// start. A seeded runtime retains its exact activated-volume binding after
+// promotion, where it becomes storage provenance rather than standby authority.
+// runtimeEligible is a declarative suspension fence: false always keeps replicas
+// at zero, while true remains subject to policy-specific verification.
 type HAStartupGateSpec struct {
 	// Policy selects either an unconditional Suspend hold or exact activated-seed startup.
 	// +kubebuilder:validation:Enum=Suspend;RequireActivatedSeed
