@@ -14966,6 +14966,17 @@ pub const IndexManager = struct {
 
     fn rollbackPendingDenseVectors(self: *IndexManager, entry: *DenseIndex, pending: []const PendingDenseVectorMapping) void {
         if (pending.len == 0) return;
+        // An authoritative source-sequence capture owns the complete
+        // pre-mutation native generation. Its caller's error path cancels that
+        // capture, restores metadata/search state, and clears the affected
+        // caches in constant time. Performing maintained HBC deletes here
+        // first is both redundant and dangerous: every inverse delete can
+        // recompute a centroid and reload external vectors, turning a
+        // recoverable mapping commit failure into a multi-minute public-write
+        // stall. Before authority exists, cancellation cannot restore a full
+        // generation and the inverse rollback below remains required.
+        if (entry.index.experimentalPostingMutationCaptureActive() and
+            entry.index.experimentalPostingWalAuthoritative()) return;
         const vector_ids = self.alloc.alloc(u64, pending.len) catch return;
         defer self.alloc.free(vector_ids);
         for (pending, 0..) |mapping, i| vector_ids[i] = mapping.vector_id;
@@ -15005,13 +15016,7 @@ pub const IndexManager = struct {
         pending: []const PendingDenseVectorMapping,
     ) !void {
         self.persistDenseVectorMappings(store, index_name, pending) catch |err| {
-            if (pending.len > 0) {
-                const vector_ids = self.alloc.alloc(u64, pending.len) catch return err;
-                defer self.alloc.free(vector_ids);
-                for (pending, 0..) |mapping, i| vector_ids[i] = mapping.vector_id;
-                entry.index.batchDelete(vector_ids) catch {};
-                entry.index.clearMetadataCache();
-            }
+            self.rollbackPendingDenseVectors(entry, pending);
             return err;
         };
         try self.refreshDenseOrdinalVectorCacheFromStoreAlloc(store, entry, index_name, pending);
@@ -25245,6 +25250,9 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
     });
 
     const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    // An optional pre-authority capture cannot restore a complete native
+    // generation yet, so it must retain the legacy inverse rollback.
+    try entry.index.beginExperimentalPostingMutationCapture();
     try entry.index.batchInsertWithMetadata(&.{
         .{
             .vector_id = 1,
@@ -25365,10 +25373,59 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
     try std.testing.expectEqual(@as(usize, 2), shared.puts);
     try std.testing.expect(shared.aborted);
     try std.testing.expectEqual(@as(u64, 0), entry.index.stats().active_count);
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    entry.index.cancelExperimentalPostingMutationCapture();
 
     const metadata = try entry.index.getMetadata(1);
     defer if (metadata) |value| alloc.free(value);
     try std.testing.expect(metadata == null);
+
+    // Once the native posting capture owns rollback, a mapping failure must
+    // not execute the maintained inverse-delete path. The captured generation
+    // remains visible to the apply owner until it cancels, then restoration is
+    // immediate and exact.
+    try entry.index.beginExperimentalPostingMutationCapture();
+    try entry.index.batchInsertWithMetadata(&.{
+        .{
+            .vector_id = 1,
+            .vector = &[_]f32{ 1.0, 2.0, 3.0 },
+            .metadata = "doc:committed",
+        },
+    });
+    try entry.index.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+    entry.index.enableExperimentalPostingWalMutations();
+    try entry.index.beginExperimentalPostingMutationCapture();
+    try entry.index.batchInsertWithMetadata(&.{
+        .{
+            .vector_id = 2,
+            .vector = &[_]f32{ 3.0, 2.0, 1.0 },
+            .metadata = "doc:captured",
+        },
+    });
+
+    shared = .{};
+    try std.testing.expectError(
+        error.CommitFailed,
+        manager.persistDenseVectorMappingsWithRollback(
+            MockStore{ .shared = &shared },
+            entry,
+            "dv_v1",
+            &.{
+                .{
+                    .doc_key = "doc:captured",
+                    .vector_id = 2,
+                },
+            },
+        ),
+    );
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
+
+    entry.index.cancelExperimentalPostingMutationCapture();
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    const captured_metadata = try entry.index.getMetadata(2);
+    defer if (captured_metadata) |value| alloc.free(value);
+    try std.testing.expect(captured_metadata == null);
 }
 
 test "dense index manager accepts external embedding indexes without enrichments" {

@@ -1946,6 +1946,21 @@ fn readManySortedPointFromSnapshot(
     backend_locked: bool,
 ) !BatchCursorReadResult {
     @memset(values, null);
+    if (try readManySortedPointFromSnapshotAsync(
+        backend,
+        mutable,
+        immutable_memtables,
+        runs,
+        l0_groups,
+        levels,
+        allocator,
+        held_values,
+        namespace,
+        keys,
+        values,
+        backend_locked,
+    )) |result| return result;
+
     var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
@@ -4947,6 +4962,218 @@ fn tryReadPointRunCandidatesAsync(
         offset = end;
     }
     return .miss;
+}
+
+const BatchAsyncPointKey = struct {
+    candidate_start: usize = 0,
+    candidate_len: usize = 0,
+    next_candidate: usize = 0,
+    read_hint: ?BorrowedReadHint = null,
+};
+
+const BatchAsyncPointSlot = struct {
+    active: bool = false,
+    key_index: usize = 0,
+    read: AsyncPointBlockRead = undefined,
+};
+
+fn startBatchAsyncPointSlot(
+    backend: anytype,
+    runs: []Run,
+    candidates: []const PointRunCandidate,
+    key_states: []BatchAsyncPointKey,
+    keys: []const []const u8,
+    namespace: backend_types.Namespace,
+    key_index: usize,
+    slot: *BatchAsyncPointSlot,
+    issued_count: *usize,
+) !bool {
+    const state = &key_states[key_index];
+    if (state.next_candidate >= state.candidate_len) return false;
+    const candidate = candidates[state.candidate_start + state.next_candidate];
+    state.next_candidate += 1;
+
+    backend.recordRunProbe();
+    recordPointRunPrecheck(backend);
+    const prepared = (try prepareAsyncPointBlockRead(
+        backend,
+        runs,
+        candidate,
+        namespace,
+        keys[key_index],
+    )) orelse return error.RunStateUnavailable;
+    if (prepared.status != .known_miss) recordPointRunPrecheckSurvivor(backend);
+    if (prepared.status == .future) issued_count.* += 1;
+    slot.* = .{
+        .active = true,
+        .key_index = key_index,
+        .read = prepared,
+    };
+    return true;
+}
+
+/// Overlap independent sparse point reads while preserving the exact LSM
+/// precedence order within each key. This is deliberately a bounded pipeline:
+/// only one candidate per key is in flight, so a newer tombstone or value is
+/// always resolved before an older run can decide that key.
+fn readManySortedPointFromSnapshotAsync(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+) !?BatchCursorReadResult {
+    if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
+    const configured_limit = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads);
+    if (configured_limit < 2) return null;
+    // Decide eligibility before touching output slots or read telemetry. A
+    // legacy in-memory run uses a different borrowing lifetime and falls back
+    // to the established scalar batch path as one complete operation.
+    for (runs) |run| {
+        if (run.path == null or run.state != null) return null;
+    }
+    backend.recordPointGets(keys.len);
+
+    const scratch_allocator = runtimeScratchAllocator(allocator);
+    const key_states = try scratch_allocator.alloc(BatchAsyncPointKey, keys.len);
+    defer scratch_allocator.free(key_states);
+    @memset(key_states, .{});
+    const resolved = try scratch_allocator.alloc(bool, keys.len);
+    defer scratch_allocator.free(resolved);
+    @memset(resolved, false);
+
+    var result: BatchCursorReadResult = .{};
+    for (keys, 0..) |key, key_index| {
+        if (mutable.findIndex(namespace, key)) |entry_index| {
+            const entry = mutable.entries.items[entry_index];
+            resolved[key_index] = true;
+            if (entry.tombstone) {
+                result.misses += 1;
+            } else {
+                values[key_index] = entry.value;
+                result.hits += 1;
+                backend.recordMutableHit();
+            }
+            continue;
+        }
+        for (immutable_memtables) |state| {
+            const entry_index = state.findIndex(namespace, key) orelse continue;
+            const entry = state.entries.items[entry_index];
+            resolved[key_index] = true;
+            if (entry.tombstone) {
+                result.misses += 1;
+            } else {
+                values[key_index] = entry.value;
+                result.hits += 1;
+                backend.recordMutableHit();
+            }
+            break;
+        }
+    }
+
+    var candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
+    defer candidates.deinit(scratch_allocator);
+    for (keys, 0..) |key, key_index| {
+        if (resolved[key_index]) continue;
+        const candidate_start = candidates.items.len;
+        if (findRunGroupIndex(l0_groups, namespace, key)) |group_index| {
+            for (l0_groups[group_index].run_indices) |run_index| {
+                if (runMayContain(runs[run_index], namespace, key)) {
+                    try candidates.append(scratch_allocator, .{ .run_index = run_index });
+                }
+            }
+        }
+        for (levels) |level| {
+            const run_index = findRunIndexInLevel(runs, level, namespace, key) orelse continue;
+            try candidates.append(scratch_allocator, .{ .run_index = run_index });
+        }
+        const candidate_len = candidates.items.len - candidate_start;
+        key_states[key_index] = .{
+            .candidate_start = candidate_start,
+            .candidate_len = candidate_len,
+        };
+        if (candidate_len == 0) {
+            resolved[key_index] = true;
+            result.misses += 1;
+        }
+    }
+
+    var slots: [max_point_async_stack_reads]BatchAsyncPointSlot = undefined;
+    for (slots[0..configured_limit]) |*slot| slot.* = .{};
+    defer for (slots[0..configured_limit]) |*slot| {
+        if (slot.active) slot.read.release();
+    };
+
+    var issued_count: usize = 0;
+    var next_key: usize = 0;
+    var active_slots: usize = 0;
+    for (slots[0..configured_limit]) |*slot| {
+        while (next_key < keys.len and resolved[next_key]) : (next_key += 1) {}
+        if (next_key == keys.len) break;
+        if (!try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, next_key, slot, &issued_count)) return error.RunStateUnavailable;
+        next_key += 1;
+        active_slots += 1;
+    }
+
+    var cursor: usize = 0;
+    while (active_slots > 0) {
+        const slot = &slots[cursor];
+        cursor = (cursor + 1) % configured_limit;
+        if (!slot.active) continue;
+
+        const key_index = slot.key_index;
+        const deciding_run_index = slot.read.candidate.run_index;
+        const lookup = try consumeAsyncPointRead(
+            backend,
+            &slot.read,
+            &key_states[key_index].read_hint,
+            held_values,
+            allocator,
+            namespace,
+            keys[key_index],
+        );
+        slot.read.release();
+        slot.active = false;
+
+        var key_decided = false;
+        if (lookup) |decision| switch (decision) {
+            .hit => |value| {
+                values[key_index] = value;
+                result.hits += 1;
+                if (runs[deciding_run_index].level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+                key_decided = true;
+            },
+            .tombstone => {
+                result.misses += 1;
+                key_decided = true;
+            },
+            .miss => {},
+        };
+
+        if (!key_decided and key_states[key_index].next_candidate < key_states[key_index].candidate_len) {
+            _ = try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, key_index, slot, &issued_count);
+            continue;
+        }
+        if (!key_decided) result.misses += 1;
+        resolved[key_index] = true;
+
+        while (next_key < keys.len and resolved[next_key]) : (next_key += 1) {}
+        if (next_key < keys.len) {
+            if (!try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, next_key, slot, &issued_count)) return error.RunStateUnavailable;
+            next_key += 1;
+        } else {
+            active_slots -= 1;
+        }
+    }
+    backend.recordPointRunAsyncBatch(issued_count);
+    return result;
 }
 
 fn getFromRunIndices(

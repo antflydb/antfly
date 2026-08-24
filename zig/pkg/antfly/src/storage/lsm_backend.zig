@@ -13428,6 +13428,81 @@ test "lsm backend async point reads issue overlapping survivors in source order"
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
+test "lsm backend sparse point batches pipeline independent blocks without weakening precedence" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-async-sparse-point-batch";
+    const count = 32;
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            var key_buf: [64]u8 = undefined;
+            for (0..count) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i});
+                try txn.put(key, large_value);
+            }
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("artifact:00000010:dense");
+            try txn.put("artifact:00000011:dense", "newest");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_storage: [count][64]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
+    }
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[10]);
+    try std.testing.expectEqualStrings("newest", values[11].?);
+    try std.testing.expectEqualSlices(u8, large_value, values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, count - 1), stats.get_many_sorted_hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_misses);
+    try std.testing.expect(stats.point_run_async_batches > 0);
+    try std.testing.expect(stats.point_run_async_reads_issued >= 2);
+}
+
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);

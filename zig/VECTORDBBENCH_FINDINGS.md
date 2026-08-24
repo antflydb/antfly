@@ -1479,6 +1479,31 @@ public profiler measured 3.63/4.26/4.74 ms p50/p95/p99, 14.87 ms maximum, and
 physical-footprint ledger peak, 729.1 MB current RSS, and 700.7 MB conservative
 demand under the explicit 1 GiB process envelope.
 
+The first post-sampling 1M qualification under a 2 GiB envelope is invalid as
+a timing result but exposed a general rollback amplification bug. At 568,800
+query-visible documents, public inserts began hitting their exact 120-second
+request timeout. A process sample caught derived replay inside
+`commitDenseVectorMappingsWithRollback`: a primary mapping-store commit failure
+started maintained inverse HBC deletes even though the active authoritative
+source capture already owned the complete pre-mutation native generation.
+Those deletes recomputed centroids and, with the governed HBC cache retaining
+only one external vector, reloaded posting members from the primary LSM. The
+correct rollback is to propagate the error and let the outer capture cancel
+restore topology, metadata, search publication, and caches in constant time.
+Pre-authority captures retain inverse rollback because they do not yet own a
+complete restorable generation. Tests cover both sides of that authority
+boundary.
+
+The same partial run confirmed that exact rerank at 1M is now dominated by
+sparse primary-artifact block reads rather than HBC routing. Sorted point
+batches now overlap independent path-backed run-block reads with a bounded
+four-slot pipeline. Each key still resolves mutable state and candidate runs in
+strict newest-to-oldest order, so tombstone and overwrite precedence is
+unchanged; only different keys overlap IO. The pipeline uses existing cache,
+checksum, allocation, and read-stat paths and caps concurrent buffers at the
+configured point-read ceiling. Its latency effect must be measured against the
+preserved complete 1M generation before another fresh load qualification.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
