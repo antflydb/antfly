@@ -420,6 +420,8 @@ pub const DenseSearchProfile = struct {
     exact_distance_ns: u64 = 0,
     exact_lsm_cache_hits: u64 = 0,
     exact_lsm_cache_misses: u64 = 0,
+    exact_artifact_cache_hits: u64 = 0,
+    exact_artifact_vectors_loaded: u64 = 0,
     hbc_nodes_visited: u64 = 0,
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
@@ -455,12 +457,15 @@ pub const DenseSearchProfile = struct {
     hbc_rerank_external_score_ns: u64 = 0,
     hbc_rerank_vector_load_ns: u64 = 0,
     hbc_rerank_metadata_lookup_ns: u64 = 0,
+    hbc_rerank_metadata_vectors_loaded: u64 = 0,
     hbc_rerank_artifact_key_ns: u64 = 0,
     hbc_rerank_artifact_read_ns: u64 = 0,
     hbc_rerank_artifact_decode_ns: u64 = 0,
     hbc_rerank_artifact_distance_ns: u64 = 0,
     hbc_rerank_lsm_cache_hits: u64 = 0,
     hbc_rerank_lsm_cache_misses: u64 = 0,
+    hbc_rerank_artifact_cache_hits: u64 = 0,
+    hbc_rerank_artifact_vectors_loaded: u64 = 0,
     hbc_rerank_distance_ns: u64 = 0,
     doc_key_resolve_ns: u64 = 0,
     doc_ordinal_lookup_ns: u64 = 0,
@@ -13165,13 +13170,15 @@ fn searchDenseInternal(
             profile.exact_distance_ns = exact.profile.distance_ns;
             profile.exact_lsm_cache_hits = exact.profile.lsm_cache_hits;
             profile.exact_lsm_cache_misses = exact.profile.lsm_cache_misses;
+            profile.exact_artifact_cache_hits = exact.profile.artifact_cache_hits;
+            profile.exact_artifact_vectors_loaded = exact.profile.artifact_vectors_loaded;
             entry.index.observeExactDenseRouteCost(.{
                 .candidates = exact.profile.candidate_count,
                 .metadata_ns = exact.profile.metadata_lookup_ns,
                 .artifact_read_decode_ns = exact.profile.artifact_read_ns +| exact.profile.artifact_decode_ns,
                 .distance_ns = exact.profile.distance_ns,
-                .cache_hits = exact.profile.lsm_cache_hits,
-                .cache_misses = exact.profile.lsm_cache_misses,
+                .artifact_cache_hits = exact.profile.artifact_cache_hits,
+                .artifact_vectors_loaded = exact.profile.artifact_vectors_loaded,
             });
             score_exactness = .exact;
             break :blk exact.results;
@@ -13245,12 +13252,15 @@ fn searchDenseInternal(
             profile.hbc_rerank_external_score_ns = profiled.profile.rerank_vector_load_ns;
             profile.hbc_rerank_vector_load_ns = profiled.profile.rerank_vector_load_ns;
             profile.hbc_rerank_metadata_lookup_ns = profiled.profile.rerank_metadata_lookup_ns;
+            profile.hbc_rerank_metadata_vectors_loaded = profiled.profile.rerank_metadata_vectors_loaded;
             profile.hbc_rerank_artifact_key_ns = profiled.profile.rerank_artifact_key_ns;
             profile.hbc_rerank_artifact_read_ns = profiled.profile.rerank_artifact_read_ns;
             profile.hbc_rerank_artifact_decode_ns = profiled.profile.rerank_artifact_decode_ns;
             profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
             profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
             profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
+            profile.hbc_rerank_artifact_cache_hits = profiled.profile.rerank_artifact_cache_hits;
+            profile.hbc_rerank_artifact_vectors_loaded = profiled.profile.rerank_artifact_vectors_loaded;
             profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
             break :blk profiled.results;
         } else executor.hbc_search(executor.ctx, entry, hbc_req) catch |err| switch (err) {

@@ -7442,7 +7442,7 @@ pub fn build(b: *std.Build) void {
         "dense search route uses measured per-index costs pressure and hysteresis",
         "one percent filtered route preserves exact recall with candidate-linear IO",
         "dense index manager accepts external embedding indexes without enrichments",
-        "production external exact scorer uses bounded sorted artifact batches",
+        "production external scorers use bounded cache-first artifact batches",
         "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds",
         "flat rabitq filtered traversal advances past its initial probe wave safely",
         "sorted unique vector id subtraction handles sparse and dense exclusions",

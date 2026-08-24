@@ -56,14 +56,19 @@ LOAD_PROGRESS_INTERVAL="${RESOURCE_CACHE_MATRIX_LOAD_PROGRESS_INTERVAL:-25000}"
 RUN_BUILD="${RESOURCE_CACHE_MATRIX_WARM_BUILD:-1}"
 ENFORCE_GATES="${RESOURCE_CACHE_MATRIX_ENFORCE_GATES:-$((1 - SMOKE))}"
 MIN_50K_FILTER_QPS="${RESOURCE_CACHE_MATRIX_MIN_50K_FILTER_QPS:-150}"
+MIN_1M_DENSE_QPS="${RESOURCE_CACHE_MATRIX_MIN_1M_DENSE_QPS:-150}"
+MIN_1M_FILTER_QPS="${RESOURCE_CACHE_MATRIX_MIN_1M_FILTER_QPS:-150}"
 MIN_1M_FILTER_TO_DENSE_RATIO="${RESOURCE_CACHE_MATRIX_MIN_1M_FILTER_TO_DENSE_RATIO:-0.80}"
 SOAK_REPEATS="${RESOURCE_CACHE_MATRIX_SOAK_REPEATS:-25}"
 RUN_ENDPOINTS="${RESOURCE_CACHE_MATRIX_RUN_ENDPOINTS:-1}"
 RUN_MAINTENANCE="${RESOURCE_CACHE_MATRIX_RUN_MAINTENANCE:-$((1 - SMOKE))}"
 MIN_P1_TO_P10_RATIO="${RESOURCE_CACHE_MATRIX_MIN_P1_TO_P10_RATIO:-0.70}"
-MIN_THREAD_SCALING_RATIO="${RESOURCE_CACHE_MATRIX_MIN_THREAD_SCALING_RATIO:-0.70}"
+MIN_THREAD_SCALING_RATIO="${RESOURCE_CACHE_MATRIX_MIN_THREAD_SCALING_RATIO:-1.25}"
 MIN_MAINTENANCE_TO_BASE_RATIO="${RESOURCE_CACHE_MATRIX_MIN_MAINTENANCE_TO_BASE_RATIO:-0.70}"
 MAX_RSS_TO_BUDGET_RATIO="${RESOURCE_CACHE_MATRIX_MAX_RSS_TO_BUDGET_RATIO:-1.25}"
+MAX_SEARCH_HEALTH_LATENCY_MS="${RESOURCE_CACHE_MATRIX_MAX_SEARCH_HEALTH_LATENCY_MS:-20}"
+MIN_SOURCE_RECALL_AT_K="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_RECALL_AT_K:-1.0}"
+MIN_SOURCE_TOP1_RECALL="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_TOP1_RECALL:-0.95}"
 
 mkdir -p "$OUT"
 STATUS_FILE="$OUT/status.tsv"
@@ -259,6 +264,12 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
       cold_us="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" http_first_pass_us)"
       warm_us="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" http_later_pass_us)"
       filtered_10_qps="$(summary_value "dense-filter-p10-1000000-m${budget_mb}" concurrent_qps)"
+      dense_1m_health_ms="$(summary_value "dense-1000000-m${budget_mb}" search_health_max_ms)"
+      filtered_1m_health_ms="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" search_health_max_ms)"
+      dense_1m_recall="$(summary_value "dense-1000000-m${budget_mb}" source_recall_at_k)"
+      dense_1m_top1_recall="$(summary_value "dense-1000000-m${budget_mb}" source_top1_recall)"
+      filtered_1m_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_recall_at_k)"
+      filtered_1m_top1_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_top1_recall)"
       load_rss_bytes="$(summary_budget_max "$budget_mb" load_rss_peak_bytes)"
       search_rss_bytes="$(summary_budget_max "$budget_mb" search_rss_peak_bytes)"
       hbc_accounted_bytes="$(summary_budget_max "$budget_mb" hbc_accounted_bytes)"
@@ -274,6 +285,14 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
         printf 'gate failed: 50k/1%% qps=%s minimum=%s budget_mb=%s\n' "$filtered_50k_qps" "$MIN_50K_FILTER_QPS" "$budget_mb" >&2
         FAILURES=$((FAILURES + 1))
       fi
+      if ! gate_float_ge "$dense_1m_qps" "$MIN_1M_DENSE_QPS"; then
+        printf 'gate failed: 1m dense qps=%s minimum=%s budget_mb=%s\n' "$dense_1m_qps" "$MIN_1M_DENSE_QPS" "$budget_mb" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
+      if ! gate_float_ge "$filtered_1m_qps" "$MIN_1M_FILTER_QPS"; then
+        printf 'gate failed: 1m/1%% qps=%s minimum=%s budget_mb=%s\n' "$filtered_1m_qps" "$MIN_1M_FILTER_QPS" "$budget_mb" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
       if ! gate_float_ge "$filtered_1m_qps" "$required_1m_qps"; then
         printf 'gate failed: 1m/1%% qps=%s required=%s (%.0f%% of dense=%s) budget_mb=%s\n' \
           "$filtered_1m_qps" "$required_1m_qps" "$(awk -v ratio="$MIN_1M_FILTER_TO_DENSE_RATIO" 'BEGIN { print ratio * 100 }')" "$dense_1m_qps" "$budget_mb" >&2
@@ -287,6 +306,21 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
       if ! gate_float_ge "$one_thread_qps" 0.001 || ! gate_float_ge "$max_thread_qps" "$required_thread_qps"; then
         printf 'gate failed: concurrency scaling threads=1 qps=%s threads=%s qps=%s required=%s budget_mb=%s\n' \
           "$one_thread_qps" "$SEARCH_THREADS" "$max_thread_qps" "$required_thread_qps" "$budget_mb" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
+      if ! gate_float_le "$dense_1m_health_ms" "$MAX_SEARCH_HEALTH_LATENCY_MS" ||
+        ! gate_float_le "$filtered_1m_health_ms" "$MAX_SEARCH_HEALTH_LATENCY_MS"; then
+        printf 'gate failed: invalid search host health latency dense_ms=%s filtered_ms=%s maximum_ms=%s budget_mb=%s\n' \
+          "$dense_1m_health_ms" "$filtered_1m_health_ms" "$MAX_SEARCH_HEALTH_LATENCY_MS" "$budget_mb" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
+      if ! gate_float_ge "$dense_1m_recall" "$MIN_SOURCE_RECALL_AT_K" ||
+        ! gate_float_ge "$filtered_1m_recall" "$MIN_SOURCE_RECALL_AT_K" ||
+        ! gate_float_ge "$dense_1m_top1_recall" "$MIN_SOURCE_TOP1_RECALL" ||
+        ! gate_float_ge "$filtered_1m_top1_recall" "$MIN_SOURCE_TOP1_RECALL"; then
+        printf 'gate failed: matched source-vector recall dense_at_k=%s filtered_at_k=%s dense_top1=%s filtered_top1=%s minimum_at_k=%s minimum_top1=%s budget_mb=%s\n' \
+          "$dense_1m_recall" "$filtered_1m_recall" "$dense_1m_top1_recall" "$filtered_1m_top1_recall" \
+          "$MIN_SOURCE_RECALL_AT_K" "$MIN_SOURCE_TOP1_RECALL" "$budget_mb" >&2
         FAILURES=$((FAILURES + 1))
       fi
       if ! gate_float_le "$load_rss_bytes" "$allowed_rss_bytes"; then

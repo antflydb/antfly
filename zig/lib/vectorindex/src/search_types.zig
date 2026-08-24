@@ -97,12 +97,22 @@ pub const SearchProfile = struct {
     rerank_vector_load_ns: u64 = 0,
     rerank_prefetch_ns: u64 = 0,
     rerank_metadata_lookup_ns: u64 = 0,
+    /// Vector-to-document metadata rows requested after decoded-cache probing.
+    /// Warm decoded vectors must not contribute to this count.
+    rerank_metadata_vectors_loaded: u64 = 0,
     rerank_artifact_key_ns: u64 = 0,
     rerank_artifact_read_ns: u64 = 0,
     rerank_artifact_decode_ns: u64 = 0,
     rerank_artifact_distance_ns: u64 = 0,
     rerank_lsm_cache_hits: u64 = 0,
     rerank_lsm_cache_misses: u64 = 0,
+    /// Candidates scored without reading an external artifact. This includes
+    /// governed decoded residency and a request-local hit when a caller has a
+    /// legitimate reuse opportunity.
+    rerank_artifact_cache_hits: u64 = 0,
+    /// External artifact values requested, including missing/corrupt values.
+    /// Unlike LSM block-cache counters, this is a per-vector work signal.
+    rerank_artifact_vectors_loaded: u64 = 0,
     vector_cache_hits: u64 = 0,
     vector_cache_misses: u64 = 0,
     metadata_cache_hits: u64 = 0,

@@ -8488,6 +8488,8 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .exact_distance_ns = profile.exact_distance_ns,
         .exact_lsm_cache_hits = profile.exact_lsm_cache_hits,
         .exact_lsm_cache_misses = profile.exact_lsm_cache_misses,
+        .exact_artifact_cache_hits = profile.exact_artifact_cache_hits,
+        .exact_artifact_vectors_loaded = profile.exact_artifact_vectors_loaded,
         .hbc_nodes_visited = profile.hbc_nodes_visited,
         .hbc_leaves_explored = profile.hbc_leaves_explored,
         .hbc_approx_vectors_scored = profile.hbc_approx_vectors_scored,
@@ -8525,12 +8527,15 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_rerank_external_score_ns = profile.hbc_rerank_external_score_ns,
         .hbc_rerank_vector_load_ns = profile.hbc_rerank_vector_load_ns,
         .hbc_rerank_metadata_lookup_ns = profile.hbc_rerank_metadata_lookup_ns,
+        .hbc_rerank_metadata_vectors_loaded = profile.hbc_rerank_metadata_vectors_loaded,
         .hbc_rerank_artifact_key_ns = profile.hbc_rerank_artifact_key_ns,
         .hbc_rerank_artifact_read_ns = profile.hbc_rerank_artifact_read_ns,
         .hbc_rerank_artifact_decode_ns = profile.hbc_rerank_artifact_decode_ns,
         .hbc_rerank_artifact_distance_ns = profile.hbc_rerank_artifact_distance_ns,
         .hbc_rerank_lsm_cache_hits = profile.hbc_rerank_lsm_cache_hits,
         .hbc_rerank_lsm_cache_misses = profile.hbc_rerank_lsm_cache_misses,
+        .hbc_rerank_artifact_cache_hits = profile.hbc_rerank_artifact_cache_hits,
+        .hbc_rerank_artifact_vectors_loaded = profile.hbc_rerank_artifact_vectors_loaded,
         .hbc_rerank_distance_ns = profile.hbc_rerank_distance_ns,
         .doc_key_resolve_ns = profile.doc_key_resolve_ns,
         .doc_ordinal_lookup_ns = profile.doc_ordinal_lookup_ns,
@@ -8621,6 +8626,11 @@ test "profiled composed dense query preserves exact route telemetry" {
         .exact_raw_batch_reads = 2,
         .exact_raw_scalar_reads = 0,
         .exact_artifact_read_ns = 789,
+        .exact_artifact_cache_hits = 3,
+        .exact_artifact_vectors_loaded = 14,
+        .hbc_rerank_metadata_vectors_loaded = 9,
+        .hbc_rerank_artifact_cache_hits = 4,
+        .hbc_rerank_artifact_vectors_loaded = 9,
     });
     try std.testing.expectEqualStrings("exact_native_filter", public.search_route);
     try std.testing.expectEqual(@as(u64, 123), public.route_estimated_exact_storage_bytes);
@@ -8630,6 +8640,11 @@ test "profiled composed dense query preserves exact route telemetry" {
     try std.testing.expectEqual(@as(u64, 2), public.exact_raw_batch_reads);
     try std.testing.expectEqual(@as(u64, 0), public.exact_raw_scalar_reads);
     try std.testing.expectEqual(@as(u64, 789), public.exact_artifact_read_ns);
+    try std.testing.expectEqual(@as(u64, 3), public.exact_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 14), public.exact_artifact_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_metadata_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 4), public.hbc_rerank_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_artifact_vectors_loaded);
 }
 
 fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.Kind {

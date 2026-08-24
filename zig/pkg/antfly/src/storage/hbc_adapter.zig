@@ -3014,6 +3014,7 @@ pub const HBCIndex = struct {
         artifact_read_decode_ns_per_vector: u64 = 0,
         exact_distance_ns_per_vector: u64 = 0,
         rerank_cache_hit_permille: u64 = 0,
+        rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
         hbc_observations: u64 = 0,
         last_route: DenseRoute = .unknown,
@@ -3024,8 +3025,8 @@ pub const HBCIndex = struct {
         metadata_ns: u64,
         artifact_read_decode_ns: u64,
         distance_ns: u64,
-        cache_hits: u64,
-        cache_misses: u64,
+        artifact_cache_hits: u64,
+        artifact_vectors_loaded: u64,
     };
     pub const QuantizedRead = vectorindex_hbc_index.CachedQuantizedReadHandle(*HBCIndex);
 
@@ -9198,6 +9199,7 @@ pub const HBCIndex = struct {
                 if (profile) |p| {
                     const elapsed = platform_time.monotonicNs() - distance_start;
                     p.vector_cache_hits += 1;
+                    p.rerank_artifact_cache_hits += 1;
                     p.rerank_artifact_distance_ns += elapsed;
                     p.rerank_distance_ns += elapsed;
                 }
@@ -9210,6 +9212,7 @@ pub const HBCIndex = struct {
 
         const vector_ids = vector_id_storage[0..miss_count];
         const metadata = metadata_storage[0..miss_count];
+        if (profile) |p| p.rerank_metadata_vectors_loaded +|= @intCast(miss_count);
         const metadata_start = platform_time.monotonicNs();
         try self.getMetadataManySortedInTxnWithScratch(
             txn,
@@ -10280,6 +10283,11 @@ pub const HBCIndex = struct {
         return previous - previous / 8 + sample / 8;
     }
 
+    fn routeRateEwmaObserved(previous: u64, sample: u64, observations: u64) u64 {
+        if (observations == 0) return sample;
+        return previous - previous / 8 + sample / 8;
+    }
+
     fn perUnit(total: u64, count: u64) u64 {
         if (total == 0 or count == 0) return 0;
         return @max(total / count, 1);
@@ -10309,17 +10317,22 @@ pub const HBCIndex = struct {
             state.artifact_read_decode_ns_per_vector,
             perUnit(
                 observation.artifact_read_decode_ns,
-                if (observation.cache_misses > 0) observation.cache_misses else observation.candidates,
+                observation.artifact_vectors_loaded,
             ),
         );
         state.exact_distance_ns_per_vector = routeRateEwma(
             state.exact_distance_ns_per_vector,
             perUnit(observation.distance_ns, observation.candidates),
         );
-        const cache_total = observation.cache_hits +| observation.cache_misses;
+        const cache_total = observation.artifact_cache_hits +| observation.artifact_vectors_loaded;
         if (cache_total > 0) {
-            const hit_permille = @min(@as(u64, 1000), observation.cache_hits *| 1000 / cache_total);
-            state.rerank_cache_hit_permille = routeRateEwma(state.rerank_cache_hit_permille, hit_permille);
+            const hit_permille = @min(@as(u64, 1000), observation.artifact_cache_hits *| 1000 / cache_total);
+            state.rerank_cache_hit_permille = routeRateEwmaObserved(
+                state.rerank_cache_hit_permille,
+                hit_permille,
+                state.rerank_cache_observations,
+            );
+            state.rerank_cache_observations +|= 1;
         }
         state.exact_observations +|= 1;
         state.last_route = .exact;
@@ -10342,7 +10355,7 @@ pub const HBCIndex = struct {
             state.artifact_read_decode_ns_per_vector,
             perUnit(
                 profile.rerank_artifact_read_ns +| profile.rerank_artifact_decode_ns,
-                if (profile.rerank_lsm_cache_misses > 0) profile.rerank_lsm_cache_misses else profile.reranked_vectors,
+                profile.rerank_artifact_vectors_loaded,
             ),
         );
         state.exact_distance_ns_per_vector = routeRateEwma(
@@ -10359,10 +10372,15 @@ pub const HBCIndex = struct {
                 profile.reranked_vectors,
             ),
         );
-        const cache_total = profile.rerank_lsm_cache_hits +| profile.rerank_lsm_cache_misses;
+        const cache_total = profile.rerank_artifact_cache_hits +| profile.rerank_artifact_vectors_loaded;
         if (cache_total > 0) {
-            const hit_permille = @min(@as(u64, 1000), profile.rerank_lsm_cache_hits *| 1000 / cache_total);
-            state.rerank_cache_hit_permille = routeRateEwma(state.rerank_cache_hit_permille, hit_permille);
+            const hit_permille = @min(@as(u64, 1000), profile.rerank_artifact_cache_hits *| 1000 / cache_total);
+            state.rerank_cache_hit_permille = routeRateEwmaObserved(
+                state.rerank_cache_hit_permille,
+                hit_permille,
+                state.rerank_cache_observations,
+            );
+            state.rerank_cache_observations +|= 1;
         }
         state.hbc_observations +|= 1;
         state.last_route = .hbc;
@@ -10658,7 +10676,7 @@ pub const HBCIndex = struct {
 // ============================================================================
 
 pub const SearchResult = vectorindex_search_results.SearchResult;
-const ApproxSearchResult = vectorindex_search_results.ApproxSearchResult;
+pub const ApproxSearchResult = vectorindex_search_results.ApproxSearchResult;
 pub const SearchRequest = vectorindex_search_types.SearchRequest;
 pub const CancellationToken = vectorindex_search_types.CancellationToken;
 pub const SearchProfile = vectorindex_search_types.SearchProfile;
@@ -11538,9 +11556,24 @@ test "hbc route observation counts external distance timing once" {
         .reranked_vectors = 2,
         .rerank_artifact_distance_ns = 100,
         .rerank_distance_ns = 100,
+        .rerank_artifact_cache_hits = 2,
     };
     idx.observeSearchCacheBenefit(&profile);
     try std.testing.expectEqual(@as(u64, 50), idx.denseRouteCostSnapshot().exact_distance_ns_per_vector);
+    try std.testing.expectEqual(@as(u64, 1000), idx.denseRouteCostSnapshot().rerank_cache_hit_permille);
+
+    // A valid all-miss sample must pull the estimate down. Treating zero as
+    // "no sample" leaves the router permanently optimistic after warmup.
+    profile = .{
+        .reranked_vectors = 2,
+        .rerank_artifact_read_ns = 200,
+        .rerank_artifact_vectors_loaded = 2,
+        .rerank_artifact_distance_ns = 100,
+    };
+    idx.observeSearchCacheBenefit(&profile);
+    const snapshot = idx.denseRouteCostSnapshot();
+    try std.testing.expectEqual(@as(u64, 875), snapshot.rerank_cache_hit_permille);
+    try std.testing.expectEqual(@as(u64, 100), snapshot.artifact_read_decode_ns_per_vector);
 }
 
 test "hbc exact-route vector admission samples outside the search epoch" {
@@ -11765,6 +11798,8 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     try std.testing.expectEqual(@as(f32, 0), distances[0]);
     try std.testing.expectEqual(@as(f32, 7), distances[1]);
     try std.testing.expectEqual(@as(u64, 1), profile.vector_cache_hits);
+    try std.testing.expectEqual(@as(u64, 1), profile.rerank_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 1), profile.rerank_metadata_vectors_loaded);
 }
 
 test "hbc shared vector publication coalesces concurrent duplicate fills" {

@@ -422,6 +422,9 @@ const QueryBenchStats = struct {
     later_pass_ns: u64 = 0,
     later_pass_queries: u64 = 0,
     response_hit_count: u64 = 0,
+    dense_recall_queries: u64 = 0,
+    dense_source_hit_count: u64 = 0,
+    dense_source_top1_count: u64 = 0,
     response_filter_match_count: u64 = 0,
     response_sort_tuple_count: u64 = 0,
     response_sort_tuple_valid_count: u64 = 0,
@@ -461,6 +464,8 @@ const QueryBenchStats = struct {
     profile_exact_artifact_read_ns: u64 = 0,
     profile_exact_artifact_decode_ns: u64 = 0,
     profile_exact_distance_ns: u64 = 0,
+    profile_exact_artifact_cache_hits: u64 = 0,
+    profile_exact_artifact_vectors_loaded: u64 = 0,
     profile_hbc_reranked_vectors: u64 = 0,
     profile_hbc_approx_candidate_count: u64 = 0,
     profile_hbc_rerank_candidate_count: u64 = 0,
@@ -501,12 +506,15 @@ const QueryBenchStats = struct {
     profile_rerank_external_score_ns: u64 = 0,
     profile_rerank_vector_load_ns: u64 = 0,
     profile_rerank_metadata_lookup_ns: u64 = 0,
+    profile_rerank_metadata_vectors_loaded: u64 = 0,
     profile_rerank_artifact_key_ns: u64 = 0,
     profile_rerank_artifact_read_ns: u64 = 0,
     profile_rerank_artifact_decode_ns: u64 = 0,
     profile_rerank_artifact_distance_ns: u64 = 0,
     profile_rerank_lsm_cache_hits: u64 = 0,
     profile_rerank_lsm_cache_misses: u64 = 0,
+    profile_rerank_artifact_cache_hits: u64 = 0,
+    profile_rerank_artifact_vectors_loaded: u64 = 0,
     profile_rerank_distance_ns: u64 = 0,
     profile_inline_metadata_hits: u64 = 0,
     profile_fetched_metadata_hits: u64 = 0,
@@ -711,6 +719,8 @@ const QueryResponseWire = struct {
                 exact_artifact_read_ns: u64 = 0,
                 exact_artifact_decode_ns: u64 = 0,
                 exact_distance_ns: u64 = 0,
+                exact_artifact_cache_hits: u64 = 0,
+                exact_artifact_vectors_loaded: u64 = 0,
                 hbc_reranked_vectors: u64 = 0,
                 hbc_approx_candidate_count: u64 = 0,
                 hbc_rerank_candidate_count: u64 = 0,
@@ -738,12 +748,15 @@ const QueryResponseWire = struct {
                 hbc_rerank_external_score_ns: u64 = 0,
                 hbc_rerank_vector_load_ns: u64 = 0,
                 hbc_rerank_metadata_lookup_ns: u64 = 0,
+                hbc_rerank_metadata_vectors_loaded: u64 = 0,
                 hbc_rerank_artifact_key_ns: u64 = 0,
                 hbc_rerank_artifact_read_ns: u64 = 0,
                 hbc_rerank_artifact_decode_ns: u64 = 0,
                 hbc_rerank_artifact_distance_ns: u64 = 0,
                 hbc_rerank_lsm_cache_hits: u64 = 0,
                 hbc_rerank_lsm_cache_misses: u64 = 0,
+                hbc_rerank_artifact_cache_hits: u64 = 0,
+                hbc_rerank_artifact_vectors_loaded: u64 = 0,
                 hbc_rerank_distance_ns: u64 = 0,
                 returned_hit_count: u32 = 0,
                 inline_metadata_hits: u32 = 0,
@@ -1276,6 +1289,7 @@ fn runHandlerBench(
         handler_stats,
         profile_stats,
         handler_concurrent,
+        .{},
         .{ .visibility = .{}, .polls = .{} },
         0,
         0,
@@ -1498,6 +1512,7 @@ fn runLocalBench(
         http_stats,
         profile_stats,
         concurrent.http,
+        concurrent.polls,
         .{ .visibility = .{}, .polls = .{} },
         0,
         0,
@@ -2324,6 +2339,19 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     stats.queries += 1;
     if (first.hits.hits) |hits| {
         stats.response_hit_count += @intCast(hits.len);
+        if (cfg.query_shape.usesDense()) {
+            stats.dense_recall_queries += 1;
+            var expected_key_buf: [32]u8 = undefined;
+            const expected_key = try std.fmt.bufPrint(&expected_key_buf, "doc:{d:0>8}", .{querySourceDocIndex(query_idx, cfg)});
+            if (hits.len > 0 and std.mem.eql(u8, hits[0]._id, expected_key)) {
+                stats.dense_source_top1_count += 1;
+            }
+            for (hits) |hit| {
+                if (!std.mem.eql(u8, hit._id, expected_key)) continue;
+                stats.dense_source_hit_count += 1;
+                break;
+            }
+        }
         var previous_sort_tuple: ?[]const std.json.Value = null;
         for (hits) |hit| {
             if (try returnedHitMatchesGeneratedFilters(cfg, query_idx, hit._id)) {
@@ -2413,6 +2441,8 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_exact_artifact_read_ns += dense.exact_artifact_read_ns;
             stats.profile_exact_artifact_decode_ns += dense.exact_artifact_decode_ns;
             stats.profile_exact_distance_ns += dense.exact_distance_ns;
+            stats.profile_exact_artifact_cache_hits += dense.exact_artifact_cache_hits;
+            stats.profile_exact_artifact_vectors_loaded += dense.exact_artifact_vectors_loaded;
             stats.profile_hbc_reranked_vectors += dense.hbc_reranked_vectors;
             stats.profile_hbc_approx_candidate_count += dense.hbc_approx_candidate_count;
             stats.profile_hbc_rerank_candidate_count += dense.hbc_rerank_candidate_count;
@@ -2457,12 +2487,15 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_rerank_external_score_ns += dense.hbc_rerank_external_score_ns;
             stats.profile_rerank_vector_load_ns += dense.hbc_rerank_vector_load_ns;
             stats.profile_rerank_metadata_lookup_ns += dense.hbc_rerank_metadata_lookup_ns;
+            stats.profile_rerank_metadata_vectors_loaded += dense.hbc_rerank_metadata_vectors_loaded;
             stats.profile_rerank_artifact_key_ns += dense.hbc_rerank_artifact_key_ns;
             stats.profile_rerank_artifact_read_ns += dense.hbc_rerank_artifact_read_ns;
             stats.profile_rerank_artifact_decode_ns += dense.hbc_rerank_artifact_decode_ns;
             stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
             stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
             stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+            stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
+            stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
             stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
             stats.profile_inline_metadata_hits += dense.inline_metadata_hits;
             stats.profile_fetched_metadata_hits += dense.fetched_metadata_hits;
@@ -2712,6 +2745,8 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_exact_artifact_read_ns += dense.exact_artifact_read_ns;
     stats.profile_exact_artifact_decode_ns += dense.exact_artifact_decode_ns;
     stats.profile_exact_distance_ns += dense.exact_distance_ns;
+    stats.profile_exact_artifact_cache_hits += dense.exact_artifact_cache_hits;
+    stats.profile_exact_artifact_vectors_loaded += dense.exact_artifact_vectors_loaded;
     stats.profile_hbc_reranked_vectors += dense.hbc_reranked_vectors;
     stats.profile_hbc_approx_candidate_count += dense.hbc_approx_candidate_count;
     stats.profile_hbc_rerank_candidate_count += dense.hbc_rerank_candidate_count;
@@ -2755,12 +2790,15 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_rerank_external_score_ns += dense.hbc_rerank_external_score_ns;
     stats.profile_rerank_vector_load_ns += dense.hbc_rerank_vector_load_ns;
     stats.profile_rerank_metadata_lookup_ns += dense.hbc_rerank_metadata_lookup_ns;
+    stats.profile_rerank_metadata_vectors_loaded += dense.hbc_rerank_metadata_vectors_loaded;
     stats.profile_rerank_artifact_key_ns += dense.hbc_rerank_artifact_key_ns;
     stats.profile_rerank_artifact_read_ns += dense.hbc_rerank_artifact_read_ns;
     stats.profile_rerank_artifact_decode_ns += dense.hbc_rerank_artifact_decode_ns;
     stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
     stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
     stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+    stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
+    stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
     stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
     stats.profile_inline_metadata_hits += dense.inline_metadata_hits;
     stats.profile_fetched_metadata_hits += dense.fetched_metadata_hits;
@@ -3050,6 +3088,7 @@ fn runStandaloneBench(
         http_stats,
         http_stats,
         concurrent.http,
+        concurrent.polls,
         load,
         load.rss_peak_bytes,
         concurrent.rss_peak_bytes,
@@ -4325,6 +4364,7 @@ fn printPublicQueryGuardrailSummaryJson(
     http_stats: QueryBenchStats,
     profile_stats: QueryBenchStats,
     concurrent: ConcurrentStats,
+    search_polls: PollStats,
     load: LoadRun,
     load_rss_peak_bytes: usize,
     search_rss_peak_bytes: usize,
@@ -4386,6 +4426,24 @@ fn printPublicQueryGuardrailSummaryJson(
             avgPerQuery(profile_stats, profile_stats.profile_hbc_filter_metadata_batches),
             nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_filter_metadata_batch_ns / profile_stats.queries),
             avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
+        },
+    );
+    std.debug.print(
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        .{
+            nsToMs(load.polls.health_max_latency_ns),
+            nsToMs(load.polls.metrics_max_latency_ns),
+            nsToMs(load.polls.status_max_latency_ns),
+            nsToMs(search_polls.health_max_latency_ns),
+            nsToMs(search_polls.metrics_max_latency_ns),
+            nsToMs(search_polls.status_max_latency_ns),
+            rate(http_stats.dense_source_hit_count, http_stats.dense_recall_queries),
+            rate(http_stats.dense_source_top1_count, http_stats.dense_recall_queries),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_cache_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_cache_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_vectors_loaded),
         },
     );
     std.debug.print(
