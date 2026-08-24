@@ -158,9 +158,13 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
-    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    var restore_with_io = restore;
+    restore_with_io.io = io_scope.io();
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithIo(path, io_scope.io());
     defer transition.deinit();
-    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore_with_io, options);
 }
 
 pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
@@ -221,7 +225,7 @@ pub fn publishPreparedRestore(
 ) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared.validateLivePath(path);
     const outcome = try prepared.publish();
-    cleanupSnapshotsForPublishedRestore(alloc, path);
+    cleanupSnapshotsForPublishedRestore(alloc, prepared.io, path);
     return outcome;
 }
 
@@ -622,10 +626,10 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
-    destroyPathIfExists(snapshot_dir);
+    destroyPathIfExistsWithIo(io, snapshot_dir);
 }
 
 fn ensureDirPath(path: []const u8) !void {

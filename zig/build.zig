@@ -6992,6 +6992,28 @@ pub fn build(b: *std.Build) void {
     const provisioning_startup_vopr_test_step = b.step("provisioning-startup-vopr-test", "Run startup admission, provisioning, retry, and crash histories on VoprIo");
     provisioning_startup_vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
 
+    const generation_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"generation lifecycle VOPR exact replays"},
+    });
+    const run_generation_lifecycle_vopr_tests = b.addRunArtifact(generation_lifecycle_vopr_tests);
+    const generation_lifecycle_vopr_test_step = b.step(
+        "generation-lifecycle-vopr-test",
+        "Run generation publication, rollback, recovery, cleanup, and lock histories on VoprIo",
+    );
+    generation_lifecycle_vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
+
+    const backfill_marker_discovery_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"backfill marker discovery VOPR exact replays"},
+    });
+    const run_backfill_marker_discovery_vopr_tests = b.addRunArtifact(backfill_marker_discovery_vopr_tests);
+    const backfill_marker_discovery_vopr_test_step = b.step(
+        "backfill-marker-discovery-vopr-test",
+        "Run metadata marker discovery, ownership, corruption, recheck, and throttle histories on VoprIo",
+    );
+    backfill_marker_discovery_vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
+
     const external_lake_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"external lake VOPR exact replays"},
@@ -7179,6 +7201,8 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
+    vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
     vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
     vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);

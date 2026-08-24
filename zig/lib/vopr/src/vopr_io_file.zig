@@ -19,6 +19,7 @@ pub const Faults = struct {
     fail_next_read: bool = false,
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
+    fail_next_rename: bool = false,
     drop_next_sync: bool = false,
     torn_next_sync_limit: ?usize = null,
     partial_write_limit: ?usize = null,
@@ -54,6 +55,7 @@ const Node = struct {
     durable_mtime_ns: i96 = 0,
     durable_ctime_ns: i96 = 0,
     lock: std.Io.File.Lock = .none,
+    shared_lock_count: usize = 0,
 };
 
 const OpenHandle = struct {
@@ -62,7 +64,7 @@ const OpenHandle = struct {
     readable: bool,
     writable: bool,
     directory: bool,
-    owns_lock: bool = false,
+    owned_lock: std.Io.File.Lock = .none,
 };
 
 pub const FileSystem = struct {
@@ -229,8 +231,8 @@ pub const FileSystem = struct {
     pub fn closeFiles(self: *FileSystem, files: []const std.Io.File) bool {
         var valid = true;
         for (files) |file| {
-            if (self.handles.get(file.handle)) |handle| {
-                if (handle.owns_lock) handle.node.lock = .none;
+            if (self.handles.getPtr(file.handle)) |handle| {
+                _ = releaseHandleLock(handle);
                 _ = self.handles.remove(file.handle);
             } else valid = false;
         }
@@ -364,6 +366,10 @@ pub const FileSystem = struct {
     }
 
     pub fn rename(self: *FileSystem, old_dir: std.Io.Dir, old_sub_path: []const u8, new_dir: std.Io.Dir, new_sub_path: []const u8, preserve: bool) anyerror!void {
+        if (self.faults.fail_next_rename) {
+            self.faults.fail_next_rename = false;
+            return error.InputOutput;
+        }
         const old_path = self.resolvePath(old_dir, old_sub_path, false) catch |err| return mapRenamePathError(err);
         defer self.allocator.free(old_path);
         const new_path = self.resolvePath(new_dir, new_sub_path, false) catch |err| return mapRenamePathError(err);
@@ -549,28 +555,67 @@ pub const FileSystem = struct {
     pub fn tryLock(self: *FileSystem, file: std.Io.File, lock: std.Io.File.Lock) std.Io.File.LockError!bool {
         const handle = self.handles.getPtr(file.handle) orelse return error.FileLocksUnsupported;
         if (lock == .none) {
-            handle.node.lock = .none;
-            handle.owns_lock = false;
+            _ = releaseHandleLock(handle);
             return true;
         }
-        if (handle.node.lock != .none and !handle.owns_lock) return false;
-        handle.node.lock = lock;
-        handle.owns_lock = true;
-        return true;
+        if (handle.owned_lock == lock) return true;
+        if (handle.owned_lock == .exclusive and lock == .shared) {
+            handle.node.lock = .shared;
+            handle.node.shared_lock_count = 1;
+            handle.owned_lock = .shared;
+            return true;
+        }
+        if (handle.owned_lock == .shared and lock == .exclusive) {
+            if (handle.node.lock != .shared or handle.node.shared_lock_count != 1) return false;
+            handle.node.shared_lock_count = 0;
+            handle.node.lock = .exclusive;
+            handle.owned_lock = .exclusive;
+            return true;
+        }
+        std.debug.assert(handle.owned_lock == .none);
+        switch (lock) {
+            .none => unreachable,
+            .shared => {
+                if (handle.node.lock == .exclusive) return false;
+                handle.node.lock = .shared;
+                handle.node.shared_lock_count += 1;
+                handle.owned_lock = .shared;
+                return true;
+            },
+            .exclusive => {
+                if (handle.node.lock != .none) return false;
+                handle.node.lock = .exclusive;
+                handle.owned_lock = .exclusive;
+                return true;
+            },
+        }
     }
 
     pub fn unlock(self: *FileSystem, file: std.Io.File) bool {
         const handle = self.handles.getPtr(file.handle) orelse return false;
-        if (!handle.owns_lock) return false;
-        handle.owns_lock = false;
-        handle.node.lock = .none;
-        return true;
+        return releaseHandleLock(handle);
     }
 
     pub fn downgradeLock(self: *FileSystem, file: std.Io.File) std.Io.File.DowngradeLockError!void {
         const handle = self.handles.getPtr(file.handle) orelse return error.Unexpected;
-        if (!handle.owns_lock or handle.node.lock != .exclusive) return error.Unexpected;
+        if (handle.owned_lock != .exclusive or handle.node.lock != .exclusive) return error.Unexpected;
         handle.node.lock = .shared;
+        handle.node.shared_lock_count = 1;
+        handle.owned_lock = .shared;
+    }
+
+    fn releaseHandleLock(handle: *OpenHandle) bool {
+        switch (handle.owned_lock) {
+            .none => return false,
+            .exclusive => handle.node.lock = .none,
+            .shared => {
+                std.debug.assert(handle.node.shared_lock_count > 0);
+                handle.node.shared_lock_count -= 1;
+                if (handle.node.shared_lock_count == 0) handle.node.lock = .none;
+            },
+        }
+        handle.owned_lock = .none;
+        return true;
     }
 
     pub fn createMemoryMap(self: *FileSystem, file: std.Io.File, options: std.Io.File.MemoryMap.CreateOptions) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
@@ -691,6 +736,7 @@ pub const FileSystem = struct {
         for (self.nodes.items) |node| {
             node.exists = node.durable_exists;
             node.lock = .none;
+            node.shared_lock_count = 0;
             node.data.clearRetainingCapacity();
             if (!node.durable_exists) continue;
             try node.data.appendSlice(self.allocator, node.durable_data.items);

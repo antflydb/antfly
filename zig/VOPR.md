@@ -683,6 +683,16 @@ VOPR work has found concrete production and harness defects:
   descriptors. Canceling the Future could discard that in-progress ownership
   and leak the descriptors. Maintenance shutdown now publishes stop and awaits
   cooperative loop completion, so scoped cleanup runs before runtime teardown.
+- The modeled filesystem represented a file lock with one aggregate owner, so
+  a second legitimate shared reader was rejected and closing either reader
+  could incorrectly unlock the other. `VoprIo` now tracks each handle's lock
+  mode and a per-node shared-owner count, including upgrade, downgrade, close,
+  unlock, and crash semantics.
+- Metadata's backfill-marker cache used zero as both "never scanned" and a
+  valid monotonic scan timestamp. A deterministic world starting at logical
+  time zero therefore rescanned an empty cache immediately. Borrowed-I/O clock
+  sampling now preserves a nonzero sentinel while keeping throttle decisions
+  replayable.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -1187,8 +1197,8 @@ integrated rows above.
 
 | Priority | Area | What to exercise |
 | --- | --- | --- |
-| P0 next | Generation publication and cleanup | Move native path locking, canonicalization, reconciliation fallback, and lock closure in `storage/db/generation_lifecycle.zig` onto caller-owned `std.Io`. Exact-replay prepare/commit publication markers, rename versus directory-sync failure, read/exclusive lock downgrade, concurrent readers and publishers, abandoned temporary generations, canonical-path aliases, and retired-generation cleanup. |
-| P0 next | Metadata backfill-marker discovery | Move marker scanning and rechecks in `metadata/service.zig` onto the metadata runtime's borrowed I/O. Cover absent, legacy, and corrupt state; marker appearance or disappearance between scans; rescan throttling; ownership changes; concurrent repair completion; cancellation; and restart. |
+| P0 integrated | Generation publication and cleanup | `generation-lifecycle-vopr-test` drives the production transition manager with one borrowed `std.Io` through clean publication, prepared rollback, rename retry, uncertain directory sync and reconciliation, prepared crash recovery, shared-reader/exclusive-publisher locking, canonical aliases, and stale-generation cleanup. Restore and HA materialization now propagate the same I/O through transition locks and publication cleanup. |
+| P0 integrated | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test` drives the production scanner and cache on borrowed filesystem and monotonic-clock capabilities through absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, disappearance/rescan, and read-fault/restart histories. Metadata service and HTTP rounds use their backend runtime I/O for scans and rechecks. |
 | P0 next | Configuration, secrets, remote content, and extensions | Start from cold configuration through production administration paths. Exercise malformed and partial configuration, secret rotation during use, crash between secret and configuration publication, remote-content refresh and rollback, and extension/Wasm installation, replacement, activation, and failed startup. |
 | P1 next | Embedded, C API, and Lite lifecycle | Compose concurrent open/close, callback lifetime, cancellation, restore staging, generation activation, crash/reopen, and native-versus-`VoprIo` differential behavior across the in-process ownership boundary. |
 | P1 next | Cross-service resource pressure | Share descriptor, memory, storage, task, and admission budgets across HTTP, DB readers/writers, background jobs, Parquet cache, and provider calls. Verify bounded overload, cancellation, cleanup, progress after pressure clears, and exact replay. |
@@ -1262,9 +1272,9 @@ Wait for a real product or toolchain requirement before adding:
    serverless-workflow, DB/index, provider-boundary, and composed-query suites
    plus the Parquet-cache, provisioning/startup, external-lake, and
    media-runtime suites as production seams evolve.
-2. Implement the P0 generation-lifecycle and metadata backfill-marker suites,
-   removing their known private leaf executors while preserving native file
-   locking and single-writer ownership.
+2. Maintain the integrated generation-lifecycle and metadata backfill-marker
+   suites, including their borrowed-I/O lock, cleanup, rescan, and logical-time
+   contracts as production formats evolve.
 3. Add the cold-start configuration, secrets, remote-content, and extension
    lifecycle suite, followed by embedded/C API/Lite and cross-service pressure
    compositions.

@@ -405,6 +405,14 @@ pub const VoprIo = struct {
         self.files.faults.fail_next_write = true;
     }
 
+    pub fn failNextFileSync(self: *VoprIo) void {
+        self.files.faults.fail_next_sync = true;
+    }
+
+    pub fn failNextFileRename(self: *VoprIo) void {
+        self.files.faults.fail_next_rename = true;
+    }
+
     pub fn dropNextFileSync(self: *VoprIo) void {
         self.files.faults.drop_next_sync = true;
     }
@@ -1819,7 +1827,17 @@ test "VoprIo modeled file surface supports deterministic iteration atomic replac
 
     try std.testing.expect(try alpha.tryLock(io, .exclusive));
     alpha.downgradeLock(io) catch unreachable;
+    var second_reader = try std.Io.Dir.cwd().openFile(io, "moved/alpha", .{});
+    defer second_reader.close(io);
+    try std.testing.expect(try second_reader.tryLock(io, .shared));
+    var waiting_writer = try std.Io.Dir.cwd().openFile(io, "moved/alpha", .{ .mode = .read_write });
+    defer waiting_writer.close(io);
+    try std.testing.expect(!try waiting_writer.tryLock(io, .exclusive));
     alpha.unlock(io);
+    try std.testing.expect(!try waiting_writer.tryLock(io, .exclusive));
+    second_reader.unlock(io);
+    try std.testing.expect(try waiting_writer.tryLock(io, .exclusive));
+    waiting_writer.unlock(io);
 
     var map = try alpha.createMemoryMap(io, .{ .len = 5 });
     defer map.destroy(io);

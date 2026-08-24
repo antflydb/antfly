@@ -13,7 +13,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const background_runtime = @import("../background_runtime.zig");
 
 const Allocator = std.mem.Allocator;
-const publication_marker_name = ".antfly-generation-publication-v2";
+pub const publication_marker_name = ".antfly-generation-publication-v2";
 const publication_marker_tmp_name = ".antfly-generation-publication-v2.tmp";
 const max_publication_marker_bytes = 4096;
 const publication_lock_suffix = ".antfly-generation.lock";
@@ -52,11 +52,9 @@ fn preparationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ canonical_path, preparation_lock_suffix });
 }
 
-fn openPathLock(lock_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    if (std.fs.path.dirname(lock_path)) |parent| try fs_paths.createDirPathPortable(io_impl.io(), parent);
-    return std.Io.Dir.cwd().createFile(io_impl.io(), lock_path, .{
+fn openPathLock(io: std.Io, lock_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
+    if (std.fs.path.dirname(lock_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    return std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
         .lock = lock,
@@ -68,22 +66,28 @@ fn openPathLock(lock_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
     };
 }
 
-fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
+fn openPublicationLockWithIo(alloc: Allocator, io: std.Io, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
     const lock_path = try publicationLockPathAlloc(alloc, canonical_path);
     defer alloc.free(lock_path);
-    return try openPathLock(lock_path, lock);
+    return try openPathLock(io, lock_path, lock);
+}
+
+fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
+    return openPublicationLockWithIo(alloc, std.Options.debug_io, canonical_path, lock);
+}
+
+fn openPreparationLockWithIo(alloc: Allocator, io: std.Io, canonical_path: []const u8) !std.Io.File {
+    const lock_path = try preparationLockPathAlloc(alloc, canonical_path);
+    defer alloc.free(lock_path);
+    return try openPathLock(io, lock_path, .exclusive);
 }
 
 fn openPreparationLock(alloc: Allocator, canonical_path: []const u8) !std.Io.File {
-    const lock_path = try preparationLockPathAlloc(alloc, canonical_path);
-    defer alloc.free(lock_path);
-    return try openPathLock(lock_path, .exclusive);
+    return openPreparationLockWithIo(alloc, std.Options.debug_io, canonical_path);
 }
 
-fn closePublicationLock(file: std.Io.File) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    file.close(io_impl.io());
+fn closePublicationLock(io: std.Io, file: std.Io.File) void {
+    file.close(io);
 }
 
 const LeaseKind = enum { preparation, exclusive, reconciliation, read };
@@ -93,10 +97,7 @@ fn realPathAlloc(alloc: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
     return try std.Io.Dir.cwd().realPathFileAlloc(io, path, alloc);
 }
 
-fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+fn canonicalPathAllocWithIo(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     const absolute = if (std.fs.path.isAbsolute(path))
         try std.fs.path.resolve(alloc, &.{path})
     else blk: {
@@ -131,6 +132,10 @@ fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
         probe = parent;
     }
     return absolute;
+}
+
+fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    return canonicalPathAllocWithIo(alloc, std.Options.debug_io, path);
 }
 
 pub const PublicationOutcome = enum {
@@ -222,7 +227,11 @@ const Manager = struct {
     }
 
     pub fn beginExclusive(self: *Manager, path: []const u8) !ExclusiveTransition {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        return self.beginExclusiveWithIo(std.Options.debug_io, path);
+    }
+
+    pub fn beginExclusiveWithIo(self: *Manager, io: std.Io, path: []const u8) !ExclusiveTransition {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         errdefer self.allocator.free(path_key);
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
@@ -230,10 +239,10 @@ const Manager = struct {
         // Filesystem lock acquisition can block or fail. Keep it outside the
         // manager mutex so rollback never has to re-enter the mutex through an
         // ExclusiveTransition destructor.
-        const preparation_lock = try openPreparationLock(self.allocator, path_key);
-        errdefer closePublicationLock(preparation_lock);
-        const publication_lock = try openPublicationLock(self.allocator, path_key, .exclusive);
-        errdefer closePublicationLock(publication_lock);
+        const preparation_lock = try openPreparationLockWithIo(self.allocator, io, path_key);
+        errdefer closePublicationLock(io, preparation_lock);
+        const publication_lock = try openPublicationLockWithIo(self.allocator, io, path_key, .exclusive);
+        errdefer closePublicationLock(io, publication_lock);
 
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -256,6 +265,7 @@ const Manager = struct {
         const transition = ExclusiveTransition{
             .manager = self,
             .alloc = self.allocator,
+            .io = io,
             .path = owned_path,
             .id = id,
             .publication_lock = publication_lock,
@@ -265,15 +275,19 @@ const Manager = struct {
     }
 
     pub fn beginPreparation(self: *Manager, path: []const u8, cleanup_scheduler: ?CleanupScheduler) !PreparationTransition {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        return self.beginPreparationWithIo(std.Options.debug_io, path, cleanup_scheduler);
+    }
+
+    pub fn beginPreparationWithIo(self: *Manager, io: std.Io, path: []const u8, cleanup_scheduler: ?CleanupScheduler) !PreparationTransition {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         errdefer self.allocator.free(path_key);
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
 
-        const preparation_lock = try openPreparationLock(self.allocator, path_key);
-        errdefer closePublicationLock(preparation_lock);
-        const publication_lock = try openPublicationLock(self.allocator, path_key, .shared);
-        errdefer closePublicationLock(publication_lock);
+        const preparation_lock = try openPreparationLockWithIo(self.allocator, io, path_key);
+        errdefer closePublicationLock(io, preparation_lock);
+        const publication_lock = try openPublicationLockWithIo(self.allocator, io, path_key, .shared);
+        errdefer closePublicationLock(io, publication_lock);
 
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -294,6 +308,7 @@ const Manager = struct {
         return .{
             .manager = self,
             .alloc = self.allocator,
+            .io = io,
             .path = owned_path,
             .id = id,
             .cleanup_scheduler = cleanup_scheduler,
@@ -303,7 +318,11 @@ const Manager = struct {
     }
 
     fn beginReconciliation(self: *Manager, path: []const u8) !?ReconciliationLease {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        return self.beginReconciliationWithIo(std.Options.debug_io, path);
+    }
+
+    fn beginReconciliationWithIo(self: *Manager, io: std.Io, path: []const u8) !?ReconciliationLease {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         errdefer self.allocator.free(path_key);
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
@@ -334,11 +353,15 @@ const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .reconciliation });
-        return .{ .manager = self, .path = owned_path, .path_key = path_key, .id = id };
+        return .{ .manager = self, .io = io, .path = owned_path, .path_key = path_key, .id = id };
     }
 
     fn beginRead(self: *Manager, path: []const u8) !ReadLease {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        return self.beginReadWithIo(std.Options.debug_io, path);
+    }
+
+    fn beginReadWithIo(self: *Manager, io: std.Io, path: []const u8) !ReadLease {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         errdefer self.allocator.free(path_key);
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
@@ -358,7 +381,7 @@ const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = path_key, .id = id, .kind = .read });
-        return .{ .manager = self, .path = owned_path, .path_key = path_key, .id = id };
+        return .{ .manager = self, .io = io, .path = owned_path, .path_key = path_key, .id = id };
     }
 
     /// Commits a cached read only after its caller holds the shared
@@ -366,12 +389,16 @@ const Manager = struct {
     /// disappeared while that lock was being acquired, so the caller must
     /// release it and retry through reconciliation.
     fn beginReadIfReconciled(self: *Manager, path: []const u8) !?ReadLease {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
-        defer self.allocator.free(path_key);
-        return try self.beginReadIfReconciledCanonical(path, path_key);
+        return self.beginReadIfReconciledWithIo(std.Options.debug_io, path);
     }
 
-    fn beginReadIfReconciledCanonical(self: *Manager, path: []const u8, path_key: []const u8) !?ReadLease {
+    fn beginReadIfReconciledWithIo(self: *Manager, io: std.Io, path: []const u8) !?ReadLease {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
+        defer self.allocator.free(path_key);
+        return try self.beginReadIfReconciledCanonical(io, path, path_key);
+    }
+
+    fn beginReadIfReconciledCanonical(self: *Manager, io: std.Io, path: []const u8, path_key: []const u8) !?ReadLease {
         const active_path_key = try self.allocator.dupe(u8, path_key);
         errdefer self.allocator.free(active_path_key);
         const owned_path = try self.allocator.dupe(u8, path);
@@ -400,11 +427,15 @@ const Manager = struct {
             self.removeEmptyPathStateLocked(path_key);
         }
         try self.active.putNoClobber(self.allocator, id, .{ .path = owned_path, .path_key = active_path_key, .id = id, .kind = .read });
-        return .{ .manager = self, .path = owned_path, .path_key = active_path_key, .id = id };
+        return .{ .manager = self, .io = io, .path = owned_path, .path_key = active_path_key, .id = id };
     }
 
     fn hasReaders(self: *Manager, path: []const u8) !bool {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        return self.hasReadersWithIo(std.Options.debug_io, path);
+    }
+
+    fn hasReadersWithIo(self: *Manager, io: std.Io, path: []const u8) !bool {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         defer self.allocator.free(path_key);
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -561,6 +592,7 @@ const Manager = struct {
 
 const ReconciliationLease = struct {
     manager: *Manager,
+    io: std.Io,
     path: []const u8,
     path_key: []const u8,
     id: u64,
@@ -578,6 +610,7 @@ const ReconciliationLease = struct {
         self.active = false;
         return .{
             .manager = self.manager,
+            .io = self.io,
             .path = self.path,
             .path_key = self.path_key,
             .id = self.id,
@@ -594,6 +627,7 @@ const ReconciliationLease = struct {
 
 pub const ReadLease = struct {
     manager: *Manager,
+    io: std.Io,
     path: []const u8,
     path_key: []const u8,
     id: u64,
@@ -608,7 +642,7 @@ pub const ReadLease = struct {
         // lock so no local opener can trust stale reconciliation state across
         // an external publication window.
         self.manager.finishRead(self.path, self.id);
-        if (publication_lock) |file| closePublicationLock(file);
+        if (publication_lock) |file| closePublicationLock(self.io, file);
         self.active = false;
     }
 };
@@ -616,6 +650,7 @@ pub const ReadLease = struct {
 pub const PreparationTransition = struct {
     manager: *Manager,
     alloc: Allocator,
+    io: std.Io,
     path: []const u8,
     id: u64,
     cleanup_scheduler: ?CleanupScheduler = null,
@@ -626,17 +661,17 @@ pub const PreparationTransition = struct {
     pub fn beginStaging(self: *PreparationTransition) !StagedGeneration {
         if (!self.active) return error.InvalidGenerationTransition;
         try self.manager.validateStaging(self.id, self.path);
-        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, false);
+        return try beginStagingGeneration(self.alloc, self.io, self.manager, self.path, self.id, self.cleanup_scheduler, false);
     }
 
     pub fn promote(self: *PreparationTransition) !ExclusiveTransition {
         if (!self.active) return error.InvalidGenerationTransition;
-        const path_key = try canonicalPathAlloc(self.alloc, self.path);
+        const path_key = try canonicalPathAllocWithIo(self.alloc, self.io, self.path);
         defer self.alloc.free(path_key);
-        if (self.publication_lock) |file| closePublicationLock(file);
+        if (self.publication_lock) |file| closePublicationLock(self.io, file);
         self.publication_lock = null;
-        const publication_lock = openPublicationLock(self.alloc, path_key, .exclusive) catch |promotion_err| {
-            self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
+        const publication_lock = openPublicationLockWithIo(self.alloc, self.io, path_key, .exclusive) catch |promotion_err| {
+            self.publication_lock = openPublicationLockWithIo(self.alloc, self.io, path_key, .shared) catch |reacquire_err| {
                 std.log.err("generation preparation lock recovery failed phase=promote promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
@@ -646,8 +681,8 @@ pub const PreparationTransition = struct {
             return promotion_err;
         };
         self.manager.promotePreparation(self.path, self.id) catch |promotion_err| {
-            closePublicationLock(publication_lock);
-            self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
+            closePublicationLock(self.io, publication_lock);
+            self.publication_lock = openPublicationLockWithIo(self.alloc, self.io, path_key, .shared) catch |reacquire_err| {
                 std.log.err("generation preparation lock recovery failed phase=state_promotion promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
@@ -662,6 +697,7 @@ pub const PreparationTransition = struct {
         return .{
             .manager = self.manager,
             .alloc = self.alloc,
+            .io = self.io,
             .path = self.path,
             .id = self.id,
             .publication_lock = publication_lock,
@@ -672,9 +708,9 @@ pub const PreparationTransition = struct {
 
     pub fn deinit(self: *PreparationTransition) void {
         if (!self.active) return;
-        if (self.publication_lock) |file| closePublicationLock(file);
+        if (self.publication_lock) |file| closePublicationLock(self.io, file);
         self.publication_lock = null;
-        if (self.preparation_lock) |file| closePublicationLock(file);
+        if (self.preparation_lock) |file| closePublicationLock(self.io, file);
         self.preparation_lock = null;
         self.manager.finishPreparation(self.path, self.id);
         self.active = false;
@@ -684,6 +720,7 @@ pub const PreparationTransition = struct {
 pub const ExclusiveTransition = struct {
     manager: *Manager,
     alloc: Allocator,
+    io: std.Io,
     path: []const u8,
     id: u64,
     publication_lock: ?std.Io.File = null,
@@ -698,9 +735,9 @@ pub const ExclusiveTransition = struct {
 
     pub fn deinit(self: *ExclusiveTransition) void {
         if (!self.active) return;
-        if (self.publication_lock) |file| closePublicationLock(file);
+        if (self.publication_lock) |file| closePublicationLock(self.io, file);
         self.publication_lock = null;
-        if (self.preparation_lock) |file| closePublicationLock(file);
+        if (self.preparation_lock) |file| closePublicationLock(self.io, file);
         self.preparation_lock = null;
         self.manager.finishExclusive(self.path, self.id);
         self.active = false;
@@ -708,19 +745,18 @@ pub const ExclusiveTransition = struct {
 
     pub fn reconcilePublished(self: *ExclusiveTransition) !void {
         try self.validate(self.path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
+        _ = try reconcilePublishedGenerationExclusive(self.alloc, self.io, self.path, self.cleanup_scheduler);
     }
 
     pub fn beginStaging(self: *ExclusiveTransition) !StagedGeneration {
         try self.validate(self.path);
-        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, true);
+        return try beginStagingGeneration(self.alloc, self.io, self.manager, self.path, self.id, self.cleanup_scheduler, true);
     }
 };
 
 fn beginStagingGeneration(
     alloc: Allocator,
+    io: std.Io,
     manager: *Manager,
     path: []const u8,
     transition_id: u64,
@@ -737,15 +773,13 @@ fn beginStagingGeneration(
     const staging_path_z = try alloc.dupeZ(u8, staging_path);
     errdefer alloc.free(staging_path_z);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     if (reconcile) _ = try reconcilePublishedGenerationExclusive(alloc, io, path, cleanup_scheduler);
     if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
     try fs_paths.createDirPathPortable(io, staging_path);
     errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
     return .{
         .alloc = alloc,
+        .io = io,
         .manager = manager,
         .transition_id = transition_id,
         .live_path = live_path,
@@ -758,6 +792,7 @@ fn beginStagingGeneration(
 
 pub const StagedGeneration = struct {
     alloc: Allocator,
+    io: std.Io,
     manager: *Manager,
     transition_id: u64,
     live_path: []u8,
@@ -793,13 +828,10 @@ pub const StagedGeneration = struct {
     pub fn seal(self: *StagedGeneration) !void {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateStaging(self.transition_id, self.live_path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
-        try syncTreePortable(self.alloc, io, self.staging_path);
+        if (!pathExists(self.io, self.staging_path)) return error.GenerationStagingMissing;
+        try syncTreePortable(self.alloc, self.io, self.staging_path);
         const parent = std.fs.path.dirname(self.staging_path) orelse if (std.fs.path.isAbsolute(self.staging_path)) "/" else ".";
-        try fs_paths.syncDirPortable(io, parent);
+        try fs_paths.syncDirPortable(self.io, parent);
         self.sealed = true;
     }
 
@@ -812,19 +844,16 @@ pub const StagedGeneration = struct {
         if (self.closed or self.published) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
+        if (!pathExists(self.io, self.staging_path)) return error.GenerationStagingMissing;
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
-        const had_live_generation = pathExists(io, self.live_path);
-        try writePublicationMarker(self.alloc, io, self.staging_path, .{
+        const had_live_generation = pathExists(self.io, self.live_path);
+        try writePublicationMarker(self.alloc, self.io, self.staging_path, .{
             .phase = .prepared,
             .retained_name = std.fs.path.basename(self.staging_path),
             .had_live_generation = had_live_generation,
         });
         if (!self.sealed) try self.seal();
-        try fs_paths.syncDirPortable(io, parent);
+        try fs_paths.syncDirPortable(self.io, parent);
 
         if (had_live_generation) {
             if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
@@ -834,16 +863,16 @@ pub const StagedGeneration = struct {
             // that can fail so deinit never mistakes the retired root for staging.
             self.published = true;
             self.preserve_retired = true;
-            const outcome = syncPublishedParent(io, parent);
+            const outcome = syncPublishedParent(self.io, parent);
             self.had_live_generation = true;
             self.publication_outcome = outcome;
             return outcome;
         }
 
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), self.staging_path, std.Io.Dir.cwd(), self.live_path, io);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), self.staging_path, std.Io.Dir.cwd(), self.live_path, self.io);
 
         self.published = true;
-        const outcome = syncPublishedParent(io, parent);
+        const outcome = syncPublishedParent(self.io, parent);
         self.publication_outcome = outcome;
         return outcome;
     }
@@ -854,17 +883,14 @@ pub const StagedGeneration = struct {
         if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
-        try writePublicationMarker(self.alloc, io, self.live_path, .{
+        try writePublicationMarker(self.alloc, self.io, self.live_path, .{
             .phase = .committed,
             .retained_name = std.fs.path.basename(self.staging_path),
             .had_live_generation = self.had_live_generation,
         });
         if (self.publication_outcome.? == .durable) {
-            _ = clearPublicationMarker(self.alloc, io, self.live_path);
+            _ = clearPublicationMarker(self.alloc, self.io, self.live_path);
             if (self.had_live_generation) {
                 scheduleRetiredGenerationCleanup(self.cleanup_scheduler, self.staging_path, parent) catch |err| {
                     std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
@@ -883,22 +909,19 @@ pub const StagedGeneration = struct {
         if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
         try self.manager.validateExclusive(self.transition_id, self.live_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
         if (self.had_live_generation) {
             if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
                 return error.AtomicGenerationExchangeUnavailable;
             }
         } else {
-            try std.Io.Dir.rename(std.Io.Dir.cwd(), self.live_path, std.Io.Dir.cwd(), self.staging_path, io);
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), self.live_path, std.Io.Dir.cwd(), self.staging_path, self.io);
         }
         self.published = false;
         self.preserve_retired = false;
         self.had_live_generation = false;
         self.publication_outcome = null;
-        if (syncPublishedParent(io, parent) == .durability_uncertain) return error.GenerationRollbackDurabilityUncertain;
+        if (syncPublishedParent(self.io, parent) == .durability_uncertain) return error.GenerationRollbackDurabilityUncertain;
     }
 
     /// Convenience API for callers whose publication has no external
@@ -909,10 +932,21 @@ pub const StagedGeneration = struct {
         return outcome;
     }
 
+    /// Models loss of process memory after a crash without running rollback or
+    /// filesystem cleanup. The next opener must recover exclusively from the
+    /// durable marker and namespace. This is intentionally test-only.
+    pub fn abandonForCrashForTest(self: *StagedGeneration) void {
+        std.debug.assert(builtin.is_test);
+        if (self.closed) return;
+        self.alloc.free(self.staging_path);
+        self.alloc.free(self.staging_path_z);
+        self.alloc.free(self.live_path);
+        self.alloc.free(self.live_path_z);
+        self.closed = true;
+    }
+
     pub fn deinit(self: *StagedGeneration) void {
         if (self.closed) return;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
         if (self.published and !self.publication_committed) {
             self.rollbackPublication() catch |err| {
                 std.log.err("prepared generation rollback failed path={s} err={s}", .{ self.live_path, @errorName(err) });
@@ -920,9 +954,9 @@ pub const StagedGeneration = struct {
             };
         }
         if (self.published) {
-            if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
+            if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(self.io, self.staging_path) catch {};
         } else {
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
+            std.Io.Dir.cwd().deleteTree(self.io, self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);
         self.alloc.free(self.staging_path_z);
@@ -1282,44 +1316,44 @@ fn reconcilePublishedGenerationExclusive(
 }
 
 pub fn acquirePublishedGenerationRead(alloc: Allocator, path: []const u8) !?ReadLease {
-    return try acquirePublishedGenerationReadWithRuntime(alloc, path, null);
+    return acquirePublishedGenerationReadWithIo(alloc, path, std.Options.debug_io);
 }
 
 pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const u8, runtime: ?*background_runtime.BackendRuntime) !?ReadLease {
-    var reconciliation = reconcile: while (true) {
-        if (try process_manager.beginReconciliation(path)) |value| break :reconcile value;
+    const io = if (runtime) |active| active.io() orelse std.Options.debug_io else std.Options.debug_io;
+    return acquirePublishedGenerationReadInternal(alloc, path, io, runtime);
+}
 
-        const path_key = try canonicalPathAlloc(process_manager_allocator, path);
+pub fn acquirePublishedGenerationReadWithIo(alloc: Allocator, path: []const u8, io: std.Io) !?ReadLease {
+    return acquirePublishedGenerationReadInternal(alloc, path, io, null);
+}
+
+fn acquirePublishedGenerationReadInternal(
+    alloc: Allocator,
+    path: []const u8,
+    io: std.Io,
+    runtime: ?*background_runtime.BackendRuntime,
+) !?ReadLease {
+    var reconciliation = reconcile: while (true) {
+        if (try process_manager.beginReconciliationWithIo(io, path)) |value| break :reconcile value;
+
+        const path_key = try canonicalPathAllocWithIo(process_manager_allocator, io, path);
         defer process_manager_allocator.free(path_key);
-        const publication_lock = try openPublicationLock(process_manager_allocator, path_key, .shared);
+        const publication_lock = try openPublicationLockWithIo(process_manager_allocator, io, path_key, .shared);
         var lock_owned = true;
-        errdefer if (lock_owned) closePublicationLock(publication_lock);
-        if (try process_manager.beginReadIfReconciledCanonical(path, path_key)) |read_value| {
+        errdefer if (lock_owned) closePublicationLock(io, publication_lock);
+        if (try process_manager.beginReadIfReconciledCanonical(io, path, path_key)) |read_value| {
             var read_lease = read_value;
             read_lease.publication_lock = publication_lock;
             lock_owned = false;
             return read_lease;
         }
-        closePublicationLock(publication_lock);
+        closePublicationLock(io, publication_lock);
         lock_owned = false;
     };
     defer reconciliation.deinit();
-    var publication_lock = try openPublicationLock(process_manager_allocator, reconciliation.path_key, .exclusive);
-    errdefer closePublicationLock(publication_lock);
-    var fallback_io_impl: std.Io.Threaded = undefined;
-    var fallback_io_owned = false;
-    defer if (fallback_io_owned) fallback_io_impl.deinit();
-    const io = if (runtime) |active|
-        active.io() orelse fallback: {
-            fallback_io_impl = std.Io.Threaded.init(alloc, .{});
-            fallback_io_owned = true;
-            break :fallback fallback_io_impl.io();
-        }
-    else fallback: {
-        fallback_io_impl = std.Io.Threaded.init(alloc, .{});
-        fallback_io_owned = true;
-        break :fallback fallback_io_impl.io();
-    };
+    var publication_lock = try openPublicationLockWithIo(process_manager_allocator, io, reconciliation.path_key, .exclusive);
+    errdefer closePublicationLock(io, publication_lock);
     var deferred_cleanup = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (deferred_cleanup.items) |stale_path| alloc.free(stale_path);
@@ -1420,21 +1454,35 @@ const process_manager_allocator = if (builtin.link_libc) std.heap.c_allocator el
 var process_manager: Manager = Manager.init(process_manager_allocator);
 
 pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
-    return try process_manager.beginExclusive(path);
+    return process_manager.beginExclusiveWithIo(std.Options.debug_io, path);
+}
+
+pub fn beginProcessExclusiveWithIo(path: []const u8, io: std.Io) !ExclusiveTransition {
+    return process_manager.beginExclusiveWithIo(io, path);
 }
 
 pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !ExclusiveTransition {
-    var transition = try process_manager.beginExclusive(path);
+    const io = if (runtime) |active| active.io() orelse std.Options.debug_io else std.Options.debug_io;
+    var transition = try process_manager.beginExclusiveWithIo(io, path);
     transition.cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
     return transition;
 }
 
 pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !PreparationTransition {
-    return try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
+    const io = if (runtime) |active| active.io() orelse std.Options.debug_io else std.Options.debug_io;
+    return process_manager.beginPreparationWithIo(io, path, CleanupScheduler.fromRuntime(runtime));
+}
+
+pub fn beginProcessPreparationWithIo(path: []const u8, io: std.Io) !PreparationTransition {
+    return process_manager.beginPreparationWithIo(io, path, null);
 }
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {
-    return try process_manager.hasReaders(path);
+    return process_manager.hasReadersWithIo(std.Options.debug_io, path);
+}
+
+pub fn hasPublishedGenerationReadWithIo(path: []const u8, io: std.Io) !bool {
+    return process_manager.hasReadersWithIo(io, path);
 }
 
 test "generation lifecycle serializes the same root and validates capability target" {
@@ -1603,8 +1651,8 @@ test "cached read admission revalidates after filesystem lock acquisition" {
     const path_key = try canonicalPathAlloc(alloc, path);
     defer alloc.free(path_key);
     const publication_lock = try openPublicationLock(alloc, path_key, .shared);
-    defer closePublicationLock(publication_lock);
-    try std.testing.expect((try manager.beginReadIfReconciledCanonical(path, path_key)) == null);
+    defer closePublicationLock(std.Options.debug_io, publication_lock);
+    try std.testing.expect((try manager.beginReadIfReconciledCanonical(std.Options.debug_io, path, path_key)) == null);
 }
 
 test "process cached read admission retains shared publication locks" {

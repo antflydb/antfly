@@ -522,6 +522,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     } else {
         if (try directoryExists(io, live_installing_root)) std.Io.Dir.cwd().deleteTree(io, live_installing_root) catch |err| return err;
         const materialized = try seed_materialization.materialize(alloc, .{
+            .io = io,
             .raw_generation_root = raw_root,
             .live_installing_root = live_installing_root,
             .generation = request.expected.generation,
