@@ -454,6 +454,13 @@ pub fn runAutoPostingMaintenanceTxn(self: anytype, txn: anytype) !void {
     _ = try repairDirtyPostingsTxnWithOptions(self, txn, .{ .max_postings = max_postings });
 }
 
+fn replaceOwnedU64Slice(alloc: std.mem.Allocator, target: *[]u64, replacement: *?[]u64) void {
+    const owned = replacement.* orelse unreachable;
+    if (target.*.len > 0) alloc.free(target.*);
+    target.* = owned;
+    replacement.* = null;
+}
+
 fn mergeUnderfullPostingWithNearestSibling(
     self: anytype,
     txn: anytype,
@@ -487,12 +494,11 @@ fn mergeUnderfullPostingWithNearestSibling(
     try sibling.ensureUnbacked(self.alloc);
 
     const merged_len = sibling.members.len + leaf.members.len;
-    var merged = try self.alloc.alloc(u64, merged_len);
-    errdefer self.alloc.free(merged);
-    @memcpy(merged[0..sibling.members.len], sibling.members);
-    @memcpy(merged[sibling.members.len..], leaf.members);
-    self.alloc.free(sibling.members);
-    sibling.members = merged;
+    var merged: ?[]u64 = try self.alloc.alloc(u64, merged_len);
+    errdefer if (merged) |owned| self.alloc.free(owned);
+    @memcpy(merged.?[0..sibling.members.len], sibling.members);
+    @memcpy(merged.?[sibling.members.len..], leaf.members);
+    replaceOwnedU64Slice(self.alloc, &sibling.members, &merged);
     posting.PostingStore.noteMembersChanged(&sibling);
     try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
     if (self.config.use_quantization) {
@@ -505,16 +511,15 @@ fn mergeUnderfullPostingWithNearestSibling(
 
     for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-    var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-    errdefer self.alloc.free(new_children);
+    var new_children: ?[]u64 = try self.alloc.alloc(u64, parent.children.len - 1);
+    errdefer if (new_children) |owned| self.alloc.free(owned);
     var wi_child: usize = 0;
     for (parent.children) |cid| {
         if (cid == leaf.id) continue;
-        new_children[wi_child] = cid;
+        new_children.?[wi_child] = cid;
         wi_child += 1;
     }
-    self.alloc.free(parent.children);
-    parent.children = new_children;
+    replaceOwnedU64Slice(self.alloc, &parent.children, &new_children);
     try self.recomputeInternalCentroid(txn, &parent);
     try self.saveNodeWithOptionsMode(txn, &parent, save_options, false);
     try self.deleteNode(txn, leaf.id);
@@ -787,6 +792,30 @@ pub fn repairDirtyPostingsTxnWithOptions(
     self.write_profile.posting_maintenance_boundary_reassigned_vectors += result.boundary_reassigned_vectors;
 
     return result;
+}
+
+test "owned slice replacement survives later error cleanup" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var node = types.Node{
+                .id = 1,
+                .is_leaf = true,
+                .level = 0,
+                .parent = 0,
+                .centroid = &.{},
+                .children = &.{},
+                .members = try alloc.dupe(u64, &.{ 1, 2 }),
+            };
+            defer node.deinit(alloc);
+
+            var replacement: ?[]u64 = try alloc.dupe(u64, &.{ 3, 4, 5 });
+            errdefer if (replacement) |owned| alloc.free(owned);
+            replaceOwnedU64Slice(alloc, &node.members, &replacement);
+            return error.InjectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFailure, Runner.run(std.testing.allocator));
 }
 
 test "posting backlog stats starts clean" {
