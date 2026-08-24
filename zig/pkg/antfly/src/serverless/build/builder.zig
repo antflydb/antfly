@@ -1563,21 +1563,108 @@ fn externalSourcePlanMatchesManifest(
         else => false,
     };
     if (!sources_match or plan.artifacts.len == 0) return false;
+
+    // External plans own the external metadata refs, while a published
+    // manifest may also carry unrelated document and search artifacts. Match
+    // the owned refs as an exact multiset so
+    // a logical rename, removal, duplicate, or replacement cannot be mistaken
+    // for an unchanged plan, while a harmless order change does not force a
+    // new publication.
+    for (plan.artifacts) |artifact| {
+        if (artifact.kind != .external_base_source) return false;
+    }
+    var current_external_count: usize = 0;
+    for (manifest.artifacts) |current_artifact| {
+        if (current_artifact.kind == .external_base_source) current_external_count += 1;
+    }
+    if (current_external_count != plan.artifacts.len) return false;
     for (plan.artifacts) |planned_artifact| {
-        var found = false;
-        for (manifest.artifacts) |current_artifact| {
-            if (planned_artifact.kind == current_artifact.kind and
-                std.mem.eql(u8, planned_artifact.artifact_id, current_artifact.artifact_id) and
-                planned_artifact.byte_len == current_artifact.byte_len and
-                std.mem.eql(u8, planned_artifact.checksum, current_artifact.checksum))
-            {
-                found = true;
-                break;
-            }
+        var planned_occurrences: usize = 0;
+        for (plan.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) planned_occurrences += 1;
         }
-        if (!found) return false;
+        var current_occurrences: usize = 0;
+        for (manifest.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) current_occurrences += 1;
+        }
+        if (planned_occurrences != current_occurrences) return false;
     }
     return true;
+}
+
+fn artifactRefEql(left: manifest_mod.ArtifactRef, right: manifest_mod.ArtifactRef) bool {
+    return left.kind == right.kind and
+        std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.artifact_id, right.artifact_id) and
+        left.byte_len == right.byte_len and
+        std.mem.eql(u8, left.checksum, right.checksum);
+}
+
+test "serverless external source plan matching is exact over owned artifacts" {
+    const base_source = manifest_mod.BaseSourceDescriptor{ .external_parquet = .{
+        .format = .parquet_prefix,
+        .source_uri = "s3://bucket/events",
+        .snapshot_id = "snapshot-1",
+        .schema_fingerprint = "schema-v1",
+        .file_inventory_artifact = "inventory-1",
+        .row_group_metadata_artifact = "row-groups-1",
+    } };
+    var planned_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .external_base_source,
+            .name = "events.external-files",
+            .artifact_id = "inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+        },
+        .{
+            .kind = .external_base_source,
+            .name = "events.row-groups",
+            .artifact_id = "row-groups-1",
+            .byte_len = 32,
+            .checksum = "sha256:row-groups-1",
+        },
+    };
+    var current_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .document_segment,
+            .artifact_id = "documents-1",
+            .byte_len = 64,
+            .checksum = "sha256:documents-1",
+        },
+        planned_artifacts[1],
+        planned_artifacts[0],
+        .{
+            .kind = .external_base_source,
+            .name = "events.deletes",
+            .artifact_id = "deletes-1",
+            .byte_len = 16,
+            .checksum = "sha256:deletes-1",
+        },
+    };
+    const plan = external_source_manifest.Plan{
+        .base_source = base_source,
+        .artifacts = planned_artifacts[0..],
+    };
+    var manifest = manifest_mod.Manifest{
+        .namespace = "events",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = current_artifacts[0..3],
+        .base_source = base_source,
+    };
+
+    try std.testing.expect(externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.renamed-files";
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.external-files";
+    manifest.artifacts = current_artifacts[0..2];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    manifest.artifacts = current_artifacts[0..];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
 }
 
 fn externalSourceDescriptorMatches(
@@ -5962,6 +6049,53 @@ test "serverless builder publishes initial external manifest without wal records
     try std.testing.expect(!unchanged.published);
     try std.testing.expectEqual(@as(u64, 1), unchanged.version);
 
+    // A content-addressed inventory can retain the same bytes while its
+    // logical manifest name changes. Consume a stale enrichment record in the
+    // same publication and prove the renamed external plan is not mistaken
+    // for the current plan merely because its content identity is unchanged.
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try wal_store.appendIdempotentIfLatest(
+            "events",
+            99,
+            "ignored-stale-enrichment",
+            "enrich-v1/2/1/0/1",
+            0,
+        ),
+    );
+    var renamed_plan = try external_source_manifest.planAlloc(
+        alloc,
+        .parquet_prefix,
+        "s3://bucket/events",
+        "snapshot-1",
+        "schema-v1",
+        .{
+            .artifact_id = "external-inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+            .name = "events.external-files",
+        },
+    );
+    defer renamed_plan.deinit(alloc);
+    var renamed = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = renamed_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer renamed.deinit(alloc);
+    try std.testing.expect(renamed.published);
+    try std.testing.expectEqual(@as(u64, 2), renamed.version);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_start_lsn);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_end_lsn);
+    var renamed_manifest = try manifest_store.getAlloc("events", 2);
+    defer renamed_manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), renamed_manifest.artifacts.len);
+    try std.testing.expectEqualStrings("events.external-files", renamed_manifest.artifacts[0].name);
+
     var updated_plan = try external_source_manifest.planAlloc(
         alloc,
         .parquet_prefix,
@@ -5972,6 +6106,7 @@ test "serverless builder publishes initial external manifest without wal records
             .artifact_id = "external-inventory-2",
             .byte_len = 144,
             .checksum = "sha256:inventory-2",
+            .name = "events.external-files",
         },
     );
     defer updated_plan.deinit(alloc);
@@ -5986,9 +6121,9 @@ test "serverless builder publishes initial external manifest without wal records
     });
     defer updated.deinit(alloc);
     try std.testing.expect(updated.published);
-    try std.testing.expectEqual(@as(u64, 2), updated.version);
+    try std.testing.expectEqual(@as(u64, 3), updated.version);
 
-    var updated_manifest = try manifest_store.getAlloc("events", 2);
+    var updated_manifest = try manifest_store.getAlloc("events", 3);
     defer updated_manifest.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), updated_manifest.artifacts.len);
     try std.testing.expectEqualStrings("external-inventory-2", updated_manifest.artifacts[0].artifact_id);
@@ -6010,7 +6145,7 @@ test "serverless builder publishes initial external manifest without wal records
             .indexes_json = @constCast("{}"),
         },
     }));
-    try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("events"));
+    try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
