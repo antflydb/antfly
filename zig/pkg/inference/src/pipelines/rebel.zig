@@ -30,6 +30,44 @@ const gliner_mod = @import("gliner.zig");
 pub const Entity = ner_mod.Entity;
 pub const Relation = gliner_mod.Relation;
 
+/// Release REBEL entity results. Entity text and batch containers are owned by
+/// the caller, while the generic entity label is borrowed static storage.
+pub fn deinitEntityBatches(allocator: std.mem.Allocator, all_entities: []const []Entity) void {
+    for (all_entities) |entities| {
+        for (entities) |entity| allocator.free(entity.text);
+        allocator.free(entities);
+    }
+    allocator.free(all_entities);
+}
+
+/// REBEL emits a single generic entity type. It can constrain generated
+/// relation names, but typed entity or endpoint schemas require a model that
+/// performs entity typing.
+pub fn validateSchemaSupport(
+    entity_labels: ?[]const []const u8,
+    relation_labels: ?[]const []const u8,
+) !void {
+    if (entity_labels) |labels| {
+        for (labels) |label| {
+            if (!std.ascii.eqlIgnoreCase(label, "ENTITY"))
+                return error.UnsupportedRebelEntityLabels;
+        }
+    }
+
+    if (relation_labels) |labels| {
+        for (labels) |constraint| {
+            const first_separator = std.mem.indexOf(u8, constraint, "::") orelse continue;
+            if (!std.ascii.eqlIgnoreCase(constraint[0..first_separator], "ENTITY"))
+                return error.UnsupportedRebelRelationEndpoints;
+
+            const remainder = constraint[first_separator + 2 ..];
+            const second_separator = std.mem.indexOf(u8, remainder, "::") orelse continue;
+            if (!std.ascii.eqlIgnoreCase(remainder[second_separator + 2 ..], "ENTITY"))
+                return error.UnsupportedRebelRelationEndpoints;
+        }
+    }
+}
+
 pub const RebelConfig = struct {
     allocator: std.mem.Allocator,
     max_length: usize,
@@ -77,13 +115,7 @@ pub const RebelPipeline = struct {
 
     pub fn recognizeBatch(self: *RebelPipeline, texts: []const []const u8) ![][]Entity {
         const extracted = try self.extractRelationsBatch(texts, null, null);
-        errdefer {
-            for (extracted.entities) |entities| {
-                for (entities) |entity| self.allocator.free(entity.text);
-                self.allocator.free(entities);
-            }
-            self.allocator.free(extracted.entities);
-        }
+        errdefer deinitEntityBatches(self.allocator, extracted.entities);
 
         for (extracted.relations) |relations| {
             for (relations) |*relation| relation.deinit(self.allocator);
@@ -97,9 +129,11 @@ pub const RebelPipeline = struct {
     pub fn extractRelationsBatch(
         self: *RebelPipeline,
         texts: []const []const u8,
-        _: ?[]const []const u8,
-        _: ?[]const []const u8,
+        entity_labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
     ) !struct { entities: [][]Entity, relations: [][]Relation } {
+        try validateSchemaSupport(entity_labels, relation_labels);
+
         const alloc = self.allocator;
         const all_entities = try alloc.alloc([]Entity, texts.len);
         var initialized_entities: usize = 0;
@@ -131,7 +165,7 @@ pub const RebelPipeline = struct {
                 alloc.free(triplets);
             }
 
-            const extracted = try tripletsToRecognizeOutput(alloc, text, triplets);
+            const extracted = try tripletsToRecognizeOutput(alloc, text, triplets, relation_labels);
             all_entities[i] = extracted.entities;
             initialized_entities += 1;
             all_relations[i] = extracted.relations;
@@ -178,6 +212,30 @@ pub const RebelPipeline = struct {
         self.config.deinit();
     }
 };
+
+/// REBEL generates an unconstrained relation vocabulary, so request schemas
+/// are enforced as a post-generation filter. Endpoint-qualified labels can be
+/// honored only when they name REBEL's explicit generic entity type.
+fn tripletMatchesRequestedRelation(triplet: Triplet, requested: []const []const u8) bool {
+    for (requested) |constraint| {
+        const first_separator = std.mem.indexOf(u8, constraint, "::") orelse {
+            if (std.ascii.eqlIgnoreCase(constraint, triplet.relation)) return true;
+            continue;
+        };
+        const source_label = constraint[0..first_separator];
+        const remainder = constraint[first_separator + 2 ..];
+        const second_separator = std.mem.indexOf(u8, remainder, "::");
+        const relation_label = if (second_separator) |index| remainder[0..index] else remainder;
+        if (!std.ascii.eqlIgnoreCase(source_label, "ENTITY") or
+            !std.ascii.eqlIgnoreCase(relation_label, triplet.relation)) continue;
+        if (second_separator) |index| {
+            const target_label = remainder[index + 2 ..];
+            if (!std.ascii.eqlIgnoreCase(target_label, "ENTITY")) continue;
+        }
+        return true;
+    }
+    return false;
+}
 
 pub fn loadConfig(allocator: std.mem.Allocator, model_dir: []const u8) !RebelConfig {
     var config = try RebelConfig.initDefault(allocator);
@@ -360,6 +418,7 @@ fn tripletsToRecognizeOutput(
     allocator: std.mem.Allocator,
     text: []const u8,
     triplets: []const Triplet,
+    requested_relations: ?[]const []const u8,
 ) !struct { entities: []Entity, relations: []Relation } {
     var entities = std.ArrayListUnmanaged(Entity).empty;
     errdefer {
@@ -374,20 +433,34 @@ fn tripletsToRecognizeOutput(
     }
 
     for (triplets) |triplet| {
+        if (requested_relations) |requested| {
+            if (requested.len > 0 and !tripletMatchesRequestedRelation(triplet, requested)) continue;
+        }
         const subject_idx = try getOrCreateEntity(allocator, text, triplet.subject, triplet.score, &entities);
         const object_idx = try getOrCreateEntity(allocator, text, triplet.object, triplet.score, &entities);
 
-        try relations.append(allocator, .{
-            .head = try cloneEntity(allocator, entities.items[subject_idx]),
-            .tail = try cloneEntity(allocator, entities.items[object_idx]),
-            .label = try allocator.dupe(u8, triplet.relation),
-            .score = triplet.score,
-        });
+        var relation = try cloneRelation(
+            allocator,
+            entities.items[subject_idx],
+            entities.items[object_idx],
+            triplet.relation,
+            triplet.score,
+        );
+        relations.append(allocator, relation) catch |err| {
+            relation.deinit(allocator);
+            return err;
+        };
     }
 
+    const owned_entities = try entities.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_entities) |entity| allocator.free(entity.text);
+        allocator.free(owned_entities);
+    }
+    const owned_relations = try relations.toOwnedSlice(allocator);
     return .{
-        .entities = try entities.toOwnedSlice(allocator),
-        .relations = try relations.toOwnedSlice(allocator),
+        .entities = owned_entities,
+        .relations = owned_relations,
     };
 }
 
@@ -403,14 +476,38 @@ fn getOrCreateEntity(
     }
 
     const span = findSpan(full_text, entity_text);
-    try entities.append(allocator, .{
-        .text = try allocator.dupe(u8, entity_text),
+    const owned_text = try allocator.dupe(u8, entity_text);
+    entities.append(allocator, .{
+        .text = owned_text,
         .label = "ENTITY",
         .start = span.start,
         .end = span.end,
         .score = score,
-    });
+    }) catch |err| {
+        allocator.free(owned_text);
+        return err;
+    };
     return entities.items.len - 1;
+}
+
+fn cloneRelation(
+    allocator: std.mem.Allocator,
+    head_entity: Entity,
+    tail_entity: Entity,
+    label: []const u8,
+    score: f32,
+) !Relation {
+    const head = try cloneEntity(allocator, head_entity);
+    errdefer allocator.free(head.text);
+    const tail = try cloneEntity(allocator, tail_entity);
+    errdefer allocator.free(tail.text);
+    const owned_label = try allocator.dupe(u8, label);
+    return .{
+        .head = head,
+        .tail = tail,
+        .label = owned_label,
+        .score = score,
+    };
 }
 
 fn cloneEntity(allocator: std.mem.Allocator, entity: Entity) !Entity {
@@ -496,6 +593,66 @@ test "parseTriplets handles plain-text fallback output" {
     try std.testing.expectEqualStrings("Google", triplets[1].subject);
 }
 
+test "REBEL relation schemas filter generated triplets and enforce endpoint constraints" {
+    const triplets = [_]Triplet{
+        .{ .subject = "Grace Hopper", .object = "Navy", .relation = "served in", .score = 0.9 },
+        .{ .subject = "Grace Hopper", .object = "COBOL", .relation = "helped create", .score = 0.8 },
+    };
+
+    try std.testing.expect(tripletMatchesRequestedRelation(triplets[0], &.{"served in"}));
+    try std.testing.expect(!tripletMatchesRequestedRelation(triplets[1], &.{"served in"}));
+    try std.testing.expect(tripletMatchesRequestedRelation(
+        triplets[0],
+        &.{"ENTITY::served in::ENTITY"},
+    ));
+    try std.testing.expect(!tripletMatchesRequestedRelation(
+        triplets[0],
+        &.{"person::served in::organization"},
+    ));
+    try validateSchemaSupport(&.{"ENTITY"}, &.{ "served in", "ENTITY::served in::ENTITY" });
+    try std.testing.expectError(
+        error.UnsupportedRebelEntityLabels,
+        validateSchemaSupport(&.{"person"}, &.{"served in"}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRebelRelationEndpoints,
+        validateSchemaSupport(null, &.{"person::served in::organization"}),
+    );
+
+    const extracted = try tripletsToRecognizeOutput(
+        std.testing.allocator,
+        "Grace Hopper served in the Navy and helped create COBOL.",
+        &triplets,
+        &.{"served in"},
+    );
+    defer {
+        for (extracted.entities) |entity| std.testing.allocator.free(entity.text);
+        std.testing.allocator.free(extracted.entities);
+        for (extracted.relations) |*relation| relation.deinit(std.testing.allocator);
+        std.testing.allocator.free(extracted.relations);
+    }
+    try std.testing.expectEqual(@as(usize, 2), extracted.entities.len);
+    try std.testing.expectEqual(@as(usize, 1), extracted.relations.len);
+    try std.testing.expectEqualStrings("served in", extracted.relations[0].label);
+}
+
+test "REBEL entity cleanup preserves borrowed generic labels" {
+    const allocator = std.testing.allocator;
+    const borrowed_label = "ENTITY";
+    const batches = try allocator.alloc([]Entity, 1);
+    batches[0] = try allocator.alloc(Entity, 1);
+    batches[0][0] = .{
+        .text = try allocator.dupe(u8, "Grace Hopper"),
+        .label = borrowed_label,
+        .start = 0,
+        .end = 12,
+        .score = 0.9,
+    };
+
+    deinitEntityBatches(allocator, batches);
+    try std.testing.expectEqualStrings("ENTITY", borrowed_label);
+}
+
 test "tripletsToRecognizeOutput deduplicates entities and preserves spans" {
     const allocator = std.testing.allocator;
     const triplets = [_]Triplet{
@@ -520,6 +677,7 @@ test "tripletsToRecognizeOutput deduplicates entities and preserves spans" {
         allocator,
         "John Smith works at Google in Mountain View.",
         &triplets,
+        null,
     );
     defer {
         for (extracted.entities) |entity| allocator.free(entity.text);
@@ -532,4 +690,41 @@ test "tripletsToRecognizeOutput deduplicates entities and preserves spans" {
     try std.testing.expectEqual(@as(usize, 2), extracted.relations.len);
     try std.testing.expectEqualStrings("ENTITY", extracted.entities[0].label);
     try std.testing.expect(extracted.entities[0].end > extracted.entities[0].start);
+}
+
+test "tripletsToRecognizeOutput releases every partial allocation" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const triplets = [_]Triplet{
+                .{
+                    .subject = "Grace Hopper",
+                    .object = "Navy",
+                    .relation = "served in",
+                    .score = 0.9,
+                },
+                .{
+                    .subject = "Grace Hopper",
+                    .object = "COBOL",
+                    .relation = "created",
+                    .score = 0.8,
+                },
+            };
+            const extracted = try tripletsToRecognizeOutput(
+                allocator,
+                "Grace Hopper served in the Navy and helped create COBOL.",
+                &triplets,
+                null,
+            );
+            defer {
+                for (extracted.entities) |entity| allocator.free(entity.text);
+                allocator.free(extracted.entities);
+                for (extracted.relations) |*relation| relation.deinit(allocator);
+                allocator.free(extracted.relations);
+            }
+            try std.testing.expectEqual(@as(usize, 3), extracted.entities.len);
+            try std.testing.expectEqual(@as(usize, 2), extracted.relations.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
