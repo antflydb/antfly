@@ -364,6 +364,11 @@ const TextExtractionState = struct {
     current_font_index: ?usize = null,
 };
 
+pub const TextOutputSpan = struct {
+    start: usize,
+    end: usize,
+};
+
 pub const TextRun = struct {
     text: []const u8,
     raw_text: ?[]const u8 = null,
@@ -389,6 +394,8 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    output_span: ?TextOutputSpan = null,
+
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -405,6 +412,26 @@ pub const TextRun = struct {
         if (self.fill_pattern_name) |name| alloc.free(name);
         if (self.stroke_pattern_name) |name| alloc.free(name);
         if (self.raw_text) |raw| alloc.free(raw);
+        alloc.free(self.text);
+        self.* = undefined;
+    }
+};
+const LayoutTextRun = struct {
+    text: []const u8,
+    x: f64,
+    y: f64,
+    font_size: f64,
+    a: f64 = 1,
+    b: f64 = 0,
+    c: f64 = 0,
+    d: f64 = 1,
+    advance_width: f64 = 0,
+    ascent: f64 = 0,
+    descent: f64 = 0,
+    paint_order: usize = 0,
+    output_span: ?TextOutputSpan = null,
+
+    fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
         alloc.free(self.text);
         self.* = undefined;
     }
@@ -676,11 +703,11 @@ const TextRunStackEntry = struct {
     fill_pattern_name: ?[]const u8,
     stroke_pattern_name: ?[]const u8,
     clip_box: ?PageBox,
-    clip_points: []const [2]f64,
+    clip_points: ?[]const [2]f64,
     clip_fill_rule: FillRule,
 
     fn deinit(self: *TextRunStackEntry, alloc: Allocator) void {
-        alloc.free(self.clip_points);
+        if (self.clip_points) |points| alloc.free(points);
         self.* = undefined;
     }
 };
@@ -869,6 +896,117 @@ const ExponentialTintTransform = struct {
     }
 };
 
+const PositionedTextOutput = union(enum) {
+    layout: *std.ArrayList(LayoutTextRun),
+    render: *std.ArrayList(TextRun),
+
+    fn len(self: PositionedTextOutput) usize {
+        return switch (self) {
+            .layout => |out| out.items.len,
+            .render => |out| out.items.len,
+        };
+    }
+
+    fn isLayout(self: PositionedTextOutput) bool {
+        return self == .layout;
+    }
+};
+
+const PositionedTextParser = struct {
+    alloc: Allocator,
+    output: PositionedTextOutput,
+    operands: std.ArrayList(syntax.Object) = .empty,
+    retained_names: std.ArrayList(syntax.Object) = .empty,
+    state: TextRunState = .{},
+    stack: std.ArrayList(TextRunStackEntry) = .empty,
+    current_path: std.ArrayList([2]f64) = .empty,
+    current_path_closed: bool = false,
+    current_clip_points: std.ArrayList([2]f64) = .empty,
+    current_clip_fill_rule: FillRule = .nonzero,
+    paint_order: usize = 0,
+    next_group_id: u32 = 1,
+
+    fn init(
+        alloc: Allocator,
+        output: PositionedTextOutput,
+        initial_state: TextRunState,
+        initial_clip_points: []const [2]f64,
+        initial_clip_fill_rule: FillRule,
+    ) !PositionedTextParser {
+        var self = PositionedTextParser{
+            .alloc = alloc,
+            .output = output,
+            .state = initial_state,
+            .current_clip_fill_rule = initial_clip_fill_rule,
+        };
+        errdefer self.deinit();
+        try self.current_clip_points.appendSlice(alloc, initial_clip_points);
+        return self;
+    }
+
+    fn deinit(self: *PositionedTextParser) void {
+        clearContentOperands(self.alloc, &self.operands);
+        self.operands.deinit(self.alloc);
+        for (self.retained_names.items) |*name| name.deinit(self.alloc);
+        self.retained_names.deinit(self.alloc);
+        for (self.stack.items) |*entry| entry.deinit(self.alloc);
+        self.stack.deinit(self.alloc);
+        self.current_path.deinit(self.alloc);
+        self.current_clip_points.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn consume(
+        self: *PositionedTextParser,
+        bytes: []const u8,
+        fonts: []const PageFont,
+        gstates: []const PageExtGState,
+        forms: []const PageForm,
+    ) anyerror!void {
+        var scanner = syntax.Scanner.init(self.alloc, bytes);
+        defer scanner.deinit();
+
+        while (true) {
+            var lex = (try readContentLexeme(&scanner)) orelse {
+                clearContentOperands(self.alloc, &self.operands);
+                continue;
+            };
+            defer syntax.Scanner.freeLexeme(self.alloc, &lex);
+
+            if (lex == .eof) break;
+            if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
+                try applyTextRunOperator(
+                    self.alloc,
+                    self.output,
+                    &self.state,
+                    &self.stack,
+                    &self.current_path,
+                    &self.current_path_closed,
+                    &self.current_clip_points,
+                    &self.current_clip_fill_rule,
+                    fonts,
+                    gstates,
+                    forms,
+                    &self.paint_order,
+                    &self.next_group_id,
+                    lex.keyword,
+                    self.operands.items,
+                );
+                try clearContentOperandsRetainingNames(self.alloc, &self.operands, &self.retained_names);
+                continue;
+            }
+
+            try scanner.unreadLexeme(try cloneLexemeForContent(self.alloc, lex));
+            const maybe_obj = try readContentObject(&scanner);
+            if (maybe_obj) |obj| {
+                try appendOwnedSyntaxObject(self.alloc, &self.operands, obj);
+            } else {
+                clearContentOperands(self.alloc, &self.operands);
+            }
+        }
+    }
+};
+
 fn extractTextRunsFromContentAppend(
     alloc: Allocator,
     out: *std.ArrayList(TextRun),
@@ -877,73 +1015,9 @@ fn extractTextRunsFromContentAppend(
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
-    var paint_order: usize = 0;
-    var next_group_id: u32 = 1;
-    return try extractTextRunsFromContentAppendWithState(alloc, out, bytes, fonts, gstates, forms, .{}, &.{}, .nonzero, &paint_order, &next_group_id);
-}
-
-fn extractTextRunsFromContentAppendWithState(
-    alloc: Allocator,
-    out: *std.ArrayList(TextRun),
-    bytes: []const u8,
-    fonts: []const PageFont,
-    gstates: []const PageExtGState,
-    forms: []const PageForm,
-    initial_state: TextRunState,
-    initial_clip_points: []const [2]f64,
-    initial_clip_fill_rule: FillRule,
-    paint_order: *usize,
-    next_group_id: *u32,
-) anyerror!void {
-    var scanner = syntax.Scanner.init(alloc, bytes);
-    defer scanner.deinit();
-
-    var operands = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (operands.items) |*obj| obj.deinit(alloc);
-        operands.deinit(alloc);
-    }
-    var retained_names = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (retained_names.items) |*name| name.deinit(alloc);
-        retained_names.deinit(alloc);
-    }
-
-    var state = initial_state;
-    var stack = std.ArrayList(TextRunStackEntry).empty;
-    defer {
-        for (stack.items) |*entry| entry.deinit(alloc);
-        stack.deinit(alloc);
-    }
-    var current_path = std.ArrayList([2]f64).empty;
-    defer current_path.deinit(alloc);
-    var current_path_closed = false;
-    var current_clip_points = std.ArrayList([2]f64).empty;
-    defer current_clip_points.deinit(alloc);
-    var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
-    try current_clip_points.appendSlice(alloc, initial_clip_points);
-    while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
-            clearContentOperands(alloc, &operands);
-            continue;
-        };
-        defer syntax.Scanner.freeLexeme(alloc, &lex);
-
-        if (lex == .eof) break;
-        if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyTextRunOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, fonts, gstates, forms, paint_order, next_group_id, lex.keyword, operands.items);
-            try clearContentOperandsRetainingNames(alloc, &operands, &retained_names);
-            continue;
-        }
-
-        try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        const maybe_obj = try readContentObject(&scanner);
-        if (maybe_obj) |obj| {
-            try appendOwnedSyntaxObject(alloc, &operands, obj);
-        } else {
-            clearContentOperands(alloc, &operands);
-        }
-    }
+    var parser = try PositionedTextParser.init(alloc, .{ .render = out }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume(bytes, fonts, gstates, forms);
 }
 
 fn extractImageRunsFromContentAppend(
@@ -1708,10 +1782,56 @@ pub const Reader = struct {
     }
 
     pub fn extractPageTextAlloc(self: *Reader, page_num: usize) ![]u8 {
-        const analysis = try self.extractPageTextAnalysisAlloc(page_num);
-        for (analysis.runs) |*run| run.deinit(self.alloc);
-        if (analysis.runs.len > 0) self.alloc.free(analysis.runs);
-        return analysis.text;
+        var page = try self.readPageObject(page_num);
+        defer page.deinit(self.alloc);
+
+        const fonts = try self.collectPageFontsAlloc(&page);
+        defer {
+            for (fonts) |*font| font.deinit(self.alloc);
+            self.alloc.free(fonts);
+        }
+        const forms = try self.collectPageTextFormsAlloc(&page);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+
+        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
+        var canonical = std.ArrayList(u8).empty;
+        defer canonical.deinit(self.alloc);
+        var layout_runs = std.ArrayList(LayoutTextRun).empty;
+        defer layout_runs.deinit(self.alloc);
+        defer for (layout_runs.items) |*run| run.deinit(self.alloc);
+        var text_parser = TextContentParser.init(self.alloc, &canonical);
+        defer text_parser.deinit();
+        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{}, &.{}, .nonzero);
+        defer layout_parser.deinit();
+
+        const streams = try self.collectContentStreamsAlloc(contents);
+        defer {
+            for (streams) |*stream| stream.deinit(self.alloc);
+            self.alloc.free(streams);
+        }
+        for (streams) |*stream| {
+            const decoded = try self.readDecodedStreamData(stream);
+            defer self.alloc.free(decoded);
+            try text_parser.consume(decoded, fonts, forms, 0);
+            try layout_parser.consume(decoded, fonts, &.{}, forms);
+        }
+
+        var owned_text = try canonical.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_text);
+        if (layout_runs.items.len > 0) {
+            const reconstructed = try reconstructTextFromRunsAlloc(self.alloc, layout_runs.items);
+            if (sameNonWhitespaceBytes(owned_text, reconstructed)) {
+                self.alloc.free(owned_text);
+                owned_text = reconstructed;
+            } else {
+                self.alloc.free(reconstructed);
+                clearTextRunOutputSpans(layout_runs.items);
+            }
+        }
+        return owned_text;
     }
 
     /// Extracts canonical page text and positioned text runs while sharing the
@@ -1903,6 +2023,9 @@ pub const Reader = struct {
         errdefer if (!pattern_transferred) for (pattern_out.items) |*run| run.deinit(self.alloc);
         errdefer if (!shape_transferred) for (shape_out.items) |*run| run.deinit(self.alloc);
 
+        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{}, &.{}, .nonzero);
+        defer text_parser.deinit();
+
         if (page.get("Contents")) |contents| {
             const streams = try self.collectContentStreamsAlloc(contents);
             defer {
@@ -1912,7 +2035,7 @@ pub const Reader = struct {
             for (streams) |*stream| {
                 const decoded = try self.readDecodedStreamData(stream);
                 defer self.alloc.free(decoded);
-                try self.extractRenderRunsFromContentAppend(&text_out, &image_out, &shading_out, &pattern_out, &shape_out, decoded, fonts, images, shadings, patterns, gstates, forms);
+                try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded, fonts, images, shadings, patterns, gstates, forms);
             }
         }
 
@@ -2181,13 +2304,19 @@ pub const Reader = struct {
         var out = std.ArrayList(TextRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
+        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{}, &.{}, .nonzero);
+        defer parser.deinit();
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
             for (streams) |*stream| stream.deinit(self.alloc);
             self.alloc.free(streams);
         }
-        for (streams) |*stream| try self.extractSingleContentTextRunsAppend(&out, stream, fonts, gstates, forms);
+        for (streams) |*stream| {
+            const decoded = try self.readDecodedStreamData(stream);
+            defer self.alloc.free(decoded);
+            try parser.consume(decoded, fonts, gstates, forms);
+        }
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -2254,7 +2383,7 @@ pub const Reader = struct {
 
     fn extractRenderRunsFromContentAppend(
         self: *const Reader,
-        text_out: *std.ArrayList(TextRun),
+        text_parser: *PositionedTextParser,
         image_out: *std.ArrayList(ImageRun),
         shading_out: *std.ArrayList(ShadingRun),
         pattern_out: *std.ArrayList(PatternRun),
@@ -2267,7 +2396,7 @@ pub const Reader = struct {
         gstates: []const PageExtGState,
         forms: []const PageForm,
     ) !void {
-        try extractTextRunsFromContentAppend(self.alloc, text_out, decoded, fonts, gstates, forms);
+        try text_parser.consume(decoded, fonts, gstates, forms);
         const has_do = contentMayContainOperator(decoded, "Do");
         const has_shape_paint = contentMayContainShapePaintOperator(decoded);
         const has_shading_paint = contentMayContainOperator(decoded, "sh");
@@ -2425,24 +2554,6 @@ pub const Reader = struct {
         }
     }
 
-    fn extractContentsTextAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, forms: []const PageForm) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const chunk = try self.extractSingleContentTextAlloc(stream, fonts, forms);
-            defer self.alloc.free(chunk);
-            try out.appendSlice(self.alloc, chunk);
-        }
-
-        return try out.toOwnedSlice(self.alloc);
-    }
-
     fn extractContentsTextAnalysisAlloc(
         self: *const Reader,
         contents: *const syntax.Object,
@@ -2457,6 +2568,10 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
+        var text_parser = TextContentParser.init(self.alloc, &text);
+        defer text_parser.deinit();
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{}, &.{}, .nonzero);
+        defer run_parser.deinit();
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2466,10 +2581,8 @@ pub const Reader = struct {
         for (streams) |*stream| {
             const decoded = try self.readDecodedStreamData(stream);
             defer self.alloc.free(decoded);
-            const chunk = try extractTextFromContentAlloc(self.alloc, decoded, fonts, forms, 0);
-            defer self.alloc.free(chunk);
-            try text.appendSlice(self.alloc, chunk);
-            try extractTextRunsFromContentAppend(self.alloc, &runs, decoded, fonts, gstates, forms);
+            try text_parser.consume(decoded, fonts, forms, 0);
+            try run_parser.consume(decoded, fonts, gstates, forms);
         }
 
         var owned_text = try text.toOwnedSlice(self.alloc);
@@ -2481,22 +2594,11 @@ pub const Reader = struct {
                 owned_text = reconstructed;
             } else {
                 self.alloc.free(reconstructed);
+                clearTextRunOutputSpans(runs.items);
             }
         }
         const owned_runs = try runs.toOwnedSlice(self.alloc);
         return .{ .text = owned_text, .runs = owned_runs };
-    }
-
-    fn extractSingleContentTextAlloc(self: *const Reader, obj: *const syntax.Object, fonts: []const PageFont, forms: []const PageForm) ![]u8 {
-        const decoded = try self.readDecodedStreamData(obj);
-        defer self.alloc.free(decoded);
-        return try extractTextFromContentAlloc(self.alloc, decoded, fonts, forms, 0);
-    }
-
-    fn extractSingleContentTextRunsAppend(self: *const Reader, out: *std.ArrayList(TextRun), obj: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm) !void {
-        const decoded = try self.readDecodedStreamData(obj);
-        defer self.alloc.free(decoded);
-        try extractTextRunsFromContentAppend(self.alloc, out, decoded, fonts, gstates, forms);
     }
 
     fn extractSingleContentImageRunsAppend(self: *const Reader, out: *std.ArrayList(ImageRun), obj: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) !void {
@@ -2862,6 +2964,13 @@ pub const Reader = struct {
         if (resources == null) return try self.alloc.alloc(PageForm, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
         return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0);
+    }
+
+    fn collectPageTextFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageForm, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0);
     }
 
     fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageFont {
@@ -3241,6 +3350,83 @@ pub const Reader = struct {
                 .forms = forms,
             });
             name = null;
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectTextFormsFromResourcesAlloc(
+        self: *const Reader,
+        resources: *const syntax.Object,
+        fallback_resources: ?*const syntax.Object,
+        depth: u8,
+    ) anyerror![]PageForm {
+        if (depth > 1) return try self.alloc.alloc(PageForm, 0);
+        const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
+        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        defer resolved_xobjects.deinit(self.alloc);
+        if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
+
+        var out = std.ArrayList(PageForm).empty;
+        defer out.deinit(self.alloc);
+        errdefer for (out.items) |*form| form.deinit(self.alloc);
+        for (resolved_xobjects.dict) |entry| {
+            var xobj = try self.resolveValue(&entry.value);
+            defer xobj.deinit(self.alloc);
+            if (xobj != .stream) continue;
+            const subtype = xobj.get("Subtype") orelse continue;
+            if (!std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
+
+            var content: ?[]u8 = try self.readDecodedStreamData(&xobj);
+            errdefer if (content) |owned| self.alloc.free(owned);
+            var resolved_form_resources: ?syntax.Object = null;
+            defer if (resolved_form_resources) |*obj| obj.deinit(self.alloc);
+            if (xobj.get("Resources")) |form_resources_obj| {
+                resolved_form_resources = try self.resolveValue(form_resources_obj);
+            } else if (fallback_resources) |fallback| {
+                resolved_form_resources = try fallback.clone(self.alloc);
+            }
+
+            var fonts: ?[]PageFont = if (resolved_form_resources) |*form_resources|
+                try self.collectFontsFromResourcesAlloc(form_resources)
+            else
+                try self.alloc.alloc(PageFont, 0);
+            errdefer if (fonts) |owned| {
+                for (owned) |*font| font.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
+            var forms: ?[]PageForm = if (resolved_form_resources) |*form_resources|
+                try self.collectTextFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1)
+            else
+                try self.alloc.alloc(PageForm, 0);
+            errdefer if (forms) |owned| {
+                for (owned) |*form| form.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
+
+            try out.append(self.alloc, .{
+                .name = name.?,
+                .content = content.?,
+                .matrix = blk: {
+                    const matrix_obj = xobj.get("Matrix") orelse break :blk .{};
+                    if (matrix_obj.* != .array or matrix_obj.array.len < 6) break :blk .{};
+                    break :blk .{
+                        .a = numericObjectValue(&matrix_obj.array[0]) orelse 1,
+                        .b = numericObjectValue(&matrix_obj.array[1]) orelse 0,
+                        .c = numericObjectValue(&matrix_obj.array[2]) orelse 0,
+                        .d = numericObjectValue(&matrix_obj.array[3]) orelse 1,
+                        .e = numericObjectValue(&matrix_obj.array[4]) orelse 0,
+                        .f = numericObjectValue(&matrix_obj.array[5]) orelse 0,
+                    };
+                },
+                .fonts = fonts.?,
+                .forms = forms.?,
+            });
+            name = null;
+            content = null;
+            fonts = null;
+            forms = null;
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -6323,6 +6509,67 @@ fn parseHexToUtf8Alloc(alloc: Allocator, hex: []const u8) ![]u8 {
     return try alloc.dupe(u8, buf[0..n]);
 }
 
+const TextContentParser = struct {
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    operands: std.ArrayList(syntax.Object) = .empty,
+    state: TextExtractionState = .{},
+
+    fn init(alloc: Allocator, out: *std.ArrayList(u8)) TextContentParser {
+        return .{ .alloc = alloc, .out = out };
+    }
+
+    fn deinit(self: *TextContentParser) void {
+        clearContentOperands(self.alloc, &self.operands);
+        self.operands.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn consume(
+        self: *TextContentParser,
+        bytes: []const u8,
+        fonts: []const PageFont,
+        forms: []const PageForm,
+        form_depth: usize,
+    ) anyerror!void {
+        if (form_depth > 128) return error.InvalidContents;
+        var scanner = syntax.Scanner.init(self.alloc, bytes);
+        defer scanner.deinit();
+
+        while (true) {
+            var lex = (try readContentLexeme(&scanner)) orelse {
+                clearContentOperands(self.alloc, &self.operands);
+                continue;
+            };
+            defer syntax.Scanner.freeLexeme(self.alloc, &lex);
+
+            if (lex == .eof) break;
+            if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
+                try applyTextOperator(
+                    self.alloc,
+                    self.out,
+                    &self.state,
+                    fonts,
+                    forms,
+                    form_depth,
+                    lex.keyword,
+                    self.operands.items,
+                );
+                clearContentOperands(self.alloc, &self.operands);
+                continue;
+            }
+
+            try scanner.unreadLexeme(try cloneLexemeForContent(self.alloc, lex));
+            const maybe_obj = try readContentObject(&scanner);
+            if (maybe_obj) |obj| {
+                try appendOwnedSyntaxObject(self.alloc, &self.operands, obj);
+            } else {
+                clearContentOperands(self.alloc, &self.operands);
+            }
+        }
+    }
+};
+
 fn extractTextFromContentAlloc(
     alloc: Allocator,
     bytes: []const u8,
@@ -6330,44 +6577,11 @@ fn extractTextFromContentAlloc(
     forms: []const PageForm,
     form_depth: usize,
 ) anyerror![]u8 {
-    if (form_depth > 128) return error.InvalidContents;
-    var scanner = syntax.Scanner.init(alloc, bytes);
-    defer scanner.deinit();
-
-    var operands = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (operands.items) |*obj| obj.deinit(alloc);
-        operands.deinit(alloc);
-    }
-
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
-    var state = TextExtractionState{};
-
-    while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
-            clearContentOperands(alloc, &operands);
-            continue;
-        };
-        defer syntax.Scanner.freeLexeme(alloc, &lex);
-
-        if (lex == .eof) break;
-        if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyTextOperator(alloc, &out, &state, fonts, forms, form_depth, lex.keyword, operands.items);
-            for (operands.items) |*obj| obj.deinit(alloc);
-            operands.clearRetainingCapacity();
-            continue;
-        }
-
-        try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        const maybe_obj = try readContentObject(&scanner);
-        if (maybe_obj) |obj| {
-            try appendOwnedSyntaxObject(alloc, &operands, obj);
-        } else {
-            clearContentOperands(alloc, &operands);
-        }
-    }
-
+    var parser = TextContentParser.init(alloc, &out);
+    defer parser.deinit();
+    try parser.consume(bytes, fonts, forms, form_depth);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -6502,7 +6716,7 @@ fn applyTextOperator(
 
 fn applyTextRunOperator(
     alloc: Allocator,
-    out: *std.ArrayList(TextRun),
+    out: PositionedTextOutput,
     state: *TextRunState,
     stack: *std.ArrayList(TextRunStackEntry),
     current_path: *std.ArrayList([2]f64),
@@ -6524,8 +6738,8 @@ fn applyTextRunOperator(
         paint_order.* += 1;
     }
     if (std.mem.eql(u8, op, "q")) {
-        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
-        errdefer alloc.free(clip_points);
+        const clip_points = if (out.isLayout()) null else try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer if (clip_points) |points| alloc.free(points);
         try stack.append(alloc, .{
             .matrix = state.matrix,
             .alpha = state.alpha,
@@ -6576,14 +6790,17 @@ fn applyTextRunOperator(
             state.fill_pattern_name = entry.fill_pattern_name;
             state.stroke_pattern_name = entry.stroke_pattern_name;
             state.clip_box = entry.clip_box;
-            current_clip_points.clearRetainingCapacity();
-            try current_clip_points.appendSlice(alloc, entry.clip_points);
-            current_clip_fill_rule.* = entry.clip_fill_rule;
+            if (entry.clip_points) |clip_points| {
+                current_clip_points.clearRetainingCapacity();
+                try current_clip_points.appendSlice(alloc, clip_points);
+                current_clip_fill_rule.* = entry.clip_fill_rule;
+            }
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
         return;
     }
+    if (std.mem.eql(u8, op, "gs") and out.isLayout()) return;
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
             state.alpha = gstate.fill_alpha;
@@ -6606,6 +6823,7 @@ fn applyTextRunOperator(
         }
         return;
     }
+    if (out.isLayout() and isLayoutIgnoredTextOperator(op)) return;
     if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -6968,7 +7186,7 @@ fn applyTextRunOperator(
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const name = operands[operands.len - 1].name;
         const form = findPageForm(forms, name) orelse return;
-        const start_len = out.items.len;
+        const start_len = out.len();
         var nested_state = buildFormTextState(state.*, form);
         if (form.transparency_group) {
             nested_state.group_parent_id = state.group_id;
@@ -6977,10 +7195,20 @@ fn applyTextRunOperator(
             nested_state.group_knockout = form.group_knockout;
             next_group_id.* += 1;
         }
-        try extractTextRunsFromContentAppendWithState(alloc, out, form.content, form.fonts, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id);
-        for (out.items[start_len..]) |*run| {
-            run.vectorizable = false;
-            run.font_index = null;
+        const nested_clip = if (out.isLayout()) &.{} else current_clip_points.items;
+        var nested_parser = try PositionedTextParser.init(alloc, out, nested_state, nested_clip, current_clip_fill_rule.*);
+        defer nested_parser.deinit();
+        nested_parser.paint_order = paint_order.*;
+        nested_parser.next_group_id = next_group_id.*;
+        try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms);
+        paint_order.* = nested_parser.paint_order;
+        next_group_id.* = nested_parser.next_group_id;
+        switch (out) {
+            .layout => {},
+            .render => |render_out| for (render_out.items[start_len..]) |*run| {
+                run.vectorizable = false;
+                run.font_index = null;
+            },
         }
         return;
     }
@@ -8193,7 +8421,7 @@ fn appendDecodedString(
 
 fn appendTextRunOperand(
     alloc: Allocator,
-    out: *std.ArrayList(TextRun),
+    out: PositionedTextOutput,
     state: *TextRunState,
     current_clip_points: []const [2]f64,
     current_clip_fill_rule: @FieldType(ShapeRun, "fill_rule"),
@@ -8207,7 +8435,7 @@ fn appendTextRunOperand(
 
 fn appendTextRunDecodedString(
     alloc: Allocator,
-    out: *std.ArrayList(TextRun),
+    out: PositionedTextOutput,
     state: *TextRunState,
     current_clip_points: []const [2]f64,
     current_clip_fill_rule: @FieldType(ShapeRun, "fill_rule"),
@@ -8237,61 +8465,81 @@ fn appendTextRunDecodedString(
         try measureFontAdvanceAlloc(alloc, fonts, font_idx, raw, decoded, state.*)
     else
         estimateDecodedAdvance(decoded, state.*);
-    if (state.render_mode != 3) {
-        const vectorizable = if (state.current_font_index) |font_idx|
-            fonts[font_idx].type3 != null or
-                fonts[font_idx].type1 != null or
-                fonts[font_idx].truetype != null or
-                fonts[font_idx].cff_otf != null
-        else
-            false;
-        const text = try alloc.dupe(u8, decoded);
-        errdefer alloc.free(text);
-        const raw_text = try alloc.dupe(u8, raw);
-        errdefer alloc.free(raw_text);
-        const fill_pattern_name = if (state.fill_pattern_name) |name| try alloc.dupe(u8, name) else null;
-        errdefer if (fill_pattern_name) |name| alloc.free(name);
-        const stroke_pattern_name = if (state.stroke_pattern_name) |name| try alloc.dupe(u8, name) else null;
-        errdefer if (stroke_pattern_name) |name| alloc.free(name);
-        const clip_points = if (current_clip_points.len > 0) try alloc.dupe([2]f64, current_clip_points) else null;
-        errdefer if (clip_points) |clip| alloc.free(clip);
-        try out.append(alloc, .{
-            .text = text,
-            .raw_text = raw_text,
-            .font_index = if (state.current_font_index) |idx| @intCast(idx) else null,
-            .vectorizable = vectorizable,
-            .x = position[0],
-            .y = position[1],
-            .font_size = state.font_size,
-            .a = basis_x[0],
-            .b = basis_x[1],
-            .c = basis_y[0],
-            .d = basis_y[1],
-            .alpha = state.alpha,
-            .stroke_alpha = state.stroke_alpha,
-            .render_mode = state.render_mode,
-            .fill_color = state.fill_color,
-            .stroke_color = state.stroke_color,
-            .stroke_width = state.stroke_width,
-            .horizontal_scale = state.horizontal_scale,
-            .char_spacing = state.char_spacing,
-            .word_spacing = state.word_spacing,
-            .advance_width = advance_width,
-            .ascent = metrics.ascent,
-            .descent = metrics.descent,
-            .paint_order = paint_order,
-            .blend_mode = state.blend_mode,
-            .group_id = state.group_id,
-            .group_parent_id = state.group_parent_id,
-            .group_isolated = state.group_isolated,
-            .group_knockout = state.group_knockout,
-            .fill_pattern_name = fill_pattern_name,
-            .stroke_pattern_name = stroke_pattern_name,
-            .clip_box = state.clip_box,
-            .clip_points = clip_points,
-            .clip_fill_rule = current_clip_fill_rule,
-        });
-    }
+    if (state.render_mode != 3) switch (out) {
+        .layout => |layout_out| {
+            const text = try alloc.dupe(u8, decoded);
+            errdefer alloc.free(text);
+            try layout_out.append(alloc, .{
+                .text = text,
+                .x = position[0],
+                .y = position[1],
+                .font_size = state.font_size,
+                .a = basis_x[0],
+                .b = basis_x[1],
+                .c = basis_y[0],
+                .d = basis_y[1],
+                .advance_width = advance_width,
+                .ascent = metrics.ascent,
+                .descent = metrics.descent,
+                .paint_order = paint_order,
+            });
+        },
+        .render => |render_out| {
+            const vectorizable = if (state.current_font_index) |font_idx|
+                fonts[font_idx].type3 != null or
+                    fonts[font_idx].type1 != null or
+                    fonts[font_idx].truetype != null or
+                    fonts[font_idx].cff_otf != null
+            else
+                false;
+            const text = try alloc.dupe(u8, decoded);
+            errdefer alloc.free(text);
+            const raw_text = try alloc.dupe(u8, raw);
+            errdefer alloc.free(raw_text);
+            const fill_pattern_name = if (state.fill_pattern_name) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (fill_pattern_name) |name| alloc.free(name);
+            const stroke_pattern_name = if (state.stroke_pattern_name) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (stroke_pattern_name) |name| alloc.free(name);
+            const clip_points = if (current_clip_points.len > 0) try alloc.dupe([2]f64, current_clip_points) else null;
+            errdefer if (clip_points) |clip| alloc.free(clip);
+            try render_out.append(alloc, .{
+                .text = text,
+                .raw_text = raw_text,
+                .font_index = if (state.current_font_index) |idx| @intCast(idx) else null,
+                .vectorizable = vectorizable,
+                .x = position[0],
+                .y = position[1],
+                .font_size = state.font_size,
+                .a = basis_x[0],
+                .b = basis_x[1],
+                .c = basis_y[0],
+                .d = basis_y[1],
+                .alpha = state.alpha,
+                .stroke_alpha = state.stroke_alpha,
+                .render_mode = state.render_mode,
+                .fill_color = state.fill_color,
+                .stroke_color = state.stroke_color,
+                .stroke_width = state.stroke_width,
+                .horizontal_scale = state.horizontal_scale,
+                .char_spacing = state.char_spacing,
+                .word_spacing = state.word_spacing,
+                .advance_width = advance_width,
+                .ascent = metrics.ascent,
+                .descent = metrics.descent,
+                .paint_order = paint_order,
+                .blend_mode = state.blend_mode,
+                .group_id = state.group_id,
+                .group_parent_id = state.group_parent_id,
+                .group_isolated = state.group_isolated,
+                .group_knockout = state.group_knockout,
+                .fill_pattern_name = fill_pattern_name,
+                .stroke_pattern_name = stroke_pattern_name,
+                .clip_box = state.clip_box,
+                .clip_points = clip_points,
+                .clip_fill_rule = current_clip_fill_rule,
+            });
+        },
+    };
 
     state.x += advance_width * state.text_a;
     state.y += advance_width * state.text_b;
@@ -8444,15 +8692,15 @@ fn sameNonWhitespaceBytes(left: []const u8, right: []const u8) bool {
     }
 }
 
-fn textRunAxisLength(run: TextRun) f64 {
+fn textRunAxisLength(run: anytype) f64 {
     return @sqrt(run.a * run.a + run.b * run.b);
 }
 
-fn textRunVerticalScale(run: TextRun) f64 {
+fn textRunVerticalScale(run: anytype) f64 {
     return @sqrt(run.c * run.c + run.d * run.d);
 }
 
-fn textRunsShareLine(previous: TextRun, current: TextRun) bool {
+fn textRunsShareLine(previous: anytype, current: anytype) bool {
     const previous_axis = textRunAxisLength(previous);
     const current_axis = textRunAxisLength(current);
     if (previous_axis <= 0.000001 or current_axis <= 0.000001) return false;
@@ -8473,7 +8721,7 @@ fn textRunsShareLine(previous: TextRun, current: TextRun) bool {
     return cross_axis_gap <= line_tolerance;
 }
 
-fn textRunForwardGap(previous: TextRun, current: TextRun) f64 {
+fn textRunForwardGap(previous: anytype, current: anytype) f64 {
     const axis = textRunAxisLength(previous);
     if (axis <= 0.000001) return 0;
     const previous_end_x = previous.x + previous.a * previous.advance_width;
@@ -8482,7 +8730,24 @@ fn textRunForwardGap(previous: TextRun, current: TextRun) f64 {
         (current.y - previous_end_y) * (previous.b / axis);
 }
 
-fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8)) !void {
+fn clearTextRunOutputSpans(runs: anytype) void {
+    for (runs) |*run| run.output_span = null;
+}
+
+fn clampTextRunOutputSpans(runs: anytype, output_len: usize) void {
+    for (runs) |*run| {
+        const span = run.output_span orelse continue;
+        if (span.end <= output_len) continue;
+        if (span.start >= output_len) {
+            run.output_span = null;
+        } else {
+            run.output_span = .{ .start = span.start, .end = output_len };
+        }
+    }
+}
+
+fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8), runs: anytype) !void {
+    const original_len = out.items.len;
     while (out.items.len > 0 and
         (out.items[out.items.len - 1] == ' ' or
             out.items[out.items.len - 1] == '\t' or
@@ -8490,6 +8755,7 @@ fn appendLayoutNewline(alloc: Allocator, out: *std.ArrayList(u8)) !void {
     {
         _ = out.pop();
     }
+    if (out.items.len != original_len) clampTextRunOutputSpans(runs, out.items.len);
     try appendNewline(alloc, out);
 }
 
@@ -8501,21 +8767,23 @@ fn endsWithColon(text: []const u8) bool {
     return text.len > 0 and text[text.len - 1] == ':';
 }
 
-fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: []const TextRun) ![]u8 {
+fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
+    clearTextRunOutputSpans(runs);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
-    var previous: ?TextRun = null;
-    for (runs) |run| {
+    var previous_index: ?usize = null;
+    for (runs, 0..) |*run, run_index| {
         if (run.text.len == 0) continue;
-        if (previous) |prior| {
-            if (!textRunsShareLine(prior, run)) {
-                try appendLayoutNewline(alloc, &out);
+        if (previous_index) |prior_index| {
+            const prior = runs[prior_index];
+            if (!textRunsShareLine(prior, run.*)) {
+                try appendLayoutNewline(alloc, &out, runs[0..run_index]);
             } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
                 !std.ascii.isWhitespace(run.text[0]))
             {
                 const axis = textRunAxisLength(prior);
                 const font_scale = @abs(prior.font_size) * axis;
-                const gap = textRunForwardGap(prior, run);
+                const gap = textRunForwardGap(prior, run.*);
                 const word_gap = @max(0.5, font_scale * 0.12);
                 const operator_overlap_tolerance = font_scale * 0.15;
                 const operator_boundary = prior.paint_order != run.paint_order;
@@ -8531,8 +8799,11 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: []const TextRun) ![]u8 {
                 }
             }
         }
+        const start = out.items.len;
         try out.appendSlice(alloc, run.text);
-        previous = run;
+        const end = out.items.len;
+        if (start < end) run.output_span = .{ .start = start, .end = end };
+        previous_index = run_index;
     }
     try appendNewline(alloc, &out);
     return try out.toOwnedSlice(alloc);
@@ -8562,6 +8833,19 @@ fn isShapePaintOperator(op: []const u8) bool {
         std.mem.eql(u8, op, "s") or std.mem.eql(u8, op, "B") or
         std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b") or
         std.mem.eql(u8, op, "b*");
+}
+
+fn isLayoutIgnoredTextOperator(op: []const u8) bool {
+    if (isShapePaintOperator(op) or std.mem.eql(u8, op, "sh")) return true;
+    const ignored = [_][]const u8{
+        "m",   "l",  "c",   "v", "y", "h", "re", "W",  "W*", "n",
+        "w",   "rg", "RG",  "g", "G", "k", "K",  "cs", "CS", "sc",
+        "scn", "SC", "SCN",
+    };
+    for (ignored) |candidate| {
+        if (std.mem.eql(u8, op, candidate)) return true;
+    }
+    return false;
 }
 
 fn isTextShowOperator(op: []const u8) bool {
@@ -8852,7 +9136,13 @@ fn buildPatternRunAlloc(
     defer tile_text_list.deinit(alloc);
     errdefer for (tile_text_list.items) |*run| run.deinit(alloc);
     const text_state = buildPatternTextState(state);
-    try extractTextRunsFromContentAppendWithState(alloc, &tile_text_list, pattern.content, pattern.fonts, pattern.gstates, pattern.forms, text_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
+    var text_parser = try PositionedTextParser.init(alloc, .{ .render = &tile_text_list }, text_state, &.{}, .nonzero);
+    defer text_parser.deinit();
+    text_parser.paint_order = tile_paint_order;
+    text_parser.next_group_id = tile_group_id;
+    try text_parser.consume(pattern.content, pattern.fonts, pattern.gstates, pattern.forms);
+    tile_paint_order = text_parser.paint_order;
+    tile_group_id = text_parser.next_group_id;
 
     var tile_pattern_list = std.ArrayList(PatternRun).empty;
     defer tile_pattern_list.deinit(alloc);
@@ -10775,7 +11065,7 @@ test "reader caches shared page fonts across text analysis" {
 
 test "reader reconstructs spaces and lines from positioned text runs" {
     const alloc = std.testing.allocator;
-    const runs = [_]TextRun{
+    var runs = [_]TextRun{
         .{ .text = "Max", .x = 0, .y = 100, .font_size = 10, .advance_width = 15, .paint_order = 0 },
         .{ .text = "Length", .x = 17, .y = 100, .font_size = 10, .advance_width = 30, .paint_order = 0 },
         .{ .text = "Avg", .x = 46.5, .y = 100, .font_size = 10, .advance_width = 14, .paint_order = 1 },
@@ -10789,9 +11079,23 @@ test "reader reconstructs spaces and lines from positioned text runs" {
     try std.testing.expect(!sameNonWhitespaceBytes("MaxLengthAvg Multi-vector", text));
 }
 
+test "reader clamps reconstructed spans after trimming line whitespace" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "Heading ", .x = 0, .y = 100, .font_size = 10, .advance_width = 40, .paint_order = 0 },
+        .{ .text = "Body", .x = 0, .y = 80, .font_size = 10, .advance_width = 20, .paint_order = 1 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+
+    try std.testing.expectEqualStrings("Heading\nBody\n", text);
+    try std.testing.expectEqual(TextOutputSpan{ .start = 0, .end = 7 }, runs[0].output_span.?);
+    try std.testing.expectEqual(TextOutputSpan{ .start = 8, .end = 12 }, runs[1].output_span.?);
+}
+
 test "reader separates caption punctuation despite overlapping metrics" {
     const alloc = std.testing.allocator;
-    const runs = [_]TextRun{
+    var runs = [_]TextRun{
         .{ .text = "Figure", .x = 0, .y = 100, .font_size = 10, .advance_width = 30, .paint_order = 0 },
         .{ .text = "4:", .x = 32, .y = 100, .font_size = 10, .advance_width = 10, .paint_order = 0 },
         .{ .text = "Statics", .x = 35, .y = 100, .font_size = 10, .advance_width = 35, .paint_order = 1 },
@@ -10855,6 +11159,100 @@ test "reader extracts positioned text runs from text matrix operators" {
     try std.testing.expectApproxEqAbs(@as(f64, 72), runs[0].x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 1), runs[0].a, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), runs[0].b, 0.001);
+}
+
+test "reader preserves text state across page content streams" {
+    const alloc = std.testing.allocator;
+    const first_content = "q 2 0 0 2 0 0 cm BT /F1 12 Tf 1 0 0 1 72 360 Tm (Hello) Tj\n";
+    const second_content = "(World) Tj ET Q\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 6 0 R >> >> /Contents [4 0 R 5 0 R] >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ first_content.len, first_content }),
+        try std.fmt.allocPrint(alloc, "5 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ second_content.len, second_content }),
+        "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, object);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const plain_text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(plain_text);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Hello World", std.mem.trim(u8, plain_text, &std.ascii.whitespace));
+    try std.testing.expectEqualStrings("Hello World", std.mem.trim(u8, analysis.text, &std.ascii.whitespace));
+    try std.testing.expectEqual(@as(usize, 2), analysis.runs.len);
+    const first = analysis.runs[0];
+    const second = analysis.runs[1];
+    try std.testing.expectApproxEqAbs(first.y, second.y, 0.001);
+    try std.testing.expectApproxEqAbs(first.a, second.a, 0.001);
+    try std.testing.expectApproxEqAbs(first.b, second.b, 0.001);
+    try std.testing.expectApproxEqAbs(first.c, second.c, 0.001);
+    try std.testing.expectApproxEqAbs(first.d, second.d, 0.001);
+    try std.testing.expect(second.x > first.x);
+    try std.testing.expect(first.font_index != null);
+    try std.testing.expectEqual(first.font_index, second.font_index);
+}
+
+test "reader plain text ignores unused malformed extended graphics state" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 12 Tf 1 0 0 1 72 720 Tm (Plain) Tj ET\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> /ExtGState << /Bad 99 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, object);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Plain", std.mem.trim(u8, text, &std.ascii.whitespace));
 }
 
 test "reader preserves rotated text transform on runs" {
@@ -11469,8 +11867,8 @@ test "PDF render run ownership is allocation-failure safe" {
                 .fill_pattern_name = "fill-pattern",
                 .stroke_pattern_name = "stroke-pattern",
             };
-            try appendTextRunDecodedString(alloc, &text_runs, &text_state, &clip, .nonzero, &.{}, 1, "owned text");
-            try appendTextRunDecodedString(alloc, &text_runs, &text_state, &clip, .nonzero, &.{}, 2, "second run");
+            try appendTextRunDecodedString(alloc, .{ .render = &text_runs }, &text_state, &clip, .nonzero, &.{}, 1, "owned text");
+            try appendTextRunDecodedString(alloc, .{ .render = &text_runs }, &text_state, &clip, .nonzero, &.{}, 2, "second run");
 
             var shape_runs = std.ArrayList(ShapeRun).empty;
             defer {

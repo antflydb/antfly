@@ -4510,6 +4510,7 @@ pub fn build(b: *std.Build) void {
             "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
             "generated text provider config is validated while parsing extraction config",
+            "PDF text regions use reconstructed output spans",
             "public enrichment validation rejects invalid execution and producer config",
             "enrichment runtime document extraction manifest uses v2 range and merge shape",
             "enrichment runtime document extraction state parses byte-array keys",
