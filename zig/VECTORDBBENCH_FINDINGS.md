@@ -1570,6 +1570,34 @@ sample explains the recall variance). Primary mutable snapshot copies totaled
 demand/RSS peaked at 508.6 MB/1.25 GB, and reopened demand/RSS at 597.8 MB/
 931.3 MB under the explicit 1 GiB envelope.
 
+The subsequent full 50K ladder reproduced the load result at 28.07 seconds
+insert and 30.10 seconds ready. Live recall was 0.9863. Aggregate QPS at
+1/5/10/20/30 clients was 50.32/214.92/278.06/159.02/152.00; latency p95 was
+34.18/36.78/62.17/212.59/334.71 ms. The throughput knee after ten clients is
+CPU/global admission saturation rather than the prior deadlock. A 1,000-query
+public profile measured recall 0.98541, 3.88 ms mean, 4.64 ms p95, and 8.33 ms
+p99, with 557.96 exact vectors and 24,263 approximate vectors per query.
+
+The fresh pre-resource-governor 1M qualification completed without the former
+~568K rollback stall or ~843K posting-capture violation, but it remains too
+slow. It inserted in 1,817.41 seconds and was ready in 1,821.51 seconds: better
+than the reported 3,000 seconds, but 2.3x the 13-minute target. Live/reopened
+recall was 0.9861/0.9858. Aggregate QPS at 1/5/10/20/30 clients was
+5.51/23.22/37.52/46.21/44.10, with p95 latency
+317.23/424.66/537.10/989.46/1,522.94 ms. The 1,000-query public profile measured
+66.72 ms mean, 136.31 ms p95, and 183.22 ms p99. Artifact reads alone averaged
+47.66 ms and exact rerank expanded to 2,068.97 vectors/query, versus about 447
+on the earlier preserved generation at equivalent recall; query selection or
+rerank-boundary behavior therefore regressed independently of sparse LSM I/O.
+
+The completed 1M root occupied 3.76 GiB, primary mutable snapshot copies
+totaled 1.46 GB, and HBC cache demand finished at 181.76 MB. Late ingest built
+150 pressure events and 156 pressure compactions and still finished with 72 L0
+runs. Direct observation caught about 3.27 GB RSS during ingest; the existing
+post-phase one-sample footprint (1.01 GB RSS, 2.00 GB demand) did not capture
+that peak and must not be presented as load peak memory. This is the clean
+pre-PR-540 baseline for the lifetime-fenced resource governor.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
