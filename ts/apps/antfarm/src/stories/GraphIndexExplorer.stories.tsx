@@ -69,11 +69,12 @@ const traversalResult: GraphQueryResult = {
       document: documents["paper:vector-db"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:vector-db", type: "cites", weight: 0.92 },
-      ],
-      edges: [
-        { source: "paper:vector-db", target: "paper:path-ranking", type: "extends", weight: 0.78 },
-        { source: "paper:vector-db", target: "paper:entity-links", type: "mentions", weight: 0.64 },
+        {
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:vector-db" },
+          type: "cites",
+          weight: 0.92,
+        },
       ],
     },
     {
@@ -83,8 +84,18 @@ const traversalResult: GraphQueryResult = {
       document: documents["paper:path-ranking"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }, { key: "paper:path-ranking" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:vector-db", type: "cites", weight: 0.92 },
-        { source: "paper:vector-db", target: "paper:path-ranking", type: "extends", weight: 0.78 },
+        {
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:vector-db" },
+          type: "cites",
+          weight: 0.92,
+        },
+        {
+          from: { key: "paper:vector-db" },
+          to: { key: "paper:path-ranking" },
+          type: "extends",
+          weight: 0.78,
+        },
       ],
     },
     {
@@ -94,14 +105,11 @@ const traversalResult: GraphQueryResult = {
       document: documents["paper:agent-memory"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:agent-memory" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
-      ],
-      edges: [
         {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
-          type: "mentions",
-          weight: 0.72,
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:agent-memory" },
+          type: "extends",
+          weight: 0.88,
         },
       ],
     },
@@ -116,10 +124,15 @@ const traversalResult: GraphQueryResult = {
         { key: "paper:entity-links" },
       ],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
         {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:agent-memory" },
+          type: "extends",
+          weight: 0.88,
+        },
+        {
+          from: { key: "paper:agent-memory" },
+          to: { key: "paper:entity-links" },
           type: "mentions",
           weight: 0.72,
         },
@@ -142,10 +155,15 @@ const shortestPathResult: GraphQueryResult = {
         { key: "paper:entity-links" },
       ],
       edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
         {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:agent-memory" },
+          type: "extends",
+          weight: 0.88,
+        },
+        {
+          from: { key: "paper:agent-memory" },
+          to: { key: "paper:entity-links" },
           type: "mentions",
           weight: 0.72,
         },

@@ -73,15 +73,25 @@ describe("GraphIndexExplorer", () => {
         {
           graph_results: {
             explorer: {
-              type: "traverse",
-              total: 1,
+              kind: "nodes",
               nodes: [
                 {
                   key: "bob",
                   depth: 1,
-                  path_edges: [{ source: "alice", target: "bob", type: "cites", weight: 0.8 }],
+                  path: [{ key: "alice" }, { key: "bob" }],
+                  path_edges: [
+                    {
+                      from: { key: "alice" },
+                      to: { key: "bob" },
+                      type: "cites",
+                      weight: 0.8,
+                    },
+                  ],
                 },
               ],
+              paths: [],
+              stats: { returned_items: 1, truncated: false },
+              took: 1,
             },
           },
         },
@@ -133,6 +143,32 @@ describe("GraphIndexExplorer", () => {
     expect(screen.getByTestId("force-graph").textContent).toContain("0 nodes");
   });
 
+  it("renders legacy path edges during the compatibility window", async () => {
+    render(
+      <GraphIndexExplorer
+        tableName="papers"
+        indexes={[graphIndex]}
+        onRefreshIndexes={() => undefined}
+        initialResult={
+          {
+            type: "traverse",
+            total: 1,
+            nodes: [
+              {
+                key: "bob",
+                path: ["alice", "bob"],
+                path_edges: [{ source: "alice", target: "bob", type: "cites", weight: 0.8 }],
+              },
+            ],
+          } as GraphQueryResult
+        }
+      />
+    );
+
+    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
+    expect(screen.getByTestId("force-graph").textContent).toContain("2 nodes / 1 edges");
+  });
+
   it("keeps same-key path endpoints distinct across tables", async () => {
     render(
       <GraphIndexExplorer
@@ -145,7 +181,14 @@ describe("GraphIndexExplorer", () => {
           paths: [
             {
               nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
-              edges: [{ source: "shared", target: "shared", type: "mentions", weight: 1 }],
+              edges: [
+                {
+                  from: { key: "shared" },
+                  to: { key: "shared", table: "entities" },
+                  type: "mentions",
+                  weight: 1,
+                },
+              ],
               total_weight: 1,
               length: 1,
             },
@@ -180,13 +223,18 @@ describe("GraphIndexExplorer", () => {
               ],
               path_edges: [
                 {
-                  source: "alice",
-                  target: "bob",
+                  from: { key: "alice" },
+                  to: { key: "bob", table: "entities" },
                   type: "mentions",
                   weight: 1,
                   metadata: { target_table: "entities" },
                 },
-                { source: "bob", target: "carol", type: "related", weight: 1 },
+                {
+                  from: { key: "bob", table: "entities" },
+                  to: { key: "carol", table: "entities" },
+                  type: "related",
+                  weight: 1,
+                },
               ],
             },
           ],

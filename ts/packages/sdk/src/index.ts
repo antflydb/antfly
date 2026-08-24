@@ -242,6 +242,7 @@ export type {
   GraphNotExistsPattern,
   GraphOptionalMatch,
   GraphPath,
+  GraphPathEdge,
   GraphPathEndpoint,
   GraphQuery,
   GraphQueryParams,

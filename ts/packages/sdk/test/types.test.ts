@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { GraphPathEdge } from "../src/index.js";
 import type { components, operations } from "../src/public-api.js";
 import { match as matchQuery } from "../src/query-helpers.js";
 import type {
@@ -21,7 +22,6 @@ import type {
   GraphDocumentFilter,
   GraphMatchQuery,
   GraphNodesResult,
-  GraphPathEdge,
   LegacyGraphQueryResult,
   MatchQuery,
   NumericRangeQuery,

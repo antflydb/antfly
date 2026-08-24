@@ -27,6 +27,7 @@ import type {
   EdgeDirection,
   EdgeTypeConfig,
   GraphNodesResult,
+  GraphPathEdge,
   GraphPathEndpoint,
   GraphQuery,
   GraphQueryResult,
@@ -59,20 +60,8 @@ type ExplorerEdge = GraphEdge & {
   pathEdge?: boolean;
 };
 
-type GraphVisualizationWireResult = {
-  kind?: "nodes" | "legacy";
-  type?: string;
-  nodes?: (
-    | GraphNodesResult["nodes"][number]
-    | NonNullable<LegacyGraphQueryResult["nodes"]>[number]
-  )[];
-  paths?: {
-    nodes?: (string | { key: string; table?: string })[];
-    edges?: Partial<Edge>[];
-  }[];
-  stats?: { returned_items: number };
-  total?: number;
-};
+type GraphVisualizationWireResult = GraphNodesResult | LegacyGraphQueryResult;
+type GraphVisualizationEdge = GraphPathEdge | Partial<Edge>;
 
 type ExplorerGraph = Omit<GraphData<ExplorerNodeMeta>, "edges"> & {
   edges: ExplorerEdge[];
@@ -146,17 +135,18 @@ function controlId(prefix: string, value: string) {
 }
 
 function normalizeEdge(
-  edge: Partial<Edge>,
+  edge: GraphVisualizationEdge,
   fallbackIndex: number,
   pathEdge = false,
   sourceIdentity?: { key: string; table?: string },
   targetIdentity?: { key: string; table?: string }
 ): ExplorerEdge | null {
-  const source = edge.source;
-  const target = edge.target;
+  const canonical = isCanonicalPathEdge(edge);
+  const source = canonical ? edge.from.key : edge.source;
+  const target = canonical ? edge.to.key : edge.target;
   if (!source || !target) return null;
-  const sourceId = graphNodeId(sourceIdentity ?? { key: source });
-  const targetId = graphNodeId(targetIdentity ?? { key: target });
+  const sourceId = graphNodeId(sourceIdentity ?? (canonical ? edge.from : { key: source }));
+  const targetId = graphNodeId(targetIdentity ?? (canonical ? edge.to : { key: target }));
   return {
     id: `${sourceId}->${targetId}:${edge.type ?? "edge"}:${fallbackIndex}`,
     source: sourceId,
@@ -166,6 +156,10 @@ function normalizeEdge(
     metadata: edge.metadata,
     pathEdge,
   };
+}
+
+function isCanonicalPathEdge(edge: GraphVisualizationEdge): edge is GraphPathEdge {
+  return "from" in edge && "to" in edge;
 }
 
 function graphNodeId(identity: { key: string; table?: string }) {
@@ -180,10 +174,13 @@ function edgeTargetTable(edge: Partial<Edge>) {
 }
 
 function pathEdgeIdentities(
-  edge: Partial<Edge>,
+  edge: GraphVisualizationEdge,
   pathNodes: Array<{ key: string; table?: string }>,
   edgeIndex: number
 ) {
+  if (isCanonicalPathEdge(edge)) {
+    return { sourceIdentity: edge.from, targetIdentity: edge.to };
+  }
   const adjacent = pathNodes.slice(edgeIndex, edgeIndex + 2);
   const followsPathOrder = adjacent[0]?.key === edge.source && adjacent[1]?.key === edge.target;
   const reversesPathOrder = adjacent[1]?.key === edge.source && adjacent[0]?.key === edge.target;
@@ -192,12 +189,14 @@ function pathEdgeIdentities(
       ? adjacent[0]
       : reversesPathOrder
         ? adjacent[1]
-        : adjacent.find((identity) => identity.key === edge.source),
+        : (adjacent.find((identity) => identity.key === edge.source) ??
+          (edge.source ? { key: edge.source } : undefined)),
     targetIdentity: followsPathOrder
       ? adjacent[1]
       : reversesPathOrder
         ? adjacent[0]
-        : adjacent.find((identity) => identity.key === edge.target),
+        : (adjacent.find((identity) => identity.key === edge.target) ??
+          (edge.target ? { key: edge.target, table: edgeTargetTable(edge) } : undefined)),
   };
 }
 
@@ -258,29 +257,21 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
     for (const identity of pathNodes) addNode(nodes, identity);
 
     for (const [edgeIndex, edge] of (node.path_edges ?? []).entries()) {
-      const { sourceIdentity, targetIdentity } = pathEdgeIdentities(edge, pathNodes, edgeIndex);
-      const normalized = normalizeEdge(
-        edge,
-        edges.size,
-        true,
-        sourceIdentity ?? (edge.source === node.key ? nodeIdentity : undefined),
-        targetIdentity ??
-          (edge.target === node.key
-            ? nodeIdentity
-            : edge.target
-              ? { key: edge.target, table: edgeTargetTable(edge) }
-              : undefined)
-      );
+      let { sourceIdentity, targetIdentity } = pathEdgeIdentities(edge, pathNodes, edgeIndex);
+      if (!isCanonicalPathEdge(edge)) {
+        if (edge.source === node.key) sourceIdentity = nodeIdentity;
+        if (edge.target === node.key) targetIdentity = nodeIdentity;
+      }
+      const normalized = normalizeEdge(edge, edges.size, true, sourceIdentity, targetIdentity);
       if (normalized) {
         edges.set(normalized.id, normalized);
-        if (!nodes.has(normalized.source)) addNode(nodes, edge.source ?? "");
-        if (!nodes.has(normalized.target)) {
-          addNode(nodes, { key: edge.target ?? "", table: edgeTargetTable(edge) });
-        }
+        if (!nodes.has(normalized.source) && sourceIdentity) addNode(nodes, sourceIdentity);
+        if (!nodes.has(normalized.target) && targetIdentity) addNode(nodes, targetIdentity);
       }
     }
 
-    for (const edge of node.edges ?? []) {
+    const connectedEdges = "edges" in node ? (node.edges ?? []) : [];
+    for (const edge of connectedEdges) {
       const normalized = normalizeEdge(
         edge,
         edges.size,
@@ -308,21 +299,12 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
     );
     for (const identity of pathNodes) addNode(nodes, identity, { resultCount: 1 });
     for (const [edgeIndex, edge] of (path.edges ?? []).entries()) {
-      if (!edge.source || !edge.target) continue;
       const { sourceIdentity, targetIdentity } = pathEdgeIdentities(edge, pathNodes, edgeIndex);
-      const normalized = normalizeEdge(
-        edge,
-        edges.size,
-        true,
-        sourceIdentity,
-        targetIdentity ?? { key: edge.target, table: edgeTargetTable(edge) }
-      );
+      const normalized = normalizeEdge(edge, edges.size, true, sourceIdentity, targetIdentity);
       if (!normalized) continue;
       edges.set(normalized.id, normalized);
-      if (!nodes.has(normalized.source)) addNode(nodes, sourceIdentity ?? edge.source);
-      if (!nodes.has(normalized.target)) {
-        addNode(nodes, targetIdentity ?? { key: edge.target, table: edgeTargetTable(edge) });
-      }
+      if (!nodes.has(normalized.source) && sourceIdentity) addNode(nodes, sourceIdentity);
+      if (!nodes.has(normalized.target) && targetIdentity) addNode(nodes, targetIdentity);
     }
   }
 
@@ -342,15 +324,9 @@ function nodeTypeColors() {
 function resultSummary(result: GraphQueryResult | null) {
   if (!result) return { total: 0, paths: 0 };
   if (result.kind === undefined) {
-    const legacy = graphVisualizationResult(result);
     return {
-      total:
-        legacy?.total ??
-        legacy?.stats?.returned_items ??
-        legacy?.nodes?.length ??
-        legacy?.paths?.length ??
-        0,
-      paths: legacy?.paths?.length ?? 0,
+      total: result.total ?? result.nodes?.length ?? result.paths?.length ?? 0,
+      paths: result.paths?.length ?? 0,
     };
   }
   switch (result.kind) {
