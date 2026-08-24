@@ -26,6 +26,16 @@ const CurrentLease = struct {
     }
 };
 
+const CurrentFenceFloor = struct {
+    value: u64,
+    etag: []u8,
+
+    fn deinit(self: *CurrentFenceFloor, alloc: Allocator) void {
+        alloc.free(self.etag);
+        self.* = undefined;
+    }
+};
+
 pub const ObjectWorkLeaseStore = struct {
     alloc: Allocator,
     client: objectstore.Client,
@@ -75,9 +85,10 @@ pub const ObjectWorkLeaseStore = struct {
 
         var current = try self.readCurrentAlloc(key);
         defer if (current) |*value| value.deinit(self.alloc);
+        if (current == null) return error.WorkLeaseRequiresPublishedHead;
 
         var took_over = false;
-        var fencing_token: u64 = 1;
+        var fencing_token: u64 = 0;
         if (current) |value| {
             if (!value.released and value.expires_at_unix_ns > now_unix_ns and
                 (value.owner_id == null or !std.mem.eql(u8, value.owner_id.?, owner_id)))
@@ -85,15 +96,11 @@ pub const ObjectWorkLeaseStore = struct {
                 return null;
             }
             if (value.released or value.expires_at_unix_ns <= now_unix_ns) {
-                fencing_token = if (value.fencing_token == 0)
-                    1
-                else
-                    std.math.add(u64, value.fencing_token, 1) catch {
-                        return error.LeaseFencingTokenExhausted;
-                    };
+                fencing_token = try self.reserveFencingToken(namespace, value.fencing_token);
                 took_over = !value.released;
             } else {
                 fencing_token = value.fencing_token;
+                try self.ensureFencingFloor(namespace, fencing_token);
             }
         }
 
@@ -306,6 +313,88 @@ pub const ObjectWorkLeaseStore = struct {
             current.released == expected.released;
     }
 
+    /// Allocate a token from a monotonic object that legacy HEAD writers do
+    /// not know about and therefore cannot erase. Tokens may be burned by a
+    /// lost HEAD CAS, but they can never be reused or move backwards.
+    fn reserveFencingToken(self: *ObjectWorkLeaseStore, namespace: []const u8, minimum: u64) !u64 {
+        const key = try fenceFloorKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        while (true) {
+            var current = try self.readFenceFloorAlloc(key);
+            defer if (current) |*value| value.deinit(self.alloc);
+            const floor = if (current) |value| @max(value.value, minimum) else minimum;
+            const proposed = std.math.add(u64, floor, 1) catch
+                return error.LeaseFencingTokenExhausted;
+            const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed});
+            defer self.alloc.free(payload);
+            var result = self.client.putObject(self.bucket, key, payload, .{
+                .content_type = "text/plain",
+                .if_none_match = current == null,
+                .if_match_etag = if (current) |value| value.etag else null,
+            }) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => {
+                    var observed = try self.readFenceFloorAlloc(key);
+                    defer if (observed) |*value| value.deinit(self.alloc);
+                    if (observed) |value| {
+                        // Equality does not prove that our request committed:
+                        // a concurrent allocator may have proposed the same
+                        // token. Advance again so an ambiguous result can burn
+                        // a token but can never hand it out twice.
+                        if (value.value >= proposed) continue;
+                    }
+                    return err;
+                },
+            };
+            defer result.deinit(self.alloc);
+            return proposed;
+        }
+    }
+
+    fn ensureFencingFloor(self: *ObjectWorkLeaseStore, namespace: []const u8, minimum: u64) !void {
+        const key = try fenceFloorKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        while (true) {
+            var current = try self.readFenceFloorAlloc(key);
+            defer if (current) |*value| value.deinit(self.alloc);
+            if (current) |value| {
+                if (value.value >= minimum) return;
+            }
+            const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{minimum});
+            defer self.alloc.free(payload);
+            var result = self.client.putObject(self.bucket, key, payload, .{
+                .content_type = "text/plain",
+                .if_none_match = current == null,
+                .if_match_etag = if (current) |value| value.etag else null,
+            }) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => {
+                    var observed = try self.readFenceFloorAlloc(key);
+                    defer if (observed) |*value| value.deinit(self.alloc);
+                    if (observed) |value| {
+                        if (value.value >= minimum) return;
+                    }
+                    return err;
+                },
+            };
+            defer result.deinit(self.alloc);
+            return;
+        }
+    }
+
+    fn readFenceFloorAlloc(self: *ObjectWorkLeaseStore, key: []const u8) !?CurrentFenceFloor {
+        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        const etag = result.metadata.etag orelse return error.MissingLeaseObjectEtag;
+        return .{
+            .value = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
+            .etag = try self.alloc.dupe(u8, etag),
+        };
+    }
+
     const vtable: work_lease.Provider.VTable = .{
         .acquire = erasedAcquire,
         .validate = erasedValidate,
@@ -371,6 +460,13 @@ fn keyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD", .{ prefix, namespace });
 }
 
+fn fenceFloorKeyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
+    if (prefix.len == 0) {
+        return try std.fmt.allocPrint(alloc, "{s}/HEAD_FENCE", .{namespace});
+    }
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD_FENCE", .{ prefix, namespace });
+}
+
 test "serverless object work lease fences stale owners and reconciles ambiguous acquisition" {
     const alloc = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(alloc);
@@ -386,14 +482,21 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
     defer store.deinit();
     const provider = store.provider();
 
+    var seed_client = memory.client();
+    var seed = try seed_client.putObject("leases", "tenant/docs/HEAD", "1", .{
+        .content_type = "text/plain",
+        .if_none_match = true,
+    });
+    seed.deinit(alloc);
+
     const first = (try provider.acquire("docs", "worker-a", 100, 10)).?;
     try std.testing.expectEqual(@as(u64, 1), first.fencing_token);
     try std.testing.expect(!(first.took_over));
     var legacy_client = memory.client();
     var legacy_head = try legacy_client.getObject("leases", "tenant/docs/HEAD", .{});
     defer legacy_head.deinit(alloc);
-    try std.testing.expectEqualStrings("0", legacy_head.body);
-    try std.testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, legacy_head.body, 10));
+    try std.testing.expectEqualStrings("1", legacy_head.body);
+    try std.testing.expectEqual(@as(u64, 1), try std.fmt.parseInt(u64, legacy_head.body, 10));
     try std.testing.expect((try provider.acquire("docs", "worker-b", 109, 10)) == null);
     try std.testing.expectError(
         error.WorkLeaseLost,
@@ -402,7 +505,7 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
 
     faults.commitNextPutThenFail(error.Timeout);
     const second = (try provider.acquire("docs", "worker-b", 110, 10)).?;
-    try std.testing.expectEqual(@as(u64, 2), second.fencing_token);
+    try std.testing.expectEqual(@as(u64, 3), second.fencing_token);
     try std.testing.expect(second.took_over);
     try std.testing.expectError(
         error.WorkLeaseLost,
@@ -412,7 +515,7 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
 
     try std.testing.expect(try provider.release("docs", "worker-b", second.fencing_token));
     const third = (try provider.acquire("docs", "worker-c", 112, 10)).?;
-    try std.testing.expectEqual(@as(u64, 3), third.fencing_token);
+    try std.testing.expectEqual(@as(u64, 4), third.fencing_token);
     try std.testing.expect(!third.took_over);
 }
 
@@ -438,24 +541,105 @@ test "serverless head publication atomically rejects a stale fencing token" {
     defer leases.deinit();
     const provider = leases.provider();
 
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+
     const stale = (try provider.acquire("docs", "worker-a", 100, 10)).?;
     const replacement = (try provider.acquire("docs", "worker-b", 110, 100)).?;
     try std.testing.expect(replacement.fencing_token > stale.fencing_token);
     try std.testing.expectError(
         error.WorkLeaseLost,
-        progress.compareAndSwapHeadFenced("docs", null, 1, .{
+        progress.compareAndSwapHeadFenced("docs", 1, 2, .{
             .owner_id = "worker-a",
             .fencing_token = stale.fencing_token,
         }),
     );
-    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", null, 1, .{
+    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", 1, 2, .{
         .owner_id = "worker-b",
         .fencing_token = replacement.fencing_token,
     }));
-    try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
+    try std.testing.expectEqual(@as(u64, 2), try progress.getHead("docs"));
     var legacy_client = memory.client();
     var legacy_head = try legacy_client.getObject("coordination", "tenant/docs/HEAD", .{});
     defer legacy_head.deinit(alloc);
-    try std.testing.expectEqualStrings("1", legacy_head.body);
-    try std.testing.expectEqual(@as(u64, 1), try std.fmt.parseInt(u64, legacy_head.body, 10));
+    try std.testing.expectEqualStrings("2", legacy_head.body);
+    try std.testing.expectEqual(@as(u64, 2), try std.fmt.parseInt(u64, legacy_head.body, 10));
+}
+
+test "serverless work lease preserves first publication for rolling rollback" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var store = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer store.deinit();
+
+    try std.testing.expectError(
+        error.WorkLeaseRequiresPublishedHead,
+        store.provider().acquire("docs", "new-worker", 100, 10),
+    );
+    var legacy_client = memory.client();
+    try std.testing.expectError(
+        error.FileNotFound,
+        legacy_client.getObject("coordination", "tenant/docs/HEAD", .{}),
+    );
+    var first_head = try legacy_client.putObject("coordination", "tenant/docs/HEAD", "1", .{
+        .content_type = "text/plain",
+        .if_none_match = true,
+    });
+    first_head.deinit(alloc);
+}
+
+test "serverless legacy head writer cannot reset the fencing epoch" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer leases.deinit();
+    const provider = leases.provider();
+
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+    const stale = (try provider.acquire("docs", "stable-owner", 100, 10)).?;
+    try std.testing.expectEqual(@as(u64, 1), stale.fencing_token);
+
+    var legacy_client = memory.client();
+    var current = try legacy_client.getObject("coordination", "tenant/docs/HEAD", .{});
+    const current_etag = try alloc.dupe(u8, current.metadata.etag.?);
+    current.deinit(alloc);
+    defer alloc.free(current_etag);
+    var legacy_publish = try legacy_client.putObject("coordination", "tenant/docs/HEAD", "2", .{
+        .content_type = "text/plain",
+        .if_match_etag = current_etag,
+    });
+    legacy_publish.deinit(alloc);
+
+    const replacement = (try provider.acquire("docs", "stable-owner", 101, 10)).?;
+    try std.testing.expect(replacement.fencing_token > stale.fencing_token);
+    try std.testing.expectError(
+        error.WorkLeaseLost,
+        progress.compareAndSwapHeadFenced("docs", 2, 3, .{
+            .owner_id = "stable-owner",
+            .fencing_token = stale.fencing_token,
+        }),
+    );
+    try std.testing.expect(try progress.compareAndSwapHeadFenced("docs", 2, 3, .{
+        .owner_id = "stable-owner",
+        .fencing_token = replacement.fencing_token,
+    }));
 }

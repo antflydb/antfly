@@ -170,17 +170,19 @@ pub const ManagedRuntime = struct {
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
-            const publish_stats = try self.publisher.runOnce();
+            const publish_stats = try self.publisher.runOnceUntil(&self.stop_requested);
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
             stats.work_lease_conflicts += publish_stats.lease_conflicts;
             stats.work_lease_takeovers += publish_stats.lease_takeovers;
         }
+        try self.cancellationCheckpoint();
 
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
+            try self.cancellationCheckpoint();
             const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -197,6 +199,7 @@ pub const ManagedRuntime = struct {
             effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
 
             if (self.enricher) |*enricher| {
+                try self.cancellationCheckpoint();
                 const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace.name) catch |err| switch (err) {
                     error.FileNotFound => null,
                     else => return err,
@@ -248,6 +251,7 @@ pub const ManagedRuntime = struct {
             }
 
             if (self.compactor) |*compactor| {
+                try self.cancellationCheckpoint();
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
                         var held_lease: ?build_mod.work_lease.HeldLease = null;
@@ -296,6 +300,7 @@ pub const ManagedRuntime = struct {
             }
 
             if (self.cfg.prune_enabled) {
+                try self.cancellationCheckpoint();
                 var result = self.pruner.pruneNamespace(namespace.name, policy.keep_latest_versions) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
@@ -372,6 +377,7 @@ pub const ManagedRuntime = struct {
         defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch |err| {
+                if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
                 lockAtomic(&self.failure_mu);
                 if (self.run_failure == null) self.run_failure = err;
                 self.failure_mu.unlock();
@@ -386,6 +392,11 @@ pub const ManagedRuntime = struct {
             };
             return;
         }
+    }
+
+    fn cancellationCheckpoint(self: *ManagedRuntime) !void {
+        if (self.stop_requested.load(.acquire)) return error.Canceled;
+        try self.io.checkCancel();
     }
 };
 
@@ -525,6 +536,12 @@ test "managed runtime publishes and prunes based on namespace policy" {
     const cumulative = runtime.metricsSnapshot();
     try std.testing.expectEqual(stats.published_namespaces, cumulative.published_namespaces);
     try std.testing.expectEqual(stats.pruned_namespaces, cumulative.pruned_namespaces);
+
+    // An already-expired shutdown budget cancels and joins the background
+    // task without converting expected teardown into a runtime failure.
+    try runtime.start();
+    runtime.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMillisecondsWithIo(runtime.io, 0));
+    try std.testing.expectEqual(@as(?anyerror, null), runtime.runtimeFailure());
 }
 
 test "managed runtime query-only role skips maintenance work" {
