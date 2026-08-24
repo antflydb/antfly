@@ -408,7 +408,7 @@ fn executeStep(
             .resource_id = emitted.resource_id,
             .payload_digest = emitted.payload_digest,
         });
-        if (recorder) |flight| try flight.recordEvent(transition_index.*, @intCast(ordinal), emitted, emitted.details);
+        if (recorder) |flight| try flight.recordEvent(transition_index.*, @intCast(ordinal), emitted);
     }
     last_digest.* = try recordObservation(Scenario, allocator, world, result, transition_index.*);
     const prior_failure_count = tracker.failureCount();
@@ -439,12 +439,11 @@ fn executeStep(
         .resource_id = selected_transition.resource_id,
         .payload_digest = outcome_event.payload_digest,
     });
-    if (recorder) |flight| try flight.recordEvent(
-        transition_index.*,
-        @intCast(events.events.items.len),
-        outcome_event,
-        transition_outcome.identity,
-    );
+    if (recorder) |flight| {
+        var detailed_outcome = outcome_event;
+        detailed_outcome.details = transition_outcome.identity;
+        try flight.recordEvent(transition_index.*, @intCast(events.events.items.len), detailed_outcome);
+    }
     if (transition_outcome.failureClass()) |failure_class| {
         // Property failures are materialized from the property tracker at the
         // end so their first-failure identity remains the single authority.

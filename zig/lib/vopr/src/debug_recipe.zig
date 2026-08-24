@@ -8,6 +8,7 @@ const causal = @import("causal.zig");
 const collector = @import("collector.zig");
 const debugger = @import("debugger.zig");
 const event_query = @import("event_query.zig");
+const flight_recorder = @import("flight_recorder.zig");
 const ids = @import("id.zig");
 const reducer = @import("reducer.zig");
 const replay = @import("replay.zig");
@@ -21,6 +22,15 @@ pub const QuerySpec = struct {
     query: event_query.Query,
 };
 
+pub const FlightConfig = struct {
+    capacity: usize = 1_024,
+    filter: flight_recorder.Filter = .{},
+    anchor_failure_transition: bool = true,
+    before_records: usize = 8,
+    after_records: usize = 8,
+    max_records: usize = 64,
+};
+
 pub const Config = struct {
     failure_ordinal: usize = 0,
     reduction: reducer.Config = .{ .max_attempts = 1_024 },
@@ -28,6 +38,9 @@ pub const Config = struct {
     event_queries: []const QuerySpec = &.{},
     collect_failure_window: bool = true,
     collector_future_choices: usize = 1,
+    /// Exact-replay the reduced artifact through a diagnostic-only recorder
+    /// and retain a configurable verbose before/after window.
+    flight: ?FlightConfig = .{},
 };
 
 pub const QueryResult = struct {
@@ -47,6 +60,12 @@ pub const CollectorRunner = struct {
 pub const RecipeRunner = struct {
     execution: reducer.ExecutionRunner,
     collectors: ?CollectorRunner = null,
+    flight_replay_fn: ?*const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        *const trace.Trace,
+        *flight_recorder.Recorder,
+    ) anyerror!trace.Trace = null,
 };
 
 pub const Package = struct {
@@ -57,8 +76,10 @@ pub const Package = struct {
     counterfactual_report: causal.CounterfactualReport,
     queries: []QueryResult,
     collectors: ?[3]collector.Sink,
+    flight: ?flight_recorder.Snapshot,
 
     pub fn deinit(self: *Package) void {
+        if (self.flight) |*snapshot_value| snapshot_value.deinit();
         if (self.collectors) |*window| for (window) |*sink| sink.deinit();
         for (self.queries) |query| {
             self.allocator.free(query.name);
@@ -99,6 +120,14 @@ pub const Package = struct {
             },
             .event_queries = self.queries,
             .collectors = collectors,
+            .flight_recorder = if (self.flight) |*snapshot_value| .{
+                .format = flight_recorder.format,
+                .trigger = snapshot_value.trigger,
+                .dropped = snapshot_value.dropped,
+                .matched = snapshot_value.matched,
+                .filtered_out = snapshot_value.filtered_out,
+                .records = snapshot_value.records,
+            } else null,
         }, .{ .whitespace = .indent_2 });
     }
 };
@@ -127,6 +156,27 @@ pub fn run(
             return replay.exact(Scenario, child_allocator, artifact);
         }
 
+        fn flightReplay(
+            _: ?*anyopaque,
+            child_allocator: std.mem.Allocator,
+            artifact: *const trace.Trace,
+            recorder: *flight_recorder.Recorder,
+        ) !trace.Trace {
+            var source = @import("choice.zig").Replay{ .records = artifact.choices.items };
+            var replayed = try execution_runner.run(Scenario, child_allocator, source.source(), blk: {
+                var runner_config = runnerConfigFromArtifact(artifact);
+                runner_config.flight_recorder = recorder;
+                break :blk runner_config;
+            });
+            errdefer replayed.deinit();
+            const expected = try artifact.renderAlloc(child_allocator);
+            defer child_allocator.free(expected);
+            const actual = try replayed.renderAlloc(child_allocator);
+            defer child_allocator.free(actual);
+            if (!std.mem.eql(u8, expected, actual)) return error.VoprReplayArtifactDiverged;
+            return replayed;
+        }
+
         fn collect(
             _: ?*anyopaque,
             child_allocator: std.mem.Allocator,
@@ -139,6 +189,7 @@ pub fn run(
     return runWithRunner(allocator, original, config, .{
         .execution = .{ .run_fn = Adapter.runCandidate, .replay_fn = Adapter.exactReplay },
         .collectors = if (@hasDecl(Scenario, "collect")) .{ .collect_fn = Adapter.collect } else null,
+        .flight_replay_fn = Adapter.flightReplay,
     });
 }
 
@@ -212,6 +263,34 @@ pub fn runWithRunner(
         }
         collectors = window;
     }
+    var flight: ?flight_recorder.Snapshot = null;
+    errdefer if (flight) |*snapshot_value| snapshot_value.deinit();
+    if (config.flight) |flight_config| {
+        if (flight_config.capacity == 0) return error.InvalidFlightRecorderCapacity;
+        var recorder = try flight_recorder.Recorder.init(allocator, flight_config.capacity);
+        defer recorder.deinit();
+        const flight_replay_fn = scenario_runner.flight_replay_fn orelse
+            return error.DebugRecipeFlightRecorderUnsupported;
+        var replayed = try flight_replay_fn(
+            scenario_runner.execution.context,
+            allocator,
+            &reduced.artifact,
+            &recorder,
+        );
+        replayed.deinit();
+        var filter = flight_config.filter;
+        if (flight_config.anchor_failure_transition) {
+            const failure_index = reduced.artifact.failures.items[reduced_failure_ordinal].index;
+            filter.first_index = @max(filter.first_index, failure_index);
+            filter.last_index = @min(filter.last_index, failure_index);
+        }
+        flight = try recorder.materializeWindow(allocator, .debugger, .{
+            .filter = filter,
+            .before_records = flight_config.before_records,
+            .after_records = flight_config.after_records,
+            .max_records = flight_config.max_records,
+        });
+    }
     return .{
         .allocator = allocator,
         .fingerprint = fingerprint,
@@ -220,6 +299,7 @@ pub fn runWithRunner(
         .counterfactual_report = counterfactual_report,
         .queries = queries,
         .collectors = collectors,
+        .flight = flight,
     };
 }
 
@@ -306,8 +386,11 @@ test "automatic debug recipe packages reduction causality queries and collectors
     defer package.deinit();
     try std.testing.expectEqual(@as(usize, 1), package.queries[0].matches.len);
     try std.testing.expect(package.collectors != null);
+    try std.testing.expect(package.flight != null);
+    try std.testing.expectEqualStrings("bad", package.flight.?.records[0].details);
     const rendered = try package.renderAlloc(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, format) != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "counterfactual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, flight_recorder.format) != null);
 }

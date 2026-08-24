@@ -37,7 +37,11 @@ pub const AggregateHealth = struct {
 };
 
 pub const Aggregate = struct {
+    run_id: []const u8,
     scenario: []const u8,
+    source_revision: []const u8,
+    target: []const u8,
+    optimize: []const u8,
     base_seed: u64,
     histories_limit: u64,
     histories_consumed: u64,
@@ -65,7 +69,11 @@ pub const Aggregate = struct {
     pub fn renderJsonAlloc(self: Aggregate, allocator: std.mem.Allocator) ![]u8 {
         return std.json.Stringify.valueAlloc(allocator, .{
             .format = aggregate_format,
+            .run_id = self.run_id,
             .scenario = self.scenario,
+            .source_revision = self.source_revision,
+            .target = self.target,
+            .optimize = self.optimize,
             .base_seed = self.base_seed,
             .budget = .{
                 .histories_limit = self.histories_limit,

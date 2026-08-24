@@ -2089,6 +2089,7 @@ pub fn runDistributedDataVoprCampaignWithChoices(
     alloc: std.mem.Allocator,
     config: DistributedDataVoprCampaignConfig,
     source: vopr.choice.Source,
+    flight_recorder: ?*vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
     try config.validate();
     var context = DistributedDataVoprContext{ .config = config };
@@ -2109,6 +2110,7 @@ pub fn runDistributedDataVoprCampaignWithChoices(
         .target = "native",
         .optimize = "test",
         .scenario_context = &context,
+        .flight_recorder = flight_recorder,
     });
 }
 
@@ -2117,7 +2119,7 @@ pub fn recordDistributedDataVoprCampaign(
     config: DistributedDataVoprCampaignConfig,
 ) !vopr.trace.Trace {
     var seeded = vopr.choice.Seeded.init(config.seed);
-    return try runDistributedDataVoprCampaignWithChoices(alloc, config, seeded.source());
+    return try runDistributedDataVoprCampaignWithChoices(alloc, config, seeded.source(), null);
 }
 
 pub fn replayDistributedDataVoprCampaign(
@@ -6175,6 +6177,7 @@ const MetadataVoprDriver = struct {
     cfg: MetadataVoprCampaignConfig,
     source: vopr.choice.Source,
     artifact: ?vopr.trace.Trace,
+    flight_recorder: ?*vopr.flight_recorder.Recorder,
     state: MetadataVoprCampaignState = .{},
     occurrence: u64 = 0,
     last_committed: [3]u64 = @splat(0),
@@ -6197,6 +6200,7 @@ const MetadataVoprDriver = struct {
         cluster: *MetadataHttpClusterSimulation,
         cfg: MetadataVoprCampaignConfig,
         source: vopr.choice.Source,
+        flight_recorder: ?*vopr.flight_recorder.Recorder,
     ) !MetadataVoprDriver {
         try cfg.validate();
         var scenario_parameters = [_]vopr.trace.Parameter{
@@ -6219,6 +6223,7 @@ const MetadataVoprDriver = struct {
             .cluster = cluster,
             .cfg = cfg,
             .source = source,
+            .flight_recorder = flight_recorder,
             .artifact = try vopr.trace.Trace.init(alloc, .{
                 .system = "antfly",
                 .scenario = "metadata-vopr",
@@ -6655,6 +6660,45 @@ const MetadataVoprDriver = struct {
             .resource_id = selected.transition.resource_id,
             .payload_digest = @bitCast(selected.transition.parameter),
         });
+        if (self.flight_recorder) |recorder| {
+            var source_buffer: [32]u8 = undefined;
+            var target_buffer: [32]u8 = undefined;
+            var parameter_buffer: [32]u8 = undefined;
+            const source = if (selected.source_node_id) |node_id|
+                try std.fmt.bufPrint(&source_buffer, "{d}", .{node_id})
+            else
+                "none";
+            const target = if (selected.target_node_id) |node_id|
+                try std.fmt.bufPrint(&target_buffer, "{d}", .{node_id})
+            else
+                "none";
+            const parameter = try std.fmt.bufPrint(&parameter_buffer, "{d}", .{selected.transition.parameter});
+            const details = try std.fmt.allocPrint(
+                self.alloc,
+                "action={s} kind={s} source={s} target={s} parameter={s} quiet={}",
+                .{ @tagName(selected.action), @tagName(selected.transition.kind), source, target, parameter, self.quiet_mode },
+            );
+            defer self.alloc.free(details);
+            try recorder.record(.{
+                .index = self.occurrence,
+                .ordinal = 0,
+                .id = vopr.id.stable("event", "metadata.action_applied"),
+                .name = "metadata.action_applied",
+                .kind = .state_change,
+                .actor_id = selected.transition.actor_id,
+                .resource_id = selected.transition.resource_id,
+                .payload_digest = @bitCast(selected.transition.parameter),
+                .details = details,
+                .fields = &.{
+                    .{ .name = "action", .value = @tagName(selected.action) },
+                    .{ .name = "transition_kind", .value = @tagName(selected.transition.kind) },
+                    .{ .name = "source_node", .value = source },
+                    .{ .name = "target_node", .value = target },
+                    .{ .name = "parameter", .value = parameter },
+                    .{ .name = "quiet_mode", .value = if (self.quiet_mode) "true" else "false" },
+                },
+            });
+        }
         _ = try self.recordObservation(self.occurrence);
         try self.evaluateProperties(self.occurrence);
     }
@@ -7476,7 +7520,16 @@ pub fn runMetadataVoprCampaignWithChoices(
     cfg: MetadataVoprCampaignConfig,
     source: vopr.choice.Source,
 ) !vopr.trace.Trace {
-    return try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, source, null);
+    return try runMetadataVoprCampaignWithChoicesAndRecorder(alloc, cfg, source, null);
+}
+
+pub fn runMetadataVoprCampaignWithChoicesAndRecorder(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    return try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, source, null, recorder);
 }
 
 fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
@@ -7484,6 +7537,7 @@ fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
     cfg: MetadataVoprCampaignConfig,
     source: vopr.choice.Source,
     raft_trace_writer: ?*std.Io.Writer,
+    recorder: ?*vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
     var scratch = try MetadataVoprScratch.init(alloc);
     defer scratch.deinit();
@@ -7538,7 +7592,7 @@ fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
 
     _ = try startBootstrappedMetadataCluster(&cluster, 48, true);
 
-    var driver = try MetadataVoprDriver.init(alloc, &cluster, cfg, source);
+    var driver = try MetadataVoprDriver.init(alloc, &cluster, cfg, source, recorder);
     defer driver.deinit();
     if (cfg.workload == .smoke) {
         try driver.runActions(cfg.operation_count);
@@ -7580,7 +7634,7 @@ fn replayMetadataVoprCampaignWithRaftTrace(
 ) !vopr.trace.Trace {
     const cfg = try MetadataVoprCampaignConfig.fromTrace(recorded);
     var replay_source = vopr.choice.Replay{ .records = recorded.choices.items };
-    var replayed = try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, replay_source.source(), writer);
+    var replayed = try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, replay_source.source(), writer, null);
     errdefer replayed.deinit();
     const expected = try recorded.renderAlloc(alloc);
     defer alloc.free(expected);
