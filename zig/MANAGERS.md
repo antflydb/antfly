@@ -760,9 +760,10 @@ concurrency sweep, and a longer 1M/1% posting-maintenance/query soak. The
 driver fails production runs below 150 QPS at 50k/1%, below 80% of matched
 unfiltered QPS at 1M/1%, when 1% selectivity regresses below 70% of the matched
 10% lane, when the maximum thread lane falls below 70% of one-thread QPS, when
-RSS exceeds 125% of the explicit process envelope, when HBC-accounted bytes
-exceed that envelope, when the maintenance soak falls below 70% of its base
-lane, or without separately populated cold/warm phases. The release-blocker
+the maximum load or search RSS across successful recorded cases exceeds 125%
+of the explicit process envelope, when their maximum HBC-accounted bytes
+exceed that envelope, when the maintenance soak falls below 70% of its
+base lane, or without separately populated cold/warm phases. The release-blocker
 recall suite runs before an evidence-producing matrix.
 Run the reduced
 endpoint/integration check before the evidence-producing matrix:

@@ -218,6 +218,18 @@ summary_value() {
     'map(select(.case == $case_name)) | last | .[$field] // 0' "$SUMMARY_FILE"
 }
 
+summary_budget_max() {
+  local budget_mb="$1"
+  local field="$2"
+  jq -sr --rawfile status "$STATUS_FILE" --arg suffix "-m${budget_mb}" --arg field "$field" '
+    ($status | split("\n") | map(split("\t") | select(length >= 2))
+      | reduce .[] as $row ({}; .[$row[0]] = $row[1])) as $latest_status
+    | map(. as $row | select(($row.case | endswith($suffix)) and $latest_status[$row.case] == "0"))
+    | group_by(.case) | map(last)
+    | map(.[$field] // 0) | max // 0
+  ' "$SUMMARY_FILE"
+}
+
 thread_sweep_qps() {
   local case_name="$1"
   local target_threads="$2"
@@ -247,8 +259,9 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
       cold_us="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" http_first_pass_us)"
       warm_us="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" http_later_pass_us)"
       filtered_10_qps="$(summary_value "dense-filter-p10-1000000-m${budget_mb}" concurrent_qps)"
-      search_rss_bytes="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" search_rss_peak_bytes)"
-      hbc_accounted_bytes="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" hbc_accounted_bytes)"
+      load_rss_bytes="$(summary_budget_max "$budget_mb" load_rss_peak_bytes)"
+      search_rss_bytes="$(summary_budget_max "$budget_mb" search_rss_peak_bytes)"
+      hbc_accounted_bytes="$(summary_budget_max "$budget_mb" hbc_accounted_bytes)"
       one_thread_qps="$(thread_sweep_qps "dense-filter-p1-1000000-m${budget_mb}" 1)"
       max_thread_qps="$(thread_sweep_qps "dense-filter-p1-1000000-m${budget_mb}" "$SEARCH_THREADS")"
       required_1m_qps="$(awk -v qps="$dense_1m_qps" -v ratio="$MIN_1M_FILTER_TO_DENSE_RATIO" 'BEGIN { printf "%.6f", qps * ratio }')"
@@ -276,8 +289,13 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
           "$one_thread_qps" "$SEARCH_THREADS" "$max_thread_qps" "$required_thread_qps" "$budget_mb" >&2
         FAILURES=$((FAILURES + 1))
       fi
+      if ! gate_float_le "$load_rss_bytes" "$allowed_rss_bytes"; then
+        printf 'gate failed: maximum load rss bytes=%s allowed=%s budget_mb=%s ratio=%s\n' \
+          "$load_rss_bytes" "$allowed_rss_bytes" "$budget_mb" "$MAX_RSS_TO_BUDGET_RATIO" >&2
+        FAILURES=$((FAILURES + 1))
+      fi
       if ! gate_float_le "$search_rss_bytes" "$allowed_rss_bytes"; then
-        printf 'gate failed: search rss bytes=%s allowed=%s budget_mb=%s ratio=%s\n' \
+        printf 'gate failed: maximum search rss bytes=%s allowed=%s budget_mb=%s ratio=%s\n' \
           "$search_rss_bytes" "$allowed_rss_bytes" "$budget_mb" "$MAX_RSS_TO_BUDGET_RATIO" >&2
         FAILURES=$((FAILURES + 1))
       fi

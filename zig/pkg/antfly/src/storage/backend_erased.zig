@@ -634,6 +634,10 @@ pub const Store = struct {
         for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayCallback) anyerror!backend_types.ReplayLaneIterationStats = null,
         for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
+        // Append-only optional ABI extensions: older stores retain their
+        // original transaction layout and fall back to ordinary admission.
+        begin_read_with_block_cache_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn = null,
+        begin_probe_with_block_cache_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission) anyerror!ProbeTxn = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -650,11 +654,25 @@ pub const Store = struct {
         return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
     }
 
+    pub fn beginReadWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ReadTxn {
+        if (self.vtable.begin_read_with_block_cache_admission) |begin_read| {
+            return try BoundaryAbi.call("begin_read_with_block_cache_admission", self.boundary_dispatch, begin_read, .{ self.allocator, self.ptr, admission });
+        }
+        return try self.beginRead();
+    }
+
     pub fn beginProbe(self: *Store) !ProbeTxn {
         if (self.vtable.begin_probe) |begin_probe| {
             return try BoundaryAbi.call("begin_probe", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr });
         }
         return try probeTxnFrom(self.allocator, try self.beginRead());
+    }
+
+    pub fn beginProbeWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ProbeTxn {
+        if (self.vtable.begin_probe_with_block_cache_admission) |begin_probe| {
+            return try BoundaryAbi.call("begin_probe_with_block_cache_admission", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr, admission });
+        }
+        return try self.beginProbe();
     }
 
     pub fn beginCurrentScan(self: *Store) !CurrentScanTxn {
@@ -1483,6 +1501,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
+        fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
+            if (Handle == Store) {
+                return try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission);
+            }
+            return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission));
+        }
+
         fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginProbe();
@@ -1491,6 +1516,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                 return try probeTxnFrom(alloc, try unbox(ptr).handle.beginProbe());
             }
             return try probeTxnFrom(alloc, try unbox(ptr).handle.beginRead());
+        }
+
+        fn beginProbeWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ProbeTxn {
+            if (Handle == Store) {
+                return try unbox(ptr).handle.beginProbeWithBlockCacheAdmission(admission);
+            }
+            return try probeTxnFrom(alloc, try unbox(ptr).handle.beginProbeWithBlockCacheAdmission(admission));
         }
 
         fn beginCurrentScan(alloc: Allocator, ptr: *anyopaque) anyerror!CurrentScanTxn {
@@ -1712,7 +1744,9 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
+            .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,
             .begin_current_scan = if (Handle == Store or @hasDecl(Handle, "beginCurrentScan")) vt.beginCurrentScan else null,
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
