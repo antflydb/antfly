@@ -103,7 +103,7 @@ const managed_complete_id = vopr.id.stable("property", "db-index.managed-race-co
 
 pub const ManagedAdmissionScenario = struct {
     pub const name: []const u8 = "db-index-managed-admission-race";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
     pub const properties = &[_]vopr.property.Declaration{
         .{ .id = managed_linearizable_id, .name = name ++ ".linearizable", .kind = .always },
         .{ .id = managed_cleanup_id, .name = name ++ ".cleanup", .kind = .always },
@@ -114,6 +114,7 @@ pub const ManagedAdmissionScenario = struct {
         fixture: *Fixture,
         materialized: bool = false,
         materialize_saw_marker: bool = false,
+        materialize_expected_marker: bool = false,
         deleted: bool = false,
         actions: u8 = 0,
     };
@@ -156,6 +157,7 @@ pub const ManagedAdmissionScenario = struct {
 
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
         if (selected.id == materialize_id) {
+            world.materialize_expected_marker = !world.deleted;
             world.materialize_saw_marker = (try world.fixture.db.materializeManagedIndexAdmission(
                 allocator,
                 managed_name,
@@ -172,6 +174,8 @@ pub const ManagedAdmissionScenario = struct {
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         try builder.addNamed(allocator, name ++ ".actions", world.actions);
         try builder.addNamed(allocator, name ++ ".materialized", @intFromBool(world.materialized));
+        try builder.addNamed(allocator, name ++ ".materialize-saw-marker", @intFromBool(world.materialize_saw_marker));
+        try builder.addNamed(allocator, name ++ ".materialize-expected-marker", @intFromBool(world.materialize_expected_marker));
         try builder.addNamed(allocator, name ++ ".deleted", @intFromBool(world.deleted));
     }
 
@@ -180,7 +184,11 @@ pub const ManagedAdmissionScenario = struct {
         const complete = world.materialized and world.deleted;
         // Materialization observes the marker iff deletion has not already
         // committed catalog absence. Both orders converge to the same cleanup.
-        try sink.check(allocator, managed_linearizable_id, !world.materialize_saw_marker or world.actions >= 1);
+        try sink.check(
+            allocator,
+            managed_linearizable_id,
+            !world.materialized or world.materialize_saw_marker == world.materialize_expected_marker,
+        );
         try sink.check(allocator, managed_cleanup_id, !complete or !pending);
         try sink.check(allocator, managed_complete_id, complete);
     }

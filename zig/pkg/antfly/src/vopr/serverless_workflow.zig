@@ -26,11 +26,12 @@ const runtime_manager = @import("../serverless/runtime/manager.zig");
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
     const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
     const stale_fenced_id = vopr.id.stable(name, "stale-owner-fenced-at-publication");
+    const legacy_epoch_id = vopr.id.stable(name, "legacy-head-rewrite-preserves-fencing-epoch");
     const duplicate_serialized_id = vopr.id.stable(name, "duplicate-workers-serialized");
     const recovery_id = vopr.id.stable(name, "interrupted-workflow-recovers");
     const compacted_id = vopr.id.stable(name, "compaction-publishes-complete-head");
@@ -39,6 +40,7 @@ pub const Scenario = struct {
         .{ .id = no_lost_documents_id, .name = name ++ ".no-lost-documents", .kind = .always },
         .{ .id = catalog_visible_id, .name = name ++ ".catalog-visible-after-cutover", .kind = .always },
         .{ .id = stale_fenced_id, .name = name ++ ".stale-owner-fenced-at-publication", .kind = .always },
+        .{ .id = legacy_epoch_id, .name = name ++ ".legacy-head-rewrite-preserves-fencing-epoch", .kind = .always },
         .{ .id = duplicate_serialized_id, .name = name ++ ".duplicate-workers-serialized", .kind = .always },
         .{ .id = recovery_id, .name = name ++ ".interrupted-workflow-recovers", .kind = .reachable },
         .{ .id = compacted_id, .name = name ++ ".compaction-publishes-complete-head", .kind = .reachable },
@@ -48,6 +50,7 @@ pub const Scenario = struct {
         clean,
         duplicate_workers,
         lease_takeover,
+        legacy_head_rewrite,
         ambiguous_publish,
         cancellation,
         retry,
@@ -59,6 +62,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "clean"),
         vopr.id.stable(name, "duplicate-workers"),
         vopr.id.stable(name, "lease-takeover"),
+        vopr.id.stable(name, "legacy-head-rewrite"),
         vopr.id.stable(name, "ambiguous-publish"),
         vopr.id.stable(name, "cancellation"),
         vopr.id.stable(name, "retry"),
@@ -69,6 +73,7 @@ pub const Scenario = struct {
         name ++ ".clean",
         name ++ ".duplicate_workers",
         name ++ ".lease_takeover",
+        name ++ ".legacy_head_rewrite",
         name ++ ".ambiguous_publish",
         name ++ ".cancellation",
         name ++ ".retry",
@@ -108,6 +113,7 @@ pub const Scenario = struct {
         first_attempt_interrupted: bool = false,
         duplicate_blocked: bool = false,
         stale_fenced: bool = false,
+        legacy_epoch_preserved: bool = false,
         recovered: bool = false,
         final_head: u64 = 0,
         visible_document_mask: u8 = 0,
@@ -217,6 +223,7 @@ pub const Scenario = struct {
             self.first_attempt_interrupted = false;
             self.duplicate_blocked = false;
             self.stale_fenced = false;
+            self.legacy_epoch_preserved = false;
             self.recovered = false;
             self.final_head = 0;
             self.visible_document_mask = 0;
@@ -322,51 +329,10 @@ pub const Scenario = struct {
                 .clean, .compaction_crash => {
                     _ = try self.runtime.runOnce();
                 },
-                .duplicate_workers => {
-                    var incumbent = (try build_mod.work_lease.acquireHeld(
-                        self.lease_impl.provider(),
-                        self.sim.io(),
-                        "docs",
-                        "worker-incumbent",
-                        100,
-                    )).?;
-                    const contender = try self.runtime.runOnce();
-                    self.duplicate_blocked = contender.work_lease_conflicts == 1 and
-                        (self.progress.getHead("docs") catch 0) == 0;
-                    var published = try self.catalog.buildNamespaceGuarded(
-                        "docs",
-                        incumbent.guard(),
-                    );
-                    published.deinit(self.alloc);
-                    _ = try incumbent.release();
-                    _ = try self.runtime.runOnce();
-                },
-                .lease_takeover => {
-                    var stale = (try build_mod.work_lease.acquireHeld(
-                        self.lease_impl.provider(),
-                        self.sim.io(),
-                        "docs",
-                        "worker-stale",
-                        10,
-                    )).?;
-                    try self.sim.jumpRealtime(10);
-                    var replacement = (try build_mod.work_lease.acquireHeld(
-                        self.lease_impl.provider(),
-                        self.sim.io(),
-                        "docs",
-                        "worker-replacement",
-                        100,
-                    )).?;
-                    if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
-                        var owned = result.*;
-                        owned.deinit(self.alloc);
-                        return error.StaleWorkerPublished;
-                    } else |err| {
-                        if (err != error.WorkLeaseLost) return err;
-                        self.stale_fenced = true;
-                        self.first_attempt_interrupted = true;
-                    }
-                    _ = try replacement.release();
+                .duplicate_workers, .lease_takeover, .legacy_head_rewrite => {
+                    // First publication is protected by the absent-to-present
+                    // HEAD CAS and intentionally does not create a lease
+                    // placeholder that would wedge an older publisher.
                     _ = try self.runtime.runOnce();
                 },
                 .ambiguous_publish => {
@@ -409,7 +375,87 @@ pub const Scenario = struct {
 
         fn runSecondPublicationAndCompaction(self: *State) !void {
             try self.ingest("doc-b", "beta gamma", 200);
-            if (self.mode == .compaction_crash) {
+            if (self.mode == .duplicate_workers) {
+                var incumbent = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-incumbent",
+                    100,
+                )).?;
+                const contender = try self.runtime.runOnce();
+                self.duplicate_blocked = contender.work_lease_conflicts == 1 and
+                    try self.progress.getHead("docs") == 1;
+                var published = try self.catalog.buildNamespaceGuarded(
+                    "docs",
+                    incumbent.guard(),
+                );
+                published.deinit(self.alloc);
+                _ = try incumbent.release();
+                _ = try self.runtime.runOnce();
+            } else if (self.mode == .lease_takeover) {
+                var stale = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-stale",
+                    10,
+                )).?;
+                try self.sim.jumpRealtime(10);
+                var replacement = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-replacement",
+                    100,
+                )).?;
+                if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleWorkerPublished;
+                } else |err| {
+                    if (err != error.WorkLeaseLost) return err;
+                    self.stale_fenced = true;
+                    self.first_attempt_interrupted = true;
+                }
+                _ = try replacement.release();
+                _ = try self.runtime.runOnce();
+            } else if (self.mode == .legacy_head_rewrite) {
+                var stale = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "stable-owner",
+                    100,
+                )).?;
+                var legacy_client = self.memory.client();
+                var current = try legacy_client.getObject("workflow-progress", "tenant/docs/HEAD", .{});
+                const current_etag = try self.alloc.dupe(u8, current.metadata.etag.?);
+                current.deinit(self.alloc);
+                defer self.alloc.free(current_etag);
+                var legacy_write = try legacy_client.putObject("workflow-progress", "tenant/docs/HEAD", "1", .{
+                    .content_type = "text/plain",
+                    .if_match_etag = current_etag,
+                });
+                legacy_write.deinit(self.alloc);
+                var replacement = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "stable-owner",
+                    100,
+                )).?;
+                self.legacy_epoch_preserved = replacement.acquisition.fencing_token > stale.acquisition.fencing_token;
+                if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleWorkerPublishedAfterLegacyRewrite;
+                } else |err| {
+                    if (err != error.WorkLeaseLost) return err;
+                }
+                _ = try replacement.release();
+                _ = try self.runtime.runOnce();
+            } else if (self.mode == .compaction_crash) {
                 var builder_lease = (try build_mod.work_lease.acquireHeld(
                     self.lease_impl.provider(),
                     self.sim.io(),
@@ -525,6 +571,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".documents", world.state.visible_document_mask);
         try builder.addNamed(allocator, name ++ ".interrupted", @intFromBool(world.state.first_attempt_interrupted));
         try builder.addNamed(allocator, name ++ ".compacted", @intFromBool(world.state.compacted));
+        try builder.addNamed(allocator, name ++ ".legacy-epoch-preserved", @intFromBool(world.state.legacy_epoch_preserved));
     }
 
     pub fn evaluate(
@@ -547,6 +594,11 @@ pub const Scenario = struct {
             allocator,
             stale_fenced_id,
             state.mode != .lease_takeover or state.stale_fenced,
+        );
+        try sink.check(
+            allocator,
+            legacy_epoch_id,
+            state.mode != .legacy_head_rewrite or state.legacy_epoch_preserved,
         );
         try sink.check(
             allocator,

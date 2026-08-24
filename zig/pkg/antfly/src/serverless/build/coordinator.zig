@@ -110,11 +110,22 @@ pub const BackgroundPublisher = struct {
     }
 
     pub fn runOnce(self: *BackgroundPublisher) !PublishRunStats {
+        return self.runOnceUntil(null);
+    }
+
+    pub fn runOnceUntil(
+        self: *BackgroundPublisher,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !PublishRunStats {
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         for (namespaces) |namespace| {
+            if (cancel_requested) |requested| {
+                if (requested.load(.acquire)) return error.Canceled;
+            }
+            try self.io.checkCancel();
             var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
@@ -129,19 +140,25 @@ pub const BackgroundPublisher = struct {
             }
 
             var held_lease: ?work_lease.HeldLease = null;
-            if (self.lease_provider) |provider| {
-                held_lease = try work_lease.acquireHeld(
-                    provider,
-                    self.io,
-                    namespace.name,
-                    self.lease_owner_id orelse return error.MissingLeaseOwner,
-                    self.lease_ttl_ns,
-                );
-                if (held_lease == null) {
-                    stats.lease_conflicts += 1;
-                    continue;
+            // The absent-to-first-HEAD CAS is already the atomic publication
+            // fence. Avoid materializing a HEAD=0 lease placeholder, which
+            // older publishers interpret as an existing head and cannot
+            // replace during a rolling rollback.
+            if (status.head_version != 0) {
+                if (self.lease_provider) |provider| {
+                    held_lease = try work_lease.acquireHeld(
+                        provider,
+                        self.io,
+                        namespace.name,
+                        self.lease_owner_id orelse return error.MissingLeaseOwner,
+                        self.lease_ttl_ns,
+                    );
+                    if (held_lease == null) {
+                        stats.lease_conflicts += 1;
+                        continue;
+                    }
+                    if (held_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
                 }
-                if (held_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
             }
             defer if (held_lease) |*lease| {
                 _ = lease.release() catch {};
@@ -154,6 +171,13 @@ pub const BackgroundPublisher = struct {
             ) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;
+                    continue;
+                },
+                error.WorkLeaseLost => {
+                    // Takeover after acquisition is expected contention. The
+                    // stale worker is fenced at publication and the publisher
+                    // must remain available for later namespaces and ticks.
+                    stats.lease_conflicts += 1;
                     continue;
                 },
                 error.FileNotFound => {
@@ -178,7 +202,8 @@ pub const BackgroundPublisher = struct {
 
     fn runLoop(self: *BackgroundPublisher) void {
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch |err| {
+            _ = self.runOnceUntil(&self.stop_requested) catch |err| {
+                if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
                 lockAtomic(&self.failure_mu);
                 if (self.run_failure == null) self.run_failure = err;
                 self.failure_mu.unlock();
@@ -263,6 +288,9 @@ test "serverless background publisher publishes once and stop wakes a long idle 
     try std.testing.expectEqual(@as(usize, 1), published.published_namespaces);
     try std.testing.expectEqual(@as(usize, 0), published.head_conflicts);
     try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, publisher.runOnceUntil(&canceled));
 
     try publisher.start();
     var attempts: usize = 0;
