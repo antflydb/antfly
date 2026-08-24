@@ -1123,7 +1123,7 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
-    retained_vector_cache_enabled: bool,
+    retained_vector_cache_enabled: ?bool,
     // Background lane used by algebraic indexes to run HLL cardinality
     // maintenance off the foreground write path. Attached after construction
     // via attachHllMaintenance(); when null, maintenance runs inline.
@@ -2492,6 +2492,12 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    fn retainedVectorCacheEnabled(self: *const IndexManager) bool {
+        if (self.retained_vector_cache_enabled) |enabled| return enabled;
+        const manager = self.resource_manager orelse return false;
+        return manager.hbcCachePolicy().target_bytes > 0;
+    }
+
     fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
         const zpath = try self.alloc.dupeZ(u8, path);
         defer self.alloc.free(zpath);
@@ -2534,7 +2540,7 @@ pub const IndexManager = struct {
         });
         errdefer index.close();
 
-        index.setRetainedVectorCacheEnabled(self.retained_vector_cache_enabled);
+        index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -10892,7 +10898,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
-                index.setRetainedVectorCacheEnabled(self.retained_vector_cache_enabled);
+                index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {
                     index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -25474,7 +25480,9 @@ test "dense index manager accepts external embedding indexes without enrichments
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .retained_vector_cache_enabled = false,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -25534,7 +25542,6 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     var manager = try IndexManager.initWithOptions(alloc, path, .{
         .resource_manager = &resource_manager,
         .hbc_cache = &hbc_cache,
-        .retained_vector_cache_enabled = true,
     });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });

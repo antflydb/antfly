@@ -452,12 +452,14 @@ exact-vector cache is a derivative read optimization, not a second database:
    computes the exact distance, and may admit a retained copy;
 4. eviction drops only that retained copy and never changes durable state.
 
-Production `IndexManager` instances default retained decoded-vector caching
-off. Enabling `IndexBackendOptions.retained_vector_cache_enabled` is an
-explicit opt-in; after opt-in, ResourceManager still owns the byte target,
-pressure sampling, admission, and eviction. This separates the product-safe
-default from direct HBC library tests and experiments that intentionally warm
-decoded vectors.
+Production `IndexManager` instances use an adaptive retained decoded-vector
+policy by default. `IndexBackendOptions.retained_vector_cache_enabled = null`
+enables the path only when ResourceManager derives nonzero capacity; `false`
+is a hard operator opt-out and `true` permits governed retention. In adaptive
+and enabled modes ResourceManager still owns the byte target, pressure
+sampling, admission, and eviction. A 1M/768-dimensional production-shaped
+run with retention forced off fell from the governed-cache baseline of about
+236 QPS to about 44 QPS, so unconditional disablement is not a viable default.
 
 There is consequently no write-side check-and-set against an independent
 vector store and no dual-write recovery protocol. A future mmap-friendly
