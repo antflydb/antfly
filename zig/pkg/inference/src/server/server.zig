@@ -4253,25 +4253,18 @@ pub const Node = struct {
         });
         defer schema_parsed.deinit();
         const operation = try canonicalExtractionOperation(schema_parsed.value);
-        const media_shape = if (operation == .structures)
-            try directExtractionMediaShape(allocator, request.inputs)
-        else
-            RequestMediaAdmissionShape{};
-        const media_admission = requestMediaAdmission(self, media_shape);
-        try self.growAdmissionUnits(reserved_units, media_admission.units);
-        reserved_units = media_admission.units;
 
         if (operation != .structures) {
             // Entity, relation, and classification models are text-only. Parse
             // them with a no-I/O path so a request that will be rejected cannot
             // trigger remote media fetches or decoding work first.
-            var parsed_inputs = try parseDirectTextExtractionInputs(allocator, request.inputs);
-            defer parsed_inputs.deinit();
             var typed_options = try std.json.parseFromSlice(extraction_api.ExtractionOptions, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{
                 .allocate = .alloc_always,
                 .ignore_unknown_fields = true,
             });
             defer typed_options.deinit();
+            var parsed_inputs = try parseDirectTextExtractionInputs(allocator, request.inputs);
+            defer parsed_inputs.deinit();
             const json = switch (operation) {
                 .entities_relations => try self.extractEntitiesAndRelationsDirectJsonAlloc(
                     allocator,
@@ -4303,6 +4296,11 @@ pub const Node = struct {
         // This parser bounds max_tokens before resolver or media work begins.
         var options = try parseExtractionOptionsJson(allocator, request.options_json);
         defer options.deinit();
+        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
+        if (media_shape.image_count > max_read_batch_images) return error.ReadBatchTooLarge;
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.growAdmissionUnits(reserved_units, media_admission.units);
+        reserved_units = media_admission.units;
         const config = extraction_mod.ExtractionConfig{
             .threshold = options.threshold orelse 0.3,
             .flat_ner = options.flat_ner orelse true,
@@ -14570,11 +14568,19 @@ test "structured extraction validates generation options before resolver and med
         .max_concurrent_requests = 1,
     });
     defer node.deinit();
-    const inputs = [_]extracting_api.Input{.{
-        .content_json =
-        \\[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]
-        ,
-    }};
+    // Three images require two admission units. With a one-unit node this
+    // proves invalid options win over capacity checks, not merely over fetch.
+    const inputs = [_]extracting_api.Input{
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/one.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/two.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/three.png"}}]
+        },
+    };
 
     resetRequestWorkTestCounters();
     try std.testing.expectError(error.InvalidMaxTokens, node.extractDirect(
@@ -14586,6 +14592,20 @@ test "structured extraction validates generation options before resolver and med
             \\{"structures":{"person":{"fields":{"name":"string"}}}}
             ,
             .options_json = "{\"max_tokens\":0}",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    try std.testing.expectError(error.MissingStructureFields, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{}}}}
+            ,
         },
     ));
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
