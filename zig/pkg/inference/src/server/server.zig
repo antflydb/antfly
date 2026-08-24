@@ -4402,6 +4402,7 @@ pub const Node = struct {
         const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
         defer allocator.free(model_path);
         if (rebel_mod.isRebelModel(allocator, model_path)) {
+            try rebel_mod.validateSchemaSupport(request.labels, request.relation_labels);
             var failure_stage: RebelExtractionFailureStage = .model_layout;
             return self.extractRebelJsonAlloc(
                 allocator,
@@ -8989,6 +8990,8 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
+            rebel_mod.validateSchemaSupport(body.labels, body.relation_labels) catch |err|
+                return rebelSchemaFailureResponse(ctx, err);
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
         }
 
@@ -9140,7 +9143,7 @@ pub const Node = struct {
             const relation_labels = request.relation_labels orelse return error.InvalidRelationSchema;
             const extracted = try pipeline.extractRelationsBatch(texts, request.labels, relation_labels);
             defer {
-                freeEntityBatches(allocator, extracted.entities);
+                rebel_mod.deinitEntityBatches(allocator, extracted.entities);
                 for (extracted.relations) |relations| {
                     for (relations) |*relation| relation.deinit(allocator);
                     allocator.free(relations);
@@ -9158,7 +9161,7 @@ pub const Node = struct {
         }
 
         const all_entities = try pipeline.recognizeBatch(texts);
-        defer freeEntityBatches(allocator, all_entities);
+        defer rebel_mod.deinitEntityBatches(allocator, all_entities);
         failure_stage.* = .response;
         const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, null, texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
@@ -11441,11 +11444,28 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedRelationExtraction,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+        error.UnsupportedRebelEntityLabels,
+        error.UnsupportedRebelRelationEndpoints,
+        => rebelSchemaFailureResponse(ctx, err),
         error.ReadBatchTooLarge,
         error.StreamTooLong,
         => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = @errorName(err) }),
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
         else => inferenceFailureResponse(ctx, err),
+    };
+}
+
+fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.UnsupportedRebelEntityLabels => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports only the generic entity label 'ENTITY'; use an entity-typing extractor for typed entity schemas",
+        }),
+        error.UnsupportedRebelRelationEndpoints => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports relation-type filters, but source and target constraints must use the generic 'ENTITY' label",
+        }),
+        else => return err,
     };
 }
 
@@ -14718,6 +14738,96 @@ test "raw entity cleanup preserves borrowed labels" {
 
     freeBorrowedLabelEntityBatches(allocator, batches);
     try std.testing.expectEqualStrings("person", borrowed_label);
+}
+
+test "REBEL rejects unsupported typed schemas before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/rebel");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/rebel_config.json",
+        .data = "{}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const input_ids = [_]?[]const u8{null};
+    const texts = [_][]const u8{"Grace Hopper served in the Navy."};
+    const direct_inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper served in the Navy.\"" }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.UnsupportedRebelEntityLabels,
+        node.extractDirect(allocator, "owner/rebel", .{
+            .inputs = &direct_inputs,
+            .schema_json = "{\"entities\":[\"person\"]}",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    const cases = [_]struct {
+        labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
+        want_relations: bool,
+        expected_message: []const u8,
+    }{
+        .{
+            .labels = &.{"person"},
+            .relation_labels = null,
+            .want_relations = false,
+            .expected_message = "REBEL supports only the generic entity label 'ENTITY'",
+        },
+        .{
+            .labels = null,
+            .relation_labels = &.{"person::served in::organization"},
+            .want_relations = true,
+            .expected_message = "source and target constraints must use the generic 'ENTITY' label",
+        },
+    };
+
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.extractEntitiesAndRelations(
+            &ctx,
+            .{
+                .model = "owner/rebel",
+                .labels = case.labels,
+                .relation_labels = case.relation_labels,
+                .input_ids = &input_ids,
+            },
+            &texts,
+            case.want_relations,
+        );
+        defer response.deinit();
+
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try ant_json.testing.expectSubsetJsonText(
+            allocator,
+            "{\"error\":\"INVALID_REQUEST\"}",
+            response.body.?,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_message) != null);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    }
 }
 
 test "canonical structure schemas preserve field types and choices" {
