@@ -156,6 +156,7 @@ const (
 	haSeedActivationRelativeRoot            = ".antfly-ha/active"
 	cloudHAPromotionReceiptAnnotation       = "cloud.antfly.io/ha-promotion-receipt"
 	cloudHATopologyGenerationAnnotation     = "cloud.antfly.io/ha-topology-generation"
+	haPromotedProcessBindingAnnotation      = "antfly.io/ha-promoted-process-binding"
 	cloudHARoleLabel                        = "cloud.antfly.io/ha-role"
 	cloudHAStandbyRole                      = "standby"
 
@@ -4193,7 +4194,8 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
 		return false, nil
 	}
-	if !isLowerHexDigest(strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])) {
+	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
+	if !isLowerHexDigest(promotionReceipt) {
 		return false, nil
 	}
 	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
@@ -4211,10 +4213,20 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	}
 	if pod.DeletionTimestamp != nil ||
 		!isPodControlledByStatefulSet(pod, statefulSet.Name) ||
-		pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole ||
 		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) {
 		return false, nil
 	}
+	binding := promotionReceipt + ":" + string(pod.UID)
+	if strings.TrimSpace(statefulSet.Annotations[haPromotedProcessBindingAnnotation]) == binding {
+		return true, nil
+	}
+	if pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole {
+		return false, nil
+	}
+	if statefulSet.Annotations == nil {
+		statefulSet.Annotations = map[string]string{}
+	}
+	statefulSet.Annotations[haPromotedProcessBindingAnnotation] = binding
 	return true, nil
 }
 

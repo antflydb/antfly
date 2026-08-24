@@ -14396,21 +14396,24 @@ func TestReconcileStandaloneStatefulSetPreservesExactLivePromotedProcess(t *test
 	observedStatefulSet := &appsv1.StatefulSet{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
 	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
+	g.Expect(observedStatefulSet.Annotations).To(HaveKeyWithValue(
+		haPromotedProcessBindingAnnotation,
+		strings.Repeat("a", 64)+":"+string(pod.UID),
+	))
 	g.Expect(observedStatefulSet.Spec.Template.Labels).To(HaveKeyWithValue(cloudHARoleLabel, "primary"))
 	g.Expect(observedStatefulSet.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--ha-primary-log"))
 	observedPod := &corev1.Pod{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, observedPod)).To(Succeed())
 	g.Expect(observedPod.UID).To(Equal(pod.UID))
 
-	// Once Kubernetes observes the primary template, normal rolling updates
-	// resume so later image and configuration changes retain their usual UX.
+	// StatefulSet control may converge mutable Pod labels to the primary
+	// template even though the process and controller revision are unchanged.
+	// The immutable receipt/UID binding must continue to preserve that process.
 	observedPod.Labels[cloudHARoleLabel] = "primary"
 	g.Expect(client.Update(context.Background(), observedPod)).To(Succeed())
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, observedStatefulSet)).To(Succeed())
-	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.RollingUpdateStatefulSetStrategyType))
-	g.Expect(observedStatefulSet.Spec.UpdateStrategy.RollingUpdate).NotTo(BeNil())
-	g.Expect(*observedStatefulSet.Spec.UpdateStrategy.RollingUpdate.Partition).To(Equal(int32(0)))
+	g.Expect(observedStatefulSet.Spec.UpdateStrategy.Type).To(Equal(appsv1.OnDeleteStatefulSetStrategyType))
 }
 
 func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) {
@@ -14445,12 +14448,21 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) 
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeTrue())
+	g.Expect(statefulSet.Annotations).To(HaveKeyWithValue(
+		haPromotedProcessBindingAnnotation,
+		strings.Repeat("a", 64)+":"+string(pod.UID),
+	))
 
 	// Lease transfer deliberately makes readiness fail closed while the same
 	// process adopts its successor bootstrap receipt. That transient must not
 	// turn the primary template publication into a process replacement.
 	pod.Status.Conditions[0].Status = corev1.ConditionFalse
 	g.Expect(client.Status().Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	pod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeTrue())
