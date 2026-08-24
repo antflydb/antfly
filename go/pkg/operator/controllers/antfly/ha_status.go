@@ -607,6 +607,15 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
 		return nil
 	}
+	if strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) != "" {
+		// The full reconciler owns the one-shot transition from a bound but
+		// pending process receipt to ordinary authority. Advancing renewTime here
+		// can continually outrun its next watchdog observation and make the two
+		// controllers wait on each other forever. The Lease duration is much
+		// longer than the watchdog observation cadence, so leave this compare
+		// boundary stable until the full path consumes the exact receipt.
+		return nil
+	}
 	identity := haReplicationIdentity(ha)
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
 		return nil

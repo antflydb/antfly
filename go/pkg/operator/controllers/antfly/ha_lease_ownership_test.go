@@ -208,6 +208,34 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 	}
 }
 
+func TestDedicatedLeaseRenewalPreservesPendingBootstrapCompareBoundary(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(now, "primary-a", "primary-a", 1)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+	receipt := haFencingLeaseBootstrapReceipt("primary-a", 1, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = receipt
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "primary-a-pod-uid"))
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("dedicated renewal with pending bootstrap receipt: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseRenewedAt) {
+		t.Fatalf("dedicated renewal moved the full reconciler's compare boundary: %#v", observed.Spec.RenewTime)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != receipt {
+		t.Fatalf("dedicated renewal consumed another controller's bootstrap receipt: %#v", observed.Annotations)
+	}
+}
+
 func TestDedicatedLeaseRenewalUsesAuthenticatedWatchdogProofEndpoint(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	t.Setenv("TEST_HA_WATCHDOG_TOKEN", "watchdog-token")
