@@ -11,6 +11,8 @@ const std = @import("std");
 const event = @import("event.zig");
 const ids = @import("id.zig");
 
+pub const format = "vopr-flight-recorder-v1";
+
 pub const Trigger = enum { failure, novelty, debugger };
 
 pub const Record = struct {
@@ -43,6 +45,15 @@ pub const Snapshot = struct {
         }
         self.allocator.free(self.records);
         self.* = undefined;
+    }
+
+    pub fn renderJsonAlloc(self: *const Snapshot, allocator: std.mem.Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(allocator, .{
+            .format = format,
+            .trigger = self.trigger,
+            .dropped = self.dropped,
+            .records = self.records,
+        }, .{ .whitespace = .indent_2 });
     }
 };
 

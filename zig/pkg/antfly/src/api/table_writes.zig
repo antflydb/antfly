@@ -8950,6 +8950,11 @@ pub const ProvisionedTableWriteSource = struct {
         ranges: []const metadata_table_manager.RangeRecord,
         backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     ) !metadata_table_provisioner.ProvisionSummary {
+        const effective_backend_runtime = backend_runtime orelse self.backend_runtime;
+        const io = if (effective_backend_runtime) |runtime|
+            runtime.io() orelse std.Options.debug_io
+        else
+            self.restore_open_options.io orelse std.Options.debug_io;
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             alloc,
             self.replica_root_dir,
@@ -8958,6 +8963,7 @@ pub const ProvisionedTableWriteSource = struct {
             tables,
             ranges,
             .{
+                .io = io,
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
             },
@@ -8983,9 +8989,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try fs_paths.createDirPathPortable(io_impl.io(), path);
+            try fs_paths.createDirPathPortable(io, path);
             try metadata_table_provisioner.applyRestoreIntentIfNeededWithOptions(
                 alloc,
                 path,

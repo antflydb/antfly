@@ -3229,17 +3229,21 @@ pub const MetadataService = struct {
                 .tables = tables,
                 .ranges = ranges,
             });
-        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
-            self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
-            group_ids,
-            tables,
-            ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-            },
-        );
+        } else owner: {
+            const backend_runtime = try self.ensureBackendRuntime();
+            break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                group_ids,
+                tables,
+                ranges,
+                .{
+                    .io = backend_runtime.io() orelse std.Options.debug_io,
+                    .backend_runtime = backend_runtime,
+                },
+            );
+        };
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
         if (summary.indexes_pending != 0) return summary;
         self.local_table_provisioning_fingerprint = fingerprint;
@@ -6055,17 +6059,21 @@ pub const MetadataHttpService = struct {
                 .tables = inputs.tables,
                 .ranges = inputs.ranges,
             });
-        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
-            self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
-            group_ids,
-            inputs.tables,
-            inputs.ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-            },
-        );
+        } else owner: {
+            const backend_runtime = try self.ensureBackendRuntime();
+            break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                group_ids,
+                inputs.tables,
+                inputs.ranges,
+                .{
+                    .io = backend_runtime.io() orelse std.Options.debug_io,
+                    .backend_runtime = backend_runtime,
+                },
+            );
+        };
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
         if (summary.indexes_pending != 0) return summary;
         self.local_table_provisioning_fingerprint = fingerprint;

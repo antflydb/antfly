@@ -17984,7 +17984,9 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    defer setup_io.deinit();
+    try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -18000,8 +18002,6 @@ pub fn runFromIterator(
     defer if (trusted_principal_secret) |value| alloc.free(value);
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
-    defer setup_io.deinit();
     try ensureDirAndParent(setup_io.io(), resolved.replica_root_dir, resolved.replica_catalog_path);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);

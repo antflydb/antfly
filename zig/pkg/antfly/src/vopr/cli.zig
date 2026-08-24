@@ -488,6 +488,16 @@ fn runContextFreeWithChoices(
     recorded: *const vopr.trace.Trace,
     source: vopr.choice.Source,
 ) !vopr.trace.Trace {
+    return runContextFreeWithChoicesAndRecorder(Scenario, alloc, recorded, source, null);
+}
+
+fn runContextFreeWithChoicesAndRecorder(
+    comptime Scenario: type,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
     return vopr.runner.run(Scenario, alloc, source, .{
         .system = recorded.header.system,
         .seed = recorded.config.seed,
@@ -500,6 +510,7 @@ fn runContextFreeWithChoices(
         .source_revision = recorded.header.source_revision,
         .target = recorded.header.target,
         .optimize = recorded.header.optimize,
+        .flight_recorder = recorder,
     });
 }
 
@@ -508,35 +519,83 @@ fn runKnownScenarioWithChoices(
     recorded: *const vopr.trace.Trace,
     source: vopr.choice.Source,
 ) !vopr.trace.Trace {
+    return runKnownScenarioWithChoicesAndRecorder(alloc, recorded, source, null);
+}
+
+fn runKnownScenarioWithChoicesAndRecorder(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
         const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(recorded);
-        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source);
+        var result = try antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source);
+        errdefer result.deinit();
+        if (recorder) |flight| try recordTraceEvents(flight, &result);
+        return result;
     }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
         const cfg = try antfly.metadata_sim_harness.DistributedDataVoprCampaignConfig.fromTrace(recorded);
-        return antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source);
+        var result = try antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source);
+        errdefer result.deinit();
+        if (recorder) |flight| try recordTraceEvents(flight, &result);
+        return result;
     }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
-        return runContextFreeWithChoices(antfly.transaction_vopr.Scenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.transaction_vopr.Scenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.wal_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.wal_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.persistent_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.persistent_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.index_manager_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.index_manager_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.db_split_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.db_split_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.raft_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.raft_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.lmdb_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.lmdb_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.lsm_vopr.CliScenario, alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.lsm_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
-        return runContextFreeWithChoices(antfly.ha_vopr.CliScenario, alloc, recorded, source);
-    if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
-        return antfly.domain_vopr.runKnownWithChoices(alloc, recorded, source);
+        return runContextFreeWithChoicesAndRecorder(antfly.ha_vopr.CliScenario, alloc, recorded, source, recorder);
+    if (antfly.domain_vopr.kindFromArtifact(recorded) != null) {
+        var result = try antfly.domain_vopr.runKnownWithChoices(alloc, recorded, source);
+        errdefer result.deinit();
+        if (recorder) |flight| try recordTraceEvents(flight, &result);
+        return result;
+    }
     return error.UnsupportedScenario;
+}
+
+fn recordTraceEvents(recorder: *vopr.flight_recorder.Recorder, artifact: *const vopr.trace.Trace) !void {
+    for (artifact.events.items) |record| try recorder.record(.{
+        .index = record.index,
+        .ordinal = record.ordinal,
+        .id = record.id,
+        .name = record.name,
+        .kind = record.kind,
+        .actor_id = record.actor_id,
+        .resource_id = record.resource_id,
+        .payload_digest = record.payload_digest,
+    });
+}
+
+fn replayKnownScenarioWithRecorder(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    recorder: *vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    var source = vopr.choice.Replay{ .records = recorded.choices.items };
+    var replayed = try runKnownScenarioWithChoicesAndRecorder(alloc, recorded, source.source(), recorder);
+    errdefer replayed.deinit();
+    const expected = try recorded.renderAlloc(alloc);
+    defer alloc.free(expected);
+    const actual = try replayed.renderAlloc(alloc);
+    defer alloc.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.VoprReplayArtifactDiverged;
+    return replayed;
 }
 
 fn counterfactualRunKnown(
@@ -1562,6 +1621,9 @@ const CampaignContext = struct {
     properties: std.AutoHashMapUnmanaged(u64, PropertySummary) = .empty,
     failure_summaries: std.AutoHashMapUnmanaged(u64, FailureSummary) = .empty,
     counterfactual_reports: u64 = 0,
+    flight_recordings: u64 = 0,
+    flight_records: u64 = 0,
+    flight_records_dropped: u64 = 0,
     first_error: ?anyerror = null,
 
     fn deinitReport(self: *@This()) void {
@@ -1609,7 +1671,9 @@ const CampaignContext = struct {
         var artifact = candidate.artifact;
         defer artifact.deinit();
 
-        var replayed = replayKnownScenario(alloc, &artifact) catch |err| {
+        var recorder = try vopr.flight_recorder.Recorder.init(alloc, 1024);
+        defer recorder.deinit();
+        var replayed = replayKnownScenarioWithRecorder(alloc, &artifact, &recorder) catch |err| {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             self.replay_divergences += 1;
@@ -1652,6 +1716,18 @@ const CampaignContext = struct {
         const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        var flight = try recorder.materialize(alloc, if (failed) .failure else .novelty);
+        defer flight.deinit();
+        const flight_bytes = try flight.renderJsonAlloc(alloc);
+        defer alloc.free(flight_bytes);
+        const flight_path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.flight.json", .{ self.artifact_dir, history_index, seed });
+        defer alloc.free(flight_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = flight_path, .data = flight_bytes });
+        try self.mutex.lock(self.io);
+        self.flight_recordings += 1;
+        self.flight_records +|= flight.records.len;
+        self.flight_records_dropped +|= flight.dropped;
+        self.mutex.unlock(self.io);
         if (failed) {
             var new_failure_ordinals: std.ArrayListUnmanaged(usize) = .empty;
             defer new_failure_ordinals.deinit(alloc);
@@ -1777,7 +1853,7 @@ const CampaignContext = struct {
         var productive: usize = 0;
         for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
         std.debug.print(
-            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} counterfactual_reports={d} workers={d} artifacts={s}\n",
+            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} counterfactual_reports={d} flight_recordings={d} flight_records={d} flight_dropped={d} workers={d} artifacts={s}\n",
             .{
                 self.scenario,
                 self.histories,
@@ -1799,6 +1875,9 @@ const CampaignContext = struct {
                 self.spliced,
                 self.splice_rejected,
                 self.counterfactual_reports,
+                self.flight_recordings,
+                self.flight_records,
+                self.flight_records_dropped,
                 self.worker_count,
                 self.artifact_dir,
             },
@@ -1833,6 +1912,69 @@ const CampaignContext = struct {
                 .{ fingerprint, summary.first_path, summary.smallest_transitions, summary.smallest_path, summary.smallest_path, summary.smallest_path },
             );
         }
+        const aggregate_properties = try alloc.alloc(vopr.report.AggregateProperty, property_ids.len);
+        defer alloc.free(aggregate_properties);
+        for (property_ids, aggregate_properties) |property_id, *out| {
+            const summary = self.properties.get(property_id).?;
+            out.* = .{
+                .property_id = property_id,
+                .name = summary.name,
+                .status = summary.status(),
+                .evaluations = summary.evaluations,
+                .ever_true = summary.ever_true,
+                .ever_false = summary.ever_false,
+            };
+        }
+        const aggregate_failures = try alloc.alloc(vopr.report.AggregateFailure, fingerprints.len);
+        defer alloc.free(aggregate_failures);
+        for (fingerprints, aggregate_failures) |fingerprint, *out| {
+            const summary = self.failure_summaries.get(fingerprint).?;
+            out.* = .{
+                .fingerprint = fingerprint,
+                .first_history = summary.first_history,
+                .first_artifact = summary.first_path,
+                .smallest_history = summary.smallest_history,
+                .smallest_transitions = summary.smallest_transitions,
+                .smallest_artifact = summary.smallest_path,
+            };
+        }
+        const artifact_names = [_][]const u8{ "results.json", "results.html" };
+        const aggregate = vopr.report.Aggregate{
+            .scenario = self.scenario,
+            .base_seed = self.base_seed,
+            .histories_limit = self.histories,
+            .histories_consumed = self.clean_histories + self.failures + self.replay_divergences + self.harness_errors,
+            .transition_limit_per_history = self.transitions,
+            .transitions_consumed = self.transitions_executed,
+            .clean_histories = self.clean_histories,
+            .failed_histories = self.failures,
+            .replay_divergences = self.replay_divergences,
+            .harness_errors = self.harness_errors,
+            .exact_replays = self.exact_replays,
+            .corpus_entries = self.corpus.entries.items.len,
+            .quarantined_entries = self.corpus.quarantined.items.len,
+            .retained_entries = self.retained,
+            .semantic_states = self.semantic_states.count(),
+            .transition_kinds = self.transition_ids.count(),
+            .faults_reached = self.fault_ids.count(),
+            .workloads_reached = self.workload_ids.count(),
+            .flight_recordings = self.flight_recordings,
+            .flight_records = self.flight_records,
+            .flight_records_dropped = self.flight_records_dropped,
+            .properties = aggregate_properties,
+            .failures = aggregate_failures,
+            .artifacts = &artifact_names,
+        };
+        const json = try aggregate.renderJsonAlloc(alloc);
+        defer alloc.free(json);
+        const html = try aggregate.renderHtmlAlloc(alloc);
+        defer alloc.free(html);
+        const json_path = try std.fmt.allocPrint(alloc, "{s}/results.json", .{self.artifact_dir});
+        defer alloc.free(json_path);
+        const html_path = try std.fmt.allocPrint(alloc, "{s}/results.html", .{self.artifact_dir});
+        defer alloc.free(html_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = json_path, .data = json });
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = html_path, .data = html });
     }
 
     fn mutateCorpusEntry(self: *@This(), alloc: std.mem.Allocator, seed: u64) !?Candidate {
@@ -2376,6 +2518,37 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     const collector_bytes = try std.Io.Dir.cwd().readFileAlloc(io, collector_path, alloc, .limited(max_trace_bytes));
     defer alloc.free(collector_bytes);
     try std.testing.expect(collector_bytes.len > 2);
+
+    var transaction_campaign = CampaignContext{
+        .io = io,
+        .histories = 1,
+        .transitions = 3,
+        .scenario = "transaction",
+        .base_seed = 0x1234,
+        .artifact_dir = corpus_path,
+        .worker_count = 1,
+        .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
+        .corpus = vopr.corpus.Corpus.init(std.heap.smp_allocator),
+    };
+    defer transaction_campaign.deinitReport();
+    defer transaction_campaign.corpus.deinit();
+    defer transaction_campaign.coverage.deinit();
+    try transaction_campaign.runHistory(0);
+    try transaction_campaign.reportSummary();
+    const flight_path = try std.fmt.allocPrint(alloc, "{s}/history-0-1234.flight.json", .{corpus_path});
+    defer alloc.free(flight_path);
+    const flight_json = try std.Io.Dir.cwd().readFileAlloc(io, flight_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(flight_json);
+    try std.testing.expect(std.mem.indexOf(u8, flight_json, vopr.flight_recorder.format) != null);
+    const aggregate_results_path = try std.fmt.allocPrint(alloc, "{s}/results.json", .{corpus_path});
+    defer alloc.free(aggregate_results_path);
+    const aggregate_results = try std.Io.Dir.cwd().readFileAlloc(io, aggregate_results_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(aggregate_results);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_results, vopr.report.aggregate_format) != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"materialized\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"progress\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"exact_replay\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"harness\": true") != null);
 }
 
 test "VOPR scenario registry records and exactly replays every context-free domain" {

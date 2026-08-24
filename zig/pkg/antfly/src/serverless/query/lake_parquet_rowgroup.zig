@@ -263,26 +263,27 @@ pub const PersistentObjectRangeCache = struct {
     /// The returned cache is the sole process owner for `root_dir`. Quiesce
     /// callers, then call `deinit` to drain accepted writes and release the
     /// worker.
-    pub fn init(root_dir: []const u8) !PersistentObjectRangeCache {
-        return try initWithPolicy(root_dir, .{});
+    pub fn init(io: std.Io, root_dir: []const u8) !PersistentObjectRangeCache {
+        return try initWithPolicy(io, root_dir, .{});
     }
 
     pub fn initWithDurability(
+        io: std.Io,
         root_dir: []const u8,
         durability: PersistentObjectRangeCacheDurability,
     ) !PersistentObjectRangeCache {
         var policy = PersistentObjectRangeCachePolicy{};
         policy.durability = durability;
-        return try initWithPolicy(root_dir, policy);
+        return try initWithPolicy(io, root_dir, policy);
     }
 
     pub fn initWithPolicy(
+        io: std.Io,
         root_dir: []const u8,
         policy: PersistentObjectRangeCachePolicy,
     ) !PersistentObjectRangeCache {
         try policy.validate();
         if (root_dir.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
-        if (@import("builtin").single_threaded) return error.PersistentObjectRangeCacheRequiresThreads;
 
         const internal_alloc = std.heap.smp_allocator;
         const state = try internal_alloc.create(PersistentObjectRangeCacheState);
@@ -293,27 +294,25 @@ pub const PersistentObjectRangeCache = struct {
             .alloc = internal_alloc,
             .root_dir = owned_root,
             .policy = policy,
-            .io_impl = std.Io.Threaded.init(internal_alloc, .{}),
+            .io = io,
         };
-        errdefer state.io_impl.deinit();
         try state.initializeInventory();
         errdefer state.deinitInventory();
-        state.worker = try std.Thread.spawn(.{}, persistentObjectRangeWorkerMain, .{state});
+        state.worker = try io.concurrent(persistentObjectRangeWorkerMain, .{state});
         return .{ .state = state };
     }
 
     pub fn deinit(self: *PersistentObjectRangeCache) void {
         const state = self.state;
-        const io = state.io_impl.io();
+        const io = state.io;
         state.mutex.lockUncancelable(io);
         state.closing = true;
         state.condition.broadcast(io);
         state.mutex.unlock(io);
-        if (state.worker) |worker| worker.join();
+        if (state.worker) |*worker| _ = worker.await(io);
         state.deinitInventory();
         state.pending.deinit(state.alloc);
         state.queue.deinit(state.alloc);
-        state.io_impl.deinit();
         state.alloc.free(state.root_dir);
         const internal_alloc = state.alloc;
         internal_alloc.destroy(state);
@@ -326,7 +325,7 @@ pub const PersistentObjectRangeCache = struct {
 
     pub fn statsSnapshot(self: *const PersistentObjectRangeCache) PersistentObjectRangeCacheStats {
         const state = self.state;
-        const io = state.io_impl.io();
+        const io = state.io;
         state.mutex.lockUncancelable(io);
         defer state.mutex.unlock(io);
         var stats = state.stats;
@@ -337,7 +336,7 @@ pub const PersistentObjectRangeCache = struct {
 
     pub fn flush(self: *PersistentObjectRangeCache) void {
         const state = self.state;
-        const io = state.io_impl.io();
+        const io = state.io;
         state.mutex.lockUncancelable(io);
         defer state.mutex.unlock(io);
         while (state.pending_count != 0) state.condition.waitUncancelable(io, &state.mutex);
@@ -365,7 +364,7 @@ pub const PersistentObjectRangeCache = struct {
         var valid = true;
         defer state.releaseEntry(entry, valid);
         const bytes = persistentObjectRangeReadEntryWithIoAlloc(
-            state.io_impl.io(),
+            state.io,
             alloc,
             path,
             cache_key,
@@ -438,10 +437,10 @@ const PersistentObjectRangeCacheState = struct {
     alloc: Allocator,
     root_dir: []u8,
     policy: PersistentObjectRangeCachePolicy,
-    io_impl: std.Io.Threaded,
+    io: std.Io,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    worker: ?std.Thread = null,
+    worker: ?std.Io.Future(void) = null,
     closing: bool = false,
     queue: std.ArrayListUnmanaged(PersistentObjectRangeCacheWrite) = .empty,
     queue_head: usize = 0,
@@ -453,7 +452,7 @@ const PersistentObjectRangeCacheState = struct {
     stats: PersistentObjectRangeCacheStats = .{},
 
     fn initializeInventory(self: *PersistentObjectRangeCacheState) !void {
-        const io = self.io_impl.io();
+        const io = self.io;
         try fs_paths.createDirPathPortable(io, self.root_dir);
         var dir = if (std.fs.path.isAbsolute(self.root_dir))
             try std.Io.Dir.openDirAbsolute(io, self.root_dir, .{ .iterate = true })
@@ -603,7 +602,7 @@ const PersistentObjectRangeCacheState = struct {
 
         const owned_key = self.alloc.dupe(u8, cache_key) catch return self.recordDropped(bytes.len);
 
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.closing) {
             _ = self.recordDroppedLocked(bytes.len);
@@ -671,7 +670,7 @@ const PersistentObjectRangeCacheState = struct {
         memory_bytes: usize,
         payload_bytes: usize,
     ) void {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         _ = self.pending.remove(owned_key);
         decrementSaturating(&self.pending_bytes, memory_bytes);
@@ -683,7 +682,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.recordDroppedLocked(byte_len);
@@ -696,21 +695,21 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn recordReadHit(self: *PersistentObjectRangeCacheState) void {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         self.stats.read_hits += 1;
         self.mutex.unlock(io);
     }
 
     fn recordReadMiss(self: *PersistentObjectRangeCacheState) void {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         self.stats.read_misses += 1;
         self.mutex.unlock(io);
     }
 
     fn recordReadError(self: *PersistentObjectRangeCacheState) void {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         self.stats.read_misses += 1;
         self.stats.read_errors += 1;
@@ -718,7 +717,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn pinEntry(self: *PersistentObjectRangeCacheState, filename: []const u8) ?*PersistentObjectRangeCacheEntry {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const entry = self.entries.get(filename) orelse return null;
@@ -729,7 +728,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn releaseEntry(self: *PersistentObjectRangeCacheState, entry: *PersistentObjectRangeCacheEntry, valid: bool) void {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         std.debug.assert(entry.pin_count > 0);
         entry.pin_count -= 1;
@@ -751,7 +750,7 @@ const PersistentObjectRangeCacheState = struct {
         corrupt: bool,
     ) void {
         const deleted = self.deleteCacheFile(entry.filename) catch false;
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         if (!deleted) {
             entry.removing = false;
@@ -775,7 +774,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn evictOne(self: *PersistentObjectRangeCacheState) bool {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         var node = self.lru.first;
         const victim = while (node) |candidate_node| : (node = candidate_node.next) {
@@ -809,7 +808,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn hasCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize) bool {
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.stats.entries < self.policy.max_entries and
@@ -828,7 +827,7 @@ const PersistentObjectRangeCacheState = struct {
     fn writeQueued(self: *PersistentObjectRangeCacheState, task: PersistentObjectRangeCacheWrite) !PersistentObjectRangeCacheWriteOutcome {
         const filename = try objectRangeCacheKeyDigestHexAlloc(self.alloc, task.cache_key);
         defer self.alloc.free(filename);
-        const io = self.io_impl.io();
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         while (self.entries.get(filename)) |entry| {
             if (entry.removing) {
@@ -878,7 +877,7 @@ const PersistentObjectRangeCacheState = struct {
     }
 
     fn deleteCacheFile(self: *PersistentObjectRangeCacheState, filename: []const u8) !bool {
-        const io = self.io_impl.io();
+        const io = self.io;
         var dir = if (std.fs.path.isAbsolute(self.root_dir))
             try std.Io.Dir.openDirAbsolute(io, self.root_dir, .{})
         else
@@ -893,7 +892,7 @@ const PersistentObjectRangeCacheState = struct {
 };
 
 fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void {
-    const io = state.io_impl.io();
+    const io = state.io;
     while (true) {
         state.mutex.lockUncancelable(io);
         while (state.queue_head == state.queue.items.len and !state.closing) {
@@ -1183,17 +1182,6 @@ fn persistentObjectRangeEncodeAlloc(alloc: Allocator, cache_key: []const u8, byt
     return encoded;
 }
 
-fn persistentObjectRangeReadEntryAlloc(
-    alloc: Allocator,
-    path: []const u8,
-    cache_key: []const u8,
-    expected_len: usize,
-) ![]u8 {
-    var io_impl = persistentObjectRangeThreadedIo();
-    defer io_impl.deinit();
-    return try persistentObjectRangeReadEntryWithIoAlloc(io_impl.io(), alloc, path, cache_key, expected_len);
-}
-
 fn persistentObjectRangeReadEntryWithIoAlloc(
     io: std.Io,
     alloc: Allocator,
@@ -1265,30 +1253,28 @@ fn persistentObjectRangeReadEntryWithIoAlloc(
     return payload;
 }
 
-fn persistentObjectRangeEnsureParentDir(path: []const u8) !void {
+fn persistentObjectRangeEnsureParentDir(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    var io_impl = persistentObjectRangeThreadedIo();
-    defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), parent);
+    try fs_paths.createDirPathPortable(io, parent);
 }
 
 fn persistentObjectRangeWriteFileAtomically(
+    io: std.Io,
     path: []const u8,
     contents: []const u8,
     durability: PersistentObjectRangeCacheDurability,
 ) !void {
-    return persistentObjectRangeWriteFilePartsAtomically(path, &.{contents}, durability);
+    return persistentObjectRangeWriteFilePartsAtomicallyWithIo(io, path, &.{contents}, durability);
 }
 
 fn persistentObjectRangeWriteEntryAtomically(
+    io: std.Io,
     path: []const u8,
     cache_key: []const u8,
     bytes: []const u8,
     durability: PersistentObjectRangeCacheDurability,
 ) !void {
-    var io_impl = persistentObjectRangeThreadedIo();
-    defer io_impl.deinit();
-    return try persistentObjectRangeWriteEntryAtomicallyWithIo(io_impl.io(), path, cache_key, bytes, durability);
+    return try persistentObjectRangeWriteEntryAtomicallyWithIo(io, path, cache_key, bytes, durability);
 }
 
 fn persistentObjectRangeWriteEntryAtomicallyWithIo(
@@ -1309,16 +1295,6 @@ fn persistentObjectRangeWriteEntryAtomicallyWithIo(
         &digest,
         bytes,
     }, durability);
-}
-
-fn persistentObjectRangeWriteFilePartsAtomically(
-    path: []const u8,
-    parts: []const []const u8,
-    durability: PersistentObjectRangeCacheDurability,
-) !void {
-    var io_impl = persistentObjectRangeThreadedIo();
-    defer io_impl.deinit();
-    return try persistentObjectRangeWriteFilePartsAtomicallyWithIo(io_impl.io(), path, parts, durability);
 }
 
 fn persistentObjectRangeWriteFilePartsAtomicallyWithIo(
@@ -1360,10 +1336,6 @@ fn persistentObjectRangeWriteFilePartsAtomicallyWithIo(
     if (durability == .durable) {
         if (std.fs.path.dirname(path)) |parent| try fs_paths.syncDirPortable(io, parent);
     }
-}
-
-fn persistentObjectRangeThreadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn hexNibble(value: u8) u8 {
@@ -6257,6 +6229,9 @@ test "parquet object range cache reuses coalesced projected chunks" {
 }
 
 test "lake persistent object range cache durability is cache-only by default and explicit when durable" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
@@ -6264,21 +6239,23 @@ test "lake persistent object range cache durability is cache-only by default and
     defer alloc.free(default_root);
     const durable_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/durable-cache", .{tmp.sub_path});
     defer alloc.free(durable_root);
-    var default_cache = try PersistentObjectRangeCache.init(default_root);
+    var default_cache = try PersistentObjectRangeCache.init(io, default_root);
     defer default_cache.deinit();
     try std.testing.expectEqual(PersistentObjectRangeCacheDurability.cache_only, default_cache.configuredPolicy().durability);
-    var durable_cache = try PersistentObjectRangeCache.initWithDurability(durable_root, .durable);
+    var durable_cache = try PersistentObjectRangeCache.initWithDurability(io, durable_root, .durable);
     defer durable_cache.deinit();
     try std.testing.expectEqual(PersistentObjectRangeCacheDurability.durable, durable_cache.configuredPolicy().durability);
 }
 
 test "lake persistent object range cache bounds write-behind admission" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bounded-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
-    var persistent = try PersistentObjectRangeCache.initWithPolicy(cache_root, .{
+    var persistent = try PersistentObjectRangeCache.initWithPolicy(io_impl.io(), cache_root, .{
         .max_total_bytes = 1024,
         .max_entries = 4,
         .max_write_queue_bytes = 4,
@@ -6300,13 +6277,15 @@ test "lake persistent object range cache bounds write-behind admission" {
 }
 
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lru-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
     const one_entry_bytes = persistentObjectRangeEncodedLen("key-a".len, "data".len).?;
-    var persistent = try PersistentObjectRangeCache.initWithPolicy(cache_root, .{
+    var persistent = try PersistentObjectRangeCache.initWithPolicy(io_impl.io(), cache_root, .{
         .max_total_bytes = one_entry_bytes * 2,
         .max_entries = 2,
         .max_write_queue_bytes = 1024,
@@ -6340,6 +6319,9 @@ test "lake persistent object range cache evicts least recently used entries with
 }
 
 test "lake persistent object range cache removes interrupted and corrupted entries" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6351,10 +6333,10 @@ test "lake persistent object range cache removes interrupted and corrupted entri
         .{cache_root},
     );
     defer alloc.free(temporary_path);
-    try persistentObjectRangeEnsureParentDir(temporary_path);
-    try persistentObjectRangeWriteFileAtomically(temporary_path, "partial", .cache_only);
+    try persistentObjectRangeEnsureParentDir(io, temporary_path);
+    try persistentObjectRangeWriteFileAtomically(io, temporary_path, "partial", .cache_only);
 
-    var persistent = try PersistentObjectRangeCache.init(cache_root);
+    var persistent = try PersistentObjectRangeCache.init(io, cache_root);
     defer persistent.deinit();
     try std.testing.expectEqual(@as(usize, 1), persistent.statsSnapshot().temporary_files_removed);
 
@@ -6362,7 +6344,7 @@ test "lake persistent object range cache removes interrupted and corrupted entri
     persistent.flush();
     const corrupt_path = try persistent.cachePathAlloc(alloc, "corrupt-key");
     defer alloc.free(corrupt_path);
-    try persistentObjectRangeWriteFileAtomically(corrupt_path, "corrupt", .cache_only);
+    try persistentObjectRangeWriteFileAtomically(io, corrupt_path, "corrupt", .cache_only);
     try std.testing.expect((try persistent.readAlloc(alloc, "corrupt-key", 4)) == null);
     const stats = persistent.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), stats.corrupt_entries_removed);
@@ -6372,6 +6354,9 @@ test "lake persistent object range cache removes interrupted and corrupted entri
 }
 
 test "lake persistent object range cache bounds startup inventory and drains accepted writes" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6383,12 +6368,12 @@ test "lake persistent object range cache bounds startup inventory and drains acc
         defer alloc.free(filename);
         const path = try std.fs.path.join(alloc, &.{ cache_root, filename });
         defer alloc.free(path);
-        try persistentObjectRangeEnsureParentDir(path);
-        try persistentObjectRangeWriteEntryAtomically(path, key, "data", .cache_only);
+        try persistentObjectRangeEnsureParentDir(io, path);
+        try persistentObjectRangeWriteEntryAtomically(io, path, key, "data", .cache_only);
     }
 
     {
-        var persistent = try PersistentObjectRangeCache.initWithPolicy(cache_root, .{
+        var persistent = try PersistentObjectRangeCache.initWithPolicy(io, cache_root, .{
             .max_total_bytes = 1024,
             .max_entries = 1,
             .max_write_queue_bytes = 1024,
@@ -6401,7 +6386,7 @@ test "lake persistent object range cache bounds startup inventory and drains acc
         try std.testing.expectEqual(.enqueued, persistent.enqueueWrite("shutdown-write", "next"));
     }
 
-    var reopened = try PersistentObjectRangeCache.initWithPolicy(cache_root, .{
+    var reopened = try PersistentObjectRangeCache.initWithPolicy(io, cache_root, .{
         .max_total_bytes = 1024,
         .max_entries = 2,
         .max_write_queue_bytes = 1024,
@@ -6414,13 +6399,15 @@ test "lake persistent object range cache bounds startup inventory and drains acc
 }
 
 test "parquet object range cache reuses persistent validated ranges" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
-    var persistent = try PersistentObjectRangeCache.init(cache_root);
+    var persistent = try PersistentObjectRangeCache.init(io_impl.io(), cache_root);
     defer persistent.deinit();
 
     const CountingRangeReader = struct {
@@ -6489,13 +6476,16 @@ test "parquet object range cache reuses persistent validated ranges" {
 }
 
 test "parquet object range cache ignores corrupted persistent ranges" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
-    var persistent = try PersistentObjectRangeCache.init(cache_root);
+    var persistent = try PersistentObjectRangeCache.init(io, cache_root);
     defer persistent.deinit();
 
     const CountingRangeReader = struct {
@@ -6538,8 +6528,8 @@ test "parquet object range cache ignores corrupted persistent ranges" {
     defer alloc.free(cache_key);
     const corrupted_path = try persistent.cachePathAlloc(alloc, cache_key);
     defer alloc.free(corrupted_path);
-    try persistentObjectRangeEnsureParentDir(corrupted_path);
-    try persistentObjectRangeWriteFileAtomically(corrupted_path, "not-a-valid-cache-entry", .cache_only);
+    try persistentObjectRangeEnsureParentDir(io, corrupted_path);
+    try persistentObjectRangeWriteFileAtomically(io, corrupted_path, "not-a-valid-cache-entry", .cache_only);
 
     var cache = ObjectRangeCache{ .persistent = &persistent };
     defer cache.deinit(alloc);
@@ -6553,13 +6543,16 @@ test "parquet object range cache ignores corrupted persistent ranges" {
 }
 
 test "lake persistent object range cache rejects an otherwise valid overlong entry" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
-    var persistent = try PersistentObjectRangeCache.init(cache_root);
+    var persistent = try PersistentObjectRangeCache.init(io, cache_root);
     defer persistent.deinit();
     const cache_key = "bucket=test:key=part.parquet:offset=2:len=4";
     const path = try persistent.cachePathAlloc(alloc, cache_key);
@@ -6570,8 +6563,8 @@ test "lake persistent object range cache rejects an otherwise valid overlong ent
     defer alloc.free(overlong);
     @memcpy(overlong[0..encoded.len], encoded);
     overlong[encoded.len] = 0xaa;
-    try persistentObjectRangeEnsureParentDir(path);
-    try persistentObjectRangeWriteFileAtomically(path, overlong, .cache_only);
+    try persistentObjectRangeEnsureParentDir(io, path);
+    try persistentObjectRangeWriteFileAtomically(io, path, overlong, .cache_only);
 
     try std.testing.expect((try persistent.readAlloc(alloc, cache_key, 4)) == null);
     try std.testing.expectError(
@@ -6581,13 +6574,16 @@ test "lake persistent object range cache rejects an otherwise valid overlong ent
 }
 
 test "parquet object range cache rejects mismatched persistent provenance" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
-    var persistent = try PersistentObjectRangeCache.init(cache_root);
+    var persistent = try PersistentObjectRangeCache.init(io, cache_root);
     defer persistent.deinit();
 
     const CountingRangeReader = struct {
@@ -6632,8 +6628,8 @@ test "parquet object range cache rejects mismatched persistent provenance" {
     defer alloc.free(mismatched_path);
     const encoded = try persistentObjectRangeEncodeAlloc(alloc, "bucket=other:key=events/part-a.parquet", "2345");
     defer alloc.free(encoded);
-    try persistentObjectRangeEnsureParentDir(mismatched_path);
-    try persistentObjectRangeWriteFileAtomically(mismatched_path, encoded, .cache_only);
+    try persistentObjectRangeEnsureParentDir(io, mismatched_path);
+    try persistentObjectRangeWriteFileAtomically(io, mismatched_path, encoded, .cache_only);
 
     var cache = ObjectRangeCache{ .persistent = &persistent };
     defer cache.deinit(alloc);

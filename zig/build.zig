@@ -6976,6 +6976,38 @@ pub fn build(b: *std.Build) void {
     );
     composed_query_vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
 
+    const parquet_cache_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"persistent Parquet cache VOPR exact replays"},
+    });
+    const run_parquet_cache_vopr_tests = b.addRunArtifact(parquet_cache_vopr_tests);
+    const parquet_cache_vopr_test_step = b.step("parquet-cache-vopr-test", "Run persistent Parquet cache faults and crash recovery on VoprIo");
+    parquet_cache_vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);
+
+    const provisioning_startup_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"provisioning startup VOPR exact replays"},
+    });
+    const run_provisioning_startup_vopr_tests = b.addRunArtifact(provisioning_startup_vopr_tests);
+    const provisioning_startup_vopr_test_step = b.step("provisioning-startup-vopr-test", "Run startup admission, provisioning, retry, and crash histories on VoprIo");
+    provisioning_startup_vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
+
+    const external_lake_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"external lake VOPR exact replays"},
+    });
+    const run_external_lake_vopr_tests = b.addRunArtifact(external_lake_vopr_tests);
+    const external_lake_vopr_test_step = b.step("external-lake-vopr-test", "Run external-lake range, cache, version, timeout, and malformed-response histories");
+    external_lake_vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
+
+    const media_runtime_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"media runtime VOPR exact replays"},
+    });
+    const run_media_runtime_vopr_tests = b.addRunArtifact(media_runtime_vopr_tests);
+    const media_runtime_vopr_test_step = b.step("media-runtime-vopr-test", "Run media registry activation, nesting, and cleanup histories on VoprIo");
+    media_runtime_vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
+
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"derived workflow VOPR records and exact replays"},
@@ -7145,6 +7177,10 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
     vopr_test_step.dependOn(&run_provider_boundary_vopr_tests.step);
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
+    vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);
+    vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
+    vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
+    vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);

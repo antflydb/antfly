@@ -325,6 +325,11 @@ pub const Controller = struct {
         return self.indexOf(fault_id) != null;
     }
 
+    pub fn activeSpec(self: *const Controller, fault_id: FaultId) ?Spec {
+        const index = self.indexOf(fault_id) orelse return null;
+        return self.active.items[index].spec;
+    }
+
     pub fn shouldEnumerateStopsOnly(self: *const Controller) bool {
         return self.quiet_suffix and self.budgets.quiet_suffix_policy == .heal_recoverable;
     }

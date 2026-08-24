@@ -72,6 +72,7 @@ pub const ProvisionSummary = struct {
 };
 
 pub const ReconcileReplicaRootOptions = struct {
+    io: std.Io = std.Options.debug_io,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
@@ -216,16 +217,16 @@ pub fn reconcileReplicaRootWithOptions(
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        try fs_paths.createDirPathPortable(options.io, path);
+        var restore_open_options = options.restore_open_options;
+        if (restore_open_options.io == null) restore_open_options.io = options.io;
         try applyRestoreIntentIfNeededWithOptions(
             alloc,
             path,
             group_id,
             table,
             range,
-            options.restore_open_options,
+            restore_open_options,
         );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
@@ -723,23 +724,9 @@ pub fn collectLocalRestoreProgressUsingIo(
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
 ) ![]table_manager.RestoreProgressRecord {
-    if (shared_io) |io| {
-        return try collectLocalRestoreProgressWithIo(
-            alloc,
-            io,
-            replica_root_dir,
-            metadata_group_id,
-            local_node_id,
-            hosted_group_ids,
-            tables,
-            ranges,
-        );
-    }
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     return try collectLocalRestoreProgressWithIo(
         alloc,
-        io_impl.io(),
+        shared_io orelse std.Options.debug_io,
         replica_root_dir,
         metadata_group_id,
         local_node_id,
@@ -860,12 +847,6 @@ pub fn applyRestoreIntentIfNeededWithOptions(
             .range_id = table_manager.rangeDocIdentityRangeId(range),
         },
     });
-}
-
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
 }
 
 fn resolveRestoreIntent(

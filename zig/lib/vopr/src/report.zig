@@ -10,6 +10,117 @@ const property = @import("property.zig");
 const trace = @import("trace.zig");
 
 pub const format = "vopr-results-v1";
+pub const aggregate_format = "vopr-run-results-v1";
+
+pub const AggregateProperty = struct {
+    property_id: ids.StableId,
+    name: []const u8,
+    status: []const u8,
+    evaluations: u64,
+    ever_true: bool,
+    ever_false: bool,
+};
+
+pub const AggregateFailure = struct {
+    fingerprint: u64,
+    first_history: u64,
+    first_artifact: []const u8,
+    smallest_history: u64,
+    smallest_transitions: u64,
+    smallest_artifact: []const u8,
+};
+
+pub const AggregateHealth = struct {
+    progress: bool,
+    exact_replay: bool,
+    harness: bool,
+};
+
+pub const Aggregate = struct {
+    scenario: []const u8,
+    base_seed: u64,
+    histories_limit: u64,
+    histories_consumed: u64,
+    transition_limit_per_history: u64,
+    transitions_consumed: u64,
+    clean_histories: u64,
+    failed_histories: u64,
+    replay_divergences: u64,
+    harness_errors: u64,
+    exact_replays: u64,
+    corpus_entries: u64,
+    quarantined_entries: u64,
+    retained_entries: u64,
+    semantic_states: u64,
+    transition_kinds: u64,
+    faults_reached: u64,
+    workloads_reached: u64,
+    flight_recordings: u64,
+    flight_records: u64,
+    flight_records_dropped: u64,
+    properties: []const AggregateProperty,
+    failures: []const AggregateFailure,
+    artifacts: []const []const u8,
+
+    pub fn renderJsonAlloc(self: Aggregate, allocator: std.mem.Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(allocator, .{
+            .format = aggregate_format,
+            .scenario = self.scenario,
+            .base_seed = self.base_seed,
+            .budget = .{
+                .histories_limit = self.histories_limit,
+                .histories_consumed = self.histories_consumed,
+                .transition_limit_per_history = self.transition_limit_per_history,
+                .transitions_consumed = self.transitions_consumed,
+            },
+            .histories = .{
+                .clean = self.clean_histories,
+                .failed = self.failed_histories,
+                .replay_divergences = self.replay_divergences,
+                .harness_errors = self.harness_errors,
+                .exact_replays = self.exact_replays,
+            },
+            .corpus = .{
+                .entries = self.corpus_entries,
+                .quarantined = self.quarantined_entries,
+                .retained = self.retained_entries,
+            },
+            .coverage = .{
+                .semantic_states = self.semantic_states,
+                .transition_kinds = self.transition_kinds,
+                .faults_reached = self.faults_reached,
+                .workloads_reached = self.workloads_reached,
+            },
+            .flight_recorder = .{
+                .materialized = self.flight_recordings,
+                .records = self.flight_records,
+                .dropped = self.flight_records_dropped,
+            },
+            .health = AggregateHealth{
+                .progress = self.histories_consumed == 0 or self.transitions_consumed > 0,
+                .exact_replay = self.replay_divergences == 0,
+                .harness = self.harness_errors == 0,
+            },
+            .properties = self.properties,
+            .failures = self.failures,
+            .artifacts = self.artifacts,
+        }, .{ .whitespace = .indent_2 });
+    }
+
+    pub fn renderHtmlAlloc(self: Aggregate, allocator: std.mem.Allocator) ![]u8 {
+        const json = try self.renderJsonAlloc(allocator);
+        defer allocator.free(json);
+        const escaped = try escapeHtmlAlloc(allocator, json);
+        defer allocator.free(escaped);
+        return std.fmt.allocPrint(
+            allocator,
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>VOPR campaign {s}</title>" ++
+                "<style>body{{font:14px ui-monospace,monospace;max-width:1100px;margin:2rem auto;padding:0 1rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#111;color:#eee;padding:1rem;border-radius:6px}}</style>" ++
+                "</head><body><h1>VOPR campaign: {s}</h1><p>{d} histories; {d} transitions; {d} failing histories.</p><pre>{s}</pre></body></html>",
+            .{ self.scenario, self.scenario, self.histories_consumed, self.transitions_consumed, self.failed_histories, escaped },
+        );
+    }
+};
 
 pub const BudgetUsage = struct {
     transition_limit: u64,

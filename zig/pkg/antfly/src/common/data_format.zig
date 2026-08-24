@@ -44,16 +44,12 @@ pub const Error = error{
     InvalidAntflyFormatMarker,
 };
 
-pub fn ensureCompatible(alloc: std.mem.Allocator, data_dir: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
+pub fn ensureCompatible(alloc: std.mem.Allocator, io: std.Io, data_dir: []const u8) !void {
     const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
     defer alloc.free(marker_path);
 
     if (pathExists(io, marker_path)) {
-        try validateMarker(alloc, marker_path);
+        try validateMarker(alloc, io, marker_path);
         return;
     }
 
@@ -66,11 +62,8 @@ pub fn ensureCompatible(alloc: std.mem.Allocator, data_dir: []const u8) !void {
     try writeMarkerAtomically(alloc, io, marker_path);
 }
 
-fn validateMarker(alloc: std.mem.Allocator, marker_path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, alloc, .limited(16 * 1024)) catch |err| {
+fn validateMarker(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8) !void {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(16 * 1024)) catch |err| {
         std.debug.print("failed to read Antfly data-dir format marker {s}: {}\n", .{ marker_path, err });
         return err;
     };
@@ -194,10 +187,10 @@ test "ensureCompatible writes marker for new data dir" {
     const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
     defer alloc.free(data_dir);
 
-    try ensureCompatible(alloc, data_dir);
-
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
+    try ensureCompatible(alloc, io_impl.io(), data_dir);
+
     const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
     defer alloc.free(marker_path);
     try std.testing.expect(pathExists(io_impl.io(), marker_path));
@@ -217,7 +210,7 @@ test "ensureCompatible rejects legacy Go store dir" {
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), store_dir);
 
-    try std.testing.expectError(Error.IncompatibleAntflyDataDir, ensureCompatible(alloc, data_dir));
+    try std.testing.expectError(Error.IncompatibleAntflyDataDir, ensureCompatible(alloc, io_impl.io(), data_dir));
 }
 
 test "ensureCompatible accepts existing marker" {
@@ -228,8 +221,10 @@ test "ensureCompatible accepts existing marker" {
     const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
     defer alloc.free(data_dir);
 
-    try ensureCompatible(alloc, data_dir);
-    try ensureCompatible(alloc, data_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try ensureCompatible(alloc, io_impl.io(), data_dir);
+    try ensureCompatible(alloc, io_impl.io(), data_dir);
 }
 
 test "ensureCompatible tolerates concurrent marker creation" {
@@ -242,19 +237,22 @@ test "ensureCompatible tolerates concurrent marker creation" {
 
     const Worker = struct {
         data_dir: []const u8,
+        io: std.Io,
         result: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            ensureCompatible(std.heap.smp_allocator, self.data_dir) catch |err| {
+            ensureCompatible(std.heap.smp_allocator, self.io, self.data_dir) catch |err| {
                 self.result = err;
             };
         }
     };
 
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
     var workers: [8]Worker = undefined;
     var threads: [8]std.Thread = undefined;
     for (&workers, &threads) |*worker, *thread| {
-        worker.* = .{ .data_dir = data_dir };
+        worker.* = .{ .data_dir = data_dir, .io = io_impl.io() };
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
     }
     for (&threads) |*thread| thread.join();
@@ -262,8 +260,6 @@ test "ensureCompatible tolerates concurrent marker creation" {
         if (worker.result) |err| return err;
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
     defer alloc.free(marker_path);
     try std.testing.expect(pathExists(io_impl.io(), marker_path));
@@ -293,5 +289,5 @@ test "ensureCompatible rejects newer storage format" {
         try writer.end();
     }
 
-    try std.testing.expectError(Error.UnsupportedAntflyDataFormat, ensureCompatible(alloc, data_dir));
+    try std.testing.expectError(Error.UnsupportedAntflyDataFormat, ensureCompatible(alloc, io_impl.io(), data_dir));
 }

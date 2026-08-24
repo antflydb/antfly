@@ -227,6 +227,7 @@ const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    io: std.Io,
     executor: lease_executor.LeaseExecutor,
     uri: []u8,
     token_path: []const u8,
@@ -305,6 +306,7 @@ const RuntimeLeaseWatchdog = struct {
                 .grace_ns = grace_ms * std.time.ns_per_ms,
                 .sentinel_path = sentinel_path,
             }, sentinel_generation, repaired_generation),
+            .io = io,
             .executor = executor,
             .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
             .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
@@ -329,11 +331,9 @@ const RuntimeLeaseWatchdog = struct {
 
     fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
         const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
-        var io_impl = std.Io.Threaded.init(self.executor.alloc, .{});
-        defer io_impl.deinit();
         _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
             self.executor.alloc,
-            io_impl.io(),
+            self.io,
             self.watchdog.cfg.sentinel_path,
             self.stable_topology_id,
             self.node_id,
@@ -1475,7 +1475,12 @@ const LocalStandaloneMetadata = struct {
                 else => return err,
             };
             break :blk try self.alloc.dupe(u8, value);
-        } else readFileAlloc(self.alloc, self.catalog_path, 64 * 1024 * 1024) catch |err| switch (err) {
+        } else readFileAlloc(
+            self.alloc,
+            self.backend_runtime.io() orelse std.Options.debug_io,
+            self.catalog_path,
+            64 * 1024 * 1024,
+        ) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -1529,7 +1534,12 @@ const LocalStandaloneMetadata = struct {
             try txn.commit();
             try store.sync(true);
         } else {
-            try writeFileAtomically(self.alloc, self.catalog_path, encoded);
+            try writeFileAtomically(
+                self.alloc,
+                self.backend_runtime.io() orelse std.Options.debug_io,
+                self.catalog_path,
+                encoded,
+            );
         }
     }
 };
@@ -1702,7 +1712,9 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    var setup_io = std.Io.Threaded.init(alloc, .{});
+    defer setup_io.deinit();
+    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
     // Validate and freeze the HA role before any startup helper can mutate a
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
@@ -1712,8 +1724,6 @@ pub fn runFromIterator(
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
-    var setup_io = std.Io.Threaded.init(alloc, .{});
-    defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureParent(setup_io.io(), resolved.local_metadata_catalog_path);
@@ -3351,19 +3361,14 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
+fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
 }
 
-fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata-{d}", .{ path, platform_time.monotonicNs() });
+fn writeFileAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    // Catalog mutations are serialized by LocalStandaloneMetadata.mutex.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata", .{path});
     defer alloc.free(tmp_path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
 
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
@@ -3897,12 +3902,9 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var probe = path;
     while (true) {
-        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), probe, alloc) catch |err| switch (err) {
+        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, probe, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -7485,7 +7487,7 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    try writeFileAtomically(alloc, catalog_path, "{not-json");
+    try writeFileAtomically(alloc, std.Options.debug_io, catalog_path, "{not-json");
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();

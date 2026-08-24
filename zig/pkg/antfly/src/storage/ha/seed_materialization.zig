@@ -166,7 +166,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     defer parsed.deinit();
     try validateTopology(alloc, io, request.raw_generation_root, request.generation, parsed.value);
 
-    try data_format.ensureCompatible(alloc, request.live_installing_root);
+    try data_format.ensureCompatible(alloc, io, request.live_installing_root);
     const data_root = try std.fs.path.join(alloc, &.{ request.live_installing_root, "data" });
     defer alloc.free(data_root);
     const replicas_root = try std.fs.path.join(alloc, &.{ data_root, "replicas" });

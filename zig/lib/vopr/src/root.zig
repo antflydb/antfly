@@ -18,6 +18,7 @@ pub const debugger = @import("debugger.zig");
 pub const debug_recipe = @import("debug_recipe.zig");
 pub const explorer = @import("explorer.zig");
 pub const fault = @import("fault.zig");
+pub const fault_vopr_io = @import("fault_vopr_io.zig");
 pub const fixture = @import("fixture.zig");
 pub const health = @import("health.zig");
 pub const id = @import("id.zig");
