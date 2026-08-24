@@ -16,6 +16,7 @@ const std = @import("std");
 const antfly = @import("antfly_storage_root");
 const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
+pub const ApiTypes = capi;
 const search_wire = @import("search_wire.zig");
 
 const db_mod = antfly.db;
@@ -1899,24 +1900,66 @@ fn openLiteHandleAlloc(
     resolved: LiteResolvedOpenOptions,
     create: bool,
 ) !*Handle {
-    const alloc = std.heap.c_allocator;
+    return try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, resolved, create, null, null);
+}
 
+/// Zig embedding seam behind the C ABI. It constructs the same opaque handle
+/// and therefore exercises the same exported request/close/callback paths, but
+/// lets an in-process host supply deterministic std.Io and runtime ownership.
+/// The runtime and I/O interface must outlive the returned handle.
+pub const HostLiteOpenOptions = struct {
+    create: bool = false,
+    read_only: bool = false,
+    hosted: bool = true,
+    no_sync: bool = false,
+};
+
+pub fn openLiteHandleWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
+    options: HostLiteOpenOptions,
+) !*anyopaque {
+    return try openLiteHandleAllocWithRuntime(alloc, path, .{
+        .open_mode = if (options.read_only) .query_readonly else .writer,
+        .profile = if (options.hosted) .hosted else .native,
+        .no_sync = options.no_sync,
+    }, options.create, io, backend_runtime);
+}
+
+pub fn closeLiteRuntimeHandle(handle_ptr: ?*anyopaque) void {
+    const handle = asHandle(handle_ptr) orelse return;
+    closeHandle(handle);
+}
+
+fn openLiteHandleAllocWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         });
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
+        .backend_runtime = backend_runtime,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -2191,7 +2234,7 @@ pub export fn antfly_lite_restore_backup_json(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    restorePortableBackupToLiteFile(alloc, io_impl.io(), path, backup.bytes(), replace) catch |err| return capi.mapError(err);
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null) catch |err| return capi.mapError(err);
     const report = LiteRestoreReport{ .path = path };
     out.* = stringifyJson(report) catch return .internal;
     return .ok;
@@ -2330,21 +2373,36 @@ pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_b
     return .ok;
 }
 
-fn restorePortableBackupToLiteFile(
+pub fn restorePortableBackupToLiteFileWithRuntime(
     alloc: Allocator,
     io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
     dest_path: []const u8,
     backup: []const u8,
     replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
+) !void {
+    try restorePortableBackupToLiteFile(alloc, io, backend_runtime, dest_path, backup, replace, cancel);
+}
+
+fn restorePortableBackupToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    dest_path: []const u8,
+    backup: []const u8,
+    replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
     try portable_backup.validatePortable(alloc, backup);
+    if (cancel) |token| try token.check();
 
     const dest_exists = liteCapiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
 
-    var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
+    var dest_lock = try antfly.lite.native.lockWriterPathWithIo(alloc, io, dest_path);
     defer dest_lock.close();
 
     if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
@@ -2355,13 +2413,22 @@ fn restorePortableBackupToLiteFile(
     errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
 
     {
-        var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
+        var backend = try lite_backend.Handle.createWithOptions(alloc, tmp_path, .{
+            .exclusive = true,
+            .io = io,
+        });
         defer backend.deinit();
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
             .external_derived_checkpoints = false,
+            .backend_runtime = backend_runtime,
         };
+        // A caller-supplied std.Io runtime may be cooperative (VoprIo) rather
+        // than backed by std.Io.Threaded. Restore is synchronous, so it must
+        // not select the executor variant that requires an owned Threaded
+        // implementation merely because the runtime exposes an Io interface.
+        if (backend_runtime != null) opts.executor = .{ .backend = .manual };
         try backend.configureDbOpenOptions(&opts);
 
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
@@ -2369,10 +2436,13 @@ fn restorePortableBackupToLiteFile(
         try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
+    if (cancel) |token| try token.check();
+
     liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         liteCapiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
+    try antfly.common.fs_paths.syncDirPortable(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
 fn liteCapiPathExists(io: std.Io, path: []const u8) bool {

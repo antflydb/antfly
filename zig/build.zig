@@ -2236,6 +2236,10 @@ pub fn build(b: *std.Build) void {
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
+    embedded_support_mod.addImport("antfly_resolver", resolver_mod);
+    embedded_support_mod.addImport("antfly_matcher", matcher_mod);
+    embedded_support_mod.addImport("antfly_reader_config", reader_config_mod);
+    embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -7025,6 +7029,45 @@ pub fn build(b: *std.Build) void {
     );
     config_extension_lifecycle_vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
 
+    const embedded_lite_lifecycle_vopr_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/vopr/embedded_lite_lifecycle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    embedded_lite_lifecycle_vopr_mod.link_libc = true;
+    embedded_lite_lifecycle_vopr_mod.addImport("vopr", vopr_mod);
+    embedded_lite_lifecycle_vopr_mod.addImport("embedded_db_surface", embedded_db_mod);
+    embedded_lite_lifecycle_vopr_mod.addImport("embedded_support", embedded_support_mod);
+    const embedded_lite_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = embedded_lite_lifecycle_vopr_mod,
+        .filters = &.{
+            "embedded and Lite lifecycle exact replay",
+            "Lite native and VoprIo produce the same logical checkpoint",
+        },
+    });
+    const run_embedded_lite_lifecycle_vopr_tests = b.addRunArtifact(embedded_lite_lifecycle_vopr_tests);
+
+    const capi_lite_lifecycle_vopr_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/vopr/capi_lite_lifecycle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_lite_lifecycle_vopr_mod.link_libc = true;
+    capi_lite_lifecycle_vopr_mod.addImport("vopr", vopr_mod);
+    capi_lite_lifecycle_vopr_mod.addImport("antfly_capi", capi_mod);
+    capi_lite_lifecycle_vopr_mod.addImport("antfly_capi_storage_root", capi_root_mod);
+    const capi_lite_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = capi_lite_lifecycle_vopr_mod,
+        .filters = &.{"C API Lite lifecycle exact replay"},
+    });
+    const run_capi_lite_lifecycle_vopr_tests = b.addRunArtifact(capi_lite_lifecycle_vopr_tests);
+    const embedded_lite_lifecycle_vopr_test_step = b.step(
+        "embedded-lite-lifecycle-vopr-test",
+        "Run embedded, C ABI, and native Lite lifecycle, restore, callback, crash, and differential histories",
+    );
+    embedded_lite_lifecycle_vopr_test_step.dependOn(&run_embedded_lite_lifecycle_vopr_tests.step);
+    embedded_lite_lifecycle_vopr_test_step.dependOn(&run_capi_lite_lifecycle_vopr_tests.step);
+
     const vopr_determinism_audit_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -7229,6 +7272,8 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
     vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_embedded_lite_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_capi_lite_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_vopr_determinism_audit_tests.step);
     vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
     vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);

@@ -82,6 +82,7 @@ An executable unit test alone is not called fully implemented.
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 | P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
 | Cold configuration and extension lifecycle | Antfly `vopr/config_extension_lifecycle.zig`; production secret store, remote-content publisher, extension administration/catalog, package scanner, and Wasmtime artifact loader all borrow the same `std.Io` | `zig build config-extension-lifecycle-vopr-test` |
+| Embedded, C API, and Lite lifecycle | Antfly `vopr/embedded_lite_lifecycle.zig` and `vopr/capi_lite_lifecycle.zig`; native Lite, docstore/index storage, Embedded DB, opaque C API handles, and portable restore borrow one caller-owned `std.Io` and `BackendRuntime` across open, close, callback, cancellation, activation, crash, and reopen boundaries | `zig build embedded-lite-lifecycle-vopr-test` |
 | Provider and composed-query boundaries | Antfly `vopr/provider_boundaries.zig`, `composed_query.zig`; real ManagedEmbedder, PostgreSQL Source, distributed merge, and graph-union seams | `zig build provider-boundary-vopr-test composed-query-vopr-test` |
 | Parquet cache, provisioning/startup, external lake, and media runtime | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/range/registry paths, injected I/O faults, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
 
@@ -702,6 +703,26 @@ VOPR work has found concrete production and harness defects:
   `VoprIo` treats a directory-file sync as the namespace durability boundary,
   and the cold-start campaign proves secret crash/reopen persistence through
   the production atomic writer.
+- Native Lite unconditionally constructed its own `std.Io.Threaded`, and its
+  docstore locks, index timestamps, and index-root canonicalization continued
+  to use native helpers even when the surrounding Embedded or C API owner had
+  a caller-supplied runtime. The lifecycle campaign exposed the index-root
+  escape as a modeled-file `FileNotFound`. Native Lite now retains either an
+  owned Threaded implementation or a borrowed `std.Io`, and every dependent
+  lock, clock, and real-path operation uses the same runtime.
+- Portable C API restore originally had no in-process runtime seam around its
+  staging writer, writer lock, import DB, activation, or parent-directory
+  durability boundary. Its first borrowed-runtime composition also selected
+  the `io_threaded` derived executor, which requires an owned Threaded
+  implementation and failed closed with `MissingBackendRuntimeIo`. Restore now
+  accepts caller-owned I/O, runtime, and cancellation; uses the manual executor
+  for that synchronous composition; checks cancellation before activation; and
+  syncs the parent directory after atomic replacement.
+- Portable directory-sync helpers relied on a platform-specialized inferred
+  error set. On platforms where the unsupported branch was compiled out,
+  portable callers could not name `DurableDirectorySyncUnsupported` in their
+  cross-platform recovery logic. The helpers now expose an explicit portable
+  error contract.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -1225,7 +1246,7 @@ integrated rows above.
 | P0 integrated | Generation publication and cleanup | `generation-lifecycle-vopr-test` drives the production transition manager with one borrowed `std.Io` through clean publication, prepared rollback, rename retry, uncertain directory sync and reconciliation, prepared crash recovery, shared-reader/exclusive-publisher locking, canonical aliases, and stale-generation cleanup. Restore and HA materialization now propagate the same I/O through transition locks and publication cleanup. |
 | P0 integrated | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test` drives the production scanner and cache on borrowed filesystem and monotonic-clock capabilities through absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, disappearance/rescan, and read-fault/restart histories. Metadata service and HTTP rounds use their backend runtime I/O for scans and rechecks. |
 | P0 integrated | Configuration, secrets, remote content, and extensions | `config-extension-lifecycle-vopr-test` exact-replays valid, malformed, and incomplete cold starts; secret rotation with retained readers; crash between durable secret and configuration publication; remote-content replacement, rejected-candidate rollback, and recovery; extension administrative install/dry-run, replacement, disable/enable, and configuration; malformed package recovery; and failed Wasm startup. The production secret store, remote-content runtime, extension lifecycle timestamping, package scanner, and Wasmtime artifact loader borrow `std.Io`; portable directory durability no longer escapes through POSIX. |
-| P1 next | Embedded, C API, and Lite lifecycle | Compose concurrent open/close, callback lifetime, cancellation, restore staging, generation activation, crash/reopen, and native-versus-`VoprIo` differential behavior across the in-process ownership boundary. |
+| P1 integrated | Embedded, C API, and Lite lifecycle | `embedded-lite-lifecycle-vopr-test` exact-replays native Lite crash/reopen, overlapping Embedded writer/reader lifetimes, C API readable-lease callback install/remove, canceled restore, atomic replacement with a pinned old reader, and current-generation visibility. Native Lite, Embedded DB, opaque C API handles, and restore staging share caller-owned `std.Io`/`BackendRuntime`; a physical-versus-`VoprIo` differential compares logical values and checkpoint sequences. |
 | P1 next | Cross-service resource pressure | Share descriptor, memory, storage, task, and admission budgets across HTTP, DB readers/writers, background jobs, Parquet cache, and provider calls. Verify bounded overload, cancellation, cleanup, progress after pressure clears, and exact replay. |
 | P1 next | Full external-lake composition | Extend the existing boundary suite through catalog discovery, manifest and schema evolution, Parquet metadata, row-group cache, and query assembly. Include stale object versions, deletion, ambiguous downloads, cache eviction, and restart. |
 | P2 next | Media-provider execution | Extend registry coverage through scripted provider HTTP for timeout, partial or malformed output, retry, cancellation, runtime replacement, and shutdown with an active request. Keep real codecs, models, and GPU execution differential. |
@@ -1301,8 +1322,8 @@ Wait for a real product or toolchain requirement before adding:
    suites, including their borrowed-I/O lock, cleanup, rescan, and logical-time
    contracts as production formats evolve.
 3. Maintain the integrated cold-start configuration, secrets, remote-content,
-   and extension lifecycle suite; next add embedded/C API/Lite and
-   cross-service pressure compositions.
+   extension, and Embedded/C API/Lite lifecycle suites; next add the
+   cross-service pressure composition.
 4. Maintain the integrated command-template composer and determinism audit as
    new suites add small compatible operations; every new exported replay
    source must enter the checked manifest and remain free of silent host

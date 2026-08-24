@@ -71,12 +71,16 @@ pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Optional caller-owned runtime for the complete native-single-file
+    /// lifecycle. Bridge mode rejects it because that engine is native-only.
+    io: ?std.Io = null,
 };
 
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    io: ?std.Io = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -165,7 +169,7 @@ pub const Handle = struct {
         };
 
         return switch (engine) {
-            .bridge_lsm_container => try openBridgeLsmContainer(allocator, path, opts),
+            .bridge_lsm_container => if (opts.io != null) error.BorrowedIoUnsupported else try openBridgeLsmContainer(allocator, path, opts),
             .native_single_file => try openNativeSingleFile(allocator, path, opts),
         };
     }
@@ -617,6 +621,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
+        .io = opts.io,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
@@ -638,6 +643,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
+        .io = opts.io,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
@@ -1116,7 +1122,7 @@ test "lite backend native stable snapshot uses open handle checkpoint" {
     const snapshot_size = handle.native_docstore.?.file.activeCheckpoint().page_count *
         @as(u64, handle.native_docstore.?.file.header.page_size);
     try handle.native_docstore.?.file.file.writePositionalAll(
-        handle.native_docstore.?.file.io_impl.io(),
+        handle.native_docstore.?.file.runtime(),
         "tail",
         snapshot_size,
     );

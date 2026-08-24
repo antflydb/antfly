@@ -114,7 +114,7 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.io_impl.io();
+    const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
     const checkpoint = pinCheckpoint(self.docs);
@@ -128,7 +128,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.io_impl.io();
+    const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
     const checkpoint = pinCheckpoint(self.docs);
@@ -139,7 +139,7 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.io_impl.io();
+    const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
     const checkpoint = pinCheckpoint(self.docs);
@@ -151,7 +151,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.io_impl.io();
+    const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
     const checkpoint = pinCheckpoint(self.docs);
@@ -253,7 +253,7 @@ fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
 
 fn nowNs(ptr: *anyopaque) u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const now = std.Io.Timestamp.now(self.docs.file.io_impl.io(), .awake);
+    const now = std.Io.Timestamp.now(self.docs.file.runtime(), .awake);
     return @intCast(now.toNanoseconds());
 }
 
@@ -263,7 +263,11 @@ fn rootIdentityAlloc(
     root_dir: []const u8,
 ) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    const canonical = try storage_io.nativeRealPathAlloc(allocator, self.docs.file.path);
+    const io = self.docs.file.runtime();
+    const canonical = if (std.fs.path.isAbsolute(self.docs.file.path))
+        try std.Io.Dir.realPathFileAbsoluteAlloc(io, self.docs.file.path, allocator)
+    else
+        try std.Io.Dir.cwd().realPathFileAlloc(io, self.docs.file.path, allocator);
     defer allocator.free(canonical);
     return try std.fmt.allocPrint(
         allocator,
@@ -667,8 +671,8 @@ test "lite native index storage recovers previous checkpoint after interrupted u
         try std.testing.expect(previous.commit_sequence > 0);
         try std.testing.expect(docs.file.activeCheckpoint().commit_sequence > previous.commit_sequence);
 
-        try docs.file.file.setLength(docs.file.io_impl.io(), previous.page_count * @as(u64, docs.file.header.page_size));
-        try docs.file.file.sync(docs.file.io_impl.io());
+        try docs.file.file.setLength(docs.file.runtime(), previous.page_count * @as(u64, docs.file.header.page_size));
+        try docs.file.file.sync(docs.file.runtime());
     }
 
     {

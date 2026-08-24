@@ -45,7 +45,11 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
     return try std.Io.Dir.cwd().createFile(io, path, flags);
 }
 
-pub fn syncDirPortable(io: anytype, path: []const u8) !void {
+/// The explicit `anyerror` return keeps the cross-platform durability error in
+/// the public contract even when the current target's comptime OS branch can
+/// prove that it will not be produced. Callers must be able to handle artifacts
+/// created for a different deployment target without target-specific catches.
+pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
@@ -92,7 +96,7 @@ pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
 /// and `Dir.cwd()` is represented by `AT_FDCWD`; neither may be passed directly
 /// to `fsync`. Reopening `.` through the held directory keeps resolution bound
 /// to the same directory while obtaining a sync-capable descriptor.
-pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) !void {
+pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) anyerror!void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
