@@ -1468,6 +1468,11 @@ const RaftTableApplyStateMachine = struct {
                     });
                     return err;
                 };
+                // The descriptor-pinned owner call intentionally bypasses the
+                // ProvisionedTableWriteSource mutation vtable. Publish the
+                // corresponding control-plane cache invalidation and status
+                // wake only after the committed mutation succeeds.
+                self.write_source.publishStorageOwnerDataChange(self.alloc, decoded.table_name);
             } else _ = self.write_source.applyPreparedReplicatedBatchGroupLocal(
                 self.alloc,
                 group_id,
@@ -4918,6 +4923,7 @@ pub const DataServer = struct {
         db_opens: usize = 0,
         skipped_db_opens: usize = 0,
         placeholder_group_count: usize = 0,
+        deferred_group_count: usize = 0,
 
         fn canOpenDb(self: *const @This()) bool {
             return self.db_opens < self.max_db_opens;
@@ -4933,6 +4939,10 @@ pub const DataServer = struct {
 
         fn recordPlaceholder(self: *@This()) void {
             self.placeholder_group_count += 1;
+        }
+
+        fn recordDeferred(self: *@This()) void {
+            self.deferred_group_count += 1;
         }
     };
 
@@ -8034,6 +8044,15 @@ pub const DataServer = struct {
                         });
                         return error.RaftBatchWriteOutcomeUnknown;
                     };
+                    switch (proposal_req.sync_level) {
+                        .full_text, .enrichments, .full_index =>
+                        // Raft apply publishes the data mutation. Full
+                        // visibility can complete later inside the compiled
+                        // owner, so publish a second status-only wake at the
+                        // exact synchronization boundary observed by the API.
+                        self.write_source.publishStorageOwnerRuntimeStatusChange(table_name),
+                        .propose, .write => {},
+                    }
                 } else {
                     const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                     sync_source.syncReplicatedBatchGroupLocalWithCancellation(alloc, group_id, table_name, proposal_req.sync_level, route.visibility_cancellation) catch |err| {
@@ -14124,6 +14143,10 @@ pub const DataServer = struct {
             return stats;
         };
         defer collection.deinit(self.alloc);
+        // An exclusive startup catch-up owner may temporarily prevent a live
+        // observation. Preserve that producer wake until a later pass can
+        // replace the placeholder with authoritative storage-owner status.
+        refresh_retry_pending = budget.deferred_group_count != 0;
         const snapshots = collection.snapshots;
         stats.db_opens = @intCast(budget.db_opens);
         stats.skipped_db_opens = @intCast(budget.skipped_db_opens);
@@ -14360,6 +14383,13 @@ pub const DataServer = struct {
                 continue;
             }
             if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
+                // Never consume the only runtime-status wake merely because a
+                // lifecycle owner is active. Publish a schema-derived stale
+                // observation now so remote control planes retain the group,
+                // and force a later pass to obtain authoritative facts after
+                // the exclusive operation drains.
+                budget.recordDeferred();
+                try self.appendCachedOrSyntheticRuntimeStatus(&items, table, group_id, .stale, budget);
                 continue;
             }
             if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
@@ -22615,7 +22645,7 @@ test "data runtime status refresh preserves only the active catch-up group while
     try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "logs")) == null);
 }
 
-test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
+test "data runtime status refresh publishes and retries an active startup group without opening it" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -22755,7 +22785,13 @@ test "data runtime status refresh skips opening the active startup group when no
     try server.requestRuntimeStatusRefresh();
 
     try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_failed.load(.monotonic));
-    try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")) == null);
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    var docs_cached = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer docs_cached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), docs_cached.items.len);
+    try std.testing.expectEqual(@as(u64, 77), docs_cached.items[0].group_id);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, docs_cached.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, docs_cached.items[0].metadata.freshness);
     try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "logs")) == null);
 }
 

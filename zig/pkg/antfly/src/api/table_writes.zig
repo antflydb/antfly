@@ -11520,6 +11520,36 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_change_hook) |hook| hook.on_change(hook.ptr, table_name, kind);
     }
 
+    /// Publish the control-plane effects of a committed mutation executed by
+    /// the resident storage owner directly. Split Raft apply deliberately
+    /// bypasses this source's mutation vtable so it can consume the descriptor
+    /// embedded in the committed command without consulting the catalog from
+    /// the apply thread. That bypass must not also skip cache invalidation and
+    /// runtime-status scheduling owned by the control process.
+    pub fn publishStorageOwnerDataChange(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+        self.notifyLocalChange(table_name, .data);
+    }
+
+    /// Publish a lifecycle-only wake after an owner-side visibility barrier.
+    /// The corresponding data change was emitted by Raft apply; this second
+    /// signal ensures the control-plane snapshot observes the final index or
+    /// enrichment state reached by a full synchronization request.
+    pub fn publishStorageOwnerRuntimeStatusChange(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) void {
+        self.notifyLocalChange(table_name, .runtime_status);
+    }
+
     fn notifyLocalIndexRepairDebt(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -32092,6 +32122,43 @@ test "provisioned table write source cold status delegates to refresh owner" {
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
+}
+
+test "provisioned table write source publishes direct storage owner data changes" {
+    const Hook = struct {
+        calls: usize = 0,
+        table_name: ?[]const u8 = null,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, table_name: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.table_name = table_name;
+            self.kind = kind;
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-storage-owner-data-change",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var hook = Hook{};
+    source.setLocalChangeHook(.{
+        .ptr = &hook,
+        .on_change = Hook.onChange,
+    });
+
+    source.publishStorageOwnerDataChange(std.testing.allocator, "docs");
+
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqualStrings("docs", hook.table_name.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
+
+    source.publishStorageOwnerRuntimeStatusChange("docs");
+
+    try std.testing.expectEqual(@as(usize, 2), hook.calls);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
 }
 
