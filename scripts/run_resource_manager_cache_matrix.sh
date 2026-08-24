@@ -126,6 +126,7 @@ run_case() {
   local budget_mb="$4"
   local filter_selectivity="${5:-10}"
   local case_repeats="${6:-$REPEATS}"
+  local run_exact_recall="${7:-0}"
   if [[ "$RESUME" == "1" ]] && awk -F '\t' -v case_name="$name" '$1 == case_name { found = 1 } END { exit(found ? 0 : 1) }' "$STATUS_FILE"; then
     printf 'skipping-recorded\t%s\n' "$name"
     return 0
@@ -158,12 +159,10 @@ run_case() {
   if [[ "$shape" == "dense-filter" ]]; then
     cmd+=(--filter-selectivity-percent "$filter_selectivity")
   fi
-  # Tie recall evidence to the cases used to explain the 50K elbow and the
-  # 1M dense/selectivity comparisons without adding full scans to every
-  # intermediate-scale diagnostic.
-  if [[ "$SMOKE" == "1" && ("$shape" == "dense" || "$shape" == "dense-filter") ]] ||
-    [[ "$docs" == "1000000" && ("$shape" == "dense" || "$shape" == "dense-filter") ]] ||
-    [[ "$docs" == "50000" && "$shape" == "dense-filter" && "$filter_selectivity" == "1" ]]; then
+  # Exact truth is deliberately opt-in per invocation. Inferring it from the
+  # shape/size also catches maintenance and ad-hoc diagnostic cases, adding
+  # billions of comparisons that neither contribute to nor gate evidence.
+  if [[ "$run_exact_recall" == "1" ]]; then
     cmd+=(--exact-recall-samples "$EXACT_RECALL_SAMPLES")
   fi
   if [[ "$shape" == "graph-expand" ]]; then
@@ -198,9 +197,19 @@ fi
 FAILURES="$(awk -F '\t' '$2 != 0 { count += 1 } END { print count + 0 }' "$STATUS_FILE")"
 for budget_mb in $MEMORY_BUDGETS_MB; do
   for docs in $SCALE_SIZES; do
-    run_case "dense-${docs}-m${budget_mb}" dense "$docs" "$budget_mb" || FAILURES=$((FAILURES + 1))
+    dense_exact_recall=0
+    if [[ "$SMOKE" == "1" || "$docs" == "1000000" ]]; then
+      dense_exact_recall=1
+    fi
+    run_case "dense-${docs}-m${budget_mb}" dense "$docs" "$budget_mb" 10 "$REPEATS" "$dense_exact_recall" || FAILURES=$((FAILURES + 1))
     for filter_selectivity in $FILTER_SELECTIVITIES; do
-      run_case "dense-filter-p${filter_selectivity}-${docs}-m${budget_mb}" dense-filter "$docs" "$budget_mb" "$filter_selectivity" || FAILURES=$((FAILURES + 1))
+      filtered_exact_recall=0
+      if [[ "$SMOKE" == "1" ]] ||
+        [[ "$docs" == "1000000" && ("$filter_selectivity" == "1" || "$filter_selectivity" == "10") ]] ||
+        [[ "$docs" == "50000" && "$filter_selectivity" == "1" ]]; then
+        filtered_exact_recall=1
+      fi
+      run_case "dense-filter-p${filter_selectivity}-${docs}-m${budget_mb}" dense-filter "$docs" "$budget_mb" "$filter_selectivity" "$REPEATS" "$filtered_exact_recall" || FAILURES=$((FAILURES + 1))
     done
   done
   if [[ "$RUN_ENDPOINTS" == "1" ]]; then

@@ -2323,9 +2323,24 @@ fn benchConcurrentHttpWithPolling(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     } else null;
-    const health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
-    const metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
-    const status_thread: ?std.Thread = blk: {
+    var health_thread: ?std.Thread = null;
+    var metrics_thread: ?std.Thread = null;
+    var status_thread: ?std.Thread = null;
+    var rss_thread: ?std.Thread = null;
+    defer {
+        // Pollers borrow stack-owned contexts, so every exit path must stop
+        // and join each successfully spawned thread before those contexts go
+        // out of scope. joinOptionalThread clears consumed handles and keeps
+        // this cleanup safe after the normal-path joins below.
+        stop.store(true, .release);
+        joinOptionalThread(&health_thread);
+        joinOptionalThread(&metrics_thread);
+        joinOptionalThread(&status_thread);
+        joinOptionalThread(&rss_thread);
+    }
+    health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
+    metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
+    status_thread = blk: {
         if (status_poller) |*poller| {
             break :blk try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{poller});
         }
@@ -2338,7 +2353,7 @@ fn benchConcurrentHttpWithPolling(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     } else null;
-    const rss_thread: ?std.Thread = if (rss_poller != null)
+    rss_thread = if (rss_poller != null)
         try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller.?})
     else
         null;
@@ -2350,12 +2365,13 @@ fn benchConcurrentHttpWithPolling(
 
     var start_gate = ConcurrentStartGate{};
     var spawned_threads: usize = 0;
+    var joined_threads: usize = 0;
     errdefer {
-        // A partial spawn must release and join workers already waiting at
-        // the gate; otherwise an allocation/thread-limit failure leaks them.
+        // Release workers waiting after a partial spawn and join only handles
+        // that have not already been consumed by the normal join loop.
         start_gate.aborted.store(true, .release);
         start_gate.start.store(true, .release);
-        for (threads[0..spawned_threads]) |thread| thread.join();
+        for (threads[joined_threads..spawned_threads]) |thread| thread.join();
     }
     for (workers, 0..) |*worker, i| {
         worker.* = .{
@@ -2376,21 +2392,27 @@ fn benchConcurrentHttpWithPolling(
     start_gate.start.store(true, .release);
 
     var combined: ConcurrentStats = .{};
+    var worker_err: ?anyerror = null;
     for (threads, workers) |thread, *worker| {
         thread.join();
-        if (worker.err) |err| return err;
+        joined_threads += 1;
+        if (worker.err) |err| {
+            if (worker_err == null) worker_err = err;
+            continue;
+        }
         combined.total_ns = @max(combined.total_ns, worker.stats.total_ns);
         combined.request_ns += worker.stats.request_ns;
         combined.max_request_ns = @max(combined.max_request_ns, worker.stats.max_request_ns);
         combined.queries += worker.stats.queries;
         combined.failures += worker.stats.failures;
     }
+    if (worker_err) |err| return err;
 
     stop.store(true, .release);
-    health_thread.join();
-    metrics_thread.join();
-    if (status_thread) |thread| thread.join();
-    if (rss_thread) |thread| thread.join();
+    joinOptionalThread(&health_thread);
+    joinOptionalThread(&metrics_thread);
+    joinOptionalThread(&status_thread);
+    joinOptionalThread(&rss_thread);
     if (health_poller.err) |err| return err;
     if (metrics_poller.err) |err| return err;
     if (status_poller) |ctx| if (ctx.err) |err| return err;
@@ -2407,6 +2429,12 @@ fn benchConcurrentHttpWithPolling(
         .rss_peak_bytes = if (rss_poller) |ctx| ctx.peak_rss_bytes else 0,
         .exact_recall_responses = exact_recall_responses,
     };
+}
+
+fn joinOptionalThread(thread: *?std.Thread) void {
+    const spawned = thread.* orelse return;
+    thread.* = null;
+    spawned.join();
 }
 
 fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config, query_idx: usize) !void {

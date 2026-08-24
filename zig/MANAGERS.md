@@ -850,7 +850,9 @@ adaptive route. Production runs sample every one of the eight generated-vector
 clusters before revisiting a cluster and record `exact_recall_lane`, sample
 count, and covered strata in each JSON summary. The sample count, required
 strata, and minimum recall remain environment-overridable for longer
-qualification runs.
+qualification runs. Exact truth is enabled explicitly only for those four
+qualification cases (and reduced smoke cases); maintenance soaks and ad-hoc
+scale diagnostics never inherit the full scans from a matching shape or size.
 Run the reduced
 endpoint/integration check before the evidence-producing matrix:
 
