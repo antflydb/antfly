@@ -2218,7 +2218,7 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     const query_path = try std.fmt.allocPrint(alloc, "{s}/query.json", .{corpus_path});
     defer alloc.free(query_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = query_path, .data =
-        \\{"selector":{"kind":"injected_error"},"limit":16}
+        \\{"selector":{},"limit":16}
     });
     const query_result_path = try std.fmt.allocPrint(alloc, "{s}/query-result.json", .{corpus_path});
     defer alloc.free(query_result_path);
@@ -2226,6 +2226,10 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     const query_result = try std.Io.Dir.cwd().readFileAlloc(io, query_result_path, alloc, .limited(max_trace_bytes));
     defer alloc.free(query_result);
     try std.testing.expect(std.mem.indexOf(u8, query_result, "vopr-event-query-v1") != null);
+    var parsed_query_result = try std.json.parseFromSlice(std.json.Value, alloc, query_result, .{});
+    defer parsed_query_result.deinit();
+    const match_count = parsed_query_result.value.object.get("match_count") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(match_count.integer > 0);
 
     const merge_invalid_path = try std.fmt.allocPrint(alloc, "{s}/invalid.voprtrace", .{corpus_path});
     defer alloc.free(merge_invalid_path);

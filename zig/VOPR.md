@@ -6,11 +6,15 @@ storage, HA, data-plane, derived-workflow, backup/restore, and clock-fault
 scenarios are implemented. The production DataServer now serves public HTTP on
 borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
 resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
-scriptable/interactive debugger are executable. Routed data, Raft, split/merge,
-query assembly, and DataServer-owned maintenance services now expose
-production-safe scheduler boundaries. Campaigns export bounded counterfactual
-graphs and explicit quarantine manifests; the virtual filesystem models
-persistent sector corruption and torn synchronization.
+scriptable/interactive debugger are executable. Replication backfill,
+supervision, authentication, complete serverless orchestration, DB/index races,
+provider boundaries, and composed query assembly have focused exact-replay
+suites. Routed data, Raft, split/merge, query assembly, and DataServer-owned
+maintenance services expose production-safe scheduler boundaries. Campaigns
+export unified reduction/causal/counterfactual debug recipes, bounded flight
+recordings, stable JSON/static reports, and explicit quarantine manifests; the
+virtual filesystem models persistent sector corruption and torn
+synchronization.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -48,6 +52,10 @@ not a prerequisite for deterministic search.
 | Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
+| Retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`; verbose event details are outside replay truth and retained only for novel/failing/debug histories | `zig build vopr-engine-test vopr-events` |
+| Stable local run/results API, static report, richer property evidence, and default harness health | `report.zig`, `health.zig`, `vopr-results` | `zig build vopr-engine-test vopr-meta-test vopr-results` |
+| Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
+| Explicit fault composition, structured-choice auditing, and injected-bug search benchmarks | `fault.zig`, `choice.zig`, `benchmark.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Replay-before-retention campaigns, deterministic workers, bounded counterfactual graphs, and quarantine manifests/raw artifacts | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
 | Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-engine-test vopr-meta-test` |
 | TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
@@ -60,6 +68,8 @@ not a prerequisite for deterministic search.
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
 | Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, repair, DataServer warmup/catch-up/root/status refresh, and auto-bulk finish work on borrowed `std.Io`/shared owners; `vopr/admission.zig` | `zig build storage-vopr-runtime-test vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
+| P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
+| Provider and composed-query boundaries | Antfly `vopr/provider_boundaries.zig`, `composed_query.zig`; real ManagedEmbedder, PostgreSQL Source, distributed merge, and graph-union seams | `zig build provider-boundary-vopr-test composed-query-vopr-test` |
 
 The real DataServer listener, httpx client/server transport, request lifecycle,
 deadline, shutdown, and partial writes now execute as deterministic `VoprIo`
@@ -178,6 +188,9 @@ lib/vopr/src/
   snapshot.zig               splice.zig
   causal.zig                 multiverse.zig
   debugger.zig               collector.zig
+  event_query.zig            flight_recorder.zig
+  report.zig                 health.zig
+  debug_recipe.zig           benchmark.zig
   vopr-trace-v1.schema.json
 
 pkg/antfly/src/vopr/
@@ -189,6 +202,13 @@ pkg/antfly/src/vopr/
   data_server.zig
   object_store.zig
   admission.zig
+  replication_backfill.zig
+  supervision.zig
+  auth_lifecycle.zig
+  serverless_workflow.zig
+  db_index_races.zig
+  provider_boundaries.zig
+  composed_query.zig
   fixtures/<scenario>/
 ```
 
@@ -395,9 +415,11 @@ seeds; worker completion order does not decide canonical corpus contents.
 ### Artifact Contract
 
 `vopr-trace-v1` NDJSON records a versioned header and configuration, choices,
-transitions, faults, events, observations, property encounters, failures, and a
-summary. The decision stream is authoritative; events and observations support
-diagnostics, coverage, and formal export.
+transitions, faults, canonical events, observations, property encounters,
+failures, and a summary. The decision stream is authoritative; canonical
+events and observations support diagnostics, coverage, and formal export.
+Verbose flight-recorder details are deliberately outside replay truth, so
+retaining or changing diagnostic detail cannot invalidate a canonical trace.
 
 Generated artifacts normally live under:
 
@@ -695,6 +717,26 @@ zig build vopr-debug -- \
 zig build vopr-debug -- \
   --trace /tmp/metadata-reduced.voprtrace \
   --interactive
+
+# Stable machine-readable/static results and a temporal event query.
+zig build vopr-results -- \
+  --trace /tmp/metadata-reduced.voprtrace \
+  --json-out /tmp/results.json \
+  --html-out /tmp/results.html
+zig build vopr-events -- \
+  --trace /tmp/metadata-reduced.voprtrace \
+  --query /tmp/event-query.json \
+  --out /tmp/event-matches.json
+
+# One reviewable failure package and deterministic corpus merge.
+zig build vopr-recipe -- \
+  --trace /tmp/metadata.voprtrace \
+  --out /tmp/failure.recipe.json \
+  --reduced-out /tmp/failure-reduced.voprtrace
+zig build vopr-corpus-merge -- \
+  --base /tmp/metadata-reduced.voprtrace \
+  --trace /tmp/failure-reduced.voprtrace \
+  --out-dir /tmp/merged-vopr-corpus
 
 # Bounded deterministic campaign.
 zig build vopr-campaign -- \
@@ -1009,15 +1051,69 @@ allocator, file, socket, storage, and queue limits, and the DataServer covers
 socket admission. Continue composing these policies into deeper DataServer
 request microsteps as those seams are added.
 
-#### Existing Antithesis-Class Tooling and Search Quality
+#### Provider Boundaries
+
+`provider-boundary-vopr-test` executes the real `ManagedEmbedder` local-provider
+boundary and the real PostgreSQL `RuntimeSource`/`QueryExecutor` boundary around
+deterministic response adapters. Its exact-replay histories cover valid,
+partial, malformed, timed-out, cancelled, transient, and retry-then-success
+responses. The suite proves dense batch cardinality/dimension/finite-value
+validation, local error normalization, PostgreSQL SQL construction and
+cancellation propagation, and zero leaked foreground admission on every return
+path. `RequestAdmission.Lease` makes that ownership single-release and explicit
+for production callbacks.
+
+Actual model execution, GPU kernels, and libpq internals remain in their
+existing differential and integration tests. This is intentional: VOPR owns
+the deterministic application boundary, not a substitute implementation of a
+provider runtime.
+
+#### Composed Query Lifecycle
+
+`composed-query-vopr-test` treats text, vector, and graph completion as
+independent stable transitions, then executes the production distributed
+`mergeSearchResults` and graph-union implementation at the global publication
+boundary. It exact-replays every component completion ordering, graph partial
+failure followed by retry, early and late cancellation, admission pressure,
+capacity release, and final reassembly. Properties prove that no partial or
+cancelled result is published, the canonical text/vector/graph set survives
+every assembly ordering, graph results remain attached, and final admission
+ownership is released.
+
+#### Self-Contained Antithesis-Class Tooling and Search Quality
 
 - Persisted pointer-free multiverse nodes, ranked counterfactual experiments,
   stable trial metadata, explicit total experiment budgets, cross-revision
   property history, scheduler-controlled completion order, and bounded
   systematic starvation are implemented in the self-contained repository.
-- Long-running campaigns write causal reports, counterfactual experiment and
-  multiverse graphs, and a quarantine manifest plus the original quarantined
-  bytes. Diagnostics run only for a newly observed failure fingerprint.
+- Every generic explored history has a bounded structured flight recorder.
+  Verbose owned details are excluded from canonical trace bytes and retained
+  only for novel histories, failures, or explicit debugger requests;
+  checkpoint-resumed exploration reconstructs the canonical prefix before
+  recording the suffix.
+- Fielded event queries support kind, name, actor, resource, fault phase,
+  transition and logical-time windows, `preceded_by`, `followed_by`, and
+  same-actor/resource correlation. `vopr-events` runs a query over a clean
+  exact replay.
+- `vopr-results` emits stable `vopr-results-v1` JSON and an optional static
+  local HTML report containing run metadata, budgets, property results,
+  first-failure and rare-success evidence, declared-but-never-encountered
+  properties, corpus entries, quarantine state, and artifact references.
+- For every new failure fingerprint, campaigns write one automatic debug
+  recipe containing same-fingerprint reduction, causal-window extraction,
+  bounded counterfactual experiments, selected event queries, logical
+  before/after collectors, and the reduced exact-replay artifact.
+- `vopr-corpus-merge` exact-replays compatible local/CI/nightly candidates,
+  quarantines incompatible or divergent bytes, and publishes a deterministic
+  merged manifest after referenced artifacts are written.
+- Fault definitions explicitly encode precedence, overlap, and exclusion
+  groups. The runner audits every choice record for typed, immediate
+  scenario-level selection instead of delayed seed interpretation.
+- Default report health covers no progress/deadlock, task and descriptor leaks,
+  allocator/storage exhaustion, cleanup, replay divergence, and harness errors.
+- `vopr-benchmark` uses an intentionally injected starvation bug and tracks
+  discovery probability plus modeled transition cost across random, guided,
+  spliced, starvation, and checkpoint-assisted exploration.
 - `vopr-debug` supports replay-proven navigation, branch creation, logical
   collectors, causal and bounded counterfactual windows, and child comparison
   from command files or an interactive terminal.
@@ -1030,7 +1126,7 @@ request microsteps as those seams are added.
 - Add stable source/basic-block coverage as secondary guidance when the Zig
   instrumentation surface can remain outside the replay ABI.
 
-### Highest-Value New VOPR Test Suites
+### Priority Test Roadmap
 
 | Priority | Area | What to exercise |
 | --- | --- | --- |
@@ -1039,17 +1135,18 @@ request microsteps as those seams are added.
 | P0 implemented | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
 | P1 implemented | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, and exact replay through production orchestration. |
 | P1 implemented | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
-| P2 | Provider boundaries | Add deterministic response adapters for inference providers and PostgreSQL/libpq covering timeout, partial response, cancellation, retry, malformed data, and admission ownership. Keep actual model execution, GPU kernels, and libpq internals in differential and integration tests. |
-| P2 | Composed query lifecycle | Exercise vector, text, graph, and global-query execution under partial failure, cancellation, resource pressure, and result-assembly races. |
+| P2 implemented | Provider boundaries | `provider-boundary-vopr-test` uses the real ManagedEmbedder and PostgreSQL Source boundaries for timeout, partial response, cancellation, retry, malformed data, SQL construction, and admission ownership. Actual models, GPU kernels, and libpq internals remain differential/integration concerns. |
+| P2 implemented | Composed query lifecycle | `composed-query-vopr-test` exact-replays vector, text, graph, and global-query completion under partial failure/retry, cancellation, resource pressure, and every result-assembly ordering through production merge and graph-union code. |
 
 Replication backfill and the standalone/serverless supervisor were the first
 targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now implemented. The complete
 serverless workflow and DB/index request-race compositions are also
-implemented. The remaining rows are P2 expansion work rather than unfinished
-P0/P1 foundations.
+implemented, as are the two P2 boundary suites. Future test work is incremental
+coverage for new production consumers and newly exposed safe suspension points,
+not unfinished P0/P1/P2 foundations.
 
-### Antithesis-Class Features Still Worth Porting
+### Ported Antithesis-Class Features
 
 VOPR already has the important core: structured controlled choices, the major
 Antithesis assertion kinds and assertion cataloging, deterministic scheduling
@@ -1057,52 +1154,29 @@ and I/O, logical checkpoints, exact replay, reduction, semantic coverage,
 starvation, causal and counterfactual analysis, and multiverse navigation. The
 documented [Antithesis assertion
 model](https://antithesis.com/docs/product/writing_tests/assertions/) is
-therefore substantially covered.
+therefore substantially covered. The hard, high-value features identified for
+local replacement are now implemented:
 
-The remaining high-value features are:
+1. bounded retroactive flight recording;
+2. fielded and temporal event-history queries comparable to [Antithesis event
+   logs](https://antithesis.com/docs/reference/event_logs/);
+3. stable repository-owned JSON results and static reports corresponding to
+   the run/log APIs described in the [Antithesis release
+   notes](https://antithesis.com/docs/release_notes/);
+4. automatic reduction/causal/counterfactual/query/collector debug recipes;
+5. first-failure, rare-success, structured-detail, and never-encountered
+   property evidence;
+6. explicit overlapping-fault precedence and exclusion algebra, matching the
+   useful application-level behavior of [overlapping
+   faults](https://antithesis.com/docs/environment/fault_injection/);
+7. automatic structured-choice auditing, following the controlled-alternative
+   principle in [Antithesis controlled
+   randomness](https://antithesis.com/docs/reference/sdk/generate_randomness/);
+8. default harness-health reporting; and
+9. injected-bug search-quality regression benchmarks.
 
-1. **Retroactive logging and flight recording.** Keep a bounded structured
-   event ring for every history, but retain or materialize verbose data only
-   when a property fails, a history becomes novel, or a debugger requests it.
-   Antithesis added retroactive logging in August 2026, as described in its
-   [release notes](https://antithesis.com/docs/release_notes/).
-2. **Queryable event history.** Add fielded event details and predicates such
-   as `preceded_by`, `followed_by`, actor/resource/fault filters, and time
-   windows. VOPR has canonical events and causal windows, but not a general
-   event-query layer comparable to [Antithesis event
-   logs](https://antithesis.com/docs/reference/event_logs/).
-3. **Self-contained run/results API.** Expose run metadata, property results,
-   event search, corpus entries, artifacts, quarantine state, and budget usage
-   through stable JSON plus an optional static local report, corresponding to
-   the run and log APIs described in the [Antithesis release
-   notes](https://antithesis.com/docs/release_notes/). This should remain a
-   repository-owned local and CI interface rather than a hosted dependency.
-4. **Automatic debug recipes.** For each new failure fingerprint,
-   automatically run reduction, causal-window extraction, bounded
-   counterfactual experiments, selected log queries, and before/after
-   collectors, then package one reviewable artifact.
-5. **Richer property evidence.** Preserve structured details, the first
-   failure, the rarest successful witness, and declared-but-never-encountered
-   results in reports and searches. The engine has cataloging and string
-   details; the reporting layer should make them first-class.
-6. **Explicit overlapping-fault algebra.** Define how partition, delay, node
-   pause, storage corruption, resource exhaustion, and clock faults compose,
-   including precedence and exclusion groups. Antithesis schedules faults
-   independently and permits [overlapping
-   faults](https://antithesis.com/docs/environment/fault_injection/).
-7. **Structured-choice audit.** Require every scenario-level decision to be
-   an immediate typed choice rather than a random integer used as a seed or
-   interpreted later. This gives search guidance the structured alternatives
-   described by [Antithesis controlled
-   randomness](https://antithesis.com/docs/reference/sdk/generate_randomness/).
-8. **Default harness-health properties.** Automatically enable no-progress or
-   deadlock, task and descriptor leaks, allocator or storage exhaustion,
-   cleanup, replay divergence, and harness-error properties for every
-   scenario.
-9. **Search-quality regression benchmarks.** Maintain a corpus of
-   intentionally injected bugs and track discovery probability and transition
-   cost across random, guided, spliced, starvation, and checkpoint-assisted
-   search.
+These capabilities are local libraries, commands, reports, and CI gates. They
+do not require an Antithesis account or hosted runtime.
 
 ### Conditional Work
 
@@ -1119,16 +1193,19 @@ Wait for a real product or toolchain requirement before adding:
 - a container or hypervisor clone, which would duplicate the expensive part of
   Antithesis without improving Antfly's in-process `std.Io` strategy.
 
-### Delivery Order
+### Ongoing Roadmap
 
-1. Maintain the implemented replication-backfill, supervisor, and
-   authentication VOPR suites, plus the complete-serverless-workflow suite, as
-   their production seams evolve.
-2. Maintain the DB and index request-race compositions as new index kinds and
-   admission dimensions are added.
-3. Build retroactive logging, event queries, and automatic debug recipes.
-4. Standardize local run/results artifacts and nightly corpus merging.
-5. Add broader query compositions and provider model adapters.
+1. Maintain the implemented replication-backfill, supervisor, authentication,
+   serverless-workflow, DB/index, provider-boundary, and composed-query suites
+   as production seams evolve.
+2. Wire deterministic corpus merging and stable results reports into nightly
+   CI retention policy; the local commands and formats are already complete.
+3. Extend provider adapters only when a new production provider boundary is
+   added, retaining real model/GPU/libpq execution as differential coverage.
+4. Add deeper query and DataServer compositions only at production-safe
+   suspension and ownership boundaries.
+5. Grow the injected-bug benchmark corpus and track search-quality regressions
+   across releases.
 6. Continuously audit new production loops so they borrow `std.Io` and
    `VoprIo` instead of creating native-only runtime paths.
 
@@ -1195,11 +1272,12 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The next work should exercise replication backfill, runtime supervision,
-authentication, and complete serverless orchestration through those existing
-primitives, then improve flight recording, event queries, and automated
-failure packaging. Compiler-guided coverage and provider-specific datagram
-campaigns remain conditional on stable instrumentation and real consumers.
-New product services should cross the existing `std.Io`, lifecycle-hook,
-admission, and owner seams rather than creating native-only loops, multiplying
-suite names, or weakening production ownership contracts.
+The identified P0, P1, and P2 orchestration suites and the hard
+Antithesis-class local tooling are implemented. The next work is operational:
+retain and merge nightly corpora, track search-quality benchmarks, and extend
+scenarios when new production consumers expose safe ownership boundaries.
+Compiler-guided coverage and provider-specific datagram campaigns remain
+conditional on stable instrumentation and real consumers. New product services
+should cross the existing `std.Io`, lifecycle-hook, admission, and owner seams
+rather than creating native-only loops, multiplying suite names, or weakening
+production ownership contracts.
