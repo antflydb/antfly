@@ -705,6 +705,35 @@ fn hbcKindStats(stats: *HbcCacheStats, kind: HbcCacheKind) *HbcCacheKindStats {
     };
 }
 
+fn snapshotHbcKindStats(stored: *HbcCacheKindStats) HbcCacheKindStats {
+    // The cache map lock stabilizes structural counters. Hits and misses are
+    // intentionally updated while readers share that lock, so they must be
+    // loaded atomically instead of copying the containing struct.
+    return .{
+        .used_bytes = stored.used_bytes,
+        .peak_bytes = stored.peak_bytes,
+        .hits = @atomicLoad(u64, &stored.hits, .monotonic),
+        .misses = @atomicLoad(u64, &stored.misses, .monotonic),
+        .insertions = stored.insertions,
+        .replacements = stored.replacements,
+        .sampled_admissions = stored.sampled_admissions,
+        .admission_skips = stored.admission_skips,
+        .evictions = stored.evictions,
+    };
+}
+
+fn snapshotHbcCacheStats(stored: *HbcCacheStats) HbcCacheStats {
+    return .{
+        .total_bytes = stored.total_bytes,
+        .accounted_bytes = stored.accounted_bytes,
+        .pinned_bytes = stored.pinned_bytes,
+        .node = snapshotHbcKindStats(&stored.node),
+        .quantized = snapshotHbcKindStats(&stored.quantized),
+        .vector = snapshotHbcKindStats(&stored.vector),
+        .metadata = snapshotHbcKindStats(&stored.metadata),
+    };
+}
+
 fn hbcResourceCacheClass(kind: HbcCacheKind) resource_manager_mod.HbcCacheClass {
     return switch (kind) {
         .node => .node,
@@ -898,13 +927,10 @@ pub const Cache = struct {
     pub fn namespaceStats(self: *Cache, namespace: u64) HbcCacheStats {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        var stats = self.namespace_stats.get(namespace) orelse HbcCacheStats{};
-        inline for (.{ HbcCacheKind.node, HbcCacheKind.quantized, HbcCacheKind.vector, HbcCacheKind.metadata }) |kind| {
-            if (self.namespace_stats.getPtr(namespace)) |stored| {
-                hbcKindStats(&stats, kind).hits = @atomicLoad(u64, &hbcKindStats(stored, kind).hits, .monotonic);
-                hbcKindStats(&stats, kind).misses = @atomicLoad(u64, &hbcKindStats(stored, kind).misses, .monotonic);
-            }
-        }
+        var stats = if (self.namespace_stats.getPtr(namespace)) |stored|
+            snapshotHbcCacheStats(stored)
+        else
+            HbcCacheStats{};
         stats.pinned_bytes = self.namespace_pinned_accounting.current(namespace);
         stats.accounted_bytes = stats.total_bytes +| stats.pinned_bytes;
         return stats;
@@ -1164,20 +1190,6 @@ pub const Cache = struct {
         }
         return missing_count;
     }
-
-    pub fn getMetadata(self: *Cache, namespace: u64, vector_id: u64) ?[]const u8 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
-        const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
-        if (self.metadata_cache.get(key)) |entry| {
-            self.noteLookupLocked(.metadata, namespace, true);
-            self.touchSlot(&self.metadata_clock, self.metadata_slots.get(key));
-            return entry.metadata;
-        }
-        self.noteLookupLocked(.metadata, namespace, false);
-        return null;
-    }
-
     pub fn borrowMetadata(self: *Cache, namespace: u64, vector_id: u64) ?BorrowedMetadataLease {
         self.mutex.lockShared();
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
@@ -1411,7 +1423,9 @@ pub const Cache = struct {
         entry.namespace = namespace;
         entry.accounted_bytes = bytes;
         self.finishInsertLocked(.metadata, key, bytes, admission);
-        return self.metadata_cache.get(key).?.metadata;
+        // The cache owns its copy. Returning the request/transaction-owned
+        // view avoids exposing an unretained allocation after unlock.
+        return metadata;
     }
 
     fn namespaceStatsPtrLocked(self: *Cache, namespace: u64) !*HbcCacheStats {
@@ -3770,9 +3784,9 @@ pub const HBCIndex = struct {
         }
     }
 
-    /// Test-only cache-path control. Production cache admission and eviction
-    /// are owned by ResourceManager.
-    fn setRetainedVectorCacheEnabled(self: *HBCIndex, enabled: bool) void {
+    /// Explicit policy control. Production IndexManager defaults this off;
+    /// ResourceManager governs admission and eviction after a caller opts in.
+    pub fn setRetainedVectorCacheEnabled(self: *HBCIndex, enabled: bool) void {
         if (self.retained_vector_cache_enabled == enabled) return;
         self.retained_vector_cache_enabled = enabled;
         if (!enabled) self.clearVectorCache();
@@ -7202,7 +7216,7 @@ pub const HBCIndex = struct {
         return entry.vector;
     }
 
-    fn cacheMetadataLocalLocked(self: *HBCIndex, vector_id: u64, metadata: []const u8) ![]const u8 {
+    fn cacheMetadataLocalLocked(self: *HBCIndex, vector_id: u64, metadata: []const u8) !void {
         const reserved_slot = self.ensureLocalMetadataCacheCapacityLocked(vector_id);
         self.invalidateLocalMetadataCacheLocked(vector_id);
         const copied = try self.alloc.dupe(u8, metadata);
@@ -7215,7 +7229,6 @@ pub const HBCIndex = struct {
         const slot = reserved_slot orelse claimLocalClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
         self.metadata_clock_refs[slot] = true;
         try self.metadata_cache_slots.put(self.alloc, vector_id, slot);
-        return entry.metadata;
     }
 
     fn clearNodeCache(self: *HBCIndex) void {
@@ -7361,12 +7374,13 @@ pub const HBCIndex = struct {
     }
 
     fn shouldAdmitConcurrentVectorCache(self: *HBCIndex) bool {
-        if (self.active_searches.load(.acquire) <= 1) return true;
-        // Local cache callers historically avoid mutation while concurrent
-        // searches borrow lock-backed entries. Shared entries have retained
-        // leases and are safe to admit concurrently.
+        // Exact scoring does not enter the HBC traversal epoch. Always consult
+        // the shared-cache doorkeeper so those misses cannot bypass pressure
+        // sampling and serialize on clone/insert/evict churn.
         if (self.shared_cache) |cache| return cache.shouldAdmitConcurrentVector(self.cache_namespace);
-        return false;
+        // Local cache entries use lock-backed borrows and remain mutation-free
+        // while multiple searches overlap.
+        return self.active_searches.load(.acquire) <= 1;
     }
 
     pub fn cacheNode(self: *HBCIndex, node: *const Node) !void {
@@ -7592,11 +7606,11 @@ pub const HBCIndex = struct {
             admission.rollback();
             self.refreshHbcCacheUsage();
         }
-        const cached = try self.cacheMetadataLocalLocked(vector_id, metadata);
+        try self.cacheMetadataLocalLocked(vector_id, metadata);
         self.noteHbcCacheInsertion(.metadata);
         admission.commit();
         self.refreshAndEnforceHbcCacheUsage(.one(.metadata, vector_id));
-        return cached;
+        return metadata;
     }
 
     pub fn getCachedNodeClone(self: *HBCIndex, node_id: u64) !?Node {
@@ -7720,15 +7734,6 @@ pub const HBCIndex = struct {
         self.cache_mu.lockShared();
         defer self.cache_mu.unlockShared();
         if (self.vector_cache.get(vector_id)) |entry| return entry.vector;
-        return null;
-    }
-
-    pub fn getCachedMetadata(self: *HBCIndex, vector_id: u64) ?[]const u8 {
-        if (!self.cache_enabled) return null;
-        if (self.shared_cache) |cache| return cache.getMetadata(self.cache_namespace, vector_id);
-        self.cache_mu.lockShared();
-        defer self.cache_mu.unlockShared();
-        if (self.metadata_cache.get(vector_id)) |entry| return entry.metadata;
         return null;
     }
 
@@ -10392,6 +10397,16 @@ const SearchScratch = vectorindex_search_runtime.SearchScratch;
 
 const ScratchHandle = vectorindex_hbc_runtime.ScratchHandle;
 
+fn expectCachedMetadata(index: *HBCIndex, vector_id: u64, expected: []const u8) !void {
+    var borrowed = index.borrowCachedMetadata(vector_id) orelse return error.TestUnexpectedResult;
+    defer borrowed.deinit();
+    try std.testing.expectEqualStrings(expected, borrowed.view());
+}
+
+fn expectMetadataNotCached(index: *HBCIndex, vector_id: u64) !void {
+    try std.testing.expect(index.borrowCachedMetadata(vector_id) == null);
+}
+
 pub const SearchResults = vectorindex_search_results.SearchResults;
 const ApproxSearchResults = vectorindex_search_results.ApproxSearchResults;
 
@@ -11007,6 +11022,38 @@ test "hbc concurrent vector admission samples at a full steady target" {
     try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(namespace).vector.sampled_admissions);
 }
 
+test "hbc exact-route vector admission samples outside the search epoch" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const vector_bytes = estimateVectorCacheBytes(&vector);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes,
+        .hard_limit_bytes = vector_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 16 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+
+    // active_searches intentionally remains zero, matching the exact scorer.
+    _ = try idx.cacheVector(1, &vector);
+    for (2..10) |vector_id| _ = try idx.cacheVector(vector_id, &vector);
+
+    const stats = cache.namespaceStats(idx.cache_namespace).vector;
+    try std.testing.expectEqual(@as(u64, 1), stats.sampled_admissions);
+    try std.testing.expectEqual(@as(u64, 2), stats.insertions);
+    try std.testing.expect(stats.used_bytes <= vector_bytes);
+}
+
 test "hbc shared cache reclaims exact vectors before protected routing nodes" {
     var centroid = [_]f32{ 0.0, 1.0 };
     var children = [_]u64{7};
@@ -11248,7 +11295,7 @@ test "hbc retained vector cache can be disabled independently of metadata cache"
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
 
     _ = try idx.cacheMetadata(1, "doc:1");
-    try std.testing.expectEqualStrings("doc:1", idx.getCachedMetadata(1).?);
+    try expectCachedMetadata(&idx, 1, "doc:1");
     try std.testing.expect(idx.hbcCacheStats().metadata.used_bytes > 0);
     try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
 }
@@ -11281,7 +11328,7 @@ test "hbc metadata cache remains active when vector cache capacity is zero" {
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
 
     _ = try idx.cacheMetadata(1, "doc:1");
-    try std.testing.expectEqualStrings("doc:1", idx.getCachedMetadata(1).?);
+    try expectCachedMetadata(&idx, 1, "doc:1");
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
     try std.testing.expect(idx.hbcCacheStats().metadata.used_bytes > 0);
     try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
@@ -11405,8 +11452,8 @@ test "hbc metadata cache is retained and resource managed during concurrent sear
 
     const input = "doc:concurrent";
     const returned = try idx.cacheMetadata(11, input);
-    try std.testing.expect(@intFromPtr(input.ptr) != @intFromPtr(returned.ptr));
-    try std.testing.expectEqualStrings(input, idx.getCachedMetadata(11).?);
+    try std.testing.expectEqual(@intFromPtr(input.ptr), @intFromPtr(returned.ptr));
+    try expectCachedMetadata(&idx, 11, input);
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
     try std.testing.expect(idx.hbcCacheStats().metadata.used_bytes > 0);
     try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
@@ -11431,7 +11478,7 @@ test "hbc retained vector cache defaults on for search performance" {
     try std.testing.expect(idx.hbcCacheStats().vector.used_bytes > 0);
 
     _ = try idx.cacheMetadata(1, "doc:1");
-    try std.testing.expectEqualStrings("doc:1", idx.getCachedMetadata(1).?);
+    try expectCachedMetadata(&idx, 1, "doc:1");
     try std.testing.expect(idx.hbcCacheStats().metadata.used_bytes > 0);
 }
 
@@ -16517,8 +16564,8 @@ test "hbc getMetadataManySortedInTxn batches ordered metadata lookups and caches
     try std.testing.expectEqualStrings("doc:7", out[0].?);
     try std.testing.expectEqual(@as(?[]const u8, null), out[1]);
     try std.testing.expectEqualStrings("doc:2", out[2].?);
-    try std.testing.expectEqualStrings("doc:7", idx.getCachedMetadata(7).?);
-    try std.testing.expectEqualStrings("doc:2", idx.getCachedMetadata(2).?);
+    try expectCachedMetadata(&idx, 7, "doc:7");
+    try expectCachedMetadata(&idx, 2, "doc:2");
 }
 
 test "hbc bulk ingest skips retained metadata cache population" {
@@ -16537,7 +16584,7 @@ test "hbc bulk ingest skips retained metadata cache population" {
     const input = "doc:1";
     const returned = try idx.cacheMetadata(1, input);
     try std.testing.expectEqual(@intFromPtr(input.ptr), @intFromPtr(returned.ptr));
-    try std.testing.expectEqual(@as(?[]const u8, null), idx.getCachedMetadata(1));
+    try expectMetadataNotCached(&idx, 1);
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().metadata.used_bytes);
 
     try idx.finishBulkIngestSessionWithOptions(.{ .compact = false });

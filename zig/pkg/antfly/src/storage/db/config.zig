@@ -247,6 +247,10 @@ pub const IndexBackendOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Full decoded vectors already have an authoritative copy in primary
+    /// storage. Retaining a second copy is an explicit production opt-in until
+    /// the cache governor can prove that reuse outweighs its memory cost.
+    retained_vector_cache_enabled: bool = false,
     // Binding a caller-owned shared cache requires a manager whose lifetime
     // covers that cache. Per-DB fallback managers govern local work but must
     // not be installed into external caches.
@@ -445,6 +449,7 @@ pub fn indexBackendOptionsForPrimary(
         .hbc_cache = overrides.hbc_cache orelse hbc_cache,
         .lsm_root_generation = if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
         .resource_manager = overrides.resource_manager orelse resource_manager,
+        .retained_vector_cache_enabled = overrides.retained_vector_cache_enabled,
         .bind_cache_resource_manager = overrides.bind_cache_resource_manager and bind_cache_resource_manager,
         .text_main_lsm_options = mergedIndexLsmOptions(
             overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,

@@ -452,6 +452,13 @@ exact-vector cache is a derivative read optimization, not a second database:
    computes the exact distance, and may admit a retained copy;
 4. eviction drops only that retained copy and never changes durable state.
 
+Production `IndexManager` instances default retained decoded-vector caching
+off. Enabling `IndexBackendOptions.retained_vector_cache_enabled` is an
+explicit opt-in; after opt-in, ResourceManager still owns the byte target,
+pressure sampling, admission, and eviction. This separates the product-safe
+default from direct HBC library tests and experiments that intentionally warm
+decoded vectors.
+
 There is consequently no write-side check-and-set against an independent
 vector store and no dual-write recovery protocol. A future mmap-friendly
 vector segment or LSM value separation must remain a versioned, rebuildable
@@ -654,6 +661,12 @@ that compatibility path. A single reusable batch workspace is charged to
 are observed once after each multi-get. Because exact scoring is single-pass,
 its request-local decoded-vector cache is disabled; a governed shared-vector
 cache may still admit a value when its policy enables that cache.
+Shared-cache admission is consulted for this route even though it does not
+enter the HBC traversal epoch, so a full target samples exact-route misses
+instead of cloning and evicting on every candidate. Metadata cache reads never
+escape as unretained slices: result attachment uses retained leases, while
+batched filtering and exact-candidate preparation keep transaction-owned views
+for the transaction lifetime.
 
 The exact/HBC route is a cost decision, not a corpus-percentage threshold. The
 planner compares storage-equivalent work for candidate full-vector reads with

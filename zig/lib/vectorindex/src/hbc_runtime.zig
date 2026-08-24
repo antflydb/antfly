@@ -576,7 +576,9 @@ pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]con
     const slot = reserved_slot orelse claimClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
     self.metadata_clock_refs[slot] = true;
     try self.metadata_cache_slots.put(self.alloc, vector_id, slot);
-    return self.metadata_cache.get(vector_id).?;
+    // The cache owns its copy. Callers retain the transaction/request view;
+    // returning cache memory here would outlive the eviction lock.
+    return metadata;
 }
 
 pub fn acquireSearchScratch(self: anytype) !ScratchHandle {

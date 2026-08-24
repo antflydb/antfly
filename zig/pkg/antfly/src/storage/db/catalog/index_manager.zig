@@ -1123,6 +1123,7 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
+    retained_vector_cache_enabled: bool,
     // Background lane used by algebraic indexes to run HLL cardinality
     // maintenance off the foreground write path. Attached after construction
     // via attachHllMaintenance(); when null, maintenance runs inline.
@@ -2173,6 +2174,7 @@ pub const IndexManager = struct {
             .resource_manager = resource_manager,
             .owned_resource_manager = owned_resource_manager,
             .bind_cache_resource_manager = bind_cache_resource_manager,
+            .retained_vector_cache_enabled = opts.retained_vector_cache_enabled,
             .primary_store = null,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
@@ -2532,6 +2534,7 @@ pub const IndexManager = struct {
         });
         errdefer index.close();
 
+        index.setRetainedVectorCacheEnabled(self.retained_vector_cache_enabled);
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -10889,6 +10892,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index.setRetainedVectorCacheEnabled(self.retained_vector_cache_enabled);
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {
                     index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -25504,6 +25508,8 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expect(!entry.index.prefersDecodedVectorResidency());
+    try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
 }
 
 test "production external exact scorer uses bounded sorted artifact batches" {
@@ -25528,6 +25534,7 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     var manager = try IndexManager.initWithOptions(alloc, path, .{
         .resource_manager = &resource_manager,
         .hbc_cache = &hbc_cache,
+        .retained_vector_cache_enabled = true,
     });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
