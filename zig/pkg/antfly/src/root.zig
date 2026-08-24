@@ -98,6 +98,7 @@ pub const vopr = @import("vopr");
 pub const domain_vopr = @import("vopr/domain_vopr.zig");
 pub const data_server_vopr = @import("vopr/data_server.zig");
 pub const admission_vopr = @import("vopr/admission.zig");
+pub const resource_pressure_vopr = @import("vopr/resource_pressure.zig");
 pub const object_store_vopr = @import("vopr/object_store.zig");
 pub const replication_backfill_vopr = @import("vopr/replication_backfill.zig");
 pub const supervision_vopr = @import("vopr/supervision.zig");

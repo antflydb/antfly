@@ -45,6 +45,7 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/provisioning_startup.zig", .bytes = @embedFile("provisioning_startup.zig") },
     .{ .path = "vopr/replication_backfill.zig", .bytes = @embedFile("replication_backfill.zig") },
     .{ .path = "vopr/request_lifecycle.zig", .bytes = @embedFile("request_lifecycle.zig") },
+    .{ .path = "vopr/resource_pressure.zig", .bytes = @embedFile("resource_pressure.zig") },
     .{ .path = "vopr/serverless_workflow.zig", .bytes = @embedFile("serverless_workflow.zig") },
     .{ .path = "vopr/supervision.zig", .bytes = @embedFile("supervision.zig") },
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },

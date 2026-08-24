@@ -6595,6 +6595,7 @@ pub fn build(b: *std.Build) void {
 
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
+        "default lake range cache queue budget is aligned with its terminal resource slice",
         "identity allocation failure rolls back every memory ledger",
         "manager teardown retires live observer snapshots",
         "batch reservation is atomic across inference resource slices",
@@ -6949,12 +6950,15 @@ pub fn build(b: *std.Build) void {
 
     const admission_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"resource admission VOPR"},
+        .filters = &.{
+            "resource admission VOPR",
+            "cross-service resource pressure VOPR",
+        },
     });
     const run_admission_vopr_tests = b.addRunArtifact(admission_vopr_tests);
     const admission_vopr_test_step = b.step(
         "admission-vopr-test",
-        "Run production resource admission under deterministic VOPR contention",
+        "Run shared production resource admission, quota, cancellation, and recovery under deterministic VOPR contention",
     );
     admission_vopr_test_step.dependOn(&run_admission_vopr_tests.step);
 

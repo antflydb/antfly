@@ -106,6 +106,10 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    /// Pending persistent object-range cache writes. The durable bytes use
+    /// the capacity-domain ledger; this slice owns only queued key/payload
+    /// memory until the cache worker completes or drops the write.
+    lake_range_cache_queue,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -139,6 +143,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .lake_range_cache_queue => "lake.range_cache_queue",
         };
     }
 };
@@ -313,6 +318,7 @@ pub const Options = struct {
             .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
         };
     }
 
@@ -348,6 +354,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
         };
     }
 };
@@ -2158,6 +2165,17 @@ test "default tokenizer cache budget is aligned with its resource slice" {
         PressureAction.shrink_cache,
         policies[tokenizer_idx].hard_action,
     );
+}
+
+test "default lake range cache queue budget is aligned with its terminal resource slice" {
+    const budgets = Options.defaultBudgets();
+    const policies = Options.defaultPolicies();
+    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    try std.testing.expectEqual(slice_count - 1, index);
+    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
+    try std.testing.expectEqual(PressureAction.report, policies[index].soft_action);
+    try std.testing.expectEqual(PressureAction.reject_work, policies[index].hard_action);
 }
 
 test "identity allocation failure rolls back every memory ledger" {

@@ -192,6 +192,7 @@ pub const Handle = struct {
                 .exclusive = true,
                 .no_sync = opts.no_sync,
                 .resource_manager = opts.resource_manager,
+                .io = opts.io,
             }) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => try open(allocator, path, opts),
                 else => return create_err,

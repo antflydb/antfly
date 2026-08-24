@@ -767,6 +767,18 @@ pub const FileSystem = struct {
         return total;
     }
 
+    pub fn openHandleCount(self: *const FileSystem) usize {
+        return self.handles.count();
+    }
+
+    pub fn capacityBytes(self: *const FileSystem) u64 {
+        return self.config.capacity_bytes;
+    }
+
+    pub fn availableBytes(self: *const FileSystem) u64 {
+        return self.config.capacity_bytes -| self.totalBytes();
+    }
+
     fn createNode(self: *FileSystem, path: []const u8, kind: std.Io.File.Kind, permissions: std.Io.File.Permissions, now_ns: i96) !*Node {
         const node = try self.allocator.create(Node);
         errdefer self.allocator.destroy(node);

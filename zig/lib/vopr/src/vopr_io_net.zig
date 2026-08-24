@@ -519,6 +519,10 @@ pub const Network = struct {
         return self.packets.items.len == 0;
     }
 
+    pub fn openSocketCount(self: *const Network) usize {
+        return self.open_sockets;
+    }
+
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress) !*SocketState {
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
         const client = try self.createSocket(.stream, address);

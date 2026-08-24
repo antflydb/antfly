@@ -218,6 +218,15 @@ pub const InitError = error{
 };
 
 pub const VoprIo = struct {
+    pub const ResourceSnapshot = struct {
+        active_tasks: usize,
+        total_tasks: usize,
+        open_file_handles: usize,
+        open_sockets: usize,
+        storage_bytes: u64,
+        storage_capacity_bytes: u64,
+    };
+
     prng: std.Random.DefaultPrng,
     monotonic_ns: i96,
     realtime_ns: i96,
@@ -340,6 +349,20 @@ pub const VoprIo = struct {
 
     pub fn entropyCallCount(self: *const VoprIo) u64 {
         return self.random_calls;
+    }
+
+    /// Backend-neutral resource evidence for scenario health and shared
+    /// admission tests. Counts describe live virtual resources; total task
+    /// identities are retained for replay diagnostics until `deinit`.
+    pub fn resourceSnapshot(self: *const VoprIo) ResourceSnapshot {
+        return .{
+            .active_tasks = self.tasks.activeTaskCount(),
+            .total_tasks = self.tasks.totalTaskCount(),
+            .open_file_handles = self.files.openHandleCount(),
+            .open_sockets = self.network.openSocketCount(),
+            .storage_bytes = self.files.totalBytes(),
+            .storage_capacity_bytes = self.files.capacityBytes(),
+        };
     }
 
     pub fn ensureNoCapabilityViolation(self: *const VoprIo) !void {

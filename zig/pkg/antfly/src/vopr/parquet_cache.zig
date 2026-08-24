@@ -139,6 +139,7 @@ pub const Scenario = struct {
         var found = false;
         inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
             try world.state.run(mode, events);
+            try world.state.sim.ensureNoCapabilityViolation();
             found = true;
         };
         if (!found) return error.InvalidParquetCacheTransition;

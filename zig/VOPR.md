@@ -83,6 +83,7 @@ An executable unit test alone is not called fully implemented.
 | P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
 | Cold configuration and extension lifecycle | Antfly `vopr/config_extension_lifecycle.zig`; production secret store, remote-content publisher, extension administration/catalog, package scanner, and Wasmtime artifact loader all borrow the same `std.Io` | `zig build config-extension-lifecycle-vopr-test` |
 | Embedded, C API, and Lite lifecycle | Antfly `vopr/embedded_lite_lifecycle.zig` and `vopr/capi_lite_lifecycle.zig`; native Lite, docstore/index storage, Embedded DB, opaque C API handles, and portable restore borrow one caller-owned `std.Io` and `BackendRuntime` across open, close, callback, cancellation, activation, crash, and reopen boundaries | `zig build embedded-lite-lifecycle-vopr-test` |
+| Cross-service resource pressure | Antfly `vopr/resource_pressure.zig`; one ResourceManager and VoprIo envelope spans production request leases, a real Lite-backed DB write/read, durable-job ownership, ManagedEmbedder provider cancellation, persistent lake-cache queue memory and disk growth, plus task/file/socket quotas | `zig build admission-vopr-test resource-budget-test` |
 | Provider and composed-query boundaries | Antfly `vopr/provider_boundaries.zig`, `composed_query.zig`; real ManagedEmbedder, PostgreSQL Source, distributed merge, and graph-union seams | `zig build provider-boundary-vopr-test composed-query-vopr-test` |
 | Parquet cache, provisioning/startup, external lake, and media runtime | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/range/registry paths, injected I/O faults, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
 
@@ -723,6 +724,18 @@ VOPR work has found concrete production and harness defects:
   portable callers could not name `DurableDirectorySyncUnsupported` in their
   cross-platform recovery logic. The helpers now expose an explicit portable
   error contract.
+- The persistent object-range cache bounded its own queue and disk footprint,
+  but its pending key/payload memory and concurrent physical growth were
+  invisible to the node-wide `ResourceManager`. Independent services could
+  therefore remain below their local limits while exceeding the shared
+  process or volume envelope. Cache queue ownership now uses an exactly-once
+  `lake_range_cache_queue` reservation, and each worker reserves capacity-domain
+  growth before file I/O; completion, coalescing, allocation failure,
+  cancellation, and shutdown all release the corresponding ownership.
+- Lite `openOrCreate` propagated a shared `ResourceManager` into its missing-file
+  fallback but dropped the caller's borrowed `std.Io`, silently returning to
+  a native Threaded create path. The cross-service DB composition now exercises
+  this fallback on `VoprIo`, and the create side retains both injected owners.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -1247,7 +1260,7 @@ integrated rows above.
 | P0 integrated | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test` drives the production scanner and cache on borrowed filesystem and monotonic-clock capabilities through absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, disappearance/rescan, and read-fault/restart histories. Metadata service and HTTP rounds use their backend runtime I/O for scans and rechecks. |
 | P0 integrated | Configuration, secrets, remote content, and extensions | `config-extension-lifecycle-vopr-test` exact-replays valid, malformed, and incomplete cold starts; secret rotation with retained readers; crash between durable secret and configuration publication; remote-content replacement, rejected-candidate rollback, and recovery; extension administrative install/dry-run, replacement, disable/enable, and configuration; malformed package recovery; and failed Wasm startup. The production secret store, remote-content runtime, extension lifecycle timestamping, package scanner, and Wasmtime artifact loader borrow `std.Io`; portable directory durability no longer escapes through POSIX. |
 | P1 integrated | Embedded, C API, and Lite lifecycle | `embedded-lite-lifecycle-vopr-test` exact-replays native Lite crash/reopen, overlapping Embedded writer/reader lifetimes, C API readable-lease callback install/remove, canceled restore, atomic replacement with a pinned old reader, and current-generation visibility. Native Lite, Embedded DB, opaque C API handles, and restore staging share caller-owned `std.Io`/`BackendRuntime`; a physical-versus-`VoprIo` differential compares logical values and checkpoint sequences. |
-| P1 next | Cross-service resource pressure | Share descriptor, memory, storage, task, and admission budgets across HTTP, DB readers/writers, background jobs, Parquet cache, and provider calls. Verify bounded overload, cancellation, cleanup, progress after pressure clears, and exact replay. |
+| P1 integrated | Cross-service resource pressure | `admission-vopr-test` composes one production `ResourceManager`, request-admission controllers, and `VoprIo` envelope across query/write request ownership, a real Lite-backed DB write and lookup, the durable-job lane, a cancelable ManagedEmbedder provider call, and the persistent Parquet range cache. Eight schedules exact-replay aggregate and slice-memory denial, cache queue denial, capacity-domain denial before disk I/O, task/file/socket exhaustion, cancellation cleanup, and progress after pressure clears. `resource-budget-test` guards the named lake-queue default mapping. |
 | P1 next | Full external-lake composition | Extend the existing boundary suite through catalog discovery, manifest and schema evolution, Parquet metadata, row-group cache, and query assembly. Include stale object versions, deletion, ambiguous downloads, cache eviction, and restart. |
 | P2 next | Media-provider execution | Extend registry coverage through scripted provider HTTP for timeout, partial or malformed output, retry, cancellation, runtime replacement, and shutdown with an active request. Keep real codecs, models, and GPU execution differential. |
 | P2 next | Upgrade and compatibility campaigns | Differentially open older data formats, trace versions, fixtures, checkpoints, and serverless artifacts; crash during migration; and prove safe rejection, rollback, or forward completion without weakening replay compatibility. |
@@ -1322,8 +1335,8 @@ Wait for a real product or toolchain requirement before adding:
    suites, including their borrowed-I/O lock, cleanup, rescan, and logical-time
    contracts as production formats evolve.
 3. Maintain the integrated cold-start configuration, secrets, remote-content,
-   extension, and Embedded/C API/Lite lifecycle suites; next add the
-   cross-service pressure composition.
+   extension, Embedded/C API/Lite lifecycle, and cross-service resource
+   pressure suites.
 4. Maintain the integrated command-template composer and determinism audit as
    new suites add small compatible operations; every new exported replay
    source must enter the checked manifest and remain free of silent host
