@@ -71,6 +71,7 @@ pub const JobState = struct {
     idempotency_key: []const u8,
     idempotency_explicit: bool = false,
     request_fingerprint: []const u8,
+    destination_authorization_fingerprint: []const u8 = "",
     result_json: ?[]const u8 = null,
     last_error: ?[]const u8 = null,
     created_at_ms: u64,
@@ -88,6 +89,7 @@ pub const StartRequest = struct {
     table_names: ?[]const []const u8 = null,
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
+    destination_authorization_fingerprint: []const u8 = "",
 };
 
 pub const ListBatch = struct {
@@ -458,6 +460,7 @@ pub const Store = struct {
                         .idempotency_key = parsed.value.idempotency_key,
                         .idempotency_explicit = parsed.value.idempotency_explicit,
                         .request_fingerprint = parsed.value.request_fingerprint,
+                        .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
                         .last_error = "resuming_after_restart",
                         .created_at_ms = parsed.value.created_at_ms,
                         .updated_at_ms = nowMillis(),
@@ -718,6 +721,7 @@ pub const Store = struct {
                 .idempotency_key = parsed.value.idempotency_key,
                 .idempotency_explicit = parsed.value.idempotency_explicit,
                 .request_fingerprint = parsed.value.request_fingerprint,
+                .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
                 .last_error = "resuming_after_restart",
                 .created_at_ms = parsed.value.created_at_ms,
                 .updated_at_ms = nowMillis(),
@@ -824,6 +828,7 @@ pub const Store = struct {
             .idempotency_key = idempotency_key,
             .idempotency_explicit = explicit_idempotency_key != null,
             .request_fingerprint = fingerprint,
+            .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
             .created_at_ms = now,
             .updated_at_ms = now,
             .expires_at_ms = std.math.maxInt(i64),
@@ -1364,6 +1369,7 @@ pub const Store = struct {
             .idempotency_key = current.idempotency_key,
             .idempotency_explicit = current.idempotency_explicit,
             .request_fingerprint = current.request_fingerprint,
+            .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
             .result_json = update.result_json orelse current.result_json,
             .last_error = update.last_error,
             .created_at_ms = current.created_at_ms,
@@ -1626,6 +1632,7 @@ fn validateStartRequest(req: StartRequest) !void {
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
         req.idempotency_namespace.len == 0 or req.idempotency_namespace.len > 256 or
+        req.destination_authorization_fingerprint.len > 64 or
         (req.table_name != null and req.table_name.?.len > max_restore_string_bytes))
         return error.RestoreJobRecordTooLarge;
     switch (req.scope) {
@@ -1898,6 +1905,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
         .connection = req.connection,
         .restore_mode = req.restore_mode,
         .table_names = req.table_names,
+        .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
     }, .{});
     defer alloc.free(canonical);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -2091,6 +2099,7 @@ test "restore job store is idempotent and fenced" {
         .connection = "archive-reader",
         .idempotency_namespace = "principal:admin:cluster",
         .idempotency_key = "restore-daily",
+        .destination_authorization_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     };
     const first = try store.start(std.testing.allocator, req);
     defer std.testing.allocator.free(first);
@@ -2099,14 +2108,17 @@ test "restore job store is idempotent and fenced" {
     try std.testing.expectEqualStrings(first, second);
     var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, first, .{});
     defer parsed.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed.value.destination_authorization_fingerprint);
     const running = (try store.begin(std.testing.allocator, parsed.value.job_id)).?;
     defer std.testing.allocator.free(running);
     var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
     defer parsed_running.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed_running.value.destination_authorization_fingerprint);
     const done = try store.finish(std.testing.allocator, parsed_running.value, "{\"status\":\"completed\"}");
     defer std.testing.allocator.free(done);
     var parsed_done = try std.json.parseFromSlice(JobState, std.testing.allocator, done, .{});
     defer parsed_done.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed_done.value.destination_authorization_fingerprint);
     try std.testing.expectEqual(Phase.succeeded, parsed_done.value.phase);
 }
 

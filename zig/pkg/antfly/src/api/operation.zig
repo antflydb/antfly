@@ -71,6 +71,9 @@ pub const RequestContext = struct {
     request_id: []const u8 = "",
     principal: ?Principal = null,
     admission: ?*AdmissionReservation = null,
+    /// Durable hash of an externally sourced table definition that was
+    /// authorized before asynchronous restore admission.
+    destination_authorization_fingerprint: []const u8 = "",
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;

@@ -53,6 +53,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const public_table_http = @import("public_table_http.zig");
+const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
@@ -110,6 +111,106 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+fn injectRowFilterIntoScanRequest(
+    alloc: std.mem.Allocator,
+    req: *http_route_helpers.OwnedScanKeysRequest,
+    row_filter_json: []const u8,
+) !void {
+    const effective = if (req.filter_query_json.len == 0)
+        try alloc.dupe(u8, row_filter_json)
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "{{\"conjuncts\":[{s},{s}]}}",
+            .{ req.filter_query_json, row_filter_json },
+        );
+    if (req.filter_query_json.len > 0) alloc.free(@constCast(req.filter_query_json));
+    req.filter_query_json = effective;
+    req.opts.filter_query_json = effective;
+}
+
+fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
+    const authenticated = identity orelse return true;
+    return http_server_mod.permissionsAllow(authenticated.permissions, .table, table_name, .write);
+}
+
+fn replicationDestinationsAllowed(
+    alloc: std.mem.Allocator,
+    identity: ?AuthenticatedIdentity,
+    replication_sources_json: []const u8,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, replication_sources_json, .{});
+    defer parsed.deinit();
+    const sources = switch (parsed.value) {
+        .array => |array| array.items,
+        else => return error.InvalidCreateTableRequest,
+    };
+    for (sources) |source| {
+        if (source != .object) return error.InvalidCreateTableRequest;
+        const routes_value = source.object.get("routes") orelse continue;
+        if (routes_value == .null) continue;
+        const configured_routes = switch (routes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidCreateTableRequest,
+        };
+        for (configured_routes) |configured_route| {
+            if (configured_route != .object) return error.InvalidCreateTableRequest;
+            const target_value = configured_route.object.get("target_table") orelse return error.InvalidCreateTableRequest;
+            const target_table = switch (target_value) {
+                .string => |value| value,
+                else => return error.InvalidCreateTableRequest,
+            };
+            if (target_table.len == 0) return error.InvalidCreateTableRequest;
+            if (!storedDestinationAllowed(identity, target_table)) return false;
+        }
+    }
+    return true;
+}
+
+fn graphResolverDestinationsAllowedInConfig(
+    identity: ?AuthenticatedIdentity,
+    config: std.json.Value,
+) !bool {
+    switch (config) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers_value| {
+                if (resolvers_value != .array) return error.InvalidCreateTableRequest;
+                for (resolvers_value.array.items) |resolver| {
+                    // String resolver references do not declare a destination here.
+                    if (resolver == .string) continue;
+                    if (resolver != .object) return error.InvalidCreateTableRequest;
+                    const table_value = resolver.object.get("table") orelse continue;
+                    if (table_value != .string or table_value.string.len == 0) return error.InvalidCreateTableRequest;
+                    if (!storedDestinationAllowed(identity, table_value.string)) return false;
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (!(try graphResolverDestinationsAllowedInConfig(identity, entry.value_ptr.*))) return false;
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            if (!(try graphResolverDestinationsAllowedInConfig(identity, item))) return false;
+        },
+        else => {},
+    }
+    return true;
+}
+
+fn graphResolverDestinationsAllowed(
+    alloc: std.mem.Allocator,
+    identity: ?AuthenticatedIdentity,
+    indexes_json: []const u8,
+    single_index: bool,
+) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    if (single_index) return try graphResolverDestinationsAllowedInConfig(identity, parsed.value);
+    if (parsed.value != .object) return error.InvalidCreateTableRequest;
+    return try graphResolverDestinationsAllowedInConfig(identity, parsed.value);
 }
 
 pub const RequestAdmission = http_server_mod.RequestAdmission;
@@ -772,6 +873,25 @@ pub const AntflyApiHandler = struct {
         {
             return try unauthorizedResponse(ctx);
         }
+        return null;
+    }
+
+    /// Internal group mutations are raw storage RPCs, not public table-write
+    /// APIs. They fail closed unless the caller presents a signed trusted
+    /// principal token; Basic and API-key identities are never accepted.
+    fn authorizeInternalServiceRequest(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        identity: *?AuthenticatedIdentity,
+    ) !?httpx.Response {
+        if (self.api_server.cfg.trusted_principal_secret == null)
+            return try jsonErrorResponse(ctx, 403, "internal service authentication is not configured");
+        const token = ctx.header(http_server_mod.trusted_principal_header) orelse
+            return try unauthorizedResponse(ctx);
+        identity.* = self.api_server.authenticateRequest(.{ .trusted_principal = token }) catch
+            return try unauthorizedResponse(ctx);
+        if (!std.mem.startsWith(u8, identity.*.?.credential_principal, "trusted:"))
+            return try jsonErrorResponse(ctx, 403, "forbidden");
         return null;
     }
 
@@ -1564,6 +1684,13 @@ pub const AntflyApiHandler = struct {
     fn internalGroupBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeInternalServiceRequest(ctx, &authenticated_identity)) |response| return response;
+        if (authenticated_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, params.table_name, .write))
+                return jsonErrorResponse(ctx, 403, "forbidden");
+        }
         if (self.api_server.cfg.routed_raft_batch_writer != null)
             return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
         const forwarding = internal_batch_forwarding.parseValues(
@@ -1873,6 +2000,13 @@ pub const AntflyApiHandler = struct {
     fn internalGroupRoutedBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeInternalServiceRequest(ctx, &authenticated_identity)) |response| return response;
+        if (authenticated_identity) |identity| {
+            if (!http_server_mod.permissionsAllow(identity.permissions, .table, params.table_name, .write))
+                return jsonErrorResponse(ctx, 403, "forbidden");
+        }
         const forwarding = internal_batch_forwarding.parseValues(
             ctx.header(internal_batch_forwarding.remaining_ms_header),
             ctx.header(internal_batch_forwarding.forwards_remaining_header),
@@ -2600,10 +2734,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.txn_sessions.listStatusesForPrincipal(
-            alloc,
-            if (authenticated_identity) |identity| identity.username else null,
-        );
+        const sessions = try self.api_server.listAuthorizedTransactionSessions(authenticated_identity);
         defer alloc.free(sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -2645,7 +2776,7 @@ pub const AntflyApiHandler = struct {
             alloc,
             begin_req,
             self.api_server.localSessionNodeId(),
-            if (authenticated_identity) |identity| identity.username else null,
+            http_server_mod.transactionPrincipal(authenticated_identity),
         );
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -3888,6 +4019,35 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
         };
+        const destinations_allowed = (replicationDestinationsAllowed(
+            alloc,
+            authenticated_identity,
+            create_req.replication_sources_json orelse "[]",
+        ) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid replication destination configuration");
+        }) and (graphResolverDestinationsAllowed(
+            alloc,
+            authenticated_identity,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            false,
+        ) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid graph resolver destination configuration");
+        });
+        if (!destinations_allowed) return jsonErrorResponse(ctx, 403, "forbidden");
+        const sealed_replication_sources_json = try stored_destination_authorization.sealReplicationSourcesJsonAlloc(
+            alloc,
+            create_req.replication_sources_json orelse "[]",
+        );
+        if (create_req.replication_sources_json) |old| alloc.free(old);
+        create_req.replication_sources_json = sealed_replication_sources_json;
+        const sealed_indexes_json = try stored_destination_authorization.sealIndexesJsonAlloc(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+        );
+        if (create_req.indexes_json) |old| alloc.free(old);
+        create_req.indexes_json = sealed_indexes_json;
         std.log.info("public create table begin table={s}", .{decoded_table_name});
         const metadata_create_start_ns = platform_time.monotonicNs();
         var metadata_create_attempts: usize = 0;
@@ -4199,7 +4359,7 @@ pub const AntflyApiHandler = struct {
             decoded_table_name,
             body_data,
             ctx.header("idempotency-key"),
-            if (authenticated_identity) |identity| identity.username else null,
+            authenticated_identity,
         );
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
@@ -4332,6 +4492,10 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
+        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
+        if (row_filter_json) |value| try injectRowFilterIntoScanRequest(alloc, &scan_req, value);
+
         if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
         defer self.releasePublicOperation("scanKeys");
         const source = self.api_server.table_reads orelse {
@@ -4372,15 +4536,6 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit(alloc);
 
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
-        defer if (row_filter_json) |value| alloc.free(value);
-        if (row_filter_json) |value| {
-            const filtered = try self.api_server.filterScanResultByRowFilter(alloc, source, decoded_table_name, result.ndjson, value);
-            defer alloc.free(filtered);
-            try ctx.setHeader("content-type", "application/x-ndjson");
-            _ = ctx.response.body(filtered);
-            return ctx.response.build();
-        }
         try ctx.setHeader("content-type", "application/x-ndjson");
         _ = ctx.response.body(result.ndjson);
         return ctx.response.build();
@@ -4714,6 +4869,16 @@ pub const AntflyApiHandler = struct {
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
         const body_data = (try ctx.body()) orelse "";
+        const destinations_allowed = graphResolverDestinationsAllowed(
+            ctx.allocator,
+            authenticated_identity,
+            body_data,
+            true,
+        ) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid graph resolver destination configuration");
+        };
+        if (!destinations_allowed) return jsonErrorResponse(ctx, 403, "forbidden");
         var resp = try public_table_http.handleTableCreateIndex(ctx.allocator, decoded_table_name, decoded_index_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
@@ -7801,6 +7966,44 @@ test "httpx global query table name comes from request body" {
     defer parsed_table.deinit();
 
     try std.testing.expectEqualStrings("files", parsed_table.table_name);
+}
+
+test "stored destination admission requires write permission on every eventual sink" {
+    const alloc = std.testing.allocator;
+    var decoy_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "decoy", .admin),
+    };
+    defer decoy_permission[0].deinit(alloc);
+    const decoy_identity = AuthenticatedIdentity{
+        .username = @constCast("attacker"),
+        .permissions = &decoy_permission,
+    };
+
+    const cdc_config =
+        \\[{"type":"postgres","dsn":"postgres://db","postgres_table":"events","routes":[{"target_table":"protected","where":{"term":{"tier":"gold"}}}]}]
+    ;
+    try std.testing.expect(!(try replicationDestinationsAllowed(alloc, decoy_identity, cdc_config)));
+
+    const graph_config =
+        \\{"type":"graph","resolvers":[{"name":"entities","table":"protected","source_artifact":"relations_v1","resolution_artifact":"resolution_v1"}]}
+    ;
+    try std.testing.expect(!(try graphResolverDestinationsAllowed(alloc, decoy_identity, graph_config, true)));
+    const table_indexes_config =
+        \\{"relations_graph":{"type":"graph"},"resolvers":[{"name":"entities","table":"protected","source_artifact":"relations_v1","resolution_artifact":"resolution_v1"}]}
+    ;
+    try std.testing.expect(!(try graphResolverDestinationsAllowed(alloc, decoy_identity, table_indexes_config, false)));
+
+    var sink_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "protected", .write),
+    };
+    defer sink_permission[0].deinit(alloc);
+    const sink_identity = AuthenticatedIdentity{
+        .username = @constCast("operator"),
+        .permissions = &sink_permission,
+    };
+    try std.testing.expect(try replicationDestinationsAllowed(alloc, sink_identity, cdc_config));
+    try std.testing.expect(try graphResolverDestinationsAllowed(alloc, sink_identity, graph_config, true));
+    try std.testing.expect(try graphResolverDestinationsAllowed(alloc, sink_identity, table_indexes_config, false));
 }
 
 test "httpx query endpoints accept ndjson multiquery bodies" {

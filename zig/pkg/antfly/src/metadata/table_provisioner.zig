@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -1299,6 +1300,7 @@ pub fn ensureResolversWithOptions(
     indexes_json: []const u8,
     options: EnsureResolverOptions,
 ) !ResolverReconcileSummary {
+    try stored_destination_authorization.validateIndexesJson(alloc, indexes_json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -2200,7 +2202,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":["entities"]}
         \\  ]
         \\}
     ;
@@ -2257,7 +2259,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2,"_antfly_destination_authorization_v1":["entities"]}
         \\  ]
         \\}
     ;
@@ -2377,7 +2379,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":["entities"]}
         \\  ]
         \\}
     ;
