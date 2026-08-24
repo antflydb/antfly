@@ -23,10 +23,11 @@ const api_mod = @import("../serverless/api/mod.zig");
 const query_mod = @import("../serverless/query/mod.zig");
 const document_segment = @import("../serverless/document_segment/mod.zig");
 const runtime_manager = @import("../serverless/runtime/manager.zig");
+const head_coordination = @import("../serverless/head_coordination.zig");
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
     const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
@@ -329,10 +330,24 @@ pub const Scenario = struct {
                 .clean, .compaction_crash => {
                     _ = try self.runtime.runOnce();
                 },
-                .duplicate_workers, .lease_takeover, .legacy_head_rewrite => {
+                .duplicate_workers => {
+                    var incumbent = (try build_mod.work_lease.acquireBootstrapHeld(
+                        self.lease_impl.provider(),
+                        self.sim.io(),
+                        "docs",
+                        "worker-incumbent",
+                        100,
+                    )).?;
+                    const contender = try self.runtime.runOnce();
+                    self.duplicate_blocked = contender.work_lease_conflicts == 1 and
+                        (self.progress.getHead("docs") catch 0) == 0;
+                    var published = try self.catalog.buildNamespace("docs");
+                    published.deinit(self.alloc);
+                    _ = try incumbent.release();
+                },
+                .lease_takeover, .legacy_head_rewrite => {
                     // First publication is protected by the absent-to-present
-                    // HEAD CAS and intentionally does not create a lease
-                    // placeholder that would wedge an older publisher.
+                    // HEAD CAS; bootstrap coordination never materializes HEAD.
                     _ = try self.runtime.runOnce();
                 },
                 .ambiguous_publish => {
@@ -375,25 +390,7 @@ pub const Scenario = struct {
 
         fn runSecondPublicationAndCompaction(self: *State) !void {
             try self.ingest("doc-b", "beta gamma", 200);
-            if (self.mode == .duplicate_workers) {
-                var incumbent = (try build_mod.work_lease.acquireHeld(
-                    self.lease_impl.provider(),
-                    self.sim.io(),
-                    "docs",
-                    "worker-incumbent",
-                    100,
-                )).?;
-                const contender = try self.runtime.runOnce();
-                self.duplicate_blocked = contender.work_lease_conflicts == 1 and
-                    try self.progress.getHead("docs") == 1;
-                var published = try self.catalog.buildNamespaceGuarded(
-                    "docs",
-                    incumbent.guard(),
-                );
-                published.deinit(self.alloc);
-                _ = try incumbent.release();
-                _ = try self.runtime.runOnce();
-            } else if (self.mode == .lease_takeover) {
+            if (self.mode == .lease_takeover) {
                 var stale = (try build_mod.work_lease.acquireHeld(
                     self.lease_impl.provider(),
                     self.sim.io(),
@@ -401,6 +398,33 @@ pub const Scenario = struct {
                     "worker-stale",
                     10,
                 )).?;
+                if (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-stale",
+                    100,
+                )) |unexpected| {
+                    var owned = unexpected;
+                    _ = try owned.release();
+                    return error.ActiveSameOwnerReacquired;
+                }
+                var raw = self.memory.client();
+                var before_takeover = try raw.getObject("workflow-progress", "tenant/docs/HEAD", .{});
+                const stale_etag = try self.alloc.dupe(u8, before_takeover.metadata.etag.?);
+                before_takeover.deinit(self.alloc);
+                defer self.alloc.free(stale_etag);
+                const stale_renewal = head_coordination.Record{
+                    .head_version = 1,
+                    .owner_id = "worker-stale",
+                    .fencing_token = stale.acquisition.fencing_token,
+                    .expires_at_unix_ns = 200,
+                    .released = false,
+                };
+                const stale_payload = try head_coordination.payloadAlloc(self.alloc, stale_renewal);
+                defer self.alloc.free(stale_payload);
+                const stale_content_type = try head_coordination.contentTypeAlloc(self.alloc, stale_renewal);
+                defer self.alloc.free(stale_content_type);
                 try self.sim.jumpRealtime(10);
                 var replacement = (try build_mod.work_lease.acquireHeld(
                     self.lease_impl.provider(),
@@ -409,6 +433,16 @@ pub const Scenario = struct {
                     "worker-replacement",
                     100,
                 )).?;
+                if (raw.putObject("workflow-progress", "tenant/docs/HEAD", stale_payload, .{
+                    .content_type = stale_content_type,
+                    .if_match_etag = stale_etag,
+                })) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleLeaseResurrected;
+                } else |err| {
+                    if (err != error.PreconditionFailed) return err;
+                }
                 if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
                     var owned = result.*;
                     owned.deinit(self.alloc);
@@ -626,7 +660,7 @@ test "complete serverless workflow VOPR exact replays claim build compact publis
                 .system = "antfly",
                 .transition_budget = 1,
                 .backend_ids = &backend_ids,
-                .source_revision = "serverless-workflow-vopr-v1",
+                .source_revision = "serverless-workflow-vopr-v3",
                 .target = "native",
                 .optimize = @tagName(@import("builtin").mode),
             },

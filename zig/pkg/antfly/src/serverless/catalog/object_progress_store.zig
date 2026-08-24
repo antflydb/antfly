@@ -208,7 +208,7 @@ pub const ObjectProgressStore = struct {
         else
             head_coordination.Record{};
         proposed.head_version = version;
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
+        const payload = try head_coordination.payloadAlloc(self.alloc, proposed);
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
@@ -389,7 +389,8 @@ pub const ObjectProgressStore = struct {
         var owned_owner_id: ?[]u8 = null;
         if (trimmed.len != 0 and trimmed[0] == '{') {
             // Transitional compatibility with the short-lived JSON-body
-            // format. The next successful write migrates it back to decimal.
+            // format. The next successful write migrates it back to the
+            // legacy-readable decimal-plus-whitespace representation.
             var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
                 .ignore_unknown_fields = false,
             });

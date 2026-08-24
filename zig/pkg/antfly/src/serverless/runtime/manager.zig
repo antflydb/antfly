@@ -22,6 +22,7 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const RuntimeConfig = struct {
     tick_interval_ms: u64 = 25,
@@ -230,13 +231,13 @@ pub const ManagedRuntime = struct {
 
                 if (self.cfg.enrichment_enabled and status.enrichment_active_stage != null) {
                     const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(status.enrichment_active_stage.?) orelse continue;
-                    const enrichment = enricher.runNamespaceWithConfig(namespace.name, .{
+                    const enrichment = enricher.runNamespaceWithConfigUntil(namespace.name, .{
                         .batch_size = policy.enrichment_batch_size,
                         .pipeline_version = stage_spec.pipeline_version,
                         .stage = status.enrichment_active_stage.?,
                         .model_preference = stage_spec.model_preference,
                         .failure_policy = policy.enrichment_failure_policy,
-                    }) catch |err| switch (err) {
+                    }, self.cancellationToken()) catch |err| switch (err) {
                         error.FileNotFound => continue,
                         else => return err,
                     };
@@ -278,9 +279,10 @@ pub const ManagedRuntime = struct {
                             lease.guard()
                         else
                             null;
-                        var compacted = compactor.compactHeadGuarded(
+                        var compacted = compactor.compactHeadGuardedUntil(
                             namespace.name,
                             publication_guard,
+                            self.cancellationToken(),
                         ) catch |err| switch (err) {
                             error.HeadChanged => {
                                 stats.compact_head_conflicts += 1;
@@ -301,7 +303,11 @@ pub const ManagedRuntime = struct {
 
             if (self.cfg.prune_enabled) {
                 try self.cancellationCheckpoint();
-                var result = self.pruner.pruneNamespace(namespace.name, policy.keep_latest_versions) catch |err| switch (err) {
+                var result = self.pruner.pruneNamespaceUntil(
+                    namespace.name,
+                    policy.keep_latest_versions,
+                    self.cancellationToken(),
+                ) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
@@ -395,8 +401,14 @@ pub const ManagedRuntime = struct {
     }
 
     fn cancellationCheckpoint(self: *ManagedRuntime) !void {
-        if (self.stop_requested.load(.acquire)) return error.Canceled;
-        try self.io.checkCancel();
+        try self.cancellationToken().check();
+    }
+
+    fn cancellationToken(self: *ManagedRuntime) maintenance_cancellation.Token {
+        return .{
+            .io = self.io,
+            .requested = &self.stop_requested,
+        };
     }
 };
 

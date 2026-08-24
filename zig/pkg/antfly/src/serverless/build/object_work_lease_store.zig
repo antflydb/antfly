@@ -17,6 +17,7 @@ const CurrentLease = struct {
     fencing_token: u64,
     expires_at_unix_ns: u64,
     released: bool,
+    body_carries_coordination_etag: bool,
     etag: []u8,
 
     fn deinit(self: *CurrentLease, alloc: Allocator) void {
@@ -90,17 +91,20 @@ pub const ObjectWorkLeaseStore = struct {
         var took_over = false;
         var fencing_token: u64 = 0;
         if (current) |value| {
-            if (!value.released and value.expires_at_unix_ns > now_unix_ns and
-                (value.owner_id == null or !std.mem.eql(u8, value.owner_id.?, owner_id)))
-            {
+            // Acquisition denotes a new worker incarnation. Even a matching
+            // configured owner must not inherit an active token: only renew()
+            // may extend the exact held lease.
+            if (!value.released and value.expires_at_unix_ns > now_unix_ns) {
+                // Seed the separate floor while rolling forward from binaries
+                // that only stored their token in HEAD metadata.
+                if (!value.body_carries_coordination_etag) {
+                    try self.ensureFencingFloor(namespace, value.fencing_token);
+                }
                 return null;
             }
             if (value.released or value.expires_at_unix_ns <= now_unix_ns) {
                 fencing_token = try self.reserveFencingToken(namespace, value.fencing_token);
                 took_over = !value.released;
-            } else {
-                fencing_token = value.fencing_token;
-                try self.ensureFencingFloor(namespace, fencing_token);
             }
         }
 
@@ -111,7 +115,7 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = expires_at,
             .released = false,
         };
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed.head_version});
+        const payload = try head_coordination.payloadAlloc(self.alloc, proposed);
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
@@ -162,6 +166,95 @@ pub const ObjectWorkLeaseStore = struct {
         }
     }
 
+    pub fn acquireBootstrap(
+        self: *ObjectWorkLeaseStore,
+        namespace: []const u8,
+        owner_id: []const u8,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !?work_lease.Acquisition {
+        const expires_at = std.math.add(u64, now_unix_ns, ttl_ns) catch
+            return error.LeaseExpiryOverflow;
+        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+
+        var current = try self.readCurrentAlloc(key);
+        defer if (current) |*value| value.deinit(self.alloc);
+        if (current) |value| {
+            if (!value.released and value.expires_at_unix_ns > now_unix_ns) return null;
+        }
+        const minimum = if (current) |value| value.fencing_token else 0;
+        const fencing_token = try self.reserveFencingToken(namespace, minimum);
+        const proposed = head_coordination.Record{
+            .owner_id = owner_id,
+            .fencing_token = fencing_token,
+            .expires_at_unix_ns = expires_at,
+            .released = false,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        defer self.alloc.free(payload);
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = "application/json",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |value| value.etag else null,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return null,
+            else => {
+                if (try self.recordMatches(key, proposed)) {
+                    return .{
+                        .fencing_token = fencing_token,
+                        .expires_at_unix_ns = expires_at,
+                        .took_over = if (current) |value| !value.released else false,
+                    };
+                }
+                return err;
+            },
+        };
+        defer result.deinit(self.alloc);
+        return .{
+            .fencing_token = fencing_token,
+            .expires_at_unix_ns = expires_at,
+            .took_over = if (current) |value| !value.released else false,
+        };
+    }
+
+    pub fn releaseBootstrap(
+        self: *ObjectWorkLeaseStore,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+    ) !bool {
+        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        var current = (try self.readCurrentAlloc(key)) orelse return false;
+        defer current.deinit(self.alloc);
+        if (current.owner_id == null or
+            !std.mem.eql(u8, current.owner_id.?, owner_id) or
+            current.fencing_token != fencing_token)
+        {
+            return false;
+        }
+        const released_record = head_coordination.Record{
+            .owner_id = owner_id,
+            .fencing_token = fencing_token,
+            .released = true,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, released_record, .{});
+        defer self.alloc.free(payload);
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = "application/json",
+            .if_match_etag = current.etag,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return false,
+            else => {
+                if (try self.recordMatches(key, released_record)) return true;
+                return err;
+            },
+        };
+        defer result.deinit(self.alloc);
+        return true;
+    }
+
     pub fn renew(
         self: *ObjectWorkLeaseStore,
         namespace: []const u8,
@@ -192,7 +285,7 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = expires_at,
             .released = false,
         };
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed.head_version});
+        const payload = try head_coordination.payloadAlloc(self.alloc, proposed);
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
@@ -234,7 +327,7 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = 0,
             .released = true,
         };
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{released_record.head_version});
+        const payload = try head_coordination.payloadAlloc(self.alloc, released_record);
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, released_record);
         defer self.alloc.free(content_type);
@@ -298,6 +391,7 @@ pub const ObjectWorkLeaseStore = struct {
             .fencing_token = record.fencing_token,
             .expires_at_unix_ns = record.expires_at_unix_ns,
             .released = record.released,
+            .body_carries_coordination_etag = head_coordination.hasPayloadFingerprint(result.body),
             .etag = owned_etag,
         };
     }
@@ -400,6 +494,8 @@ pub const ObjectWorkLeaseStore = struct {
         .validate = erasedValidate,
         .renew = erasedRenew,
         .release = erasedRelease,
+        .acquire_bootstrap = erasedAcquireBootstrap,
+        .release_bootstrap = erasedReleaseBootstrap,
     };
 
     fn erasedAcquire(
@@ -451,6 +547,27 @@ pub const ObjectWorkLeaseStore = struct {
             ttl_ns,
         );
     }
+
+    fn erasedAcquireBootstrap(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        owner_id: []const u8,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !?work_lease.Acquisition {
+        const self: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
+        return try self.acquireBootstrap(namespace, owner_id, now_unix_ns, ttl_ns);
+    }
+
+    fn erasedReleaseBootstrap(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+    ) !bool {
+        const self: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
+        return try self.releaseBootstrap(namespace, owner_id, fencing_token);
+    }
 };
 
 fn keyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
@@ -465,6 +582,13 @@ fn fenceFloorKeyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u
         return try std.fmt.allocPrint(alloc, "{s}/HEAD_FENCE", .{namespace});
     }
     return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD_FENCE", .{ prefix, namespace });
+}
+
+fn bootstrapKeyAlloc(alloc: Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
+    if (prefix.len == 0) {
+        return try std.fmt.allocPrint(alloc, "{s}/HEAD_BOOTSTRAP", .{namespace});
+    }
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD_BOOTSTRAP", .{ prefix, namespace });
 }
 
 test "serverless object work lease fences stale owners and reconciles ambiguous acquisition" {
@@ -495,8 +619,11 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
     var legacy_client = memory.client();
     var legacy_head = try legacy_client.getObject("leases", "tenant/docs/HEAD", .{});
     defer legacy_head.deinit(alloc);
-    try std.testing.expectEqualStrings("1", legacy_head.body);
-    try std.testing.expectEqual(@as(u64, 1), try std.fmt.parseInt(u64, legacy_head.body, 10));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        try std.fmt.parseInt(u64, std.mem.trim(u8, legacy_head.body, " \t\r\n"), 10),
+    );
+    try std.testing.expect((try provider.acquire("docs", "worker-a", 109, 10)) == null);
     try std.testing.expect((try provider.acquire("docs", "worker-b", 109, 10)) == null);
     try std.testing.expectError(
         error.WorkLeaseLost,
@@ -561,8 +688,10 @@ test "serverless head publication atomically rejects a stale fencing token" {
     var legacy_client = memory.client();
     var legacy_head = try legacy_client.getObject("coordination", "tenant/docs/HEAD", .{});
     defer legacy_head.deinit(alloc);
-    try std.testing.expectEqualStrings("2", legacy_head.body);
-    try std.testing.expectEqual(@as(u64, 2), try std.fmt.parseInt(u64, legacy_head.body, 10));
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        try std.fmt.parseInt(u64, std.mem.trim(u8, legacy_head.body, " \t\r\n"), 10),
+    );
 }
 
 test "serverless work lease preserves first publication for rolling rollback" {
@@ -581,6 +710,10 @@ test "serverless work lease preserves first publication for rolling rollback" {
         error.WorkLeaseRequiresPublishedHead,
         store.provider().acquire("docs", "new-worker", 100, 10),
     );
+    const bootstrap = (try store.provider().acquireBootstrap("docs", "new-worker", 100, 10)).?;
+    try std.testing.expect(
+        (try store.provider().acquireBootstrap("docs", "contender", 100, 10)) == null,
+    );
     var legacy_client = memory.client();
     try std.testing.expectError(
         error.FileNotFound,
@@ -591,6 +724,64 @@ test "serverless work lease preserves first publication for rolling rollback" {
         .if_none_match = true,
     });
     first_head.deinit(alloc);
+    try std.testing.expect(try store.provider().releaseBootstrap(
+        "docs",
+        "new-worker",
+        bootstrap.fencing_token,
+    ));
+}
+
+test "serverless lease body CAS rejects a stale metadata-only renewal" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer leases.deinit();
+    const provider = leases.provider();
+
+    try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+    const stale = (try provider.acquire("docs", "worker-a", 100, 10)).?;
+    var raw = memory.client();
+    var before_takeover = try raw.getObject("coordination", "tenant/docs/HEAD", .{});
+    const stale_etag = try alloc.dupe(u8, before_takeover.metadata.etag.?);
+    before_takeover.deinit(alloc);
+    defer alloc.free(stale_etag);
+
+    const stale_renewal = head_coordination.Record{
+        .head_version = 1,
+        .owner_id = "worker-a",
+        .fencing_token = stale.fencing_token,
+        .expires_at_unix_ns = 210,
+        .released = false,
+    };
+    const stale_payload = try head_coordination.payloadAlloc(alloc, stale_renewal);
+    defer alloc.free(stale_payload);
+    const stale_content_type = try head_coordination.contentTypeAlloc(alloc, stale_renewal);
+    defer alloc.free(stale_content_type);
+
+    const replacement = (try provider.acquire("docs", "worker-b", 110, 100)).?;
+    try std.testing.expect(replacement.fencing_token > stale.fencing_token);
+    try std.testing.expectError(
+        error.PreconditionFailed,
+        raw.putObject("coordination", "tenant/docs/HEAD", stale_payload, .{
+            .content_type = stale_content_type,
+            .if_match_etag = stale_etag,
+        }),
+    );
+    try provider.validate("docs", "worker-b", replacement.fencing_token, 111);
 }
 
 test "serverless legacy head writer cannot reset the fencing epoch" {
@@ -642,4 +833,49 @@ test "serverless legacy head writer cannot reset the fencing epoch" {
         .owner_id = "stable-owner",
         .fencing_token = replacement.fencing_token,
     }));
+}
+
+test "serverless active pre-floor lease seeds rollback-safe fencing epoch" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer leases.deinit();
+
+    const active = head_coordination.Record{
+        .head_version = 7,
+        .owner_id = "old-new-worker",
+        .fencing_token = 41,
+        .expires_at_unix_ns = 200,
+        .released = false,
+    };
+    const active_content_type = try head_coordination.contentTypeAlloc(alloc, active);
+    defer alloc.free(active_content_type);
+    var raw = memory.client();
+    var seeded = try raw.putObject("coordination", "tenant/docs/HEAD", "7", .{
+        .content_type = active_content_type,
+        .if_none_match = true,
+    });
+    seeded.deinit(alloc);
+
+    // A conflicting new worker cannot inherit the active lease, but observing
+    // it migrates the durable floor before an old binary can erase metadata.
+    try std.testing.expect((try leases.provider().acquire("docs", "new-worker", 100, 10)) == null);
+    var current = try raw.getObject("coordination", "tenant/docs/HEAD", .{});
+    const current_etag = try alloc.dupe(u8, current.metadata.etag.?);
+    current.deinit(alloc);
+    defer alloc.free(current_etag);
+    var legacy = try raw.putObject("coordination", "tenant/docs/HEAD", "7", .{
+        .content_type = "text/plain",
+        .if_match_etag = current_etag,
+    });
+    legacy.deinit(alloc);
+
+    const replacement = (try leases.provider().acquire("docs", "new-worker", 101, 10)).?;
+    try std.testing.expect(replacement.fencing_token > active.fencing_token);
 }
