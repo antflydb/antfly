@@ -7870,6 +7870,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             else => {
                 std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
+                public_table_http.setLastBatchFailureName(err);
                 return error.InternalFailure;
             },
         };
@@ -7938,6 +7939,7 @@ pub const ApiHttpServer = struct {
             error.HAFencedPrimary => return error.HAFencedPrimary,
             else => {
                 std.log.err("public table batch failed table={s} err={}", .{ table_name, err });
+                public_table_http.setLastBatchFailureName(err);
                 return error.InternalFailure;
             },
         }) orelse return error.NotFound;

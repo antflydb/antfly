@@ -2229,6 +2229,13 @@ pub const BoundTableReadSource = struct {
                 .result = profiled.result,
                 .dense_profile = mapDenseSearchProfile(profiled.profile),
             };
+        } else if (snapshot_req.profile) {
+            const profiled = try self.db.searchWithDenseProfile(alloc, snapshot_req);
+            execution = .{
+                .request = snapshot_req,
+                .result = profiled.result,
+                .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
+            };
         } else {
             execution = .{
                 .request = snapshot_req,
@@ -8871,11 +8878,47 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_scratch_acquire_ns = profile.hbc_scratch_acquire_ns,
         .hbc_node_cache_lookup_ns = profile.hbc_node_cache_lookup_ns,
         .hbc_quantized_cache_lookup_ns = profile.hbc_quantized_cache_lookup_ns,
+        .hbc_filter_candidates = profile.hbc_filter_candidates,
+        .hbc_filter_rejected = profile.hbc_filter_rejected,
+        .hbc_filter_metadata_batches = profile.hbc_filter_metadata_batches,
+        .hbc_filter_metadata_batch_ns = profile.hbc_filter_metadata_batch_ns,
+        .hbc_traversal_waves = profile.hbc_traversal_waves,
+        .hbc_traversal_initial_wave_leaves = profile.hbc_traversal_initial_wave_leaves,
+        .hbc_traversal_max_wave_leaves = profile.hbc_traversal_max_wave_leaves,
+        .hbc_traversal_bound_resolutions = profile.hbc_traversal_bound_resolutions,
+        .hbc_traversal_bound_fallbacks = profile.hbc_traversal_bound_fallbacks,
+        .hbc_traversal_bound_stops = profile.hbc_traversal_bound_stops,
+        .hbc_traversal_frontier_remaining = profile.hbc_traversal_frontier_remaining,
+        .hbc_traversal_eligible_vectors = profile.hbc_traversal_eligible_vectors,
+        .hbc_traversal_stop_lower_bound = profile.hbc_traversal_stop_lower_bound,
+        .hbc_traversal_stop_result_upper_bound = profile.hbc_traversal_stop_result_upper_bound,
         .resolved_search_width = profile.resolved_search_width,
         .resolved_epsilon = profile.resolved_epsilon,
         .native_filter_candidate_count = profile.native_filter_candidate_count,
         .search_route = profile.search_route,
         .route_reason = profile.route_reason,
+        .route_estimated_exact_storage_bytes = profile.route_estimated_exact_storage_bytes,
+        .route_estimated_hbc_storage_bytes = profile.route_estimated_hbc_storage_bytes,
+        .route_estimated_exact_work_ns = profile.route_estimated_exact_work_ns,
+        .route_estimated_hbc_work_ns = profile.route_estimated_hbc_work_ns,
+        .exact_candidate_count = profile.exact_candidate_count,
+        .exact_batch_count = profile.exact_batch_count,
+        .exact_max_batch_size = profile.exact_max_batch_size,
+        .exact_workspace_bytes = profile.exact_workspace_bytes,
+        .exact_request_vector_cache_entries = profile.exact_request_vector_cache_entries,
+        .exact_raw_batch_reads = profile.exact_raw_batch_reads,
+        .exact_raw_scalar_reads = profile.exact_raw_scalar_reads,
+        .exact_missing_vectors = profile.exact_missing_vectors,
+        .exact_candidate_prepare_ns = profile.exact_candidate_prepare_ns,
+        .exact_metadata_lookup_ns = profile.exact_metadata_lookup_ns,
+        .exact_artifact_key_ns = profile.exact_artifact_key_ns,
+        .exact_artifact_read_ns = profile.exact_artifact_read_ns,
+        .exact_artifact_decode_ns = profile.exact_artifact_decode_ns,
+        .exact_distance_ns = profile.exact_distance_ns,
+        .exact_lsm_cache_hits = profile.exact_lsm_cache_hits,
+        .exact_lsm_cache_misses = profile.exact_lsm_cache_misses,
+        .exact_artifact_cache_hits = profile.exact_artifact_cache_hits,
+        .exact_artifact_vectors_loaded = profile.exact_artifact_vectors_loaded,
         .hbc_nodes_visited = profile.hbc_nodes_visited,
         .hbc_leaves_explored = profile.hbc_leaves_explored,
         .hbc_approx_vectors_scored = profile.hbc_approx_vectors_scored,
@@ -8883,6 +8926,9 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_reranked_vectors = profile.hbc_reranked_vectors,
         .hbc_approx_candidate_count = profile.hbc_approx_candidate_count,
         .hbc_rerank_candidate_count = profile.hbc_rerank_candidate_count,
+        .hbc_rerank_batches = profile.hbc_rerank_batches,
+        .hbc_rerank_max_batch_size = profile.hbc_rerank_max_batch_size,
+        .hbc_rerank_candidates_skipped_by_bound = profile.hbc_rerank_candidates_skipped_by_bound,
         .hbc_ambiguous_top_k_pairs = profile.hbc_ambiguous_top_k_pairs,
         .hbc_ambiguous_boundary_pairs = profile.hbc_ambiguous_boundary_pairs,
         .hbc_ambiguous_distance_over_hits = profile.hbc_ambiguous_distance_over_hits,
@@ -8910,12 +8956,15 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_rerank_external_score_ns = profile.hbc_rerank_external_score_ns,
         .hbc_rerank_vector_load_ns = profile.hbc_rerank_vector_load_ns,
         .hbc_rerank_metadata_lookup_ns = profile.hbc_rerank_metadata_lookup_ns,
+        .hbc_rerank_metadata_vectors_loaded = profile.hbc_rerank_metadata_vectors_loaded,
         .hbc_rerank_artifact_key_ns = profile.hbc_rerank_artifact_key_ns,
         .hbc_rerank_artifact_read_ns = profile.hbc_rerank_artifact_read_ns,
         .hbc_rerank_artifact_decode_ns = profile.hbc_rerank_artifact_decode_ns,
         .hbc_rerank_artifact_distance_ns = profile.hbc_rerank_artifact_distance_ns,
         .hbc_rerank_lsm_cache_hits = profile.hbc_rerank_lsm_cache_hits,
         .hbc_rerank_lsm_cache_misses = profile.hbc_rerank_lsm_cache_misses,
+        .hbc_rerank_artifact_cache_hits = profile.hbc_rerank_artifact_cache_hits,
+        .hbc_rerank_artifact_vectors_loaded = profile.hbc_rerank_artifact_vectors_loaded,
         .hbc_rerank_distance_ns = profile.hbc_rerank_distance_ns,
         .doc_key_resolve_ns = profile.doc_key_resolve_ns,
         .doc_ordinal_lookup_ns = profile.doc_ordinal_lookup_ns,
@@ -8951,7 +9000,11 @@ fn mapDenseDebugPair(pair: db_query_search.DenseSearchProfile.DebugPair) query_a
 
 fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (!req.profile) return null;
-    if (req.full_text != null or req.full_text_queries.len > 0) return null;
+    if (req.full_text) |full_text| switch (full_text) {
+        .match_all => {},
+        else => return null,
+    };
+    if (req.full_text_queries.len > 0) return null;
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
     if (req.dense_queries.len > 1) return null;
@@ -8960,6 +9013,8 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (req.dense_queries.len == 1) {
         var dense_req = req;
         dense_req.index_name = req.dense_queries[0].index_name;
+        dense_req.full_text = null;
+        dense_req.dense_queries = &.{};
         return .{
             .req = dense_req,
             .query = req.dense_queries[0].query,
@@ -8971,6 +9026,54 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
         .dense_knn => |dense| .{ .req = req, .query = dense },
         else => null,
     };
+}
+
+test "profiled composed dense query preserves exact route telemetry" {
+    const profiled = profiledDenseQuery(.{
+        .profile = true,
+        .full_text = .{ .match_all = {} },
+        .dense_queries = &.{.{
+            .name = "semantic",
+            .index_name = "semantic_idx",
+            .query = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 10 },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"a\"}}",
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("semantic_idx", profiled.req.index_name.?);
+    try std.testing.expect(profiled.req.full_text == null);
+    try std.testing.expectEqual(@as(usize, 0), profiled.req.dense_queries.len);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"a\"}}", profiled.req.filter_query_json);
+    try std.testing.expectEqual(@as(u32, 10), profiled.query.k);
+
+    const public = mapDenseSearchProfile(.{
+        .search_route = "exact_native_filter",
+        .route_reason = "exact_storage_work_lower",
+        .route_estimated_exact_storage_bytes = 123,
+        .route_estimated_hbc_storage_bytes = 456,
+        .exact_candidate_count = 17,
+        .exact_batch_count = 2,
+        .exact_raw_batch_reads = 2,
+        .exact_raw_scalar_reads = 0,
+        .exact_artifact_read_ns = 789,
+        .exact_artifact_cache_hits = 3,
+        .exact_artifact_vectors_loaded = 14,
+        .hbc_rerank_metadata_vectors_loaded = 9,
+        .hbc_rerank_artifact_cache_hits = 4,
+        .hbc_rerank_artifact_vectors_loaded = 9,
+    });
+    try std.testing.expectEqualStrings("exact_native_filter", public.search_route);
+    try std.testing.expectEqual(@as(u64, 123), public.route_estimated_exact_storage_bytes);
+    try std.testing.expectEqual(@as(u64, 456), public.route_estimated_hbc_storage_bytes);
+    try std.testing.expectEqual(@as(u64, 17), public.exact_candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), public.exact_batch_count);
+    try std.testing.expectEqual(@as(u64, 2), public.exact_raw_batch_reads);
+    try std.testing.expectEqual(@as(u64, 0), public.exact_raw_scalar_reads);
+    try std.testing.expectEqual(@as(u64, 789), public.exact_artifact_read_ns);
+    try std.testing.expectEqual(@as(u64, 3), public.exact_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 14), public.exact_artifact_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_metadata_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 4), public.hbc_rerank_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_artifact_vectors_loaded);
 }
 
 fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.Kind {
@@ -9063,6 +9166,15 @@ fn queryDbDetailed(
             .request = snapshot_req,
             .result = profiled.result,
             .dense_profile = mapDenseSearchProfile(profiled.profile),
+            .db_owner = owner,
+        };
+    }
+    if (snapshot_req.profile) {
+        const profiled = try db.searchWithDenseProfile(alloc, snapshot_req);
+        return .{
+            .request = snapshot_req,
+            .result = profiled.result,
+            .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
             .db_owner = owner,
         };
     }

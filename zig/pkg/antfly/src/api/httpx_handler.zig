@@ -488,8 +488,7 @@ pub const AntflyApiHandler = struct {
         api: public_table_http.TableApi,
     ) !httpx.Response {
         var resp = try public_table_http.handleTableBatch(alloc, table_name, body_data, api);
-        defer resp.deinit(alloc);
-        return respondApiResponseBody(ctx, resp.status, resp.body);
+        return respondOwnedApiResponseWithAllocator(ctx, &resp, alloc);
     }
 
     fn handleTableBatchOffEventLoop(
@@ -537,8 +536,7 @@ pub const AntflyApiHandler = struct {
         _ = future.await(runtime_io);
         if (job.err) |err| return err;
         var resp = job.result.?;
-        defer resp.deinit(job_alloc);
-        return respondApiResponseBody(ctx, resp.status, resp.body);
+        return respondOwnedApiResponseWithAllocator(ctx, &resp, job_alloc);
     }
 
     fn forwardTransactionSession(
@@ -6724,6 +6722,25 @@ test "httpx owned response preserves retryable JSON metadata" {
     try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
     try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
     try std.testing.expectEqualStrings(public_table_http.storage_read_temporarily_unavailable_body, response.body.?);
+
+    var batch_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/batch");
+    defer batch_request.deinit();
+    var batch_ctx = httpx.Context.init(alloc, undefined, &batch_request);
+    defer batch_ctx.deinit();
+    var batch_failure = public_table_http.OwnedResponse{
+        .status = 500,
+        .body = try alloc.dupe(u8, "{\"error\":\"InferenceProviderFailure\",\"message\":\"batch failed\"}"),
+        .json = true,
+    };
+    var failure_response = try AntflyApiHandler.respondOwnedApiResponse(&batch_ctx, &batch_failure);
+    defer failure_response.deinit();
+    try std.testing.expectEqual(@as(u16, 500), failure_response.status.code);
+    try std.testing.expectEqualStrings("application/json", failure_response.headers.get("content-type").?);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"error\":\"InferenceProviderFailure\",\"message\":\"batch failed\"}",
+        failure_response.body.?,
+    );
 }
 
 test "httpx query admission rejects saturated queries without blocking control routes" {

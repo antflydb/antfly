@@ -15,8 +15,10 @@
 const std = @import("std");
 const antfly = @import("antfly-zig");
 const builtin = @import("builtin");
+const httpx = @import("httpx");
 
 const api = antfly.public_api;
+const guardrail_build_options = @import("public_query_guardrail_build_options");
 const common = antfly.common;
 const db_mod = antfly.db;
 const metadata_api = antfly.metadata_api;
@@ -32,7 +34,7 @@ const std_http_listener = antfly.common.http.std_http_listener;
 const table_name = "docs";
 const index_name = "dense_idx";
 const sparse_index_name = "sparse_idx";
-const text_index_name = "full_text_index_v1";
+const text_index_name = "full_text_index_v0";
 const algebraic_index_name = "algebraic_idx";
 const graph_index_name = "graph_idx";
 const native_endian = builtin.target.cpu.arch.endian();
@@ -219,6 +221,7 @@ const Config = struct {
     queries: usize = 25,
     repeats: usize = 10,
     k: usize = 100,
+    exact_recall_samples: usize = 0,
     batch_size: usize = 250,
     search_threads: usize = 5,
     search_thread_sweep: bool = false,
@@ -235,6 +238,8 @@ const Config = struct {
     startup_timeout_ms: u64 = 30_000,
     index_ready_timeout_ms: u64 = 120_000,
     load_progress_interval: usize = 25_000,
+    filter_selectivity_percent: u8 = 10,
+    process_memory_budget_mb: ?u64 = null,
     standalone_binary: []const u8 = "./zig-out/bin/antfly",
     bind_host: []const u8 = "127.0.0.1",
 };
@@ -292,7 +297,12 @@ const HbcCacheWire = struct {
 };
 
 const IndexStatusWire = struct {
+    config: IndexConfig = .{},
     status: ?Status = null,
+
+    const IndexConfig = struct {
+        name: []const u8 = "",
+    };
 
     const Status = struct {
         doc_count: ?u64 = null,
@@ -413,6 +423,12 @@ const QueryBenchStats = struct {
     later_pass_ns: u64 = 0,
     later_pass_queries: u64 = 0,
     response_hit_count: u64 = 0,
+    dense_recall_queries: u64 = 0,
+    dense_source_hit_count: u64 = 0,
+    dense_source_top1_count: u64 = 0,
+    dense_exact_recall_hits: u64 = 0,
+    dense_exact_recall_expected: u64 = 0,
+    dense_exact_recall_samples: u64 = 0,
     response_filter_match_count: u64 = 0,
     response_sort_tuple_count: u64 = 0,
     response_sort_tuple_valid_count: u64 = 0,
@@ -426,9 +442,39 @@ const QueryBenchStats = struct {
     profile_hbc_scratch_acquire_ns: u64 = 0,
     profile_hbc_node_cache_lookup_ns: u64 = 0,
     profile_hbc_quantized_cache_lookup_ns: u64 = 0,
+    profile_hbc_filter_candidates: u64 = 0,
+    profile_hbc_filter_rejected: u64 = 0,
+    profile_hbc_filter_metadata_batches: u64 = 0,
+    profile_hbc_filter_metadata_batch_ns: u64 = 0,
+    profile_hbc_traversal_waves: u64 = 0,
+    profile_hbc_traversal_bound_stops: u64 = 0,
+    profile_hbc_traversal_bound_fallbacks: u64 = 0,
+    profile_hbc_traversal_eligible_vectors: u64 = 0,
+    profile_exact_route_count: u64 = 0,
+    profile_route_estimated_exact_storage_bytes: u64 = 0,
+    profile_route_estimated_hbc_storage_bytes: u64 = 0,
+    profile_route_estimated_exact_work_ns: u64 = 0,
+    profile_route_estimated_hbc_work_ns: u64 = 0,
+    profile_exact_candidate_count: u64 = 0,
+    profile_exact_batch_count: u64 = 0,
+    profile_exact_workspace_bytes: u64 = 0,
+    profile_exact_request_vector_cache_entries: u64 = 0,
+    profile_exact_raw_batch_reads: u64 = 0,
+    profile_exact_raw_scalar_reads: u64 = 0,
+    profile_exact_missing_vectors: u64 = 0,
+    profile_exact_candidate_prepare_ns: u64 = 0,
+    profile_exact_metadata_lookup_ns: u64 = 0,
+    profile_exact_artifact_key_ns: u64 = 0,
+    profile_exact_artifact_read_ns: u64 = 0,
+    profile_exact_artifact_decode_ns: u64 = 0,
+    profile_exact_distance_ns: u64 = 0,
+    profile_exact_artifact_cache_hits: u64 = 0,
+    profile_exact_artifact_vectors_loaded: u64 = 0,
     profile_hbc_reranked_vectors: u64 = 0,
     profile_hbc_approx_candidate_count: u64 = 0,
     profile_hbc_rerank_candidate_count: u64 = 0,
+    profile_hbc_rerank_batches: u64 = 0,
+    profile_hbc_rerank_candidates_skipped_by_bound: u64 = 0,
     profile_hbc_ambiguous_top_k_pairs: u64 = 0,
     profile_hbc_ambiguous_boundary_pairs: u64 = 0,
     profile_hbc_ambiguous_distance_over_hits: u64 = 0,
@@ -464,12 +510,15 @@ const QueryBenchStats = struct {
     profile_rerank_external_score_ns: u64 = 0,
     profile_rerank_vector_load_ns: u64 = 0,
     profile_rerank_metadata_lookup_ns: u64 = 0,
+    profile_rerank_metadata_vectors_loaded: u64 = 0,
     profile_rerank_artifact_key_ns: u64 = 0,
     profile_rerank_artifact_read_ns: u64 = 0,
     profile_rerank_artifact_decode_ns: u64 = 0,
     profile_rerank_artifact_distance_ns: u64 = 0,
     profile_rerank_lsm_cache_hits: u64 = 0,
     profile_rerank_lsm_cache_misses: u64 = 0,
+    profile_rerank_artifact_cache_hits: u64 = 0,
+    profile_rerank_artifact_vectors_loaded: u64 = 0,
     profile_rerank_distance_ns: u64 = 0,
     profile_inline_metadata_hits: u64 = 0,
     profile_fetched_metadata_hits: u64 = 0,
@@ -642,9 +691,46 @@ const QueryResponseWire = struct {
                 hbc_scratch_acquire_ns: u64 = 0,
                 hbc_node_cache_lookup_ns: u64 = 0,
                 hbc_quantized_cache_lookup_ns: u64 = 0,
+                hbc_filter_candidates: u64 = 0,
+                hbc_filter_rejected: u64 = 0,
+                hbc_filter_metadata_batches: u64 = 0,
+                hbc_filter_metadata_batch_ns: u64 = 0,
+                hbc_traversal_waves: u64 = 0,
+                hbc_traversal_initial_wave_leaves: u64 = 0,
+                hbc_traversal_max_wave_leaves: u64 = 0,
+                hbc_traversal_bound_resolutions: u64 = 0,
+                hbc_traversal_bound_fallbacks: u64 = 0,
+                hbc_traversal_bound_stops: u64 = 0,
+                hbc_traversal_frontier_remaining: u64 = 0,
+                hbc_traversal_eligible_vectors: u64 = 0,
+                hbc_traversal_stop_lower_bound: f32 = 0,
+                hbc_traversal_stop_result_upper_bound: f32 = 0,
+                search_route: []const u8 = "",
+                route_estimated_exact_storage_bytes: u64 = 0,
+                route_estimated_hbc_storage_bytes: u64 = 0,
+                route_estimated_exact_work_ns: u64 = 0,
+                route_estimated_hbc_work_ns: u64 = 0,
+                exact_candidate_count: u64 = 0,
+                exact_batch_count: u64 = 0,
+                exact_workspace_bytes: u64 = 0,
+                exact_request_vector_cache_entries: u64 = 0,
+                exact_raw_batch_reads: u64 = 0,
+                exact_raw_scalar_reads: u64 = 0,
+                exact_missing_vectors: u64 = 0,
+                exact_candidate_prepare_ns: u64 = 0,
+                exact_metadata_lookup_ns: u64 = 0,
+                exact_artifact_key_ns: u64 = 0,
+                exact_artifact_read_ns: u64 = 0,
+                exact_artifact_decode_ns: u64 = 0,
+                exact_distance_ns: u64 = 0,
+                exact_artifact_cache_hits: u64 = 0,
+                exact_artifact_vectors_loaded: u64 = 0,
                 hbc_reranked_vectors: u64 = 0,
                 hbc_approx_candidate_count: u64 = 0,
                 hbc_rerank_candidate_count: u64 = 0,
+                hbc_rerank_batches: u64 = 0,
+                hbc_rerank_max_batch_size: u64 = 0,
+                hbc_rerank_candidates_skipped_by_bound: u64 = 0,
                 hbc_ambiguous_top_k_pairs: u64 = 0,
                 hbc_ambiguous_boundary_pairs: u64 = 0,
                 hbc_ambiguous_distance_over_hits: u64 = 0,
@@ -666,12 +752,15 @@ const QueryResponseWire = struct {
                 hbc_rerank_external_score_ns: u64 = 0,
                 hbc_rerank_vector_load_ns: u64 = 0,
                 hbc_rerank_metadata_lookup_ns: u64 = 0,
+                hbc_rerank_metadata_vectors_loaded: u64 = 0,
                 hbc_rerank_artifact_key_ns: u64 = 0,
                 hbc_rerank_artifact_read_ns: u64 = 0,
                 hbc_rerank_artifact_decode_ns: u64 = 0,
                 hbc_rerank_artifact_distance_ns: u64 = 0,
                 hbc_rerank_lsm_cache_hits: u64 = 0,
                 hbc_rerank_lsm_cache_misses: u64 = 0,
+                hbc_rerank_artifact_cache_hits: u64 = 0,
+                hbc_rerank_artifact_vectors_loaded: u64 = 0,
                 hbc_rerank_distance_ns: u64 = 0,
                 returned_hit_count: u32 = 0,
                 inline_metadata_hits: u32 = 0,
@@ -1083,14 +1172,21 @@ pub fn main(init: std.process.Init) !void {
     const query_bodies = try makeQueryBodies(alloc, queries, cfg);
     defer freeOwnedStrings(alloc, query_bodies);
 
-    switch (cfg.mode) {
-        .handler => try runHandlerBench(alloc, cfg, dataset, queries, query_bodies),
-        .local => try runLocalBench(alloc, init.io, cfg, dataset, queries, query_bodies),
-        .standalone => {
-            const cwd = try std.process.currentPathAlloc(init.io, alloc);
-            defer alloc.free(cwd);
-            try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
-        },
+    if (comptime guardrail_build_options.standalone_only) {
+        if (cfg.mode != .standalone) return error.InvalidArgument;
+        const cwd = try std.process.currentPathAlloc(init.io, alloc);
+        defer alloc.free(cwd);
+        try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+    } else {
+        switch (cfg.mode) {
+            .handler => try runHandlerBench(alloc, cfg, dataset, queries, query_bodies),
+            .local => try runLocalBench(alloc, init.io, cfg, dataset, queries, query_bodies),
+            .standalone => {
+                const cwd = try std.process.currentPathAlloc(init.io, alloc);
+                defer alloc.free(cwd);
+                try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+            },
+        }
     }
 }
 
@@ -1197,6 +1293,7 @@ fn runHandlerBench(
         handler_stats,
         profile_stats,
         handler_concurrent,
+        .{},
         .{ .visibility = .{}, .polls = .{} },
         0,
         0,
@@ -1236,6 +1333,7 @@ fn runHandlerBench(
             if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
+    printPublicQueryExactRouteProfile(profile_stats);
     printPublicQuerySortProfile(cfg, handler_stats);
     printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
@@ -1353,7 +1451,7 @@ fn runLocalBench(
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-query\n", .{});
-    const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
+    var http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     const profile_stats = if (http_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
         db_stats
     else
@@ -1371,6 +1469,7 @@ fn runLocalBench(
 
     try enforceGuardrails(cfg, concurrent.polls);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
+    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -1418,6 +1517,7 @@ fn runLocalBench(
         http_stats,
         profile_stats,
         concurrent.http,
+        concurrent.polls,
         .{ .visibility = .{}, .polls = .{} },
         0,
         0,
@@ -1457,6 +1557,7 @@ fn runLocalBench(
             if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
+    printPublicQueryExactRouteProfile(http_stats);
     printPublicQuerySortProfile(cfg, http_stats);
     printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
@@ -1616,6 +1717,8 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
         cfg.repeats = try parseNextUsize(args, "--repeats");
     } else if (std.mem.eql(u8, arg, "--k")) {
         cfg.k = try parseNextUsize(args, "--k");
+    } else if (std.mem.eql(u8, arg, "--exact-recall-samples")) {
+        cfg.exact_recall_samples = try parseNextUsize(args, "--exact-recall-samples");
     } else if (std.mem.eql(u8, arg, "--batch-size")) {
         cfg.batch_size = try parseNextUsize(args, "--batch-size");
     } else if (std.mem.eql(u8, arg, "--search-threads")) {
@@ -1644,6 +1747,14 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
         cfg.index_ready_timeout_ms = try parseNextU64(args, "--index-ready-timeout-ms");
     } else if (std.mem.eql(u8, arg, "--load-progress-interval")) {
         cfg.load_progress_interval = try parseNextUsize(args, "--load-progress-interval");
+    } else if (std.mem.eql(u8, arg, "--filter-selectivity-percent")) {
+        const percent = try parseNextUsize(args, "--filter-selectivity-percent");
+        if (percent != 1 and percent != 10) return error.InvalidArgument;
+        cfg.filter_selectivity_percent = @intCast(percent);
+    } else if (std.mem.eql(u8, arg, "--process-memory-budget-mb")) {
+        const budget_mb = try parseNextU64(args, "--process-memory-budget-mb");
+        if (budget_mb == 0) return error.InvalidArgument;
+        cfg.process_memory_budget_mb = budget_mb;
     } else if (std.mem.eql(u8, arg, "--sync-level")) {
         const raw = args.next() orelse return error.InvalidArgument;
         cfg.sync_level = db_mod.types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;
@@ -2235,6 +2346,19 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     stats.queries += 1;
     if (first.hits.hits) |hits| {
         stats.response_hit_count += @intCast(hits.len);
+        if (cfg.query_shape.usesDense()) {
+            stats.dense_recall_queries += 1;
+            var expected_key_buf: [32]u8 = undefined;
+            const expected_key = try std.fmt.bufPrint(&expected_key_buf, "doc:{d:0>8}", .{querySourceDocIndex(query_idx, cfg)});
+            if (hits.len > 0 and std.mem.eql(u8, hits[0]._id, expected_key)) {
+                stats.dense_source_top1_count += 1;
+            }
+            for (hits) |hit| {
+                if (!std.mem.eql(u8, hit._id, expected_key)) continue;
+                stats.dense_source_hit_count += 1;
+                break;
+            }
+        }
         var previous_sort_tuple: ?[]const std.json.Value = null;
         for (hits) |hit| {
             if (try returnedHitMatchesGeneratedFilters(cfg, query_idx, hit._id)) {
@@ -2298,9 +2422,39 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_hbc_scratch_acquire_ns += dense.hbc_scratch_acquire_ns;
             stats.profile_hbc_node_cache_lookup_ns += dense.hbc_node_cache_lookup_ns;
             stats.profile_hbc_quantized_cache_lookup_ns += dense.hbc_quantized_cache_lookup_ns;
+            stats.profile_hbc_filter_candidates += dense.hbc_filter_candidates;
+            stats.profile_hbc_filter_rejected += dense.hbc_filter_rejected;
+            stats.profile_hbc_filter_metadata_batches += dense.hbc_filter_metadata_batches;
+            stats.profile_hbc_filter_metadata_batch_ns += dense.hbc_filter_metadata_batch_ns;
+            stats.profile_hbc_traversal_waves += dense.hbc_traversal_waves;
+            stats.profile_hbc_traversal_bound_stops += dense.hbc_traversal_bound_stops;
+            stats.profile_hbc_traversal_bound_fallbacks += dense.hbc_traversal_bound_fallbacks;
+            stats.profile_hbc_traversal_eligible_vectors += dense.hbc_traversal_eligible_vectors;
+            if (std.mem.eql(u8, dense.search_route, "exact_native_filter")) stats.profile_exact_route_count += 1;
+            stats.profile_route_estimated_exact_storage_bytes += dense.route_estimated_exact_storage_bytes;
+            stats.profile_route_estimated_hbc_storage_bytes += dense.route_estimated_hbc_storage_bytes;
+            stats.profile_route_estimated_exact_work_ns += dense.route_estimated_exact_work_ns;
+            stats.profile_route_estimated_hbc_work_ns += dense.route_estimated_hbc_work_ns;
+            stats.profile_exact_candidate_count += dense.exact_candidate_count;
+            stats.profile_exact_batch_count += dense.exact_batch_count;
+            stats.profile_exact_workspace_bytes += dense.exact_workspace_bytes;
+            stats.profile_exact_request_vector_cache_entries += dense.exact_request_vector_cache_entries;
+            stats.profile_exact_raw_batch_reads += dense.exact_raw_batch_reads;
+            stats.profile_exact_raw_scalar_reads += dense.exact_raw_scalar_reads;
+            stats.profile_exact_missing_vectors += dense.exact_missing_vectors;
+            stats.profile_exact_candidate_prepare_ns += dense.exact_candidate_prepare_ns;
+            stats.profile_exact_metadata_lookup_ns += dense.exact_metadata_lookup_ns;
+            stats.profile_exact_artifact_key_ns += dense.exact_artifact_key_ns;
+            stats.profile_exact_artifact_read_ns += dense.exact_artifact_read_ns;
+            stats.profile_exact_artifact_decode_ns += dense.exact_artifact_decode_ns;
+            stats.profile_exact_distance_ns += dense.exact_distance_ns;
+            stats.profile_exact_artifact_cache_hits += dense.exact_artifact_cache_hits;
+            stats.profile_exact_artifact_vectors_loaded += dense.exact_artifact_vectors_loaded;
             stats.profile_hbc_reranked_vectors += dense.hbc_reranked_vectors;
             stats.profile_hbc_approx_candidate_count += dense.hbc_approx_candidate_count;
             stats.profile_hbc_rerank_candidate_count += dense.hbc_rerank_candidate_count;
+            stats.profile_hbc_rerank_batches += dense.hbc_rerank_batches;
+            stats.profile_hbc_rerank_candidates_skipped_by_bound += dense.hbc_rerank_candidates_skipped_by_bound;
             stats.profile_hbc_ambiguous_top_k_pairs += dense.hbc_ambiguous_top_k_pairs;
             stats.profile_hbc_ambiguous_boundary_pairs += dense.hbc_ambiguous_boundary_pairs;
             stats.profile_hbc_ambiguous_distance_over_hits += dense.hbc_ambiguous_distance_over_hits;
@@ -2340,12 +2494,15 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_rerank_external_score_ns += dense.hbc_rerank_external_score_ns;
             stats.profile_rerank_vector_load_ns += dense.hbc_rerank_vector_load_ns;
             stats.profile_rerank_metadata_lookup_ns += dense.hbc_rerank_metadata_lookup_ns;
+            stats.profile_rerank_metadata_vectors_loaded += dense.hbc_rerank_metadata_vectors_loaded;
             stats.profile_rerank_artifact_key_ns += dense.hbc_rerank_artifact_key_ns;
             stats.profile_rerank_artifact_read_ns += dense.hbc_rerank_artifact_read_ns;
             stats.profile_rerank_artifact_decode_ns += dense.hbc_rerank_artifact_decode_ns;
             stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
             stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
             stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+            stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
+            stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
             stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
             stats.profile_inline_metadata_hits += dense.inline_metadata_hits;
             stats.profile_fetched_metadata_hits += dense.fetched_metadata_hits;
@@ -2366,12 +2523,11 @@ fn returnedHitMatchesGeneratedFilters(cfg: Config, query_idx: usize, doc_key: []
     };
     const source_doc_idx = querySourceDocIndex(query_idx, cfg);
     if (cfg.query_shape.usesFilter()) {
-        if (!std.mem.eql(u8, docStatus(doc_idx), docStatus(source_doc_idx)) or
-            !std.mem.eql(u8, docTenant(doc_idx), docTenant(source_doc_idx)))
-        {
+        const divisor = filterSelectivityDivisor(cfg);
+        if (doc_idx % divisor != source_doc_idx % divisor) {
             std.debug.print(
-                "public-query guardrail failed: filtered hit does not match generated filter query_shape={s} query_idx={d} source_doc={d} hit_doc={d} expected_status={s} actual_status={s} expected_tenant={s} actual_tenant={s}\n",
-                .{ cfg.query_shape.text(), query_idx, source_doc_idx, doc_idx, docStatus(source_doc_idx), docStatus(doc_idx), docTenant(source_doc_idx), docTenant(doc_idx) },
+                "public-query guardrail failed: filtered hit does not match generated {d}% bucket query_shape={s} query_idx={d} source_doc={d} hit_doc={d}\n",
+                .{ cfg.filter_selectivity_percent, cfg.query_shape.text(), query_idx, source_doc_idx, doc_idx },
             );
             return error.FilterGuardrailFailed;
         }
@@ -2576,6 +2732,28 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_hbc_scratch_acquire_ns += dense.hbc_scratch_acquire_ns;
     stats.profile_hbc_node_cache_lookup_ns += dense.hbc_node_cache_lookup_ns;
     stats.profile_hbc_quantized_cache_lookup_ns += dense.hbc_quantized_cache_lookup_ns;
+    stats.profile_hbc_filter_candidates += dense.hbc_filter_candidates;
+    stats.profile_hbc_filter_rejected += dense.hbc_filter_rejected;
+    stats.profile_hbc_filter_metadata_batches += dense.hbc_filter_metadata_batches;
+    stats.profile_hbc_filter_metadata_batch_ns += dense.hbc_filter_metadata_batch_ns;
+    if (std.mem.eql(u8, dense.search_route, "exact_native_filter")) stats.profile_exact_route_count += 1;
+    stats.profile_route_estimated_exact_storage_bytes += dense.route_estimated_exact_storage_bytes;
+    stats.profile_route_estimated_hbc_storage_bytes += dense.route_estimated_hbc_storage_bytes;
+    stats.profile_exact_candidate_count += dense.exact_candidate_count;
+    stats.profile_exact_batch_count += dense.exact_batch_count;
+    stats.profile_exact_workspace_bytes += dense.exact_workspace_bytes;
+    stats.profile_exact_request_vector_cache_entries += dense.exact_request_vector_cache_entries;
+    stats.profile_exact_raw_batch_reads += dense.exact_raw_batch_reads;
+    stats.profile_exact_raw_scalar_reads += dense.exact_raw_scalar_reads;
+    stats.profile_exact_missing_vectors += dense.exact_missing_vectors;
+    stats.profile_exact_candidate_prepare_ns += dense.exact_candidate_prepare_ns;
+    stats.profile_exact_metadata_lookup_ns += dense.exact_metadata_lookup_ns;
+    stats.profile_exact_artifact_key_ns += dense.exact_artifact_key_ns;
+    stats.profile_exact_artifact_read_ns += dense.exact_artifact_read_ns;
+    stats.profile_exact_artifact_decode_ns += dense.exact_artifact_decode_ns;
+    stats.profile_exact_distance_ns += dense.exact_distance_ns;
+    stats.profile_exact_artifact_cache_hits += dense.exact_artifact_cache_hits;
+    stats.profile_exact_artifact_vectors_loaded += dense.exact_artifact_vectors_loaded;
     stats.profile_hbc_reranked_vectors += dense.hbc_reranked_vectors;
     stats.profile_hbc_approx_candidate_count += dense.hbc_approx_candidate_count;
     stats.profile_hbc_rerank_candidate_count += dense.hbc_rerank_candidate_count;
@@ -2619,12 +2797,15 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_rerank_external_score_ns += dense.hbc_rerank_external_score_ns;
     stats.profile_rerank_vector_load_ns += dense.hbc_rerank_vector_load_ns;
     stats.profile_rerank_metadata_lookup_ns += dense.hbc_rerank_metadata_lookup_ns;
+    stats.profile_rerank_metadata_vectors_loaded += dense.hbc_rerank_metadata_vectors_loaded;
     stats.profile_rerank_artifact_key_ns += dense.hbc_rerank_artifact_key_ns;
     stats.profile_rerank_artifact_read_ns += dense.hbc_rerank_artifact_read_ns;
     stats.profile_rerank_artifact_decode_ns += dense.hbc_rerank_artifact_decode_ns;
     stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
     stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
     stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+    stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
+    stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
     stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
     stats.profile_inline_metadata_hits += dense.inline_metadata_hits;
     stats.profile_fetched_metadata_hits += dense.fetched_metadata_hits;
@@ -2788,6 +2969,127 @@ fn makeQueries(alloc: std.mem.Allocator, dataset: []const f32, cfg: Config) ![]f
     return queries;
 }
 
+const ExactRecallNeighbor = struct {
+    doc_idx: usize,
+    distance: f32,
+};
+
+fn exactRecallWorseThan(_: void, a: ExactRecallNeighbor, b: ExactRecallNeighbor) std.math.Order {
+    const primary = std.math.order(b.distance, a.distance);
+    if (primary != .eq) return primary;
+    return std.math.order(b.doc_idx, a.doc_idx);
+}
+
+fn supportsExactDenseRecall(cfg: Config) bool {
+    return cfg.query_shape == .dense or cfg.query_shape == .dense_filter;
+}
+
+fn exactDenseRecallCandidateEligible(cfg: Config, source_doc_idx: usize, candidate_doc_idx: usize) bool {
+    if (cfg.query_shape.usesFilter()) {
+        const divisor = filterSelectivityDivisor(cfg);
+        if (candidate_doc_idx % divisor != source_doc_idx % divisor) return false;
+    }
+    if (cfg.query_shape.usesExclusion() and
+        std.mem.eql(u8, docCategory(candidate_doc_idx), docExcludedCategory(source_doc_idx))) return false;
+    return true;
+}
+
+fn calculateExactDenseRecallTruth(
+    alloc: std.mem.Allocator,
+    dataset: []const f32,
+    query_idx: usize,
+    cfg: Config,
+) ![]usize {
+    if (!supportsExactDenseRecall(cfg) or cfg.k == 0) return try alloc.alloc(usize, 0);
+    const source_doc_idx = querySourceDocIndex(query_idx, cfg);
+    const query = dataset[source_doc_idx * cfg.dims ..][0..cfg.dims];
+    var nearest = std.PriorityQueue(ExactRecallNeighbor, void, exactRecallWorseThan).initContext({});
+    defer nearest.deinit(alloc);
+    try nearest.ensureTotalCapacity(alloc, @min(cfg.k, cfg.docs));
+
+    for (0..cfg.docs) |doc_idx| {
+        if (!exactDenseRecallCandidateEligible(cfg, source_doc_idx, doc_idx)) continue;
+        const candidate = dataset[doc_idx * cfg.dims ..][0..cfg.dims];
+        const neighbor = ExactRecallNeighbor{
+            .doc_idx = doc_idx,
+            // The generated vectors are normalized, so L2 and cosine produce
+            // the same ordering used by both local and standalone indexes.
+            .distance = antfly.vector.distance(query, candidate, .l2_squared),
+        };
+        if (nearest.items.len < cfg.k) {
+            try nearest.push(alloc, neighbor);
+            continue;
+        }
+        const worst = nearest.peek() orelse continue;
+        if (neighbor.distance < worst.distance or
+            (neighbor.distance == worst.distance and neighbor.doc_idx < worst.doc_idx))
+        {
+            _ = nearest.pop();
+            try nearest.push(alloc, neighbor);
+        }
+    }
+
+    const truth = try alloc.alloc(usize, nearest.items.len);
+    for (nearest.items, 0..) |neighbor, i| truth[i] = neighbor.doc_idx;
+    return truth;
+}
+
+fn validateSampledExactDenseRecall(
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    dataset: []const f32,
+    query_bodies: []const []const u8,
+    cfg: Config,
+    stats: *QueryBenchStats,
+) !void {
+    if (!supportsExactDenseRecall(cfg) or cfg.exact_recall_samples == 0) return;
+    const sample_count = @min(cfg.exact_recall_samples, cfg.queries);
+    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+    var client = api.ApiHttpClient.init(alloc, executor.executor());
+
+    for (0..sample_count) |sample_idx| {
+        // Use the midpoint of deterministic query strata instead of sampling
+        // only query zero. This remains reproducible across memory envelopes.
+        const query_idx = @min(
+            cfg.queries - 1,
+            ((sample_idx * 2 + 1) * cfg.queries) / (sample_count * 2),
+        );
+        const truth = try calculateExactDenseRecallTruth(alloc, dataset, query_idx, cfg);
+        defer alloc.free(truth);
+        if (truth.len == 0) return error.InvalidRecallGroundTruth;
+
+        var resp = try client.fetchQuery(base_uri, table_name, query_bodies[query_idx]);
+        defer resp.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(QueryResponseWire, alloc, resp.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.responses.len == 0) return error.InvalidQueryResponse;
+        const hits = parsed.value.responses[0].hits.hits orelse return error.InvalidQueryResponse;
+
+        var matched: u64 = 0;
+        for (truth) |truth_doc_idx| {
+            for (hits) |hit| {
+                const returned_doc_idx = benchmarkDocIndexFromKey(hit._id) orelse continue;
+                if (returned_doc_idx != truth_doc_idx) continue;
+                matched += 1;
+                break;
+            }
+        }
+        stats.dense_exact_recall_hits += matched;
+        stats.dense_exact_recall_expected += @intCast(truth.len);
+        stats.dense_exact_recall_samples += 1;
+    }
+    std.debug.print(
+        "public_query_exact_recall samples={d} hits={d} expected={d} recall_at_k={d:.6}\n",
+        .{
+            stats.dense_exact_recall_samples,
+            stats.dense_exact_recall_hits,
+            stats.dense_exact_recall_expected,
+            rate(stats.dense_exact_recall_hits, stats.dense_exact_recall_expected),
+        },
+    );
+}
+
 fn makeQueryBodies(alloc: std.mem.Allocator, queries: []const f32, cfg: Config) ![]const []const u8 {
     const out = try alloc.alloc([]const u8, cfg.queries);
     errdefer alloc.free(out);
@@ -2821,15 +3123,20 @@ fn runStandaloneBench(
         }
     }
 
-    const bind_port = try reserveEphemeralPort(io);
-    var health_port = try reserveEphemeralPort(io);
-    if (health_port == bind_port) health_port +%= 1;
-    var metadata_port = try reserveEphemeralPort(io);
-    if (metadata_port == bind_port or metadata_port == health_port) metadata_port +%= 2;
-    var metadata_admin_port = try reserveEphemeralPort(io);
-    if (metadata_admin_port == bind_port or metadata_admin_port == health_port or metadata_admin_port == metadata_port) metadata_admin_port +%= 3;
-    var store_raft_port = try reserveEphemeralPort(io);
-    if (store_raft_port == bind_port or store_raft_port == health_port or store_raft_port == metadata_port or store_raft_port == metadata_admin_port) store_raft_port +%= 4;
+    var ports: [5]u16 = undefined;
+    for (&ports, 0..) |*port, i| {
+        while (true) {
+            port.* = try reserveEphemeralPort(io);
+            var duplicate = false;
+            for (ports[0..i]) |prior| duplicate = duplicate or prior == port.*;
+            if (!duplicate) break;
+        }
+    }
+    const bind_port = ports[0];
+    const health_port = ports[1];
+    const metadata_port = ports[2];
+    const metadata_admin_port = ports[3];
+    const store_raft_port = ports[4];
 
     var child = try spawnStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
@@ -2856,7 +3163,7 @@ fn runStandaloneBench(
     printMemoryBreakdown("post_load", load_memory);
 
     std.debug.print("public-query guardrail stage=http-query\n", .{});
-    const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
+    var http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
     try enforceExactSortGuardrail(cfg, http_stats);
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
@@ -2868,6 +3175,9 @@ fn runStandaloneBench(
         std.debug.print("public-query guardrail memory_breakdown_err phase=post_search err={s}\n", .{@errorName(err)});
         break :blk MemoryBreakdown{};
     };
+    // Keep exact ground-truth work and validation requests outside every
+    // latency, QPS, cache-residency, and process-RSS measurement above.
+    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_http_ns = http_stats.avgNs();
     const avg_profile_ns = http_stats.avgProfileNs();
@@ -2908,6 +3218,7 @@ fn runStandaloneBench(
         http_stats,
         http_stats,
         concurrent.http,
+        concurrent.polls,
         load,
         load.rss_peak_bytes,
         concurrent.rss_peak_bytes,
@@ -2954,6 +3265,7 @@ fn runStandaloneBench(
             if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(http_stats.queries)),
         },
     );
+    printPublicQueryExactRouteProfile(http_stats);
     printPublicQuerySortProfile(cfg, http_stats);
     printPublicQuerySymbolicFilterProfile(cfg, http_stats);
     std.debug.print(
@@ -3057,7 +3369,7 @@ fn spawnStandalone(
     defer alloc.free(config_path);
     const config_json = try std.fmt.allocPrint(
         alloc,
-        "{{\"metadata\":{{}},\"storage\":{{\"local\":{{\"base_dir\":\"{s}\"}}}},\"replication_factor\":1,\"default_shards_per_table\":1,\"max_shard_size_bytes\":1099511627776,\"max_shards_per_table\":1}}",
+        "{{\"deployment_mode\":\"standalone\",\"metadata\":{{}},\"storage\":{{\"engine\":\"local\",\"local\":{{\"base_dir\":\"{s}\"}}}},\"replication_factor\":1,\"default_shards_per_table\":1,\"max_shard_size_bytes\":1099511627776,\"max_shards_per_table\":1}}",
         .{root_path},
     );
     defer alloc.free(config_json);
@@ -3067,8 +3379,17 @@ fn spawnStandalone(
         .data = config_json,
     });
 
+    const process_memory_budget_arg = if (cfg.process_memory_budget_mb) |budget_mb|
+        try std.fmt.allocPrint(alloc, "{d}", .{budget_mb})
+    else
+        null;
+    defer if (process_memory_budget_arg) |arg| alloc.free(arg);
+
     switch (cfg.server_kind) {
         .zig => {
+            var env_map = std.process.Environ.Map.init(alloc);
+            defer env_map.deinit();
+            if (process_memory_budget_arg) |arg| try env_map.put("ANTFLY_PROCESS_MEMORY_BUDGET_MB", arg);
             return try std.process.spawn(io, .{
                 .argv = &.{
                     cfg.standalone_binary,
@@ -3091,6 +3412,7 @@ fn spawnStandalone(
                     snapshot_root,
                 },
                 .cwd = .{ .path = cwd },
+                .environ_map = if (process_memory_budget_arg != null) &env_map else null,
                 .stdin = .ignore,
                 .stdout = .inherit,
                 .stderr = .inherit,
@@ -3114,6 +3436,7 @@ fn spawnStandalone(
             try env_map.put("ANTFLY_HEALTH_PORT", health_port_arg);
             try env_map.put("ANTFLY_LOG_STYLE", "logfmt");
             try env_map.put("ANTFLY_STANDALONE_TERMITE", "false");
+            if (process_memory_budget_arg) |arg| try env_map.put("ANTFLY_PROCESS_MEMORY_BUDGET_MB", arg);
 
             return try std.process.spawn(io, .{
                 .argv = &.{
@@ -3182,11 +3505,6 @@ fn seedStandalone(
     defer alloc.free(create_index_path);
     const created_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_index_path, create_index_body, &.{ 200, 201 });
     defer alloc.free(created_index);
-
-    if (cfg.query_shape.usesFullText()) {
-        // Table creation provisions the reserved default full-text index.
-        // The public create-index route rejects creating it a second time.
-    }
 
     if (cfg.with_sparse or cfg.query_shape.usesSparse()) {
         const create_sparse_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"embeddings\",\"sparse\":true,\"external\":true}}", .{sparse_index_name});
@@ -3443,6 +3761,10 @@ fn appendVectorDocJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocato
     try out.appendSlice(alloc, docStatus(doc_idx));
     try out.appendSlice(alloc, "\",\"tenant\":\"");
     try out.appendSlice(alloc, docTenant(doc_idx));
+    try out.appendSlice(alloc, "\",\"filter_bucket_10\":\"");
+    try out.print(alloc, "{d}", .{doc_idx % 10});
+    try out.appendSlice(alloc, "\",\"filter_bucket_100\":\"");
+    try out.print(alloc, "{d}", .{doc_idx % 100});
     try out.appendSlice(alloc, "\",\"score\":");
     try out.print(alloc, "{d}", .{docScore(doc_idx)});
     try out.appendSlice(alloc, ",\"created_at\":\"");
@@ -3498,11 +3820,33 @@ fn fetchIndexVisibilitySnapshot(
     base_uri: []const u8,
     target_index_name: []const u8,
 ) !VisibilitySnapshot {
-    var detail = try client.fetchTableIndex(base_uri, table_name, target_index_name);
+    var detail = client.fetchTableIndex(base_uri, table_name, target_index_name) catch |err| switch (err) {
+        error.UnexpectedHttpStatus => {
+            // A newly projected standalone table can briefly serve the index
+            // collection before its detail route is visible. The collection
+            // carries the same status contract and is sufficient for the
+            // readiness fence.
+            var listed = try client.fetchTableIndexes(base_uri, table_name);
+            defer listed.deinit(alloc);
+            var parsed_list = try std.json.parseFromSlice([]IndexStatusWire, alloc, listed.body, .{ .ignore_unknown_fields = true });
+            defer parsed_list.deinit();
+            for (parsed_list.value) |index_status| {
+                if (std.mem.eql(u8, index_status.config.name, target_index_name)) {
+                    return visibilityFromIndexStatus(index_status);
+                }
+            }
+            return err;
+        },
+        else => return err,
+    };
     defer detail.deinit(alloc);
     var parsed = try std.json.parseFromSlice(IndexStatusWire, alloc, detail.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.status) |status| {
+    return visibilityFromIndexStatus(parsed.value);
+}
+
+fn visibilityFromIndexStatus(index_status: IndexStatusWire) VisibilitySnapshot {
+    if (index_status.status) |status| {
         const total_indexed = status.total_indexed orelse 0;
         const doc_count = status.doc_count orelse total_indexed;
         const query_visible_doc_count = status.query_visible_doc_count orelse doc_count;
@@ -3917,7 +4261,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     }
     if (cfg.query_shape.usesFilter()) {
         if (wrote_field) try out.append(alloc, ',');
-        try appendMetadataFilterQuery(&out, alloc, source_doc_idx);
+        try appendMetadataFilterQuery(&out, alloc, source_doc_idx, cfg);
         wrote_field = true;
     }
     if (cfg.query_shape.usesExclusion()) {
@@ -4149,6 +4493,7 @@ fn printPublicQueryGuardrailSummaryJson(
     http_stats: QueryBenchStats,
     profile_stats: QueryBenchStats,
     concurrent: ConcurrentStats,
+    search_polls: PollStats,
     load: LoadRun,
     load_rss_peak_bytes: usize,
     search_rss_peak_bytes: usize,
@@ -4156,7 +4501,7 @@ fn printPublicQueryGuardrailSummaryJson(
 ) void {
     const reports_real_http = !std.mem.eql(u8, mode, "handler");
     std.debug.print(
-        "{{\"event\":\"public_query_guardrail_summary\",\"mode\":\"{s}\",\"server\":\"{s}\",\"query_shape\":\"{s}\",\"with_schema\":{},\"with_algebraic\":{},\"with_sparse\":{},\"with_graph\":{},\"docs\":{d},\"dims\":{d},\"queries\":{d},\"repeats\":{d},\"k\":{d},\"threads\":{d}",
+        "{{\"event\":\"public_query_guardrail_summary\",\"mode\":\"{s}\",\"server\":\"{s}\",\"query_shape\":\"{s}\",\"with_schema\":{},\"with_algebraic\":{},\"with_sparse\":{},\"with_graph\":{},\"docs\":{d},\"dims\":{d},\"queries\":{d},\"repeats\":{d},\"k\":{d},\"threads\":{d},\"process_memory_budget_mb\":{d}",
         .{
             mode,
             server,
@@ -4171,6 +4516,7 @@ fn printPublicQueryGuardrailSummaryJson(
             cfg.repeats,
             cfg.k,
             cfg.search_threads,
+            cfg.process_memory_budget_mb orelse 0,
         },
     );
     std.debug.print(
@@ -4192,7 +4538,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_rss_peak_bytes\":{d},\"search_rss_peak_bytes\":{d},\"hbc_total_bytes\":{d},\"hbc_accounted_bytes\":{d},\"lsm_cache_bytes\":{d},\"full_text_pending_bytes\":{d},\"replay_window_bytes\":{d},\"approx_candidates_avg\":{d:.3},\"rerank_candidates_avg\":{d:.3},\"reranked_vectors_avg\":{d:.3},\"top_k_count_avg\":{d:.3},\"profile_response_rate\":{d:.6},\"dense_profile_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_native_doc_values_rate\":{d:.6},\"sort_source_isolated_rate\":{d:.6},\"sort_candidates_avg\":{d:.3},\"sort_selected_avg\":{d:.3},\"sort_native_doc_value_hits_avg\":{d:.3},\"sort_stored_json_loads_avg\":{d:.3},\"returned_hits_avg\":{d:.3}}}\n",
+        ",\"load_rss_peak_bytes\":{d},\"search_rss_peak_bytes\":{d},\"hbc_total_bytes\":{d},\"hbc_accounted_bytes\":{d},\"lsm_cache_bytes\":{d},\"full_text_pending_bytes\":{d},\"replay_window_bytes\":{d},\"approx_candidates_avg\":{d:.3},\"rerank_candidates_avg\":{d:.3},\"reranked_vectors_avg\":{d:.3},\"filter_candidates_avg\":{d:.3},\"filter_rejected_avg\":{d:.3},\"filter_metadata_batches_avg\":{d:.3},\"filter_metadata_batch_us_avg\":{d:.3},\"top_k_count_avg\":{d:.3}",
         .{
             load_rss_peak_bytes,
             search_rss_peak_bytes,
@@ -4204,7 +4550,52 @@ fn printPublicQueryGuardrailSummaryJson(
             avgPerQuery(profile_stats, profile_stats.profile_hbc_approx_candidate_count),
             avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_candidate_count),
             avgPerQuery(profile_stats, profile_stats.profile_hbc_reranked_vectors),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_filter_candidates),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_filter_rejected),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_filter_metadata_batches),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_filter_metadata_batch_ns / profile_stats.queries),
             avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
+        },
+    );
+    std.debug.print(
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        .{
+            nsToMs(load.polls.health_max_latency_ns),
+            nsToMs(load.polls.metrics_max_latency_ns),
+            nsToMs(load.polls.status_max_latency_ns),
+            nsToMs(search_polls.health_max_latency_ns),
+            nsToMs(search_polls.metrics_max_latency_ns),
+            nsToMs(search_polls.status_max_latency_ns),
+            rate(http_stats.dense_source_hit_count, http_stats.dense_recall_queries),
+            rate(http_stats.dense_source_top1_count, http_stats.dense_recall_queries),
+            rate(http_stats.dense_exact_recall_hits, http_stats.dense_exact_recall_expected),
+            http_stats.dense_exact_recall_samples,
+            avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_cache_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_cache_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_vectors_loaded),
+        },
+    );
+    std.debug.print(
+        ",\"exact_route_rate\":{d:.6},\"exact_estimated_storage_bytes_avg\":{d:.3},\"hbc_estimated_storage_bytes_avg\":{d:.3},\"exact_estimated_work_us_avg\":{d:.3},\"hbc_estimated_work_us_avg\":{d:.3},\"traversal_waves_avg\":{d:.3},\"traversal_bound_stop_rate\":{d:.6},\"traversal_bound_fallbacks_avg\":{d:.3},\"traversal_eligible_vectors_avg\":{d:.3},\"rerank_batches_avg\":{d:.3},\"rerank_candidates_skipped_by_bound_avg\":{d:.3},\"exact_candidates_avg\":{d:.3},\"exact_batches_avg\":{d:.3},\"exact_batch_reads_avg\":{d:.3},\"exact_scalar_reads_avg\":{d:.3},\"exact_artifact_read_us_avg\":{d:.3},\"profile_response_rate\":{d:.6},\"dense_profile_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_native_doc_values_rate\":{d:.6},\"sort_source_isolated_rate\":{d:.6},\"sort_candidates_avg\":{d:.3},\"sort_selected_avg\":{d:.3},\"sort_native_doc_value_hits_avg\":{d:.3},\"sort_stored_json_loads_avg\":{d:.3},\"returned_hits_avg\":{d:.3}}}\n",
+        .{
+            rate(profile_stats.profile_exact_route_count, profile_stats.queries),
+            avgPerQuery(profile_stats, profile_stats.profile_route_estimated_exact_storage_bytes),
+            avgPerQuery(profile_stats, profile_stats.profile_route_estimated_hbc_storage_bytes),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_route_estimated_exact_work_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_route_estimated_hbc_work_ns / profile_stats.queries),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_traversal_waves),
+            rate(profile_stats.profile_hbc_traversal_bound_stops, profile_stats.queries),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_traversal_bound_fallbacks),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_traversal_eligible_vectors),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_batches),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_candidates_skipped_by_bound),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_batch_count),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_raw_batch_reads),
+            avgPerQuery(profile_stats, profile_stats.profile_exact_raw_scalar_reads),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_exact_artifact_read_ns / profile_stats.queries),
             profile_stats.profileResponseRate(),
             profile_stats.denseProfileRate(),
             rate(http_stats.profile_sort_response_count, http_stats.queries),
@@ -4222,6 +4613,30 @@ fn printPublicQueryGuardrailSummaryJson(
 fn avgPerQuery(stats: QueryBenchStats, value: u64) f64 {
     const query_count = if (stats.queries == 0) 1 else stats.queries;
     return @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(query_count));
+}
+
+fn printPublicQueryExactRouteProfile(stats: QueryBenchStats) void {
+    std.debug.print(
+        "public_query_exact_route rate={d:.4} estimated_exact_storage_bytes={d:.2} estimated_hbc_storage_bytes={d:.2} candidates={d:.2} batches={d:.2} workspace_bytes={d:.2} request_vector_cache_entries={d:.2} batch_reads={d:.2} scalar_reads={d:.2} missing_vectors={d:.2} prepare_us={d:.3} metadata_us={d:.3} artifact_key_us={d:.3} artifact_read_us={d:.3} artifact_decode_us={d:.3} distance_us={d:.3}\n",
+        .{
+            rate(stats.profile_exact_route_count, stats.queries),
+            avgPerQuery(stats, stats.profile_route_estimated_exact_storage_bytes),
+            avgPerQuery(stats, stats.profile_route_estimated_hbc_storage_bytes),
+            avgPerQuery(stats, stats.profile_exact_candidate_count),
+            avgPerQuery(stats, stats.profile_exact_batch_count),
+            avgPerQuery(stats, stats.profile_exact_workspace_bytes),
+            avgPerQuery(stats, stats.profile_exact_request_vector_cache_entries),
+            avgPerQuery(stats, stats.profile_exact_raw_batch_reads),
+            avgPerQuery(stats, stats.profile_exact_raw_scalar_reads),
+            avgPerQuery(stats, stats.profile_exact_missing_vectors),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_candidate_prepare_ns / stats.queries),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_metadata_lookup_ns / stats.queries),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_artifact_key_ns / stats.queries),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_artifact_read_ns / stats.queries),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_artifact_decode_ns / stats.queries),
+            nsToUs(if (stats.queries == 0) 0 else stats.profile_exact_distance_ns / stats.queries),
+        },
+    );
 }
 
 fn rate(value: u64, total: u64) f64 {
@@ -4260,8 +4675,8 @@ fn expectedSymbolicMatchCount(source_doc_idx: usize, cfg: Config) usize {
     for (0..cfg.docs) |doc_idx| {
         if (cfg.query_shape.usesFullText() and !std.mem.eql(u8, docBodyTerm(doc_idx), docBodyTerm(source_doc_idx))) continue;
         if (cfg.query_shape.usesFilter()) {
-            if (!std.mem.eql(u8, docStatus(doc_idx), docStatus(source_doc_idx))) continue;
-            if (!std.mem.eql(u8, docTenant(doc_idx), docTenant(source_doc_idx))) continue;
+            const divisor = filterSelectivityDivisor(cfg);
+            if (doc_idx % divisor != source_doc_idx % divisor) continue;
         }
         if (cfg.query_shape.usesExclusion() and std.mem.eql(u8, docCategory(doc_idx), docExcludedCategory(source_doc_idx))) continue;
         count += 1;
@@ -4278,6 +4693,10 @@ fn exactSortCursorDocIndex(source_doc_idx: usize, cfg: Config) usize {
 
 fn docStatus(doc_idx: usize) []const u8 {
     return if (doc_idx % 2 == 0) "active" else "archived";
+}
+
+fn filterSelectivityDivisor(cfg: Config) usize {
+    return if (cfg.filter_selectivity_percent == 1) 100 else 10;
 }
 
 fn docTenant(doc_idx: usize) []const u8 {
@@ -4379,12 +4798,13 @@ fn appendDocBody(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc
     });
 }
 
-fn appendMetadataFilterQuery(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, source_doc_idx: usize) !void {
-    try out.appendSlice(alloc, "\"filter_query\":{\"conjuncts\":[");
-    try appendGeneratedTermQuery(out, alloc, "status", docStatus(source_doc_idx));
-    try out.append(alloc, ',');
-    try appendGeneratedTermQuery(out, alloc, "tenant", docTenant(source_doc_idx));
-    try out.appendSlice(alloc, "]}");
+fn appendMetadataFilterQuery(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, source_doc_idx: usize, cfg: Config) !void {
+    const divisor = filterSelectivityDivisor(cfg);
+    try out.appendSlice(alloc, "\"filter_query\":{\"term\":{\"");
+    try out.appendSlice(alloc, if (divisor == 100) "filter_bucket_100" else "filter_bucket_10");
+    try out.appendSlice(alloc, "\":\"");
+    try out.print(alloc, "{d}", .{source_doc_idx % divisor});
+    try out.appendSlice(alloc, "\"}}");
 }
 
 fn appendMetadataExclusionQuery(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, source_doc_idx: usize) !void {
@@ -4438,10 +4858,11 @@ fn tempPath(buf: []u8) [:0]u8 {
     return std.fmt.bufPrintZ(buf, "/tmp/antfly-public-query-{d}", .{platform_time.monotonicNs()}) catch unreachable;
 }
 
-fn reserveEphemeralPort(_: std.Io) !u16 {
-    const span: u16 = 20_000;
-    const base: u16 = 20_000;
-    return base + @as(u16, @intCast(platform_time.monotonicNs() % span));
+fn reserveEphemeralPort(io: std.Io) !u16 {
+    const listen_addr = httpx.socket.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try httpx.TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    return listener.getLocalAddress().ip4.port;
 }
 
 fn sampleRssBytes(alloc: std.mem.Allocator, io: std.Io, pid: std.process.Child.Id) !usize {

@@ -22117,7 +22117,11 @@ fn dbHbcCacheKindStatsFromIndex(cache_stats: hbc_mod.HbcCacheKindStats) db_mod.t
     return .{
         .used_bytes = cache_stats.used_bytes,
         .peak_bytes = cache_stats.peak_bytes,
+        .hits = cache_stats.hits,
+        .misses = cache_stats.misses,
         .insertions = cache_stats.insertions,
+        .replacements = cache_stats.replacements,
+        .sampled_admissions = cache_stats.sampled_admissions,
         .admission_skips = cache_stats.admission_skips,
         .evictions = cache_stats.evictions,
     };
@@ -22127,6 +22131,7 @@ fn dbHbcCacheStatsFromIndex(cache_stats: hbc_mod.HbcCacheStats) db_mod.types.Hbc
     return .{
         .total_bytes = cache_stats.total_bytes,
         .accounted_bytes = cache_stats.accounted_bytes,
+        .pinned_bytes = cache_stats.pinned_bytes,
         .node = dbHbcCacheKindStatsFromIndex(cache_stats.node),
         .quantized = dbHbcCacheKindStatsFromIndex(cache_stats.quantized),
         .vector = dbHbcCacheKindStatsFromIndex(cache_stats.vector),

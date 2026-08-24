@@ -192,10 +192,16 @@ pub fn buildKnowledgeGraph(
             errdefer allocator.free(text_indices);
             text_indices[0] = indexed_relation.text_index;
 
+            const owned_head_id = try allocator.dupe(u8, head_id);
+            errdefer allocator.free(owned_head_id);
+            const owned_tail_id = try allocator.dupe(u8, tail_id);
+            errdefer allocator.free(owned_tail_id);
+            const label = try allocator.dupe(u8, relation.label);
+            errdefer allocator.free(label);
             try relations.append(allocator, .{
-                .head_id = try allocator.dupe(u8, head_id),
-                .tail_id = try allocator.dupe(u8, tail_id),
-                .label = try allocator.dupe(u8, relation.label),
+                .head_id = owned_head_id,
+                .tail_id = owned_tail_id,
+                .label = label,
                 .score = relation.score,
                 .text_indices = text_indices,
             });
@@ -234,13 +240,15 @@ fn resolveEntities(
     defer allocator.free(assignments);
     @memset(assignments, -1);
 
-    var normalized_cache = try allocator.alloc([]const u8, entities.len);
+    const normalized_cache = try allocator.alloc([]const u8, entities.len);
+    var normalized_count: usize = 0;
     defer {
-        for (normalized_cache) |text| allocator.free(text);
+        for (normalized_cache[0..normalized_count]) |text| allocator.free(text);
         allocator.free(normalized_cache);
     }
     for (entities, 0..) |indexed_entity, i| {
         normalized_cache[i] = try normalizeText(allocator, indexed_entity.entity.text);
+        normalized_count += 1;
     }
 
     for (entities, 0..) |indexed_entity, i| {
@@ -266,16 +274,20 @@ fn resolveEntities(
     }
 
     const resolved = try allocator.alloc(ResolvedEntity, clusters.items.len);
+    var resolved_count: usize = 0;
     errdefer {
-        for (resolved) |*entity| entity.deinit(allocator);
+        for (resolved[0..resolved_count]) |*entity| entity.deinit(allocator);
         allocator.free(resolved);
     }
 
     for (clusters.items, 0..) |cluster, i| {
         resolved[i] = try buildResolvedEntity(allocator, i, cluster.indices.items, entities, normalized_cache, cfg);
+        resolved_count += 1;
         for (cluster.indices.items) |entity_index| {
+            const normalized_text = try allocator.dupe(u8, normalized_cache[entity_index]);
+            errdefer allocator.free(normalized_text);
             try mention_refs.append(allocator, .{
-                .normalized_text = try allocator.dupe(u8, normalized_cache[entity_index]),
+                .normalized_text = normalized_text,
                 .label = entities[entity_index].entity.label,
                 .entity_id = resolved[i].id,
                 .text_index = entities[entity_index].text_index,
@@ -329,7 +341,9 @@ fn buildResolvedEntity(
             }
             if (already_seen) continue;
             try seen.append(allocator, normalized);
-            try mention_values.append(allocator, try allocator.dupe(u8, entities[idx].entity.text));
+            const mention_text = try allocator.dupe(u8, entities[idx].entity.text);
+            errdefer allocator.free(mention_text);
+            try mention_values.append(allocator, mention_text);
         }
     }
 
@@ -450,10 +464,16 @@ fn deduplicateRelations(allocator: std.mem.Allocator, relations: []const Resolve
         const text_indices = if (relation.text_indices) |indices| try allocator.dupe(usize, indices) else null;
         errdefer if (text_indices) |indices| allocator.free(indices);
 
+        const head_id = try allocator.dupe(u8, relation.head_id);
+        errdefer allocator.free(head_id);
+        const tail_id = try allocator.dupe(u8, relation.tail_id);
+        errdefer allocator.free(tail_id);
+        const label = try allocator.dupe(u8, relation.label);
+        errdefer allocator.free(label);
         deduped[count] = .{
-            .head_id = try allocator.dupe(u8, relation.head_id),
-            .tail_id = try allocator.dupe(u8, relation.tail_id),
-            .label = try allocator.dupe(u8, relation.label),
+            .head_id = head_id,
+            .tail_id = tail_id,
+            .label = label,
             .score = relation.score,
             .text_indices = text_indices,
         };
