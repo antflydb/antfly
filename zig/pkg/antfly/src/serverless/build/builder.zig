@@ -3494,51 +3494,59 @@ fn buildGraphMetricArtifactRefsAlloc(
     for (specs) |spec| {
         try cancellation.check();
         const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
-        var reusable = current != null;
-        var derivation_unchanged = current != null;
-        if (current) |manifest| {
-            const previous_graph_ref = findArtifactRefByName(manifest.artifacts, .graph_segment, spec.index_name);
-            if (previous_graph_ref == null or !artifactRefsIdentifySamePayload(previous_graph_ref.?, graph_ref)) {
-                reusable = false;
-                derivation_unchanged = false;
+        const topology_unchanged = if (current) |manifest| topology: {
+            const previous_graph_ref = findArtifactRefByName(manifest.artifacts, .graph_segment, spec.index_name) orelse break :topology false;
+            break :topology artifactRefsIdentifySamePayload(previous_graph_ref, graph_ref);
+        } else false;
+
+        // Resolve every configured metric independently. A missing or stale
+        // sibling must not consume rebuild budget or replace a healthy metric
+        // with a rejection sidecar. Dirty metrics remain batched so compatible
+        // HITS authority/hub pairs still share one computation.
+        const resolved = try alloc.alloc(?manifest_mod.ArtifactRef, spec.configs.len);
+        defer alloc.free(resolved);
+        @memset(resolved, null);
+        errdefer for (resolved) |maybe_ref| if (maybe_ref) |ref| freeArtifactRef(alloc, ref);
+
+        var dirty_configs = std.ArrayListUnmanaged(@import("../../graph/graph.zig").GraphMetricConfig).empty;
+        defer dirty_configs.deinit(alloc);
+        var dirty_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer dirty_indexes.deinit(alloc);
+
+        for (spec.configs, 0..) |config, config_index| {
+            const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, config.name);
+            const config_unchanged = previous_config != null and
+                lake_graph_metric.configFingerprint(previous_config.?) == lake_graph_metric.configFingerprint(config);
+            var reused = false;
+            if (topology_unchanged and config_unchanged) {
+                if (current) |manifest| {
+                    const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                    defer alloc.free(artifact_name);
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name)) |metric_index| {
+                        const metric_ref = manifest.artifacts[metric_index];
+                        if (try graphMetricArtifactReusable(alloc, artifacts, metric_ref, spec.index_name, config, graph_ref, cancellation)) {
+                            var cloned = try cloneArtifactRefAlloc(alloc, metric_ref);
+                            if (cloned.published_generation == 0) cloned.published_generation = provenance.published_generation;
+                            if (cloned.edge_generation == 0) cloned.edge_generation = provenance.edge_generation;
+                            if (cloned.computed_at_ms == 0) cloned.computed_at_ms = provenance.computed_at_ms;
+                            if (cloned.materializer_fingerprint == 0) cloned.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
+                            resolved[config_index] = cloned;
+                            reused = true;
+                        }
+                    }
+                }
             }
-            for (spec.configs) |config| {
-                const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, config.name) orelse {
-                    reusable = false;
-                    derivation_unchanged = false;
-                    break;
-                };
-                if (lake_graph_metric.configFingerprint(previous_config) != lake_graph_metric.configFingerprint(config)) {
-                    reusable = false;
-                    derivation_unchanged = false;
-                    break;
-                }
-                const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
-                defer alloc.free(artifact_name);
-                const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name) orelse {
-                    reusable = false;
-                    break;
-                };
-                const metric_ref = manifest.artifacts[metric_index];
-                if (!try graphMetricArtifactReusable(alloc, artifacts, metric_ref, spec.index_name, config, graph_ref, cancellation)) {
-                    reusable = false;
-                    break;
-                }
+            if (!reused) {
+                try dirty_configs.append(alloc, config);
+                try dirty_indexes.append(alloc, config_index);
             }
         }
 
-        if (reusable) {
-            try refs.ensureUnusedCapacity(alloc, spec.configs.len);
-            for (spec.configs) |config| {
-                const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
-                defer alloc.free(artifact_name);
-                const metric_index = findNamedArtifactIndex(current.?, .graph_metric_segment, artifact_name) orelse unreachable;
-                var cloned = try cloneArtifactRefAlloc(alloc, current.?.artifacts[metric_index]);
-                if (cloned.published_generation == 0) cloned.published_generation = provenance.published_generation;
-                if (cloned.edge_generation == 0) cloned.edge_generation = provenance.edge_generation;
-                if (cloned.computed_at_ms == 0) cloned.computed_at_ms = provenance.computed_at_ms;
-                if (cloned.materializer_fingerprint == 0) cloned.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
-                refs.appendAssumeCapacity(cloned);
+        if (dirty_configs.items.len == 0) {
+            try refs.ensureUnusedCapacity(alloc, resolved.len);
+            for (resolved) |*maybe_ref| {
+                refs.appendAssumeCapacity(maybe_ref.*.?);
+                maybe_ref.* = null;
             }
             continue;
         }
@@ -3549,7 +3557,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                 artifacts,
                 spec.index_name,
                 graph_ref,
-                spec.configs,
+                dirty_configs.items,
                 cancellation,
                 .build_budget_exceeded,
                 graph_metric_limits,
@@ -3570,7 +3578,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                         artifacts,
                         spec.index_name,
                         graph_ref,
-                        spec.configs,
+                        dirty_configs.items,
                         cancellation,
                         .build_budget_exceeded,
                         graph_metric_limits,
@@ -3584,7 +3592,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                 artifacts,
                 spec.index_name,
                 graph_ref,
-                spec.configs,
+                dirty_configs.items,
                 cancellation,
                 graph_metric_limits,
                 &graph_metric_budget,
@@ -3596,7 +3604,7 @@ fn buildGraphMetricArtifactRefsAlloc(
                     artifacts,
                     spec.index_name,
                     graph_ref,
-                    spec.configs,
+                    dirty_configs.items,
                     cancellation,
                     .build_budget_exceeded,
                     graph_metric_limits,
@@ -3605,28 +3613,39 @@ fn buildGraphMetricArtifactRefsAlloc(
                 else => return err,
             };
         };
-        var built_refs_moved = false;
+        var built_refs_moved: usize = 0;
         defer {
-            if (!built_refs_moved) for (built) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
+            for (built[built_refs_moved..]) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
             alloc.free(built);
         }
-        // Repairing an unchanged derivation must retain each metric's own
-        // publication provenance. Configurations may have been introduced in
-        // different generations even though they now share one graph build.
-        if (derivation_unchanged) {
-            if (current) |manifest| {
-                for (built) |*ref| {
-                    const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, ref.name) orelse continue;
-                    const previous_metric = manifest.artifacts[metric_index];
-                    if (previous_metric.published_generation != 0) ref.published_generation = previous_metric.published_generation;
-                    if (previous_metric.edge_generation != 0) ref.edge_generation = previous_metric.edge_generation;
-                    if (previous_metric.computed_at_ms != 0) ref.computed_at_ms = previous_metric.computed_at_ms;
+        for (built, dirty_indexes.items) |*ref, config_index| {
+            if (topology_unchanged) {
+                if (current) |manifest| {
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, ref.name)) |metric_index| {
+                        const previous_metric = manifest.artifacts[metric_index];
+                        // edge_generation identifies the topology snapshot,
+                        // not the metric configuration. Config-only rebuilds
+                        // therefore retain it while advancing publication and
+                        // computation provenance.
+                        if (previous_metric.edge_generation != 0) ref.edge_generation = previous_metric.edge_generation;
+                        const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, spec.configs[config_index].name);
+                        const config_unchanged = previous_config != null and
+                            lake_graph_metric.configFingerprint(previous_config.?) == lake_graph_metric.configFingerprint(spec.configs[config_index]);
+                        if (config_unchanged) {
+                            if (previous_metric.published_generation != 0) ref.published_generation = previous_metric.published_generation;
+                            if (previous_metric.computed_at_ms != 0) ref.computed_at_ms = previous_metric.computed_at_ms;
+                        }
+                    }
                 }
             }
+            resolved[config_index] = ref.*;
+            built_refs_moved += 1;
         }
-        try refs.ensureUnusedCapacity(alloc, built.len);
-        for (built) |ref| refs.appendAssumeCapacity(ref);
-        built_refs_moved = true;
+        try refs.ensureUnusedCapacity(alloc, resolved.len);
+        for (resolved) |*maybe_ref| {
+            refs.appendAssumeCapacity(maybe_ref.*.?);
+            maybe_ref.* = null;
+        }
     }
     return try refs.toOwnedSlice(alloc);
 }
@@ -5537,13 +5556,15 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     try std.testing.expectEqual(@as(u32, 1), first.stats.graph_segment_count);
     const metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "rank");
     defer alloc.free(metric_name);
+    const degree_metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "degree");
+    defer alloc.free(degree_metric_name);
     const first_graph = first.artifacts[findNamedArtifactIndex(first, .graph_segment, "graph_idx").?];
     const first_metric = first.artifacts[findNamedArtifactIndex(first, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqual(graph_metric_segment_mod.wire_version, first_metric.metadata_version);
     try std.testing.expectEqual(@as(u64, 1), first_metric.published_generation);
     try std.testing.expectEqual(@as(u64, 1), first_metric.edge_generation);
     try std.testing.expectEqual(lake_graph_metric.materializerFingerprint(.{}), first_metric.materializer_fingerprint);
-    try std.testing.expect(findNamedArtifactIndex(first, .graph_metric_segment, "9:graph_idx6:degree") != null);
+    try std.testing.expect(findNamedArtifactIndex(first, .graph_metric_segment, degree_metric_name) != null);
     try artifact_store.delete(first_metric.artifact_id);
 
     const unchanged_graph_mutation = try api_codec.encodeMutationAlloc(alloc, .{
@@ -5581,6 +5602,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     defer third.deinit(alloc);
     const third_graph = third.artifacts[findNamedArtifactIndex(third, .graph_segment, "graph_idx").?];
     const third_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, metric_name).?];
+    const third_degree_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, degree_metric_name).?];
     try std.testing.expect(!std.mem.eql(u8, second_graph.artifact_id, third_graph.artifact_id));
     try std.testing.expect(!std.mem.eql(u8, second_metric.artifact_id, third_metric.artifact_id));
     try std.testing.expectEqual(@as(u64, 3), third_metric.published_generation);
@@ -5618,8 +5640,15 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     defer fourth.deinit(alloc);
     const fourth_graph = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_segment, "graph_idx").?];
     const fourth_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, metric_name).?];
+    const fourth_degree_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, degree_metric_name).?];
     try std.testing.expectEqualStrings(third_graph.artifact_id, fourth_graph.artifact_id);
     try std.testing.expect(!std.mem.eql(u8, third_metric.artifact_id, fourth_metric.artifact_id));
+    try std.testing.expectEqual(@as(u64, 4), fourth_metric.published_generation);
+    try std.testing.expectEqual(third_metric.edge_generation, fourth_metric.edge_generation);
+    try std.testing.expectEqualStrings(third_degree_metric.artifact_id, fourth_degree_metric.artifact_id);
+    try std.testing.expectEqual(third_degree_metric.published_generation, fourth_degree_metric.published_generation);
+    try std.testing.expectEqual(third_degree_metric.edge_generation, fourth_degree_metric.edge_generation);
+    try std.testing.expectEqual(third_degree_metric.computed_at_ms, fourth_degree_metric.computed_at_ms);
 }
 
 test "builder reuses graph artifact when wal updates do not change graph projection" {

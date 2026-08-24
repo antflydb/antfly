@@ -250,21 +250,29 @@ pub const ManagedRuntime = struct {
             var table = table_record;
             defer table.deinit(self.alloc);
 
+            // Parse the table definition once per namespace/stage rather than
+            // once for each managed embedder. Keep created embedders owned by
+            // this scope until the enricher transaction commits.
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+            defer parsed.deinit();
+
             if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
-                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                defer parsed.deinit();
                 const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
+                var embedder_owned = true;
+                errdefer if (embedder_owned) sparse_embedder.deinit(self.alloc);
                 try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
+                embedder_owned = false;
             } else {
                 enricher.clearSparseEmbedder();
             }
 
             if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
-                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                defer parsed.deinit();
                 const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
                 const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
+                var embedder_owned = true;
+                errdefer if (embedder_owned) dense_embedder.deinit(self.alloc);
                 try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
+                embedder_owned = false;
             } else {
                 enricher.clearChunkEmbedder();
             }

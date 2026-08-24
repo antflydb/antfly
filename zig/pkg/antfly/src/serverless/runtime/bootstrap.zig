@@ -443,26 +443,37 @@ pub const OwnedStack = struct {
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
+        var enricher_owned = true;
+        errdefer if (enricher_owned) enricher.deinit();
         if (cfg.embedding_indexes_json) |indexes_json| {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
                 .remote_content = cfg.remote_content,
             };
             var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
-            errdefer query_embedder.deinit();
+            var query_embedder_owned = true;
+            errdefer if (query_embedder_owned) query_embedder.deinit();
             if (query_embedder.hasDenseEntries()) {
                 self.managed_query_embedder = query_embedder;
                 self.dense_query_index_name = try alloc.dupe(u8, cfg.chunk_embedding_index_name);
+                query_embedder_owned = false;
             } else {
                 query_embedder.deinit();
+                query_embedder_owned = false;
                 self.managed_query_embedder = null;
                 self.dense_query_index_name = null;
             }
             if (try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |sparse_embedder| {
+                var embedder_owned = true;
+                errdefer if (embedder_owned) sparse_embedder.deinit(alloc);
                 try enricher.setSparseEmbedder(sparse_embedder, cfg.sparse_embedding_index_name);
+                embedder_owned = false;
             }
             if (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |dense_embedder| {
+                var embedder_owned = true;
+                errdefer if (embedder_owned) dense_embedder.deinit(alloc);
                 try enricher.setChunkEmbedder(dense_embedder, cfg.chunk_embedding_index_name, cfg.chunk_embedding_dimensions);
+                embedder_owned = false;
             }
         } else {
             self.managed_query_embedder = null;
@@ -470,6 +481,7 @@ pub const OwnedStack = struct {
         }
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
+        enricher_owned = false;
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
         self.handler.setIo(io);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
