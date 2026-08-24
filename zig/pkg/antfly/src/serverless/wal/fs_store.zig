@@ -79,6 +79,34 @@ pub const FsStore = struct {
         payload: []const u8,
         operation_id: []const u8,
     ) !u64 {
+        return (try self.appendIdempotentMaybeLatest(namespace, timestamp_ns, payload, operation_id, null)).?;
+    }
+
+    pub fn appendIdempotentIfLatest(
+        self: *FsStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        return try self.appendIdempotentMaybeLatest(
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
+    }
+
+    fn appendIdempotentMaybeLatest(
+        self: *FsStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: ?u64,
+    ) !?u64 {
         if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
             return error.InvalidWalOperationId;
         if (payload.len > record_codec.idempotent_payload_max) return error.WalRecordTooLarge;
@@ -107,6 +135,9 @@ pub const FsStore = struct {
             state.next_lsn
         else
             1;
+        if (expected_latest_lsn) |expected| {
+            if (lsn - 1 != expected) return null;
+        }
         const encoded = try record_codec.encodeIdempotentRecordAlloc(self.alloc, lsn, timestamp_ns, payload, operation_id);
         defer self.alloc.free(encoded);
         try writeAppendedLogAtomically(self.alloc, log_path, current, encoded);
@@ -200,6 +231,7 @@ pub const FsStore = struct {
         .deinit = erasedDeinit,
         .append = erasedAppend,
         .append_idempotent = erasedAppendIdempotent,
+        .append_idempotent_if_latest = erasedAppendIdempotentIfLatest,
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
@@ -218,6 +250,24 @@ pub const FsStore = struct {
     fn erasedAppendIdempotent(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8, operation_id: []const u8) !u64 {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
+    }
+
+    fn erasedAppendIdempotentIfLatest(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.appendIdempotentIfLatest(
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
     }
 
     fn erasedReadFromAlloc(ptr: *anyopaque, alloc: Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
@@ -443,6 +493,35 @@ test "serverless fs wal store idempotent append survives reopen and truncation" 
         try std.testing.expectEqualStrings("enrich/1", records[0].operation_id.?);
         try std.testing.expectEqual(@as(u64, 2), try store.appendIdempotent("docs", 200, "derived", "enrich/1"));
     }
+}
+
+test "serverless fs WAL conditional idempotent append fences a changed latest LSN" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "conditional-idempotent");
+    defer cleanupTmp(path);
+
+    var impl = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    var store = impl.walStore();
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try store.append("docs", 100, "user-one"));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try store.appendIdempotentIfLatest("docs", 101, "stale-derived", "enrich/1", 0),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try store.appendIdempotentIfLatest("docs", 101, "derived", "enrich/1", 1),
+    );
+    try std.testing.expectEqual(@as(u64, 3), try store.append("docs", 102, "user-two"));
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try store.appendIdempotentIfLatest("docs", 101, "derived", "enrich/1", 1),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try store.appendIdempotentIfLatest("docs", 103, "stale-derived-two", "enrich/2", 2),
+    );
+    try std.testing.expectEqual(@as(u64, 3), try store.latestLsn("docs"));
 }
 
 test "fs wal store erased interface works" {

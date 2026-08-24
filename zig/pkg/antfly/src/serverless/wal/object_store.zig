@@ -188,6 +188,34 @@ pub const ObjectStore = struct {
         payload: []const u8,
         operation_id: []const u8,
     ) !u64 {
+        return (try self.appendIdempotentMaybeLatest(namespace, timestamp_ns, payload, operation_id, null)).?;
+    }
+
+    pub fn appendIdempotentIfLatest(
+        self: *ObjectStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        return try self.appendIdempotentMaybeLatest(
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
+    }
+
+    fn appendIdempotentMaybeLatest(
+        self: *ObjectStore,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: ?u64,
+    ) !?u64 {
         if (operation_id.len == 0 or operation_id.len > std.math.maxInt(u16))
             return error.InvalidWalOperationId;
         if (payload.len > idempotent_payload_max) return error.WalRecordTooLarge;
@@ -212,6 +240,9 @@ pub const ObjectStore = struct {
         }
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;
+        if (expected_latest_lsn) |expected| {
+            if (next_lsn - 1 != expected) return null;
+        }
         const encoded = try encodeIdempotentRecordAlloc(
             self.alloc,
             next_lsn,
@@ -226,11 +257,14 @@ pub const ObjectStore = struct {
             try self.alloc.dupe(u8, encoded);
         defer self.alloc.free(combined);
 
-        var result = try self.client.putObject(self.bucket, key, combined, .{
+        var result = self.client.putObject(self.bucket, key, combined, .{
             .content_type = "application/octet-stream",
             .if_none_match = current == null,
             .if_match_etag = if (current) |value| value.etag else null,
-        });
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => if (expected_latest_lsn != null) return null else return err,
+            else => return err,
+        };
         defer result.deinit(self.alloc);
         return next_lsn;
     }
@@ -336,6 +370,7 @@ pub const ObjectStore = struct {
         .deinit = erasedDeinit,
         .append = erasedAppend,
         .append_idempotent = erasedAppendIdempotent,
+        .append_idempotent_if_latest = erasedAppendIdempotentIfLatest,
         .read_from_alloc = erasedReadFromAlloc,
         .latest_lsn = erasedLatestLsn,
         .truncate_prefix = erasedTruncatePrefix,
@@ -360,6 +395,24 @@ pub const ObjectStore = struct {
     ) !u64 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.appendIdempotent(namespace, timestamp_ns, payload, operation_id);
+    }
+
+    fn erasedAppendIdempotentIfLatest(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return try self.appendIdempotentIfLatest(
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
     }
 
     fn erasedReadFromAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
@@ -537,7 +590,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-test "objectstore-backed wal store appends and truncates over file uri" {
+test "serverless objectstore-backed WAL conditionally appends and truncates over file uri" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "wal");
     defer cleanupTmp(path);
@@ -556,6 +609,20 @@ test "objectstore-backed wal store appends and truncates over file uri" {
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqual(@as(u64, 2), records[0].lsn);
     try std.testing.expectEqual(@as(u64, 1), try store.truncatePrefix("docs", 2));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try store.appendIdempotentIfLatest("docs", 30, "stale", "enrich/1", 1),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 3),
+        try store.appendIdempotentIfLatest("docs", 30, "derived", "enrich/1", 2),
+    );
+    try std.testing.expectEqual(@as(u64, 4), try store.append("docs", 40, "user"));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try store.appendIdempotentIfLatest("docs", 50, "stale-two", "enrich/2", 3),
+    );
+    try std.testing.expectEqual(@as(u64, 4), try store.latestLsn("docs"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

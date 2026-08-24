@@ -270,6 +270,42 @@ pub const FsProgressStore = struct {
         try self.writeStageHeadU64Unlocked(namespace, stage, head_version, retired_head_doc_offset);
     }
 
+    pub fn getEnrichmentStageProgress(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+    ) !?progress_store.EnrichmentStageProgress {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn compareAndSwapEnrichmentStageProgress(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        expected: ?progress_store.EnrichmentStageProgress,
+        desired: progress_store.EnrichmentStageProgress,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (!stageProgressOptionalEql(current, expected)) return false;
+        if (current) |value| {
+            if (desired.head_version < value.head_version) return false;
+            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+        }
+        try self.writeStageProgressUnlocked(namespace, stage, desired);
+        return true;
+    }
+
     const Kind = enum {
         head,
         gc_watermark,
@@ -308,6 +344,32 @@ pub const FsProgressStore = struct {
         defer self.alloc.free(path);
         try ensureParentDir(path);
         const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{value});
+        defer self.alloc.free(payload);
+        try writeFileAtomically(path, payload);
+    }
+
+    fn readOptionalStageProgressUnlocked(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+    ) !progress_store.EnrichmentStageProgress {
+        const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
+        defer self.alloc.free(path);
+        const raw = try readFileAlloc(self.alloc, path);
+        defer self.alloc.free(raw);
+        return try parseStageProgress(raw);
+    }
+
+    fn writeStageProgressUnlocked(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        value: progress_store.EnrichmentStageProgress,
+    ) !void {
+        const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
+        defer self.alloc.free(path);
+        try ensureParentDir(path);
+        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ value.head_version, value.doc_offset });
         defer self.alloc.free(payload);
         try writeFileAtomically(path, payload);
     }
@@ -360,6 +422,8 @@ pub const FsProgressStore = struct {
         .get_enrichment_stage_head_doc_offset = erasedGetEnrichmentStageHeadDocOffset,
         .compare_and_swap_enrichment_stage_head_doc_offset = erasedCompareAndSwapEnrichmentStageHeadDocOffset,
         .delete_enrichment_stage_head_doc_offset = erasedDeleteEnrichmentStageHeadDocOffset,
+        .get_enrichment_stage_progress = erasedGetEnrichmentStageProgress,
+        .compare_and_swap_enrichment_stage_progress = erasedCompareAndSwapEnrichmentStageProgress,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -496,7 +560,48 @@ pub const FsProgressStore = struct {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.deleteEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
     }
+
+    fn erasedGetEnrichmentStageProgress(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+    ) !?progress_store.EnrichmentStageProgress {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getEnrichmentStageProgress(namespace, @enumFromInt(stage_id));
+    }
+
+    fn erasedCompareAndSwapEnrichmentStageProgress(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        expected: ?progress_store.EnrichmentStageProgress,
+        desired: progress_store.EnrichmentStageProgress,
+    ) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapEnrichmentStageProgress(
+            namespace,
+            @enumFromInt(stage_id),
+            expected,
+            desired,
+        );
+    }
 };
+
+fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
+    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
+    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
+    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
+    return .{ .head_version = head_version, .doc_offset = doc_offset };
+}
+
+fn stageProgressOptionalEql(
+    lhs: ?progress_store.EnrichmentStageProgress,
+    rhs: ?progress_store.EnrichmentStageProgress,
+) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+}
 
 fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -676,6 +781,18 @@ test "serverless enrichment progress isolates overlapping published head offsets
     try store.deleteEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1);
     try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1));
     try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1, null, 0)));
+
+    const first = progress_store.EnrichmentStageProgress{ .head_version = 2, .doc_offset = 4 };
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("docs", .chunk_preview, null, first));
+    const next = progress_store.EnrichmentStageProgress{ .head_version = 3, .doc_offset = 0 };
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("docs", .chunk_preview, first, next));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageProgress(
+        "docs",
+        .chunk_preview,
+        first,
+        .{ .head_version = 2, .doc_offset = 5 },
+    )));
+    try std.testing.expectEqual(@as(?progress_store.EnrichmentStageProgress, next), try store.getEnrichmentStageProgress("docs", .chunk_preview));
 }
 
 test "fs progress store allows exactly one concurrent head CAS winner" {

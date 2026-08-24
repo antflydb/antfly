@@ -19,6 +19,11 @@ const head_coordination = @import("../head_coordination.zig");
 
 pub const PublicationFence = head_coordination.Fence;
 
+pub const EnrichmentStageProgress = struct {
+    head_version: u64,
+    doc_offset: u64,
+};
+
 pub const ProgressStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -44,6 +49,8 @@ pub const ProgressStore = struct {
         get_enrichment_stage_head_doc_offset: *const fn (*anyopaque, []const u8, u8, u64) anyerror!?u64,
         compare_and_swap_enrichment_stage_head_doc_offset: *const fn (*anyopaque, []const u8, u8, u64, ?u64, u64) anyerror!bool,
         delete_enrichment_stage_head_doc_offset: *const fn (*anyopaque, []const u8, u8, u64) anyerror!void,
+        get_enrichment_stage_progress: *const fn (*anyopaque, []const u8, u8) anyerror!?EnrichmentStageProgress,
+        compare_and_swap_enrichment_stage_progress: *const fn (*anyopaque, []const u8, u8, ?EnrichmentStageProgress, EnrichmentStageProgress) anyerror!bool,
     };
 
     pub fn deinit(self: *ProgressStore) void {
@@ -214,6 +221,41 @@ pub const ProgressStore = struct {
             namespace,
             @intFromEnum(stage),
             head_version,
+        );
+    }
+
+    /// A single durable record for the active head and offset of one stage.
+    /// Advancing the head and resetting its offset in one CAS fences stale
+    /// workers without allocating progress objects for historical heads.
+    pub fn getEnrichmentStageProgress(
+        self: *ProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+    ) !?EnrichmentStageProgress {
+        return try self.vtable.get_enrichment_stage_progress(
+            self.ptr,
+            namespace,
+            @intFromEnum(stage),
+        );
+    }
+
+    pub fn compareAndSwapEnrichmentStageProgress(
+        self: *ProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        expected: ?EnrichmentStageProgress,
+        desired: EnrichmentStageProgress,
+    ) !bool {
+        if (expected) |current| {
+            if (desired.head_version < current.head_version) return false;
+            if (desired.head_version == current.head_version and desired.doc_offset < current.doc_offset) return false;
+        }
+        return try self.vtable.compare_and_swap_enrichment_stage_progress(
+            self.ptr,
+            namespace,
+            @intFromEnum(stage),
+            expected,
+            desired,
         );
     }
 };
