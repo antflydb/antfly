@@ -10,6 +10,8 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -161,6 +163,94 @@ func TestReconcilePhysicalIsolationForceDeletedOrphanWithoutWatchdogProofFailsCl
 	got := cluster.Status.HAStatus.PlannedActions[0]
 	if got.AdminJobPhase != haAdminJobPhaseRunning || got.PhysicalIsolationReceipt.ObservedAt != nil || got.CompletedAt != nil {
 		t.Fatalf("force-deleted orphan was treated as isolated without watchdog proof: %#v", got)
+	}
+}
+
+// A Service-selector partition mutates the StatefulSet selector label on the
+// old Pod. Kubernetes consequently releases the controller reference and a
+// scale-to-zero no longer removes that process. After the exact process-bound
+// watchdog grace, the operator must delete that orphan without risking a
+// same-name replacement.
+func TestReconcilePhysicalIsolationDeletesExactOrphanAfterWatchdogBarrier(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	action.AdminJobPhase = haAdminJobPhaseRunning
+	action.CompletedAt = nil
+	receipt := action.PhysicalIsolationReceipt
+	receipt.IsolatedStatefulSetGeneration = 0
+	receipt.IsolatedStatefulSetObservedGeneration = 0
+	receipt.IsolatedStatefulSetResourceVersion = ""
+	receipt.ObservedLeaseResourceVersion = ""
+	receipt.AbsenceProven = false
+	receipt.AbsencePodListResourceVersion = ""
+	receipt.FrozenBoundaryLSN = 0
+	receipt.ObservedAt = nil
+	receipt.CompletedAt = nil
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+
+	sts, lease := currentPhysicalIsolationObjects(cluster, now)
+	proof := receipt.WatchdogProof
+	orphan := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: proof.PodName, Namespace: cluster.Namespace, UID: types.UID(proof.PodUID), ResourceVersion: "pod-rv",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: proof.ContainerName, ContainerID: proof.ContainerID, RestartCount: proof.ContainerRestartCount,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: proof.ContainerStartedAt}},
+			}},
+		},
+	}
+	reconciler := testHAReconciler(t, cluster, sts, lease, orphan)
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-with-orphan"}
+	reconciler.Now = func() time.Time { return now.Add(20 * time.Second) }
+	monotonicNow := now
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
+		t.Fatalf("start local watchdog barrier: %v", err)
+	}
+	current := &corev1.Pod{}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Name: orphan.Name, Namespace: orphan.Namespace}, current); err != nil {
+		t.Fatalf("orphan disappeared before watchdog barrier: %v", err)
+	}
+
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAStatusCheckpointed) {
+		t.Fatalf("exact orphan deletion was not a reconciliation barrier: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Name: orphan.Name, Namespace: orphan.Namespace}, current); !apierrors.IsNotFound(err) {
+		t.Fatalf("exact self-fenced orphan survived cleanup: %v", err)
+	}
+	got := cluster.Status.HAStatus.PlannedActions[0]
+	if got.AdminJobPhase != haAdminJobPhaseRunning || got.PhysicalIsolationReceipt.ObservedAt != nil || got.CompletedAt != nil {
+		t.Fatalf("orphan deletion skipped the required post-delete observation checkpoint: %#v", got)
+	}
+}
+
+func TestPhysicalIsolationOrphanCleanupRefusesSameNameReplacement(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: action.PhysicalIsolationReceipt.WatchdogProof.PodName, Namespace: cluster.Namespace,
+			UID: types.UID("replacement-pod-uid"), ResourceVersion: "replacement-rv",
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	reconciler := testHAReconciler(t, cluster, replacement)
+	deleted, err := reconciler.deletePhysicallyIsolatedOrphan(
+		context.Background(),
+		&action,
+		&corev1.PodList{Items: []corev1.Pod{*replacement}},
+	)
+	if err != nil || deleted {
+		t.Fatalf("same-name replacement matched old-process cleanup: deleted=%v err=%v", deleted, err)
+	}
+	current := &corev1.Pod{}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Name: replacement.Name, Namespace: replacement.Namespace}, current); err != nil {
+		t.Fatalf("same-name replacement was deleted: %v", err)
 	}
 }
 

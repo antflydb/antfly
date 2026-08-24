@@ -221,6 +221,26 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			}
 			return nil
 		}
+		if !absenceProven {
+			if !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
+				return nil
+			}
+			// A Service-selector partition can make the StatefulSet controller
+			// orphan its still-running Pod before the scale-to-zero update. Once
+			// the exact pre-transfer process has exceeded its fail-closed watchdog
+			// bound, remove that orphan with UID and resource-version
+			// preconditions. The zero grace period only cleans up the Kubernetes
+			// object; promotion safety continues to come from the process-bound
+			// watchdog proof because a partitioned kubelet may keep a deleted
+			// container alive.
+			deleted, err := r.deletePhysicallyIsolatedOrphan(ctx, action, pods)
+			if err != nil {
+				return err
+			}
+			if deleted {
+				return errHAStatusCheckpointed
+			}
+		}
 		if receipt.ObservedAt == nil {
 			if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
 				return nil
@@ -291,6 +311,38 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		return errHAStatusCheckpointed
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) deletePhysicallyIsolatedOrphan(ctx context.Context, action *antflyv1.HAPlannedActionStatus, pods *corev1.PodList) (bool, error) {
+	if r == nil || r.Client == nil || action == nil || action.PhysicalIsolationReceipt == nil ||
+		action.PhysicalIsolationReceipt.WatchdogProof == nil || pods == nil {
+		return false, nil
+	}
+	proof := action.PhysicalIsolationReceipt.WatchdogProof
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Name != proof.PodName || string(pod.UID) != proof.PodUID ||
+			pod.UID == "" || strings.TrimSpace(pod.ResourceVersion) == "" ||
+			pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		uid := pod.UID
+		resourceVersion := pod.ResourceVersion
+		err := r.Delete(ctx, pod,
+			client.GracePeriodSeconds(0),
+			client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+		)
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// Re-read through the uncached boundary reader before deciding
+			// whether this exact process disappeared or merely changed version.
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("isolate former primary: delete exact orphan Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // listStatefulSetPodsForPhysicalIsolation discovers old-writer processes by
