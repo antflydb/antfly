@@ -1457,6 +1457,28 @@ with no artifact reads. On this contended host those absolute times are
 diagnostic, but the controlled result supports normal cache admission plus an
 explicit resource envelope over benchmark-specific transient reads.
 
+The shared HBC cache then exposed two general foreground-tail bugs. Reusing an
+evicted CLOCK slot scanned from the beginning of the full slot array, and a
+second-chance miss could charge a complete CLOCK revolution to one insertion.
+Keeping the slot array compact makes removal/reuse constant-time; bounding one
+victim search to 64 entries distributes the second-chance sweep while advancing
+the hand and preserving namespace fairness. Focused churn, recency, and bounded
+scan tests cover the map/slot invariants. On the same persisted 50K generation,
+the official warmed VectorDBBench p99 fell from 440.5 ms to 12.8 ms at 0.9867
+recall after these changes.
+
+Continuous macOS `vmmap --summary` sampling was the remaining regular tail, not
+Antfly. It produced approximately 450--520 ms stalls every 75 queries and even
+charged some pauses inside server search timers because `vmmap` inspects the
+live target. The qualification runner now invokes the Circus sampler once after
+each timed phase. The kernel footprint ledger preserves the process high-water,
+so this retains the same primary memory yardstick without perturbing load or
+query latency. With sampling moved out of the timed window, the checked-in
+public profiler measured 3.63/4.26/4.74 ms p50/p95/p99, 14.87 ms maximum, and
+0.98671 recall across 1,000 queries. The post-phase sample reported a 659.2 MB
+physical-footprint ledger peak, 729.1 MB current RSS, and 700.7 MB conservative
+demand under the explicit 1 GiB process envelope.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1467,11 +1489,12 @@ fresh lifecycles and reports mean plus range.
 For native macOS runs, the primary demand number is the process tree's
 `phys_footprint` ledger high-water. System-wide wired growth is reported as a
 separate conservative diagnostic because unrelated host activity cannot be
-attributed to Antfly. RSS remains the cache-inclusive view. The sampler still
-polls RSS at the requested cadence, but rate-limits expensive `vmmap` ledger
-reads to once per second per PID; the ledger itself preserves peaks between
-reads. Earlier private scripts invoked `vmmap` every 200 ms and materially
-contaminated load throughput.
+attributed to Antfly. RSS remains the cache-inclusive point-in-time view. Do not
+poll native `vmmap` during a timed phase: invoke the sampler once immediately
+afterward and use the kernel-maintained footprint high-water for the phase peak.
+The qualification runner captures live and restarted processes separately.
+Historical scripts invoked `vmmap` every 200--300 ms and materially contaminated
+both load throughput and query tails; those timings are not publication data.
 
 The first partial 1M sample is diagnostic only: dataset download occurred after
 the wired baseline, contaminating the system-wide wired delta. Its
@@ -1494,10 +1517,12 @@ published.
    127.6 MB of the 150.7 MB live aggregate in the external-admission run;
    bound-read copies were 23.1 MB. Do not replace multi-operation snapshots
    with unsafe live probes merely to improve a cumulative counter.
-4. Repeat the whole-tree 1M lifecycle three times through Circus on a
-   controlled host and publish its mean plus range. The corrected fresh run is
-   1,711.26 seconds, but the 50K phase split and immediate query tails remain
-   scheduler-sensitive even when total load stays near 42--45 seconds.
+4. Repeat the whole-tree 1M lifecycle three times through the post-phase-sampled
+   harness on a controlled host and publish its mean plus range. Historical
+   1M timings between 1,386 and 1,915 seconds were collected with intrusive
+   `vmmap` polling and must be rerun; the 50K phase split and immediate query
+   tails are also scheduler-sensitive even when total load stays near
+   42--45 seconds.
 5. Add deterministic fault injection at every posting-WAL append, fsync,
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
