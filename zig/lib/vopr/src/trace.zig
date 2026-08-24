@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const health = @import("health.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
 const property = @import("property.zig");
@@ -121,6 +122,9 @@ pub const Trace = struct {
     properties: std.ArrayListUnmanaged(PropertyRecord) = .empty,
     failures: std.ArrayListUnmanaged(FailureRecord) = .empty,
     summary: ?Summary = null,
+    /// Diagnostic-only evidence sampled by the runner. It is intentionally
+    /// omitted from render/parse and therefore cannot affect replay truth.
+    health_evidence: ?health.Evidence = null,
 
     pub fn init(allocator: std.mem.Allocator, header: Header, config: Config) !Trace {
         if (header.system.len == 0 or header.scenario.len == 0 or header.scenario_version == 0) return error.InvalidTraceHeader;

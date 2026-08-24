@@ -455,14 +455,12 @@ pub const Scenario = struct {
         try sink.check(allocator, recovery_id, world.state.mode != .restart_recovery or world.state.restart_recovered);
     }
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
-        const resources = world.state.sim.resourceSnapshot();
-        return .{
+        return world.state.sim.healthSnapshot(.{
             .progress_expected = true,
             .progress_units = world.state.progress,
-            .active_tasks = resources.active_tasks,
-            .open_descriptors = resources.live_file_handles + resources.live_sockets,
-            .cleanup_complete = world.state.complete and resources.active_tasks == 0 and resources.live_file_handles == 0,
-        };
+            .consistency_valid = world.state.sound,
+            .cleanup_complete = world.state.complete,
+        });
     }
     pub fn done(world: *World) bool {
         return world.state.complete;

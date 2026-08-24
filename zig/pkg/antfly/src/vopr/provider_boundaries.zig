@@ -402,6 +402,21 @@ pub const Scenario = struct {
         try sink.check(allocator, complete_id, state.complete);
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        const admissions_clean = state.inference_admission.stats().in_flight == 0 and
+            state.postgres_admission.stats().in_flight == 0;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.inference_attempts + state.postgres_attempts,
+            .recovery_expected = state.mode == .inference_retry or state.mode == .postgres_retry,
+            .recovery_complete = state.complete and state.retry_recovered,
+            .consistency_valid = state.outcome_classified and state.invalid_rejected and
+                state.cancellation_propagated and state.timeout_propagated and state.sql_constructed,
+            .cleanup_complete = state.complete and admissions_clean,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.state.complete;
     }

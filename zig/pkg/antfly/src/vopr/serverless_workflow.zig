@@ -652,6 +652,19 @@ pub const Scenario = struct {
         try sink.check(allocator, compacted_id, state.complete and state.compacted);
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.final_head + @popCount(state.visible_document_mask),
+            .recovery_expected = state.mode != .clean,
+            .recovery_complete = state.complete and state.recovered,
+            .consistency_valid = !state.complete or
+                (state.visible_document_mask == 3 and state.final_head == 3 and state.compacted),
+            .cleanup_complete = state.complete and !state.runtime_live,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.state.complete;
     }

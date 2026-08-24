@@ -257,6 +257,20 @@ pub const Scenario = struct {
         try sink.check(allocator, complete_id, state.done);
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return .{
+            .progress_expected = true,
+            .progress_units = @intFromBool(state.text_complete) + @intFromBool(state.vector_complete) +
+                @intFromBool(state.graph_complete) + @intFromBool(state.published),
+            .recovery_expected = state.graph_failed or state.pressure_observed,
+            .recovery_complete = state.done and state.admission.stats().in_flight == 0,
+            .consistency_valid = !state.partial_published and !state.cancelled_published and
+                state.canonical_result and state.graph_preserved,
+            .cleanup_complete = state.done and state.admission.stats().in_flight == 0,
+        };
+    }
+
     pub fn done(world: *World) bool {
         return world.state.done;
     }

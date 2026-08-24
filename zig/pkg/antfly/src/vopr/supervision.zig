@@ -229,6 +229,21 @@ pub const Scenario = struct {
         try sink.check(allocator, restart_id, state.complete and state.ready_generations >= 1 and (!needs_restart or state.restart_count >= 1));
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        const stopped_cleanly = state.supervisor.currentState() == .stopped and
+            !state.public_api.running and !state.maintenance.running;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.ready_generations + state.restart_count,
+            .recovery_expected = state.mode != .clean,
+            .recovery_complete = state.complete and state.ready_generations >= 1,
+            .consistency_valid = !state.readiness_violation and !state.rollback_violation and
+                !state.failure_without_cancellation,
+            .cleanup_complete = state.complete and stopped_cleanly,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.state.complete;
     }

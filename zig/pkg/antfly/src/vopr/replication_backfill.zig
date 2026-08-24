@@ -443,6 +443,19 @@ pub const Scenario = struct {
         try sink.check(allocator, recovery_id, state.complete and (state.mode == .clean or state.first_attempt_failed));
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = @popCount(state.applied_mask) + state.lifecycle_calls,
+            .recovery_expected = state.mode != .clean,
+            .recovery_complete = state.complete and (state.mode == .clean or state.first_attempt_failed),
+            .consistency_valid = state.max_snapshot_checkpoint <= @popCount(state.applied_mask & 3) and
+                (!state.complete or state.applied_mask == 7),
+            .cleanup_complete = state.complete,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.state.complete;
     }

@@ -386,6 +386,18 @@ pub const Scenario = struct {
         try sink.check(allocator, complete_id, state.complete);
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.lifecycle_calls,
+            .recovery_expected = state.mode == .durable_reload or state.mode == .crash_between_user_and_policy,
+            .recovery_complete = state.complete and state.durable_agreement and state.crash_rolled_back,
+            .consistency_valid = state.durable_agreement and state.revoked_safe and state.policy_visible and state.crash_rolled_back,
+            .cleanup_complete = state.complete and !state.seed_mutation_escaped,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.state.complete;
     }

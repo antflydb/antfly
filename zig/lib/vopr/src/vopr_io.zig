@@ -14,6 +14,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const event = @import("event.zig");
+const health_mod = @import("health.zig");
 const ids = @import("id.zig");
 const runtime_mod = @import("runtime.zig");
 const sim_runtime_mod = @import("sim_runtime.zig");
@@ -227,6 +228,22 @@ pub const VoprIo = struct {
         storage_capacity_bytes: u64,
     };
 
+    pub const HealthOptions = struct {
+        progress_expected: bool = false,
+        progress_units: u64 = 0,
+        expected_active_tasks: u64 = 0,
+        expected_open_descriptors: u64 = 0,
+        allocator_exhausted: ?bool = null,
+        /// Opt in only when reaching physical capacity is itself unhealthy;
+        /// intentional bounded-capacity campaigns normally leave this false.
+        check_storage_exhaustion: bool = false,
+        unexpected_crash: ?bool = null,
+        recovery_expected: bool = false,
+        recovery_complete: ?bool = null,
+        consistency_valid: ?bool = null,
+        cleanup_complete: ?bool = null,
+    };
+
     prng: std.Random.DefaultPrng,
     monotonic_ns: i96,
     realtime_ns: i96,
@@ -362,6 +379,32 @@ pub const VoprIo = struct {
             .open_sockets = self.network.openSocketCount(),
             .storage_bytes = self.files.totalBytes(),
             .storage_capacity_bytes = self.files.capacityBytes(),
+        };
+    }
+
+    /// Standard health adapter for every scenario borrowing this runtime. It
+    /// automatically supplies task, descriptor, and physical-storage evidence
+    /// while leaving domain progress, recovery, and consistency semantics in
+    /// the scenario's control.
+    pub fn healthSnapshot(self: *const VoprIo, options: HealthOptions) health_mod.Snapshot {
+        const resources = self.resourceSnapshot();
+        return .{
+            .progress_expected = options.progress_expected,
+            .progress_units = options.progress_units,
+            .active_tasks = @intCast(resources.active_tasks),
+            .expected_active_tasks = options.expected_active_tasks,
+            .open_descriptors = @intCast(resources.open_file_handles + resources.open_sockets),
+            .expected_open_descriptors = options.expected_open_descriptors,
+            .allocator_exhausted = options.allocator_exhausted,
+            .storage_exhausted = if (options.check_storage_exhaustion)
+                resources.storage_bytes >= resources.storage_capacity_bytes
+            else
+                null,
+            .unexpected_crash = options.unexpected_crash,
+            .recovery_expected = options.recovery_expected,
+            .recovery_complete = options.recovery_complete,
+            .consistency_valid = options.consistency_valid,
+            .cleanup_complete = options.cleanup_complete,
         };
     }
 
