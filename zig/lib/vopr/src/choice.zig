@@ -13,6 +13,41 @@ pub const Request = struct {
     enabled: []const transition.Transition,
 };
 
+pub const AuditResult = struct {
+    choices: u64,
+    distinct_sites: u64,
+    parameterized_choices: u64,
+    maximum_enabled: usize,
+};
+
+/// Proves that every recorded scenario decision selected one immediate typed
+/// transition. Seeds remain configuration/discovery metadata: a choice cannot
+/// select an opaque value to be interpreted later because the selected stable
+/// ID must be the transition executed at that exact occurrence.
+pub fn auditTrace(history: *const trace.Trace) !AuditResult {
+    try history.validate();
+    var result = AuditResult{
+        .choices = @intCast(history.choices.items.len),
+        .distinct_sites = 0,
+        .parameterized_choices = 0,
+        .maximum_enabled = 0,
+    };
+    for (history.choices.items, history.transitions.items, 0..) |record, executed, index| {
+        if (record.site_id != ids.stable("choice", record.site_name)) return error.UnstableChoiceSiteId;
+        if (record.occurrence != index) return error.NonImmediateChoiceOccurrence;
+        if (record.selected_id != executed.id) return error.DeferredChoiceInterpretation;
+        result.maximum_enabled = @max(result.maximum_enabled, record.enabled_ids.len);
+        result.parameterized_choices += @intFromBool(executed.parameter != 0);
+        var seen_site = false;
+        for (history.choices.items[0..index]) |prior| if (prior.site_id == record.site_id) {
+            seen_site = true;
+            break;
+        };
+        result.distinct_sites += @intFromBool(!seen_site);
+    }
+    return result;
+}
+
 pub const Source = struct {
     ptr: *anyopaque,
     choose_fn: *const fn (*anyopaque, Request) anyerror!ids.StableId,
@@ -509,4 +544,26 @@ test "enumerating source visits a dynamic choice tree exactly once" {
     try std.testing.expect(seen_short);
     try std.testing.expectEqual([_]bool{ true, true, true }, seen_suffix);
     try std.testing.expectError(error.EnumerationExhausted, enumerating.beginHistory());
+}
+
+test "structured-choice audit rejects deferred interpretation" {
+    const observation = @import("observation.zig");
+    var history = try trace.Trace.init(std.testing.allocator, .{ .scenario = "choice-audit", .scenario_version = 1 }, .{ .transition_budget = 1 });
+    defer history.deinit();
+    const digest = observation.digestFeatures(&.{});
+    try history.addObservation(.{ .index = 0, .digest = digest, .features = &.{} });
+    try history.addChoice(.{
+        .site_id = ids.stable("choice", "choice-audit.transition"),
+        .site_name = "choice-audit.transition",
+        .occurrence = 0,
+        .enabled_ids = &.{ 2, 3 },
+        .selected_id = 2,
+    });
+    try history.addTransition(.{ .index = 1, .id = 2, .name = "typed.two", .kind = .workload, .parameter = 2 });
+    try history.addObservation(.{ .index = 1, .digest = digest, .features = &.{} });
+    history.summary = .{ .transitions = 1, .final_observation_digest = digest, .property_failures = 0 };
+    const audited = try auditTrace(&history);
+    try std.testing.expectEqual(@as(u64, 1), audited.parameterized_choices);
+    history.transitions.items[0].id = 3;
+    try std.testing.expectError(error.DeferredChoiceInterpretation, auditTrace(&history));
 }

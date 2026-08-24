@@ -36,6 +36,7 @@ pub const QuarantineReason = enum {
     scenario_changed,
     scenario_version_changed,
     backend_changed,
+    replay_diverged,
 };
 
 pub const Quarantined = struct {
@@ -56,6 +57,18 @@ pub const ImportResult = union(enum) {
 };
 
 pub const AddResult = struct { index: usize, inserted: bool };
+
+pub const MergeCandidate = struct {
+    bytes: []const u8,
+    novelty: coverage.Novelty = .{},
+};
+
+pub const MergeReport = struct {
+    candidates: u64 = 0,
+    inserted: u64 = 0,
+    duplicates: u64 = 0,
+    quarantined: u64 = 0,
+};
 
 pub const PropertyHistory = struct {
     property_id: ids.StableId,
@@ -161,6 +174,41 @@ pub const Corpus = struct {
     pub fn markProductive(self: *Corpus, index: usize) !void {
         if (index >= self.entries.items.len) return error.InvalidCorpusIndex;
         self.entries.items[index].productive_children +|= 1;
+    }
+
+    /// Deterministically merge local/CI/nightly artifacts. Input completion
+    /// order is discarded; candidates are processed by content digest and
+    /// bytes, and every incompatible item remains inspectable in quarantine.
+    pub fn merge(
+        self: *Corpus,
+        candidates: []const MergeCandidate,
+        compatibility: Compatibility,
+    ) !MergeReport {
+        const order = try self.allocator.alloc(usize, candidates.len);
+        defer self.allocator.free(order);
+        for (order, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, order, candidates, struct {
+            fn lessThan(values: []const MergeCandidate, lhs: usize, rhs: usize) bool {
+                const left_digest = ids.digest(values[lhs].bytes);
+                const right_digest = ids.digest(values[rhs].bytes);
+                if (left_digest != right_digest) return left_digest < right_digest;
+                return std.mem.lessThan(u8, values[lhs].bytes, values[rhs].bytes);
+            }
+        }.lessThan);
+        var report = MergeReport{ .candidates = @intCast(candidates.len) };
+        for (order) |index| switch (try self.importBytes(
+            candidates[index].bytes,
+            candidates[index].novelty,
+            compatibility,
+        )) {
+            .retained => |retained| if (retained.inserted) {
+                report.inserted += 1;
+            } else {
+                report.duplicates += 1;
+            },
+            .quarantined => report.quarantined += 1,
+        };
+        return report;
     }
 
     pub fn quarantineBytes(self: *Corpus, bytes: []const u8, reason: QuarantineReason) !usize {
@@ -278,4 +326,31 @@ test "corpus quarantines incompatible retained histories and preserves property 
         .scenario_version = 2,
     });
     try std.testing.expectEqual(@as(usize, 2), corpus.quarantined.items.len);
+}
+
+test "nightly corpus merge is order independent and quarantines invalid bytes" {
+    const observation = @import("observation.zig");
+    var artifact = try trace.Trace.init(std.testing.allocator, .{ .scenario = "merge", .scenario_version = 1 }, .{ .transition_budget = 1 });
+    defer artifact.deinit();
+    const digest = observation.digestFeatures(&.{});
+    try artifact.addObservation(.{ .index = 0, .digest = digest, .features = &.{} });
+    try artifact.addChoice(.{ .site_id = 1, .site_name = "merge", .occurrence = 0, .enabled_ids = &.{2}, .selected_id = 2 });
+    try artifact.addTransition(.{ .index = 1, .id = 2, .name = "step", .kind = .workload });
+    try artifact.addObservation(.{ .index = 1, .digest = digest, .features = &.{} });
+    artifact.summary = .{ .transitions = 1, .final_observation_digest = digest, .property_failures = 0 };
+    const bytes = try artifact.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const candidates = [_]MergeCandidate{
+        .{ .bytes = "invalid" },
+        .{ .bytes = bytes, .novelty = .{ .discovered = 2 } },
+        .{ .bytes = bytes },
+    };
+    var corpus = Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const report = try corpus.merge(&candidates, .{ .scenario = "merge", .scenario_version = 1 });
+    try std.testing.expectEqual(@as(u64, 1), report.inserted);
+    try std.testing.expectEqual(@as(u64, 1), report.duplicates);
+    try std.testing.expectEqual(@as(u64, 1), report.quarantined);
+    try std.testing.expectEqual(@as(usize, 1), corpus.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), corpus.quarantined.items.len);
 }

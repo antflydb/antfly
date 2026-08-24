@@ -7078,6 +7078,30 @@ pub fn build(b: *std.Build) void {
     const sim_debug_compat_step = b.step("sim-debug", "Compatibility alias for vopr-debug");
     sim_debug_compat_step.dependOn(&debug_vopr_cli.step);
 
+    const results_vopr_cli = b.addRunArtifact(vopr_cli);
+    results_vopr_cli.addArg("results");
+    if (b.args) |args| results_vopr_cli.addArgs(args);
+    const vopr_results_step = b.step("vopr-results", "Render exact-replayed VOPR results as stable JSON and static HTML");
+    vopr_results_step.dependOn(&results_vopr_cli.step);
+
+    const events_vopr_cli = b.addRunArtifact(vopr_cli);
+    events_vopr_cli.addArg("events");
+    if (b.args) |args| events_vopr_cli.addArgs(args);
+    const vopr_events_step = b.step("vopr-events", "Run a fielded temporal query over an exact-replayed VOPR event history");
+    vopr_events_step.dependOn(&events_vopr_cli.step);
+
+    const recipe_vopr_cli = b.addRunArtifact(vopr_cli);
+    recipe_vopr_cli.addArg("recipe");
+    if (b.args) |args| recipe_vopr_cli.addArgs(args);
+    const vopr_recipe_step = b.step("vopr-recipe", "Build a reduction, causal, counterfactual, query, and collector debug package");
+    vopr_recipe_step.dependOn(&recipe_vopr_cli.step);
+
+    const corpus_merge_vopr_cli = b.addRunArtifact(vopr_cli);
+    corpus_merge_vopr_cli.addArg("corpus-merge");
+    if (b.args) |args| corpus_merge_vopr_cli.addArgs(args);
+    const vopr_corpus_merge_step = b.step("vopr-corpus-merge", "Exact-replay and deterministically merge local, CI, and nightly VOPR corpora");
+    vopr_corpus_merge_step.dependOn(&corpus_merge_vopr_cli.step);
+
     const vopr_test_step = b.step("vopr-test", "Run the fast deterministic Antfly VOPR suites");
     vopr_test_step.dependOn(&run_vopr_contract_tests.step);
     vopr_test_step.dependOn(&run_transaction_vopr_tests.step);

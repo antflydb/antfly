@@ -26,6 +26,10 @@ pub fn dispatch(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) 
     if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "explain")) return explainCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "debug")) return debugCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "results")) return resultsCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "events")) return eventsCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "recipe")) return recipeCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "corpus-merge")) return corpusMergeCommand(alloc, io, argv[2..]);
     return usage();
 }
 
@@ -169,6 +173,287 @@ fn replayCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     report("replayed", path, &replayed);
 }
 
+fn resultsCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var json_path: ?[]const u8 = null;
+    var html_path: ?[]const u8 = null;
+    var run_id: ?[]const u8 = null;
+    var history_id: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--json-out")) {
+            json_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--html-out")) {
+            html_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--run-id")) {
+            run_id = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--history-id")) {
+            history_id = try nextValue(args, &index);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    if (json_path == null and html_path == null) return error.ResultsOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var replayed = try replayKnownScenario(alloc, &recorded);
+    replayed.deinit();
+    const artifact_paths = [_][]const u8{input};
+    var results = try vopr.report.Results.build(alloc, &recorded, declarationsKnown(&recorded), .{
+        .run_id = run_id,
+        .history_id = history_id,
+        .artifacts = &artifact_paths,
+    });
+    defer results.deinit();
+    if (json_path) |output| {
+        const bytes = try results.renderJsonAlloc(alloc);
+        defer alloc.free(bytes);
+        try writeDebugArtifact(io, output, bytes);
+    }
+    if (html_path) |output| {
+        const bytes = try results.renderHtmlAlloc(alloc);
+        defer alloc.free(bytes);
+        try writeDebugArtifact(io, output, bytes);
+    }
+    std.debug.print("VOPR results run={s} history={s} json={s} html={s}\n", .{
+        results.run_id,
+        results.history_id,
+        json_path orelse "-",
+        html_path orelse "-",
+    });
+}
+
+fn eventsCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var query_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--query")) {
+            query_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    const query_input = query_path orelse return error.EventQueryPathRequired;
+    const output = output_path orelse return error.EventQueryOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var replayed = try replayKnownScenario(alloc, &recorded);
+    replayed.deinit();
+    const query_bytes = try std.Io.Dir.cwd().readFileAlloc(io, query_input, alloc, .limited(1024 * 1024));
+    defer alloc.free(query_bytes);
+    var parsed = try std.json.parseFromSlice(vopr.event_query.Query, alloc, query_bytes, .{});
+    defer parsed.deinit();
+    const matches = try vopr.event_query.searchAlloc(alloc, &recorded, parsed.value);
+    defer alloc.free(matches);
+    const result = try std.json.Stringify.valueAlloc(alloc, .{
+        .format = "vopr-event-query-v1",
+        .trace = input,
+        .query = parsed.value,
+        .match_count = matches.len,
+        .matches = matches,
+    }, .{ .whitespace = .indent_2 });
+    defer alloc.free(result);
+    try writeDebugArtifact(io, output, result);
+    std.debug.print("VOPR event query matches={d} trace={s} out={s}\n", .{ matches.len, input, output });
+}
+
+fn recipeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var trace_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var reduced_path: ?[]const u8 = null;
+    var failure_ordinal: usize = 0;
+    var attempts: u64 = 1_024;
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--trace")) {
+            trace_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--reduced-out")) {
+            reduced_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--failure")) {
+            failure_ordinal = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--attempts")) {
+            attempts = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const input = trace_path orelse return error.TracePathRequired;
+    const output = output_path orelse return error.DebugRecipeOutputRequired;
+    const reduced_output = reduced_path orelse return error.ReducedTraceOutputRequired;
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+    defer recorded.deinit();
+    var package = try runDebugRecipeKnown(alloc, &recorded, failure_ordinal, attempts);
+    defer package.deinit();
+    const package_bytes = try package.renderAlloc(alloc);
+    defer alloc.free(package_bytes);
+    try writeDebugArtifact(io, output, package_bytes);
+    const reduced_bytes = try package.reduced.artifact.renderAlloc(alloc);
+    defer alloc.free(reduced_bytes);
+    try writeDebugArtifact(io, reduced_output, reduced_bytes);
+    std.debug.print("VOPR debug recipe fingerprint={x} transitions={d}->{d} out={s} reduced={s}\n", .{
+        package.fingerprint,
+        package.reduced.report.original_transitions,
+        package.reduced.report.reduced_transitions,
+        output,
+        reduced_output,
+    });
+}
+
+fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var base_path: ?[]const u8 = null;
+    var output_dir: ?[]const u8 = null;
+    var force = false;
+    var trace_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer trace_paths.deinit(alloc);
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--base")) {
+            base_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--trace")) {
+            try trace_paths.append(alloc, try nextValue(args, &index));
+        } else if (std.mem.eql(u8, args[index], "--out-dir")) {
+            output_dir = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--force")) {
+            force = true;
+        } else return error.UnknownArgument;
+        index += 1;
+    }
+    const base_input = base_path orelse return error.CorpusBaseTraceRequired;
+    const output = output_dir orelse return error.CorpusOutputDirectoryRequired;
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/index.json", .{output});
+    defer alloc.free(manifest_path);
+    if (!force) {
+        if (std.Io.Dir.cwd().statFile(io, manifest_path, .{})) |_| {
+            return error.CorpusOutputAlreadyExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+    }
+
+    var owned_bytes: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (owned_bytes.items) |bytes| alloc.free(bytes);
+        owned_bytes.deinit(alloc);
+    }
+    try owned_bytes.append(alloc, try std.Io.Dir.cwd().readFileAlloc(io, base_input, alloc, .limited(max_trace_bytes)));
+    for (trace_paths.items) |path| try owned_bytes.append(
+        alloc,
+        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_trace_bytes)),
+    );
+    var base = try vopr.trace.parseAlloc(alloc, owned_bytes.items[0]);
+    defer base.deinit();
+    var base_replay = try replayKnownScenario(alloc, &base);
+    base_replay.deinit();
+    const compatibility = vopr.corpus.Compatibility{
+        .scenario = base.header.scenario,
+        .scenario_version = base.header.scenario_version,
+        .backend_ids = base.config.backend_ids,
+    };
+    var corpus = vopr.corpus.Corpus.init(alloc);
+    defer corpus.deinit();
+    var candidates: std.ArrayListUnmanaged(vopr.corpus.MergeCandidate) = .empty;
+    defer candidates.deinit(alloc);
+    var replay_quarantined: u64 = 0;
+    for (owned_bytes.items) |bytes| {
+        var candidate = vopr.trace.parseAlloc(alloc, bytes) catch {
+            try candidates.append(alloc, .{ .bytes = bytes });
+            continue;
+        };
+        defer candidate.deinit();
+        const compatible = std.mem.eql(u8, candidate.header.scenario, compatibility.scenario) and
+            candidate.header.scenario_version == compatibility.scenario_version and
+            std.mem.eql(vopr.id.StableId, candidate.config.backend_ids, compatibility.backend_ids);
+        if (compatible) {
+            var replayed = replayKnownScenario(alloc, &candidate) catch {
+                _ = try corpus.quarantineBytes(bytes, .replay_diverged);
+                replay_quarantined += 1;
+                continue;
+            };
+            replayed.deinit();
+        }
+        try candidates.append(alloc, .{ .bytes = bytes });
+    }
+    var merge_report = try corpus.merge(candidates.items, compatibility);
+    merge_report.candidates += replay_quarantined;
+    merge_report.quarantined += replay_quarantined;
+    try ensureDir(io, output);
+    const quarantine_dir = try std.fmt.allocPrint(alloc, "{s}/quarantine", .{output});
+    defer alloc.free(quarantine_dir);
+    if (corpus.quarantined.items.len != 0) try ensureDir(io, quarantine_dir);
+
+    const ManifestArtifact = struct { trace_digest: u64, path: []const u8 };
+    const ManifestQuarantine = struct { trace_digest: u64, reason: vopr.corpus.QuarantineReason, path: []const u8 };
+    const artifacts = try alloc.alloc(ManifestArtifact, corpus.entries.items.len);
+    defer alloc.free(artifacts);
+    var artifacts_initialized: usize = 0;
+    defer for (artifacts[0..artifacts_initialized]) |item| alloc.free(item.path);
+    for (corpus.entries.items, 0..) |entry, entry_index| {
+        const relative_path = try std.fmt.allocPrint(alloc, "trace-{x}.voprtrace", .{entry.key.trace_digest});
+        artifacts[entry_index] = .{ .trace_digest = entry.key.trace_digest, .path = relative_path };
+        artifacts_initialized += 1;
+        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ output, relative_path });
+        defer alloc.free(full_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
+    }
+    const quarantined = try alloc.alloc(ManifestQuarantine, corpus.quarantined.items.len);
+    defer alloc.free(quarantined);
+    var quarantine_initialized: usize = 0;
+    defer for (quarantined[0..quarantine_initialized]) |item| alloc.free(item.path);
+    for (corpus.quarantined.items, 0..) |entry, entry_index| {
+        const relative_path = try std.fmt.allocPrint(
+            alloc,
+            "quarantine/{s}-{x}.voprquarantine",
+            .{ @tagName(entry.reason), entry.trace_digest },
+        );
+        quarantined[entry_index] = .{
+            .trace_digest = entry.trace_digest,
+            .reason = entry.reason,
+            .path = relative_path,
+        };
+        quarantine_initialized += 1;
+        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ output, relative_path });
+        defer alloc.free(full_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = entry.bytes });
+    }
+    const manifest = try std.json.Stringify.valueAlloc(alloc, .{
+        .format = "vopr-corpus-merge-v1",
+        .scenario = compatibility.scenario,
+        .scenario_version = compatibility.scenario_version,
+        .backend_ids = compatibility.backend_ids,
+        .report = merge_report,
+        .artifacts = artifacts,
+        .quarantine = quarantined,
+        .property_history = corpus.property_history.items,
+    }, .{ .whitespace = .indent_2 });
+    defer alloc.free(manifest);
+    // The manifest is the completion marker and is written after every
+    // referenced retained/quarantined byte artifact is durable to the API.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+    std.debug.print("VOPR corpus merge candidates={d} retained={d} duplicates={d} quarantined={d} out={s}\n", .{
+        merge_report.candidates,
+        merge_report.inserted,
+        merge_report.duplicates,
+        merge_report.quarantined,
+        output,
+    });
+}
+
 fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
         return antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, recorded);
@@ -269,6 +554,84 @@ fn counterfactualReplayKnown(
     recorded: *const vopr.trace.Trace,
 ) !vopr.trace.Trace {
     return replayKnownScenario(alloc, recorded);
+}
+
+fn recipeCollectKnown(
+    _: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    prefix: usize,
+) !vopr.collector.Sink {
+    return collectKnownAt(alloc, recorded, prefix);
+}
+
+fn runDebugRecipeKnown(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    failure_ordinal: usize,
+    attempts: u64,
+) !vopr.debug_recipe.Package {
+    const queries = [_]vopr.debug_recipe.QuerySpec{
+        .{ .name = "injected-errors", .query = .{ .selector = .{ .kind = .injected_error } } },
+        .{ .name = "client-responses", .query = .{ .selector = .{ .kind = .client_response } } },
+        .{ .name = "fault-starts", .query = .{ .selector = .{ .kind = .fault_started } } },
+    };
+    const execution = vopr.reducer.ExecutionRunner{
+        .run_fn = counterfactualRunKnown,
+        .replay_fn = counterfactualReplayKnown,
+    };
+    return vopr.debug_recipe.runWithRunner(alloc, recorded, .{
+        .failure_ordinal = failure_ordinal,
+        .reduction = .{ .max_attempts = attempts },
+        .counterfactual = .{
+            .prefix_window = 8,
+            .descendants_per_alternative = 2,
+            .max_experiments = 16,
+            .suffix_seed = recorded.config.seed orelse 0,
+        },
+        .event_queries = &queries,
+        .collect_failure_window = antfly.domain_vopr.kindFromArtifact(recorded) != null,
+    }, .{
+        .execution = execution,
+        .collectors = if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
+            .{ .collect_fn = recipeCollectKnown }
+        else
+            null,
+    });
+}
+
+fn declarationsKnown(recorded: *const vopr.trace.Trace) []const vopr.property.Declaration {
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
+        return antfly.metadata_sim_harness.DistributedDataVoprScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
+        return antfly.transaction_vopr.Scenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
+        return antfly.wal_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.persistent_vopr.CliScenario.name))
+        return antfly.persistent_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.index_manager_vopr.CliScenario.name))
+        return antfly.index_manager_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.db_split_vopr.CliScenario.name))
+        return antfly.db_split_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.raft_vopr.CliScenario.name))
+        return antfly.raft_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lmdb_vopr.CliScenario.name))
+        return antfly.lmdb_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.lsm_vopr.CliScenario.name))
+        return antfly.lsm_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
+        return antfly.ha_vopr.CliScenario.properties;
+    if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
+        .distributed_transaction => antfly.domain_vopr.DistributedTransactionScenario.properties,
+        .data_plane => antfly.domain_vopr.DataPlaneScenario.properties,
+        .derived_workflow => antfly.domain_vopr.DerivedWorkflowScenario.properties,
+        .backup_restore => antfly.domain_vopr.BackupRestoreScenario.properties,
+        .clock_fault => antfly.domain_vopr.ClockLeaseTtlScenario.properties,
+    };
+    // The metadata harness declares its operation properties dynamically from
+    // trace parameters, so the generic report derives the complete encountered
+    // catalog from canonical property records for that one scenario.
+    return &.{};
 }
 
 fn defaultCampaignTransitions(scenario: []const u8) !usize {
@@ -1384,45 +1747,28 @@ const CampaignContext = struct {
     ) !void {
         const alloc = std.heap.smp_allocator;
         const failure = artifact.failures.items[failure_ordinal];
-        var causal_report = try vopr.causal.analyzeAlloc(alloc, artifact, failure_ordinal);
-        defer causal_report.deinit();
-        const causal_bytes = try causal_report.renderAlloc(alloc);
-        defer alloc.free(causal_bytes);
-        const causal_path = try std.fmt.allocPrint(
+        var package = try runDebugRecipeKnown(alloc, artifact, failure_ordinal, 256);
+        defer package.deinit();
+        const recipe_bytes = try package.renderAlloc(alloc);
+        defer alloc.free(recipe_bytes);
+        const recipe_path = try std.fmt.allocPrint(
             alloc,
-            "{s}/failure-{x}.causal.json",
+            "{s}/failure-{x}.recipe.json",
             .{ self.artifact_dir, failure.fingerprint },
         );
-        defer alloc.free(causal_path);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = causal_path, .data = causal_bytes });
-
-        var counterfactual = try vopr.causal.analyzeCounterfactualWithRunner(
+        defer alloc.free(recipe_path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = recipe_path, .data = recipe_bytes });
+        const reduced_bytes = try package.reduced.artifact.renderAlloc(alloc);
+        defer alloc.free(reduced_bytes);
+        const reduced_path = try std.fmt.allocPrint(
             alloc,
-            artifact,
-            failure_ordinal,
-            .{
-                .prefix_window = 8,
-                .descendants_per_alternative = 2,
-                .max_experiments = 16,
-                .suffix_seed = self.base_seed ^ failure.fingerprint,
-            },
-            .{
-                .run_fn = counterfactualRunKnown,
-                .replay_fn = counterfactualReplayKnown,
-            },
-        );
-        defer counterfactual.deinit();
-        const counterfactual_bytes = try counterfactual.renderAlloc(alloc);
-        defer alloc.free(counterfactual_bytes);
-        const counterfactual_path = try std.fmt.allocPrint(
-            alloc,
-            "{s}/failure-{x}.counterfactual.json",
+            "{s}/failure-{x}.reduced.voprtrace",
             .{ self.artifact_dir, failure.fingerprint },
         );
-        defer alloc.free(counterfactual_path);
+        defer alloc.free(reduced_path);
         try std.Io.Dir.cwd().writeFile(self.io, .{
-            .sub_path = counterfactual_path,
-            .data = counterfactual_bytes,
+            .sub_path = reduced_path,
+            .data = reduced_bytes,
         });
     }
 
@@ -1788,6 +2134,10 @@ fn usage() error{InvalidUsage} {
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\  vopr debug --trace <path> [--prefix <choice-index>] [--out <path.json>] [--commands <path>] [--interactive]
+        \\  vopr results --trace <path> [--run-id <id>] [--history-id <id>] [--json-out <path>] [--html-out <path>]
+        \\  vopr events --trace <path> --query <query.json> --out <matches.json>
+        \\  vopr recipe --trace <path> [--failure <ordinal>] [--attempts <n>] --out <recipe.json> --reduced-out <reduced.voprtrace>
+        \\  vopr corpus-merge --base <trace> [--trace <trace> ...] --out-dir <directory> [--force]
         \\
     , .{});
     return error.InvalidUsage;
@@ -1844,6 +2194,57 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
 
     const corpus_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(corpus_path);
+    const promoted_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ corpus_path, filename });
+    defer alloc.free(promoted_path);
+    const results_json_path = try std.fmt.allocPrint(alloc, "{s}/results.json", .{corpus_path});
+    defer alloc.free(results_json_path);
+    const results_html_path = try std.fmt.allocPrint(alloc, "{s}/results.html", .{corpus_path});
+    defer alloc.free(results_html_path);
+    try resultsCommand(alloc, io, &.{
+        "--trace",    promoted_path,
+        "--run-id",   "meta-test-run",
+        "--json-out", results_json_path,
+        "--html-out", results_html_path,
+    });
+    const results_json = try std.Io.Dir.cwd().readFileAlloc(io, results_json_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(results_json);
+    try std.testing.expect(std.mem.indexOf(u8, results_json, vopr.report.format) != null);
+    try std.testing.expect(std.mem.indexOf(u8, results_json, "meta-test-run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results_json, "health_checks") != null);
+    const results_html = try std.Io.Dir.cwd().readFileAlloc(io, results_html_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(results_html);
+    try std.testing.expect(std.mem.startsWith(u8, results_html, "<!doctype html>"));
+
+    const query_path = try std.fmt.allocPrint(alloc, "{s}/query.json", .{corpus_path});
+    defer alloc.free(query_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = query_path, .data =
+        \\{"selector":{"kind":"injected_error"},"limit":16}
+    });
+    const query_result_path = try std.fmt.allocPrint(alloc, "{s}/query-result.json", .{corpus_path});
+    defer alloc.free(query_result_path);
+    try eventsCommand(alloc, io, &.{ "--trace", promoted_path, "--query", query_path, "--out", query_result_path });
+    const query_result = try std.Io.Dir.cwd().readFileAlloc(io, query_result_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(query_result);
+    try std.testing.expect(std.mem.indexOf(u8, query_result, "vopr-event-query-v1") != null);
+
+    const merge_invalid_path = try std.fmt.allocPrint(alloc, "{s}/invalid.voprtrace", .{corpus_path});
+    defer alloc.free(merge_invalid_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = merge_invalid_path, .data = "not-a-trace" });
+    const merge_output_path = try std.fmt.allocPrint(alloc, "{s}/merged", .{corpus_path});
+    defer alloc.free(merge_output_path);
+    try corpusMergeCommand(alloc, io, &.{
+        "--base",    promoted_path,
+        "--trace",   promoted_path,
+        "--trace",   merge_invalid_path,
+        "--out-dir", merge_output_path,
+    });
+    const merge_manifest_path = try std.fmt.allocPrint(alloc, "{s}/index.json", .{merge_output_path});
+    defer alloc.free(merge_manifest_path);
+    const merge_manifest = try std.Io.Dir.cwd().readFileAlloc(io, merge_manifest_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(merge_manifest);
+    try std.testing.expect(std.mem.indexOf(u8, merge_manifest, "vopr-corpus-merge-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merge_manifest, "invalid_trace") != null);
+
     var context = CampaignContext{
         .io = io,
         .histories = 1,
@@ -1867,24 +2268,31 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     } else return error.PersistentCorpusMutationRequired;
 
     try context.writeFailureDiagnostics(&promoted, 0);
-    const causal_artifact_path = try std.fmt.allocPrint(
+    const recipe_artifact_path = try std.fmt.allocPrint(
         alloc,
-        "{s}/failure-{x}.causal.json",
+        "{s}/failure-{x}.recipe.json",
         .{ corpus_path, promoted.failures.items[0].fingerprint },
     );
-    defer alloc.free(causal_artifact_path);
-    const causal_artifact = try std.Io.Dir.cwd().readFileAlloc(io, causal_artifact_path, alloc, .limited(max_trace_bytes));
-    defer alloc.free(causal_artifact);
-    try std.testing.expect(std.mem.indexOf(u8, causal_artifact, "failure_identity") != null);
-    const counterfactual_artifact_path = try std.fmt.allocPrint(
+    defer alloc.free(recipe_artifact_path);
+    const recipe_artifact = try std.Io.Dir.cwd().readFileAlloc(io, recipe_artifact_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(recipe_artifact);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, vopr.debug_recipe.format) != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "failure_identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "counterfactual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "event_queries") != null);
+    const reduced_artifact_path = try std.fmt.allocPrint(
         alloc,
-        "{s}/failure-{x}.counterfactual.json",
+        "{s}/failure-{x}.reduced.voprtrace",
         .{ corpus_path, promoted.failures.items[0].fingerprint },
     );
-    defer alloc.free(counterfactual_artifact_path);
-    const counterfactual_artifact = try std.Io.Dir.cwd().readFileAlloc(io, counterfactual_artifact_path, alloc, .limited(max_trace_bytes));
-    defer alloc.free(counterfactual_artifact);
-    try std.testing.expect(std.mem.indexOf(u8, counterfactual_artifact, "vopr-multiverse-v1") != null);
+    defer alloc.free(reduced_artifact_path);
+    const reduced_artifact = try std.Io.Dir.cwd().readFileAlloc(io, reduced_artifact_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(reduced_artifact);
+    var packaged_reduction = try vopr.trace.parseAlloc(alloc, reduced_artifact);
+    defer packaged_reduction.deinit();
+    try std.testing.expectEqual(promoted.failures.items[0].fingerprint, packaged_reduction.failures.items[0].fingerprint);
+    var packaged_replay = try replayKnownScenario(alloc, &packaged_reduction);
+    packaged_replay.deinit();
 
     _ = try context.corpus.quarantineBytes("not-a-vopr-trace", .invalid_trace);
     try context.exportQuarantineArtifacts();

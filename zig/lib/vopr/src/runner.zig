@@ -5,6 +5,7 @@ const std = @import("std");
 const choice = @import("choice.zig");
 const collector = @import("collector.zig");
 const event = @import("event.zig");
+const flight_recorder = @import("flight_recorder.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
 const outcome = @import("outcome.zig");
@@ -31,6 +32,9 @@ pub const Config = struct {
     /// trace sink). It is intentionally absent from the replay artifact and
     /// must not change choices, observations, properties, or failures.
     scenario_context: ?*anyopaque = null,
+    /// Optional diagnostic-only ring. Recorder contents and capacity never
+    /// participate in choices, observations, fingerprints, or replay.
+    flight_recorder: ?*flight_recorder.Recorder = null,
 };
 
 const PropertyFailure = struct {
@@ -57,7 +61,7 @@ pub fn run(
     errdefer result.deinit();
 
     const last_digest = try recordObservation(Scenario, allocator, &world, &result, 0);
-    return continueRun(Scenario, allocator, choice_source, config.transition_budget, &world, &tracker, &result, 0, last_digest);
+    return continueRun(Scenario, allocator, choice_source, config.transition_budget, &world, &tracker, &result, 0, last_digest, config.flight_recorder);
 }
 
 /// Replays and validates an exact prefix, then captures all logical execution
@@ -86,7 +90,7 @@ pub fn captureCheckpoint(
     var replay_source = choice.Replay{ .records = artifact.choices.items };
     var transition_index: u64 = 0;
     while (transition_index < prefix_len) {
-        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest) == .stopped)
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null) == .stopped)
             return error.SnapshotPrefixPastScenarioEnd;
     }
     actual.summary = .{
@@ -142,7 +146,7 @@ pub fn collectAt(
     var replay_source = choice.Replay{ .records = artifact.choices.items };
     var transition_index: u64 = 0;
     while (transition_index < prefix_len) {
-        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest) == .stopped)
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null) == .stopped)
             return error.CollectorPrefixPastScenarioEnd;
     }
     actual.summary = .{
@@ -203,6 +207,7 @@ pub fn resumeFromCheckpoint(
         &result,
         checkpoint.transition_index,
         checkpoint.observation_digest,
+        null,
     );
 }
 
@@ -216,11 +221,12 @@ fn continueRun(
     result: *trace.Trace,
     starting_transition_index: u64,
     starting_digest: u64,
+    recorder: ?*flight_recorder.Recorder,
 ) !trace.Trace {
     var last_digest = starting_digest;
     var transition_index = starting_transition_index;
     while (!Scenario.done(world)) {
-        if (try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest) == .stopped)
+        if (try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest, recorder) == .stopped)
             break;
     }
     try choice_source.finish();
@@ -259,6 +265,7 @@ fn continueRun(
         .property_failures = @intCast(tracker.failureCount()),
     };
     try result.validate();
+    _ = try choice.auditTrace(result);
     return result.*;
 }
 
@@ -272,6 +279,7 @@ fn executeStep(
     result: *trace.Trace,
     transition_index: *u64,
     last_digest: *u64,
+    recorder: ?*flight_recorder.Recorder,
 ) !StepResult {
     if (Scenario.done(world)) return error.SnapshotPrefixPastScenarioEnd;
     if (transition_index.* == transition_budget) return .stopped;
@@ -376,6 +384,7 @@ fn executeStep(
             .resource_id = emitted.resource_id,
             .payload_digest = emitted.payload_digest,
         });
+        if (recorder) |flight| try flight.recordEvent(transition_index.*, @intCast(ordinal), emitted, emitted.details);
     }
     last_digest.* = try recordObservation(Scenario, allocator, world, result, transition_index.*);
     const prior_failure_count = tracker.failureCount();
@@ -405,6 +414,12 @@ fn executeStep(
         .resource_id = selected_transition.resource_id,
         .payload_digest = outcome_event.payload_digest,
     });
+    if (recorder) |flight| try flight.recordEvent(
+        transition_index.*,
+        @intCast(events.events.items.len),
+        outcome_event,
+        transition_outcome.identity,
+    );
     if (transition_outcome.failureClass()) |failure_class| {
         // Property failures are materialized from the property tracker at the
         // end so their first-failure identity remains the single authority.
@@ -533,4 +548,59 @@ fn evaluateProperties(
 fn declarationFor(declarations: []const property.Declaration, id: ids.StableId) ?property.Declaration {
     for (declarations) |declaration| if (declaration.id == id) return declaration;
     return null;
+}
+
+test "flight recording retains verbose details without changing replay truth" {
+    const Scenario = struct {
+        pub const name: []const u8 = "runner-flight-recorder";
+        pub const version: u32 = 1;
+        const step_id = ids.stable("transition", "runner-flight.step");
+        pub const properties = &[_]property.Declaration{};
+        pub const World = struct { done: bool = false };
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(world: *World, list: *transition.List, allocator_: std.mem.Allocator) !void {
+            if (!world.done) try list.append(allocator_, .{ .id = step_id, .name = "runner-flight.step", .kind = .workload });
+        }
+        pub fn execute(world: *World, _: transition.Transition, events: *event.Sink, allocator_: std.mem.Allocator) !outcome.TransitionOutcome {
+            world.done = true;
+            try events.emitDetailed(allocator_, event.Event.named(.domain, "runner-flight.detail", 17), "verbose-only-secret");
+            return .applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, allocator_: std.mem.Allocator) !void {
+            try builder.addNamed(allocator_, "runner-flight.done", @intFromBool(world.done));
+        }
+        pub fn evaluate(_: *World, _: *property.Sink, _: std.mem.Allocator) !void {}
+        pub fn done(world: *World) bool {
+            return world.done;
+        }
+    };
+
+    var recorder = try flight_recorder.Recorder.init(std.testing.allocator, 4);
+    defer recorder.deinit();
+    var recorded_source = choice.Seeded.init(9);
+    var recorded = try run(Scenario, std.testing.allocator, recorded_source.source(), .{
+        .seed = 9,
+        .transition_budget = 1,
+        .flight_recorder = &recorder,
+    });
+    defer recorded.deinit();
+    var plain_source = choice.Seeded.init(9);
+    var plain = try run(Scenario, std.testing.allocator, plain_source.source(), .{ .seed = 9, .transition_budget = 1 });
+    defer plain.deinit();
+    const recorded_bytes = try recorded.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(recorded_bytes);
+    const plain_bytes = try plain.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(plain_bytes);
+    try std.testing.expectEqualSlices(u8, plain_bytes, recorded_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, recorded_bytes, "verbose-only-secret") == null);
+
+    var snapshot_value = try recorder.materialize(std.testing.allocator, .failure);
+    defer snapshot_value.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot_value.records.len);
+    try std.testing.expectEqualStrings("verbose-only-secret", snapshot_value.records[0].details);
+    var replayed = try @import("replay.zig").exact(Scenario, std.testing.allocator, &recorded);
+    replayed.deinit();
 }

@@ -35,6 +35,23 @@ pub const Result = struct {
     }
 };
 
+/// Application-owned execution registry used by parameterized scenarios. The
+/// reducer remains Antfly-independent while still proving every candidate by
+/// a clean exact replay through the application's canonical scenario runner.
+pub const ExecutionRunner = struct {
+    context: ?*anyopaque = null,
+    run_fn: *const fn (?*anyopaque, std.mem.Allocator, *const trace.Trace, choice.Source) anyerror!trace.Trace,
+    replay_fn: *const fn (?*anyopaque, std.mem.Allocator, *const trace.Trace) anyerror!trace.Trace,
+
+    pub fn run(self: ExecutionRunner, allocator: std.mem.Allocator, parent: *const trace.Trace, source: choice.Source) !trace.Trace {
+        return self.run_fn(self.context, allocator, parent, source);
+    }
+
+    pub fn exactReplay(self: ExecutionRunner, allocator: std.mem.Allocator, artifact: *const trace.Trace) !trace.Trace {
+        return self.replay_fn(self.context, allocator, artifact);
+    }
+};
+
 pub fn reduce(
     comptime Scenario: type,
     allocator: std.mem.Allocator,
@@ -56,11 +73,43 @@ pub fn reduceWithContext(
     config: Config,
     scenario_context: ?*anyopaque,
 ) !Result {
+    const Adapter = struct {
+        fn runCandidate(
+            context: ?*anyopaque,
+            child_allocator: std.mem.Allocator,
+            parent: *const trace.Trace,
+            source: choice.Source,
+        ) !trace.Trace {
+            return runner.run(Scenario, child_allocator, source, runnerConfig(parent, context));
+        }
+
+        fn exactReplay(
+            context: ?*anyopaque,
+            child_allocator: std.mem.Allocator,
+            artifact: *const trace.Trace,
+        ) !trace.Trace {
+            return replay.exactWithContext(Scenario, child_allocator, artifact, context);
+        }
+    };
+    return reduceWithRunner(allocator, original, target_fingerprint, config, .{
+        .context = scenario_context,
+        .run_fn = Adapter.runCandidate,
+        .replay_fn = Adapter.exactReplay,
+    });
+}
+
+pub fn reduceWithRunner(
+    allocator: std.mem.Allocator,
+    original: *const trace.Trace,
+    target_fingerprint: u64,
+    config: Config,
+    execution: ExecutionRunner,
+) !Result {
     if (config.max_attempts == 0) return error.InvalidReductionAttemptBudget;
     if (!hasFingerprint(original, target_fingerprint)) return error.TargetFingerprintMissing;
 
     // Prove the input itself is an exact replay before treating it as a bug.
-    var replayed = try replay.exactWithContext(Scenario, allocator, original, scenario_context);
+    var replayed = try execution.exactReplay(allocator, original);
     replayed.deinit();
     var current = try cloneTrace(allocator, original);
     errdefer current.deinit();
@@ -87,12 +136,12 @@ pub fn reduceWithContext(
                 report.attempts += 1;
                 report.deletion_attempts += 1;
                 var source = try choice.Deleting.init(current.choices.items, start, end, config.suffix_seed +% report.attempts);
-                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current, scenario_context)) catch continue;
+                var candidate = execution.run(allocator, &current, source.source()) catch continue;
                 defer candidate.deinit();
                 if (!hasFingerprint(&candidate, target_fingerprint)) continue;
                 if (!try strictlySimpler(allocator, &candidate, &current)) continue;
 
-                var exact = replay.exactWithContext(Scenario, allocator, &candidate, scenario_context) catch continue;
+                var exact = execution.exactReplay(allocator, &candidate) catch continue;
                 exact.deinit();
                 report.replay_checks += 1;
                 const replacement = try cloneTrace(allocator, &candidate);
@@ -115,12 +164,12 @@ pub fn reduceWithContext(
                 if (alternative == record.selected_id or report.attempts == config.max_attempts) continue;
                 report.attempts += 1;
                 var source = choice.Mutating.init(current.choices.items, choice_index, alternative, config.suffix_seed +% report.attempts);
-                var candidate = runner.run(Scenario, allocator, source.source(), runnerConfig(&current, scenario_context)) catch continue;
+                var candidate = execution.run(allocator, &current, source.source()) catch continue;
                 defer candidate.deinit();
                 if (!hasFingerprint(&candidate, target_fingerprint)) continue;
                 if (!try strictlySimpler(allocator, &candidate, &current)) continue;
 
-                var exact = replay.exactWithContext(Scenario, allocator, &candidate, scenario_context) catch continue;
+                var exact = execution.exactReplay(allocator, &candidate) catch continue;
                 exact.deinit();
                 report.replay_checks += 1;
                 const replacement = try cloneTrace(allocator, &candidate);

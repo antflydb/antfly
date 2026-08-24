@@ -17,6 +17,57 @@ pub const FaultId = ids.StableId;
 pub const Kind = enum { node, partitioned_link, delayed_message, storage, resource, custom };
 pub const Lifecycle = enum { persistent, one_shot };
 
+/// Cross-domain identity used to define overlap independently of a scenario's
+/// concrete fault names and resources.
+pub const Family = enum {
+    partition,
+    delay,
+    node_pause,
+    storage_corruption,
+    resource_exhaustion,
+    clock,
+    custom,
+};
+
+pub const Relationship = enum {
+    /// Both faults remain effective and neither has semantic precedence.
+    independent,
+    /// The pair may not overlap.
+    excluded,
+    /// `left` is applied before `right` when both are active.
+    left_precedes,
+};
+
+pub const Rule = struct {
+    left: Family,
+    right: Family,
+    relationship: Relationship,
+};
+
+pub const Algebra = struct {
+    rules: []const Rule = &.{},
+
+    pub fn validate(self: Algebra) !void {
+        for (self.rules, 0..) |rule, index| {
+            if (rule.left == rule.right and rule.relationship == .left_precedes)
+                return error.SelfPrecedingFaultFamily;
+            for (self.rules[0..index]) |prior| {
+                const same_direction = prior.left == rule.left and prior.right == rule.right;
+                const opposite_direction = prior.left == rule.right and prior.right == rule.left;
+                if (same_direction or opposite_direction) return error.DuplicateFaultCompositionRule;
+            }
+        }
+    }
+
+    pub fn relationship(self: Algebra, left: Family, right: Family) struct { relationship: Relationship, reversed: bool } {
+        for (self.rules) |rule| {
+            if (rule.left == left and rule.right == right) return .{ .relationship = rule.relationship, .reversed = false };
+            if (rule.left == right and rule.right == left) return .{ .relationship = rule.relationship, .reversed = true };
+        }
+        return .{ .relationship = .independent, .reversed = false };
+    }
+};
+
 pub const Spec = struct {
     id: FaultId,
     name: []const u8,
@@ -24,6 +75,12 @@ pub const Spec = struct {
     lifecycle: Lifecycle = .persistent,
     actor_id: ?ids.StableId = null,
     resource_id: ?ids.StableId = null,
+    family: ?Family = null,
+    /// Faults in one non-null group are mutually exclusive even when their
+    /// families would otherwise compose.
+    exclusion_group: ?ids.StableId = null,
+    /// Stable tie-break for otherwise independent effective-order queries.
+    priority: i16 = 0,
 
     pub fn named(kind: Kind, lifecycle: Lifecycle, name: []const u8) Spec {
         return .{ .id = ids.stable("fault", name), .name = name, .kind = kind, .lifecycle = lifecycle };
@@ -34,6 +91,17 @@ pub const Spec = struct {
         if (self.name.len == 0) return error.EmptyFaultName;
         if ((self.kind == .node or self.kind == .partitioned_link or self.kind == .delayed_message or self.kind == .storage) and self.resource_id == null)
             return error.FaultResourceRequired;
+    }
+
+    pub fn effectiveFamily(self: Spec) Family {
+        return self.family orelse switch (self.kind) {
+            .node => .node_pause,
+            .partitioned_link => .partition,
+            .delayed_message => .delay,
+            .storage => .storage_corruption,
+            .resource => .resource_exhaustion,
+            .custom => .custom,
+        };
     }
 
     pub fn startTransition(self: Spec) transition.Transition {
@@ -91,6 +159,8 @@ pub const Rejection = enum {
     partition_budget,
     delayed_message_budget,
     storage_epoch_budget,
+    exclusion_group,
+    overlap_excluded,
 };
 
 pub const Admission = union(enum) {
@@ -107,6 +177,7 @@ const Active = struct { spec: Spec };
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     budgets: Budgets,
+    algebra: Algebra,
     total_nodes: u32,
     active: std.ArrayListUnmanaged(Active) = .empty,
     outstanding_delayed_messages: u32 = 0,
@@ -115,8 +186,13 @@ pub const Controller = struct {
     quiet_suffix: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, total_nodes: u32, budgets: Budgets) !Controller {
+        return initWithAlgebra(allocator, total_nodes, budgets, .{});
+    }
+
+    pub fn initWithAlgebra(allocator: std.mem.Allocator, total_nodes: u32, budgets: Budgets, algebra: Algebra) !Controller {
         try budgets.validate(total_nodes);
-        return .{ .allocator = allocator, .budgets = budgets, .total_nodes = total_nodes };
+        try algebra.validate();
+        return .{ .allocator = allocator, .budgets = budgets, .algebra = algebra, .total_nodes = total_nodes };
     }
 
     pub fn deinit(self: *Controller) void {
@@ -133,6 +209,10 @@ pub const Controller = struct {
             if (active.spec.id == spec.id) return .{ .rejected = .duplicate_fault };
             if (active.spec.kind == spec.kind and active.spec.resource_id != null and active.spec.resource_id == spec.resource_id)
                 return .{ .rejected = .duplicate_resource_fault };
+            if (spec.exclusion_group != null and active.spec.exclusion_group == spec.exclusion_group)
+                return .{ .rejected = .exclusion_group };
+            if (self.algebra.relationship(active.spec.effectiveFamily(), spec.effectiveFamily()).relationship == .excluded)
+                return .{ .rejected = .overlap_excluded };
         }
         switch (spec.kind) {
             .node => {
@@ -168,6 +248,9 @@ pub const Controller = struct {
                 .lifecycle = spec.lifecycle,
                 .actor_id = spec.actor_id,
                 .resource_id = spec.resource_id,
+                .family = spec.family,
+                .exclusion_group = spec.exclusion_group,
+                .priority = spec.priority,
             } });
         }
         errdefer {
@@ -246,6 +329,46 @@ pub const Controller = struct {
         return self.quiet_suffix and self.budgets.quiet_suffix_policy == .heal_recoverable;
     }
 
+    /// Returns active fault IDs in deterministic semantic application order.
+    /// Explicit precedence rules form a DAG; independent nodes use priority
+    /// then stable ID. A cycle fails closed instead of silently inventing an
+    /// order that could differ between model adapters.
+    pub fn effectiveOrderAlloc(self: *const Controller, allocator: std.mem.Allocator) ![]FaultId {
+        const count = self.active.items.len;
+        const result = try allocator.alloc(FaultId, count);
+        errdefer allocator.free(result);
+        const emitted = try allocator.alloc(bool, count);
+        defer allocator.free(emitted);
+        @memset(emitted, false);
+        var output_index: usize = 0;
+        while (output_index < count) : (output_index += 1) {
+            var selected: ?usize = null;
+            for (self.active.items, 0..) |candidate, candidate_index| {
+                if (emitted[candidate_index]) continue;
+                var has_predecessor = false;
+                for (self.active.items, 0..) |predecessor, predecessor_index| {
+                    if (candidate_index == predecessor_index or emitted[predecessor_index]) continue;
+                    const relation = self.algebra.relationship(predecessor.spec.effectiveFamily(), candidate.spec.effectiveFamily());
+                    if (relation.relationship == .left_precedes and !relation.reversed) {
+                        has_predecessor = true;
+                        break;
+                    }
+                    if (relation.relationship == .left_precedes and relation.reversed) {
+                        // Candidate precedes predecessor, so this pair does not
+                        // block candidate.
+                        continue;
+                    }
+                }
+                if (has_predecessor) continue;
+                if (selected == null or orderLess(candidate.spec, self.active.items[selected.?].spec)) selected = candidate_index;
+            }
+            const index = selected orelse return error.FaultPrecedenceCycle;
+            emitted[index] = true;
+            result[output_index] = self.active.items[index].spec.id;
+        }
+        return result;
+    }
+
     fn indexOf(self: *const Controller, fault_id: FaultId) ?usize {
         for (self.active.items, 0..) |active, index| if (active.spec.id == fault_id) return index;
         return null;
@@ -262,7 +385,14 @@ fn rejectionError(reason: Rejection) anyerror {
         .partition_budget => error.PartitionBudgetExceeded,
         .delayed_message_budget => error.DelayedMessageBudgetExceeded,
         .storage_epoch_budget => error.StorageFaultEpochBudgetExceeded,
+        .exclusion_group => error.FaultExclusionGroupActive,
+        .overlap_excluded => error.FaultOverlapExcluded,
     };
+}
+
+fn orderLess(lhs: Spec, rhs: Spec) bool {
+    if (lhs.priority != rhs.priority) return lhs.priority > rhs.priority;
+    return lhs.id < rhs.id;
 }
 
 fn emitLifecycle(sink: *event.Sink, allocator: std.mem.Allocator, kind: event.Kind, spec: Spec) !void {
@@ -345,6 +475,37 @@ test "storage epochs and delayed-message state enforce separate budgets" {
     var delayed = Spec.named(.delayed_message, .one_shot, "network.delay-message");
     delayed.resource_id = 90;
     try std.testing.expectEqual(Rejection.delayed_message_budget, (try controller.admission(delayed)).rejected);
+}
+
+test "explicit fault algebra composes precedence and exclusions" {
+    const rules = [_]Rule{
+        .{ .left = .partition, .right = .delay, .relationship = .left_precedes },
+        .{ .left = .partition, .right = .storage_corruption, .relationship = .excluded },
+    };
+    var controller = try Controller.initWithAlgebra(std.testing.allocator, 3, .{ .max_partitioned_links = 2 }, .{ .rules = &rules });
+    defer controller.deinit();
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    var delay = Spec.named(.delayed_message, .persistent, "delay");
+    delay.resource_id = 40;
+    delay.priority = 10;
+    var partition = Spec.named(.partitioned_link, .persistent, "partition");
+    partition.resource_id = 41;
+    var corruption = Spec.named(.storage, .persistent, "corruption");
+    corruption.resource_id = 42;
+    try controller.start(delay, &sink, std.testing.allocator);
+    try controller.start(partition, &sink, std.testing.allocator);
+    try std.testing.expectEqual(Rejection.overlap_excluded, (try controller.admission(corruption)).rejected);
+    const order = try controller.effectiveOrderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqualSlices(FaultId, &.{ partition.id, delay.id }, order);
+
+    var grouped_a = Spec.named(.resource, .persistent, "group-a");
+    grouped_a.exclusion_group = 99;
+    var grouped_b = Spec.named(.custom, .persistent, "group-b");
+    grouped_b.exclusion_group = 99;
+    try controller.start(grouped_a, &sink, std.testing.allocator);
+    try std.testing.expectEqual(Rejection.exclusion_group, (try controller.admission(grouped_b)).rejected);
 }
 
 test "generic runner records controller lifecycle without synthetic pulses" {
