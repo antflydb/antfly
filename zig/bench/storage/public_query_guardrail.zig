@@ -1159,7 +1159,7 @@ pub fn main(init: std.process.Init) !void {
         if (cfg.mode != .standalone) return error.InvalidArgument;
         const cwd = try std.process.currentPathAlloc(init.io, alloc);
         defer alloc.free(cwd);
-        try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+        try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
     } else {
         switch (cfg.mode) {
             .handler => try runHandlerBench(alloc, cfg, dataset, queries, query_bodies),
@@ -1167,7 +1167,7 @@ pub fn main(init: std.process.Init) !void {
             .standalone => {
                 const cwd = try std.process.currentPathAlloc(init.io, alloc);
                 defer alloc.free(cwd);
-                try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+                try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
             },
         }
     }
@@ -2941,6 +2941,7 @@ fn makeQueryBodies(alloc: std.mem.Allocator, queries: []const f32, cfg: Config) 
 fn runStandaloneBench(
     alloc: std.mem.Allocator,
     io: std.Io,
+    parent_environ: std.process.Environ,
     cwd: []const u8,
     cfg: Config,
     dataset: []const f32,
@@ -2972,7 +2973,7 @@ fn runStandaloneBench(
     const metadata_admin_port = ports[3];
     const store_raft_port = ports[4];
 
-    var child = try spawnStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
+    var child = try spawnStandalone(alloc, io, parent_environ, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
 
     const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, bind_port });
@@ -3174,6 +3175,7 @@ fn runStandaloneBench(
 fn spawnStandalone(
     alloc: std.mem.Allocator,
     io: std.Io,
+    parent_environ: std.process.Environ,
     cwd: []const u8,
     cfg: Config,
     root_path: []const u8,
@@ -3217,7 +3219,7 @@ fn spawnStandalone(
 
     switch (cfg.server_kind) {
         .zig => {
-            var env_map = std.process.Environ.Map.init(alloc);
+            var env_map = try std.process.Environ.createMap(parent_environ, alloc);
             defer env_map.deinit();
             if (process_memory_budget_arg) |arg| try env_map.put("ANTFLY_PROCESS_MEMORY_BUDGET_MB", arg);
             return try std.process.spawn(io, .{
@@ -3259,7 +3261,7 @@ fn spawnStandalone(
             defer alloc.free(store_raft);
             const metadata_cluster = try std.fmt.allocPrint(alloc, "{{\"1\":\"{s}\"}}", .{metadata_raft});
             defer alloc.free(metadata_cluster);
-            var env_map = std.process.Environ.Map.init(alloc);
+            var env_map = try std.process.Environ.createMap(parent_environ, alloc);
             defer env_map.deinit();
             try env_map.put("ANTFLY_DATA_DIR", root_path);
             try env_map.put("ANTFLY_STORAGE_LOCAL_BASE_DIR", root_path);

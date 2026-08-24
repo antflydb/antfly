@@ -268,9 +268,9 @@ pub fn candidateLessThan(_: void, a: types.PriorityItem, b: types.PriorityItem) 
 }
 
 fn candidatePriorityScore(item: types.PriorityItem) f32 {
-    // An unresolved candidate may conceal the best admissible bound, so it
-    // must be resolved before any bound-based frontier ordering or stop.
-    if (!item.bound_resolved) return -std.math.inf(f32);
+    // Preserve centroid-distance routing until a leaf has supplied a genuine
+    // member bound. Treating every unresolved internal node as -infinity makes
+    // the beam traverse insertion/id order and destroys ANN recall.
     if (std.math.isFinite(item.lower_bound)) return item.lower_bound;
     return item.distance - item.error_bound;
 }

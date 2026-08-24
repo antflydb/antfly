@@ -130,10 +130,11 @@ fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCe
 }
 
 fn flatProbeScore(probe: FlatCentroidProbe) f32 {
-    // Unknown radii must be visited before bounded postings: omitting them
-    // from a bounded directory selection would make the stopping proof false.
-    if (!probe.bound_resolved) return -std.math.inf(f32);
-    return probe.member_lower_bound;
+    // Metrics without a valid radius retain ordinary centroid routing. A
+    // proof-based stop separately requires every remaining probe to have a
+    // resolved member bound.
+    if (probe.bound_resolved) return probe.member_lower_bound;
+    return probe.distance - probe.error_bound;
 }
 
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {

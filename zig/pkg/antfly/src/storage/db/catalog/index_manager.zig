@@ -8014,7 +8014,10 @@ pub const IndexManager = struct {
             defer self.alloc.free(artifact_keys);
             const raw_values = try self.alloc.alloc(?[]const u8, batch_capacity);
             defer self.alloc.free(raw_values);
-            const vector_scratch = try self.alloc.alloc(f32, entry.dims);
+            const vector_views = try self.alloc.alloc([]const f32, batch_capacity);
+            defer self.alloc.free(vector_views);
+            const vector_scratch_len = try std.math.mul(usize, batch_capacity, entry.dims);
+            const vector_scratch = try self.alloc.alloc(f32, vector_scratch_len);
             defer self.alloc.free(vector_scratch);
 
             var hbc_profile: hbc_mod.SearchProfile = .{};
@@ -8044,7 +8047,7 @@ pub const IndexManager = struct {
                         batch_distances[0..batch_len],
                         vector_scratch,
                         entry.dims,
-                        .{ .artifact_keys = artifact_keys, .raw_values = raw_values },
+                        .{ .artifact_keys = artifact_keys, .raw_values = raw_values, .vector_views = vector_views },
                         &hbc_profile,
                     );
                     for (batch_ids[0..batch_len], batch_metadata[0..batch_len], batch_distances[0..batch_len]) |vector_id, maybe_doc_key, distance| {

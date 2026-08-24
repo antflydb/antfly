@@ -287,10 +287,12 @@ pub const PostingStore = struct {
             .pointer => |ptr| ptr.child,
             else => @TypeOf(index),
         };
+        var transformed_vectors: ?[]f32 = null;
+        defer if (transformed_vectors) |vectors| index.alloc.free(vectors);
         if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
             const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
             const vectors = try index.alloc.alloc(f32, matrix_len);
-            defer index.alloc.free(vectors);
+            transformed_vectors = vectors;
             try index.loadPostingVectorsTransformed(txn, node.members, vectors);
             for (0..node.members.len) |i| {
                 vec.add(node.centroid, vectors[i * index.config.dims ..][0..index.config.dims]);
@@ -310,19 +312,20 @@ pub const PostingStore = struct {
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
         if (index.config.metric == .l2_squared) {
-            const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
-            const vectors = try index.alloc.alloc(f32, matrix_len);
-            defer index.alloc.free(vectors);
-            if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
-                try index.loadPostingVectorsTransformed(txn, node.members, vectors);
-            } else {
+            const vectors = if (comptime @hasDecl(Index, "loadPostingVectorsTransformed"))
+                transformed_vectors.?
+            else blk: {
+                const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
+                const allocated = try index.alloc.alloc(f32, matrix_len);
+                transformed_vectors = allocated;
                 const raw_scratch = try index.alloc.alloc(f32, index.config.dims);
                 defer index.alloc.free(raw_scratch);
                 for (node.members, 0..) |member_id, row| {
                     const raw = try index.getVectorScratch(txn, member_id, raw_scratch);
-                    _ = index.transformVector(raw, vectors[row * index.config.dims ..][0..index.config.dims]);
+                    _ = index.transformVector(raw, allocated[row * index.config.dims ..][0..index.config.dims]);
                 }
-            }
+                break :blk allocated;
+            };
             var max_squared: f32 = 0;
             for (0..node.members.len) |row| {
                 const candidate = vectors[row * index.config.dims ..][0..index.config.dims];

@@ -681,10 +681,22 @@ fn copyNonQuantizedLeafPayloadPrefix(
         }
     };
 
-    if (self.getCachedQuantizedPtr(leaf_id)) |cached| switch (cached.*) {
-        .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
-        .rabit => {},
-    };
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
+        if (self.borrowCachedQuantized(leaf_id)) |borrowed| {
+            var handle = borrowed;
+            defer handle.deinit();
+            switch (handle.ptr().*) {
+                .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
+                .rabit => {},
+            }
+        }
+    } else if (comptime @hasDecl(Index, "getCachedQuantizedPtr")) {
+        if (self.getCachedQuantizedPtr(leaf_id)) |cached| switch (cached.*) {
+            .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
+            .rabit => {},
+        };
+    }
 
     var key_buf: [10]u8 = undefined;
     const encoded = self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, leaf_id)) catch return null;
@@ -2153,7 +2165,10 @@ pub fn searchProfiledRequest(
                     profile.traversal_max_wave_leaves,
                     @as(u64, @intCast(next_wave_end - previous_wave_end)),
                 );
-                if (approx_results.isFull() and probe.bound_resolved) {
+                if (approx_results.isFull() and
+                    probe.bound_resolved and
+                    flatProbeFrontierHasOnlyResolvedBounds(probes[i..probe_count]))
+                {
                     const result_upper = retainedResultUpperBound(&approx_results);
                     if (probe.member_lower_bound > result_upper) {
                         profile.traversal_bound_stops += 1;
@@ -2300,7 +2315,10 @@ pub fn searchProfiledRequest(
             profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
             if (approx_results.isFull()) {
                 if (candidates.peek()) |frontier| {
-                    if (frontier.bound_resolved and std.math.isFinite(frontier.lower_bound)) {
+                    if (frontier.bound_resolved and
+                        std.math.isFinite(frontier.lower_bound) and
+                        candidateFrontierHasOnlyResolvedBounds(&candidates))
+                    {
                         const result_upper = retainedResultUpperBound(&approx_results);
                         if (frontier.lower_bound > result_upper) {
                             profile.traversal_bound_stops += 1;
@@ -3385,11 +3403,15 @@ fn loadVectorIdsSortedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    const vector_namespace = if (comptime @hasDecl(Index, "vectorArtifactReadNamespace"))
-        self.vectorArtifactReadNamespace()
-    else
-        .vecs;
-    try getNamespacedManySorted(self, txn, vector_namespace, key_views, values);
+    if (comptime @hasDecl(Index, "vectorArtifactReadNamespace")) {
+        switch (self.vectorArtifactReadNamespace()) {
+            .vecs => try getNamespacedManySorted(self, txn, .vecs, key_views, values),
+            .vecs_transient => try getNamespacedManySorted(self, txn, .vecs_transient, key_views, values),
+            else => unreachable,
+        }
+    } else {
+        try getNamespacedManySorted(self, txn, .vecs, key_views, values);
+    }
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
@@ -3405,7 +3427,8 @@ fn loadVectorIdsSortedWithScratch(
             vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
             continue;
         }
-        const view = try vectorViewFromRaw(value, scratch);
+        const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
+        const view = try vectorViewFromRaw(value, slot_scratch);
         if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
             self.notifyVectorViewLoadForTest(lookups[i].vector_id);
         }
@@ -4276,6 +4299,20 @@ fn retainedResultUpperBound(results: *const search_results.ApproxSearchResults) 
     var upper: f32 = -std.math.inf(f32);
     for (results.items.items) |item| upper = @max(upper, item.distance + item.error_bound);
     return upper;
+}
+
+fn candidateFrontierHasOnlyResolvedBounds(candidates: anytype) bool {
+    for (candidates.items) |candidate| {
+        if (!candidate.bound_resolved or !std.math.isFinite(candidate.lower_bound)) return false;
+    }
+    return true;
+}
+
+fn flatProbeFrontierHasOnlyResolvedBounds(probes: []const spfresh_index.FlatCentroidProbe) bool {
+    for (probes) |probe| {
+        if (!probe.bound_resolved or !std.math.isFinite(probe.member_lower_bound)) return false;
+    }
+    return true;
 }
 
 fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {

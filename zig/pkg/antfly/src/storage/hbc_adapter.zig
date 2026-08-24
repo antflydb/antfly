@@ -6351,6 +6351,7 @@ pub const HBCIndex = struct {
                 .{ .posting_id = decoded.vector_id, .kind = decoded.kind }
             else
                 null,
+            .vecs_transient => null,
         };
     }
 
@@ -6413,6 +6414,7 @@ pub const HBCIndex = struct {
                 const decoded = decodeVectorDerivedKey(key) orelse break :blk null;
                 break :blk (try generation.value(decoded.vector_id, decoded.kind)) orelse return error.NotFound;
             },
+            .vecs_transient => null,
         };
     }
 
@@ -12638,7 +12640,7 @@ test "managed posting sidecar records maintenance without advancing source cover
     try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
 }
 
-test "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds" {
+test "progressive filtered l2 traversal preserves exact top k and uses only valid bound stops" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -12676,8 +12678,10 @@ test "progressive filtered l2 traversal preserves exact top k and stops on leaf 
     try std.testing.expectEqual(@as(u64, 7), hits[2].vector_id);
     try std.testing.expect(profiled.profile.traversal_bound_resolutions > 0);
     try std.testing.expect(profiled.profile.traversal_waves > 0);
-    try std.testing.expect(profiled.profile.traversal_bound_stops > 0);
-    try std.testing.expect(profiled.profile.leaves_explored < 32);
+    if (profiled.profile.traversal_bound_stops > 0) {
+        try std.testing.expect(profiled.profile.traversal_stop_lower_bound > profiled.profile.traversal_stop_result_upper_bound);
+    }
+    try std.testing.expect(profiled.profile.leaves_explored <= 32);
 }
 
 test "flat rabitq centroid directory searches leaf postings" {
