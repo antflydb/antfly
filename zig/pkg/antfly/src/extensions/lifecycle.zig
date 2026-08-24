@@ -19,11 +19,20 @@ const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const platform_time = @import("antfly_platform").time;
 
 pub fn installOnService(
     service: anytype,
     alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.InstallExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return installOnServiceWithIo(service, alloc, std.Options.debug_io, extension_name, request);
+}
+
+pub fn installOnServiceWithIo(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    io: std.Io,
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
@@ -36,7 +45,7 @@ pub fn installOnService(
 
     var persisted_request = request;
     persisted_request.dry_run = false;
-    const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
+    const installed_at_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).toNanoseconds(), std.time.ns_per_ms));
     var installed = try catalog.installManifestOnly(extension_name, extension_name, persisted_request, installed_at_ms);
     errdefer installed.deinitOwned(alloc);
 

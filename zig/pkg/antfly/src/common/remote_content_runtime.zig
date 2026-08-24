@@ -8,7 +8,6 @@ const scraping = @import("antfly_scraping");
 const config_mod = @import("config.zig");
 const secrets = @import("secrets.zig");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
 
 const request_refresh_interval_ns: u64 = std.time.ns_per_s;
 const health_refresh_interval_ns: u64 = 500 * std.time.ns_per_ms;
@@ -61,6 +60,7 @@ pub const Health = struct {
 /// by `attach`; each actual remote fetch acquires a ref-counted snapshot.
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     path: []u8,
     secret_store: ?*secrets.FileStore,
     expected_deployment: ?config_mod.DeploymentMode,
@@ -88,9 +88,19 @@ pub const Runtime = struct {
         secret_store: ?*secrets.FileStore,
         expected_deployment: ?config_mod.DeploymentMode,
     ) !Runtime {
+        return initWithIo(alloc, std.Options.debug_io, path, secret_store, expected_deployment);
+    }
+
+    pub fn initWithIo(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        secret_store: ?*secrets.FileStore,
+        expected_deployment: ?config_mod.DeploymentMode,
+    ) !Runtime {
         const owned_path = try alloc.dupe(u8, path);
         errdefer alloc.free(owned_path);
-        var image = try readFileImage(alloc, path);
+        var image = try readFileImageWithIo(alloc, io, path);
         defer image.deinit(alloc);
         var config = try config_mod.Config.parseFromSliceWithSecretsForDeployment(alloc, image.raw, secret_store, expected_deployment);
         errdefer config.deinit();
@@ -105,6 +115,7 @@ pub const Runtime = struct {
         };
         return .{
             .alloc = alloc,
+            .io = io,
             .path = owned_path,
             .secret_store = secret_store,
             .expected_deployment = expected_deployment,
@@ -136,7 +147,7 @@ pub const Runtime = struct {
     }
 
     fn refreshIfChangedForHealth(self: *Runtime) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = monotonicNs(self.io);
         const scheduled_ns = self.next_health_refresh_ns.load(.acquire);
         if (scheduled_ns != 0 and now_ns < scheduled_ns) return;
         if (self.next_health_refresh_ns.cmpxchgStrong(
@@ -154,7 +165,7 @@ pub const Runtime = struct {
     /// request that wins both the interval CAS and refresh try-lock performs
     /// I/O; all other requests immediately acquire the current snapshot.
     fn refreshIfChangedForRequest(self: *Runtime) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = monotonicNs(self.io);
         const scheduled_ns = self.next_request_refresh_ns.load(.acquire);
         if (scheduled_ns != 0 and now_ns < scheduled_ns) return;
         if (self.next_request_refresh_ns.cmpxchgStrong(
@@ -170,7 +181,7 @@ pub const Runtime = struct {
 
     fn refreshIfChangedOwned(self: *Runtime, force_content_check: bool) bool {
         if (!force_content_check) {
-            const metadata = statFileMetadata(self.alloc, self.path) catch |err| {
+            const metadata = statFileMetadataWithIo(self.io, self.path) catch |err| {
                 platform_sync.lockYielding(&self.publish_mutex);
                 defer self.publish_mutex.unlock();
                 self.markFailedLocked(err);
@@ -182,7 +193,7 @@ pub const Runtime = struct {
             if (identity_unchanged) return false;
         }
 
-        var image = readFileImage(self.alloc, self.path) catch |err| {
+        var image = readFileImageWithIo(self.alloc, self.io, self.path) catch |err| {
             platform_sync.lockYielding(&self.publish_mutex);
             defer self.publish_mutex.unlock();
             self.markFailedLocked(err);
@@ -431,9 +442,10 @@ const FileImage = struct {
 };
 
 fn readFileImage(alloc: std.mem.Allocator, path: []const u8) !FileImage {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    return readFileImageWithIo(alloc, std.Options.debug_io, path);
+}
+
+fn readFileImageWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !FileImage {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -459,9 +471,11 @@ fn readFileImage(alloc: std.mem.Allocator, path: []const u8) !FileImage {
 }
 
 fn statFileMetadata(alloc: std.mem.Allocator, path: []const u8) !FileMetadata {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    _ = alloc;
+    return statFileMetadataWithIo(std.Options.debug_io, path);
+}
+
+fn statFileMetadataWithIo(io: std.Io, path: []const u8) !FileMetadata {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -473,6 +487,12 @@ fn statFileMetadata(alloc: std.mem.Allocator, path: []const u8) !FileMetadata {
         .size = stat.size,
         .mtime_ns = stat.mtime.toNanoseconds(),
     };
+}
+
+fn monotonicNs(io: std.Io) u64 {
+    const value = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    if (value <= 0) return 0;
+    return @intCast(value);
 }
 
 fn writeTestConfigAtomically(path: []const u8, contents: []const u8) !void {

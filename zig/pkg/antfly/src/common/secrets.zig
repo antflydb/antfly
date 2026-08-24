@@ -16,7 +16,6 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
-const platform_time = @import("antfly_platform").time;
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
@@ -243,6 +242,7 @@ const FileMetadata = struct {
 
 pub const FileStore = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     path: []u8,
     fallbacks: []FileStore = &.{},
     mutex: std.atomic.Mutex = .unlocked,
@@ -260,8 +260,13 @@ pub const FileStore = struct {
     next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
+        return initWithIo(alloc, std.Options.debug_io, path);
+    }
+
+    pub fn initWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !FileStore {
         var store = FileStore{
             .alloc = alloc,
+            .io = io,
             .path = try alloc.dupe(u8, path),
         };
         errdefer store.deinit();
@@ -270,9 +275,13 @@ pub const FileStore = struct {
     }
 
     pub fn initLayered(alloc: std.mem.Allocator, paths: []const []const u8) !FileStore {
+        return initLayeredWithIo(alloc, std.Options.debug_io, paths);
+    }
+
+    pub fn initLayeredWithIo(alloc: std.mem.Allocator, io: std.Io, paths: []const []const u8) !FileStore {
         if (paths.len == 0) return error.InvalidArguments;
 
-        var store = try FileStore.init(alloc, paths[0]);
+        var store = try FileStore.initWithIo(alloc, io, paths[0]);
         errdefer store.deinit();
 
         if (paths.len > 1) {
@@ -284,7 +293,7 @@ pub const FileStore = struct {
                 store.fallbacks = &.{};
             }
             for (paths[1..]) |path| {
-                store.fallbacks[initialized] = try FileStore.init(alloc, path);
+                store.fallbacks[initialized] = try FileStore.initWithIo(alloc, io, path);
                 initialized += 1;
             }
         }
@@ -365,12 +374,12 @@ pub const FileStore = struct {
     /// the store lock or issuing a stat syscall on every cache lookup.
     pub fn refreshIfChangedThrottled(self: *FileStore, interval_ns: u64) !bool {
         if (interval_ns == 0) return try self.refreshIfChanged();
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = nowNsWithIo(self.io);
         if (now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
 
         self.lock();
         defer self.unlock();
-        const locked_now_ns = platform_time.monotonicNs();
+        const locked_now_ns = nowNsWithIo(self.io);
         if (locked_now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
         self.next_throttled_refresh_ns.store(locked_now_ns +| interval_ns, .release);
         errdefer self.next_throttled_refresh_ns.store(0, .release);
@@ -428,7 +437,7 @@ pub const FileStore = struct {
             next.deinit(self.alloc);
         }
 
-        const now_ns = nowNs();
+        const now_ns = nowNsWithIo(self.io);
         if (next.getPtr(key)) |existing| {
             const new_value = try self.alloc.dupe(u8, value);
             self.alloc.free(existing.value);
@@ -582,7 +591,7 @@ pub const FileStore = struct {
     }
 
     fn load(self: *FileStore) !void {
-        const metadata = statFileMetadata(self.path) catch |err| switch (err) {
+        const metadata = statFileMetadataWithIo(self.io, self.path) catch |err| switch (err) {
             error.FileNotFound => {
                 self.observed_metadata = null;
                 self.markReloadHealthyLocked(false);
@@ -596,7 +605,7 @@ pub const FileStore = struct {
             return;
         }
 
-        const loaded = try loadEntriesFromFile(self.alloc, self.path);
+        const loaded = try loadEntriesFromFileWithIo(self.alloc, self.io, self.path);
         var next = loaded.entries;
         errdefer {
             deinitEntries(self.alloc, &next);
@@ -614,7 +623,7 @@ pub const FileStore = struct {
     }
 
     fn refreshIfChangedLocked(self: *FileStore) !bool {
-        const metadata = statFileMetadata(self.path) catch |err| switch (err) {
+        const metadata = statFileMetadataWithIo(self.io, self.path) catch |err| switch (err) {
             error.FileNotFound => {
                 if (self.observed_metadata != null) {
                     const first_failure = !self.last_reload_failed;
@@ -643,7 +652,7 @@ pub const FileStore = struct {
             }
         }
 
-        const loaded = loadEntriesFromFile(self.alloc, self.path) catch |err| {
+        const loaded = loadEntriesFromFileWithIo(self.alloc, self.io, self.path) catch |err| {
             const first_failure = !self.last_reload_failed;
             self.markReloadFailedLocked();
             if (first_failure) std.log.warn("secret store reload failed; keeping last known good snapshot path={s} err={}", .{ self.path, err });
@@ -687,8 +696,8 @@ pub const FileStore = struct {
         });
         defer alloc.free(encoded);
 
-        try ensureParentDir(self.path);
-        try writeFileAtomically(self.path, encoded);
+        try ensureParentDirWithIo(self.io, self.path);
+        try writeFileAtomicallyWithIo(self.io, self.path, encoded);
         var content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &content_hash, .{});
         return content_hash;
@@ -700,7 +709,7 @@ pub const FileStore = struct {
         // Local API writes are not control-plane publications and therefore
         // must not preserve an acknowledgement generation from older bytes.
         self.source_generation = null;
-        self.observed_metadata = try statFileMetadata(self.path);
+        self.observed_metadata = try statFileMetadataWithIo(self.io, self.path);
         self.generation_value +%= 1;
         self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
@@ -749,14 +758,14 @@ pub const FileStore = struct {
         self.last_reload_failed = false;
         if (count_success) {
             self.reload_success_count +%= 1;
-            self.last_success_ns = nowNs();
+            self.last_success_ns = nowNsWithIo(self.io);
         }
     }
 
     fn markReloadFailedLocked(self: *FileStore) void {
         if (!self.last_reload_failed) self.reload_failure_count +%= 1;
         self.last_reload_failed = true;
-        self.last_failure_ns = nowNs();
+        self.last_failure_ns = nowNsWithIo(self.io);
     }
 };
 
@@ -767,7 +776,11 @@ const LoadedEntries = struct {
 };
 
 fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !LoadedEntries {
-    const raw = try readFileAlloc(alloc, path);
+    return loadEntriesFromFileWithIo(alloc, std.Options.debug_io, path);
+}
+
+fn loadEntriesFromFileWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedEntries {
+    const raw = try readFileAllocWithIo(alloc, io, path);
     defer alloc.free(raw);
     var content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw, &content_hash, .{});
@@ -1029,15 +1042,18 @@ fn formatTimestampOwned(alloc: std.mem.Allocator, ns: u64) ![]u8 {
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    return readFileAllocWithIo(alloc, std.Options.debug_io, path);
+}
+
+fn readFileAllocWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
 }
 
 fn statFileMetadata(path: []const u8) !?FileMetadata {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    return statFileMetadataWithIo(std.Options.debug_io, path);
+}
+
+fn statFileMetadataWithIo(io: std.Io, path: []const u8) !?FileMetadata {
     const stat = if (std.fs.path.isAbsolute(path)) blk: {
         var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -1057,19 +1073,22 @@ fn statFileMetadata(path: []const u8) !?FileMetadata {
 }
 
 fn ensureParentDir(path: []const u8) !void {
+    return ensureParentDirWithIo(std.Options.debug_io, path);
+}
+
+fn ensureParentDirWithIo(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), parent);
+    try fs_paths.createDirPathPortable(io, parent);
 }
 
 fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-secrets-{d}", .{ path, nowNs() });
+    return writeFileAtomicallyWithIo(std.Options.debug_io, path, contents);
+}
+
+fn writeFileAtomicallyWithIo(io: std.Io, path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-secrets-{d}", .{ path, nowNsWithIo(io) });
     defer std.heap.page_allocator.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var tmp_exists = false;
     defer if (tmp_exists) deleteFileWithIo(io, tmp_path) catch {};
 
@@ -1097,9 +1116,7 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
 }
 
 fn deleteFile(path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    try deleteFileWithIo(io_impl.io(), path);
+    try deleteFileWithIo(std.Options.debug_io, path);
 }
 
 fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
@@ -1111,9 +1128,11 @@ fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
 }
 
 fn nowNs() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const now = std.Io.Timestamp.now(io_impl.io(), .awake);
+    return nowNsWithIo(std.Options.debug_io);
+}
+
+fn nowNsWithIo(io: std.Io) u64 {
+    const now = std.Io.Timestamp.now(io, .awake);
     return @intCast(now.toNanoseconds());
 }
 
