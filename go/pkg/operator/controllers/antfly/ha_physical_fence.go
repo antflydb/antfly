@@ -50,14 +50,15 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		if err := validateHAFormerPrimaryIsolationAction(cluster, action); err != nil {
 			return err
 		}
-		// Once the topology has adopted this exact promotion, the completed
-		// receipt is historical authority. The shared Lease is expected to move
-		// on to the child scope and must not retroactively invalidate the proof
-		// that fenced the parent. We still revalidate every immutable receipt and
-		// promotion binding below.
-		if haPhysicalIsolationTopologyAdvanced(cluster, action) {
+		// Once an exact promotion receipt exists, the completed isolation receipt
+		// is immutable historical authority. The shared Lease may expire or advance
+		// while the route and durable topology are still converging. Requiring that
+		// mutable Lease to remain current here would block the very reconciliation
+		// that commits those later steps. Before promotion, a restarted controller
+		// must still repeat its local monotonic watchdog barrier below.
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded && haPhysicalIsolationPromotionRecorded(cluster, action) {
 			if !haPhysicalIsolationSucceededWithEvidence(cluster, *action) {
-				return fmt.Errorf("isolate former primary: advanced topology lacks a complete matching physical-isolation receipt")
+				return fmt.Errorf("isolate former primary: completed action lacks a complete matching physical-isolation receipt")
 			}
 			return nil
 		}
@@ -623,14 +624,23 @@ func haPhysicalIsolationActionMatchesIdentity(cluster *antflyv1.AntflyCluster, a
 }
 
 func haPhysicalIsolationTopologyAdvanced(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) bool {
+	if !haPhysicalIsolationPromotionRecorded(cluster, action) {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return identity != nil &&
+		strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch
+}
+
+func haPhysicalIsolationPromotionRecorded(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) bool {
 	if cluster == nil || action == nil || action.AdminJobPhase != haAdminJobPhaseSucceeded {
 		return false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	promotion := haPromotionReceipt(cluster.Status.HAStatus)
-	return identity != nil && promotion != nil &&
-		strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
-		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch &&
+	return identity != nil && promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
 		strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
 		strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
 		action.FenceGeneration == promotion.FenceGeneration

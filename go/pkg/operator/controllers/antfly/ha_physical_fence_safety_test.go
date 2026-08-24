@@ -95,6 +95,39 @@ func TestReconcilePhysicalIsolationFreshControllerWaitsLocalWatchdogBarrier(t *t
 	}
 }
 
+// Once the exact isolation receipt is complete, later route/topology work must
+// not depend on the promotion Lease remaining live. The promoted process can
+// restart or change authority mode before Colony adopts the child identity.
+func TestReconcileCompletedPhysicalIsolationDoesNotRevalidateMutableLease(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	identity := cluster.Spec.HighAvailability.Identity
+	promotion := haCompletePromotionReceipt(action.StandbyName, action.RouteTo)
+	promotion.ClusterID = identity.ClusterID
+	promotion.ShardID = identity.ShardID
+	promotion.TableID = identity.TableID
+	promotion.ParentTimelineID = identity.TimelineID
+	promotion.ParentEpoch = identity.Epoch
+	promotion.FenceGeneration = action.FenceGeneration
+	cluster.Status.HAStatus.LastPromotion = promotion
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+
+	// Deliberately omit the StatefulSet and Lease. A terminal, structurally
+	// valid receipt must release route reconciliation from external old-scope
+	// objects even while the spec still records the parent topology.
+	reconciler := testHAReconciler(t, cluster)
+	reconciler.Now = func() time.Time { return now.Add(24 * time.Hour) }
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
+		t.Fatalf("completed receipt borrowed authority from mutable external objects: %v", err)
+	}
+
+	cluster.Status.HAStatus.PlannedActions[0].PhysicalIsolationReceipt.WatchdogProof.ProcessBootID = "corrupt"
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err == nil ||
+		!strings.Contains(err.Error(), "completed action lacks a complete matching physical-isolation receipt") {
+		t.Fatalf("corrupt completed receipt was accepted: %v", err)
+	}
+}
+
 // Pod API absence is not proof that a force-deleted container stopped on a
 // partitioned node. Without an exact pre-transfer runtime watchdog proof the
 // action must remain Running forever, even after every wall/monotonic delay.
