@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from attrs import define as _attrs_define
+
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.graph_path_edge_metadata import GraphPathEdgeMetadata
+    from ..models.graph_path_endpoint import GraphPathEndpoint
+
+
+T = TypeVar("T", bound="GraphPathEdge")
+
+
+@_attrs_define
+class GraphPathEdge:
+    """One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical
+    edge keys, so identity remains unambiguous across tables and for equal keys in different tables.
+
+        Attributes:
+            from_ (GraphPathEndpoint):
+            to (GraphPathEndpoint):
+            type_ (str):
+            weight (float):
+            metadata (GraphPathEdgeMetadata | Unset):
+    """
+
+    from_: GraphPathEndpoint
+    to: GraphPathEndpoint
+    type_: str
+    weight: float
+    metadata: GraphPathEdgeMetadata | Unset = UNSET
+
+    def to_dict(self) -> dict[str, Any]:
+        from_ = self.from_.to_dict()
+
+        to = self.to.to_dict()
+
+        type_ = self.type_
+
+        weight = self.weight
+
+        metadata: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metadata, Unset):
+            metadata = self.metadata.to_dict()
+
+        field_dict: dict[str, Any] = {}
+
+        field_dict.update(
+            {
+                "from": from_,
+                "to": to,
+                "type": type_,
+                "weight": weight,
+            }
+        )
+        if metadata is not UNSET:
+            field_dict["metadata"] = metadata
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_path_edge_metadata import GraphPathEdgeMetadata
+        from ..models.graph_path_endpoint import GraphPathEndpoint
+
+        d = dict(src_dict)
+        from_ = GraphPathEndpoint.from_dict(d.pop("from"))
+
+        to = GraphPathEndpoint.from_dict(d.pop("to"))
+
+        type_ = d.pop("type")
+
+        weight = d.pop("weight")
+
+        _metadata = d.pop("metadata", UNSET)
+        metadata: GraphPathEdgeMetadata | Unset
+        if isinstance(_metadata, Unset):
+            metadata = UNSET
+        else:
+            metadata = GraphPathEdgeMetadata.from_dict(_metadata)
+
+        graph_path_edge = cls(
+            from_=from_,
+            to=to,
+            type_=type_,
+            weight=weight,
+            metadata=metadata,
+        )
+
+        return graph_path_edge

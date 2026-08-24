@@ -2425,6 +2425,23 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
+    GraphPathEdge:
+      type: object
+      additionalProperties: false
+      required: [from, to, type, weight]
+      description: >-
+        One edge in a canonical path. `from` and `to` are the exact ordered
+        traversal endpoints, not unqualified physical edge keys, so identity
+        remains unambiguous across tables and for equal keys in different
+        tables.
+      properties:
+        from: { $ref: '#/components/schemas/GraphPathEndpoint' }
+        to: { $ref: '#/components/schemas/GraphPathEndpoint' }
+        type: { type: string }
+        weight: { type: number, format: double }
+        metadata:
+          type: object
+          additionalProperties: true
     NodeFilter:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -2942,7 +2959,8 @@ components:
           description: Ordered node identities. Table is omitted for nodes in the query table.
         edges:
           type: array
-          items: { $ref: '#/components/schemas/PathEdge' }
+          items: { $ref: '#/components/schemas/GraphPathEdge' }
+          description: Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
         total_weight:
           type: number
           format: double
@@ -3303,8 +3321,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: array
           items:
-            $ref: '#/components/schemas/PathEdge'
-          description: "Edges in path from start to this node"
+            $ref: '#/components/schemas/GraphPathEdge'
+          description: "Ordered typed edges in path from start to this node"
         provenance:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3316,12 +3334,6 @@ components:
           type: object
           additionalProperties: true
           description: "Parsed evidence envelope for provenance labels and edge metadata"
-        edges:
-          x-go-type-skip-optional-pointer: true
-          type: array
-          items:
-            $ref: '#/components/schemas/Edge'
-          description: "Connected edges when supplied by the graph executor."
     LegacyGraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object

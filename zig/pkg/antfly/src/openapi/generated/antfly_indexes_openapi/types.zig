@@ -1860,9 +1860,19 @@ pub const GraphOptionalMatch = struct {
 pub const GraphPath = struct {
     /// Ordered node identities. Table is omitted for nodes in the query table.
     nodes: []const GraphPathEndpoint,
-    edges: []const PathEdge,
+    /// Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
+    edges: []const GraphPathEdge,
     total_weight: f64,
     length: i64,
+};
+
+/// One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables.
+pub const GraphPathEdge = struct {
+    from: GraphPathEndpoint,
+    to: GraphPathEndpoint,
+    type: []const u8,
+    weight: f64,
+    metadata: ?std.json.Value = null,
 };
 
 pub const GraphPathEndpoint = struct {
@@ -2139,14 +2149,12 @@ pub const GraphResultNode = struct {
     document: ?std.json.Value = null,
     /// Exact ordered node identities in the path from the start node to this node
     path: ?[]const GraphPathEndpoint = null,
-    /// Edges in path from start to this node
-    path_edges: ?[]const PathEdge = null,
+    /// Ordered typed edges in path from start to this node
+    path_edges: ?[]const GraphPathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.Value = null,
-    /// Connected edges when supplied by the graph executor.
-    edges: ?[]const Edge = null,
 };
 
 pub const GraphResultRefNodeSelector = struct {

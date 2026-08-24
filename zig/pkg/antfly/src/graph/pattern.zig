@@ -915,7 +915,8 @@ fn findReachableNodes(
                 for (edges, 0..) |graph_edge, edge_index| {
                     if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = edgeTargetTable(
+                    const target_table = canonicalEdgeTargetTable(
+                        edge_reader,
                         frontier.table,
                         graph_edge,
                         target_key,
@@ -955,7 +956,12 @@ fn findReachableNodes(
                         if (!mask[edge_index]) continue;
                     } else if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = edgeTargetTable(frontier.table, graph_edge, target_key);
+                    const target_table = canonicalEdgeTargetTable(
+                        edge_reader,
+                        frontier.table,
+                        graph_edge,
+                        target_key,
+                    );
                     const closes_required_target = target_required and
                         targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
                     if (frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }) and
@@ -975,7 +981,8 @@ fn findReachableNodes(
 
             for (edges, 0..) |graph_edge, edge_index| {
                 const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                const target_table = edgeTargetTable(
+                const target_table = canonicalEdgeTargetTable(
+                    edge_reader,
                     frontier.table,
                     graph_edge,
                     target_key,
@@ -1131,6 +1138,25 @@ fn edgeTargetTable(
         return traversal_mod.metadataTargetTable(edge.metadata) orelse current_table;
     }
     return current_table;
+}
+
+/// Edge metadata names tables in the storage namespace, while match bindings
+/// may use a canonical query-relative namespace (for example, null for the
+/// source table). Readers that cross table boundaries can normalize the
+/// derived table before it enters path-cycle checks, alias predicates, or
+/// distinct-identity sets. The compile-time capability check keeps local and
+/// serverless readers allocation- and dispatch-free.
+fn canonicalEdgeTargetTable(
+    edge_reader: anytype,
+    current_table: ?[]const u8,
+    edge: graph_mod.Edge,
+    target_key: []const u8,
+) ?[]const u8 {
+    const table = edgeTargetTable(current_table, edge, target_key);
+    if (comptime @hasDecl(@TypeOf(edge_reader), "canonicalizeTable")) {
+        return edge_reader.canonicalizeTable(table);
+    }
+    return table;
 }
 
 fn passesPrefixFilter(key: []const u8, filter: NodeFilter) bool {
@@ -3837,6 +3863,76 @@ test "pattern matching routes later hops through the bound table" {
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("C", matches[0].bindings[2].key);
     try std.testing.expectEqualStrings("entities", matches[0].bindings[2].table.?);
+}
+
+test "conjunctive cycle canonicalizes an explicit source table on return" {
+    const Reader = struct {
+        const source_edges = [_]graph_mod.Edge{.{
+            .source = "A",
+            .target = "X",
+            .edge_type = "external",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "{\"target_table\":\"entities\"}",
+        }};
+        const return_edges = [_]graph_mod.Edge{.{
+            .source = "X",
+            .target = "A",
+            .edge_type = "returns",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "{\"target_table\":\"docs\"}",
+        }};
+
+        pub fn canonicalizeTable(_: @This(), table: ?[]const u8) ?[]const u8 {
+            const name = table orelse return null;
+            return if (std.mem.eql(u8, name, "docs")) null else name;
+        }
+
+        pub fn getEdges(
+            _: @This(),
+            _: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            _: []const []const u8,
+            _: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            if (table == null and std.mem.eql(u8, key, "A"))
+                return @constCast(source_edges[0..]);
+            if (table != null and
+                std.mem.eql(u8, table.?, "entities") and
+                std.mem.eql(u8, key, "X"))
+                return @constCast(return_edges[0..]);
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const nodes = [_]MatchNode{
+        .{ .alias = "source" },
+        .{ .alias = "entity" },
+    };
+    const edges = [_]MatchEdge{
+        .{ .from = "source", .to = "entity", .step = .{ .types = &.{"external"} } },
+        .{ .from = "entity", .to = "source", .step = .{ .types = &.{"returns"} } },
+    };
+
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"A"},
+        .{ .anchor_alias = "source", .nodes = &nodes, .edges = &edges },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expect(matches[0].bindings[0].table == null);
+    try std.testing.expectEqualStrings("A", matches[0].bindings[0].key);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[1].table.?);
+    try std.testing.expectEqualStrings("X", matches[0].bindings[1].key);
 }
 
 test "pattern matching preserves a table-scoped start reference" {

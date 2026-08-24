@@ -191,6 +191,7 @@ export type TraversalRules = components["schemas"]["TraversalRules"];
 export type TraversalResult = components["schemas"]["TraversalResult"];
 export type GraphDocumentFilter = components["schemas"]["GraphDocumentFilter"];
 export type GraphPathEndpoint = components["schemas"]["GraphPathEndpoint"];
+export type GraphPathEdge = components["schemas"]["GraphPathEdge"];
 export type GraphPath = components["schemas"]["GraphPath"];
 export type GraphMatchEdge = components["schemas"]["GraphMatchEdge"];
 export type GraphAliasOperand = components["schemas"]["GraphAliasOperand"];

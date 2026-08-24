@@ -19,6 +19,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
+const graph_paths_mod = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
@@ -5477,10 +5478,9 @@ fn toOpenApiGraphRows(
                     binding.node.table,
                 ),
                 .path = try toOpenApiGraphNodePath(alloc, binding.node),
-                .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
+                .path_edges = try toOpenApiOptionalGraphPathEdges(alloc, binding.node),
                 .provenance = binding.node.provenance,
                 .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
-                .edges = null,
             };
             try row.map.put(alloc, binding.alias, node);
         }
@@ -5724,10 +5724,16 @@ test "canonical graph paths preserve table-qualified node identities" {
     const alloc = arena.allocator();
     var path_nodes = [_][]const u8{ "doc:a", "shared" };
     var node_tables = [_]?[]const u8{ null, "entities" };
+    var path_edges = [_]graph_paths_mod.PathEdge{.{
+        .source = "doc:a",
+        .target = "shared",
+        .edge_type = "mentions",
+        .weight = 1,
+    }};
     var paths = [_]db_mod.types.GraphPath{.{
         .nodes = &path_nodes,
         .node_tables = &node_tables,
-        .edges = &.{},
+        .edges = &path_edges,
         .total_weight = 1,
         .length = 1,
     }};
@@ -5748,6 +5754,9 @@ test "canonical graph paths preserve table-qualified node identities" {
     try std.testing.expect(canonical == .graph_nodes_result);
     try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].nodes[1].key);
     try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].nodes[1].table.?);
+    try std.testing.expectEqualStrings("doc:a", canonical.graph_nodes_result.paths[0].edges[0].from.key);
+    try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].edges[0].to.key);
+    try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].edges[0].to.table.?);
 
     var legacy_query = query;
     legacy_query.legacy_response = true;
@@ -5796,10 +5805,9 @@ fn toOpenApiGraphNodes(
             .distance = node.distance,
             .document = try document_lookup.document(node.key, node.table),
             .path = try toOpenApiGraphNodePath(alloc, node),
-            .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
+            .path_edges = try toOpenApiOptionalGraphPathEdges(alloc, node),
             .provenance = node.provenance,
             .evidence = try graphNodeEvidenceJsonValue(alloc, node),
-            .edges = null,
         };
     }
     return nodes;
@@ -5869,6 +5877,7 @@ fn toOpenApiGraphPaths(
 ) ![]const indexes_openapi.GraphPath {
     const out = try alloc.alloc(indexes_openapi.GraphPath, paths.len);
     for (paths, 0..) |path, i| {
+        if (@as(usize, path.length) != path.edges.len) return error.InvalidRemoteResponse;
         if (path.node_tables.len != 0 and path.node_tables.len != path.nodes.len) {
             return error.InvalidRemoteResponse;
         }
@@ -5881,7 +5890,12 @@ fn toOpenApiGraphPaths(
         }
         out[i] = .{
             .nodes = nodes,
-            .edges = try toOpenApiPathEdges(alloc, path.edges),
+            .edges = try toOpenApiGraphPathEdges(
+                alloc,
+                path.nodes,
+                path.node_tables,
+                path.edges,
+            ),
             .total_weight = path.total_weight,
             .length = @intCast(path.length),
         };
@@ -5898,6 +5912,48 @@ fn toOpenApiPathEdges(
         out[i] = .{
             .source = edge.source,
             .target = edge.target,
+            .type = edge.edge_type,
+            .weight = edge.weight,
+            .metadata = try pathEdgeMetadataJsonValue(alloc, edge.metadata),
+        };
+    }
+    return out;
+}
+
+fn toOpenApiGraphPathEdges(
+    alloc: std.mem.Allocator,
+    nodes: []const []const u8,
+    node_tables: []const ?[]const u8,
+    edges: anytype,
+) ![]const indexes_openapi.GraphPathEdge {
+    if (node_tables.len != 0 and node_tables.len != nodes.len)
+        return error.InvalidRemoteResponse;
+    if (nodes.len == 0) {
+        if (edges.len != 0) return error.InvalidRemoteResponse;
+    } else if (edges.len != nodes.len - 1) {
+        return error.InvalidRemoteResponse;
+    }
+
+    const out = try alloc.alloc(indexes_openapi.GraphPathEdge, edges.len);
+    errdefer if (out.len > 0) alloc.free(out);
+    for (edges, 0..) |edge, i| {
+        const left_key = nodes[i];
+        const right_key = nodes[i + 1];
+        const connects_in_order = std.mem.eql(u8, edge.source, left_key) and
+            std.mem.eql(u8, edge.target, right_key);
+        const connects_in_reverse = std.mem.eql(u8, edge.source, right_key) and
+            std.mem.eql(u8, edge.target, left_key);
+        if (!connects_in_order and !connects_in_reverse)
+            return error.InvalidRemoteResponse;
+        out[i] = .{
+            .from = .{
+                .key = left_key,
+                .table = if (node_tables.len == 0) null else node_tables[i],
+            },
+            .to = .{
+                .key = right_key,
+                .table = if (node_tables.len == 0) null else node_tables[i + 1],
+            },
             .type = edge.edge_type,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataJsonValue(alloc, edge.metadata),
@@ -6010,6 +6066,19 @@ fn toOpenApiOptionalPathEdges(
     return try toOpenApiPathEdges(alloc, value);
 }
 
+fn toOpenApiOptionalGraphPathEdges(
+    alloc: std.mem.Allocator,
+    node: graph_query_mod.GraphResultNode,
+) !?[]const indexes_openapi.GraphPathEdge {
+    const edges = node.path_edges orelse return null;
+    const path = node.path orelse {
+        if (edges.len == 0) return null;
+        return error.InvalidRemoteResponse;
+    };
+    const tables = node.path_tables orelse &.{};
+    return try toOpenApiGraphPathEdges(alloc, path, tables, edges);
+}
+
 test "api query contract preserves algebraic graph path provenance" {
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_impl.deinit();
@@ -6057,8 +6126,12 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqualStrings("C", encoded[0].path.?[2].key);
     try std.testing.expectEqualStrings("entities", encoded[0].path.?[2].table.?);
     try std.testing.expectEqual(@as(usize, 2), encoded[0].path_edges.?.len);
-    try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type.?);
-    try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight.?);
+    try std.testing.expectEqualStrings("A", encoded[0].path_edges.?[0].from.key);
+    try std.testing.expect(encoded[0].path_edges.?[0].from.table == null);
+    try std.testing.expectEqualStrings("B", encoded[0].path_edges.?[0].to.key);
+    try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
+    try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
+    try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
     try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.object.get("mention_count").?.integer);
     try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
     try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);

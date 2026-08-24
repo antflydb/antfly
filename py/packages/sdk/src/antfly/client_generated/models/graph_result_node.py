@@ -9,11 +9,10 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.edge import Edge
+    from ..models.graph_path_edge import GraphPathEdge
     from ..models.graph_path_endpoint import GraphPathEndpoint
     from ..models.graph_result_node_document import GraphResultNodeDocument
     from ..models.graph_result_node_evidence import GraphResultNodeEvidence
-    from ..models.path_edge import PathEdge
 
 
 T = TypeVar("T", bound="GraphResultNode")
@@ -31,11 +30,10 @@ class GraphResultNode:
         document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
         path (list[GraphPathEndpoint] | Unset): Exact ordered node identities in the path from the start node to this
             node
-        path_edges (list[PathEdge] | Unset): Edges in path from start to this node
+        path_edges (list[GraphPathEdge] | Unset): Ordered typed edges in path from start to this node
         provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
             algebraic graph executor
         evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata
-        edges (list[Edge] | Unset): Connected edges when supplied by the graph executor.
     """
 
     key: str
@@ -44,10 +42,9 @@ class GraphResultNode:
     distance: float | Unset = UNSET
     document: GraphResultNodeDocument | Unset = UNSET
     path: list[GraphPathEndpoint] | Unset = UNSET
-    path_edges: list[PathEdge] | Unset = UNSET
+    path_edges: list[GraphPathEdge] | Unset = UNSET
     provenance: list[str] | Unset = UNSET
     evidence: GraphResultNodeEvidence | Unset = UNSET
-    edges: list[Edge] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,13 +82,6 @@ class GraphResultNode:
         if not isinstance(self.evidence, Unset):
             evidence = self.evidence.to_dict()
 
-        edges: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.edges, Unset):
-            edges = []
-            for edges_item_data in self.edges:
-                edges_item = edges_item_data.to_dict()
-                edges.append(edges_item)
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -115,18 +105,15 @@ class GraphResultNode:
             field_dict["provenance"] = provenance
         if evidence is not UNSET:
             field_dict["evidence"] = evidence
-        if edges is not UNSET:
-            field_dict["edges"] = edges
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.edge import Edge
+        from ..models.graph_path_edge import GraphPathEdge
         from ..models.graph_path_endpoint import GraphPathEndpoint
         from ..models.graph_result_node_document import GraphResultNodeDocument
         from ..models.graph_result_node_evidence import GraphResultNodeEvidence
-        from ..models.path_edge import PathEdge
 
         d = dict(src_dict)
         key = d.pop("key")
@@ -154,11 +141,11 @@ class GraphResultNode:
                 path.append(path_item)
 
         _path_edges = d.pop("path_edges", UNSET)
-        path_edges: list[PathEdge] | Unset = UNSET
+        path_edges: list[GraphPathEdge] | Unset = UNSET
         if _path_edges is not UNSET:
             path_edges = []
             for path_edges_item_data in _path_edges:
-                path_edges_item = PathEdge.from_dict(path_edges_item_data)
+                path_edges_item = GraphPathEdge.from_dict(path_edges_item_data)
 
                 path_edges.append(path_edges_item)
 
@@ -171,15 +158,6 @@ class GraphResultNode:
         else:
             evidence = GraphResultNodeEvidence.from_dict(_evidence)
 
-        _edges = d.pop("edges", UNSET)
-        edges: list[Edge] | Unset = UNSET
-        if _edges is not UNSET:
-            edges = []
-            for edges_item_data in _edges:
-                edges_item = Edge.from_dict(edges_item_data)
-
-                edges.append(edges_item)
-
         graph_result_node = cls(
             key=key,
             table=table,
@@ -190,7 +168,6 @@ class GraphResultNode:
             path_edges=path_edges,
             provenance=provenance,
             evidence=evidence,
-            edges=edges,
         )
 
         graph_result_node.additional_properties = d

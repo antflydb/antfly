@@ -17923,15 +17923,17 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"doc:a"},{"key":"shared","table":"entities"}]}],"paths":[{"nodes":[{"key":"doc:a"},{"key":"shared","table":"entities"}],"edges":[],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false},"took":1}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].nodes.len);
-    try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].path.?[0]);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path.?[0]);
     try std.testing.expect(result.graph_results[0].nodes[0].path_tables.?[0] == null);
     try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].path_tables.?[1].?);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].source);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].target);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
     try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
@@ -18201,7 +18203,11 @@ fn parseRemoteGraphNodeWithKey(
     errdefer if (owned_table) |table| alloc.free(table);
     const owned_path = if (item.path) |value| try cloneRemoteCanonicalGraphNodePath(alloc, value) else null;
     errdefer if (owned_path) |value| value.deinit(alloc);
-    const path_edges = if (item.path_edges) |value| try cloneRemoteGraphNodePathEdges(alloc, value) else null;
+    const path_edges = if (item.path_edges) |value| blk: {
+        const path = item.path orelse return error.InvalidQueryRequest;
+        try validateRemoteCanonicalGraphPathEdges(path, value);
+        break :blk try cloneRemoteCanonicalGraphNodePathEdges(alloc, value);
+    } else null;
     errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
     const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
     errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
@@ -18228,7 +18234,7 @@ fn parseRemoteLegacyGraphNodeWithKey(
     errdefer if (owned_table) |table| alloc.free(table);
     const path = if (item.path) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
     errdefer if (path) |value| freeRemoteGraphNodePath(alloc, value);
-    const path_edges = if (item.path_edges) |value| try cloneRemoteGraphNodePathEdges(alloc, value) else null;
+    const path_edges = if (item.path_edges) |value| try cloneRemoteLegacyGraphNodePathEdges(alloc, value) else null;
     errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
     const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
     errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
@@ -18383,7 +18389,7 @@ fn freeRemoteGraphNodePath(alloc: std.mem.Allocator, value: []const []const u8) 
     if (value.len > 0) alloc.free(value);
 }
 
-fn cloneRemoteGraphNodePathEdges(
+fn cloneRemoteLegacyGraphNodePathEdges(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.PathEdge,
 ) ![]graph_query_mod.PathEdgeInfo {
@@ -18404,6 +18410,34 @@ fn cloneRemoteGraphNodePathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight orelse return error.InvalidQueryRequest,
+            .metadata = metadata,
+        };
+        initialized += 1;
+    }
+    return edges;
+}
+
+fn cloneRemoteCanonicalGraphNodePathEdges(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathEdge,
+) ![]graph_query_mod.PathEdgeInfo {
+    const edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, value.len);
+    var initialized: usize = 0;
+    errdefer freeRemoteGraphNodePathEdgeItems(alloc, edges, initialized);
+    for (value, 0..) |item, i| {
+        const source = try alloc.dupe(u8, item.from.key);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, item.to.key);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, item.type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
+        edges[i] = .{
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = item.weight,
             .metadata = metadata,
         };
         initialized += 1;
@@ -18469,6 +18503,8 @@ fn parseRemoteCanonicalGraphPath(
     alloc: std.mem.Allocator,
     item: indexes_openapi.GraphPath,
 ) !graph_paths.Path {
+    if (item.length < 0 or @as(u64, @intCast(item.length)) != item.edges.len)
+        return error.InvalidQueryRequest;
     const nodes = try alloc.alloc([]const u8, item.nodes.len);
     var initialized_nodes: usize = 0;
     errdefer {
@@ -18496,7 +18532,8 @@ fn parseRemoteCanonicalGraphPath(
             initialized_tables += 1;
         }
     }
-    const edges = try parseRemotePathEdges(alloc, item.edges);
+    try validateRemoteCanonicalGraphPathEdges(item.nodes, item.edges);
+    const edges = try parseRemoteCanonicalPathEdges(alloc, item.edges);
     errdefer {
         for (edges) |edge| {
             alloc.free(edge.source);
@@ -18528,6 +18565,67 @@ fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         };
     }
     return edges;
+}
+
+fn parseRemoteCanonicalPathEdges(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathEdge,
+) ![]graph_paths.PathEdge {
+    const edges = try alloc.alloc(graph_paths.PathEdge, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (edges[0..initialized]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        if (edges.len > 0) alloc.free(edges);
+    }
+    for (value, 0..) |item, i| {
+        const source = try alloc.dupe(u8, item.from.key);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, item.to.key);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, item.type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
+        edges[i] = .{
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = item.weight,
+            .metadata = metadata,
+        };
+        initialized += 1;
+    }
+    return edges;
+}
+
+fn validateRemoteCanonicalGraphPathEdges(
+    nodes: []const indexes_openapi.GraphPathEndpoint,
+    edges: []const indexes_openapi.GraphPathEdge,
+) !void {
+    if (nodes.len == 0) {
+        if (edges.len != 0) return error.InvalidQueryRequest;
+        return;
+    }
+    if (edges.len != nodes.len - 1) return error.InvalidQueryRequest;
+    for (edges, 0..) |edge, i| {
+        if (!graphPathEndpointEql(edge.from, nodes[i]) or
+            !graphPathEndpointEql(edge.to, nodes[i + 1]))
+            return error.InvalidQueryRequest;
+    }
+}
+
+fn graphPathEndpointEql(
+    left: indexes_openapi.GraphPathEndpoint,
+    right: indexes_openapi.GraphPathEndpoint,
+) bool {
+    if (!std.mem.eql(u8, left.key, right.key)) return false;
+    if (left.table == null or right.table == null) return left.table == null and right.table == null;
+    return std.mem.eql(u8, left.table.?, right.table.?);
 }
 
 fn appendJsonFieldName(

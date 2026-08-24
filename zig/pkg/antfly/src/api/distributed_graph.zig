@@ -1567,6 +1567,14 @@ const DistributedEdgeReader = struct {
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
 
+    /// MATCH uses null as the canonical source-table qualifier. Graph edge
+    /// metadata necessarily uses absolute table names when an external hop
+    /// returns to that table, so normalize before the graph matcher performs
+    /// identity-sensitive cycle, predicate, and aggregate work.
+    pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        return canonicalGraphNodeTable(self.source_table, table);
+    }
+
     pub fn getEdges(
         self: @This(),
         a: std.mem.Allocator,

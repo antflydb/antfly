@@ -316,6 +316,8 @@ type (
 	GraphKeyNodeSelector           = oapi.GraphKeyNodeSelector
 	GraphIdentityNodeSelector      = oapi.GraphIdentityNodeSelector
 	GraphResultRefNodeSelector     = oapi.GraphResultRefNodeSelector
+	GraphPath                      = oapi.GraphPath
+	GraphPathEdge                  = oapi.GraphPathEdge
 	GraphPathEndpoint              = oapi.GraphPathEndpoint
 	GraphResultNode                = oapi.GraphResultNode
 	GraphResultBinding             = oapi.GraphResultBinding

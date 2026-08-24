@@ -12279,6 +12279,17 @@ export interface components {
              */
             std_dev_threshold?: number;
         };
+        /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
+        GraphPathEdge: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
+            type: string;
+            /** Format: double */
+            weight: number;
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
         /** @description A node in graph query results */
         GraphResultNode: {
             /** @description Document key */
@@ -12298,16 +12309,14 @@ export interface components {
             };
             /** @description Exact ordered node identities in the path from the start node to this node */
             path?: components["schemas"]["GraphPathEndpoint"][];
-            /** @description Edges in path from start to this node */
-            path_edges?: components["schemas"]["PathEdge"][];
+            /** @description Ordered typed edges in path from start to this node */
+            path_edges?: components["schemas"]["GraphPathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
             /** @description Parsed evidence envelope for provenance labels and edge metadata */
             evidence?: {
                 [key: string]: unknown;
             };
-            /** @description Connected edges when supplied by the graph executor. */
-            edges?: components["schemas"]["Edge"][];
         };
         GraphResultBinding: components["schemas"]["GraphResultNode"] | null;
         GraphResultRow: {
@@ -12367,7 +12376,8 @@ export interface components {
         GraphPath: {
             /** @description Ordered node identities. Table is omitted for nodes in the query table. */
             nodes: components["schemas"]["GraphPathEndpoint"][];
-            edges: components["schemas"]["PathEdge"][];
+            /** @description Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1]. */
+            edges: components["schemas"]["GraphPathEdge"][];
             /** Format: double */
             total_weight: number;
             length: number;

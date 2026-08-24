@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 if TYPE_CHECKING:
+    from ..models.graph_path_edge import GraphPathEdge
     from ..models.graph_path_endpoint import GraphPathEndpoint
-    from ..models.path_edge import PathEdge
 
 
 T = TypeVar("T", bound="GraphPath")
@@ -19,13 +19,13 @@ class GraphPath:
 
     Attributes:
         nodes (list[GraphPathEndpoint]): Ordered node identities. Table is omitted for nodes in the query table.
-        edges (list[PathEdge]):
+        edges (list[GraphPathEdge]): Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
         total_weight (float):
         length (int):
     """
 
     nodes: list[GraphPathEndpoint]
-    edges: list[PathEdge]
+    edges: list[GraphPathEdge]
     total_weight: float
     length: int
 
@@ -59,8 +59,8 @@ class GraphPath:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_path_edge import GraphPathEdge
         from ..models.graph_path_endpoint import GraphPathEndpoint
-        from ..models.path_edge import PathEdge
 
         d = dict(src_dict)
         nodes = []
@@ -73,7 +73,7 @@ class GraphPath:
         edges = []
         _edges = d.pop("edges")
         for edges_item_data in _edges:
-            edges_item = PathEdge.from_dict(edges_item_data)
+            edges_item = GraphPathEdge.from_dict(edges_item_data)
 
             edges.append(edges_item)
 

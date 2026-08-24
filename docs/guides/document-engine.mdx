@@ -220,6 +220,12 @@ answer. Table-qualified identities use `{"key":"…","table":"…"}`; omitting
 `table`, or explicitly naming the queried table, has the same identity
 semantics.
 
+Canonical paths preserve that identity on both nodes and edges. Each path edge
+uses typed `from` and `to` endpoints and is ordered with the node list:
+`edges[i]` traverses from `nodes[i]` to `nodes[i + 1]`. The deprecated
+`graph_searches` response keeps its original unqualified `source` and `target`
+edge keys during the compatibility window.
+
 `match` expresses branched conjunctive patterns and can return rows or exact
 named counts. Node filters are non-scoring stored-document predicates; they do
 not run full-text analyzers. Range predicates use explicit `numeric_range` or

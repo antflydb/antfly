@@ -388,6 +388,8 @@ from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
 from .graph_optional_match_nodes import GraphOptionalMatchNodes
 from .graph_path import GraphPath
+from .graph_path_edge import GraphPathEdge
+from .graph_path_edge_metadata import GraphPathEdgeMetadata
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
@@ -1299,6 +1301,8 @@ __all__ = (
     "GraphOptionalMatch",
     "GraphOptionalMatchNodes",
     "GraphPath",
+    "GraphPathEdge",
+    "GraphPathEdgeMetadata",
     "GraphPathEndpoint",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",

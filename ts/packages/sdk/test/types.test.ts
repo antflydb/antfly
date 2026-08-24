@@ -21,6 +21,7 @@ import type {
   GraphDocumentFilter,
   GraphMatchQuery,
   GraphNodesResult,
+  GraphPathEdge,
   LegacyGraphQueryResult,
   MatchQuery,
   NumericRangeQuery,
@@ -232,6 +233,18 @@ describe("Antfly Query Type Integration", () => {
       expect(bindings.kind).toBe("bindings");
       expect(aggregates.aggregates.count?.exact).toBe(true);
       expect(nodes.kind).toBe("nodes");
+    });
+
+    it("exports table-qualified canonical path edges", () => {
+      const edge: GraphPathEdge = {
+        from: { key: "shared" },
+        to: { key: "shared", table: "entities" },
+        type: "references",
+        weight: 1,
+      };
+
+      expect(edge.from.table).toBeUndefined();
+      expect(edge.to.table).toBe("entities");
     });
 
     it("rejects analyzer-backed and full-text range shapes in graph filters", () => {
