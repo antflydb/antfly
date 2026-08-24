@@ -529,6 +529,12 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if lease.Annotations == nil {
 		lease.Annotations = map[string]string{}
 	}
+	// Runtime status can briefly lag after a role/topology transition. Once the
+	// Lease carries a positive boundary for an unchanged fencing identity, an
+	// ordinary renewal may advance that lower bound but must never regress it.
+	// Successor bootstrap still performs its exact boundary comparison above;
+	// this normalization is deliberately limited to the final renewal write.
+	scope = haFencingLeaseScopeWithMonotonicBoundary(lease, scope)
 	if !preserveTransferredScope {
 		for key, value := range scope.annotations() {
 			lease.Annotations[key] = value
@@ -1077,6 +1083,30 @@ func (scope haFencingLeaseScope) annotations() map[string]string {
 		haFencingLeaseAnnotationCurrentPrimaryID: scope.currentPrimaryID,
 		haFencingLeaseAnnotationPrimaryLSN:       strconv.FormatUint(scope.primaryLSN, 10),
 	}
+}
+
+func haFencingLeaseScopeWithMonotonicBoundary(lease *coordinationv1.Lease, scope haFencingLeaseScope) haFencingLeaseScope {
+	if lease == nil || lease.Annotations == nil {
+		return scope
+	}
+	identityAnnotations := scope.annotations()
+	for _, key := range []string{
+		haFencingLeaseAnnotationClusterID,
+		haFencingLeaseAnnotationShardID,
+		haFencingLeaseAnnotationTableID,
+		haFencingLeaseAnnotationTimelineID,
+		haFencingLeaseAnnotationEpoch,
+		haFencingLeaseAnnotationCurrentPrimaryID,
+	} {
+		if lease.Annotations[key] != identityAnnotations[key] {
+			return scope
+		}
+	}
+	persisted, err := strconv.ParseUint(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64)
+	if err == nil && persisted > scope.primaryLSN {
+		scope.primaryLSN = persisted
+	}
+	return scope
 }
 
 func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseScope) bool {

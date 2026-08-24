@@ -501,6 +501,21 @@ func TestCommittedTransferBindsExactSuccessorProcessAndScope(t *testing.T) {
 	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" {
 		t.Fatalf("ordinary successor renewal did not advance the positive boundary: %#v", observed)
 	}
+
+	// A lagging post-transition runtime observation must not lower the durable
+	// boundary used by any subsequent failover decision.
+	now = leaseTime.Add(17 * time.Second)
+	proof.ObservedAt = metav1.NewTime(now.Add(-time.Second))
+	successor.Status.HAStatus.PrimaryLSN = 687
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("renew successor with lagging positive boundary: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" {
+		t.Fatalf("ordinary successor renewal regressed the durable positive boundary: %#v", observed)
+	}
 }
 
 func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
