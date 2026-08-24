@@ -11920,8 +11920,10 @@ export interface components {
         };
         /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers. Alias-to-alias predicates belong in GraphMatch.where. */
         GraphDocumentFilter: components["schemas"]["GraphDocumentFuzzyFilter"] | components["schemas"]["GraphDocumentTermFilter"] | components["schemas"]["GraphDocumentPrefixFilter"] | components["schemas"]["GraphDocumentRegexpFilter"] | components["schemas"]["GraphDocumentWildcardFilter"] | components["schemas"]["GraphDocumentNumericRangeFilter"] | components["schemas"]["GraphDocumentTermRangeFilter"] | components["schemas"]["GraphDocumentDateRangeFilter"] | components["schemas"]["GraphDocumentMatchAllFilter"] | components["schemas"]["GraphDocumentMatchNoneFilter"] | components["schemas"]["GraphDocumentIdsFilter"] | components["schemas"]["GraphDocumentBoolFieldFilter"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
-        /** @description Declared under an alias of at most 128 Unicode code points. */
+        /** @description Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of a branched pattern. */
         GraphMatchNode: {
+            /** @description Owning table for this alias. Omit for the queried table. */
+            table?: string;
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };

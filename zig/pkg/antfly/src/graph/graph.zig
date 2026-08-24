@@ -58,6 +58,40 @@ pub const Edge = struct {
     metadata: []const u8, // raw JSON bytes
 };
 
+/// Stable cursor for one logical adjacency scan. `type_index` addresses the
+/// caller's edge-type list (zero also represents the wildcard scan), while the
+/// remaining fields reconstruct the last physical key emitted from that phase.
+pub const EdgeScanCursor = struct {
+    direction: EdgeDirection,
+    type_index: u32,
+    edge_type: []u8,
+    adjacent_key: []u8,
+    at_phase_start: bool = false,
+
+    pub fn deinit(self: *EdgeScanCursor, alloc: Allocator) void {
+        alloc.free(self.edge_type);
+        alloc.free(self.adjacent_key);
+        self.* = undefined;
+    }
+};
+
+pub const EdgePage = struct {
+    edges: []Edge,
+    next_cursor: ?EdgeScanCursor = null,
+    owned_bytes: usize = 0,
+
+    pub fn deinit(self: *EdgePage, alloc: Allocator) void {
+        if (self.edges.len > 0) GraphIndex.freeEdges(alloc, self.edges);
+        if (self.next_cursor) |*cursor| cursor.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const EdgePageLimits = struct {
+    max_edges: usize,
+    max_owned_bytes: usize,
+};
+
 /// A physical, table-local relationship identity. Graph edge keys are laid out
 /// by this tuple, so a batch of probes can be answered without materializing
 /// either endpoint's complete adjacency list.
@@ -1049,6 +1083,246 @@ pub const GraphIndex = struct {
         return try results.toOwnedSlice(alloc);
     }
 
+    /// Read one bounded page of an adjacency in the same deterministic order
+    /// as `getEdgesByTypes`. The cursor contains logical edge identity rather
+    /// than backend state, so a caller can resume against the same pinned DB
+    /// generation across an internal RPC boundary.
+    pub fn getEdgesByTypesPage(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        scan_cursor: ?EdgeScanCursor,
+        limits: EdgePageLimits,
+    ) !EdgePage {
+        if (limits.max_edges == 0 or limits.max_owned_bytes == 0)
+            return error.QueryCandidateBudgetExceeded;
+
+        var results = std.ArrayListUnmanaged(Edge).empty;
+        errdefer {
+            for (results.items) |edge| freeEdge(alloc, edge);
+            results.deinit(alloc);
+        }
+        var owned_bytes: usize = 0;
+        const type_count: usize = if (edge_types.len == 0) 1 else edge_types.len;
+        var type_index: usize = if (scan_cursor) |cursor| cursor.type_index else 0;
+        if (type_index >= type_count) return error.InvalidArgument;
+        if (scan_cursor) |cursor| {
+            if (cursor.direction == .both or
+                (direction == .out and cursor.direction != .out) or
+                (direction == .in and cursor.direction != .in) or
+                (edge_types.len > 0 and !std.mem.eql(u8, cursor.edge_type, edge_types[type_index])))
+                return error.InvalidArgument;
+            if (edge_types.len > 0) {
+                for (edge_types[0..type_index]) |prior| {
+                    if (std.mem.eql(u8, edge_types[type_index], prior)) return error.InvalidArgument;
+                }
+            }
+        }
+
+        while (type_index < type_count) : (type_index += 1) {
+            if (edge_types.len > 0) {
+                var duplicate = false;
+                for (edge_types[0..type_index]) |prior| {
+                    if (std.mem.eql(u8, edge_types[type_index], prior)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+            }
+            const requested_type = if (edge_types.len == 0) "" else edge_types[type_index];
+            var phase: EdgeDirection = if (scan_cursor) |cursor|
+                if (cursor.type_index == type_index) cursor.direction else firstScanDirection(direction)
+            else
+                firstScanDirection(direction);
+
+            while (true) {
+                if (results.items.len >= limits.max_edges or owned_bytes >= limits.max_owned_bytes) {
+                    var next_cursor = try edgeScanStartCursor(
+                        alloc,
+                        phase,
+                        @intCast(type_index),
+                        requested_type,
+                    );
+                    errdefer next_cursor.deinit(alloc);
+                    return .{
+                        .edges = try results.toOwnedSlice(alloc),
+                        .next_cursor = next_cursor,
+                        .owned_bytes = owned_bytes,
+                    };
+                }
+                const active_resume = if (scan_cursor) |cursor|
+                    cursor.type_index == type_index and cursor.direction == phase
+                else
+                    false;
+                const capped = try self.scanEdgePagePhase(
+                    alloc,
+                    &results,
+                    &owned_bytes,
+                    key,
+                    requested_type,
+                    @intCast(type_index),
+                    phase,
+                    if (active_resume) scan_cursor else null,
+                    limits,
+                );
+                if (capped) |cursor| {
+                    return .{
+                        .edges = try results.toOwnedSlice(alloc),
+                        .next_cursor = cursor,
+                        .owned_bytes = owned_bytes,
+                    };
+                }
+                if (direction != .both or phase == .in) break;
+                phase = .in;
+            }
+        }
+
+        return .{
+            .edges = try results.toOwnedSlice(alloc),
+            .owned_bytes = owned_bytes,
+        };
+    }
+
+    /// Materialize an adjacency only while it fits the caller's explicit
+    /// request budget. Page-sized scans ensure the budget is checked before a
+    /// high-degree node can force unbounded allocation.
+    pub fn getEdgesByTypesBounded(
+        self: *GraphIndex,
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) ![]Edge {
+        const page_edge_cap: usize = 4096;
+        const page_byte_cap: usize = 4 * 1024 * 1024;
+        var results = std.ArrayListUnmanaged(Edge).empty;
+        errdefer {
+            for (results.items) |edge| freeEdge(alloc, edge);
+            results.deinit(alloc);
+        }
+        var total_bytes: usize = 0;
+        var cursor: ?EdgeScanCursor = null;
+        defer if (cursor) |*value| value.deinit(alloc);
+
+        while (true) {
+            const edge_room = if (results.items.len < max_edges) max_edges - results.items.len else 0;
+            const byte_room = if (total_bytes < max_owned_bytes) max_owned_bytes - total_bytes else 0;
+            var page = try self.getEdgesByTypesPage(
+                alloc,
+                key,
+                edge_types,
+                direction,
+                cursor,
+                .{
+                    .max_edges = @min(page_edge_cap, std.math.add(usize, edge_room, 1) catch std.math.maxInt(usize)),
+                    .max_owned_bytes = @min(page_byte_cap, @max(byte_room, 1)),
+                },
+            );
+            if (cursor) |*value| value.deinit(alloc);
+            cursor = null;
+            errdefer page.deinit(alloc);
+
+            const next_count = std.math.add(usize, results.items.len, page.edges.len) catch
+                return error.QueryCandidateBudgetExceeded;
+            const next_bytes = std.math.add(usize, total_bytes, page.owned_bytes) catch
+                return error.QueryCandidateBudgetExceeded;
+            if (next_count > max_edges or next_bytes > max_owned_bytes)
+                return error.QueryCandidateBudgetExceeded;
+
+            try results.ensureUnusedCapacity(alloc, page.edges.len);
+            for (page.edges) |edge| results.appendAssumeCapacity(edge);
+            alloc.free(page.edges);
+            page.edges = @constCast((&[_]Edge{})[0..]);
+            total_bytes = next_bytes;
+            cursor = page.next_cursor;
+            page.next_cursor = null;
+            page.deinit(alloc);
+            if (cursor == null) break;
+        }
+        return try results.toOwnedSlice(alloc);
+    }
+
+    fn firstScanDirection(direction: EdgeDirection) EdgeDirection {
+        return if (direction == .in) .in else .out;
+    }
+
+    fn scanEdgePagePhase(
+        self: *GraphIndex,
+        alloc: Allocator,
+        results: *std.ArrayListUnmanaged(Edge),
+        owned_bytes: *usize,
+        key: []const u8,
+        requested_type: []const u8,
+        type_index: u32,
+        phase: EdgeDirection,
+        scan_cursor: ?EdgeScanCursor,
+        limits: EdgePageLimits,
+    ) !?EdgeScanCursor {
+        std.debug.assert(phase != .both);
+        const phase_start_len = results.items.len;
+        const prefix = if (phase == .out)
+            try edgePrefixAlloc(alloc, key, self.index_name, requested_type)
+        else
+            try reverseEdgePrefixAlloc(alloc, key, self.index_name, requested_type);
+        defer alloc.free(prefix);
+
+        const resume_key = if (scan_cursor) |cursor|
+            if (cursor.at_phase_start)
+                null
+            else if (phase == .out)
+                try edgeKeyAlloc(alloc, key, self.index_name, cursor.edge_type, cursor.adjacent_key)
+            else
+                try reverseEdgeKeyAlloc(alloc, key, self.index_name, cursor.edge_type, cursor.adjacent_key)
+        else
+            null;
+        defer if (resume_key) |value| alloc.free(value);
+
+        var txn = if (phase == .out) try self.beginReadOutgoingTxn() else try self.beginReadReverseTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+
+        var entry = (try cursor.seekAtOrAfter(resume_key orelse prefix)) orelse return null;
+        if (resume_key) |value| {
+            if (std.mem.eql(u8, entry.key, value)) entry = (try cursor.next()) orelse return null;
+        }
+
+        while (std.mem.startsWith(u8, entry.key, prefix)) {
+            if (results.items.len >= limits.max_edges)
+                return try edgeScanCursorFromPhysicalKey(alloc, phase, type_index, results.items[results.items.len - 1]);
+
+            const before = results.items.len;
+            if (phase == .out)
+                try appendEdgeFromKV(alloc, results, entry.key, entry.value)
+            else
+                try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value);
+            if (results.items.len != before) {
+                const appended = results.items[results.items.len - 1];
+                const edge_bytes = edgeOwnedBytes(appended);
+                const next_bytes = std.math.add(usize, owned_bytes.*, edge_bytes) catch
+                    return error.QueryCandidateBudgetExceeded;
+                if (next_bytes > limits.max_owned_bytes) {
+                    _ = results.pop();
+                    freeEdge(alloc, appended);
+                    if (results.items.len == 0) return error.QueryCandidateBudgetExceeded;
+                    if (results.items.len == phase_start_len)
+                        return try edgeScanStartCursor(alloc, phase, type_index, requested_type);
+                    return try edgeScanCursorFromPhysicalKey(alloc, phase, type_index, results.items[results.items.len - 1]);
+                }
+                owned_bytes.* = next_bytes;
+                if (results.items.len >= limits.max_edges)
+                    return try edgeScanCursorFromPhysicalKey(alloc, phase, type_index, appended);
+            }
+            entry = (try cursor.next()) orelse break;
+        }
+        return null;
+    }
+
     /// Resolve exact physical relationships with one snapshot and one sorted
     /// backend multi-get. Results remain aligned with `probes`; null means the
     /// relationship does not exist. Only found edges allocate edge payloads.
@@ -1483,6 +1757,48 @@ pub const GraphIndex = struct {
         return false;
     }
 
+    fn edgeOwnedBytes(edge: Edge) usize {
+        var total: usize = @sizeOf(Edge);
+        total = std.math.add(usize, total, edge.source.len) catch return std.math.maxInt(usize);
+        total = std.math.add(usize, total, edge.target.len) catch return std.math.maxInt(usize);
+        total = std.math.add(usize, total, edge.edge_type.len) catch return std.math.maxInt(usize);
+        return std.math.add(usize, total, edge.metadata.len) catch std.math.maxInt(usize);
+    }
+
+    fn edgeScanCursorFromPhysicalKey(
+        alloc: Allocator,
+        direction: EdgeDirection,
+        type_index: u32,
+        edge: Edge,
+    ) !EdgeScanCursor {
+        const edge_type = try alloc.dupe(u8, edge.edge_type);
+        errdefer alloc.free(edge_type);
+        const adjacent_key = try alloc.dupe(u8, if (direction == .out) edge.target else edge.source);
+        return .{
+            .direction = direction,
+            .type_index = type_index,
+            .edge_type = edge_type,
+            .adjacent_key = adjacent_key,
+        };
+    }
+
+    fn edgeScanStartCursor(
+        alloc: Allocator,
+        direction: EdgeDirection,
+        type_index: u32,
+        edge_type_name: []const u8,
+    ) !EdgeScanCursor {
+        const edge_type = try alloc.dupe(u8, edge_type_name);
+        errdefer alloc.free(edge_type);
+        return .{
+            .direction = direction,
+            .type_index = type_index,
+            .edge_type = edge_type,
+            .adjacent_key = try alloc.alloc(u8, 0),
+            .at_phase_start = true,
+        };
+    }
+
     /// Free an edge's allocated fields.
     pub fn freeEdge(alloc: Allocator, edge: Edge) void {
         alloc.free(edge.source);
@@ -1576,6 +1892,100 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+test "graph bounded adjacency pages preserve order and fail before budget overflow" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "bounded-page-store");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "bounded-page-rev");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+
+    for (0..5) |i| {
+        var target_buf: [16]u8 = undefined;
+        const target = try std.fmt.bufPrint(&target_buf, "doc-{d}", .{i});
+        try graph.addEdge("root", target, "cites", 1, 0, 0, "{}");
+    }
+
+    var first = try graph.getEdgesByTypesPage(
+        alloc,
+        "root",
+        &.{"cites"},
+        .out,
+        null,
+        .{ .max_edges = 2, .max_owned_bytes = 4096 },
+    );
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), first.edges.len);
+    try std.testing.expect(first.next_cursor != null);
+
+    var second = try graph.getEdgesByTypesPage(
+        alloc,
+        "root",
+        &.{"cites"},
+        .out,
+        first.next_cursor,
+        .{ .max_edges = 4, .max_owned_bytes = 4096 },
+    );
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), second.edges.len);
+    try std.testing.expect(second.next_cursor == null);
+    try std.testing.expectEqualStrings("doc-2", second.edges[0].target);
+
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 4, 4096),
+    );
+    const exact = try graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 5, 4096);
+    defer GraphIndex.freeEdges(alloc, exact);
+    try std.testing.expectEqual(@as(usize, 5), exact.len);
+    var cites_bytes: usize = 0;
+    for (exact) |edge| cites_bytes += GraphIndex.edgeOwnedBytes(edge);
+    try graph.addEdge("root", "doc-r", "refs", 1, 0, 0, "{}");
+    var typed_first = try graph.getEdgesByTypesPage(
+        alloc,
+        "root",
+        &.{ "cites", "refs" },
+        .out,
+        null,
+        .{ .max_edges = 10, .max_owned_bytes = cites_bytes },
+    );
+    defer typed_first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), typed_first.edges.len);
+    try std.testing.expect(typed_first.next_cursor.?.at_phase_start);
+    try std.testing.expectEqual(@as(u32, 1), typed_first.next_cursor.?.type_index);
+    var typed_second = try graph.getEdgesByTypesPage(
+        alloc,
+        "root",
+        &.{ "cites", "refs" },
+        .out,
+        typed_first.next_cursor,
+        .{ .max_edges = 10, .max_owned_bytes = 4096 },
+    );
+    defer typed_second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), typed_second.edges.len);
+    try std.testing.expectEqualStrings("refs", typed_second.edges[0].edge_type);
+    const deduplicated_types = try graph.getEdgesByTypesBounded(
+        alloc,
+        "root",
+        &.{ "cites", "cites" },
+        .out,
+        5,
+        4096,
+    );
+    defer GraphIndex.freeEdges(alloc, deduplicated_types);
+    try std.testing.expectEqual(@as(usize, 5), deduplicated_types.len);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 5, 1),
+    );
 }
 
 test "graph addEdge and getEdges in (reverse index)" {

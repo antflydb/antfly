@@ -1978,13 +1978,14 @@ test "query parser rejects graph queries and graph searches together" {
 
 test "query parser accepts graph pattern searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
+        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{"table":"entities"}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expect(owned.req.graph_queries[0].query.query_type == .pattern);
     try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.match_pattern.?.nodes.len);
+    try std.testing.expectEqualStrings("entities", owned.req.graph_queries[0].query.match_pattern.?.nodes[1].table.?);
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
     try std.testing.expectEqual(@as(u32, 10), owned.req.graph_queries[0].query.params.max_results);
 }

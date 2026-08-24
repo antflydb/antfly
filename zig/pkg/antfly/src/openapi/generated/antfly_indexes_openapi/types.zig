@@ -1750,8 +1750,10 @@ pub const GraphMatchEdge = struct {
     max_weight: ?f64 = null,
 };
 
-/// Declared under an alias of at most 128 Unicode code points.
+/// Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of a branched pattern.
 pub const GraphMatchNode = struct {
+    /// Owning table for this alias. Omit for the queried table.
+    table: ?[]const u8 = null,
     /// Non-scoring structured stored-document predicate evaluated for this alias.
     filter: ?GraphDocumentFilter = null,
 };

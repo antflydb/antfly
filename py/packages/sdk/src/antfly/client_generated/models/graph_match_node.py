@@ -30,20 +30,24 @@ T = TypeVar("T", bound="GraphMatchNode")
 
 @_attrs_define
 class GraphMatchNode:
-    """Declared under an alias of at most 128 Unicode code points.
+    """Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a
+    cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of
+    a branched pattern.
 
-    Attributes:
-        filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
-            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
-            GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
-            GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
-            GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
-            stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
-            deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
-            Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
-            Alias-to-alias predicates belong in GraphMatch.where.
+        Attributes:
+            table (str | Unset): Owning table for this alias. Omit for the queried table.
+            filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
+                GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
+                GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
+                GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
+                GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
+                stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
+                deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
+                Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
+                Alias-to-alias predicates belong in GraphMatch.where.
     """
 
+    table: str | Unset = UNSET
     filter_: (
         GraphDocumentBoolFieldFilter
         | GraphDocumentDateRangeFilter
@@ -78,6 +82,8 @@ class GraphMatchNode:
         from ..models.graph_document_term_filter import GraphDocumentTermFilter
         from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
         from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
+
+        table = self.table
 
         filter_: dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
@@ -116,6 +122,8 @@ class GraphMatchNode:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if table is not UNSET:
+            field_dict["table"] = table
         if filter_ is not UNSET:
             field_dict["filter"] = filter_
 
@@ -140,6 +148,7 @@ class GraphMatchNode:
         from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
 
         d = dict(src_dict)
+        table = d.pop("table", UNSET)
 
         def _parse_filter_(
             data: object,
@@ -284,6 +293,7 @@ class GraphMatchNode:
         filter_ = _parse_filter_(d.pop("filter", UNSET))
 
         graph_match_node = cls(
+            table=table,
             filter_=filter_,
         )
 

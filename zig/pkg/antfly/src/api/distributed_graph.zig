@@ -475,6 +475,8 @@ pub const GraphEdgesRequest = struct {
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
+    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
     timeout_ms: ?u32 = null,
     cancellation: ?CancellationToken = null,
 
@@ -691,6 +693,8 @@ const GraphEdgesRequestJson = struct {
     direction: []const u8 = "out",
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
+    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
+    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
     tensor_access_path: GraphTensorAccessPathJson,
     tensor_program: std.json.Value,
 };
@@ -1598,6 +1602,51 @@ const DistributedEdgeReader = struct {
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
+        return try self.getEdgesBounded(
+            a,
+            table,
+            key,
+            edge_types,
+            direction,
+            graph_pattern_mod.default_max_explored_edges,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        );
+    }
+
+    pub fn getEdgesBounded(
+        self: @This(),
+        a: std.mem.Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try self.getEdgesBoundedForPattern(
+            a,
+            table,
+            key,
+            edge_types,
+            direction,
+            max_edges,
+            max_owned_bytes,
+            false,
+        );
+    }
+
+    pub fn getEdgesBoundedForPattern(
+        self: @This(),
+        a: std.mem.Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+        source_table_declared: bool,
+    ) ![]graph_mod.Edge {
+        if (max_edges == 0 or max_owned_bytes == 0) return error.QueryCandidateBudgetExceeded;
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
@@ -1620,18 +1669,27 @@ const DistributedEdgeReader = struct {
                 key,
                 table_state.topology_epoch,
             )) orelse return error.TableNotFound;
-            var resp = try self.getEdgesFromGroup(a, table_name, table_state, group_id, key, edge_types, .out);
+            var resp = try self.getEdgesFromGroup(
+                a,
+                table_name,
+                table_state,
+                group_id,
+                key,
+                edge_types,
+                .out,
+                max_edges,
+                max_owned_bytes,
+            );
             const edges = resp.edges;
             resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
             resp.deinit(a);
             return edges;
         }
 
-        // The current MATCH contract does not declare a source table per alias.
-        // Consequently an external-table reverse hop cannot identify which
-        // table owns the source-sharded reverse index. Fail closed instead of
-        // returning an incomplete result; same-table reverse expansion is exact.
-        if (!std.mem.eql(u8, table_name, self.source_table))
+        // Legacy reverse expansion carries only the bound target table and
+        // therefore cannot identify an external source index. Canonical MATCH
+        // supplies the declared source-alias table explicitly.
+        if (!std.mem.eql(u8, table_name, self.source_table) and !source_table_declared)
             return error.UnsupportedQueryRequest;
 
         const routed = try table_catalog.routedSpanSnapshot(a, self.catalog, table_name, "", "");
@@ -1651,9 +1709,37 @@ const DistributedEdgeReader = struct {
         const fanout_io = self.worker.fanoutIo();
         const plan = planGraphFanout(fanout_io != null, self.worker.fanoutWidthCap(), routed.group_ids.len);
 
+        const Appender = struct {
+            fn appendCloned(
+                alloc: std.mem.Allocator,
+                output: *std.ArrayListUnmanaged(graph_mod.Edge),
+                seen: *GraphEdgeIdentitySet,
+                input: []const graph_mod.Edge,
+                deduplicate: bool,
+                edge_limit: usize,
+                byte_limit: usize,
+                owned_bytes: *usize,
+            ) !void {
+                for (input) |edge| {
+                    if (deduplicate and seen.contains(graphEdgeIdentity(edge))) continue;
+                    if (output.items.len >= edge_limit) return error.QueryCandidateBudgetExceeded;
+                    const edge_bytes = graphEdgeOwnedBytes(edge);
+                    if (edge_bytes > byte_limit -| owned_bytes.*) return error.QueryCandidateBudgetExceeded;
+                    const cloned = try cloneOwnedGraphEdge(alloc, edge);
+                    var cloned_owned = true;
+                    errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(alloc, cloned);
+                    try output.append(alloc, cloned);
+                    cloned_owned = false;
+                    owned_bytes.* += edge_bytes;
+                    if (deduplicate) try seen.put(alloc, graphEdgeIdentity(cloned), {});
+                }
+            }
+        };
+        var owned_bytes: usize = 0;
+
         if (fanout_io) |io| {
             if (plan.parallel) {
-                const slots = try a.alloc(GraphEdgesFanoutSlot, routed.group_ids.len);
+                const slots = try a.alloc(GraphEdgesFanoutSlot, plan.width);
                 defer {
                     for (slots) |*slot| slot.deinit();
                     a.free(slots);
@@ -1670,6 +1756,8 @@ const DistributedEdgeReader = struct {
                         key_inner: []const u8,
                         edge_types_inner: []const []const u8,
                         direction_inner: graph_mod.EdgeDirection,
+                        max_edges_inner: usize,
+                        max_owned_bytes_inner: usize,
                     ) void {
                         slot.result = reader.getEdgesFromGroup(
                             slot.arena.allocator(),
@@ -1679,6 +1767,8 @@ const DistributedEdgeReader = struct {
                             key_inner,
                             edge_types_inner,
                             direction_inner,
+                            max_edges_inner,
+                            max_owned_bytes_inner,
                         ) catch |err| {
                             slot.err = err;
                             return;
@@ -1689,8 +1779,13 @@ const DistributedEdgeReader = struct {
                 var start: usize = 0;
                 while (start < routed.group_ids.len) : (start += plan.width) {
                     const end = @min(start + plan.width, routed.group_ids.len);
+                    const wave_len = end - start;
+                    const remaining_edges = max_edges -| edges.items.len;
+                    const remaining_bytes = max_owned_bytes -| owned_bytes;
+                    const fair_edges = @max(@as(usize, 1), std.math.divCeil(usize, remaining_edges, wave_len) catch 1);
+                    const fair_bytes = @max(@as(usize, 1), std.math.divCeil(usize, remaining_bytes, wave_len) catch 1);
                     var group: std.Io.Group = .init;
-                    for (routed.group_ids[start..end], start..end) |group_id, i| {
+                    for (routed.group_ids[start..end], 0..) |group_id, i| {
                         group.async(io, Fiber.run, .{
                             self,
                             &slots[i],
@@ -1700,20 +1795,61 @@ const DistributedEdgeReader = struct {
                             key,
                             edge_types,
                             requested_direction,
+                            fair_edges,
+                            fair_bytes,
                         });
                     }
                     group.await(io) catch {};
-                }
-                for (slots) |slot| if (slot.err) |err| return err;
-                for (slots) |slot| {
-                    for (slot.result.?.edges) |edge| {
-                        if (direction == .both and seen_edges.contains(graphEdgeIdentity(edge))) continue;
-                        const cloned = try cloneOwnedGraphEdge(a, edge);
-                        var cloned_owned = true;
-                        errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(a, cloned);
-                        try edges.append(a, cloned);
-                        cloned_owned = false;
-                        if (direction == .both) try seen_edges.put(a, graphEdgeIdentity(cloned), {});
+
+                    // Balanced shards complete concurrently within a fair share
+                    // of the remaining request budget. A skewed shard retries
+                    // after successful peers have been accounted, preserving
+                    // exactness without multiplying transient memory by fanout.
+                    for (slots[0..wave_len]) |slot| {
+                        if (slot.err) |err| switch (err) {
+                            error.QueryCandidateBudgetExceeded => continue,
+                            else => return err,
+                        };
+                        try Appender.appendCloned(
+                            a,
+                            &edges,
+                            &seen_edges,
+                            slot.result.?.edges,
+                            direction == .both,
+                            max_edges,
+                            max_owned_bytes,
+                            &owned_bytes,
+                        );
+                    }
+                    for (slots[0..wave_len], routed.group_ids[start..end]) |*slot, group_id| {
+                        const slot_err = slot.err orelse continue;
+                        if (slot_err != error.QueryCandidateBudgetExceeded) continue;
+                        var retry = try self.getEdgesFromGroup(
+                            a,
+                            table_name,
+                            table_state,
+                            group_id,
+                            key,
+                            edge_types,
+                            requested_direction,
+                            @max(@as(usize, 1), max_edges -| edges.items.len),
+                            @max(@as(usize, 1), max_owned_bytes -| owned_bytes),
+                        );
+                        defer retry.deinit(a);
+                        try Appender.appendCloned(
+                            a,
+                            &edges,
+                            &seen_edges,
+                            retry.edges,
+                            direction == .both,
+                            max_edges,
+                            max_owned_bytes,
+                            &owned_bytes,
+                        );
+                    }
+                    for (slots[0..wave_len]) |*slot| {
+                        slot.deinit();
+                        slot.* = .init();
                     }
                 }
                 return try edges.toOwnedSlice(a);
@@ -1729,19 +1865,20 @@ const DistributedEdgeReader = struct {
                 key,
                 edge_types,
                 requested_direction,
+                @max(@as(usize, 1), max_edges -| edges.items.len),
+                @max(@as(usize, 1), max_owned_bytes -| owned_bytes),
             );
             defer resp.deinit(a);
-            try edges.ensureUnusedCapacity(a, resp.edges.len);
-            for (resp.edges) |edge| {
-                if (direction == .both and seen_edges.contains(graphEdgeIdentity(edge))) {
-                    graph_mod.GraphIndex.freeEdge(a, edge);
-                    continue;
-                }
-                if (direction == .both) try seen_edges.put(a, graphEdgeIdentity(edge), {});
-                edges.appendAssumeCapacity(edge);
-            }
-            a.free(resp.edges);
-            resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
+            try Appender.appendCloned(
+                a,
+                &edges,
+                &seen_edges,
+                resp.edges,
+                direction == .both,
+                max_edges,
+                max_owned_bytes,
+                &owned_bytes,
+            );
         }
         return try edges.toOwnedSlice(a);
     }
@@ -1755,7 +1892,13 @@ const DistributedEdgeReader = struct {
         key: []const u8,
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
     ) !GraphEdgesResponse {
+        if (max_edges == 0 or max_owned_bytes == 0 or
+            max_edges > graph_pattern_mod.default_max_explored_edges or
+            max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
+            return error.QueryCandidateBudgetExceeded;
         var request_owns_fields = false;
         const index_name = try a.dupe(u8, self.index_name);
         errdefer if (!request_owns_fields) a.free(index_name);
@@ -1779,6 +1922,8 @@ const DistributedEdgeReader = struct {
             .tensor_program = tensor_program,
             .topology_epoch = table_state.topology_epoch,
             .identity_read_generation = try table_state.generationForGroup(group_id),
+            .max_edges = @intCast(max_edges),
+            .max_owned_bytes = @intCast(max_owned_bytes),
         };
         request_owns_fields = true;
         defer req.deinit(a);
@@ -1842,6 +1987,14 @@ fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mo
         .updated_at = edge.updated_at,
         .metadata = metadata,
     };
+}
+
+fn graphEdgeOwnedBytes(edge: graph_mod.Edge) usize {
+    var total: usize = @sizeOf(graph_mod.Edge);
+    total = std.math.add(usize, total, edge.source.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.target.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.edge_type.len) catch return std.math.maxInt(usize);
+    return std.math.add(usize, total, edge.metadata.len) catch std.math.maxInt(usize);
 }
 
 fn executeDistributedPattern(
@@ -4234,6 +4387,7 @@ fn identityGenerationFromResolvedFilterEnvelope(
 
 pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
     try validateGraphEdgesTensorAccessPath(alloc, req);
+    try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes);
     var fragment_names: ?[][]const u8 = null;
     defer if (fragment_names) |names| alloc.free(names);
     var output_dim_names: ?[][]const u8 = null;
@@ -4255,6 +4409,8 @@ pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest)
         },
         .topology_epoch = req.topology_epoch,
         .identity_read_generation = req.identity_read_generation,
+        .max_edges = req.max_edges,
+        .max_owned_bytes = req.max_owned_bytes,
         .tensor_access_path = try graphTensorAccessPathJsonAlloc(alloc, tensor_path, &fragment_names, &output_dim_names, &law_names),
         .tensor_program = tensor_program_json.value,
     });
@@ -4273,6 +4429,7 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
         tensor_access_path,
         &tensor_program,
     );
+    try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes);
     return .{
         .index_name = try alloc.dupe(u8, parsed.value.index_name),
         .key = try alloc.dupe(u8, parsed.value.key),
@@ -4285,9 +4442,17 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
             .out,
         .topology_epoch = parsed.value.topology_epoch,
         .identity_read_generation = parsed.value.identity_read_generation,
+        .max_edges = parsed.value.max_edges,
+        .max_owned_bytes = parsed.value.max_owned_bytes,
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
+}
+
+fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32) !void {
+    if (max_edges == 0 or max_edges > graph_pattern_mod.default_max_explored_edges or
+        max_owned_bytes == 0 or max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
+        return error.InvalidQueryRequest;
 }
 
 fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge {
@@ -8433,6 +8598,8 @@ test "distributed graph edges request preserves typed graph edge access path" {
         .direction = .both,
         .topology_epoch = 42,
         .identity_read_generation = 12345,
+        .max_edges = 17,
+        .max_owned_bytes = 4096,
         .tensor_access_path = try cloneGraphTensorAccessPathAlloc(alloc, algebraic_ir.graphEdgeAccessPath("graph_idx")),
         .tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(alloc, "graph_idx"),
     };
@@ -8457,6 +8624,8 @@ test "distributed graph edges request preserves typed graph edge access path" {
     try std.testing.expectEqualStrings("mentions", parsed.edge_types[1]);
     try std.testing.expectEqual(@as(u64, 42), parsed.topology_epoch);
     try std.testing.expectEqual(@as(?u64, 12345), parsed.identity_read_generation);
+    try std.testing.expectEqual(@as(u32, 17), parsed.max_edges);
+    try std.testing.expectEqual(@as(u32, 4096), parsed.max_owned_bytes);
     try std.testing.expect(parsed.tensor_access_path != null);
     try std.testing.expect(parsed.tensor_program != null);
     try std.testing.expectEqualStrings(expected_program_id, parsed.tensor_program.?.program_id);
@@ -8659,6 +8828,20 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     defer reader.freeEdges(alloc, both);
     try std.testing.expectEqual(@as(usize, 2), both.len);
     try std.testing.expectEqual(@as(u32, 5), state.calls);
+
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        reader.getEdgesBounded(
+            alloc,
+            null,
+            "doc:z",
+            &.{"links"},
+            .in,
+            1,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        ),
+    );
+    try std.testing.expectEqual(@as(u32, 7), state.calls);
 }
 
 test "distributed graph edges response round trips owned edges" {

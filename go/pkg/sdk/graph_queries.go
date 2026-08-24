@@ -498,9 +498,12 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		return fmt.Errorf("antfly: graph match exceeds the %d optional-pattern complexity budget", maxGraphOptionalPatterns)
 	}
 	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
-	for alias := range query.Match.Nodes {
+	for alias, node := range query.Match.Nodes {
 		if !validGraphIdentifier(alias) {
 			return fmt.Errorf("antfly: graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		}
+		if node.Table != "" && strings.TrimSpace(node.Table) == "" {
+			return fmt.Errorf("antfly: graph alias %q table must not be blank", alias)
 		}
 	}
 	visible := make(map[string]struct{}, len(query.Match.Nodes))

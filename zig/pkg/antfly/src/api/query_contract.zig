@@ -9577,6 +9577,7 @@ fn parseGraphMatchNodes(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(i
     errdefer {
         for (nodes[0..initialized]) |node| {
             alloc.free(node.alias);
+            if (node.table) |table| alloc.free(table);
             freePatternNodeFilter(alloc, node.filter);
         }
         alloc.free(nodes);
@@ -9586,10 +9587,16 @@ fn parseGraphMatchNodes(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(i
         if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*)) return error.InvalidQueryRequest;
         const alias = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(alias);
+        const table = if (entry.value_ptr.table) |table_name| blk: {
+            if (table_name.len == 0) return error.InvalidQueryRequest;
+            break :blk try alloc.dupe(u8, table_name);
+        } else null;
+        errdefer if (table) |table_name| alloc.free(table_name);
         const filter = try parseGraphFilterValue(alloc, entry.value_ptr.filter);
         errdefer freePatternNodeFilter(alloc, filter);
         nodes[initialized] = .{
             .alias = alias,
+            .table = table,
             .filter = filter,
         };
         initialized += 1;
@@ -11902,6 +11909,7 @@ pub fn freeGraphQuery(alloc: std.mem.Allocator, query: graph_query_mod.GraphQuer
 fn freeGraphMatchNodes(alloc: std.mem.Allocator, nodes: []const graph_pattern_mod.MatchNode) void {
     for (nodes) |node| {
         alloc.free(node.alias);
+        if (node.table) |table| alloc.free(table);
         freePatternNodeFilter(alloc, node.filter);
     }
     if (nodes.len > 0) alloc.free(nodes);

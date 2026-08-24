@@ -28,6 +28,7 @@ pub const Error = operation.ApiError || error{
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    QueryCandidateBudgetExceeded,
     GroupLeaderUnavailable,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
@@ -712,6 +713,7 @@ pub const Operations = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.UnknownGroup, error.TableNotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse error.NotFound;

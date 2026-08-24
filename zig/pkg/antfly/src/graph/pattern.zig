@@ -33,6 +33,7 @@ pub const max_identifier_codepoints: usize = 128;
 pub const max_identifier_bytes: usize = max_identifier_codepoints * 4;
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
+pub const default_max_explored_edge_bytes: usize = 64 * 1024 * 1024;
 pub const default_max_intermediate_states: usize = 100_000;
 pub const default_max_distinct_identities: usize = 100_000;
 pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
@@ -59,6 +60,11 @@ pub const PatternEdgeStep = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     types: []const []const u8 = &.{},
+    /// Execution-only source-table hint installed when a conjunctive edge is
+    /// expanded in reverse from its bound target. The boolean distinguishes a
+    /// declared query-table alias (null) from the absence of an override.
+    reverse_from_declared_alias: bool = false,
+    reverse_source_table: ?[]const u8 = null,
 };
 
 pub const PatternStep = struct {
@@ -131,6 +137,9 @@ test "pattern match take transfers optional null alias ownership" {
 
 pub const MatchNode = struct {
     alias: []const u8,
+    /// Null denotes the query table; otherwise this is the alias's owning
+    /// table and participates in exact identity matching and reverse routing.
+    table: ?[]const u8 = null,
     filter: NodeFilter = .{},
 };
 
@@ -221,9 +230,22 @@ pub const MatchOptions = struct {
 pub const WorkBudget = struct {
     remaining_nodes: usize,
     remaining_edges: usize,
+    remaining_edge_bytes: usize,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
-        return .{ .remaining_nodes = max_nodes, .remaining_edges = max_edges };
+        return .{
+            .remaining_nodes = max_nodes,
+            .remaining_edges = max_edges,
+            .remaining_edge_bytes = default_max_explored_edge_bytes,
+        };
+    }
+
+    pub fn edgeLimit(self: WorkBudget) usize {
+        return self.remaining_edges;
+    }
+
+    pub fn edgeByteLimit(self: WorkBudget) usize {
+        return self.remaining_edge_bytes;
     }
 
     fn consumeNode(self: *WorkBudget) !void {
@@ -235,7 +257,65 @@ pub const WorkBudget = struct {
         if (count > self.remaining_edges) return error.QueryCandidateBudgetExceeded;
         self.remaining_edges -= count;
     }
+
+    fn consumeEdgeBytes(self: *WorkBudget, bytes: usize) !void {
+        if (bytes > self.remaining_edge_bytes) return error.QueryCandidateBudgetExceeded;
+        self.remaining_edge_bytes -= bytes;
+    }
 };
+
+fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
+    var total: usize = 0;
+    for (edges) |edge| {
+        total = try std.math.add(usize, total, @sizeOf(graph_mod.Edge));
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
+}
+
+fn getEdgesForBudget(
+    alloc: Allocator,
+    edge_reader: anytype,
+    table: ?[]const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    work_budget: *WorkBudget,
+    source_table_declared: bool,
+) ![]graph_mod.Edge {
+    if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBoundedForPattern")) {
+        return try edge_reader.getEdgesBoundedForPattern(
+            alloc,
+            table,
+            key,
+            edge_types,
+            direction,
+            work_budget.edgeLimit(),
+            work_budget.edgeByteLimit(),
+            source_table_declared,
+        );
+    }
+    if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBounded")) {
+        return try edge_reader.getEdgesBounded(
+            alloc,
+            table,
+            key,
+            edge_types,
+            direction,
+            work_budget.edgeLimit(),
+            work_budget.edgeByteLimit(),
+        );
+    }
+    return try edge_reader.getEdges(alloc, table, key, edge_types, direction);
+}
+
+fn consumeMaterializedEdges(work_budget: *WorkBudget, edges: []const graph_mod.Edge) !void {
+    try work_budget.consumeEdges(edges.len);
+    try work_budget.consumeEdgeBytes(try edgeOwnedBytes(edges));
+}
 
 pub fn isValidIdentifier(value: []const u8) bool {
     if (value.len == 0 or value.len > max_identifier_bytes) return false;
@@ -330,6 +410,20 @@ pub fn matchPattern(
         ) ![]graph_mod.Edge {
             if (table != null) return try a.alloc(graph_mod.Edge, 0);
             return try self.graph_index.getEdgesByTypes(a, key, edge_types, direction);
+        }
+
+        pub fn getEdgesBounded(
+            self: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            edge_types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            max_edges: usize,
+            max_bytes: usize,
+        ) ![]graph_mod.Edge {
+            if (table != null) return try a.alloc(graph_mod.Edge, 0);
+            return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
         }
 
         pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
@@ -470,6 +564,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
                     start.key,
                     start_direction,
                     admission,
+                    work_budget,
                 );
             }
         }
@@ -678,12 +773,15 @@ fn matchExactTwoEdgePattern(
         return try alloc.alloc(PatternMatch, 0);
     }
 
-    const forward_edges = try edge_reader.getEdges(
+    const forward_edges = try getEdgesForBudget(
         alloc,
+        edge_reader,
         null,
         start_key,
         pattern[1].edge.types,
         pattern[1].edge.direction,
+        work_budget,
+        false,
     );
     defer edge_reader.freeEdges(alloc, forward_edges);
 
@@ -721,7 +819,7 @@ fn matchExactTwoEdgePattern(
     // Match generic-expansion accounting: one expanded start node, then one
     // expanded middle node and one exact relationship probe per candidate.
     try work_budget.consumeNode();
-    try work_budget.consumeEdges(forward_edges.len);
+    try consumeMaterializedEdges(work_budget, forward_edges);
     for (candidates.items) |_| try work_budget.consumeNode();
     try work_budget.consumeEdges(candidates.items.len);
 
@@ -888,19 +986,22 @@ fn findReachableNodes(
             try work_budget.consumeNode();
             if (frontier.hops >= max_hops) continue;
 
-            const edges = try edge_reader.getEdges(
+            const edges = try getEdgesForBudget(
                 alloc,
-                frontier.table,
+                edge_reader,
+                if (edge.reverse_from_declared_alias) edge.reverse_source_table else frontier.table,
                 frontier.key,
                 edge.types,
                 edge.direction,
+                work_budget,
+                edge.reverse_from_declared_alias,
             );
             defer edge_reader.freeEdges(alloc, edges);
             if (stats) |active| {
                 active.adjacency_reads += 1;
                 active.adjacency_edges += edges.len;
             }
-            try work_budget.consumeEdges(edges.len);
+            try consumeMaterializedEdges(work_budget, edges);
 
             const admitted_edges = if (node_admission) |admission| blk: {
                 const edge_mask = try alloc.alloc(bool, edges.len);
@@ -915,11 +1016,12 @@ fn findReachableNodes(
                 for (edges, 0..) |graph_edge, edge_index| {
                     if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = canonicalEdgeTargetTable(
+                    const target_table = resolvedEdgeTargetTable(
                         edge_reader,
                         frontier.table,
                         graph_edge,
                         target_key,
+                        edge,
                     );
                     const closes_required_target = target_required and
                         targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
@@ -956,11 +1058,12 @@ fn findReachableNodes(
                         if (!mask[edge_index]) continue;
                     } else if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                    const target_table = canonicalEdgeTargetTable(
+                    const target_table = resolvedEdgeTargetTable(
                         edge_reader,
                         frontier.table,
                         graph_edge,
                         target_key,
+                        edge,
                     );
                     const closes_required_target = target_required and
                         targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
@@ -981,11 +1084,12 @@ fn findReachableNodes(
 
             for (edges, 0..) |graph_edge, edge_index| {
                 const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                const target_table = canonicalEdgeTargetTable(
+                const target_table = resolvedEdgeTargetTable(
                     edge_reader,
                     frontier.table,
                     graph_edge,
                     target_key,
+                    edge,
                 );
                 const revisits_path = frontierContainsNode(
                     frontier.*,
@@ -1063,14 +1167,16 @@ fn startNodeAdmitted(
     start_key: []const u8,
     direction: graph_mod.EdgeDirection,
     admission: NodeAdmission,
+    work_budget: *WorkBudget,
 ) !bool {
     const keys = [_][]const u8{start_key};
     const admitted = try admission.filterLocalKeysAlloc(alloc, &keys);
     defer alloc.free(admitted);
     if (admitted[0] or direction == .out) return admitted[0];
 
-    const incoming = try edge_reader.getEdges(alloc, null, start_key, &.{}, .in);
+    const incoming = try getEdgesForBudget(alloc, edge_reader, null, start_key, &.{}, .in, work_budget, false);
     defer edge_reader.freeEdges(alloc, incoming);
+    try consumeMaterializedEdges(work_budget, incoming);
     for (incoming) |graph_edge| {
         if (std.mem.eql(u8, graph_edge.target, start_key) and
             (admission.external_targets or
@@ -1157,6 +1263,33 @@ fn canonicalEdgeTargetTable(
         return edge_reader.canonicalizeTable(table);
     }
     return table;
+}
+
+fn canonicalizeNodeTable(edge_reader: anytype, table: ?[]const u8) ?[]const u8 {
+    if (comptime @hasDecl(@TypeOf(edge_reader), "canonicalizeTable")) {
+        return edge_reader.canonicalizeTable(table);
+    }
+    return table;
+}
+
+fn resolvedEdgeTargetTable(
+    edge_reader: anytype,
+    current_table: ?[]const u8,
+    graph_edge: graph_mod.Edge,
+    target_key: []const u8,
+    step: PatternEdgeStep,
+) ?[]const u8 {
+    if (step.reverse_from_declared_alias and
+        step.direction == .in and
+        std.mem.eql(u8, target_key, graph_edge.source))
+    {
+        return canonicalizeNodeTable(edge_reader, step.reverse_source_table);
+    }
+    return canonicalEdgeTargetTable(edge_reader, current_table, graph_edge, target_key);
+}
+
+fn declaredNodeTableMatches(edge_reader: anytype, actual: ?[]const u8, declared: ?[]const u8) bool {
+    return optionalTableEql(actual, canonicalizeNodeTable(edge_reader, declared));
 }
 
 fn passesPrefixFilter(key: []const u8, filter: NodeFilter) bool {
@@ -1248,6 +1381,11 @@ pub fn matchConjunctivePattern(
             return try self.graph_index.getEdgesByTypes(a, key, types, direction);
         }
 
+        pub fn getEdgesBounded(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) ![]graph_mod.Edge {
+            if (table != null) return try a.alloc(graph_mod.Edge, 0);
+            return try self.graph_index.getEdgesByTypesBounded(a, key, types, direction, max_edges, max_bytes);
+        }
+
         pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
             graph_mod.GraphIndex.freeEdges(a, edges);
         }
@@ -1306,6 +1444,7 @@ fn matchConjunctivePatternLimitedWithEdgeReader(
     try validateConjunctivePattern(pattern);
 
     const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+    if (!declaredNodeTableMatches(edge_reader, null, anchor_node.table)) return error.InvalidArgument;
     var local_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
     const work_budget = opts.work_budget orelse &local_work_budget;
     const admitted_starts = if (opts.start_validation == .required and opts.node_admission != null)
@@ -1370,6 +1509,7 @@ fn buildConjunctiveStates(
     try validateConjunctivePattern(pattern);
 
     const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+    if (!declaredNodeTableMatches(edge_reader, null, anchor_node.table)) return error.InvalidArgument;
     const anchor_alias = anchor_node.alias;
     var local_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
     const work_budget: *WorkBudget = opts.work_budget orelse &local_work_budget;
@@ -1599,6 +1739,7 @@ pub const ConjunctiveCountAggregateStream = struct {
         try validateConjunctivePattern(pattern);
 
         const anchor_node = selectConjunctiveAnchor(pattern) orelse return error.InvalidArgument;
+        if (!declaredNodeTableMatches(edge_reader, null, anchor_node.table)) return error.InvalidArgument;
         var local_work_budget = WorkBudget.init(aggregate_opts.max_explored_nodes, aggregate_opts.max_explored_edges);
         const work_budget = aggregate_opts.work_budget orelse &local_work_budget;
         const admitted_starts = if (aggregate_opts.start_validation == .required and aggregate_opts.node_admission != null)
@@ -1680,6 +1821,11 @@ pub fn aggregateConjunctivePattern(
         pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             if (table != null) return try a.alloc(graph_mod.Edge, 0);
             return try self.graph_index.getEdgesByTypes(a, key, types, direction);
+        }
+
+        pub fn getEdgesBounded(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) ![]graph_mod.Edge {
+            if (table != null) return try a.alloc(graph_mod.Edge, 0);
+            return try self.graph_index.getEdgesByTypesBounded(a, key, types, direction, max_edges, max_bytes);
         }
 
         pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
@@ -1918,8 +2064,13 @@ fn streamConjunctiveGroup(
     const target = if (from_binding != null) to_binding else from_binding;
     var step = edge.step;
     const new_alias = if (from_binding != null) edge.to else edge.from;
-    if (from_binding == null) step.direction = reverseDirection(step.direction);
-    const node_filter = if (findMatchNode(group_nodes, new_alias)) |node| node.filter else NodeFilter{};
+    const new_node = findMatchNode(group_nodes, new_alias);
+    if (from_binding == null) {
+        step.direction = reverseDirection(step.direction);
+        step.reverse_from_declared_alias = true;
+        step.reverse_source_table = if (new_node) |node| node.table else null;
+    }
+    const node_filter = if (new_node) |node| node.filter else NodeFilter{};
     var target_node_storage: [1]node_identity.Ref = undefined;
     const target_nodes: []const node_identity.Ref = if (target) |binding| blk: {
         target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
@@ -1951,6 +2102,7 @@ fn streamConjunctiveGroup(
     defer processed[edge_index] = false;
     for (reachable) |reached| {
         if (sink.full()) break;
+        if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
         var expanded = try cloneConjunctiveState(alloc, state);
         defer expanded.deinit(alloc);
         if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
@@ -2001,7 +2153,7 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     }
 
     for (pattern.nodes, 0..) |node, i| {
-        if (!isValidIdentifier(node.alias)) return error.InvalidArgument;
+        if (!isValidIdentifier(node.alias) or (node.table != null and std.mem.trim(u8, node.table.?, " \t\r\n").len == 0)) return error.InvalidArgument;
         for (pattern.nodes[0..i]) |prior| if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
     }
     if (pattern.anchor_alias) |anchor_alias| {
@@ -2013,7 +2165,8 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     for (pattern.predicates) |predicate| try validateMatchPredicate(pattern.nodes, predicate);
     for (pattern.optional, 0..) |optional_pattern, optional_index| {
         for (optional_pattern.nodes, 0..) |node, node_index| {
-            if (!isValidIdentifier(node.alias) or findMatchNode(pattern.nodes, node.alias) != null)
+            if (!isValidIdentifier(node.alias) or (node.table != null and std.mem.trim(u8, node.table.?, " \t\r\n").len == 0) or
+                findMatchNode(pattern.nodes, node.alias) != null)
                 return error.InvalidArgument;
             for (optional_pattern.nodes[0..node_index]) |prior| {
                 if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
@@ -2239,8 +2392,13 @@ fn expandConjunctiveEdge(
     const target = if (from_binding != null) to_binding else from_binding;
     var step = edge.step;
     const new_alias = if (from_binding != null) edge.to else edge.from;
-    if (from_binding == null) step.direction = reverseDirection(step.direction);
-    const node_filter = if (findMatchNode(group_nodes, new_alias)) |node| node.filter else NodeFilter{};
+    const new_node = findMatchNode(group_nodes, new_alias);
+    if (from_binding == null) {
+        step.direction = reverseDirection(step.direction);
+        step.reverse_from_declared_alias = true;
+        step.reverse_source_table = if (new_node) |node| node.table else null;
+    }
+    const node_filter = if (new_node) |node| node.filter else NodeFilter{};
     var target_node_storage: [1]node_identity.Ref = undefined;
     const target_nodes: []const node_identity.Ref = if (target) |binding| blk: {
         target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
@@ -2268,6 +2426,7 @@ fn expandConjunctiveEdge(
         if (reachable.len > 0) alloc.free(reachable);
     }
     for (reachable) |reached| {
+        if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
         var expanded = try cloneConjunctiveState(alloc, state);
         errdefer expanded.deinit(alloc);
         if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
@@ -2669,6 +2828,67 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const paths_mod.PathEdge) void {
         alloc.free(edge.edge_type);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
+}
+
+test "conjunctive reverse expansion uses the declared cross-table source alias" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        pub fn canonicalizeTable(_: @This(), table: ?[]const u8) ?[]const u8 {
+            if (table) |name| if (std.mem.eql(u8, name, "docs")) return null;
+            return table;
+        }
+
+        pub fn getEdgesBoundedForPattern(
+            _: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            _: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            _: usize,
+            _: usize,
+            source_table_declared: bool,
+        ) ![]graph_mod.Edge {
+            const out = try a.alloc(graph_mod.Edge, 1);
+            if (std.mem.eql(u8, key, "author")) {
+                try std.testing.expect(table == null);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                out[0] = .{ .source = "author", .target = "post", .edge_type = "AUTHORED", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+                return out;
+            }
+            try std.testing.expectEqualStrings("post", key);
+            try std.testing.expectEqualStrings("entities", table.?);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.in, direction);
+            try std.testing.expect(source_table_declared);
+            out[0] = .{ .source = "reply", .target = "post", .edge_type = "REPLIES_TO", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"docs\"}" };
+            return out;
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+
+    const nodes = [_]MatchNode{
+        .{ .alias = "author" },
+        .{ .alias = "post" },
+        .{ .alias = "reply", .table = "entities" },
+    };
+    const edges = [_]MatchEdge{
+        .{ .from = "author", .to = "post", .step = .{ .types = &.{"AUTHORED"} } },
+        .{ .from = "reply", .to = "post", .step = .{ .types = &.{"REPLIES_TO"} } },
+    };
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{"author"},
+        .{ .anchor_alias = "author", .nodes = &nodes, .edges = &edges },
+        .{ .max_results = 0, .return_aliases = &.{"reply"} },
+    );
+    defer freeMatches(alloc, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("reply", matches[0].bindings[0].key);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
 }
 
 test "conjunctive match supports branches anti joins inequality and optional nulls" {

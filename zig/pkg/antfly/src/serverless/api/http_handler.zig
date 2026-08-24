@@ -5226,7 +5226,43 @@ const ServerlessPatternEdgeReader = struct {
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
-        return try allocPublicSegmentEdges(alloc, self.cached, self.budget, table, key, edge_types, direction, true);
+        return try self.getEdgesBounded(
+            alloc,
+            table,
+            key,
+            edge_types,
+            direction,
+            graph_pattern_mod.default_max_explored_edges,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        );
+    }
+
+    pub fn getEdgesBounded(
+        self: @This(),
+        alloc: Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_owned_bytes: usize,
+    ) ![]graph_mod.Edge {
+        // A serverless snapshot contains only the queried table's source
+        // segment. Treating an external alias as a local source would turn an
+        // incomplete MATCH into an exact-looking empty relation.
+        if (table != null) return error.UnsupportedQueryRequest;
+        return try allocPublicSegmentEdgesBounded(
+            alloc,
+            self.cached,
+            self.budget,
+            null,
+            key,
+            edge_types,
+            direction,
+            true,
+            max_edges,
+            max_owned_bytes,
+        );
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -5283,6 +5319,33 @@ fn allocPublicSegmentEdges(
     direction: graph_mod.EdgeDirection,
     include_qualified_targets: bool,
 ) ![]graph_mod.Edge {
+    return try allocPublicSegmentEdgesBounded(
+        alloc,
+        cached,
+        budget,
+        table,
+        key,
+        edge_types,
+        direction,
+        include_qualified_targets,
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+    );
+}
+
+fn allocPublicSegmentEdgesBounded(
+    alloc: Allocator,
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+    table: ?[]const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    include_qualified_targets: bool,
+    max_edges: usize,
+    max_owned_bytes: usize,
+) ![]graph_mod.Edge {
+    if (max_edges == 0 or max_owned_bytes == 0) return error.QueryCandidateBudgetExceeded;
     // Serverless snapshots contain one table-local graph segment. Never alias a
     // cross-table identity into that local key space.
     if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
@@ -5292,13 +5355,49 @@ fn allocPublicSegmentEdges(
         (if (direction == .in or direction == .both) adjacency.in_edges.len else 0);
     try budget.admitEdges(scanned);
 
+    const MetadataLengthCache = std.StringHashMapUnmanaged(usize);
+    var metadata_lengths = MetadataLengthCache.empty;
+    defer metadata_lengths.deinit(alloc);
+    const Metadata = struct {
+        fn encodedLength(
+            a: Allocator,
+            cache: *MetadataLengthCache,
+            target_table: ?[]const u8,
+        ) !usize {
+            const value = target_table orelse return 0;
+            if (cache.get(value)) |length| return length;
+            const encoded = try std.json.Stringify.valueAlloc(a, .{ .target_table = value }, .{});
+            defer a.free(encoded);
+            // Bound preflight bookkeeping independently of adversarial table
+            // cardinality while retaining the common repeated-table fast path.
+            if (cache.count() < 256) try cache.put(a, value, encoded.len);
+            return encoded.len;
+        }
+    };
     var edge_count: usize = 0;
+    var owned_bytes: usize = 0;
     if (direction == .out or direction == .both) for (adjacency.out_edges) |edge| {
         if (!include_qualified_targets and edge.neighbor_table_id != null) continue;
-        if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
+        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+        edge_count = std.math.add(usize, edge_count, 1) catch return error.QueryCandidateBudgetExceeded;
+        const metadata_len = try Metadata.encodedLength(alloc, &metadata_lengths, cached.segment.neighborTable(edge));
+        var edge_bytes: usize = @sizeOf(graph_mod.Edge);
+        edge_bytes = std.math.add(usize, edge_bytes, adjacency.node_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.neighbor_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.edge_type.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, metadata_len) catch return error.QueryCandidateBudgetExceeded;
+        owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch return error.QueryCandidateBudgetExceeded;
+        if (edge_count > max_edges or owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
     };
     if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
-        if (patternEdgeTypeRequested(edge.edge_type, edge_types)) edge_count += 1;
+        if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
+        edge_count = std.math.add(usize, edge_count, 1) catch return error.QueryCandidateBudgetExceeded;
+        var edge_bytes: usize = @sizeOf(graph_mod.Edge);
+        edge_bytes = std.math.add(usize, edge_bytes, edge.neighbor_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, adjacency.node_id.len) catch return error.QueryCandidateBudgetExceeded;
+        edge_bytes = std.math.add(usize, edge_bytes, edge.edge_type.len) catch return error.QueryCandidateBudgetExceeded;
+        owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch return error.QueryCandidateBudgetExceeded;
+        if (edge_count > max_edges or owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
     };
 
     const edges = try alloc.alloc(graph_mod.Edge, edge_count);
@@ -10828,6 +10927,36 @@ test "serverless public graph reader preserves qualified endpoint identity" {
     );
     defer if (qualified_path) |path| graph_paths.freePath(alloc, path);
     try std.testing.expect(qualified_path == null);
+
+    var pattern_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const pattern_reader = ServerlessPatternEdgeReader{ .cached = &cached, .budget = &pattern_budget };
+    const bounded = try pattern_reader.getEdgesBounded(
+        alloc,
+        null,
+        "doc:a",
+        &.{"mentions"},
+        .out,
+        1,
+        graph_pattern_mod.default_max_explored_edge_bytes,
+    );
+    defer pattern_reader.freeEdges(alloc, bounded);
+    try std.testing.expectEqual(@as(usize, 1), bounded.len);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        pattern_reader.getEdgesBounded(alloc, null, "doc:a", &.{"mentions"}, .out, 1, 1),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        pattern_reader.getEdgesBounded(
+            alloc,
+            "entities",
+            "shared",
+            &.{"mentions"},
+            .in,
+            1,
+            graph_pattern_mod.default_max_explored_edge_bytes,
+        ),
+    );
 }
 
 test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {

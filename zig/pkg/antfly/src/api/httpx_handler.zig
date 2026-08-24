@@ -1049,6 +1049,7 @@ pub const AntflyApiHandler = struct {
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
             else => textResponse(ctx, 500, "internal server error"),
         };
     }

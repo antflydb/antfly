@@ -224,6 +224,20 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected oversized graph alias error")
 	}
+	if _, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Anchor: "a",
+			Nodes: map[string]GraphMatchNode{
+				"a": {},
+				"b": {Table: "  "},
+			},
+			Edges: []GraphMatchEdge{{From: "a", To: "b"}},
+		},
+		Return: validReturn,
+	}); err == nil {
+		t.Fatal("expected blank graph alias table error")
+	}
 }
 
 func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {

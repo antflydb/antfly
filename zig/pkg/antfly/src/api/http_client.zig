@@ -1432,6 +1432,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            422 => return remoteGraphEdgesError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -3052,6 +3053,14 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remoteGraphEdgesError(body: []const u8) anyerror {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, message, "query candidate budget exceeded")) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return error.UnexpectedHttpStatus;
+}
+
 fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
     switch (status) {
@@ -3124,6 +3133,17 @@ test "api http client preserves remote storage read contention" {
     try std.testing.expectEqual(
         error.UnexpectedHttpStatus,
         remoteStorageReadUnavailableError("group leader unavailable"),
+    );
+}
+
+test "api http client preserves remote graph edge budget exhaustion" {
+    try std.testing.expectEqual(
+        error.QueryCandidateBudgetExceeded,
+        remoteGraphEdgesError("query candidate budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.UnexpectedHttpStatus,
+        remoteGraphEdgesError("invalid graph edge request"),
     );
 }
 

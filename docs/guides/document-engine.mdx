@@ -240,8 +240,9 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
         "anchor": "author",
         "nodes": {
           "author": {"filter": {"term": "person", "field": "kind"}},
-          "post": {},
+          "post": {"table": "messages"},
           "reply": {
+            "table": "messages",
             "filter": {
               "numeric_range": {"field": "score", "min": 0.8}
             }
@@ -270,8 +271,12 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
 ```
 
 Exact aggregation streams bindings without materializing a bounded row page.
-`match.anchor` names the alias enumerated from the query table; aliases reached
-through cross-table edges retain their table-qualified identities. Anchor
+`match.anchor` names the alias enumerated from the query table. Omit a node's
+`table` for that same table; declare `table` on every cross-table alias. The
+declaration is part of the alias's identity and lets the planner safely expand a
+relationship in reverse without guessing its source table. Reached aliases
+retain their table-qualified identities, and a binding from a different table
+never satisfies the declaration. Anchor
 identities are read in stable snapshot-pinned pages, independently for each
 named graph operation. A request may contain at most eight named `match`
 operations. Put multiple counts over one pattern in a single `match` return
