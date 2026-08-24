@@ -7691,10 +7691,14 @@ pub const DB = struct {
         } else 1.0;
         if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
 
-        const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata|
-            try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
-        else
-            "";
+        const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata| blk: {
+            // Edge metadata has one stable public shape across ingestion,
+            // storage, graph queries, and generated SDKs. Reject scalar or
+            // array values before they become durable artifacts rather than
+            // allowing a later response to violate the object contract.
+            if (metadata != .object) return error.InvalidGraphEdges;
+            break :blk try std.json.Stringify.valueAlloc(self.alloc, metadata, .{});
+        } else "";
         errdefer if (metadata_json.len > 0) self.alloc.free(@constCast(metadata_json));
 
         const index_name = try self.alloc.dupe(u8, path.index_name);
@@ -30868,6 +30872,7 @@ fn appendGraphEdgeArtifactWrite(
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     write: types.GraphEdgeWrite,
 ) !void {
+    try validateGraphEdgeMetadataJson(alloc, write.metadata_json);
     const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
     defer alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -30876,6 +30881,25 @@ fn appendGraphEdgeArtifactWrite(
         .key = owned_key,
         .value = payload,
     });
+}
+
+fn validateGraphEdgeMetadataJson(alloc: Allocator, metadata_json: []const u8) !void {
+    if (metadata_json.len == 0) return;
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, metadata_json, .{}) catch
+        return error.InvalidGraphEdges;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGraphEdges;
+}
+
+test "graph edge metadata accepts only the public object shape" {
+    const alloc = std.testing.allocator;
+    try validateGraphEdgeMetadataJson(alloc, "");
+    try validateGraphEdgeMetadataJson(alloc, "{}");
+    try validateGraphEdgeMetadataJson(alloc, "{\"kind\":\"citation\"}");
+    try std.testing.expectError(error.InvalidGraphEdges, validateGraphEdgeMetadataJson(alloc, "null"));
+    try std.testing.expectError(error.InvalidGraphEdges, validateGraphEdgeMetadataJson(alloc, "[]"));
+    try std.testing.expectError(error.InvalidGraphEdges, validateGraphEdgeMetadataJson(alloc, "\"legacy\""));
+    try std.testing.expectError(error.InvalidGraphEdges, validateGraphEdgeMetadataJson(alloc, "{"));
 }
 
 fn containsBatchWriteKey(list: []const types.BatchWrite, key: []const u8) bool {

@@ -1297,6 +1297,11 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    /// Owned, validated public `graph_queries` or `graph_searches` object used
+    /// only when a single-owner request must be proxied to its remote owner.
+    /// Keeping the admitted wire fragment avoids maintaining a second public
+    /// graph DSL serializer alongside the OpenAPI contract.
+    graph_queries_wire_json: []const u8 = "",
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1414,6 +1419,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_queries_wire_json",
     "merge_config",
     "reranker",
     "reranker_query_text",

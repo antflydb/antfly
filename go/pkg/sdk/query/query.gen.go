@@ -117,7 +117,9 @@ type DisjunctionQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
 	Boost     Boost   `json:"boost,omitempty,omitzero"`
 	Disjuncts []Query `json:"disjuncts"`
-	Min       float64 `json:"min,omitempty,omitzero"`
+
+	// Min Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+	Min *uint32 `json:"min,omitempty"`
 }
 
 // DocIdQuery defines model for DocIdQuery.
@@ -1246,37 +1248,38 @@ type ClientWithResponsesInterface interface {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"bHqCPZwQvbLns9t/AgAA//8=",
+	"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",
+	"5DJDARmjM/omnIZvaEAzMCt3Prv9bwAAAP//",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

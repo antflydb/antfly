@@ -296,8 +296,11 @@ components:
         boost:
           $ref: "#/components/schemas/Boost"
         min:
-          type: number
-          format: double
+          type: integer
+          format: uint32
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
       required:
         - disjuncts
     MatchAllQuery:

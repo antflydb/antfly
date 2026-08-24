@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { GraphPathEdge } from "../src/index.js";
 import type { components, operations } from "../src/public-api.js";
-import { match as matchQuery } from "../src/query-helpers.js";
+import { disjunction, match as matchQuery, term } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
   BatchRequest,
@@ -50,6 +50,20 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("Disjunction minimum", () => {
+    const clauses = [term("draft", "status"), term("pending", "status")];
+
+    it("distinguishes omission from an explicit zero", () => {
+      expect(disjunction(clauses)).toEqual({ disjuncts: clauses, min: undefined });
+      expect(disjunction(clauses, 0)).toEqual({ disjuncts: clauses, min: 0 });
+    });
+
+    it("rejects values outside the integer execution contract", () => {
+      expect(() => disjunction(clauses, 1.5)).toThrow(RangeError);
+      expect(() => disjunction(clauses, 3)).toThrow(RangeError);
+    });
+  });
+
   describe("Backup metadata availability responses", () => {
     it("types both retryable 503 variants", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];

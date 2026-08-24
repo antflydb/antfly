@@ -4206,22 +4206,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
 
-        var needs_graph_coordinator = requiresDistributedGraphCoordinator(group_ids.len, req);
-        if (!needs_graph_coordinator and group_ids.len == 1 and req.graph_queries.len > 0) {
-            var graph_route = (try table_router.resolveGroupRoute(
-                alloc,
-                self.catalog,
-                self.router,
-                group_ids[0],
-                routePolicyForConsistency(consistency),
-            )) orelse return null;
-            defer graph_route.deinit(alloc);
-            needs_graph_coordinator = switch (graph_route) {
-                .local => false,
-                .remote => true,
-            };
-        }
-        if (needs_graph_coordinator) {
+        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             const base_req = graphCoordinatorBaseRequest(req);
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
@@ -16676,10 +16661,6 @@ fn encodeScanRequest(
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
-    // Graph operations have dedicated typed worker envelopes. Serializing them
-    // through the generic query endpoint previously emitted the deprecated
-    // graph_searches shape under the canonical graph_queries name.
-    if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -16760,6 +16741,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.exclusion_text) |exclusion_text| {
         try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
+    if (req.graph_queries.len > 0) {
+        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_queries_wire_json);
+    }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
             .@"union" => "union",
@@ -16783,7 +16767,10 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     return try out.toOwnedSlice(alloc);
 }
 
-test "generic shard query wire rejects graph operations" {
+test "generic shard query wire preserves admitted canonical graph operations" {
+    const graph_wire =
+        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+    ;
     const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",
         .query = .{
@@ -16792,10 +16779,58 @@ test "generic shard query wire rejects graph operations" {
             .start_nodes = .{ .keys = &.{"doc:a"} },
         },
     }};
+    const encoded = try encodeQueryRequest(std.testing.allocator, .{
+        .graph_queries = &graph_queries,
+        .graph_queries_wire_json = graph_wire,
+    });
+    defer std.testing.allocator.free(encoded);
+    var parsed = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const graph_queries_value = parsed.value.object.get("graph_queries") orelse return error.TestUnexpectedResult;
+    const neighbors = graph_queries_value.object.get("neighbors") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("graph_idx", neighbors.object.get("index").?.string);
+    try std.testing.expect(neighbors.object.get("traverse") != null);
+}
+
+test "generic shard query wire fails closed without an admitted graph fragment" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"doc:a"} } },
+    }};
     try std.testing.expectError(
         error.UnsupportedQueryRequest,
         encodeQueryRequest(std.testing.allocator, .{ .graph_queries = &graph_queries }),
     );
+}
+
+/// Append the exact bounded graph operation map captured during admission.
+/// Reconstructing this from the execution AST would duplicate the public DSL
+/// and eventually drift as the OpenAPI contract evolves.
+fn appendGraphQueriesField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    graph_queries: []const db_mod.types.NamedGraphQuery,
+    graph_queries_wire_json: []const u8,
+) !void {
+    if (graph_queries.len == 0) return;
+    const legacy = graph_queries[0].query.legacy_response;
+    for (graph_queries[1..]) |named| {
+        if (named.query.legacy_response != legacy) return error.InvalidQueryRequest;
+    }
+
+    const wire = std.mem.trim(u8, graph_queries_wire_json, &std.ascii.whitespace);
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, wire, .{}) catch
+        return error.UnsupportedQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.count() != graph_queries.len)
+        return error.UnsupportedQueryRequest;
+    for (graph_queries) |named| {
+        if (parsed.value.object.get(named.name) == null) return error.UnsupportedQueryRequest;
+    }
+
+    try appendJsonFieldName(alloc, out, first, if (legacy) "graph_searches" else "graph_queries");
+    try out.appendSlice(alloc, wire);
 }
 
 fn appendQueryHierarchyField(

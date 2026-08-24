@@ -1511,7 +1511,8 @@ pub const GraphDocumentFilterConjunction = struct {
 
 pub const GraphDocumentFilterDisjunction = struct {
     disjuncts: []const GraphDocumentFilter,
-    min: ?f64 = null,
+    /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+    min: ?i64 = null,
 };
 
 pub const GraphDocumentFuzzyFilter = struct {

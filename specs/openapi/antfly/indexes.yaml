@@ -2869,9 +2869,12 @@ components:
           maxItems: 64
           items: { $ref: '#/components/schemas/GraphDocumentFilter' }
         min:
-          type: number
-          format: double
+          type: integer
+          format: uint32
           minimum: 0
+          maximum: 64
+          x-go-type-skip-optional-pointer: false
+          description: Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
     GraphDocumentFilter:
       oneOf:
         - $ref: '#/components/schemas/GraphDocumentFuzzyFilter'

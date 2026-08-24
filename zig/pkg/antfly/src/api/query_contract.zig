@@ -2620,6 +2620,9 @@ pub fn parseQueryRequestWithDeadline(
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
+    if (req.graph_queries.len > 0) {
+        req.graph_queries_wire_json = try captureGraphQueriesWireAlloc(alloc, effective_body);
+    }
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
     }
@@ -5956,7 +5959,7 @@ fn toOpenApiGraphPathEdges(
             },
             .type = edge.edge_type,
             .weight = edge.weight,
-            .metadata = try pathEdgeMetadataJsonValue(alloc, edge.metadata),
+            .metadata = try pathEdgeMetadataObjectJsonValue(alloc, edge.metadata),
         };
     }
     return out;
@@ -5965,6 +5968,33 @@ fn toOpenApiGraphPathEdges(
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
     if (metadata.len == 0) return null;
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
+}
+
+/// Canonical GraphPathEdge metadata is object-shaped. New writes enforce this
+/// at ingestion, while old durable records may contain scalar or malformed
+/// payloads accepted by earlier releases. Omit only that optional metadata on
+/// canonical reads so legacy data cannot break generated response decoders.
+fn pathEdgeMetadataObjectJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
+    if (metadata.len == 0) return null;
+    const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch return null;
+    return if (value == .object) value else null;
+}
+
+test "canonical graph path metadata safely reads legacy non-object records" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const object = (try pathEdgeMetadataObjectJsonValue(alloc, "{\"kind\":\"citation\"}")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(object == .object);
+    try std.testing.expectEqualStrings("citation", object.object.get("kind").?.string);
+    try std.testing.expect((try pathEdgeMetadataObjectJsonValue(alloc, "\"legacy\"")) == null);
+    try std.testing.expect((try pathEdgeMetadataObjectJsonValue(alloc, "{")) == null);
+
+    const legacy = (try pathEdgeMetadataJsonValue(alloc, "\"legacy\"")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("legacy", legacy.string);
 }
 
 fn graphNodeEvidenceJsonValue(
@@ -8209,8 +8239,25 @@ fn parseGeneratedBleveBooleanQuery(
     };
 }
 
-fn parsePublicMinimumShouldMatch(minimum: ?f64, clause_count: usize) !u32 {
-    const value = minimum orelse return 0;
+fn parsePublicMinimumShouldMatch(minimum: anytype, clause_count: usize) !u32 {
+    return switch (@typeInfo(@TypeOf(minimum))) {
+        .optional => if (minimum) |value|
+            parsePublicMinimumShouldMatchValue(value, clause_count)
+        else
+            0,
+        else => parsePublicMinimumShouldMatchValue(minimum, clause_count),
+    };
+}
+
+fn parsePublicMinimumShouldMatchValue(raw: anytype, clause_count: usize) !u32 {
+    // The public schema is integer-shaped. Keep the small float compatibility
+    // arm for raw JSON and rolling deployments generated from the old schema;
+    // both paths enforce the same exact integer execution contract.
+    const value: f64 = switch (@typeInfo(@TypeOf(raw))) {
+        .int, .comptime_int => @floatFromInt(raw),
+        .float, .comptime_float => @floatCast(raw),
+        else => @compileError("minimum_should_match must be numeric"),
+    };
     if (!std.math.isFinite(value) or
         value < 0 or
         @floor(value) != value or
@@ -9947,6 +9994,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
+    if (req.graph_queries_wire_json.len > 0) alloc.free(req.graph_queries_wire_json);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
     if (req.sparse) |sparse| {
         alloc.free(sparse.indices);
@@ -9971,6 +10019,22 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     }
     if (req.distributed_text_stats.len > 0) @import("../search/distributed_stats.zig").deinitTextFieldStats(alloc, req.distributed_text_stats);
     req.* = undefined;
+}
+
+/// Capture only the admitted graph operation map for transparent single-owner
+/// proxying. This stays independent of generated OpenAPI representation details
+/// and avoids a reverse serializer that would have to evolve with the DSL.
+fn captureGraphQueriesWireAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const canonical = parsed.value.object.get("graph_queries");
+    const legacy = parsed.value.object.get("graph_searches");
+    if (canonical != null and legacy != null) return error.InvalidQueryRequest;
+    const value = canonical orelse legacy orelse return error.InvalidQueryRequest;
+    if (value != .object) return error.InvalidQueryRequest;
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
 fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod.types.NamedDocFilterBinding) void {
@@ -14081,6 +14145,35 @@ test "api query contract rejects duplicate graph binding projections" {
         error.InvalidQueryRequest,
         parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
     );
+}
+
+test "api query contract owns the admitted graph wire for exact proxying" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "graph_queries": {
+        \\    "walk": {
+        \\      "index": "graph_idx",
+        \\      "traverse": {
+        \\        "start": {"keys":["doc:a"]},
+        \\        "direction": "in",
+        \\        "filter": {"term":"active","field":"status"}
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var owned = try parseQueryRequest(alloc, null, "docs", body);
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, owned.req.graph_queries_wire_json, .{});
+    defer wire.deinit();
+    const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
+    const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("in", traverse.object.get("direction").?.string);
+    const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
 }
 
 test "api query contract preflight rejects count with reranker" {

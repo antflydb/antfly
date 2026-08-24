@@ -2541,7 +2541,8 @@ pub const DerivedCoverageStatusPolicy = enum {
 pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
     boost: ?Boost = null,
-    min: ?f64 = null,
+    /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+    min: ?i64 = null,
 };
 
 /// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
@@ -4678,7 +4679,8 @@ pub const GraphDocumentFilterConjunction = struct {
 
 pub const GraphDocumentFilterDisjunction = struct {
     disjuncts: []const GraphDocumentFilter,
-    min: ?f64 = null,
+    /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+    min: ?i64 = null,
 };
 
 pub const GraphDocumentFuzzyFilter = struct {

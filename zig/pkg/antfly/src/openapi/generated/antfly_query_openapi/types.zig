@@ -38,7 +38,8 @@ pub const DateRangeStringQuery = struct {
 pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
     boost: ?Boost = null,
-    min: ?f64 = null,
+    /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+    min: ?i64 = null,
 };
 
 pub const DocIdQuery = struct {

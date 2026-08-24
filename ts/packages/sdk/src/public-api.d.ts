@@ -11586,7 +11586,10 @@ export interface components {
         DisjunctionQuery: {
             disjuncts: components["schemas"]["Query"][];
             boost?: components["schemas"]["Boost"];
-            /** Format: double */
+            /**
+             * Format: uint32
+             * @description Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+             */
             min?: number;
         };
         BooleanQuery: {
@@ -11901,7 +11904,10 @@ export interface components {
         };
         GraphDocumentFilterDisjunction: {
             disjuncts: components["schemas"]["GraphDocumentFilter"][];
-            /** Format: double */
+            /**
+             * Format: uint32
+             * @description Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+             */
             min?: number;
         };
         GraphDocumentFilterBoolean: {

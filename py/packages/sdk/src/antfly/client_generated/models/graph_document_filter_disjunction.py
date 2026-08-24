@@ -36,7 +36,8 @@ class GraphDocumentFilterDisjunction:
             GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
             GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
             GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter]):
-        min_ (float | Unset):
+        min_ (int | Unset): Minimum number of disjuncts that must match. Omit for conventional disjunction semantics;
+            set to 0 to make a pure disjunction optional.
     """
 
     disjuncts: list[
@@ -56,7 +57,7 @@ class GraphDocumentFilterDisjunction:
         | GraphDocumentTermRangeFilter
         | GraphDocumentWildcardFilter
     ]
-    min_: float | Unset = UNSET
+    min_: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.graph_document_bool_field_filter import GraphDocumentBoolFieldFilter

@@ -50,7 +50,8 @@ class DisjunctionQuery:
             TermRangeQuery | WildcardQuery]):
         boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
             query.
-        min_ (float | Unset):
+        min_ (int | Unset): Minimum number of disjuncts that must match. Omit for conventional disjunction semantics;
+            set to 0 to make a pure disjunction optional.
     """
 
     disjuncts: list[
@@ -82,7 +83,7 @@ class DisjunctionQuery:
         | WildcardQuery
     ]
     boost: float | None | Unset = UNSET
-    min_: float | Unset = UNSET
+    min_: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

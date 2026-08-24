@@ -347,7 +347,7 @@ func NewMatchNone() Query {
 // Example:
 //
 //	must := query.NewConjunction([]query.Query{query.NewTerm("published", "status")})
-//	mustNot := query.NewDisjunction([]query.Query{query.NewTerm("archived", "status")}, 0)
+//	mustNot := query.NewDisjunction([]query.Query{query.NewTerm("archived", "status")})
 //	q := query.NewBoolean(must, DisjunctionQuery{}, mustNot)
 func NewBoolean(must ConjunctionQuery, should DisjunctionQuery, mustNot DisjunctionQuery) Query {
 	return BooleanQuery{
@@ -369,16 +369,24 @@ func NewConjunction(queries []Query) ConjunctionQuery {
 	return ConjunctionQuery{Conjuncts: queries}
 }
 
-// NewDisjunction creates a DisjunctionQuery (OR).
+// NewDisjunction creates a conventional DisjunctionQuery (OR), which requires
+// at least one disjunct to match when it is the only positive clause.
 //
 // Example:
 //
 //	q := query.NewDisjunction([]query.Query{
 //	    query.NewTerm("draft", "status"),
 //	    query.NewTerm("pending", "status"),
-//	}, 0)
-func NewDisjunction(queries []Query, min float64) DisjunctionQuery {
-	return DisjunctionQuery{Disjuncts: queries, Min: min}
+//	})
+func NewDisjunction(queries []Query) DisjunctionQuery {
+	return DisjunctionQuery{Disjuncts: queries}
+}
+
+// NewDisjunctionWithMinimum creates a DisjunctionQuery with an explicit
+// minimum-should-match value. A value of zero deliberately makes a pure
+// disjunction optional; this is distinct from omitting the minimum.
+func NewDisjunctionWithMinimum(queries []Query, minimumShouldMatch uint32) DisjunctionQuery {
+	return DisjunctionQuery{Disjuncts: queries, Min: &minimumShouldMatch}
 }
 
 // NewDocIds creates a DocIdQuery.
