@@ -102,6 +102,7 @@ pub const object_store_vopr = @import("vopr/object_store.zig");
 pub const replication_backfill_vopr = @import("vopr/replication_backfill.zig");
 pub const supervision_vopr = @import("vopr/supervision.zig");
 pub const auth_lifecycle_vopr = @import("vopr/auth_lifecycle.zig");
+pub const serverless_workflow_vopr = @import("vopr/serverless_workflow.zig");
 pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
 pub const http_lifecycle_vopr = @import("vopr/http_lifecycle.zig");
 pub const http_disconnect_vopr = @import("vopr/http_disconnect.zig");
@@ -351,6 +352,7 @@ test {
     _ = domain_vopr;
     _ = data_server_vopr;
     _ = object_store_vopr;
+    _ = serverless_workflow_vopr;
     _ = request_lifecycle_vopr;
     _ = http_lifecycle_vopr;
     _ = schema;

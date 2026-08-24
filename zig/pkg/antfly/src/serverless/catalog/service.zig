@@ -664,13 +664,22 @@ pub const CatalogService = struct {
     }
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuarded(namespace, null);
+    }
+
+    pub fn buildNamespaceGuarded(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+    ) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlan(
+        return try self.builder.publishNamespaceWithMetricAndPlanGuarded(
             namespace,
             policy.vector_distance_metric,
             plan,
+            publication_guard,
         );
     }
 

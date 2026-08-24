@@ -32,6 +32,7 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
+const work_lease = @import("work_lease.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
@@ -231,6 +232,21 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
     ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanGuarded(
+            namespace,
+            vector_metric,
+            plan,
+            null,
+        );
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanGuarded(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !BuildResult {
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -250,13 +266,33 @@ pub const Builder = struct {
         if (records.len == 0) {
             if (plan.external_source_plan) |external_plan| {
                 if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?)) {
-                    return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+                    return try self.publishExternalManifestWithoutWal(
+                        namespace,
+                        current_head,
+                        next_version,
+                        start_lsn,
+                        plan,
+                        publication_guard,
+                    );
                 }
             } else if (current_head == 0 and plan.table_definition.base_source != null) {
-                return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+                return try self.publishExternalManifestWithoutWal(
+                    namespace,
+                    current_head,
+                    next_version,
+                    start_lsn,
+                    plan,
+                    publication_guard,
+                );
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
-                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan);
+                return try self.republishHeadWithPlan(
+                    namespace,
+                    current_head,
+                    vector_metric,
+                    plan,
+                    publication_guard,
+                );
             }
             return .{
                 .namespace = try self.alloc.dupe(u8, namespace),
@@ -423,6 +459,7 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        if (publication_guard) |guard| try guard.check(namespace);
         const published = try self.progress.compareAndSwapHead(namespace, if (current_head == 0) null else current_head, next_version);
         if (!published) return error.HeadChanged;
 
@@ -443,6 +480,7 @@ pub const Builder = struct {
         version: u64,
         start_lsn: u64,
         plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
     ) !BuildResult {
         var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
         defer manifest.deinit(self.alloc);
@@ -452,6 +490,7 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        if (publication_guard) |guard| try guard.check(namespace);
         const published = try self.progress.compareAndSwapHead(
             namespace,
             if (current_head == 0) null else current_head,
@@ -479,7 +518,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        });
+        }, null);
     }
 
     fn republishHeadWithPlan(
@@ -488,6 +527,7 @@ pub const Builder = struct {
         current_head: u64,
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
     ) !BuildResult {
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
@@ -650,6 +690,7 @@ pub const Builder = struct {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        if (publication_guard) |guard| try guard.check(namespace);
         const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
         if (!published) return error.HeadChanged;
 

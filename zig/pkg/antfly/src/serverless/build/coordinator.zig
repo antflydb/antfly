@@ -13,25 +13,45 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const catalog_service = @import("../catalog/service.zig");
+const work_lease = @import("work_lease.zig");
 
 pub const PublishRunStats = struct {
     published_namespaces: usize = 0,
     head_conflicts: usize = 0,
     idle_namespaces: usize = 0,
+    lease_conflicts: usize = 0,
+    lease_takeovers: usize = 0,
 };
 
 pub const BackgroundPublisher = struct {
     alloc: Allocator,
+    io: std.Io,
     catalog: *catalog_service.CatalogService,
     poll_interval_ms: u64,
-    thread: ?std.Thread = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    failure_mu: std.atomic.Mutex = .unlocked,
+    run_failure: ?anyerror = null,
+    lease_provider: ?work_lease.Provider = null,
+    lease_owner_id: ?[]u8 = null,
+    lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
 
     pub fn init(alloc: Allocator, catalog: *catalog_service.CatalogService, poll_interval_ms: u64) BackgroundPublisher {
+        return initWithIo(alloc, std.Options.debug_io, catalog, poll_interval_ms);
+    }
+
+    pub fn initWithIo(
+        alloc: Allocator,
+        io: std.Io,
+        catalog: *catalog_service.CatalogService,
+        poll_interval_ms: u64,
+    ) BackgroundPublisher {
         return .{
             .alloc = alloc,
+            .io = io,
             .catalog = catalog,
             .poll_interval_ms = poll_interval_ms,
         };
@@ -39,21 +59,47 @@ pub const BackgroundPublisher = struct {
 
     pub fn deinit(self: *BackgroundPublisher) void {
         self.stop();
+        if (self.lease_owner_id) |owner_id| self.alloc.free(owner_id);
         self.* = undefined;
     }
 
     pub fn start(self: *BackgroundPublisher) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        if (self.future != null) return error.AlreadyStarted;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        lockAtomic(&self.failure_mu);
+        self.run_failure = null;
+        self.failure_mu.unlock();
+        self.future = self.io.async(runLoop, .{self});
     }
 
     pub fn stop(self: *BackgroundPublisher) void {
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        if (self.future) |*future| {
+            _ = future.await(self.io);
+            self.future = null;
         }
+    }
+
+    pub fn runtimeFailure(self: *BackgroundPublisher) ?anyerror {
+        lockAtomic(&self.failure_mu);
+        defer self.failure_mu.unlock();
+        return self.run_failure;
+    }
+
+    pub fn configureLease(
+        self: *BackgroundPublisher,
+        provider: work_lease.Provider,
+        owner_id: []const u8,
+        ttl_ns: u64,
+    ) !void {
+        if (self.future != null) return error.AlreadyStarted;
+        if (owner_id.len == 0) return error.InvalidLeaseOwner;
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        const owned_owner = try self.alloc.dupe(u8, owner_id);
+        if (self.lease_owner_id) |current| self.alloc.free(current);
+        self.lease_owner_id = owned_owner;
+        self.lease_provider = provider;
+        self.lease_ttl_ns = ttl_ns;
     }
 
     pub fn runOnce(self: *BackgroundPublisher) !PublishRunStats {
@@ -75,7 +121,30 @@ pub const BackgroundPublisher = struct {
                 continue;
             }
 
-            var result = self.catalog.buildNamespace(namespace.name) catch |err| switch (err) {
+            var held_lease: ?work_lease.HeldLease = null;
+            if (self.lease_provider) |provider| {
+                held_lease = try work_lease.acquireHeld(
+                    provider,
+                    self.io,
+                    namespace.name,
+                    self.lease_owner_id orelse return error.MissingLeaseOwner,
+                    self.lease_ttl_ns,
+                );
+                if (held_lease == null) {
+                    stats.lease_conflicts += 1;
+                    continue;
+                }
+                if (held_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
+            }
+            defer if (held_lease) |*lease| {
+                _ = lease.release() catch {};
+            };
+
+            const publication_guard = if (held_lease) |*lease| lease.guard() else null;
+            var result = self.catalog.buildNamespaceGuarded(
+                namespace.name,
+                publication_guard,
+            ) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;
                     continue;
@@ -102,8 +171,17 @@ pub const BackgroundPublisher = struct {
 
     fn runLoop(self: *BackgroundPublisher) void {
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch PublishRunStats{};
-            sleepMs(@max(self.poll_interval_ms, 1));
+            _ = self.runOnce() catch |err| {
+                lockAtomic(&self.failure_mu);
+                if (self.run_failure == null) self.run_failure = err;
+                self.failure_mu.unlock();
+                return;
+            };
+            std.Io.sleep(
+                self.io,
+                .fromMilliseconds(@intCast(@max(self.poll_interval_ms, 1))),
+                .awake,
+            ) catch return;
         }
     }
 };
@@ -368,11 +446,19 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+// Native-thread regression tests below intentionally use a real sleep while
+// exercising the Threaded differential backend. Production loops sleep on the
+// borrowed `std.Io` stored by `BackgroundPublisher`.
 fn sleepMs(ms: u64) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
+    std.Io.sleep(
+        io_impl.io(),
+        .fromMilliseconds(@intCast(@max(ms, 1))),
+        .awake,
+    ) catch {};
+}
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    platform_sync.lockYielding(mutex);
 }

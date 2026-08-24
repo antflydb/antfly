@@ -635,6 +635,11 @@ VOPR work has found concrete production and harness defects:
   choice could therefore monopolize a campaign worker. The reusable engine now
   enforces an explicit total experiment budget and spends it on choices nearest
   the failure first.
+- Enabling durable workflow leases made serverless maintenance shutdown reach
+  a cancellation point while `buildStatus` still owned cloned search-source
+  descriptors. Canceling the Future could discard that in-progress ownership
+  and leak the descriptors. Maintenance shutdown now publishes stop and awaits
+  cooperative loop completion, so scoped cleanup runs before runtime teardown.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -799,10 +804,10 @@ eligible TLA+ traces.
 
 ## Roadmap
 
-The remaining opportunities are targeted integration scenarios and operational
-tooling rather than missing foundational infrastructure. They are not a second
-numbered phase plan and are not dependencies of the already implemented domain
-suites.
+Calling these VOPR tests, the remaining opportunities are targeted integration
+scenarios and operational tooling rather than missing foundational
+infrastructure. They are not a second numbered phase plan and are not
+dependencies of the already implemented domain suites.
 
 ### Implemented Extension Seams
 
@@ -941,6 +946,34 @@ selects the same generation, cancellation before restore staging is harmless,
 and retry downloads and verifies the complete chunked artifact. Extend these
 protocol campaigns when new production object-store consumers are introduced.
 
+#### Complete Serverless Workflow
+
+Serverless maintenance now uses a durable object-store work lease with retained
+monotonic fencing tokens, conditional acquire/renew/release, explicit expiry,
+timeout-after-commit reconciliation, and publication guards checked at the
+builder and compactor head CAS. A released lease remains as an expired record
+so tokens cannot move backwards. A long-running worker may renew the exact
+owner/token at cutover when nobody took over; once another worker advances the
+token, the stale worker fails closed even if it already produced artifacts and
+a manifest. Production bootstrap enables the shared lease lane by default with
+a per-process identity generated from its borrowed `std.Io`.
+
+`BackgroundPublisher` no longer owns a native thread: it borrows `std.Io`, owns
+one Future, reports its first failure, and cooperatively joins on shutdown.
+`ManagedRuntime` applies the same lease to publication and compaction, records
+claim conflicts and takeovers, and preserves progress CAS as the final durable
+visibility boundary.
+
+The `serverless-workflow-vopr-test` gate composes the real WAL, builder,
+artifacts, manifests, catalog, progress store, runtime, compactor, and query
+session over independently faultable object-store lanes. It exact-replays clean
+execution, duplicate workers, expired-lease takeover with stale publication
+fencing, ambiguous head publication, cancellation before head publication,
+retryable artifact failure, crash after committed manifest, and ambiguous
+compaction publication. Every history restarts the production runtime from
+durable state and proves both documents are visible from the compacted catalog
+head.
+
 #### Admission and Resource Pressure
 
 The production resource manager now runs under replayable contention schedules
@@ -983,14 +1016,16 @@ request microsteps as those seams are added.
 | P0 implemented | Replication backfill and rebalancing | `replication-backfill-vopr-test` covers snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, schema changes, and exact replay through the production runners. |
 | P0 implemented | Standalone and serverless supervision | `supervision-vopr-test` covers partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, virtual watchdog expiry, and restart through the production supervisor. The serverless manager now owns a borrowed-`std.Io` Future instead of a native run-loop thread. |
 | P0 implemented | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
-| P1 | Complete serverless workflow | Claim, build, compact or enrich, publish, and catalog visibility with duplicate workers, lease takeover, ambiguous object-store completion, retry, cancellation, and crash recovery. Object-store protocols are covered; their orchestration is not yet covered end to end. |
+| P1 implemented | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, and exact replay through production orchestration. |
 | P1 | DB and index request races | Elevate meaningful native-thread regressions such as cross-index admission, reader/writer fairness, delete/materialize, capture, shutdown, and cancellation into VOPR transitions through production-safe seams. Do not mechanically port test threads. |
 | P2 | Provider boundaries | Add deterministic response adapters for inference providers and PostgreSQL/libpq covering timeout, partial response, cancellation, retry, malformed data, and admission ownership. Keep actual model execution, GPU kernels, and libpq internals in differential and integration tests. |
 | P2 | Composed query lifecycle | Exercise vector, text, graph, and global-query execution under partial failure, cancellation, resource pressure, and result-assembly races. |
 
-Start with replication backfill, followed by the standalone/serverless
-supervisor. Those areas have the richest combinations of durable state,
-ownership, concurrency, and recovery.
+Replication backfill and the standalone/serverless supervisor were the first
+targets because they have the richest combinations of durable state,
+ownership, concurrency, and recovery; both are now implemented. The complete
+serverless workflow is also implemented, leaving DB and index request races as
+the next P1 target.
 
 ### Antithesis-Class Features Still Worth Porting
 
@@ -1007,8 +1042,8 @@ The remaining high-value features are:
 1. **Retroactive logging and flight recording.** Keep a bounded structured
    event ring for every history, but retain or materialize verbose data only
    when a property fails, a history becomes novel, or a debugger requests it.
-   Antithesis describes retroactive logging in its [release
-   notes](https://antithesis.com/docs/release_notes/).
+   Antithesis added retroactive logging in August 2026, as described in its
+   [release notes](https://antithesis.com/docs/release_notes/).
 2. **Queryable event history.** Add fielded event details and predicates such
    as `preceded_by`, `followed_by`, actor/resource/fault filters, and time
    windows. VOPR has canonical events and causal windows, but not a general
@@ -1016,8 +1051,10 @@ The remaining high-value features are:
    logs](https://antithesis.com/docs/reference/event_logs/).
 3. **Self-contained run/results API.** Expose run metadata, property results,
    event search, corpus entries, artifacts, quarantine state, and budget usage
-   through stable JSON plus an optional static local report. This should remain
-   a repository-owned local and CI interface rather than a hosted dependency.
+   through stable JSON plus an optional static local report, corresponding to
+   the run and log APIs described in the [Antithesis release
+   notes](https://antithesis.com/docs/release_notes/). This should remain a
+   repository-owned local and CI interface rather than a hosted dependency.
 4. **Automatic debug recipes.** For each new failure fingerprint,
    automatically run reduction, causal-window extraction, bounded
    counterfactual experiments, selected log queries, and before/after
@@ -1062,8 +1099,10 @@ Wait for a real product or toolchain requirement before adding:
 
 ### Delivery Order
 
-1. Add replication-backfill and supervisor VOPR suites.
-2. Add authentication and complete-serverless-workflow suites.
+1. Maintain the implemented replication-backfill, supervisor, and
+   authentication VOPR suites, plus the complete-serverless-workflow suite, as
+   their production seams evolve.
+2. Add DB and index request-race compositions.
 3. Build retroactive logging, event queries, and automatic debug recipes.
 4. Standardize local run/results artifacts and nightly corpus merging.
 5. Add DB/index/query compositions and provider model adapters.

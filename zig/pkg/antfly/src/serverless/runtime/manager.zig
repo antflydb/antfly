@@ -48,6 +48,8 @@ pub const RuntimeRunStats = struct {
     enrichment_fallback_documents: usize = 0,
     enrichment_failed_documents: usize = 0,
     enrichment_stage_failures: usize = 0,
+    work_lease_conflicts: usize = 0,
+    work_lease_takeovers: usize = 0,
 };
 
 pub const ManagedRuntime = struct {
@@ -66,6 +68,9 @@ pub const ManagedRuntime = struct {
     stop_requested: std.atomic.Value(bool) = .init(false),
     failure_mu: std.atomic.Mutex = .unlocked,
     run_failure: ?anyerror = null,
+    work_lease_provider: ?build_mod.work_lease.Provider = null,
+    work_lease_owner_id: ?[]u8 = null,
+    work_lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
 
     pub fn init(
         alloc: Allocator,
@@ -88,7 +93,12 @@ pub const ManagedRuntime = struct {
             .io = io,
             .cfg = cfg,
             .catalog = catalog,
-            .publisher = build_mod.BackgroundPublisher.init(alloc, catalog, cfg.tick_interval_ms),
+            .publisher = build_mod.BackgroundPublisher.initWithIo(
+                alloc,
+                io,
+                catalog,
+                cfg.tick_interval_ms,
+            ),
             .pruner = pruner,
         };
     }
@@ -97,6 +107,7 @@ pub const ManagedRuntime = struct {
         self.stop();
         if (self.enricher) |*enricher| enricher.deinit();
         self.publisher.deinit();
+        if (self.work_lease_owner_id) |owner_id| self.alloc.free(owner_id);
         self.* = undefined;
     }
 
@@ -113,7 +124,7 @@ pub const ManagedRuntime = struct {
     pub fn stop(self: *ManagedRuntime) void {
         self.stop_requested.store(true, .monotonic);
         if (self.future) |*future| {
-            future.cancel(self.io);
+            _ = future.await(self.io);
             self.future = null;
         }
     }
@@ -134,6 +145,8 @@ pub const ManagedRuntime = struct {
             const publish_stats = try self.publisher.runOnce();
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
+            stats.work_lease_conflicts += publish_stats.lease_conflicts;
+            stats.work_lease_takeovers += publish_stats.lease_takeovers;
         }
 
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
@@ -209,7 +222,34 @@ pub const ManagedRuntime = struct {
             if (self.compactor) |*compactor| {
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
-                        var compacted = compactor.compactHead(namespace.name) catch |err| switch (err) {
+                        var held_lease: ?build_mod.work_lease.HeldLease = null;
+                        if (self.work_lease_provider) |provider| {
+                            held_lease = try build_mod.work_lease.acquireHeld(
+                                provider,
+                                self.io,
+                                namespace.name,
+                                self.work_lease_owner_id orelse return error.MissingLeaseOwner,
+                                self.work_lease_ttl_ns,
+                            );
+                            if (held_lease == null) {
+                                stats.work_lease_conflicts += 1;
+                                continue;
+                            }
+                            if (held_lease.?.acquisition.took_over) {
+                                stats.work_lease_takeovers += 1;
+                            }
+                        }
+                        defer if (held_lease) |*lease| {
+                            _ = lease.release() catch {};
+                        };
+                        const publication_guard = if (held_lease) |*lease|
+                            lease.guard()
+                        else
+                            null;
+                        var compacted = compactor.compactHeadGuarded(
+                            namespace.name,
+                            publication_guard,
+                        ) catch |err| switch (err) {
                             error.HeadChanged => {
                                 stats.compact_head_conflicts += 1;
                                 continue;
@@ -255,6 +295,24 @@ pub const ManagedRuntime = struct {
         self.enricher = enricher;
     }
 
+    pub fn configureWorkLease(
+        self: *ManagedRuntime,
+        provider: build_mod.work_lease.Provider,
+        owner_id: []const u8,
+        ttl_ns: u64,
+    ) !void {
+        if (self.future != null) return error.AlreadyStarted;
+        if (owner_id.len == 0) return error.InvalidLeaseOwner;
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        const owned_owner = try self.alloc.dupe(u8, owner_id);
+        errdefer self.alloc.free(owned_owner);
+        try self.publisher.configureLease(provider, owner_id, ttl_ns);
+        if (self.work_lease_owner_id) |current| self.alloc.free(current);
+        self.work_lease_owner_id = owned_owner;
+        self.work_lease_provider = provider;
+        self.work_lease_ttl_ns = ttl_ns;
+    }
+
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
@@ -274,6 +332,8 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.enrichment_fallback_documents += stats.enrichment_fallback_documents;
         self.cumulative_stats.enrichment_failed_documents += stats.enrichment_failed_documents;
         self.cumulative_stats.enrichment_stage_failures += stats.enrichment_stage_failures;
+        self.cumulative_stats.work_lease_conflicts += stats.work_lease_conflicts;
+        self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
 
     fn runLoop(self: *ManagedRuntime) void {

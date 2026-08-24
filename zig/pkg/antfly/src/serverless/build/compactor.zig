@@ -29,6 +29,7 @@ const catalog_mod = @import("../catalog/mod.zig");
 const shared_vector = @import("antfly_vector").vector;
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const builder_mod = @import("builder.zig");
+const work_lease = @import("work_lease.zig");
 
 pub const CompactionResult = struct {
     namespace: []u8,
@@ -63,6 +64,14 @@ pub const Compactor = struct {
     }
 
     pub fn compactHead(self: *Compactor, namespace: []const u8) !CompactionResult {
+        return try self.compactHeadGuarded(namespace, null);
+    }
+
+    pub fn compactHeadGuarded(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !CompactionResult {
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -203,6 +212,7 @@ pub const Compactor = struct {
         defer manifest.deinit(self.alloc);
 
         try self.manifests.put(manifest);
+        if (publication_guard) |guard| try guard.check(namespace);
         const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
         if (!published) return error.HeadChanged;
 

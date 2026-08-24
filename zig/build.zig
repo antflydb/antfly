@@ -6916,6 +6916,17 @@ pub fn build(b: *std.Build) void {
     );
     serverless_object_store_vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
 
+    const serverless_workflow_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"complete serverless workflow VOPR exact replays"},
+    });
+    const run_serverless_workflow_vopr_tests = b.addRunArtifact(serverless_workflow_vopr_tests);
+    const serverless_workflow_vopr_test_step = b.step(
+        "serverless-workflow-vopr-test",
+        "Run claim, build, compaction, publication, visibility, and recovery histories",
+    );
+    serverless_workflow_vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
+
     const admission_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"resource admission VOPR"},
@@ -7067,6 +7078,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
+    vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
