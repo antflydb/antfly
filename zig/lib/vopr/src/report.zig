@@ -141,6 +141,7 @@ pub const Context = struct {
     histories_consumed: u64 = 1,
     artifacts: []const []const u8 = &.{},
     health_snapshot: ?health.Snapshot = null,
+    health_evidence: ?health.Evidence = null,
 };
 
 pub const PropertyEvidence = struct {
@@ -187,6 +188,7 @@ pub const Results = struct {
     properties: []PropertyEvidence,
     failures: []Failure,
     artifacts: [][]const u8,
+    health_evidence: ?health.Evidence,
     health_checks: [health.check_count]health.Check,
 
     pub fn build(
@@ -240,6 +242,11 @@ pub const Results = struct {
             artifacts[index] = try allocator.dupe(u8, artifact);
             artifacts_initialized += 1;
         }
+        const health_evidence = context.health_evidence orelse history.health_evidence;
+        const health_checks = if (health_evidence) |evidence|
+            health.evaluateEvidence(history, evidence)
+        else
+            health.evaluate(history, context.health_snapshot);
         return .{
             .allocator = allocator,
             .run_id = run_id,
@@ -266,7 +273,8 @@ pub const Results = struct {
             .properties = properties,
             .failures = failures,
             .artifacts = artifacts,
-            .health_checks = health.evaluate(history, context.health_snapshot),
+            .health_evidence = health_evidence,
+            .health_checks = health_checks,
         };
     }
 
@@ -306,6 +314,7 @@ pub const Results = struct {
             properties: []const PropertyEvidence,
             failures: []const Failure,
             artifacts: []const []const u8,
+            health_evidence: ?health.Evidence,
             health_checks: []const health.Check,
         };
         return std.json.Stringify.valueAlloc(allocator, Wire{
@@ -327,6 +336,7 @@ pub const Results = struct {
             .properties = self.properties,
             .failures = self.failures,
             .artifacts = self.artifacts,
+            .health_evidence = self.health_evidence,
             .health_checks = &self.health_checks,
         }, .{});
     }

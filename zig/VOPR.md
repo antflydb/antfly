@@ -64,7 +64,7 @@ An executable unit test alone is not called fully implemented.
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Integrated retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`; every retained/failing parallel Antfly campaign history writes a bounded `.flight.json`; runner-backed scenarios retain verbose details, while custom metadata/domain drivers currently backfill canonical event fields | `zig build vopr-engine-test vopr-meta-test vopr-events` |
-| Integrated per-history and aggregate run/results API; executable health foundation | `report.zig`, `health.zig`, `vopr-results`; parallel campaigns write stable `vopr-run-results-v1` JSON and static HTML with progress, replay, and harness health. Leak/exhaustion/cleanup checks are reported when a caller supplies a snapshot and are not yet automatically derivable for every scenario | `zig build vopr-engine-test vopr-meta-test vopr-results` |
+| Integrated per-history and aggregate run/results API with phased health evidence | `runner.zig`, `report.zig`, `health.zig`, `vopr_io.zig`, `vopr-results`; every runner history samples continuous/recovery/final health without changing canonical trace bytes, exact replay rematerializes the evidence, `VoprIo.healthSnapshot` supplies task/descriptor/storage data, and mature P0/P1 adapters add domain progress, recovery, consistency, allocator/crash classification, and cleanup | `zig build vopr-engine-test vopr-contract-test vopr-registry-test vopr-results` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
 | Integrated fault composition and structured-choice auditing; executable search benchmark foundation | `fault.zig`, `fault_vopr_io.zig`, `choice.zig`, `benchmark.zig`; precedence drives real `VoprIo` effects in the Parquet-cache suite. The benchmark corpus currently contains one injected starvation bug | `zig build vopr-engine-test parquet-cache-vopr-test vopr-benchmark` |
 | Integrated command-template composition and fail-closed entropy/source audit | `command.zig` implements first/parallel/serial/singleton/anytime/eventually/finally roles with compatibility, exclusion, fault, and quiescence policies; `determinism.zig` combines immediate-choice and borrowed-I/O entropy evidence; Antfly `vopr/determinism_audit.zig` covers every exported VOPR source and both legacy metadata replay regions | `zig build vopr-engine-test vopr-determinism-audit` |
@@ -1204,10 +1204,14 @@ ownership is released.
   the two replay regions in the mixed legacy metadata harness. Runtime evidence
   reports immediate structured choices and deterministic `std.Io` entropy
   calls separately.
-- Default report health defines no progress/deadlock, task and descriptor leaks,
-  allocator/storage exhaustion, cleanup, replay divergence, and harness errors.
-  Campaign aggregates always populate progress, replay, and harness status;
-  other checks require a supplied scenario snapshot and are not automatic yet.
+- Default report health defines no progress/deadlock, unexpected crash, task
+  and descriptor leaks, allocator/storage exhaustion, eventual recovery, final
+  consistency, cleanup, replay divergence, and harness errors. The runner
+  automatically samples continuous, recovery/quiescent, and final phases;
+  generic scenarios receive progress/cleanup evidence, `VoprIo` scenarios use
+  a reusable resource adapter, and mature P0/P1 suites add domain recovery and
+  consistency evidence. These diagnostics are deliberately excluded from
+  canonical trace bytes and are rematerialized by exact replay for results.
 - `vopr-benchmark` currently uses one intentionally injected starvation bug and tracks
   discovery probability plus modeled transition cost across random, guided,
   spliced, starvation, and checkpoint-assisted exploration. A representative
@@ -1245,7 +1249,7 @@ targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now integrated. The complete
 serverless workflow and DB/index request-race compositions are also
 integrated, as are the two P2 boundary suites. Future test work is targeted
-composition, automatic scenario health snapshots, multi-bug search benchmarks,
+composition, richer retained diagnostics, multi-bug search benchmarks,
 and newly exposed safe suspension points rather than missing scheduler or
 replay foundations.
 
@@ -1291,8 +1295,9 @@ local replacement are integrated or have an executable local foundation:
 7. automatic structured-choice auditing, following the controlled-alternative
    principle in [Antithesis controlled
    randomness](https://antithesis.com/docs/reference/sdk/generate_randomness/);
-8. default harness-health reporting (integrated for campaign progress, replay,
-   and harness status; automatic scenario snapshots remain incomplete); and
+8. default harness-health reporting with automatic continuous,
+   recovery/quiescent, and final snapshots, plus reusable `VoprIo` resource
+   evidence and mature P0/P1 domain adapters; and
 9. injected-bug search-quality benchmarking (one stable injected bug today;
    a representative multi-bug corpus remains incomplete).
 
@@ -1305,7 +1310,7 @@ do not require an Antithesis account or hosted runtime.
 | --- | --- | --- |
 | P0 integrated | Reusable command-template composer | `lib/vopr/command.zig` implements Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles. Commands declare symmetric compatibility/deny lists, exclusion groups, fault policy, and before/after quiescence requirements. The composer tracks stable active invocation identities, enforces singleton and serial admission, snapshots quiet-suffix obligations, and exact-replays eventual/final completion. |
 | P0 integrated | Complete entropy interception and audit | `lib/vopr/determinism.zig` admits only immediate structured choices and borrowed-`std.Io` entropy as runtime evidence. `vopr-determinism-audit` fail-closes on host RNG, delayed private PRNGs, host clocks, native threads/I/O, filesystem escapes, native libraries, unordered iteration, and pointer-derived identity in replayable adapters; reviewed differential boundaries require line-local categorized rationale. Its manifest is checked against every exported VOPR source and includes both legacy metadata replay regions. |
-| P1 next | Continuous and quiescent validation phases | Standardize invariant checks during work, eventual recovery after faults stop, and final consistency and cleanup after quiescence. Automatically populate no-progress, crash, task, descriptor, allocator, storage, and cleanup health evidence from scenario/runtime adapters. |
+| P1 integrated | Continuous and quiescent validation phases | The runner automatically samples every history in continuous, recovery/quiescent, and final phases, aggregates bounded no-progress and recovery evidence, classifies allocator and unexpected process/panic failures, and retains the pointer-free diagnostic outside canonical replay bytes. `VoprIo.healthSnapshot` automatically populates task, descriptor, and optional physical-storage evidence; the replication, supervision, auth, serverless-workflow, DB/index, provider, composed-query, resource-pressure, cache, startup, generation, configuration, Embedded/Lite, external-lake, and media suites add domain progress, consistency, exhaustion, and cleanup semantics. `vopr-results` uses exact-replayed evidence automatically. |
 | P1 next | Richer retroactive logging | Add configurable field and text filters, preserve verbose structured details for custom metadata/domain drivers, and let debugger recipes recover selected before/after windows without changing canonical replay bytes. |
 | P1 next | Local run index and usage API | Index stable results across revisions by run, property, fingerprint, corpus entry, quarantine state, artifact, and budget usage. Expose deterministic JSON and CLI queries plus a static local summary; do not require a hosted service. |
 | P1 next | Search recurrence and rarity reporting | Grow a representative injected-bug corpus and report discovery probability, transitions and logical cost to failure, repeated occurrences, confidence intervals, and the simplest examples by transitions and retained output volume across search strategies. |
@@ -1341,9 +1346,10 @@ Wait for a real product or toolchain requirement before adding:
    new suites add small compatible operations; every new exported replay
    source must enter the checked manifest and remain free of silent host
    nondeterminism.
-5. Add continuous, eventual-after-faults, and final-after-quiescence validation
-   adapters to mature scenarios, including automatic task, descriptor,
-   allocator, storage, crash, progress, and cleanup health evidence.
+5. Maintain continuous, eventual-after-faults, and final-after-quiescence
+   validation adapters as scenarios gain new resources; every mature suite
+   should expose domain recovery/consistency while `VoprIo` continues to supply
+   task, descriptor, and storage evidence automatically.
 6. Compose full Iceberg/Parquet discovery-to-row materialization, media-provider
    cancellation/retry, and upgrade/compatibility campaigns only at
    production-safe adapter and ownership boundaries.
@@ -1425,8 +1431,8 @@ export, counterfactual analysis, and independent production-shaped scenarios.
 
 The identified P0, P1, and P2 orchestration suites are integrated. The hard
 Antithesis-class local tooling has either campaign integration or an executable
-foundation; automatic scenario health snapshots and broader search benchmarks
-remain adoption work. The next operational work is to retain and merge nightly
+foundation; broader search benchmarks and the local cross-run index remain
+adoption work. The next operational work is to retain and merge nightly
 corpora, track search-quality benchmarks, and extend scenarios when new
 production consumers expose safe ownership boundaries.
 Compiler-guided coverage and provider-specific datagram campaigns remain

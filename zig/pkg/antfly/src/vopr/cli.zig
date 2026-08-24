@@ -201,12 +201,14 @@ fn resultsCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
     var replayed = try replayKnownScenario(alloc, &recorded);
+    const replayed_health = replayed.health_evidence;
     replayed.deinit();
     const artifact_paths = [_][]const u8{input};
     var results = try vopr.report.Results.build(alloc, &recorded, declarationsKnown(&recorded), .{
         .run_id = run_id,
         .history_id = history_id,
         .artifacts = &artifact_paths,
+        .health_evidence = replayed_health,
     });
     defer results.deinit();
     if (json_path) |output| {

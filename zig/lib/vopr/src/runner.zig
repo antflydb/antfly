@@ -6,6 +6,7 @@ const choice = @import("choice.zig");
 const collector = @import("collector.zig");
 const event = @import("event.zig");
 const flight_recorder = @import("flight_recorder.zig");
+const health = @import("health.zig");
 const ids = @import("id.zig");
 const observation = @import("observation.zig");
 const outcome = @import("outcome.zig");
@@ -61,7 +62,9 @@ pub fn run(
     errdefer result.deinit();
 
     const last_digest = try recordObservation(Scenario, allocator, &world, &result, 0);
-    return continueRun(Scenario, allocator, choice_source, config.transition_budget, &world, &tracker, &result, 0, last_digest, config.flight_recorder);
+    var health_recorder = health.Recorder{};
+    recordHealth(Scenario, &world, 0, &health_recorder);
+    return continueRun(Scenario, allocator, choice_source, config.transition_budget, &world, &tracker, &result, 0, last_digest, config.flight_recorder, &health_recorder);
 }
 
 /// Replays and validates an exact prefix, then captures all logical execution
@@ -87,10 +90,12 @@ pub fn captureCheckpoint(
     var actual = try initTrace(Scenario, allocator, config);
     defer actual.deinit();
     var last_digest = try recordObservation(Scenario, allocator, &world, &actual, 0);
+    var health_recorder = health.Recorder{};
+    recordHealth(Scenario, &world, 0, &health_recorder);
     var replay_source = choice.Replay{ .records = artifact.choices.items };
     var transition_index: u64 = 0;
     while (transition_index < prefix_len) {
-        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null) == .stopped)
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null, &health_recorder) == .stopped)
             return error.SnapshotPrefixPastScenarioEnd;
     }
     actual.summary = .{
@@ -143,10 +148,12 @@ pub fn collectAt(
     var actual = try initTrace(Scenario, allocator, config);
     defer actual.deinit();
     var last_digest = try recordObservation(Scenario, allocator, &world, &actual, 0);
+    var health_recorder = health.Recorder{};
+    recordHealth(Scenario, &world, 0, &health_recorder);
     var replay_source = choice.Replay{ .records = artifact.choices.items };
     var transition_index: u64 = 0;
     while (transition_index < prefix_len) {
-        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null) == .stopped)
+        if (try executeStep(Scenario, allocator, replay_source.source(), config.transition_budget, &world, &tracker, &actual, &transition_index, &last_digest, null, &health_recorder) == .stopped)
             return error.CollectorPrefixPastScenarioEnd;
     }
     actual.summary = .{
@@ -208,6 +215,8 @@ pub fn resumeFromCheckpointWithRecorder(
     var result = try initTraceFromArtifact(allocator, artifact);
     errdefer result.deinit();
     try copyPrefix(&result, artifact, prefix_len);
+    var health_recorder = health.Recorder{};
+    recordHealth(Scenario, &world, checkpoint.transition_index, &health_recorder);
     return continueRun(
         Scenario,
         allocator,
@@ -219,6 +228,7 @@ pub fn resumeFromCheckpointWithRecorder(
         checkpoint.transition_index,
         checkpoint.observation_digest,
         recorder,
+        &health_recorder,
     );
 }
 
@@ -233,11 +243,12 @@ fn continueRun(
     starting_transition_index: u64,
     starting_digest: u64,
     recorder: ?*flight_recorder.Recorder,
+    health_recorder: *health.Recorder,
 ) !trace.Trace {
     var last_digest = starting_digest;
     var transition_index = starting_transition_index;
     while (!Scenario.done(world)) {
-        if (try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest, recorder) == .stopped)
+        if (try executeStep(Scenario, allocator, choice_source, transition_budget, world, tracker, result, &transition_index, &last_digest, recorder, health_recorder) == .stopped)
             break;
     }
     try choice_source.finish();
@@ -275,6 +286,7 @@ fn continueRun(
         .final_observation_digest = last_digest,
         .property_failures = @intCast(tracker.failureCount()),
     };
+    if (health_recorder.evidence().samples != 0) result.health_evidence = health_recorder.evidence();
     try result.validate();
     _ = try choice.auditTrace(result);
     return result.*;
@@ -291,6 +303,7 @@ fn executeStep(
     transition_index: *u64,
     last_digest: *u64,
     recorder: ?*flight_recorder.Recorder,
+    health_recorder: *health.Recorder,
 ) !StepResult {
     if (Scenario.done(world)) return error.SnapshotPrefixPastScenarioEnd;
     if (transition_index.* == transition_budget) return .stopped;
@@ -402,6 +415,7 @@ fn executeStep(
     try evaluateProperties(Scenario, allocator, world, result, tracker, transition_index.*);
     if (@hasDecl(Scenario, "quiescent") and Scenario.quiescent(world)) tracker.beginQuiescence(transition_index.*);
     if (Scenario.done(world)) tracker.finish(transition_index.*);
+    recordHealth(Scenario, world, transition_index.*, health_recorder);
     if (tracker.failureCount() > prior_failure_count) {
         for (Scenario.properties, tracker.statuses) |declaration, status| {
             if (status.first_failure_transition == transition_index.*) {
@@ -444,6 +458,26 @@ fn executeStep(
         });
     }
     return .executed;
+}
+
+fn recordHealth(comptime Scenario: type, world: *Scenario.World, transition_index: u64, recorder: *health.Recorder) void {
+    const phase: health.Phase = if (comptime @hasDecl(Scenario, "validationPhase"))
+        Scenario.validationPhase(world)
+    else if (Scenario.done(world))
+        .final
+    else if (comptime @hasDecl(Scenario, "quiescent"))
+        if (Scenario.quiescent(world)) .recovery else .continuous
+    else
+        .continuous;
+    const snapshot_value: health.Snapshot = if (comptime @hasDecl(Scenario, "healthSnapshot"))
+        Scenario.healthSnapshot(world)
+    else
+        .{
+            .progress_expected = !Scenario.done(world),
+            .progress_units = transition_index,
+            .cleanup_complete = if (Scenario.done(world)) true else null,
+        };
+    recorder.record(phase, snapshot_value);
 }
 
 fn initTrace(comptime Scenario: type, allocator: std.mem.Allocator, config: Config) !trace.Trace {
@@ -614,4 +648,68 @@ test "flight recording retains verbose details without changing replay truth" {
     try std.testing.expectEqualStrings("verbose-only-secret", snapshot_value.records[0].details);
     var replayed = try @import("replay.zig").exact(Scenario, std.testing.allocator, &recorded);
     replayed.deinit();
+}
+
+test "runner automatically records phased health outside canonical replay bytes" {
+    const Scenario = struct {
+        pub const name: []const u8 = "runner-health-phases";
+        pub const version: u32 = 1;
+        const advance_id = ids.stable("transition", name ++ ".advance");
+        pub const properties = &[_]property.Declaration{};
+        pub const World = struct { step: u8 = 0 };
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(world: *World, list: *transition.List, allocator_: std.mem.Allocator) !void {
+            if (world.step < 3) try list.append(allocator_, .{ .id = advance_id, .name = name ++ ".advance", .kind = .workload });
+        }
+        pub fn execute(world: *World, _: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+            world.step += 1;
+            return .applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, allocator_: std.mem.Allocator) !void {
+            try builder.addNamed(allocator_, name ++ ".step", world.step);
+        }
+        pub fn evaluate(_: *World, _: *property.Sink, _: std.mem.Allocator) !void {}
+        pub fn validationPhase(world: *World) health.Phase {
+            return if (world.step == 3) .final else if (world.step >= 1) .recovery else .continuous;
+        }
+        pub fn healthSnapshot(world: *World) health.Snapshot {
+            return .{
+                .progress_expected = true,
+                .progress_units = world.step,
+                .active_tasks = 0,
+                .open_descriptors = 0,
+                .recovery_expected = world.step >= 1,
+                .recovery_complete = world.step >= 2,
+                .consistency_valid = world.step < 3 or world.step == 3,
+                .cleanup_complete = world.step == 3,
+            };
+        }
+        pub fn done(world: *World) bool {
+            return world.step == 3;
+        }
+    };
+
+    var source = choice.Seeded.init(77);
+    var artifact = try run(Scenario, std.testing.allocator, source.source(), .{ .transition_budget = 3 });
+    defer artifact.deinit();
+    const evidence = artifact.health_evidence.?;
+    try std.testing.expectEqual(@as(u64, 4), evidence.samples);
+    try std.testing.expectEqual(@as(u64, 1), evidence.continuous_samples);
+    try std.testing.expectEqual(@as(u64, 2), evidence.recovery_samples);
+    try std.testing.expectEqual(@as(u64, 1), evidence.final_samples);
+    try std.testing.expect(evidence.recovery_complete);
+    try std.testing.expect(evidence.final_snapshot.?.cleanup_complete.?);
+
+    const encoded = try artifact.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try trace.parseAlloc(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.health_evidence == null);
+
+    var replayed = try @import("replay.zig").exact(Scenario, std.testing.allocator, &artifact);
+    defer replayed.deinit();
+    try std.testing.expectEqual(evidence.samples, replayed.health_evidence.?.samples);
 }

@@ -193,6 +193,16 @@ pub const ManagedAdmissionScenario = struct {
         try sink.check(allocator, managed_complete_id, complete);
     }
 
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        return world.fixture.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = world.actions,
+            .consistency_valid = !world.materialized or
+                world.materialize_saw_marker == world.materialize_expected_marker,
+            .cleanup_complete = world.materialized and world.deleted,
+        });
+    }
+
     pub fn done(world: *World) bool {
         return world.materialized and world.deleted;
     }
@@ -318,6 +328,18 @@ pub const PublishedCaptureScenario = struct {
             world.barrier_observed_reader or world.capture_rejected_after_closure);
         try sink.check(allocator, capture_drain_id, !world.barrier_observed_reader or !world.barrier_ended or !world.capture_held);
         try sink.check(allocator, capture_complete_id, world.deleted);
+    }
+
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const progress = @as(u64, @intFromBool(world.capture_attempted)) +
+            @intFromBool(world.barrier_started) + @intFromBool(world.barrier_ended) +
+            @intFromBool(world.deleted);
+        return world.fixture.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = progress,
+            .consistency_valid = !world.barrier_observed_reader or !world.barrier_ended or !world.capture_held,
+            .cleanup_complete = world.deleted and !world.capture_held,
+        });
     }
 
     pub fn done(world: *World) bool {
@@ -621,6 +643,18 @@ pub const TextAdmissionScenario = struct {
         try sink.check(allocator, admission_fair_id, world.state.fifo_fair);
         try sink.check(allocator, admission_cleanup_id, world.state.cleanup_safe);
         try sink.check(allocator, admission_complete_id, world.state.complete);
+    }
+
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return state.fixture.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = @intFromBool(state.complete),
+            .recovery_expected = !state.cleanup_safe,
+            .recovery_complete = state.complete and state.cleanup_safe,
+            .consistency_valid = state.cross_index_isolated and state.fifo_fair,
+            .cleanup_complete = state.complete and state.cleanup_safe,
+        });
     }
 
     pub fn done(world: *World) bool {
