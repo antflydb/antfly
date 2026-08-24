@@ -870,7 +870,7 @@ const PersistentObjectRangeCacheState = struct {
         const source = manager.capacitySource() orelse return null;
         const observation = try source.current();
         const timestamp_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        const now_ns = std.math.cast(u64, timestamp_ns) orelse
+        const now_ns: u64 = std.math.cast(u64, timestamp_ns) orelse
             if (timestamp_ns < 0) 0 else std.math.maxInt(u64);
         return manager.reserveCapacity(
             self.alloc,
