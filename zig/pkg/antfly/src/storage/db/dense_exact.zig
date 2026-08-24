@@ -40,6 +40,8 @@ pub const SearchOutcome = struct {
         distance_ns: u64 = 0,
         lsm_cache_hits: u64 = 0,
         lsm_cache_misses: u64 = 0,
+        artifact_cache_hits: u64 = 0,
+        artifact_vectors_loaded: u64 = 0,
     };
 };
 

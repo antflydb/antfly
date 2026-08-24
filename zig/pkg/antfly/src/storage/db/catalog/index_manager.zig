@@ -8022,6 +8022,8 @@ pub const IndexManager = struct {
             exact_profile.distance_ns = hbc_profile.rerank_artifact_distance_ns;
             exact_profile.lsm_cache_hits = hbc_profile.rerank_lsm_cache_hits;
             exact_profile.lsm_cache_misses = hbc_profile.rerank_lsm_cache_misses;
+            exact_profile.artifact_cache_hits = hbc_profile.rerank_artifact_cache_hits;
+            exact_profile.artifact_vectors_loaded = hbc_profile.rerank_artifact_vectors_loaded;
         } else {
             var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
                 error.Unsupported => null,
@@ -16124,6 +16126,7 @@ pub const IndexManager = struct {
                     distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
                     if (profile) |p| {
                         const elapsed = platform_time.monotonicNs() - distance_start;
+                        p.rerank_artifact_cache_hits += 1;
                         p.rerank_artifact_distance_ns += elapsed;
                         p.rerank_distance_ns += elapsed;
                     }
@@ -16136,7 +16139,10 @@ pub const IndexManager = struct {
                 const cached = handle.view();
                 if (cached.len != dims) return error.InvalidVectorDimensions;
                 const distance_start = platform_time.monotonicNs();
-                if (profile) |p| p.vector_cache_hits += 1;
+                if (profile) |p| {
+                    p.vector_cache_hits += 1;
+                    p.rerank_artifact_cache_hits += 1;
+                }
                 distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
                 if (profile) |p| {
                     const elapsed = platform_time.monotonicNs() - distance_start;
@@ -16155,6 +16161,7 @@ pub const IndexManager = struct {
             key_count += 1;
         }
         if (key_count == 0) return;
+        if (profile) |p| p.rerank_artifact_vectors_loaded +|= @intCast(key_count);
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
         if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
 
@@ -25357,7 +25364,7 @@ test "dense index manager accepts external embedding indexes without enrichments
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
 }
 
-test "production external exact scorer uses bounded sorted artifact batches" {
+test "production external scorers use bounded cache-first artifact batches" {
     const alloc = std.testing.allocator;
     const dims: usize = 3;
     const candidate_count = exact_dense_score_batch_size + 17;
@@ -25420,11 +25427,56 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     residency_probe.deinit();
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
-    const metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+    var metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+
+    // Exercise the production HBC -> IndexManager -> DocStore external-vector
+    // wiring with one governed decoded hit and one true artifact miss. The
+    // adapter must compact the miss set before both metadata and artifact I/O.
+    _ = try entry.index.cacheVector(candidate_ids[0], vectors[0..dims]);
+    {
+        var hbc_txn = try entry.index.beginReadTxn();
+        defer hbc_txn.abort();
+        const ranked = [_]hbc_mod.ApproxSearchResult{
+            .{ .vector_id = candidate_ids[0], .distance = 0.1 },
+            .{ .vector_id = candidate_ids[1], .distance = 0.2 },
+        };
+        var rerank_distances: [2]f32 = undefined;
+        var rerank_vector_ids: [2]u64 = undefined;
+        var rerank_metadata: [2]?[]const u8 = undefined;
+        var rerank_lookups: [2]hbc_mod.FixedKeyLookup = undefined;
+        var rerank_key_views: [2][]const u8 = undefined;
+        var rerank_values: [2]?[]const u8 = undefined;
+        var rerank_scratch: [dims]f32 = undefined;
+        var rerank_miss_distances: [2]f32 = undefined;
+        var rerank_profile: hbc_mod.SearchProfile = .{};
+        try std.testing.expect(try entry.index.scoreExternalRerankVectorsSortedWithScratch(
+            &hbc_txn,
+            &ranked,
+            &.{ 0, 1 },
+            vectors[0..dims],
+            0,
+            &rerank_distances,
+            &rerank_vector_ids,
+            &rerank_metadata,
+            &rerank_lookups,
+            &rerank_key_views,
+            &rerank_values,
+            &rerank_scratch,
+            &rerank_miss_distances,
+            &rerank_profile,
+        ));
+        try std.testing.expectEqual(@as(f32, 0), rerank_distances[0]);
+        try std.testing.expect(std.math.isFinite(rerank_distances[1]));
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_artifact_cache_hits);
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_metadata_vectors_loaded);
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_artifact_vectors_loaded);
+    }
+    try std.testing.expectEqual(metadata_insertions_before + 1, entry.index.hbcCacheStats().metadata.insertions);
+    metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
 
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
-    const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[0], "semantic_idx");
+    const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[2], "semantic_idx");
     defer alloc.free(missing_artifact_key);
     try store.delete(missing_artifact_key);
 

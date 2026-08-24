@@ -656,8 +656,11 @@ plus total accounted and detached pinned bytes. Shared retained vector and
 metadata borrows are included in hit/miss counters. ResourceManager reports
 reclaim requests and reclaimed bytes in its snapshot and benchmark resource
 logs; LSM cache stats and benchmark logs count pressure-denied transient serves
-separately from retained inserts. Query profiles report cache and rerank LSM
-hits/misses and artifact read/decode time. Operators should graph those values
+separately from retained inserts. Query profiles keep LSM block-cache
+hits/misses distinct from per-vector artifact-cache hits, artifact vectors
+loaded, and HBC metadata rows loaded after decoded-cache probing. Adaptive
+routing uses only the latter per-vector signals; an LSM block hit is not proof
+that a decoded vector or artifact read was avoided. Operators should graph those values
 with aggregate and HBC soft/hard limits, process working set, active searches,
 and p50/p95/p99 query latency. A capacity cliff is confirmed when exact-vector
 bytes flatten at the HBC target while rerank LSM misses and eviction churn rise.
@@ -714,6 +717,14 @@ candidate prepare, metadata lookup, artifact key/read/decode, distance time,
 batch geometry, workspace bytes, scalar versus batch reads, missing vectors,
 request-cache entries, and LSM cache hits/misses.
 
+External HBC reranking applies the same cache-first rule before metadata I/O.
+It probes governed decoded residency for the bounded rerank batch, compacts
+only true misses, fetches metadata for that compact set, then issues external
+artifact reads. Warm hits therefore avoid both metadata and artifact storage
+work. `rerank_metadata_vectors_loaded`, `rerank_artifact_cache_hits`, and
+`rerank_artifact_vectors_loaded` make this invariant directly testable on the
+production `IndexManager`/`DocStore` path.
+
 The planner emits nanosecond work estimates from the first query. Its
 dimension-aware cold priors cover filter membership, quantized scoring,
 external artifact-miss service, and exact distance; the 11:1 byte model remains
@@ -722,7 +733,9 @@ snapshot is available. Each HBC index maintains a slow EWMA for those
 components and rerank cache-hit rate. A component is replaced independently as
 either route measures it, so an exact-only or HBC-only workload does not leave
 the alternate route uncosted. Artifact read/decode is learned per cache miss
-and then weighted by the observed hit rate. The planner incorporates the
+and then weighted by the observed hit rate. Zero-hit observations are valid
+samples and reduce a previously warm estimate; they are not treated as missing
+telemetry. The planner incorporates the
 ResourceManager HBC slice's current pressure and residency and retains the
 prior route inside a 20% hysteresis band; exact wins an equal-cost tie. The
 dimension-aware component budget remains authoritative. Profiles expose both
@@ -812,14 +825,19 @@ covers dense and 1%/10% filtered-dense searches at 50k, 600k, 700k, 800k, and 1M
 full-text and graph endpoints at 50k and 1M, 2 GiB and 8 GiB envelopes, cold
 first-pass versus later-pass latency, 1/16-thread endpoints through the
 concurrency sweep, and a longer 1M/1% posting-maintenance/query soak. The
-driver fails production runs below 150 QPS at 50k/1%, below 80% of matched
-unfiltered QPS at 1M/1%, when 1% selectivity regresses below 70% of the matched
-10% lane, when the maximum thread lane falls below 70% of one-thread QPS, when
+driver fails production runs below 150 QPS at 50k/1%, below 150 QPS for either
+1M dense or 1M/1%, below 80% of matched unfiltered QPS at 1M/1%, when 1%
+selectivity regresses below 70% of the matched 10% lane, when the maximum
+thread lane fails to exceed one-thread QPS by 25%, when the search health probe
+exceeds 20 ms (invalidating a contaminated-host result), when the exact source
+vector is not returned at k or top-1 source recall falls below 95%, when
 the maximum load or search RSS across successful recorded cases exceeds 125%
 of the explicit process envelope, when their maximum HBC-accounted bytes
 exceed that envelope, when the maintenance soak falls below 70% of its
-base lane, or without separately populated cold/warm phases. The release-blocker
-recall suite runs before an evidence-producing matrix.
+base lane, or without separately populated cold/warm phases. All thresholds
+remain environment-overridable for an explicitly different resource envelope.
+The release-blocker recall suite and the per-lane matched source-vector recall
+canary run before a result is accepted as evidence.
 Run the reduced
 endpoint/integration check before the evidence-producing matrix:
 
