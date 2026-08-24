@@ -629,6 +629,9 @@ func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
 	appendArg("--ha-startup-topology-id", receipt.TopologyID)
 	appendArg("--ha-startup-topology-generation", strconv.FormatInt(receipt.TopologyGeneration, 10))
 	appendArg("--ha-startup-generation", receipt.Generation)
+	appendArg("--ha-startup-slot-name", receipt.SlotName)
+	appendArg("--ha-startup-timeline-id", strconv.FormatUint(receipt.TimelineID, 10))
+	appendArg("--ha-startup-epoch", strconv.FormatUint(receipt.Epoch, 10))
 	appendArg("--ha-startup-target-pvc-name", receipt.TargetPVCName)
 	appendArg("--ha-startup-target-pvc-uid", receipt.TargetPVCUID)
 	if receipt.ManifestSHA256 != "" {

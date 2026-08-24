@@ -6869,6 +6869,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts canonical host port and models dir flags",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
+            "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
