@@ -1496,13 +1496,6 @@ pub const Cache = struct {
         slots: *std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize),
         key: HbcSharedCacheKey,
     ) !void {
-        for (clock.items, 0..) |entry, i| {
-            if (entry.key.namespace == 0) {
-                try slots.put(self.alloc, key, i);
-                clock.items[i] = .{ .key = key, .referenced = .init(true) };
-                return;
-            }
-        }
         const slot = clock.items.len;
         try slots.put(self.alloc, key, slot);
         errdefer _ = slots.remove(key);
@@ -1736,7 +1729,18 @@ pub const Cache = struct {
 
     fn removeSlot(clock: *std.ArrayListUnmanaged(HbcSharedClockEntry), slots: *std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize), key: HbcSharedCacheKey) void {
         if (slots.fetchRemove(key)) |removed| {
-            if (removed.value < clock.items.len) clock.items[removed.value] = .{};
+            std.debug.assert(removed.value < clock.items.len);
+            const last = clock.items.len - 1;
+            if (removed.value != last) {
+                const moved = &clock.items[last];
+                const moved_slot = slots.getPtr(moved.key) orelse unreachable;
+                clock.items[removed.value] = .{
+                    .key = moved.key,
+                    .referenced = .init(moved.referenced.load(.acquire)),
+                };
+                moved_slot.* = removed.value;
+            }
+            _ = clock.pop();
         }
     }
 
@@ -10667,6 +10671,31 @@ test "hbc shared cache evicts across namespaces under one resource budget" {
     try std.testing.expectEqual(@as(u64, 0), cache.namespaceStats(ns_a).vector.used_bytes);
     try std.testing.expectEqual(vector_bytes, cache.namespaceStats(ns_b).vector.used_bytes);
     try std.testing.expectEqual(vector_bytes, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "hbc shared cache keeps CLOCK slots compact across churn" {
+    const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = 3 * vector_bytes,
+        .hard_limit_bytes = 3 * vector_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    const namespace = hbcCacheNamespace("/tmp/hbc-clock-churn");
+
+    for (1..1000) |id| {
+        const value: f32 = @floatFromInt(id);
+        _ = try cache.cacheVector(namespace, id, &.{ value, value + 1, value + 2, value + 3 });
+        try std.testing.expectEqual(cache.vector_cache.count(), cache.vector_clock.items.len);
+        try std.testing.expectEqual(cache.vector_cache.count(), cache.vector_slots.count());
+        for (cache.vector_clock.items, 0..) |entry, slot| {
+            try std.testing.expectEqual(slot, cache.vector_slots.get(entry.key).?);
+        }
+    }
 }
 
 test "hbc shared cache CLOCK refreshes recency on borrowed vector hits" {
