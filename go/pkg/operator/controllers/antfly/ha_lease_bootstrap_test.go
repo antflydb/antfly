@@ -412,6 +412,7 @@ func TestCommittedTransferBindsExactSuccessorProcessAndScope(t *testing.T) {
 	successor.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
 		PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
+		PrimaryLSN:            711,
 	}
 	pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
 	reconciler := testHAReconciler(t, lease, pod)
@@ -559,6 +560,7 @@ func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
 			successor.Status.HAStatus = &antflyv1.HAStatus{
 				PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
 				PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
+				PrimaryLSN:            711,
 			}
 			tt.mutate(successor, lease)
 			wantProcess := lease.Annotations[haFencingLeaseAnnotationProcessBootID]

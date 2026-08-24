@@ -403,8 +403,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
-		committedSuccessor := bootstrapUnknownBoundary &&
-			haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)
+		committedSuccessor := haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
 			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||
