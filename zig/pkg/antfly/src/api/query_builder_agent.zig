@@ -3536,7 +3536,7 @@ fn buildGraphQueryBuilderSystemPrompt(
         \\
         \\GraphQuery forms:
         \\- Neighbors: {"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":5},"edge_types":["links"],"max_depth":1}}
-        \\- Traverse: {"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["references"],"max_depth":2,"deduplicate_nodes":true}}
+        \\- Traverse: {"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["references"],"max_depth":2}}
         \\- Shortest path: {"index":"graph_idx","shortest_path":{"from":{"key":"doc:a"},"to":{"key":"doc:b"},"edge_types":["depends_on"],"max_depth":6}}
         \\- Match with exact endpoints: {"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{},"c":{"filter":{"ids":["doc:c"]}}},"edges":[{"from":"a","to":"b","types":["links"]},{"from":"b","to":"c","types":["links"]}]},"return":{"bindings":["c"]}}
         \\
@@ -4809,7 +4809,6 @@ fn queryBuilderInferredGraphSearches(
                     .from = try queryBuilderPatternAlias(alloc, i - 1),
                     .to = alias,
                     .types = edge_types,
-                    .direction = .out,
                     .min_hops = 1,
                     .max_hops = 1,
                 };
@@ -4835,7 +4834,6 @@ fn queryBuilderInferredGraphSearches(
             .edge_types = edge_types,
             .max_depth = queryBuilderConstraintInteger(request.constraints, "graph_max_depth") orelse graph_mode.max_depth,
             .limit = queryBuilderConstraintInteger(request.constraints, "graph_max_results") orelse queryBuilderConstraintLimit(request.constraints),
-            .deduplicate_nodes = true,
             .include_paths = graph_mode.include_paths,
         },
     };

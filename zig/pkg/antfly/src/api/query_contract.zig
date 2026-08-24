@@ -3314,7 +3314,7 @@ pub fn encodeQueryResponses(
         hits[i] = try toOpenApiHit(arena, req, hit);
     }
 
-    const graph_results = if (result.graph_results.len > 0)
+    const graph_results = if (req.graph_queries.len > 0)
         try buildGraphQueryResults(arena, req, meta, result)
     else
         null;
@@ -5245,7 +5245,6 @@ fn buildGraphQueryResults(
     errdefer out.deinit(alloc);
 
     for (req.graph_queries) |requested| {
-        if (requested.query.aggregates.len == 0) continue;
         var occurrences: usize = 0;
         for (result.graph_results) |graph_result| {
             if (std.mem.eql(u8, requested.name, graph_result.name)) occurrences += 1;
@@ -5254,7 +5253,8 @@ fn buildGraphQueryResults(
     }
 
     for (result.graph_results) |graph_result| {
-        const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse continue;
+        const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse
+            return error.InvalidRemoteResponse;
         try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(
             alloc,
             graph_query,
@@ -5636,6 +5636,45 @@ test "graph aggregate response fails closed on missing or inexact results" {
             .aggregates = @constCast(partial[0..]),
             .hits = &.{},
             .total_hits = 0,
+        },
+    ));
+}
+
+test "graph response encoding requires exactly one result per traversal operation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const named_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    try std.testing.expectError(error.InvalidRemoteResponse, encodeQueryResponses(
+        alloc,
+        "docs",
+        .{ .graph_queries = &named_queries },
+        .{},
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
+    ));
+
+    const unknown_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("other"),
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+        alloc,
+        .{ .graph_queries = &named_queries },
+        .{},
+        .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = 0,
+            .graph_results = @constCast(unknown_results[0..]),
         },
     ));
 }
@@ -9303,12 +9342,12 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .start_nodes = start,
         .params = .{
             .edge_types = edge_types,
-            .direction = parseGraphDirection(traversal.direction),
+            .direction = .out,
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
             .min_weight = traversal.min_weight,
             .max_weight = traversal.max_weight,
-            .deduplicate = traversal.deduplicate_nodes orelse true,
+            .deduplicate = true,
             .include_paths = traversal.include_paths orelse false,
             .node_filter = filter,
         },
@@ -9351,7 +9390,7 @@ fn parseGraphPathQuery(
         .k = k,
         .params = .{
             .edge_types = edge_types,
-            .direction = parseGraphDirection(path.direction),
+            .direction = .out,
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
             .min_weight = path.min_weight,
             .max_weight = path.max_weight,
@@ -9548,7 +9587,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
             .to = to,
             .step = .{
                 .types = types,
-                .direction = parseGraphDirection(edge.direction),
+                .direction = .out,
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .min_weight = edge.min_weight,
@@ -14156,7 +14195,6 @@ test "api query contract owns the admitted graph wire for exact proxying" {
         \\      "index": "graph_idx",
         \\      "traverse": {
         \\        "start": {"keys":["doc:a"]},
-        \\        "direction": "in",
         \\        "filter": {"term":"active","field":"status"}
         \\      }
         \\    }
@@ -14171,9 +14209,24 @@ test "api query contract owns the admitted graph wire for exact proxying" {
     defer wire.deinit();
     const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
     const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("in", traverse.object.get("direction").?.string);
+    try std.testing.expect(traverse.object.get("direction") == null);
     const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
+}
+
+test "canonical graph contract rejects modes without exact public execution" {
+    const cases = [_][]const u8{
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
+        "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
+        "{\"graph_queries\":{\"rows\":{\"index\":\"g\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{},\"b\":{}},\"edges\":[{\"from\":\"a\",\"to\":\"b\",\"direction\":\"in\"}]},\"return\":{\"bindings\":[\"b\"]}}}}",
+    };
+    for (cases) |body| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
+        );
+    }
 }
 
 test "api query contract preflight rejects count with reranker" {

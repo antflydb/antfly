@@ -112,7 +112,7 @@ pub const TableApi = struct {
         GraphDistinctBudgetExceeded,
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
-        GraphCrossRangeModeUnsupported,
+        GraphQueryModeUnsupported,
         HierarchyCursorStale,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
@@ -783,20 +783,20 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
-const GraphCrossRangeDiagnostic = struct {
+const GraphQueryModeDiagnostic = struct {
     operation: []const u8 = "$request",
     mode: []const u8 = "graph_queries",
     reason: []const u8 = "unsupported_mode",
 };
 
-pub fn graphCrossRangeModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+pub fn graphQueryModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
-    const diagnostic = if (parsed) |value| graphCrossRangeDiagnostic(value.value) else GraphCrossRangeDiagnostic{};
+    const diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
-        .@"error" = "graph_cross_range_mode_unsupported",
-        .message = "this graph query mode cannot be executed exactly across multiple shards; use a supported canonical graph mode or a single-shard table",
+        .@"error" = "graph_query_mode_unsupported",
+        .message = "this graph query mode is not supported by exact public execution; use graph_queries with outgoing, deduplicated traversal semantics",
         .retryable = false,
         .operation = diagnostic.operation,
         .mode = diagnostic.mode,
@@ -804,22 +804,22 @@ pub fn graphCrossRangeModeUnsupportedBody(alloc: std.mem.Allocator, body: []cons
     }, .{});
 }
 
-fn graphCrossRangeDiagnostic(root: std.json.Value) GraphCrossRangeDiagnostic {
+fn graphQueryModeDiagnostic(root: std.json.Value) GraphQueryModeDiagnostic {
     if (root != .object) return .{};
     if (root.object.get("expand_strategy")) |value| {
         if (value != .null) return .{ .reason = "expand_strategy_not_supported" };
     }
     if (root.object.get("graph_queries")) |queries| {
-        if (queries == .object) return canonicalCrossRangeDiagnostic(queries.object);
+        if (queries == .object) return canonicalGraphModeDiagnostic(queries.object);
     }
     if (root.object.get("graph_searches")) |queries| {
-        if (queries == .object) return legacyCrossRangeDiagnostic(queries.object);
+        if (queries == .object) return legacyGraphModeDiagnostic(queries.object);
     }
     return .{};
 }
 
-fn canonicalCrossRangeDiagnostic(queries: std.json.ObjectMap) GraphCrossRangeDiagnostic {
-    var fallback: ?GraphCrossRangeDiagnostic = null;
+fn canonicalGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnostic {
+    var fallback: ?GraphQueryModeDiagnostic = null;
     var it = queries.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
@@ -854,8 +854,8 @@ fn canonicalCrossRangeDiagnostic(queries: std.json.ObjectMap) GraphCrossRangeDia
     return fallback orelse .{};
 }
 
-fn legacyCrossRangeDiagnostic(queries: std.json.ObjectMap) GraphCrossRangeDiagnostic {
-    var fallback: ?GraphCrossRangeDiagnostic = null;
+fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnostic {
+    var fallback: ?GraphQueryModeDiagnostic = null;
     var it = queries.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
@@ -1161,9 +1161,9 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
             },
-            error.GraphCrossRangeModeUnsupported => {
-                std.log.warn("public table graph mode lacks exact cross-range execution table={s}", .{table_name});
-                return .{ .status = 422, .body = try graphCrossRangeModeUnsupportedBody(alloc, body), .json = true };
+            error.GraphQueryModeUnsupported => {
+                std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryModeUnsupportedBody(alloc, body), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -3414,7 +3414,7 @@ test "public table query handler maps candidate budget exhaustion" {
 }
 
 test "public table query handler maps exact graph execution failures" {
-    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, cross_range_mode, topology_changed };
+    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, graph_query_mode, topology_changed };
     const Backend = struct {
         fn iface(kind: *Kind) TableApi {
             return .{
@@ -3447,7 +3447,7 @@ test "public table query handler maps exact graph execution failures" {
                 .distinct_budget => error.GraphDistinctBudgetExceeded,
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
-                .cross_range_mode => error.GraphCrossRangeModeUnsupported,
+                .graph_query_mode => error.GraphQueryModeUnsupported,
                 .topology_changed => error.TopologyChanged,
             };
         }
@@ -3534,31 +3534,31 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
     try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
 
-    kind = .cross_range_mode;
+    kind = .graph_query_mode;
     var cross_range_resp = try handleTableQueryRequest(
         std.testing.allocator,
         "docs",
-        "{\"graph_queries\":{\"incoming\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]},\"direction\":\"in\"}}}}",
+        "{\"graph_searches\":{\"incoming\":{\"type\":\"traverse\",\"index_name\":\"relationships\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"params\":{\"direction\":\"in\"}}}}",
         null,
         Backend.iface(&kind),
     );
     defer cross_range_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 422), cross_range_resp.status);
-    var cross_range = try ant_json.parseFromSlice(
+    var graph_mode = try ant_json.parseFromSlice(
         metadata_openapi.QueryUnprocessableError,
         std.testing.allocator,
         cross_range_resp.body,
         .{},
     );
-    defer cross_range.deinit();
-    const cross_range_error = switch (cross_range.value) {
-        .graph_cross_range_mode_unsupported_error => |value| value,
+    defer graph_mode.deinit();
+    const graph_mode_error = switch (graph_mode.value) {
+        .graph_query_mode_unsupported_error => |value| value,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(!cross_range_error.retryable);
-    try std.testing.expectEqualStrings("incoming", cross_range_error.operation);
-    try std.testing.expectEqualStrings("traverse", cross_range_error.mode);
-    try std.testing.expectEqualStrings("direction_must_be_out", cross_range_error.reason);
+    try std.testing.expect(!graph_mode_error.retryable);
+    try std.testing.expectEqualStrings("incoming", graph_mode_error.operation);
+    try std.testing.expectEqualStrings("traverse", graph_mode_error.mode);
+    try std.testing.expectEqualStrings("direction_must_be_out", graph_mode_error.reason);
 
     kind = .topology_changed;
     var topology_resp = try handleTableQueryRequest(
@@ -3595,7 +3595,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
 }
 
-test "cross-range graph diagnostics identify the rejected operation constraint" {
+test "unsupported graph mode diagnostics identify the rejected operation constraint" {
     const Case = struct {
         body: []const u8,
         operation: []const u8,
@@ -3610,7 +3610,7 @@ test "cross-range graph diagnostics identify the rejected operation constraint" 
             .reason = "expand_strategy_not_supported",
         },
         .{
-            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
+            .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",
             .operation = "walk",
             .mode = "traverse",
             .reason = "deduplicate_nodes_must_be_true",
@@ -3654,10 +3654,10 @@ test "cross-range graph diagnostics identify the rejected operation constraint" 
     };
 
     for (cases) |case| {
-        const body = try graphCrossRangeModeUnsupportedBody(std.testing.allocator, case.body);
+        const body = try graphQueryModeUnsupportedBody(std.testing.allocator, case.body);
         defer std.testing.allocator.free(body);
         var parsed = try ant_json.parseFromSlice(
-            metadata_openapi.GraphCrossRangeModeUnsupportedError,
+            metadata_openapi.GraphQueryModeUnsupportedError,
             std.testing.allocator,
             body,
             .{},

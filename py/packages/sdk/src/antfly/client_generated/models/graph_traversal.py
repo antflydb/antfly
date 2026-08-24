@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
-from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -34,43 +33,37 @@ T = TypeVar("T", bound="GraphTraversal")
 
 @_attrs_define
 class GraphTraversal:
-    """
-    Attributes:
-        start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
-            exactly one explicit, exact selector form.
-        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
-        direction (EdgeDirection | Unset): Direction of edges to query:
-            - out: Outgoing edges from the node
-            - in: Incoming edges to the node
-            - both: Both outgoing and incoming edges
-        max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
-        min_weight (float | Unset):
-        max_weight (float | Unset):
-        limit (int | Unset):  Default: 100.
-        deduplicate_nodes (bool | Unset): Visit each exact table-qualified node identity at most once. Omit for the
-            default true behavior; set false to enumerate repeated visits. Default: True.
-        include_paths (bool | Unset):  Default: False.
-        include_documents (bool | Unset): Include each result node's stored document. Default: False.
-        fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
-        filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
-            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
-            GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
-            GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
-            GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
-            stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
-            deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
-            Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
-            Alias-to-alias predicates belong in GraphMatch.where.
+    """Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an
+    undirected relationship by indexing an outgoing edge in each direction.
+
+        Attributes:
+            start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
+                exactly one explicit, exact selector form.
+            edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
+            max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
+            min_weight (float | Unset):
+            max_weight (float | Unset):
+            limit (int | Unset):  Default: 100.
+            include_paths (bool | Unset):  Default: False.
+            include_documents (bool | Unset): Include each result node's stored document. Default: False.
+            fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
+            filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
+                GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
+                GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
+                GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
+                GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
+                stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
+                deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
+                Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
+                Alias-to-alias predicates belong in GraphMatch.where.
     """
 
     start: GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector
     edge_types: list[str] | Unset = UNSET
-    direction: EdgeDirection | Unset = UNSET
     max_depth: int | Unset = 1
     min_weight: float | Unset = UNSET
     max_weight: float | Unset = UNSET
     limit: int | Unset = 100
-    deduplicate_nodes: bool | Unset = True
     include_paths: bool | Unset = False
     include_documents: bool | Unset = False
     fields: list[str] | Unset = UNSET
@@ -123,10 +116,6 @@ class GraphTraversal:
         if not isinstance(self.edge_types, Unset):
             edge_types = self.edge_types
 
-        direction: str | Unset = UNSET
-        if not isinstance(self.direction, Unset):
-            direction = self.direction.value
-
         max_depth = self.max_depth
 
         min_weight = self.min_weight
@@ -134,8 +123,6 @@ class GraphTraversal:
         max_weight = self.max_weight
 
         limit = self.limit
-
-        deduplicate_nodes = self.deduplicate_nodes
 
         include_paths = self.include_paths
 
@@ -188,8 +175,6 @@ class GraphTraversal:
         )
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
-        if direction is not UNSET:
-            field_dict["direction"] = direction
         if max_depth is not UNSET:
             field_dict["max_depth"] = max_depth
         if min_weight is not UNSET:
@@ -198,8 +183,6 @@ class GraphTraversal:
             field_dict["max_weight"] = max_weight
         if limit is not UNSET:
             field_dict["limit"] = limit
-        if deduplicate_nodes is not UNSET:
-            field_dict["deduplicate_nodes"] = deduplicate_nodes
         if include_paths is not UNSET:
             field_dict["include_paths"] = include_paths
         if include_documents is not UNSET:
@@ -261,13 +244,6 @@ class GraphTraversal:
 
         edge_types = cast(list[str], d.pop("edge_types", UNSET))
 
-        _direction = d.pop("direction", UNSET)
-        direction: EdgeDirection | Unset
-        if isinstance(_direction, Unset):
-            direction = UNSET
-        else:
-            direction = EdgeDirection(_direction)
-
         max_depth = d.pop("max_depth", UNSET)
 
         min_weight = d.pop("min_weight", UNSET)
@@ -275,8 +251,6 @@ class GraphTraversal:
         max_weight = d.pop("max_weight", UNSET)
 
         limit = d.pop("limit", UNSET)
-
-        deduplicate_nodes = d.pop("deduplicate_nodes", UNSET)
 
         include_paths = d.pop("include_paths", UNSET)
 
@@ -429,12 +403,10 @@ class GraphTraversal:
         graph_traversal = cls(
             start=start,
             edge_types=edge_types,
-            direction=direction,
             max_depth=max_depth,
             min_weight=min_weight,
             max_weight=max_weight,
             limit=limit,
-            deduplicate_nodes=deduplicate_nodes,
             include_paths=include_paths,
             include_documents=include_documents,
             fields=fields,

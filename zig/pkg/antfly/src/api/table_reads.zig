@@ -3082,7 +3082,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        try rejectUnsupportedCrossRangeGraphMode(group_ids.len, req);
+        try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
@@ -4179,7 +4179,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        try rejectUnsupportedCrossRangeGraphMode(group_ids.len, req);
+        try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -6809,9 +6809,10 @@ fn graphRequestHasRetrievalLane(req: db_mod.types.SearchRequest) bool {
 
 /// Graph results cannot be merged from independently evaluated shard-local
 /// traversals: limits, deduplication, path selection, and MATCH bindings are
-/// global semantics. Keep unsupported modes available for a single local
-/// group, but fail closed once correctness requires cross-range execution.
-fn rejectUnsupportedCrossRangeGraphMode(
+/// global semantics. Legacy and embedded callers may still use local-only
+/// modes on one unauthenticated group, but public execution fails closed when
+/// the exact coordinator cannot preserve their semantics and authorization.
+fn rejectUnsupportedGraphQueryMode(
     group_count: usize,
     req: db_mod.types.SearchRequest,
 ) !void {
@@ -6819,7 +6820,7 @@ fn rejectUnsupportedCrossRangeGraphMode(
         !distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or req.graph_table_read_authorizer != null))
     {
-        return error.GraphCrossRangeModeUnsupported;
+        return error.GraphQueryModeUnsupported;
     }
 }
 
@@ -26268,7 +26269,7 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
     try std.testing.expect(retrieval.full_text.? == .match);
 }
 
-test "unsupported cross-range graph modes fail closed" {
+test "unsupported graph query modes fail closed" {
     const Authorizer = struct {
         fn authorize(
             _: ?*const anyopaque,
@@ -26289,16 +26290,16 @@ test "unsupported cross-range graph modes fail closed" {
     }};
     const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
 
-    try rejectUnsupportedCrossRangeGraphMode(1, req);
-    try std.testing.expectError(error.GraphCrossRangeModeUnsupported, rejectUnsupportedCrossRangeGraphMode(2, req));
-    try std.testing.expectError(error.GraphCrossRangeModeUnsupported, rejectUnsupportedCrossRangeGraphMode(1, .{
+    try rejectUnsupportedGraphQueryMode(1, req);
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, req));
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
         .graph_queries = &graph_queries,
         .graph_table_read_authorizer = .{
             .ctx = null,
             .authorize_table = Authorizer.authorize,
         },
     }));
-    try rejectUnsupportedCrossRangeGraphMode(2, .{});
+    try rejectUnsupportedGraphQueryMode(2, .{});
 }
 
 test "qualified graph endpoint requires coordination for a single source group" {

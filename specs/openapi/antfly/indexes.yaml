@@ -2903,6 +2903,10 @@ components:
       type: object
       additionalProperties: false
       required: [start]
+      description: >-
+        Outgoing breadth-first traversal with request-wide deduplication by
+        exact table-qualified node identity. Model an undirected relationship
+        by indexing an outgoing edge in each direction.
       properties:
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
@@ -2912,8 +2916,6 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 65536 }
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction:
-          $ref: '#/components/schemas/EdgeDirection'
         max_depth:
           type: integer
           minimum: 1
@@ -2927,11 +2929,6 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
-        deduplicate_nodes:
-          type: boolean
-          default: true
-          x-go-type-skip-optional-pointer: false
-          description: Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
         include_paths: { type: boolean, default: false }
         include_documents:
           type: boolean
@@ -2977,6 +2974,7 @@ components:
       type: object
       additionalProperties: false
       required: [from, to]
+      description: Find the best outgoing path from `from` to `to`.
       properties:
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
@@ -2986,7 +2984,6 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 65536 }
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction: { $ref: '#/components/schemas/EdgeDirection' }
         max_depth:
           type: integer
           minimum: 1
@@ -3010,6 +3007,7 @@ components:
       type: object
       additionalProperties: false
       required: [from, to, k]
+      description: Find up to `k` outgoing loopless paths from `from` to `to`.
       properties:
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
@@ -3023,7 +3021,6 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 65536 }
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction: { $ref: '#/components/schemas/EdgeDirection' }
         max_depth:
           type: integer
           minimum: 1
@@ -3056,7 +3053,9 @@ components:
       additionalProperties: false
       required: [from, to]
       description: >-
-        Structural edge expansion between aliases. Variable-length expansion
+        Outgoing structural edge expansion from the `from` alias to the `to`
+        alias. Reverse a relationship by swapping those aliases; model an
+        undirected relationship by indexing both directed edges. Variable-length expansion
         uses node-simple paths: a (table, key) identity is visited at most once
         within one expanded edge path, except when closing onto an already bound
         target alias for an explicit cycle.
@@ -3069,7 +3068,6 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 65536 }
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
-        direction: { $ref: '#/components/schemas/EdgeDirection' }
         min_hops:
           type: integer
           minimum: 1

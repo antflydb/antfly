@@ -24,7 +24,6 @@ import {
 import { ForceGraph, type GraphData, type GraphEdge, type GraphNode } from "@antfly/graph";
 import type {
   Edge,
-  EdgeDirection,
   EdgeTypeConfig,
   GraphNodesResult,
   GraphPathEdge,
@@ -377,7 +376,6 @@ export function GraphIndexExplorer({
   const availableEdgeTypes = useMemo(() => edgeTypesForIndex(selectedIndex), [selectedIndex]);
   const [selectedEdgeTypes, setSelectedEdgeTypes] = useState<string[]>([]);
   const [mode, setMode] = useState<GraphMode>(initialMode);
-  const [direction, setDirection] = useState<EdgeDirection>("out");
   const [weightMode, setWeightMode] = useState<PathWeightMode>("min_hops");
   const [startKey, setStartKey] = useState(initialStartKey);
   const [targetKey, setTargetKey] = useState(initialTargetKey);
@@ -452,7 +450,6 @@ export function GraphIndexExplorer({
               from: { key: startKey.trim() },
               to: { key: targetKey.trim() },
               edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
-              direction,
               max_depth: maxDepth,
               min_weight: minWeight > 0 ? minWeight : undefined,
               weight_mode: weightMode,
@@ -464,13 +461,11 @@ export function GraphIndexExplorer({
             traverse: {
               start: { keys: [startKey.trim()] },
               edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
-              direction,
               max_depth: mode === "neighbors" ? 1 : maxDepth,
               limit: maxResults,
               min_weight: minWeight > 0 ? minWeight : undefined,
               include_paths: includePaths,
               include_documents: true,
-              deduplicate_nodes: true,
             },
           };
 
@@ -488,7 +483,6 @@ export function GraphIndexExplorer({
     }
   }, [
     api,
-    direction,
     includePaths,
     maxDepth,
     maxResults,
@@ -649,34 +643,16 @@ export function GraphIndexExplorer({
               </div>
             )}
 
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label>Direction</Label>
-                <Select
-                  value={direction}
-                  onValueChange={(value) => setDirection(value as EdgeDirection)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="out">Out</SelectItem>
-                    <SelectItem value="in">In</SelectItem>
-                    <SelectItem value="both">Both</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="graph-max-depth">Depth</Label>
-                <Input
-                  id="graph-max-depth"
-                  type="number"
-                  min={1}
-                  max={12}
-                  value={maxDepth}
-                  onChange={(event) => setMaxDepth(coerceInteger(event.target.value, 2, 1, 12))}
-                />
-              </div>
+            <div className="space-y-2">
+              <Label htmlFor="graph-max-depth">Outgoing depth</Label>
+              <Input
+                id="graph-max-depth"
+                type="number"
+                min={1}
+                max={12}
+                value={maxDepth}
+                onChange={(event) => setMaxDepth(coerceInteger(event.target.value, 2, 1, 12))}
+              />
             </div>
 
             {mode === "shortest_path" ? (

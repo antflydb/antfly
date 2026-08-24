@@ -1895,7 +1895,7 @@ components:
         retryable:
           type: boolean
           enum: [false]
-    GraphCrossRangeModeUnsupportedError:
+    GraphQueryModeUnsupportedError:
       type: object
       additionalProperties: false
       required: [status, error, message, retryable, operation, mode, reason]
@@ -1906,7 +1906,7 @@ components:
           enum: [422]
         error:
           type: string
-          enum: [graph_cross_range_mode_unsupported]
+          enum: [graph_query_mode_unsupported]
         message:
           type: string
         retryable:
@@ -1963,7 +1963,7 @@ components:
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
         - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-        - $ref: '#/components/schemas/GraphCrossRangeModeUnsupportedError'
+        - $ref: '#/components/schemas/GraphQueryModeUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
       discriminator:
         propertyName: error
@@ -1972,7 +1972,7 @@ components:
           query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
           graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-          graph_cross_range_mode_unsupported: '#/components/schemas/GraphCrossRangeModeUnsupportedError'
+          graph_query_mode_unsupported: '#/components/schemas/GraphQueryModeUnsupportedError'
           graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
     SortDirection:
       $ref: "sort.yaml#/components/schemas/SortDirection"

@@ -1,7 +1,7 @@
 from enum import IntEnum
 
 
-class GraphCrossRangeModeUnsupportedErrorStatus(IntEnum):
+class GraphQueryModeUnsupportedErrorStatus(IntEnum):
     VALUE_422 = 422
 
     def __str__(self) -> str:

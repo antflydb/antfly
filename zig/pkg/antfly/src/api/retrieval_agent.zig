@@ -5852,10 +5852,8 @@ fn buildTreeGraphSearches(
         .index = tree_search.index,
         .traverse = .{
             .start = start_nodes,
-            .direction = .out,
             .max_depth = max_depth,
             .limit = max_results,
-            .deduplicate_nodes = true,
             // Tree retrieval consumes both the document and its ancestry when
             // ranking branches and grounding generation. Keep those semantics
             // explicit in the canonical graph query instead of relying on the

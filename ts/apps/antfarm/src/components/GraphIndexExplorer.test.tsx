@@ -119,7 +119,6 @@ describe("GraphIndexExplorer", () => {
             traverse: expect.objectContaining({
               start: { keys: ["alice"] },
               include_paths: true,
-              deduplicate_nodes: true,
               max_depth: 2,
             }),
           }),

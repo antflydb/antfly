@@ -419,7 +419,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
         error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
         error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
-        error.GraphCrossRangeModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
+        // Preserve the append-only runtime detail code while the public error
+        // name reflects that unsupported exact modes are not topology-specific.
+        error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -893,7 +895,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
-        .graph_cross_range_mode_unsupported => "GraphCrossRangeModeUnsupported",
+        .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
     };
 }
 
@@ -906,7 +908,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
     try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
-    try std.testing.expectEqual(error.GraphCrossRangeModeUnsupported, errorFromStatus(statusFromError(error.GraphCrossRangeModeUnsupported)));
+    try std.testing.expectEqual(error.GraphQueryModeUnsupported, errorFromStatus(statusFromError(error.GraphQueryModeUnsupported)));
     try std.testing.expectEqual(error.InferenceProviderFailure, errorFromStatus(statusFromError(error.InferenceProviderFailure)));
     try std.testing.expectEqual(error.KernelJitRequiredDynamicLoad, errorFromStatus(statusFromError(error.KernelJitRequiredDynamicLoad)));
     try std.testing.expectEqual(error.UnexpectedToken, errorFromStatus(statusFromError(error.UnexpectedToken)));

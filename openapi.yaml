@@ -8355,7 +8355,7 @@ components:
           type: boolean
           enum:
             - false
-    GraphCrossRangeModeUnsupportedError:
+    GraphQueryModeUnsupportedError:
       type: object
       additionalProperties: false
       required:
@@ -8375,7 +8375,7 @@ components:
         error:
           type: string
           enum:
-            - graph_cross_range_mode_unsupported
+            - graph_query_mode_unsupported
         message:
           type: string
         retryable:
@@ -8443,7 +8443,7 @@ components:
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
         - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-        - $ref: '#/components/schemas/GraphCrossRangeModeUnsupportedError'
+        - $ref: '#/components/schemas/GraphQueryModeUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
       discriminator:
         propertyName: error
@@ -8452,7 +8452,7 @@ components:
           query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
           graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-          graph_cross_range_mode_unsupported: '#/components/schemas/GraphCrossRangeModeUnsupportedError'
+          graph_query_mode_unsupported: '#/components/schemas/GraphQueryModeUnsupportedError'
           graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
     SortDirection:
       type: boolean
@@ -22522,9 +22522,11 @@ components:
       required:
         - from
         - to
-      description: 'Structural edge expansion between aliases. Variable-length expansion uses node-simple
-        paths: a (table, key) identity is visited at most once within one expanded edge path, except when
-        closing onto an already bound target alias for an explicit cycle.'
+      description: 'Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse
+        a relationship by swapping those aliases; model an undirected relationship by indexing both directed
+        edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at
+        most once within one expanded edge path, except when closing onto an already bound target alias
+        for an explicit cycle.'
       properties:
         from:
           type: string
@@ -22544,8 +22546,6 @@ components:
             maxLength: 65536
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
             at most 64 KiB.
-        direction:
-          $ref: '#/components/schemas/EdgeDirection'
         min_hops:
           type: integer
           minimum: 1
@@ -22851,6 +22851,8 @@ components:
       additionalProperties: false
       required:
         - start
+      description: Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified
+        node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
       properties:
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
@@ -22863,8 +22865,6 @@ components:
             minLength: 1
             maxLength: 65536
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction:
-          $ref: '#/components/schemas/EdgeDirection'
         max_depth:
           type: integer
           minimum: 1
@@ -22884,12 +22884,6 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
-        deduplicate_nodes:
-          type: boolean
-          default: true
-          x-go-type-skip-optional-pointer: false
-          description: Visit each exact table-qualified node identity at most once. Omit for the default
-            true behavior; set false to enumerate repeated visits.
         include_paths:
           type: boolean
           default: false
@@ -22937,6 +22931,7 @@ components:
       required:
         - from
         - to
+      description: Find the best outgoing path from `from` to `to`.
       properties:
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
@@ -22951,8 +22946,6 @@ components:
             minLength: 1
             maxLength: 65536
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction:
-          $ref: '#/components/schemas/EdgeDirection'
         max_depth:
           type: integer
           minimum: 1
@@ -22998,6 +22991,7 @@ components:
         - from
         - to
         - k
+      description: Find up to `k` outgoing loopless paths from `from` to `to`.
       properties:
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
@@ -23016,8 +23010,6 @@ components:
             minLength: 1
             maxLength: 65536
           description: At most 64 unique edge types totaling at most 64 KiB.
-        direction:
-          $ref: '#/components/schemas/EdgeDirection'
         max_depth:
           type: integer
           minimum: 1

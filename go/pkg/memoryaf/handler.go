@@ -197,7 +197,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		},
 	}
 
-	embIdx, err := client.NewIndexConfig(embeddingIndex, client.EmbeddingsIndexConfig{
+	embIdx, err := client.NewCreateIndexRequest(client.EmbeddingsIndexConfig{
 		Dimension: embedderDimension,
 		Field:     "content",
 		Embedder: client.EmbedderConfig{
@@ -208,7 +208,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		return fmt.Errorf("build embedding index config: %w", err)
 	}
 
-	graphIdx, err := client.NewIndexConfig(graphIndex, client.GraphIndexConfig{
+	graphIdx, err := client.NewCreateIndexRequest(client.GraphIndexConfig{
 		EdgeTypes: []client.EdgeTypeConfig{
 			{Name: "mentions", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
 			{Name: "related_to", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
@@ -227,7 +227,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 				"memory": memorySchema,
 			},
 		},
-		Indexes: map[string]client.IndexConfig{
+		Indexes: map[string]client.CreateIndexRequest{
 			embeddingIndex: *embIdx,
 			graphIndex:     *graphIdx,
 		},
@@ -249,7 +249,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 			TtlDuration: DefaultEphemeralTTL,
 			TtlField:    "created_at",
 		},
-		Indexes: map[string]client.IndexConfig{
+		Indexes: map[string]client.CreateIndexRequest{
 			embeddingIndex: *embIdx,
 			graphIndex:     *graphIdx,
 		},
@@ -691,11 +691,14 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 			for _, e := range queryEntities {
 				entityKeys = append(entityKeys, entityKey(e.Label, e.Text))
 			}
-			reqMap["graph_queries"] = map[string]any{
+			// Incoming expansion is retained through the deprecated local graph
+			// contract until the exact public coordinator supports reverse edges.
+			reqMap["graph_searches"] = map[string]any{
 				"entity_expansion": map[string]any{
-					"index": graphIndex,
-					"traverse": map[string]any{
-						"start":      map[string]any{"keys": entityKeys},
+					"type":        "traverse",
+					"index_name":  graphIndex,
+					"start_nodes": map[string]any{"keys": entityKeys},
+					"params": map[string]any{
 						"edge_types": []string{"mentions"},
 						"direction":  "in",
 						"max_depth":  1,
@@ -752,15 +755,16 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		"table":            table,
 		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
 		"limit":            limit,
-		"graph_queries": map[string]any{
+		"graph_searches": map[string]any{
 			"related": map[string]any{
-				"index": graphIndex,
-				"traverse": map[string]any{
-					"start":      map[string]any{"keys": []string{mKey}},
-					"edge_types": []string{"mentions", "related_to"},
-					"direction":  "both",
-					"max_depth":  depth,
-					"limit":      limit,
+				"type":        "traverse",
+				"index_name":  graphIndex,
+				"start_nodes": map[string]any{"keys": []string{mKey}},
+				"params": map[string]any{
+					"edge_types":  []string{"mentions", "related_to"},
+					"direction":   "both",
+					"max_depth":   depth,
+					"max_results": limit,
 				},
 			},
 		},
@@ -809,11 +813,12 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		"table":            table,
 		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
 		"limit":            limit,
-		"graph_queries": map[string]any{
+		"graph_searches": map[string]any{
 			"mentions": map[string]any{
-				"index": graphIndex,
-				"traverse": map[string]any{
-					"start":      map[string]any{"keys": []string{eKey}},
+				"type":        "traverse",
+				"index_name":  graphIndex,
+				"start_nodes": map[string]any{"keys": []string{eKey}},
+				"params": map[string]any{
 					"edge_types": []string{"mentions"},
 					"direction":  "in",
 					"max_depth":  1,

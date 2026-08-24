@@ -5,7 +5,6 @@ from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
-from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="GraphMatchEdge")
@@ -13,19 +12,16 @@ T = TypeVar("T", bound="GraphMatchEdge")
 
 @_attrs_define
 class GraphMatchEdge:
-    """Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity
-    is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an
-    explicit cycle.
+    """Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those
+    aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-
+    simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing
+    onto an already bound target alias for an explicit cycle.
 
         Attributes:
             from_ (str):
             to (str):
             types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
                 at most 64 KiB.
-            direction (EdgeDirection | Unset): Direction of edges to query:
-                - out: Outgoing edges from the node
-                - in: Incoming edges to the node
-                - both: Both outgoing and incoming edges
             min_hops (int | Unset):  Default: 1.
             max_hops (int | Unset):  Default: 1.
             min_weight (float | Unset):
@@ -35,7 +31,6 @@ class GraphMatchEdge:
     from_: str
     to: str
     types: list[str] | Unset = UNSET
-    direction: EdgeDirection | Unset = UNSET
     min_hops: int | Unset = 1
     max_hops: int | Unset = 1
     min_weight: float | Unset = UNSET
@@ -49,10 +44,6 @@ class GraphMatchEdge:
         types: list[str] | Unset = UNSET
         if not isinstance(self.types, Unset):
             types = self.types
-
-        direction: str | Unset = UNSET
-        if not isinstance(self.direction, Unset):
-            direction = self.direction.value
 
         min_hops = self.min_hops
 
@@ -72,8 +63,6 @@ class GraphMatchEdge:
         )
         if types is not UNSET:
             field_dict["types"] = types
-        if direction is not UNSET:
-            field_dict["direction"] = direction
         if min_hops is not UNSET:
             field_dict["min_hops"] = min_hops
         if max_hops is not UNSET:
@@ -94,13 +83,6 @@ class GraphMatchEdge:
 
         types = cast(list[str], d.pop("types", UNSET))
 
-        _direction = d.pop("direction", UNSET)
-        direction: EdgeDirection | Unset
-        if isinstance(_direction, Unset):
-            direction = UNSET
-        else:
-            direction = EdgeDirection(_direction)
-
         min_hops = d.pop("min_hops", UNSET)
 
         max_hops = d.pop("max_hops", UNSET)
@@ -113,7 +95,6 @@ class GraphMatchEdge:
             from_=from_,
             to=to,
             types=types,
-            direction=direction,
             min_hops=min_hops,
             max_hops=max_hops,
             min_weight=min_weight,

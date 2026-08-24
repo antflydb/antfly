@@ -845,7 +845,7 @@ test "parse supported graph queries accepts pattern requests" {
         \\      "match": {
         \\        "anchor": "a",
         \\        "nodes": {"a": {}, "b": {}},
-        \\        "edges": [{"from": "a", "to": "b", "types": ["links"], "direction": "out", "min_hops": 1, "max_hops": 2}]
+        \\        "edges": [{"from": "a", "to": "b", "types": ["links"], "min_hops": 1, "max_hops": 2}]
         \\      },
         \\      "return": {"bindings": ["b"], "limit": 10}
         \\    }

@@ -164,7 +164,6 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         },
         "limit": 10,
     }
-
     def public_neighbors_query() -> dict | None:
         try:
             result = serverless_api.query_table(
@@ -636,8 +635,8 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
             "c": {"filter": {"prefix": "ga", "field": "title"}},
         },
         "edges": [
-            {"from": "a", "to": "b", "types": ["cites"], "direction": "out"},
-            {"from": "b", "to": "c", "types": ["cites"], "direction": "out"},
+            {"from": "a", "to": "b", "types": ["cites"]},
+            {"from": "b", "to": "c", "types": ["cites"]},
         ],
     }
     query_payload = {
@@ -738,7 +737,7 @@ def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(back
         "graph_queries": {
             "neighbors": {
                 "index": "graph_idx",
-                "traverse": {"start": {"keys": ["doc-a"]}, "edge_types": ["knows"], "direction": "out", "max_depth": 1},
+                "traverse": {"start": {"keys": ["doc-a"]}, "edge_types": ["knows"], "max_depth": 1},
             }
         },
         "limit": 10,
@@ -767,7 +766,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
                         "child": {"filter": {"ids": ["child"]}},
                         "parent": {},
                     },
-                    "edges": [{"from": "child", "to": "parent", "types": ["child_of"], "direction": "out"}],
+                    "edges": [{"from": "child", "to": "parent", "types": ["child_of"]}],
                 },
                 "return": {"bindings": ["parent"], "limit": 10},
             }
@@ -919,8 +918,8 @@ def test_stateful_graph_pattern_two_hop_and_documents(backup_api):
                         "c": {},
                     },
                     "edges": [
-                        {"from": "a", "to": "b", "types": ["knows"], "direction": "out"},
-                        {"from": "b", "to": "c", "types": ["knows"], "direction": "out"},
+                        {"from": "a", "to": "b", "types": ["knows"]},
+                        {"from": "b", "to": "c", "types": ["knows"]},
                     ],
                 },
                 "return": {"bindings": ["a", "b", "c"], "limit": 10},
@@ -987,7 +986,6 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                             "from": "start",
                             "to": "end",
                             "types": ["knows"],
-                            "direction": "out",
                             "min_hops": 1,
                             "max_hops": 2,
                         }
@@ -1001,7 +999,7 @@ def test_stateful_graph_pattern_variable_length_and_cycle(backup_api):
                     "anchor": "x",
                     "nodes": {"x": {"filter": {"ids": ["doc-a"]}}},
                     "edges": [
-                        {"from": "x", "to": "x", "types": ["knows"], "direction": "out", "min_hops": 1, "max_hops": 3}
+                        {"from": "x", "to": "x", "types": ["knows"], "min_hops": 1, "max_hops": 3}
                     ],
                 },
                 "return": {"bindings": ["x"], "limit": 10},
@@ -1106,8 +1104,8 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                         "d": {},
                     },
                     "edges": [
-                        {"from": "a", "to": "middle", "types": ["knows"], "direction": "out"},
-                        {"from": "middle", "to": "d", "types": ["knows"], "direction": "out"},
+                        {"from": "a", "to": "middle", "types": ["knows"]},
+                        {"from": "middle", "to": "d", "types": ["knows"]},
                     ],
                 },
                 "return": {"bindings": ["middle", "d"], "limit": 10},
@@ -1122,8 +1120,8 @@ def test_stateful_graph_pattern_diamond_and_edge_type_filter(backup_api):
                         "c": {},
                     },
                     "edges": [
-                        {"from": "a", "to": "b", "types": ["knows"], "direction": "out"},
-                        {"from": "b", "to": "c", "types": ["follows"], "direction": "out"},
+                        {"from": "a", "to": "b", "types": ["knows"]},
+                        {"from": "b", "to": "c", "types": ["follows"]},
                     ],
                 },
                 "return": {"bindings": ["a", "b", "c"], "limit": 10},
@@ -1338,21 +1336,23 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-1"}],
-                "KNOWS": [{"target": "person-b"}],
+                # The canonical graph DSL is directed. Materialize both arcs
+                # for LSQB's undirected KNOWS relationship.
+                "KNOWS": [{"target": "person-b"}, {"target": "person-c"}],
             },
         ),
         "person-b": doc(
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-2"}],
-                "KNOWS": [{"target": "person-c"}],
+                "KNOWS": [{"target": "person-a"}, {"target": "person-c"}],
             },
         ),
         "person-c": doc(
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-3"}],
-                "KNOWS": [{"target": "person-a"}],
+                "KNOWS": [{"target": "person-a"}, {"target": "person-b"}],
             },
         ),
         "forum": doc(
@@ -1381,8 +1381,14 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         ),
         "post-q2": doc("Post", {"HAS_CREATOR": [{"target": "person-b"}]}),
         "chain-a": doc("Person", {"KNOWS": [{"target": "chain-b"}]}),
-        "chain-b": doc("Person", {"KNOWS": [{"target": "chain-c"}]}),
-        "chain-c": doc("Person", {"HAS_INTEREST": [{"target": "interest-tag"}]}),
+        "chain-b": doc("Person", {"KNOWS": [{"target": "chain-a"}, {"target": "chain-c"}]}),
+        "chain-c": doc(
+            "Person",
+            {
+                "KNOWS": [{"target": "chain-b"}],
+                "HAS_INTEREST": [{"target": "interest-tag"}],
+            },
+        ),
         "interest-tag": doc("Tag"),
         "creator": doc("Person"),
         "liker": doc("Person", {"LIKES": [{"target": "message-optional"}]}),
@@ -1474,7 +1480,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "post": node("Post"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
                 {"from": "comment", "to": "person1", "types": ["HAS_CREATOR"]},
                 {"from": "comment", "to": "post", "types": ["REPLY_OF"]},
                 {"from": "post", "to": "person2", "types": ["HAS_CREATOR"]},
@@ -1497,9 +1503,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 {"from": "city2", "to": "country", "types": ["IS_PART_OF"]},
                 {"from": "person3", "to": "city3", "types": ["IS_LOCATED_IN"]},
                 {"from": "city3", "to": "country", "types": ["IS_PART_OF"]},
-                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
-                {"from": "person3", "to": "person1", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
+                {"from": "person3", "to": "person1", "types": ["KNOWS"]},
             ],
         ),
         "q4": count_query(
@@ -1539,8 +1545,8 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where=neq("person1", "person3"),
@@ -1593,8 +1599,8 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"], "direction": "both"},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"], "direction": "both"},
+                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where={
@@ -1606,7 +1612,6 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                                     "from": "person1",
                                     "to": "person3",
                                     "types": ["KNOWS"],
-                                    "direction": "both",
                                 }
                             ]
                         }
@@ -1707,7 +1712,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
                         "a": {},
                         "b": {},
                     },
-                    "edges": [{"from": "a", "to": "b", "types": ["knows"], "direction": "out"}],
+                    "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                 },
                 "return": {"bindings": ["b"], "limit": 2},
             },
@@ -1716,7 +1721,7 @@ def test_stateful_graph_pattern_max_results_limit(backup_api):
                 "match": {
                     "anchor": "a",
                     "nodes": {"a": {}, "b": {}},
-                    "edges": [{"from": "a", "to": "b", "types": ["knows"], "direction": "out"}],
+                    "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
                 },
                 "return": {
                     "aggregates": {

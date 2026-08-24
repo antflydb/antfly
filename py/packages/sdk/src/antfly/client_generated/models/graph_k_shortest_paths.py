@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
-from ..models.edge_direction import EdgeDirection
 from ..models.path_weight_mode import PathWeightMode
 from ..types import UNSET, Unset
 
@@ -33,16 +32,13 @@ T = TypeVar("T", bound="GraphKShortestPaths")
 
 @_attrs_define
 class GraphKShortestPaths:
-    """
+    """Find up to `k` outgoing loopless paths from `from` to `to`.
+
     Attributes:
         from_ (GraphPathEndpoint):
         to (GraphPathEndpoint):
         k (int):
         edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
-        direction (EdgeDirection | Unset): Direction of edges to query:
-            - out: Outgoing edges from the node
-            - in: Incoming edges to the node
-            - both: Both outgoing and incoming edges
         max_depth (int | Unset):  Default: 10.
         min_weight (float | Unset):
         max_weight (float | Unset):
@@ -68,7 +64,6 @@ class GraphKShortestPaths:
     to: GraphPathEndpoint
     k: int
     edge_types: list[str] | Unset = UNSET
-    direction: EdgeDirection | Unset = UNSET
     max_depth: int | Unset = 10
     min_weight: float | Unset = UNSET
     max_weight: float | Unset = UNSET
@@ -119,10 +114,6 @@ class GraphKShortestPaths:
         edge_types: list[str] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
             edge_types = self.edge_types
-
-        direction: str | Unset = UNSET
-        if not isinstance(self.direction, Unset):
-            direction = self.direction.value
 
         max_depth = self.max_depth
 
@@ -185,8 +176,6 @@ class GraphKShortestPaths:
         )
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
-        if direction is not UNSET:
-            field_dict["direction"] = direction
         if max_depth is not UNSET:
             field_dict["max_depth"] = max_depth
         if min_weight is not UNSET:
@@ -231,13 +220,6 @@ class GraphKShortestPaths:
         k = d.pop("k")
 
         edge_types = cast(list[str], d.pop("edge_types", UNSET))
-
-        _direction = d.pop("direction", UNSET)
-        direction: EdgeDirection | Unset
-        if isinstance(_direction, Unset):
-            direction = UNSET
-        else:
-            direction = EdgeDirection(_direction)
 
         max_depth = d.pop("max_depth", UNSET)
 
@@ -403,7 +385,6 @@ class GraphKShortestPaths:
             to=to,
             k=k,
             edge_types=edge_types,
-            direction=direction,
             max_depth=max_depth,
             min_weight=min_weight,
             max_weight=max_weight,

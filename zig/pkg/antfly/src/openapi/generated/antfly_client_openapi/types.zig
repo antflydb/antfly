@@ -4478,19 +4478,6 @@ pub const GraphCountAggregate = struct {
     distinct: ?bool = null,
 };
 
-pub const GraphCrossRangeModeUnsupportedError = struct {
-    status: i32,
-    @"error": []const u8,
-    message: []const u8,
-    retryable: bool,
-    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
-    operation: []const u8,
-    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
-    mode: []const u8,
-    /// Stable machine-readable constraint that prevents exact cross-range execution.
-    reason: []const u8,
-};
-
 pub const GraphDistinctBudgetExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -4871,13 +4858,13 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
+/// Find up to `k` outgoing loopless paths from `from` to `to`.
 pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     k: i64,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -4910,13 +4897,12 @@ pub const GraphMatch = struct {
     optional: ?[]const GraphOptionalMatch = null,
 };
 
-/// Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
+/// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
     max_hops: ?i64 = null,
     min_weight: ?f64 = null,
@@ -5127,6 +5113,19 @@ pub const GraphQuery = union(enum) {
             .graph_traverse_query => |v| try jw.write(v.*),
         }
     }
+};
+
+pub const GraphQueryModeUnsupportedError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+    operation: []const u8,
+    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
+    mode: []const u8,
+    /// Stable machine-readable constraint that prevents exact cross-range execution.
+    reason: []const u8,
 };
 
 /// Deprecated graph_searches traversal and path parameters.
@@ -5401,12 +5400,12 @@ pub const GraphReturn = union(enum) {
     }
 };
 
+/// Find the best outgoing path from `from` to `to`.
 pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -5427,18 +5426,16 @@ pub const GraphShortestPathQuery = struct {
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
+/// Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     limit: ?i64 = null,
-    /// Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
-    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document.
     include_documents: ?bool = null,
@@ -8967,7 +8964,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
-    graph_cross_range_mode_unsupported_error: GraphCrossRangeModeUnsupportedError,
+    graph_query_mode_unsupported_error: GraphQueryModeUnsupportedError,
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
@@ -8990,8 +8987,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_cross_range_mode_unsupported")) {
-            return .{ .graph_cross_range_mode_unsupported_error = try std.json.parseFromSliceLeaky(GraphCrossRangeModeUnsupportedError, allocator, input, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
+            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryModeUnsupportedError, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
@@ -9025,8 +9022,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_cross_range_mode_unsupported")) {
-            return .{ .graph_cross_range_mode_unsupported_error = try std.json.parseFromValueLeaky(GraphCrossRangeModeUnsupportedError, allocator, source, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
+            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryModeUnsupportedError, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
@@ -9040,7 +9037,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
-            .graph_cross_range_mode_unsupported_error => |v| try jw.write(v),
+            .graph_query_mode_unsupported_error => |v| try jw.write(v),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
         }
     }

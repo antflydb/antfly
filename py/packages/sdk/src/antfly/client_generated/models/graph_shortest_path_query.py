@@ -17,7 +17,7 @@ class GraphShortestPathQuery:
     """
     Attributes:
         index (str):
-        shortest_path (GraphShortestPath):
+        shortest_path (GraphShortestPath): Find the best outgoing path from `from` to `to`.
     """
 
     index: str

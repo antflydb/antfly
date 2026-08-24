@@ -1519,19 +1519,6 @@ pub const GraphAnchorFilterRequiresIndexError = struct {
     retryable: bool,
 };
 
-pub const GraphCrossRangeModeUnsupportedError = struct {
-    status: i32,
-    @"error": []const u8,
-    message: []const u8,
-    retryable: bool,
-    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
-    operation: []const u8,
-    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
-    mode: []const u8,
-    /// Stable machine-readable constraint that prevents exact cross-range execution.
-    reason: []const u8,
-};
-
 pub const GraphDistinctBudgetExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -1552,6 +1539,19 @@ pub const GraphMatchOperationLimitExceededError = struct {
     maximum: i64,
     /// Named MATCH operations supplied by the request.
     actual: i64,
+};
+
+pub const GraphQueryModeUnsupportedError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+    operation: []const u8,
+    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
+    mode: []const u8,
+    /// Stable machine-readable constraint that prevents exact cross-range execution.
+    reason: []const u8,
 };
 
 pub const HierarchyAncestor = struct {
@@ -2509,7 +2509,7 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
-    graph_cross_range_mode_unsupported_error: GraphCrossRangeModeUnsupportedError,
+    graph_query_mode_unsupported_error: GraphQueryModeUnsupportedError,
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
@@ -2532,8 +2532,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_cross_range_mode_unsupported")) {
-            return .{ .graph_cross_range_mode_unsupported_error = try std.json.parseFromSliceLeaky(GraphCrossRangeModeUnsupportedError, allocator, input, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
+            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryModeUnsupportedError, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
@@ -2567,8 +2567,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_cross_range_mode_unsupported")) {
-            return .{ .graph_cross_range_mode_unsupported_error = try std.json.parseFromValueLeaky(GraphCrossRangeModeUnsupportedError, allocator, source, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
+            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryModeUnsupportedError, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
@@ -2582,7 +2582,7 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
-            .graph_cross_range_mode_unsupported_error => |v| try jw.write(v),
+            .graph_query_mode_unsupported_error => |v| try jw.write(v),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
         }
     }

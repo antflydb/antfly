@@ -17,7 +17,7 @@ class GraphKShortestPathsQuery:
     """
     Attributes:
         index (str):
-        k_shortest_paths (GraphKShortestPaths):
+        k_shortest_paths (GraphKShortestPaths): Find up to `k` outgoing loopless paths from `from` to `to`.
     """
 
     index: str

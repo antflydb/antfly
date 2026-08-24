@@ -17,7 +17,6 @@
               "result_ref": "$full_text_results",
               "limit": 5
             },
-            "direction": "out",
             "edge_types": ["cites"],
             "max_depth": 1,
             "limit": 5

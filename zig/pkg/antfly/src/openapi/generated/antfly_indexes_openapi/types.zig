@@ -1703,13 +1703,13 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
+/// Find up to `k` outgoing loopless paths from `from` to `to`.
 pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     k: i64,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -1742,13 +1742,12 @@ pub const GraphMatch = struct {
     optional: ?[]const GraphOptionalMatch = null,
 };
 
-/// Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
+/// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
     max_hops: ?i64 = null,
     min_weight: ?f64 = null,
@@ -2222,12 +2221,12 @@ pub const GraphReturn = union(enum) {
     }
 };
 
+/// Find the best outgoing path from `from` to `to`.
 pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -2248,18 +2247,16 @@ pub const GraphShortestPathQuery = struct {
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
+/// Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     limit: ?i64 = null,
-    /// Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
-    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document.
     include_documents: ?bool = null,

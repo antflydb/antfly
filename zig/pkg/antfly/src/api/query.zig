@@ -1004,7 +1004,7 @@ fn mergeGraphSearchResults(
     }
 
     for (results) |result| {
-        try validateGraphAggregateQueriesForShard(queries, result.graph_results);
+        try validateGraphQueriesForShard(queries, result.graph_results);
         for (result.graph_results) |graph_result| {
             try validateGraphAggregateShard(queries, graph_result);
             const idx = blk: {
@@ -1101,17 +1101,30 @@ fn mergeGraphSearchResults(
     return merged;
 }
 
-fn validateGraphAggregateQueriesForShard(
+/// A shard graph response is operation-keyed just like the public contract.
+/// Empty operations are represented by an empty result, never by omitting the
+/// operation, so version skew or a broken worker cannot silently turn an exact
+/// graph request into a partial success.
+fn validateGraphQueriesForShard(
     queries: []const db_mod.types.NamedGraphQuery,
     graph_results: []const db_mod.types.GraphSearchResult,
 ) !void {
     for (queries) |named| {
-        if (named.query.aggregates.len == 0) continue;
         var occurrences: usize = 0;
         for (graph_results) |graph_result| {
             if (std.mem.eql(u8, named.name, graph_result.name)) occurrences += 1;
         }
         if (occurrences != 1) return error.InvalidRemoteResponse;
+    }
+
+    for (graph_results) |graph_result| {
+        var requested = false;
+        for (queries) |named| {
+            if (!std.mem.eql(u8, named.name, graph_result.name)) continue;
+            requested = true;
+            break;
+        }
+        if (!requested) return error.InvalidRemoteResponse;
     }
 }
 
@@ -3526,6 +3539,57 @@ test "graph merge rejects missing and inexact aggregate shards" {
     try std.testing.expectError(
         error.InvalidRemoteResponse,
         mergeGraphSearchResults(alloc, &distinct_queries, &incomplete_results),
+    );
+}
+
+test "graph merge rejects missing duplicate and unknown traversal operations" {
+    const alloc = std.testing.allocator;
+    const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "walk", .query = .{
+        .query_type = .traverse,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+    } }};
+
+    const omitted = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &.{},
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &queries, &omitted),
+    );
+
+    var duplicate_graph = [_]db_mod.types.GraphSearchResult{
+        .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
+        .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
+    };
+    const duplicate = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &duplicate_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &queries, &duplicate),
+    );
+
+    var unknown_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("other"),
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const unknown = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &unknown_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &queries, &unknown),
     );
 }
 

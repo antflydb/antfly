@@ -2994,7 +2994,7 @@ export interface components {
             /** @enum {boolean} */
             retryable: false;
         };
-        GraphCrossRangeModeUnsupportedError: {
+        GraphQueryModeUnsupportedError: {
             /**
              * Format: int32
              * @enum {integer}
@@ -3004,7 +3004,7 @@ export interface components {
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            error: "graph_cross_range_mode_unsupported";
+            error: "graph_query_mode_unsupported";
             message: string;
             /** @enum {boolean} */
             retryable: false;
@@ -3043,7 +3043,7 @@ export interface components {
              */
             actual: number;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphCrossRangeModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -11923,13 +11923,12 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
-        /** @description Structural edge expansion between aliases. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. */
+        /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. */
         GraphMatchEdge: {
             from: string;
             to: string;
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
             /** @default 1 */
             min_hops?: number;
             /** @default 1 */
@@ -12037,11 +12036,11 @@ export interface components {
         };
         /** @description Select graph nodes using exactly one explicit, exact selector form. */
         GraphNodeSelector: components["schemas"]["GraphKeyNodeSelector"] | components["schemas"]["GraphIdentityNodeSelector"] | components["schemas"]["GraphResultRefNodeSelector"];
+        /** @description Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction. */
         GraphTraversal: {
             start: components["schemas"]["GraphNodeSelector"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
             /**
              * @description Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
              * @default 1
@@ -12053,11 +12052,6 @@ export interface components {
             max_weight?: number;
             /** @default 100 */
             limit?: number;
-            /**
-             * @description Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
-             * @default true
-             */
-            deduplicate_nodes?: boolean;
             /** @default false */
             include_paths?: boolean;
             /**
@@ -12082,12 +12076,12 @@ export interface components {
          * @enum {string}
          */
         PathWeightMode: "min_hops" | "min_weight" | "max_weight";
+        /** @description Find the best outgoing path from `from` to `to`. */
         GraphShortestPath: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
             /** @default 10 */
             max_depth?: number;
             /** Format: double */
@@ -12109,13 +12103,13 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
+        /** @description Find up to `k` outgoing loopless paths from `from` to `to`. */
         GraphKShortestPaths: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             k: number;
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: string[];
-            direction?: components["schemas"]["EdgeDirection"];
             /** @default 10 */
             max_depth?: number;
             /** Format: double */
