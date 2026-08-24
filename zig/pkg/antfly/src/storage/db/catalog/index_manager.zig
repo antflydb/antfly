@@ -1722,6 +1722,7 @@ pub const IndexManager = struct {
         recycle_raw_reads: bool = true,
         cache_raw_values: bool = true,
         cache_vectors: bool = true,
+        block_cache_admission: backend_types.Namespace.BlockCacheAdmission = .retain,
 
         const DefaultRawReadLimitBytes: u64 = 32 * 1024 * 1024;
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
@@ -1796,8 +1797,8 @@ pub const IndexManager = struct {
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
             if (self.read_txn == null) {
                 self.read_txn = switch (self.read_txn_kind) {
-                    .probe => try store.beginProbeTxn(),
-                    .snapshot => try store.beginReadTxn(),
+                    .probe => try store.beginProbeTxnWithBlockCacheAdmission(self.block_cache_admission),
+                    .snapshot => try store.beginReadTxnWithBlockCacheAdmission(self.block_cache_admission),
                 };
             }
             return &self.read_txn.?;
@@ -7682,6 +7683,7 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7707,6 +7709,7 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7734,9 +7737,31 @@ pub const IndexManager = struct {
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = false,
+                .block_cache_admission = if (entry.index.prefersDecodedVectorResidency()) .transient else .retain,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
+
+        // Admit the candidate-normalization and per-candidate metadata arrays
+        // before any of them allocate. The include length is a conservative
+        // upper bound after sort/unique/subtraction; charging the exclusion
+        // copy unconditionally preserves fail-closed accounting without first
+        // scanning a large request merely to discover whether it is sorted.
+        const requested_candidates: u64 = @intCast(req.filter_ids.len);
+        const fixed_candidate_bytes = requested_candidates *|
+            (@as(u64, @sizeOf(u64)) + @sizeOf(?[]const u8) + @sizeOf(?[]u8));
+        const exclusion_bytes = @as(u64, @intCast(req.exclude_ids.len)) *| @sizeOf(u64);
+        const result_capacity_bytes = @as(u64, @intCast(req.k)) *| 64;
+        const vector_scratch_bytes = @as(u64, entry.dims) *| @sizeOf(f32);
+        const preflight_workspace_bytes = fixed_candidate_bytes +| exclusion_bytes +|
+            result_capacity_bytes +| vector_scratch_bytes +| 4096;
+        var workspace_accounted: u64 = 0;
+        if (!self.tryObserveDenseWorkingBytes(
+            .dense_search_working_set,
+            &workspace_accounted,
+            preflight_workspace_bytes,
+        )) return error.ResourceBudgetExceeded;
+        defer self.observeDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, 0);
 
         const prepare_start_ns = platform_time.monotonicNs();
         var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
@@ -7744,6 +7769,7 @@ pub const IndexManager = struct {
         const unique_candidate_ids = candidates.values;
         var exact_profile: dense_exact.SearchOutcome.Profile = .{
             .candidate_count = @intCast(unique_candidate_ids.len),
+            .workspace_bytes = preflight_workspace_bytes,
             .candidate_prepare_ns = platform_time.monotonicNs() - prepare_start_ns,
         };
         try checkDenseSearchCancelled(req);
@@ -7883,14 +7909,13 @@ pub const IndexManager = struct {
             const per_candidate_workspace = @sizeOf(u64) + @sizeOf(?[]const u8) + @sizeOf(f32) +
                 @sizeOf([]const u8) + @sizeOf(?[]const u8) + @sizeOf(DenseArtifactReadKey) +
                 @sizeOf([]const u8) + @sizeOf(usize) + @sizeOf(?[]const u8);
-            const workspace_bytes = @as(u64, @intCast(batch_capacity)) *| per_candidate_workspace +|
+            const batch_workspace_bytes = @as(u64, @intCast(batch_capacity)) *| per_candidate_workspace +|
                 @as(u64, entry.dims) *| @sizeOf(f32) +| max_batch_key_bytes +| 4096;
-            exact_profile.workspace_bytes = workspace_bytes;
-            var workspace_accounted: u64 = 0;
-            if (!self.tryObserveDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, workspace_bytes)) {
+            const total_workspace_bytes = preflight_workspace_bytes +| batch_workspace_bytes;
+            exact_profile.workspace_bytes = total_workspace_bytes;
+            if (!self.tryObserveDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, total_workspace_bytes)) {
                 return error.ResourceBudgetExceeded;
             }
-            defer self.observeDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, 0);
 
             const batch_ids = try self.alloc.alloc(u64, batch_capacity);
             defer self.alloc.free(batch_ids);
@@ -16049,6 +16074,7 @@ pub const IndexManager = struct {
                 const cached = handle.view();
                 if (cached.len != dims) return error.InvalidVectorDimensions;
                 const distance_start = platform_time.monotonicNs();
+                if (profile) |p| p.vector_cache_hits += 1;
                 distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
                 if (profile) |p| {
                     const elapsed = platform_time.monotonicNs() - distance_start;
@@ -16057,6 +16083,7 @@ pub const IndexManager = struct {
                 }
                 continue;
             }
+            if (profile) |p| p.vector_cache_misses += 1;
             const doc_key = maybe_doc_key orelse continue;
             const storage_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
@@ -25143,7 +25170,15 @@ test "production external exact scorer uses bounded sorted artifact batches" {
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
-    var manager = try IndexManager.init(alloc, path);
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
     try manager.addAllNoBackfill(&store, &.{.{
@@ -25180,6 +25215,7 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "semantic_idx", writes, .{ .mode = .bulk_ingest });
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.index.prefersDecodedVectorResidency());
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
 
@@ -25216,6 +25252,7 @@ test "production external exact scorer uses bounded sorted artifact batches" {
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.raw_scalar_reads);
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.request_vector_cache_entries);
     try std.testing.expectEqual(@as(usize, 0), vector_namespace_probes.count);
+    try std.testing.expect(entry.index.hbcCacheStats().vector.used_bytes > 0);
     try std.testing.expectEqual(@as(u64, 1), outcome.profile.missing_vectors);
     try std.testing.expect(outcome.profile.workspace_bytes > 0);
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);

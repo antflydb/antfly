@@ -315,7 +315,7 @@ const HbcPhysicalAccounting = struct {
         _ = self.pinned_bytes.fetchAdd(bytes, .monotonic);
     }
 
-    fn current(self: *HbcPhysicalAccounting) u64 {
+    fn current(self: *const HbcPhysicalAccounting) u64 {
         return self.published_bytes.load(.acquire);
     }
 };
@@ -859,6 +859,12 @@ pub const Cache = struct {
         if (self.namespace_stats.getPtr(namespace)) |stats| noteHbcKindSampledAdmission(stats, .vector);
         self.mutex.unlockExclusive();
         return true;
+    }
+
+    fn retainsEveryConcurrentVector(self: *const Cache) bool {
+        if (self.concurrent_vector_admission_stride.load(.acquire) != 1) return false;
+        const target = self.admission_target_bytes.load(.acquire);
+        return target == 0 or self.physical_accounting.current() < target;
     }
 
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
@@ -3543,6 +3549,28 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache or self.lsmSessionBatchingActive()) return .vecs;
         if (self.config.max_cached_vectors == 0) return .vecs;
         return .vecs_transient;
+    }
+
+    /// Query-side external-vector loaders use this same ownership decision for
+    /// primary-store artifact blocks. It keeps one governed decoded copy when
+    /// that cache is admissible, and retains LSM blocks normally when decoded
+    /// vector retention is disabled or intentionally bypassed.
+    pub fn prefersDecodedVectorResidency(self: *const HBCIndex) bool {
+        if (!self.cache_enabled or !self.retained_vector_cache_enabled) return false;
+        if (self.bypass_external_vector_cache or self.lsmSessionBatchingActive()) return false;
+        if (self.config.max_cached_vectors == 0) return false;
+        // Production external-vector searches share retained entries across
+        // requests. A local cache deliberately avoids concurrent mutation, so
+        // retaining primary-store blocks is the safer ownership there.
+        const shared = self.shared_cache orelse return false;
+        if (!shared.retainsEveryConcurrentVector()) return false;
+        // Under pressure, sampled vector admission intentionally leaves most
+        // misses uncached. Retain their LSM data blocks instead; transient
+        // ownership is beneficial only while every decoded miss is eligible.
+        if (self.resource_manager) |manager| {
+            if (manager.hbcCachePolicy().concurrent_vector_admission_stride != 1) return false;
+        }
+        return true;
     }
 
     fn getNamespacedCommitted(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8) ![]const u8 {
@@ -6769,10 +6797,11 @@ pub const HBCIndex = struct {
     pub fn observeSearchCacheBenefit(self: *HBCIndex, profile: *const SearchProfile) void {
         self.observeHbcDenseRouteCost(profile);
         const manager = self.resource_manager orelse return;
+        if (!manager.beginHbcCacheBenefitSample()) return;
         const cache_stats = self.hbcCacheStats();
         const node_hits = profile.nodes_visited -| profile.node_cache_misses;
         const quantized_hits = profile.approx_leaves_scored -| profile.quantized_cache_misses;
-        manager.observeHbcCacheBenefit(.{
+        manager.observeHbcCacheBenefitSampled(.{
             .{
                 .hits = node_hits,
                 .misses = profile.node_cache_misses,
@@ -6786,12 +6815,15 @@ pub const HBCIndex = struct {
                 .resident_bytes = cache_stats.quantized.used_bytes,
             },
             .{
-                .hits = profile.rerank_lsm_cache_hits,
-                .misses = profile.rerank_lsm_cache_misses,
+                .hits = profile.vector_cache_hits,
+                .misses = profile.vector_cache_misses,
                 .miss_service_ns = profile.rerank_artifact_read_ns +| profile.rerank_artifact_decode_ns,
                 .resident_bytes = cache_stats.vector.used_bytes,
             },
             .{
+                .hits = profile.metadata_cache_hits,
+                .misses = profile.metadata_cache_misses,
+                .miss_service_ns = profile.metadata_cache_miss_ns,
                 .resident_bytes = cache_stats.metadata.used_bytes,
             },
         });

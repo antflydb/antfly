@@ -376,8 +376,26 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalReadTxn.open(self.backend, self.namespace);
         }
 
+        pub fn beginReadWithBlockCacheAdmission(
+            self: *@This(),
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) !LocalReadTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalReadTxn.open(self.backend, namespace);
+        }
+
         pub fn beginProbe(self: *@This()) !LocalProbeTxn {
             return try LocalProbeTxn.open(self.backend, self.namespace);
+        }
+
+        pub fn beginProbeWithBlockCacheAdmission(
+            self: *@This(),
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) !LocalProbeTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalProbeTxn.open(self.backend, namespace);
         }
 
         pub fn beginCurrentScan(self: *@This()) !LocalCurrentScanTxn {

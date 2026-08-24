@@ -1743,6 +1743,32 @@ pub fn getMetadataManySortedInTxnWithScratch(
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
 ) !void {
+    return try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        null,
+        null,
+        null,
+    );
+}
+
+fn getMetadataManySortedInTxnWithScratchProfiled(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    out_metadata: []?[]const u8,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    profile: ?*search_types.SearchProfile,
+    now_fn_u64: ?*const fn () u64,
+    elapsed_fn_u64: ?*const fn (u64) u64,
+) !void {
     if (vector_ids.len != out_metadata.len) return error.InvalidArgument;
     if (lookup_storage.len < vector_ids.len) return error.InvalidArgument;
     if (key_views_storage.len < vector_ids.len) return error.InvalidArgument;
@@ -1753,9 +1779,11 @@ pub fn getMetadataManySortedInTxnWithScratch(
     var lookup_count: usize = 0;
     for (vector_ids, 0..) |vector_id, index| {
         if (self.getCachedMetadata(vector_id)) |cached| {
+            if (profile) |p| p.metadata_cache_hits += 1;
             out_metadata[index] = cached;
             continue;
         }
+        if (profile) |p| p.metadata_cache_misses += 1;
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, vector_id);
         lookup_storage[lookup_count] = .{
@@ -1774,6 +1802,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
+    const miss_start = if (now_fn_u64) |now| now() else 0;
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
         try txn.getManySorted(.vecs, key_views, values);
     } else {
@@ -1784,6 +1813,7 @@ pub fn getMetadataManySortedInTxnWithScratch(
             };
         }
     }
+    if (profile) |p| p.metadata_cache_miss_ns += elapsed_fn_u64.?(miss_start);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         out_metadata[lookups[i].item_index] = try self.cacheMetadata(lookups[i].vector_id, value);
@@ -1974,21 +2004,17 @@ pub fn searchProfiledRequest(
         // centroid per posting). Keep the full ordered frontier so selective
         // filters can advance without rebuilding it and stopping can be based
         // on a real lower bound instead of the old fixed probe cutoff.
-        const probe_capacity = @max(initial_probe_limit, spfresh_index.publishedFlatPostingCapacity(self));
-        var probes = try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_capacity);
-        defer self.alloc.free(probes);
-
-        const probe_count = try spfresh_index.selectFlatRabitqPostings(
+        const probes = try spfresh_index.selectFlatRabitqPostingsAlloc(
             self,
             &txn,
             transformed_query,
-            probe_capacity,
-            probes,
             scratch,
             &profile,
             now_fn_u64,
             elapsed_fn_u64,
         );
+        defer self.alloc.free(probes);
+        const probe_count = probes.len;
 
         var flat_leaves_scored: usize = 0;
         var previous_wave_end: usize = 0;
@@ -2451,7 +2477,7 @@ fn scoreLeafMemberIds(
         const filter_start = now_fn_u64();
         profile.filter_metadata_batches += 1;
         const candidates = scratch.member_ids[0..filtered_count];
-        try getMetadataManySortedInTxnWithScratch(
+        try getMetadataManySortedInTxnWithScratchProfiled(
             self,
             txn,
             candidates,
@@ -2459,6 +2485,9 @@ fn scoreLeafMemberIds(
             scratch.lookups[0..filtered_count],
             scratch.key_views[0..filtered_count],
             scratch.values[0..filtered_count],
+            profile,
+            now_fn_u64,
+            elapsed_fn_u64,
         );
         profile.filter_metadata_batch_ns += elapsed_fn_u64(filter_start);
         var prefix_count: usize = 0;
@@ -2529,6 +2558,7 @@ fn scoreLeafMemberIds(
     for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
         if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
+            profile.vector_cache_hits += 1;
             var handle = cached_handle;
             defer handle.deinit();
             const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
@@ -2539,6 +2569,7 @@ fn scoreLeafMemberIds(
             profile.exact_vectors_scored += 1;
             continue;
         }
+        if (!indexHasExternalVectorLoader(self)) profile.vector_cache_misses += 1;
         fetch_member_ids[fetch_count] = member_id;
         fetch_count += 1;
     }

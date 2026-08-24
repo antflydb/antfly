@@ -376,23 +376,31 @@ fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirec
     }
 }
 
-pub fn selectFlatRabitqPostings(
+/// Scores and returns the complete ordered flat frontier from one retained
+/// directory publication. Allocation capacity is derived from that same
+/// directory, so a concurrent publication cannot make the caller silently
+/// truncate newer postings with an older capacity snapshot.
+pub fn selectFlatRabitqPostingsAlloc(
     self: anytype,
     txn: anytype,
     query: []const f32,
-    limit: usize,
-    probes: []FlatCentroidProbe,
     scratch: anytype,
     profile: *search_types.SearchProfile,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
-) !usize {
-    if (limit == 0 or probes.len == 0) return 0;
-    const probe_limit = @min(limit, probes.len);
+) ![]FlatCentroidProbe {
     const start = now_fn_u64();
     const directory = try acquireFlatCentroidDirectory(self, txn);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
+
+    var posting_count: usize = 0;
+    for (directory.blocks) |*block| {
+        posting_count = std.math.add(usize, posting_count, block.posting_ids.len) catch return error.OutOfMemory;
+    }
+    std.debug.assert(posting_count == directory.posting_count);
+    const probes = try self.alloc.alloc(FlatCentroidProbe, posting_count);
+    errdefer self.alloc.free(probes);
     var probe_count: usize = 0;
 
     for (directory.blocks) |*block| {
@@ -406,7 +414,7 @@ pub fn selectFlatRabitqPostings(
                 flatL2MemberLowerBound(distances[i], error_bounds[i], block.covering_radii[i])
             else
                 null;
-            insertFlatProbe(probes[0..probe_limit], &probe_count, .{
+            insertFlatProbe(probes, &probe_count, .{
                 .posting_id = posting_id,
                 .distance = distances[i],
                 .error_bound = error_bounds[i],
@@ -416,13 +424,10 @@ pub fn selectFlatRabitqPostings(
         }
     }
 
+    std.debug.assert(probe_count == posting_count);
     std.mem.sort(FlatCentroidProbe, probes[0..probe_count], {}, flatProbeLess);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
-    return probe_count;
-}
-
-pub fn publishedFlatPostingCapacity(self: anytype) usize {
-    return @intCast(publishedNodeCountSnapshot(self));
+    return probes;
 }
 
 fn recomputeAncestorCentroids(
