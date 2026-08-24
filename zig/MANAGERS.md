@@ -559,9 +559,10 @@ node or quantized pointer across eviction.
 ResourceManager returns a concurrent exact-vector admission stride:
 
 - normal pressure below the cache target admits every shared-cache miss;
-- a cache at its steady target samples one in eight misses even if synchronous
-  eviction has already returned the pressure reading to normal;
-- soft HBC or aggregate pressure samples one in eight optional vector misses;
+- a cache at its steady target samples one in eight decoded-owner requests even
+  if synchronous eviction has already returned the pressure reading to normal;
+- soft HBC or aggregate pressure samples one in eight optional decoded-owner
+  requests;
 - hard pressure stops optional concurrent vector admission until reclamation.
 
 This rate limits lock and allocation churn under pressure or saturation; it
@@ -570,12 +571,17 @@ therefore warm over time without turning a full cache into an insert/evict lock
 convoy. Routing nodes and quantized payloads use retained handles and may warm
 during concurrent search.
 
-External-vector queries make one residency decision before opening their
-primary-store transaction. They atomically reserve decoded-cache headroom for
-the bounded exact/rerank load count; a successful lease uses transient LSM
-block admission and guarantees every coherent decoded miss is eligible for
-publication without per-vector sampling. If the reservation is unavailable,
-the complete request retains LSM blocks and suppresses decoded-cache writes.
+External-vector queries choose one residency owner before opening their
+primary-store transaction. A decoded-owner lease uses transient LSM block
+admission, then precharges physical cache capacity immediately before each
+actual miss batch. Publication atomically transfers that charge to retained
+entries, so unrelated admissions cannot steal it and no second charge or hard
+limit overcommit is possible. At saturation, one sampled request receives a
+bounded replacement window rather than freezing the resident set or rotating
+the entire cache. If the next complete batch cannot be precharged because the
+window is exhausted, entries are pinned, or pressure changed, the transaction
+is recycled before the read and the remainder of the request uses retained LSM
+ownership with decoded publication suppressed.
 If a stale or missing quantized payload expands exact work beyond the admitted
 bound, the session releases the remaining lease, closes the transient
 transaction, and switches to retained LSM admission before the additional
@@ -676,9 +682,11 @@ that compatibility path. A single reusable batch workspace is charged to
 `dense_search_working_set` for its lifetime, while retained transaction pages
 are observed once after each multi-get. Because exact scoring is single-pass,
 its request-local decoded-vector cache is disabled; a governed shared-vector
-cache may still own the request when the complete candidate batch fits an
-up-front decoded-residency lease. Otherwise the primary-store transaction uses
-normal retained block admission and does not populate decoded vectors.
+cache may still own the request through a decoded-residency lease. Capacity is
+reserved once for each bounded miss batch; a saturated request receives at
+most its ResourceManager-derived replacement window before a safe pre-read
+handoff to retained LSM ownership. Otherwise the primary-store transaction
+uses normal retained block admission and does not populate decoded vectors.
 Metadata cache reads never escape as unretained slices: result attachment uses
 retained leases, while batched filtering keeps transaction-owned views for the
 transaction lifetime. Exact-candidate preparation additionally bypasses both
@@ -763,14 +771,16 @@ with QPS; QPS alone cannot distinguish cache capacity from search quality or
 CPU saturation.
 
 When a request owns a decoded-residency lease, HBC marks its exact-vector LSM
-reads as transient. The LSM still retains indexes and bloom filters, and it may
-reuse a block already resident for another reader, but a vector miss does not
-publish a second serialized copy into the LSM block cache. If decoded-vector
-caching is disabled, bypassed, pressured, lacks headroom for the bounded query,
-or cannot cover a degraded-path expansion, HBC uses normal retained LSM block
-admission and suppresses decoded writes for those reads. `policy_bypasses`
-distinguishes this deliberate ownership choice from pressure-denied
-`transient_serves`.
+reads as transient only after the complete upcoming miss batch has physical
+cache capacity precharged. The LSM still retains indexes and bloom filters, and
+it may reuse a block already resident for another reader, but a vector miss
+does not publish a second serialized copy into the LSM block cache. If
+decoded-vector caching is disabled, bypassed, pressured, cannot reclaim pinned
+capacity, exhausts its bounded saturation window, or encounters a
+degraded-path expansion, HBC switches before the next read to normal retained
+LSM block admission and suppresses decoded writes for those reads.
+`policy_bypasses` distinguishes this deliberate ownership choice from
+pressure-denied `transient_serves`.
 
 Reclaim dispatch apportions work among registered cache owners by weight and
 rotates its starting owner. The shared HBC cache similarly computes weighted

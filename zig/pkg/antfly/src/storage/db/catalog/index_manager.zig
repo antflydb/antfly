@@ -1766,11 +1766,12 @@ pub const IndexManager = struct {
         fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
-            if (lease.remainingBytes() >= required_bytes) return;
-            // A degraded/stale payload can require more exact loads than the
-            // normal rerank bound reserved at query admission. Switch before
-            // the read, while no returned transaction views are live, so the
-            // remainder of the request is coherently LSM-owned.
+            if (lease.ensureCapacity(required_bytes)) return;
+            // Capacity is precharged before the read. A saturated replacement
+            // window, pinned cache entries, or degraded/stale payload can make
+            // the next complete batch ineligible. Switch while no returned
+            // transaction views are live, so the remainder of the request is
+            // coherently LSM-owned and cannot overcommit the cache envelope.
             self.useLsmResidency();
         }
 
@@ -24221,6 +24222,75 @@ test "dense vector load session switches to retained LSM ownership before reserv
     session.ensureDecodedResidencyCapacity(2, dims);
     try std.testing.expect(session.decoded_residency_lease == null);
     try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.retain, session.block_cache_admission);
+}
+
+test "production external vector session evolves a saturated decoded resident set" {
+    const alloc = std.testing.allocator;
+    const dims: usize = 2;
+    const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes * 2,
+        .hard_limit_bytes = vector_bytes * 2,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "external-vector-saturated-residency");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(alloc, std.mem.span(path), .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    manager.primary_store = &store;
+
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
+    const context = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+
+    _ = try entry.index.cacheVector(1, &[_]f32{ 1, 0 });
+    _ = try entry.index.cacheVector(2, &[_]f32{ 0, 1 });
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+
+    const doc_key = "doc:replacement";
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "semantic_idx");
+    defer alloc.free(artifact_key);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 0.5, 0.5 });
+    defer alloc.free(payload);
+    try store.put(artifact_key, payload);
+
+    const lease = entry.index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = context,
+        .cache_vectors = false,
+        .block_cache_admission = .transient,
+        .decoded_residency_lease = lease,
+    };
+    defer session.deinit();
+    const previous_session = IndexManager.active_dense_vector_load_session;
+    defer IndexManager.active_dense_vector_load_session = previous_session;
+    IndexManager.active_dense_vector_load_session = &session;
+
+    var scratch: [dims]f32 = undefined;
+    const loaded = try IndexManager.loadDenseVectorForHbcIntoScratch(context, 3, doc_key, &scratch);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 0.5, 0.5 }, loaded);
+    var retained = entry.index.borrowCachedVector(3) orelse return error.TestUnexpectedResult;
+    retained.deinit();
+    try std.testing.expect(session.decoded_residency_lease != null);
+    try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.transient, session.block_cache_admission);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 }
 
 test "dense vector load session is bounded by the shared apply working-set budget" {
