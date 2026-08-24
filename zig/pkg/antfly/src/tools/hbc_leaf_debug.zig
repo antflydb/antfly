@@ -253,7 +253,9 @@ fn debugGlobalApprox(
     defer approx_results.deinit();
 
     var profile: search_types.SearchProfile = .{};
-    const root = try idx.getNodePtrProfiled(&txn, idx.metadata.root_node, &profile);
+    var root_handle = try idx.getNodeReadProfiled(&txn, idx.metadata.root_node, &profile);
+    defer root_handle.deinit(alloc);
+    const root = root_handle.ptr();
     if (root.is_leaf) {
         try hbc_index_mod.scoreLeafMembers(idx, &txn, root, transformed_query, transformed_query_measure, query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, nowNsU64Fixed, elapsedSinceU64Fixed);
     } else {
@@ -263,7 +265,9 @@ fn debugGlobalApprox(
         while (true) {
             const candidate = candidates.pop() orelse break;
             if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
-            const node = idx.getNodePtrProfiled(&txn, candidate.id, &profile) catch continue;
+            var node_handle = idx.getNodeReadProfiled(&txn, candidate.id, &profile) catch continue;
+            defer node_handle.deinit(alloc);
+            const node = node_handle.ptr();
             if (!node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) break;
             if (!node.is_leaf and search_mod.shouldSkipInternalCandidate(candidate, &approx_results, &beam_state, epsilon)) continue;
 

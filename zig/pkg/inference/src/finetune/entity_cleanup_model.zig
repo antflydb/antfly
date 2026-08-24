@@ -306,17 +306,24 @@ pub fn scoreEntities(
         });
         defer allocator.free(features);
 
+        const text = try allocator.dupe(u8, entity.text);
+        errdefer allocator.free(text);
+        const label = try allocator.dupe(u8, entity.label);
+        errdefer allocator.free(label);
+        const embedding = try projectEmbedding(allocator, head, features);
+        errdefer allocator.free(embedding);
+
         out[idx] = .{
             .entity = .{
-                .text = try allocator.dupe(u8, entity.text),
-                .label = try allocator.dupe(u8, entity.label),
+                .text = text,
+                .label = label,
                 .start = entity.start,
                 .end = entity.end,
                 .score = entity.score,
             },
             .validity_score = sigmoid(dot(head.validity_weight, features) + head.validity_bias),
             .representative_score = sigmoid(dot(head.representative_weight, features) + head.representative_bias),
-            .embedding = try projectEmbedding(allocator, head, features),
+            .embedding = embedding,
         };
         built += 1;
     }

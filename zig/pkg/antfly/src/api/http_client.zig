@@ -264,6 +264,13 @@ pub const ApiHttpClient = struct {
         if (std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/")) {
             return raft_routes.Routes.join(self.alloc, base_uri, path);
         }
+        // Accept both listener-root and already-canonical public API base
+        // URIs. Benchmark and external clients commonly retain `/db/v1` in
+        // their configured base; appending it again silently targets a
+        // nonexistent `/db/v1/db/v1/...` route.
+        if (std.mem.endsWith(u8, base_uri, "/db/v1")) {
+            return raft_routes.Routes.join(self.alloc, base_uri, path);
+        }
         const canonical_path = try std.fmt.allocPrint(self.alloc, "/db/v1{s}", .{path});
         defer self.alloc.free(canonical_path);
         return raft_routes.Routes.join(self.alloc, base_uri, canonical_path);

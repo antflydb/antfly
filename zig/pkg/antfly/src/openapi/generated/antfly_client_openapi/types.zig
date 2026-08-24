@@ -8835,7 +8835,7 @@ pub const SuccessMessage = struct {
     message: ?[]const u8 = null,
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
