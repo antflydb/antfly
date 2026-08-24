@@ -243,14 +243,17 @@ pub const Scanner = struct {
                         }
                         if (tok3 == .keyword and std.mem.eql(u8, tok3.keyword, "obj")) {
                             const boxed = try self.alloc.create(Object);
-                            errdefer self.alloc.destroy(boxed);
+                            var boxed_initialized = false;
+                            errdefer {
+                                if (boxed_initialized) boxed.deinit(self.alloc);
+                                self.alloc.destroy(boxed);
+                            }
                             boxed.* = try self.readObject();
+                            boxed_initialized = true;
 
                             var end_tok = try self.readToken();
                             defer end_tok.deinit(self.alloc);
                             if (end_tok != .keyword or !std.mem.eql(u8, end_tok.keyword, "endobj")) {
-                                boxed.deinit(self.alloc);
-                                self.alloc.destroy(boxed);
                                 return error.MissingEndObj;
                             }
 
@@ -344,6 +347,10 @@ pub const Scanner = struct {
 
         const owned = try entries.toOwnedSlice(self.alloc);
         entries = .empty;
+        errdefer {
+            for (owned) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(owned);
+        }
 
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
@@ -441,7 +448,9 @@ pub const Scanner = struct {
     }
 
     fn unreadToken(self: *Scanner, tok: Token) anyerror!void {
-        try self.unread.append(self.alloc, tok);
+        var owned = tok;
+        errdefer owned.deinit(self.alloc);
+        try self.unread.append(self.alloc, owned);
     }
 
     fn skipSpaceAndComments(self: *Scanner) void {

@@ -1802,8 +1802,6 @@ pub const Reader = struct {
         var layout_runs = std.ArrayList(LayoutTextRun).empty;
         defer layout_runs.deinit(self.alloc);
         defer for (layout_runs.items) |*run| run.deinit(self.alloc);
-        var text_parser = TextContentParser.init(self.alloc, &canonical);
-        defer text_parser.deinit();
         var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{}, &.{}, .nonzero);
         defer layout_parser.deinit();
 
@@ -1815,6 +1813,12 @@ pub const Reader = struct {
         for (streams) |*stream| {
             const decoded = try self.readDecodedStreamData(stream);
             defer self.alloc.free(decoded);
+            // Keep the pre-reconstruction extraction contract as the byte
+            // preservation baseline. Real-world PDFs sometimes package
+            // independently generated content streams whose inherited font
+            // state would otherwise decode (and drop) different glyphs.
+            var text_parser = TextContentParser.init(self.alloc, &canonical);
+            defer text_parser.deinit();
             try text_parser.consume(decoded, fonts, forms, 0);
             try layout_parser.consume(decoded, fonts, &.{}, forms);
         }
@@ -2568,8 +2572,6 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var text_parser = TextContentParser.init(self.alloc, &text);
-        defer text_parser.deinit();
         var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{}, &.{}, .nonzero);
         defer run_parser.deinit();
 
@@ -2581,6 +2583,11 @@ pub const Reader = struct {
         for (streams) |*stream| {
             const decoded = try self.readDecodedStreamData(stream);
             defer self.alloc.free(decoded);
+            // Runs retain cross-stream graphics/text state for geometry, while
+            // canonical bytes retain the legacy per-stream decoding behavior.
+            // Reconstruction is accepted only when it preserves those bytes.
+            var text_parser = TextContentParser.init(self.alloc, &text);
+            defer text_parser.deinit();
             try text_parser.consume(decoded, fonts, forms, 0);
             try run_parser.consume(decoded, fonts, gstates, forms);
         }
@@ -4190,14 +4197,20 @@ pub const Reader = struct {
     }
 
     fn buildPageFont(self: *const Reader, name: []const u8, font_obj: *const syntax.Object) !PageFont {
+        var owned_name: ?[]u8 = try self.alloc.dupe(u8, name);
+        errdefer if (owned_name) |value| self.alloc.free(value);
+        var decoder: ?FontDecoder = try self.buildFontDecoder(font_obj);
+        errdefer if (decoder) |*value| value.deinit(self.alloc);
         var font = PageFont{
-            .name = try self.alloc.dupe(u8, name),
-            .decoder = try self.buildFontDecoder(font_obj),
+            .name = owned_name.?,
+            .decoder = decoder.?,
             .type3 = null,
             .type1 = null,
             .truetype = null,
             .cff_otf = null,
         };
+        owned_name = null;
+        decoder = null;
         errdefer font.deinit(self.alloc);
         font.type3 = self.buildType3Font(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -11215,6 +11228,78 @@ test "reader preserves text state across page content streams" {
     try std.testing.expect(second.x > first.x);
     try std.testing.expect(first.font_index != null);
     try std.testing.expectEqual(first.font_index, second.font_index);
+}
+
+test "reader preserves canonical bytes when inherited stream font loses glyphs" {
+    const alloc = std.testing.allocator;
+    const first_content = "q BT /F1 12 Tf\n";
+    const second_content = "(FOURTH EDITION) Tj ET Q\n";
+    // This two-byte font deliberately recognizes only the first two code
+    // pairs. Persisting it into the independently generated second stream
+    // produces "FR"; the legacy per-stream canonical extraction preserves the
+    // complete literal text and therefore rejects that lossy reconstruction.
+    const cmap =
+        "2 beginbfchar\n" ++
+        "<464F> <0046>\n" ++
+        "<5552> <0052>\n" ++
+        "endbfchar\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 6 0 R >> >> /Contents [4 0 R 5 0 R] >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ first_content.len, first_content }),
+        try std.fmt.allocPrint(alloc, "5 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ second_content.len, second_content }),
+        "6 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 7 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "7 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[6]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, object);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 8\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const plain_text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(plain_text);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+
+    try std.testing.expectEqualStrings("FOURTH EDITION", std.mem.trim(u8, plain_text, &std.ascii.whitespace));
+    try std.testing.expectEqualStrings("FOURTH EDITION", std.mem.trim(u8, analysis.text, &std.ascii.whitespace));
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectEqualStrings("FR", analysis.runs[0].text);
+    try std.testing.expectEqual(@as(?TextOutputSpan, null), analysis.runs[0].output_span);
+
+    const AllocationRunner = struct {
+        fn run(failing_alloc: Allocator, pdf_bytes: []const u8) !void {
+            var parsed = try Reader.init(failing_alloc, pdf_bytes);
+            defer parsed.deinit();
+
+            const extracted = try parsed.extractPageTextAlloc(1);
+            defer failing_alloc.free(extracted);
+            var extracted_analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer extracted_analysis.deinit(failing_alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{sample});
 }
 
 test "reader plain text ignores unused malformed extended graphics state" {
