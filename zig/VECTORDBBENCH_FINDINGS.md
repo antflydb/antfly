@@ -1598,6 +1598,72 @@ post-phase one-sample footprint (1.01 GB RSS, 2.00 GB demand) did not capture
 that peak and must not be presented as load peak memory. This is the clean
 pre-PR-540 baseline for the lifetime-fenced resource governor.
 
+The post-PR-540 integration preserves both sides of the cache callback
+contract. ResourceManager invokes reclaimers outside its registry and
+accounting locks and holds a fixed-slot in-flight lease so unregister can fence
+callback context destruction. HBC and LSM callbacks remain opportunistic and
+never wait for their cache owner locks. Managed query sessions reserve decoded
+vector residency as one request-owned unit, switch coherently to retained LSM
+residency before an overrun, and avoid loading metadata for already decoded
+rerank hits. The resource-budget suite passed 73 tests, the LSM suite passed
+323 with one intentional skip, the DB query suite passed 191 with two skips,
+and the standalone vector-index suite passed all 38 tests.
+
+The fresh post-governor 50K public-API gate inserted in 20.48 seconds and was
+ready in 24.53 seconds. At five clients it reached 374.62 QPS with 28.66 ms
+p95 and 0.9859 recall. The standardized full run was scheduler-noisier at
+29.89 seconds insert and 31.93 seconds ready, but query throughput changed
+materially: C1/C5/C10/C20/C30 reached
+171.92/1330.34/1507.15/1308.57/1165.07 QPS, versus
+50.32/214.92/278.06/159.02/152.00 before the governor follow-ups. Corresponding
+p95 latency was 12.61/5.49/9.29/22.49/40.48 ms instead of
+34.18/36.78/62.17/212.59/334.71 ms. Live recall was 0.9845 and warm reopened
+recall was 0.9810. The warm 1,000-query profile measured 4.17 ms mean, 4.80 ms
+p95, and 5.10 ms p99; governed decoded residency eliminated artifact read and
+decode time in that warm phase.
+
+The checked-in runner now complements the post-phase Circus footprint sample
+with a lightweight 200 ms `ps` RSS timeline for the entire live and reopened
+lifecycle. The full 50K run peaked at 1.55 GB RSS and 1.20 GB attributable
+demand under the explicit 2 GiB envelope; the reopened process peaked at
+456 MB RSS. This closes the methodology gap that hid the earlier 1M load peak
+without reintroducing intrusive `vmmap` sampling into timed traffic.
+
+The fresh post-governor 1M qualification completed without the former rollback
+stall, posting-WAL capture violation, retry storm, or visibility loss. It
+inserted in 1,499.99 seconds and was ready in 1,502.04 seconds: 17.5% faster
+than the 1,821.51-second baseline, but still 1.9x the 13-minute target. Catch-up
+is now only 2.05 seconds, so remaining load time belongs almost entirely to the
+primary document/artifact LSM. Live recall was 0.9852. C1/C5/C10/C20/C30
+throughput was 9.98/54.88/93.55/97.15/46.58 QPS, versus
+5.51/23.22/37.52/46.21/44.10 before the governor follow-ups. The useful knee is
+twenty clients; thirty clients saturated this host and raised p95 to 1.87
+seconds. Warm reopened recall was 0.9851, and the 1,000-query profile improved
+from 66.72 to 36.33 ms mean and from 136.31 to 77.35 ms p95. Exact rerank work
+remained high at 2,087.31 vectors/query, so residency ownership accelerated the
+same broad rerank boundary rather than hiding a recall reduction.
+
+Continuous 1M RSS peaked at 2.50 GB live and 2.09 GB after restart; the
+post-phase footprint ledger reported 2.13 GB demand. This is materially below
+the prior 3.27--3.89 GB observations but does not meet a strict 2 GiB process
+envelope. ResourceManager's managed-host peak was 1.10 GB, while dense apply
+alone peaked at 222.42 MB against an 89.48 MB slice hard limit and two aggregate
+accounting errors were recorded. The gap between managed charges, footprint,
+and RSS needs an ownership audit; it must not be dismissed as harmless mapped
+residency.
+
+The final disk and write counters isolate the next general bottleneck. The
+3.7 GiB root contained 3.3 GiB of primary LSM runs and only 357 MiB of the
+native vector index. Primary ingest accepted five million logical entries, but
+only 360,000 entries (7.2%) reached direct sorted ingest. The remainder caused
+4,564 flushes, 16,595 flush output runs, 4.06 GB of flush output, and 4,381
+manifest publications. It then required 147 pressure events and 151 pressure
+compactions, finishing with 88 L0 and 13 lower-level runs. Mutable snapshot
+copies totaled 1.51 GB and current-scan rotations 342.85 MB. The native HBC
+generation/WAL design is no longer the dominant load or disk cost; making the
+primary append-heavy document/artifact path publish larger sorted runs with
+far fewer manifests is the highest-leverage next experiment.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1650,11 +1716,13 @@ published.
    explicit catalog capability once mixed-version upgrade/downgrade policy is
    defined. Keep the persisted authority marker sticky and require an explicit
    source-journal rebuild to move back to the general LSM.
-7. Make soft primary compaction yield promptly to foreground query admission,
-   and reduce the number of small partitioned L0 outputs produced during bulk
-   ingest. The whole-tree 1M run still accumulated 2.30 GB of mutable clones;
-   the faster 50K insert A/B reached 118 L0 runs and let compaction dominate the
-   immediate query tail even though HBC was already ready.
+7. Make append-heavy primary document/artifact publication use a larger sorted
+   run window with one manifest per window, while preserving duplicate-key,
+   tombstone, WAL, and source-sequence ordering. The post-governor 1M run sent
+   only 7.2% of five million entries through direct sorted ingest and paid for
+   4,564 mutable flushes, 16,595 output runs, and 4,381 manifests. Then make
+   soft primary compaction yield promptly to foreground query admission and
+   remeasure the lower-level overlap closure.
 8. Bound native HBC mutation/publication CPU and delta disk amplification
    without weakening its durable sequence. The current WAL/generation boundary
    correctly owns `covered_source_sequence`, but the cost-aware 1M run still
@@ -1673,3 +1741,10 @@ published.
     revision, and HBC query leases must request the matching revision so an old
     topology generation cannot score a newly overwritten vector. Do not add a
     second 3.07 GB per-index float32 plane as the final implementation.
+11. Audit managed-memory ownership against process footprint. Dense apply
+    reached 222.42 MB against an 89.48 MB slice hard limit, ResourceManager
+    recorded two aggregate accounting errors, and 1M demand/RSS exceeded the
+    managed-host peak by roughly 1.0/1.4 GB. Classify allocator arenas, mapped
+    run/index pages, detached cache leases, and runtime stacks before changing
+    budgets; fix missing or double ownership rather than lowering cache targets
+    until the gap is explained.
