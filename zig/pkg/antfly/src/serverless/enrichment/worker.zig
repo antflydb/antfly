@@ -171,7 +171,17 @@ pub const SparseEnricher = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
         try maintenance_cancellation.check(cancellation);
 
+        // Loading and materializing the immutable manifest can be expensive.
+        // Do not initialize progress or emit work if publication moved while
+        // it was in flight. The monotonic stage-head CAS below closes the race
+        // where HEAD changes immediately after this check.
+        if ((try self.progress.getHead(namespace)) != head)
+            return error.EnrichmentProgressChanged;
+
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
+        if (stored_head) |version| {
+            if (version > head) return error.EnrichmentProgressChanged;
+        }
         var scoped_offset = try self.progress.getEnrichmentStageHeadDocOffset(namespace, cfg.stage, head);
         if (scoped_offset == null) {
             // Migrate an offset written before progress became head-scoped

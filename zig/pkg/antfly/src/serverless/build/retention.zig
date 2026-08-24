@@ -163,9 +163,9 @@ pub const Pruner = struct {
         for (versions) |version| {
             if (version > published_head or kept_versions.contains(version)) continue;
             try maintenance_cancellation.check(cancellation);
-            // Remove per-head enrichment progress before its manifest. A
-            // worker for this obsolete head can no longer recreate the key:
-            // its compare-and-swap expects the deleted prior offset.
+            // Retire per-head enrichment progress before its manifest. The
+            // progress stores leave a same-key tombstone so a worker that
+            // loaded this manifest before retention cannot recreate progress.
             inline for (std.meta.tags(catalog_mod.EnrichmentStage)) |stage| {
                 try self.progress.deleteEnrichmentStageHeadDocOffset(namespace, stage, version);
             }
@@ -362,6 +362,7 @@ test "serverless retention follows publication lineage around lower orphan" {
     try std.testing.expectEqualSlices(u64, &.{ 1, 3 }, versions);
     try std.testing.expectEqual(@as(?u64, 1), try progress.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1));
     try std.testing.expectEqual(@as(?u64, null), try progress.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2));
+    try std.testing.expect(!(try progress.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2, null, 0)));
     try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(orphan_artifact.artifact_id));
     const first = try artifacts.getAlloc(first_artifact.artifact_id);
     defer alloc.free(first);

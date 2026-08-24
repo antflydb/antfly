@@ -19,6 +19,8 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
 
+const retired_head_doc_offset = std.math.maxInt(u64);
+
 pub const FsProgressStore = struct {
     alloc: Allocator,
     root_dir: []u8,
@@ -183,6 +185,9 @@ pub const FsProgressStore = struct {
             else => return err,
         };
         if (current != expected) return false;
+        if (current) |version| {
+            if (head_version < version) return false;
+        }
         try self.writeStageU64Unlocked(namespace, stage, "HEAD_VERSION", head_version);
         return true;
     }
@@ -223,10 +228,11 @@ pub const FsProgressStore = struct {
     ) !?u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.readOptionalStageHeadU64Unlocked(namespace, stage, head_version) catch |err| switch (err) {
+        const value = self.readOptionalStageHeadU64Unlocked(namespace, stage, head_version) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
+        return if (value == retired_head_doc_offset) null else value;
     }
 
     pub fn compareAndSwapEnrichmentStageHeadDocOffset(
@@ -237,6 +243,7 @@ pub const FsProgressStore = struct {
         expected: ?u64,
         doc_offset: u64,
     ) !bool {
+        if (doc_offset == retired_head_doc_offset) return error.InvalidEnrichmentDocOffset;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -257,9 +264,10 @@ pub const FsProgressStore = struct {
     ) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const path = try stageHeadOffsetPathAlloc(self.alloc, self.root_dir, namespace, stage, head_version);
-        defer self.alloc.free(path);
-        try deleteFileIfExists(path);
+        // Logical deletion is a durable tombstone. Removing the file would
+        // let a worker that loaded the old manifest before retention recreate
+        // the offset with a null-expected CAS after the manifest is gone.
+        try self.writeStageHeadU64Unlocked(namespace, stage, head_version, retired_head_doc_offset);
     }
 
     const Kind = enum {
@@ -542,23 +550,6 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     }
 }
 
-fn deleteFileIfExists(path: []const u8) !void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.deleteFileAbsolute(io, path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    } else {
-        std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
-}
-
 fn pathForAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, kind: FsProgressStore.Kind) ![]u8 {
     return switch (kind) {
         .head => try headPathAlloc(alloc, root_dir, namespace),
@@ -679,10 +670,12 @@ test "serverless enrichment progress isolates overlapping published head offsets
     // advance head 1 after the head CAS, but it cannot alter head 2's offset.
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2, null, 0));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .lexical_sparse, 1, 2));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .lexical_sparse, 2, 1)));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1, 5, 6));
     try std.testing.expectEqual(@as(?u64, 0), try store.getEnrichmentStageDocOffset("docs", .lexical_sparse));
     try store.deleteEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1);
     try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1, null, 0)));
 }
 
 test "fs progress store allows exactly one concurrent head CAS winner" {

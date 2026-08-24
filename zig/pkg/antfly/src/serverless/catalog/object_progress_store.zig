@@ -21,6 +21,8 @@ const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
 
+const retired_head_doc_offset = std.math.maxInt(u64);
+
 pub const ObjectProgressStore = struct {
     alloc: std.mem.Allocator,
     client: objectstore.Client,
@@ -303,6 +305,9 @@ pub const ObjectProgressStore = struct {
         expected: ?u64,
         head_version: u64,
     ) !bool {
+        if (expected) |current| {
+            if (head_version < current) return false;
+        }
         const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "HEAD_VERSION");
         defer self.alloc.free(key);
         return try self.compareAndSwap(key, expected, head_version);
@@ -334,7 +339,8 @@ pub const ObjectProgressStore = struct {
     ) !?u64 {
         const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
         defer self.alloc.free(key);
-        return self.tryReadValue(key);
+        const value = try self.tryReadValue(key);
+        return if (value == retired_head_doc_offset) null else value;
     }
 
     pub fn compareAndSwapEnrichmentStageHeadDocOffset(
@@ -345,6 +351,7 @@ pub const ObjectProgressStore = struct {
         expected: ?u64,
         doc_offset: u64,
     ) !bool {
+        if (doc_offset == retired_head_doc_offset) return error.InvalidEnrichmentDocOffset;
         const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
         defer self.alloc.free(key);
         return try self.compareAndSwap(key, expected, doc_offset);
@@ -358,10 +365,14 @@ pub const ObjectProgressStore = struct {
     ) !void {
         const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
         defer self.alloc.free(key);
-        self.client.deleteObject(self.bucket, key, .{}) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        // Keep a same-key tombstone so a stale null-expected CAS cannot
+        // resurrect progress after retention removes the manifest. The
+        // conditional put also composes across runtime processes.
+        while (true) {
+            const current = try self.tryReadValue(key);
+            if (current == retired_head_doc_offset) return;
+            if (try self.compareAndSwap(key, current, retired_head_doc_offset)) return;
+        }
     }
 
     fn compareAndSwap(self: *ObjectProgressStore, key: []const u8, expected: ?u64, value: u64) !bool {
@@ -695,12 +706,14 @@ test "objectstore-backed progress store supports cas over file uri" {
     try std.testing.expect(try store.compareAndSwapEnrichmentStage("docs", null, 2));
     try std.testing.expect(try store.compareAndSwapEnrichmentDocOffset("docs", null, 3));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .chunk_embeddings, null, 4));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .chunk_embeddings, 4, 3)));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageDocOffset("docs", .chunk_embeddings, null, 5));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4, null, 6));
     try std.testing.expectEqual(@as(?u64, 6), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4));
     try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 5));
     try store.deleteEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4);
     try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4, null, 0)));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

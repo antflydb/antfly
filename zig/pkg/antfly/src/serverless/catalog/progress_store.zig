@@ -121,6 +121,11 @@ pub const ProgressStore = struct {
         expected: ?u64,
         head_version: u64,
     ) !bool {
+        // Published manifest versions are monotonic. A worker that captured an
+        // older HEAD must not move the visible enrichment stage backward.
+        if (expected) |current| {
+            if (head_version < current) return false;
+        }
         return try self.vtable.compare_and_swap_enrichment_stage_head_version(self.ptr, namespace, @intFromEnum(stage), expected, head_version);
     }
 

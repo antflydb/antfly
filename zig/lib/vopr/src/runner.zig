@@ -113,7 +113,7 @@ pub fn captureCheckpoint(
     defer allocator.free(expected_bytes);
     if (!std.mem.eql(u8, actual_bytes, expected_bytes)) return error.CheckpointPrefixArtifactDiverged;
 
-    return snapshot.captureExecution(
+    var checkpoint = try snapshot.captureExecution(
         Scenario,
         allocator,
         &world,
@@ -122,6 +122,8 @@ pub fn captureCheckpoint(
         last_digest,
         try snapshot.prefixDigest(artifact, prefix_len),
     );
+    checkpoint.health_recorder = health_recorder;
+    return checkpoint;
 }
 
 /// Clean-replay to a choice prefix, prove the reconstructed prefix equals the
@@ -215,8 +217,12 @@ pub fn resumeFromCheckpointWithRecorder(
     var result = try initTraceFromArtifact(allocator, artifact);
     errdefer result.deinit();
     try copyPrefix(&result, artifact, prefix_len);
-    var health_recorder = health.Recorder{};
-    recordHealth(Scenario, &world, checkpoint.transition_index, &health_recorder);
+    var health_recorder = checkpoint.health_recorder orelse health.Recorder{};
+    // Scenario-created checkpoints do not carry diagnostic prefix state.
+    // Captured execution checkpoints already include this exact sample and
+    // must not double-count it or reset their consecutive-stall state.
+    if (checkpoint.health_recorder == null)
+        recordHealth(Scenario, &world, checkpoint.transition_index, &health_recorder);
     return continueRun(
         Scenario,
         allocator,
@@ -687,6 +693,15 @@ test "runner automatically records phased health outside canonical replay bytes"
                 .cleanup_complete = world.step == 3,
             };
         }
+        pub fn snapshotAlloc(world: *const World, allocator_: std.mem.Allocator) ![]u8 {
+            const bytes = try allocator_.alloc(u8, 1);
+            bytes[0] = world.step;
+            return bytes;
+        }
+        pub fn restoreSnapshot(world: *World, bytes: []const u8, _: std.mem.Allocator) !void {
+            if (bytes.len != 1) return error.InvalidHealthSnapshot;
+            world.step = bytes[0];
+        }
         pub fn done(world: *World) bool {
             return world.step == 3;
         }
@@ -712,4 +727,12 @@ test "runner automatically records phased health outside canonical replay bytes"
     var replayed = try @import("replay.zig").exact(Scenario, std.testing.allocator, &artifact);
     defer replayed.deinit();
     try std.testing.expectEqual(evidence.samples, replayed.health_evidence.?.samples);
+
+    var checkpoint = try captureCheckpoint(Scenario, std.testing.allocator, &artifact, 2);
+    defer checkpoint.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), checkpoint.health_recorder.?.evidence().samples);
+    var suffix = choice.Replay{ .records = artifact.choices.items, .cursor = 2 };
+    var resumed = try resumeFromCheckpoint(Scenario, std.testing.allocator, &artifact, checkpoint, suffix.source());
+    defer resumed.deinit();
+    try std.testing.expectEqualDeep(evidence, resumed.health_evidence.?);
 }
