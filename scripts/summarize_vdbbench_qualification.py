@@ -79,6 +79,25 @@ def summarize(run_root: Path) -> dict[str, Any]:
     if memory_profiles:
         summary["memory_profiles"] = memory_profiles
 
+    rss_profiles: dict[str, Any] = {}
+    for rss_path in sorted(run_root.glob("rss-*.json")):
+        rss = load_json(rss_path)
+        rss_profiles[rss_path.stem] = {
+            key: rss.get(key)
+            for key in (
+                "peak_rss_bytes",
+                "peak_rss_kib",
+                "samples",
+                "first_wall_time_s",
+                "last_wall_time_s",
+                "interval_seconds",
+                "source",
+            )
+            if key in rss
+        }
+    if rss_profiles:
+        summary["rss_profiles"] = rss_profiles
+
     public_profiles: dict[str, Any] = {}
     for profile_path in sorted(run_root.glob("public-query-profile*.json")):
         profile = load_json(profile_path)

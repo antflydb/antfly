@@ -252,6 +252,7 @@ fi
 
 server_pid=
 sampler_pid=
+rss_sampler_pid=
 
 stop_server() {
   if [[ -n "$server_pid" ]]; then
@@ -266,6 +267,11 @@ cleanup() {
     kill "$sampler_pid" 2>/dev/null || true
     wait "$sampler_pid" 2>/dev/null || true
     sampler_pid=
+  fi
+  if [[ -n "$rss_sampler_pid" ]]; then
+    kill "$rss_sampler_pid" 2>/dev/null || true
+    wait "$rss_sampler_pid" 2>/dev/null || true
+    rss_sampler_pid=
   fi
   stop_server
 }
@@ -305,6 +311,63 @@ start_server() {
     sleep 0.1
   done
   curl -fsS "http://127.0.0.1:$health_port/healthz" >/dev/null
+}
+
+start_rss_sampler() {
+  local samples_path=$1
+  (
+    printf 'wall_time_s\trss_kib\n'
+    while kill -0 "$server_pid" 2>/dev/null; do
+      local rss_kib
+      rss_kib=$(ps -o rss= -p "$server_pid" 2>/dev/null | tr -d '[:space:]') || break
+      if [[ "$rss_kib" =~ ^[0-9]+$ ]]; then
+        printf '%s\t%s\n' "$(date +%s)" "$rss_kib"
+      fi
+      sleep 0.2
+    done
+  ) >"$samples_path" &
+  rss_sampler_pid=$!
+}
+
+stop_rss_sampler() {
+  local samples_path=$1
+  local summary_path=$2
+  if [[ -n "$rss_sampler_pid" ]]; then
+    kill "$rss_sampler_pid" 2>/dev/null || true
+    wait "$rss_sampler_pid" 2>/dev/null || true
+    rss_sampler_pid=
+  fi
+  python3 - "$samples_path" "$summary_path" <<'PY'
+import json
+import pathlib
+import sys
+
+samples_path = pathlib.Path(sys.argv[1])
+summary_path = pathlib.Path(sys.argv[2])
+samples = []
+if samples_path.exists():
+    for line in samples_path.read_text(encoding="utf-8").splitlines()[1:]:
+        fields = line.split("\t")
+        if len(fields) != 2:
+            continue
+        samples.append((int(fields[0]), int(fields[1])))
+with summary_path.open("w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "samples": len(samples),
+            "peak_rss_kib": max((rss for _, rss in samples), default=0),
+            "peak_rss_bytes": max((rss for _, rss in samples), default=0) * 1024,
+            "first_wall_time_s": samples[0][0] if samples else None,
+            "last_wall_time_s": samples[-1][0] if samples else None,
+            "interval_seconds": 0.2,
+            "source": "ps_rss",
+        },
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+    handle.write("\n")
+PY
 }
 
 run_public_profile() {
@@ -458,6 +521,7 @@ PY
 if [[ "$resume_after_live" == "1" ]]; then
   mark_phase restart_begin
   start_server "antfly-reopened${label_suffix}.log"
+  start_rss_sampler "$run_root/rss-restart${label_suffix}.tsv"
   mark_phase restart_ready
   if [[ "$diagnostic_profile_only" != "1" ]]; then
     run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
@@ -477,6 +541,9 @@ if [[ "$resume_after_live" == "1" ]]; then
     "$run_root/footprint-restart${label_suffix}.jsonl" \
     "$run_root/footprint-restart${label_suffix}.log" \
     "$run_root/wired-baseline${label_suffix}.json"
+  stop_rss_sampler \
+    "$run_root/rss-restart${label_suffix}.tsv" \
+    "$run_root/rss-restart${label_suffix}.json"
   if [[ "$diagnostic_profile_only" != "1" ]]; then
     python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
   fi
@@ -485,6 +552,7 @@ fi
 
 mark_phase server_start
 start_server antfly-initial.log
+start_rss_sampler "$run_root/rss-live.tsv"
 mark_phase live_load_and_query_start
 run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
@@ -498,11 +566,13 @@ capture_footprint_once \
   "$run_root/footprint.jsonl" \
   "$run_root/footprint.log" \
   "$run_root/wired-baseline.json"
+stop_rss_sampler "$run_root/rss-live.tsv" "$run_root/rss-live.json"
 
 mark_phase restart_begin
 stop_server
 mark_phase shutdown_complete
 start_server antfly-reopened.log
+start_rss_sampler "$run_root/rss-restart.tsv"
 mark_phase restart_ready
 
 run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
@@ -521,5 +591,6 @@ capture_footprint_once \
   "$run_root/footprint-restart.jsonl" \
   "$run_root/footprint-restart.log" \
   "$run_root/wired-baseline.json"
+stop_rss_sampler "$run_root/rss-restart.tsv" "$run_root/rss-restart.json"
 
 python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
