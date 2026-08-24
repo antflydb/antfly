@@ -73,6 +73,16 @@ CLIPCLAP_GGUF_FILES = (
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
 
+# Distributed binaries fail fast without an isolated internal RPC identity.
+# Every subprocess launched by this pytest tree inherits this test-only key;
+# production deployments must provision their own random credential as
+# documented in docs/secrets.md.
+os.environ.setdefault(
+    "ANTFLY_INTERNAL_SERVICE_SECRET",
+    "antfly-e2e-dedicated-internal-service-secret-v1",
+)
+os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+
 
 def resolve_binary_path(binary: str) -> str:
     return str(Path(binary).expanduser().resolve())

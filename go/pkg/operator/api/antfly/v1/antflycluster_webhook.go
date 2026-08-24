@@ -204,6 +204,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateInternalServiceAuth(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if err := r.validateProductTierMapping(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
@@ -217,6 +221,58 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 			strings.Join(allErrors, "\n  - "))
 	}
 
+	return nil
+}
+
+func (r *AntflyCluster) validateInternalServiceAuth() error {
+	auth := r.Spec.InternalServiceAuth
+	if r.isStandaloneMode() {
+		if auth != nil {
+			return fmt.Errorf("spec.internalServiceAuth must be omitted in Standalone mode")
+		}
+		return nil
+	}
+	// Kubernetes applies the CRD's Distributed default before admission. Keeping
+	// the zero-value path neutral also preserves direct Go callers and legacy
+	// Swarm objects; the controller normalizes/defaults its working copy before
+	// invoking this fallback validation.
+	if r.Spec.Mode != ClusterModeDistributed {
+		return nil
+	}
+	if auth == nil {
+		return fmt.Errorf("spec.internalServiceAuth is required in Distributed mode")
+	}
+
+	var validationErrors []string
+	ref := auth.SecretKeyRef
+	name := strings.TrimSpace(ref.Name)
+	key := strings.TrimSpace(ref.Key)
+	if name == "" {
+		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.name is required")
+	} else {
+		if name != ref.Name {
+			validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.name must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("spec.internalServiceAuth.secretKeyRef.name %q is invalid: %s", name, strings.Join(errs, "; ")))
+		}
+	}
+	if key == "" {
+		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.key is required")
+	} else {
+		if key != ref.Key {
+			validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.key must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsConfigMapKey(key); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("spec.internalServiceAuth.secretKeyRef.key %q is invalid: %s", key, strings.Join(errs, "; ")))
+		}
+	}
+	if ref.Optional != nil && *ref.Optional {
+		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.optional must be false")
+	}
+	if len(validationErrors) > 0 {
+		return fmt.Errorf("InternalServiceAuth validation failed:\n  - %s", strings.Join(validationErrors, "\n  - "))
+	}
 	return nil
 }
 

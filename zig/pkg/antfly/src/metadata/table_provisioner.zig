@@ -2208,7 +2208,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":["entities"]}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:catalog","destinations":["entities"]}}
         \\  ]
         \\}
     ;
@@ -2265,7 +2265,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2,"_antfly_destination_authorization_v1":["entities"]}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2,"_antfly_destination_authorization_v1":{"principal":"service:catalog","destinations":["entities"]}}
         \\  ]
         \\}
     ;
@@ -2385,7 +2385,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":["entities"]}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:catalog","destinations":["entities"]}}
         \\  ]
         \\}
     ;

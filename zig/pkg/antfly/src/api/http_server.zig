@@ -791,11 +791,15 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
-    /// Dedicated node-to-node signing key. When omitted, deployments migrate
-    /// compatibly through the trusted-principal key; setting it separates
-    /// internal RPC authentication from public trusted-principal admission.
+    /// Dedicated node-to-node signing identity. Distributed runtimes validate
+    /// both values before opening a listener; they must never share the public
+    /// trusted-principal signing domain.
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    /// Explicit first-phase rolling-upgrade mode. Upgraded clients always sign;
+    /// servers may temporarily accept old unsigned peers until enforcement is
+    /// enabled cluster-wide. Defaults to fail closed.
+    internal_service_accept_legacy_unauthenticated: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
@@ -4154,12 +4158,14 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn authenticateInternalServiceRequest(self: *ApiHttpServer, token: []const u8) !AuthenticatedIdentity {
-        const secret = self.cfg.internal_service_secret orelse
-            self.cfg.trusted_principal_secret orelse return error.Unauthorized;
+        const secret = self.cfg.internal_service_secret orelse return error.Unauthorized;
+        if (self.cfg.trusted_principal_secret) |trusted_secret| {
+            if (std.mem.eql(u8, secret, trusted_secret)) return error.Unauthorized;
+        }
         return try self.authenticateTrustedPrincipalWithIssuer(
             token,
             secret,
-            self.cfg.internal_service_issuer orelse self.cfg.trusted_principal_issuer,
+            self.cfg.internal_service_issuer,
         );
     }
 
@@ -15643,6 +15649,40 @@ test "internal service credentials cannot authorize public inference routes" {
     );
 }
 
+test "api http server validates dedicated internal service runtime credentials" {
+    try std.testing.expectError(
+        error.InternalServiceSecretMissing,
+        internal_service_auth.validateRuntimeConfig(null, "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceSecretTooShort,
+        internal_service_auth.validateRuntimeConfig("short", "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceIssuerMissing,
+        internal_service_auth.validateRuntimeConfig("0123456789abcdef0123456789abcdef", null),
+    );
+    try internal_service_auth.validateRuntimeConfig(
+        "0123456789abcdef0123456789abcdef",
+        "cluster-a",
+    );
+    try std.testing.expectError(
+        error.InternalServiceSecretReused,
+        internal_service_auth.validateCredentialIsolation(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+        ),
+    );
+    try std.testing.expectEqual(
+        internal_service_auth.RolloutMode.enforce,
+        try internal_service_auth.parseRolloutMode(null),
+    );
+    try std.testing.expectEqual(
+        internal_service_auth.RolloutMode.migration,
+        try internal_service_auth.parseRolloutMode("migration"),
+    );
+}
+
 fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
     return .{
         .resource_type = .table,
@@ -22922,12 +22962,15 @@ test "api http server document scan requires table read permission" {
 
     var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
     var source = FakeSource{};
-    const internal_secret = "internal-service-principal-secret";
+    const trusted_principal_secret = "gateway-trusted-principal-secret";
+    const internal_secret = "dedicated-internal-service-secret";
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
         .user_manager = &auth.manager,
-        .trusted_principal_secret = internal_secret,
-        .trusted_principal_issuer = "antfly-node",
+        .trusted_principal_secret = trusted_principal_secret,
+        .trusted_principal_issuer = "gateway",
+        .internal_service_secret = internal_secret,
+        .internal_service_issuer = "antfly-node",
     }, source.iface(), read_source.source(), null);
     defer server.deinit();
 
@@ -22992,15 +23035,28 @@ test "api http server document scan requires table read permission" {
     defer forbidden_internal_capabilities.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), forbidden_internal_capabilities.status);
 
+    server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    var legacy_migration_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer legacy_migration_batch.deinit(alloc);
+    // The request reached the unavailable test adapter instead of being
+    // rejected at authentication, proving the migration switch is explicit.
+    try std.testing.expectEqual(@as(u16, 404), legacy_migration_batch.status);
+    server.cfg.internal_service_accept_legacy_unauthenticated = false;
+
     const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const user_payload = try std.fmt.allocPrint(
         alloc,
-        \\{{"iss":"antfly-node","sub":"operator","tables":["secrets"],"operations":["write"],"iat":{d},"exp":{d}}}
+        \\{{"iss":"gateway","sub":"operator","tables":["secrets"],"operations":["write"],"iat":{d},"exp":{d}}}
     ,
         .{ now_seconds, now_seconds + 60 },
     );
     defer alloc.free(user_payload);
-    const user_token = try encodeTrustedPrincipalToken(alloc, internal_secret, user_payload);
+    const user_token = try encodeTrustedPrincipalToken(alloc, trusted_principal_secret, user_payload);
     defer alloc.free(user_token);
     const user_headers = [_]http_common.RequestHeader{
         .{ .name = trusted_principal_header, .value = user_token },
@@ -23013,7 +23069,26 @@ test "api http server document scan requires table read permission" {
         .body = "{}",
     });
     defer trusted_user_internal_batch.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 403), trusted_user_internal_batch.status);
+    try std.testing.expectEqual(@as(u16, 401), trusted_user_internal_batch.status);
+
+    const forged_service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = trusted_principal_secret,
+        .issuer = "gateway",
+        .subject = "node:forged",
+    }, now_seconds);
+    defer alloc.free(forged_service_token);
+    const forged_service_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = forged_service_token },
+    };
+    var forged_internal_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .headers = &forged_service_headers,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer forged_internal_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), forged_internal_batch.status);
 
     const service_token = try internal_service_auth.tokenAlloc(alloc, .{
         .secret = internal_secret,

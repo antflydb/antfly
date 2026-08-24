@@ -283,12 +283,20 @@ pub const AntflyApiHandler = struct {
     fn internalServiceAuthRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         if (!requiresInternalServicePrincipal(ctx.request.uri.path)) return null;
         const secret = self.api_server.cfg.internal_service_secret orelse
-            self.api_server.cfg.trusted_principal_secret orelse
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
         if (secret.len == 0)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
-        const token = ctx.header(internal_service_auth.header_name) orelse
+        const token = ctx.header(internal_service_auth.header_name) orelse {
+            if (self.api_server.cfg.internal_service_accept_legacy_unauthenticated) {
+                // This compatibility path is opt-in, startup-validated, and
+                // intended only for the first half of a two-phase rolling
+                // upgrade. Mark accepted responses so operators can verify old
+                // peer traffic has drained before enabling enforcement.
+                try ctx.setHeader("X-Antfly-Internal-Auth", "legacy-migration");
+                return null;
+            }
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
+        };
         var identity = self.api_server.authenticateInternalServiceRequest(token) catch
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
         defer identity.deinit(self.api_server.alloc);
@@ -1134,8 +1142,8 @@ pub const AntflyApiHandler = struct {
                             const executor = server.cfg.session_executor orelse return error.Unavailable;
                             var client = http_client.ApiHttpClient.init(alloc, executor);
                             _ = client.withInternalServiceAuth(
-                                server.cfg.internal_service_secret orelse server.cfg.trusted_principal_secret,
-                                server.cfg.internal_service_issuer orelse server.cfg.trusted_principal_issuer,
+                                server.cfg.internal_service_secret,
+                                server.cfg.internal_service_issuer,
                             );
                             return client.fetchTableRepairCancelRequested(uri, table_name, job_id, attempt_id);
                         }

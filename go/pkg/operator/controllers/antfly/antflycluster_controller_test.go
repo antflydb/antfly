@@ -61,6 +61,119 @@ type statusUpdateRejectingWriter struct {
 	err error
 }
 
+func testInternalServiceAuthSpec() *antflyv1.InternalServiceAuthSpec {
+	return &antflyv1.InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "test-internal-service-auth"},
+		Key:                  "secret",
+	}}
+}
+
+func TestInternalServiceAuthEnvUsesSecretSelectorWithoutReadingSecret(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "tenant-a", UID: "cluster-uid"},
+		Spec:       antflyv1.AntflyClusterSpec{InternalServiceAuth: testInternalServiceAuthSpec()},
+	}
+	env := internalServiceAuthEnv(cluster, internalServiceAuthRolloutMigration)
+	if len(env) != 3 {
+		t.Fatalf("expected secret, issuer, and rollout environment, got %#v", env)
+	}
+	if env[0].Name != antflyInternalServiceSecretEnvVar || env[0].Value != "" || env[0].ValueFrom == nil || env[0].ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("expected signing key to use SecretKeyRef only, got %#v", env[0])
+	}
+	if env[0].ValueFrom.SecretKeyRef.Name != "test-internal-service-auth" || env[0].ValueFrom.SecretKeyRef.Key != "secret" || env[0].ValueFrom.SecretKeyRef.Optional == nil || *env[0].ValueFrom.SecretKeyRef.Optional {
+		t.Fatalf("unexpected required Secret selector: %#v", env[0].ValueFrom.SecretKeyRef)
+	}
+	if env[1].Value != "antfly-cluster:cluster-uid" || env[2].Value != "migration" {
+		t.Fatalf("unexpected derived non-secret environment: %#v", env)
+	}
+}
+
+func TestDistributedRuntimeNeedsInternalServiceAuthMigration(t *testing.T) {
+	distributed := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeDistributed}}
+	if !distributedRuntimeNeedsInternalServiceAuthMigration(distributed) {
+		t.Fatal("legacy distributed cluster must be revalidated before workload mutation")
+	}
+	distributed.Spec.InternalServiceAuth = testInternalServiceAuthSpec()
+	if distributedRuntimeNeedsInternalServiceAuthMigration(distributed) {
+		t.Fatal("configured distributed cluster must not remain migration-blocked")
+	}
+	standalone := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterModeStandalone}}
+	if distributedRuntimeNeedsInternalServiceAuthMigration(standalone) {
+		t.Fatal("standalone cluster does not use distributed internal service authentication")
+	}
+}
+
+func TestInternalServiceAuthUpgradeRequiresRuntimeCapabilityBeforeEnforcement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "cluster-uid"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:                antflyv1.ClusterModeDistributed,
+			InternalServiceAuth: testInternalServiceAuthSpec(),
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				Replicas:    1,
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{Replicas: 1},
+		},
+	}
+
+	newReconciler := func(objects ...client.Object) *AntflyClusterReconciler {
+		return &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
+	}
+	mode, pending, err := newReconciler().desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
+	if err != nil || mode != internalServiceAuthRolloutEnforce || pending {
+		t.Fatalf("new cluster should enforce immediately, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+
+	completeStatefulSet := func(name string, mode internalServiceAuthRolloutMode) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Generation: 2},
+			Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{internalServiceAuthRolloutAnnotation: string(mode)},
+			}}},
+			Status: appsv1.StatefulSetStatus{
+				ObservedGeneration: 2,
+				UpdatedReplicas:    1,
+				ReadyReplicas:      1,
+				CurrentRevision:    "revision-a",
+				UpdateRevision:     "revision-a",
+			},
+		}
+	}
+	legacyMetadata := completeStatefulSet("example-metadata", "")
+	legacyData := completeStatefulSet("example-data", "")
+	mode, pending, err = newReconciler(legacyMetadata, legacyData).desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
+	if err != nil || mode != internalServiceAuthRolloutMigration || !pending {
+		t.Fatalf("legacy cluster should enter migration, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+
+	migrationMetadata := completeStatefulSet("example-metadata", internalServiceAuthRolloutMigration)
+	migrationData := completeStatefulSet("example-data", internalServiceAuthRolloutMigration)
+	capabilityReconciler := newReconciler(migrationMetadata, migrationData)
+	capabilityReconciler.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set(internalServiceAuthCapabilityHeader, internalServiceAuthCapabilityVersion+"; mode=migration")
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+	})}
+	mode, pending, err = capabilityReconciler.desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
+	if err != nil || mode != internalServiceAuthRolloutEnforce || pending {
+		t.Fatalf("capability-proven migration should advance to enforce, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+
+	missingCapabilityReconciler := newReconciler(migrationMetadata.DeepCopy(), migrationData.DeepCopy())
+	missingCapabilityReconciler.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+	})}
+	mode, pending, err = missingCapabilityReconciler.desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
+	if err != nil || mode != internalServiceAuthRolloutMigration || !pending {
+		t.Fatalf("missing runtime capability must remain in migration, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+}
+
 func (w statusUpdateRejectingWriter) Update(context.Context, client.Object, ...client.SubResourceUpdateOption) error {
 	return w.err
 }
@@ -372,8 +485,9 @@ func TestReconcileStopsWhenMetadataTopologyCheckpointConflicts(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "checkpoint-conflict", Namespace: "default", Generation: 1},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode:  antflyv1.ClusterModeDistributed,
-			Image: "antfly:test",
+			Mode:                antflyv1.ClusterModeDistributed,
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:     3,
 				Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "512Mi"},
@@ -12477,7 +12591,8 @@ func TestReconcileCancelsDataScaleDownWhenOrdinalDesiredAgain(t *testing.T) {
 			Generation: 3,
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image: "antfly:test",
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    1,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -12572,7 +12687,8 @@ func TestReconcileWaitsForDataScaleDownCancellationRecovery(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
 		ObjectMeta: metav1.ObjectMeta{Name: "cancel-recovering", Namespace: "default", Generation: 3},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image: "antfly:test",
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    1,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -12655,7 +12771,8 @@ func TestReconcileFinalizesDataScaleDownAfterStatefulSetShrinks(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
 		ObjectMeta: metav1.ObjectMeta{Name: "finalize-scale", Namespace: "default", Generation: 3},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image: "antfly:test",
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    1,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -12737,7 +12854,8 @@ func TestReconcileRetriesFailedDataScaleDownFinalization(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
 		ObjectMeta: metav1.ObjectMeta{Name: "retry-finalize-scale", Namespace: "default", Generation: 3},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image: "antfly:test",
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    1,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -12817,7 +12935,8 @@ func TestReconcileKeepsFailedDataScaleDownFinalizationFailure(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster"},
 		ObjectMeta: metav1.ObjectMeta{Name: "failed-finalize-scale", Namespace: "default", Generation: 3},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image: "antfly:test",
+			Image:               "antfly:test",
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    1,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -14744,8 +14863,8 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
-	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
+	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
 
 	for _, component := range []string{"metadata", "data"} {
 		sts := &appsv1.StatefulSet{}
@@ -14975,7 +15094,7 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
 
 	sts := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
@@ -14987,7 +15106,7 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 		"cloud.antfly.io/org-id":      "org-123",
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
 	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-after"))
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/org-id", "org-123"))
@@ -15032,7 +15151,7 @@ func TestMetadataStatefulSetPreparesPersistentStorageForNonRootRuntime(t *testin
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
 
 	sts := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}

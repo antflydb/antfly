@@ -13,12 +13,53 @@ pub const principal_kind = "service";
 pub const default_subject = "antfly-node";
 pub const token_ttl_seconds: i64 = 60;
 pub const header_name = "X-Antfly-Trusted-Principal";
+pub const minimum_secret_bytes: usize = 32;
+pub const maximum_issuer_bytes: usize = 256;
+
+/// `migration` is an explicit two-phase rolling-upgrade escape hatch. New
+/// nodes still sign every outbound internal request, but temporarily accept
+/// unsigned requests from old peers. Operators must return to `enforce` after
+/// every peer has been upgraded. The secure default never accepts legacy RPC.
+pub const RolloutMode = enum {
+    enforce,
+    migration,
+};
 
 pub const Config = struct {
     secret: []const u8,
     issuer: []const u8,
     subject: []const u8 = default_subject,
 };
+
+pub fn parseRolloutMode(raw: ?[]const u8) !RolloutMode {
+    const value = raw orelse return .enforce;
+    if (std.mem.eql(u8, value, "enforce")) return .enforce;
+    if (std.mem.eql(u8, value, "migration")) return .migration;
+    return error.InvalidInternalServiceRolloutMode;
+}
+
+pub fn validateRuntimeConfig(secret: ?[]const u8, issuer: ?[]const u8) !void {
+    const signing_secret = secret orelse return error.InternalServiceSecretMissing;
+    if (signing_secret.len < minimum_secret_bytes)
+        return error.InternalServiceSecretTooShort;
+    const signing_issuer = issuer orelse return error.InternalServiceIssuerMissing;
+    if (signing_issuer.len == 0 or signing_issuer.len > maximum_issuer_bytes)
+        return error.InvalidInternalServiceIssuer;
+    for (signing_issuer) |byte| {
+        if (byte < 0x21 or byte > 0x7e)
+            return error.InvalidInternalServiceIssuer;
+    }
+}
+
+pub fn validateCredentialIsolation(
+    internal_service_secret: ?[]const u8,
+    trusted_principal_secret: ?[]const u8,
+) !void {
+    const internal = internal_service_secret orelse return;
+    const trusted = trusted_principal_secret orelse return;
+    if (std.mem.eql(u8, internal, trusted))
+        return error.InternalServiceSecretReused;
+}
 
 pub fn tokenAlloc(alloc: std.mem.Allocator, config: Config, now_seconds: i64) ![]u8 {
     const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
@@ -63,4 +104,37 @@ test "internal service tokens carry a distinct bounded identity" {
     }, 100);
     defer alloc.free(token);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, token, "."));
+}
+
+test "runtime config requires an isolated production-strength credential" {
+    try std.testing.expectError(
+        error.InternalServiceSecretMissing,
+        validateRuntimeConfig(null, "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceSecretTooShort,
+        validateRuntimeConfig("short", "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceIssuerMissing,
+        validateRuntimeConfig("0123456789abcdef0123456789abcdef", null),
+    );
+    try validateRuntimeConfig("0123456789abcdef0123456789abcdef", "cluster-a");
+    try std.testing.expectError(
+        error.InternalServiceSecretReused,
+        validateCredentialIsolation(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+        ),
+    );
+    try validateCredentialIsolation(
+        "0123456789abcdef0123456789abcdef",
+        "fedcba9876543210fedcba9876543210",
+    );
+    try std.testing.expectEqual(RolloutMode.enforce, try parseRolloutMode(null));
+    try std.testing.expectEqual(RolloutMode.migration, try parseRolloutMode("migration"));
+    try std.testing.expectError(
+        error.InvalidInternalServiceRolloutMode,
+        parseRolloutMode("disabled"),
+    );
 }

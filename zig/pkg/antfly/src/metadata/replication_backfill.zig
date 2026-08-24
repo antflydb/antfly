@@ -4201,7 +4201,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
         \\  "dsn":"postgres://db",
         \\  "postgres_table":"users",
         \\  "key_template":"id",
-        \\  "_antfly_destination_authorization_v1":["premium_users","free_users"],
+        \\  "_antfly_destination_authorization_v1":{"principal":"service:catalog","destinations":["premium_users","free_users"]},
         \\  "routes":[
         \\    {
         \\      "target_table":"premium_users",
@@ -5426,7 +5426,7 @@ test "metadata replication stream routes matching rows to target tables" {
         \\  "postgres_table":"users",
         \\  "key_template":"id",
         \\  "on_update":[{"op":"$set","path":"ignored","value":"true"}],
-        \\  "_antfly_destination_authorization_v1":["premium_users","free_users"],
+        \\  "_antfly_destination_authorization_v1":{"principal":"service:catalog","destinations":["premium_users","free_users"]},
         \\  "routes":[
         \\    {
         \\      "target_table":"premium_users",

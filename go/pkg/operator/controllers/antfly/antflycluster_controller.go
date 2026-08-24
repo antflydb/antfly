@@ -110,6 +110,13 @@ const (
 	antflySecretStoreEnvVar               = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 	antflyExtensionPackageStoreEnvVar     = "ANTFLY_EXTENSION_PACKAGE_STORE"
 	antflyStandaloneExtensionPackageStore = "/antflydb/extensions"
+	antflyInternalServiceSecretEnvVar     = "ANTFLY_INTERNAL_SERVICE_SECRET" // #nosec G101 -- environment variable name, not a credential
+	antflyInternalServiceIssuerEnvVar     = "ANTFLY_INTERNAL_SERVICE_ISSUER" // #nosec G101 -- environment variable name, not a credential
+	antflyInternalServiceRolloutEnvVar    = "ANTFLY_INTERNAL_SERVICE_ROLLOUT_MODE"
+	internalServiceAuthRolloutAnnotation  = "antfly.io/internal-service-auth-rollout-mode"
+	internalServiceAuthCapabilityHeader   = "X-Antfly-Internal-Service-Auth"
+	internalServiceAuthCapabilityVersion  = "v1"
+	internalServiceAuthRolloutInterval    = 10 * time.Second
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
@@ -208,6 +215,43 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 		Name:  antflySecretStoreEnvVar,
 		Value: secretStorePath(store),
 	}}
+}
+
+type internalServiceAuthRolloutMode string
+
+const (
+	internalServiceAuthRolloutEnforce   internalServiceAuthRolloutMode = "enforce"
+	internalServiceAuthRolloutMigration internalServiceAuthRolloutMode = "migration"
+)
+
+func internalServiceAuthIssuer(cluster *antflyv1.AntflyCluster) string {
+	// UID prevents a deleted/recreated cluster with the same namespace/name from
+	// sharing an issuer. The fallback is used only by unit tests and pre-create
+	// rendering; reconciled Kubernetes objects always have a UID.
+	identity := strings.TrimSpace(string(cluster.UID))
+	if identity == "" {
+		identity = cluster.Namespace + ":" + cluster.Name
+	}
+	return "antfly-cluster:" + identity
+}
+
+func internalServiceAuthEnv(cluster *antflyv1.AntflyCluster, mode internalServiceAuthRolloutMode) []corev1.EnvVar {
+	if cluster == nil || cluster.Spec.InternalServiceAuth == nil {
+		return nil
+	}
+	secretRef := cluster.Spec.InternalServiceAuth.SecretKeyRef.DeepCopy()
+	optional := false
+	secretRef.Optional = &optional
+	return []corev1.EnvVar{
+		{
+			Name: antflyInternalServiceSecretEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: secretRef,
+			},
+		},
+		{Name: antflyInternalServiceIssuerEnvVar, Value: internalServiceAuthIssuer(cluster)},
+		{Name: antflyInternalServiceRolloutEnvVar, Value: string(mode)},
+	}
 }
 
 func haRuntimeAdminTokenEnv(ha *antflyv1.HighAvailabilitySpec) []corev1.EnvVar {
@@ -1648,6 +1692,7 @@ type metadataRuntimeTopologyStatus struct {
 	MetadataRaftVoterSetFingerprint *string `json:"metadata_raft_voter_set_fingerprint"`
 	MetadataRaftJointConsensus      *bool   `json:"metadata_raft_joint_consensus"`
 	MetadataRaftLearnerCount        *int32  `json:"metadata_raft_learner_count"`
+	InternalServiceAuthCapability   string  `json:"-"`
 }
 
 const (
@@ -1999,6 +2044,7 @@ func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Conte
 		if err := json.Unmarshal(body, &status); err != nil {
 			return nil, fmt.Errorf("decode metadata topology: %w", err)
 		}
+		status.InternalServiceAuthCapability = strings.TrimSpace(resp.Header.Get(internalServiceAuthCapabilityHeader))
 		return &status, nil
 	}
 	return nil, fmt.Errorf("metadata runtime topology route is unavailable")
@@ -2080,6 +2126,80 @@ func metadataMembershipCapabilityRolloutComplete(statefulSet *appsv1.StatefulSet
 		statefulSet.Status.ReadyReplicas >= expectedReplicas &&
 		statefulSet.Status.CurrentRevision != "" &&
 		statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func statefulSetRolloutComplete(statefulSet *appsv1.StatefulSet, expectedReplicas int32) bool {
+	if statefulSet == nil || statefulSet.Name == "" || statefulSet.Status.ObservedGeneration < statefulSet.Generation {
+		return false
+	}
+	if statefulSet.Status.UpdatedReplicas < expectedReplicas || statefulSet.Status.ReadyReplicas < expectedReplicas {
+		return false
+	}
+	return statefulSet.Status.CurrentRevision != "" && statefulSet.Status.CurrentRevision == statefulSet.Status.UpdateRevision
+}
+
+func statefulSetInternalServiceAuthMode(statefulSet *appsv1.StatefulSet) internalServiceAuthRolloutMode {
+	if statefulSet == nil {
+		return ""
+	}
+	return internalServiceAuthRolloutMode(statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation])
+}
+
+// desiredInternalServiceAuthRolloutMode makes upgrades from runtimes that sent
+// unsigned internal RPC a durable two-rollout transition. It never reads the
+// signing key: capability is proven by a non-secret response header emitted by
+// every upgraded metadata process after it has started in migration mode.
+func (r *AntflyClusterReconciler) desiredInternalServiceAuthRolloutMode(ctx context.Context, cluster *antflyv1.AntflyCluster) (internalServiceAuthRolloutMode, bool, error) {
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	metadataKey := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	metadataErr := r.Get(ctx, metadataKey, metadataStatefulSet)
+	if metadataErr != nil && !errors.IsNotFound(metadataErr) {
+		return "", false, fmt.Errorf("read metadata StatefulSet for internal-service auth rollout: %w", metadataErr)
+	}
+	dataStatefulSet := &appsv1.StatefulSet{}
+	dataKey := types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}
+	dataErr := r.Get(ctx, dataKey, dataStatefulSet)
+	if dataErr != nil && !errors.IsNotFound(dataErr) {
+		return "", false, fmt.Errorf("read data StatefulSet for internal-service auth rollout: %w", dataErr)
+	}
+
+	metadataExists := metadataErr == nil
+	dataExists := dataErr == nil
+	if !metadataExists && !dataExists {
+		// A brand-new cluster has no legacy peers and starts fail-closed.
+		return internalServiceAuthRolloutEnforce, false, nil
+	}
+	metadataMode := statefulSetInternalServiceAuthMode(metadataStatefulSet)
+	dataMode := statefulSetInternalServiceAuthMode(dataStatefulSet)
+	if metadataMode == internalServiceAuthRolloutEnforce || dataMode == internalServiceAuthRolloutEnforce {
+		// Once enforcement begins, never regress to accepting unsigned traffic.
+		return internalServiceAuthRolloutEnforce, false, nil
+	}
+	if !metadataExists || !dataExists || metadataMode != internalServiceAuthRolloutMigration || dataMode != internalServiceAuthRolloutMigration {
+		return internalServiceAuthRolloutMigration, true, nil
+	}
+
+	metadataReplicas := effectiveMetadataNodeReplicas(cluster)
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	if !statefulSetRolloutComplete(metadataStatefulSet, metadataReplicas) || !statefulSetRolloutComplete(dataStatefulSet, dataReplicas) {
+		return internalServiceAuthRolloutMigration, true, nil
+	}
+
+	for ordinal := int32(0); ordinal < metadataReplicas; ordinal++ {
+		status, err := r.fetchMetadataRuntimeTopology(ctx, cluster, ordinal)
+		if err != nil {
+			return internalServiceAuthRolloutMigration, true, nil
+		}
+		if status.InternalServiceAuthCapability != internalServiceAuthCapabilityVersion+"; mode=migration" {
+			// An old runtime can be Ready while ignoring the injected environment.
+			// Keep migration active until every metadata member proves support.
+			return internalServiceAuthRolloutMigration, true, nil
+		}
+	}
+	return internalServiceAuthRolloutEnforce, false, nil
 }
 
 func (state metadataMembershipCapabilityRolloutState) requeueAfter() time.Duration {
@@ -2515,6 +2635,14 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if !needsValidation && haRuntimeNeedsAdminTokenMigration(&antflyCluster) {
 		needsValidation = true
 	}
+	// Existing distributed clusters may have a successful validation checkpoint
+	// from an operator version that predated internal-service authentication.
+	// Revalidate before touching either StatefulSet so the new fail-closed image
+	// cannot roll until the deployment controller has provisioned and referenced
+	// the dedicated credential.
+	if !needsValidation && distributedRuntimeNeedsInternalServiceAuthMigration(&antflyCluster) {
+		needsValidation = true
+	}
 	// Seed the durable metadata topology record for clusters created by older
 	// operator versions before relying on it for future update validation.
 	if !needsValidation && !standaloneMode && antflyCluster.Status.MetadataTopologyReplicas == 0 {
@@ -2643,9 +2771,16 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileServices(ctx, workingCluster); err != nil {
 		return ctrl.Result{}, err
 	}
+	internalServiceAuthMode, internalServiceAuthRolloutPending, err := r.desiredInternalServiceAuthRolloutMode(ctx, workingCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if internalServiceAuthRolloutPending {
+		log.Info("Internal-service authentication upgrade is rolling in migration mode", "mode", internalServiceAuthMode)
+	}
 
 	// Create Metadata StatefulSet
-	if err := r.reconcileMetadataStatefulSet(ctx, efCache, workingCluster); err != nil {
+	if err := r.reconcileMetadataStatefulSet(ctx, efCache, workingCluster, internalServiceAuthMode); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2852,7 +2987,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	workingCluster.Spec.Storage.DataStorage = r.reconcileStorageAutoGrow(ctx, workingCluster, "data", "data-storage", workingCluster.Name+"-data", effectiveDataStorageSize(workingCluster), maxDataAutoGrowSize(workingCluster))
 
 	// Create Data StatefulSet
-	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster); err != nil {
+	if err := r.reconcileDataStatefulSet(ctx, efCache, workingCluster, internalServiceAuthMode); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2893,8 +3028,13 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if requeueAfter := minPositiveDuration(
-		periodicRequeueAfter(workingCluster),
-		r.metadataTopologyObservationRequeueAfter(workingCluster),
+		minPositiveDuration(periodicRequeueAfter(workingCluster), r.metadataTopologyObservationRequeueAfter(workingCluster)),
+		func() time.Duration {
+			if internalServiceAuthRolloutPending {
+				return internalServiceAuthRolloutInterval
+			}
+			return 0
+		}(),
 	); requeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -2908,6 +3048,10 @@ func haRuntimeNeedsAdminTokenMigration(cluster *antflyv1.AntflyCluster) bool {
 	}
 	ha := cluster.Spec.HighAvailability
 	return ha.Mode != "" && ha.Mode != antflyv1.HAModeDisabled && strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == ""
+}
+
+func distributedRuntimeNeedsInternalServiceAuthMigration(cluster *antflyv1.AntflyCluster) bool {
+	return cluster != nil && effectiveTopologyMode(cluster) == topologyModeDistributed && cluster.Spec.InternalServiceAuth == nil
 }
 
 func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
@@ -4121,7 +4265,7 @@ func (r *AntflyClusterReconciler) buildPodAnnotations(ctx context.Context, cache
 	return annotations
 }
 
-func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode) error {
 	replicas := int32(3)
 	if cluster.Spec.MetadataNodes.Replicas > 0 {
 		replicas = cluster.Spec.MetadataNodes.Replicas
@@ -4212,7 +4356,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         cluster.Spec.MetadataNodes.EnvFrom,
-						Env:             secretStoreEnv(cluster.Spec.SecretStore),
+						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), internalServiceAuthEnv(cluster, authMode)...),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -4304,6 +4448,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 			statefulSet.Spec.Template.Annotations = make(map[string]string)
 		}
 		statefulSet.Spec.Template.Annotations[metadataMembershipStatusCapabilityAnnotation] = metadataMembershipStatusCapabilityVersion
+		statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation] = string(authMode)
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,
@@ -4391,7 +4536,7 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 	return config.String()
 }
 
-func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode) error {
 	replicas := effectiveDataNodeReplicas(cluster)
 
 	storageSize := "1Gi"
@@ -4498,7 +4643,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								MountPath: "/config",
 							},
 						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
-						Env: append(append([]corev1.EnvVar{
+						Env: append(append(append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -4507,7 +4652,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...),
+						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...), internalServiceAuthEnv(cluster, authMode)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -4566,6 +4711,10 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
+		if statefulSet.Spec.Template.Annotations == nil {
+			statefulSet.Spec.Template.Annotations = make(map[string]string)
+		}
+		statefulSet.Spec.Template.Annotations[internalServiceAuthRolloutAnnotation] = string(authMode)
 
 		// Apply user-specified scheduling constraints first
 		applySchedulingConstraints(&statefulSet.Spec.Template,

@@ -19,6 +19,7 @@ const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
@@ -361,6 +362,7 @@ const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 const internal_service_secret_key = "antfly.internal_service.secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
+const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 
 fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     var cfg: raft_engine.runtime.RuntimeConfig = .{};
@@ -7352,8 +7354,8 @@ pub const DataServer = struct {
         const raft = self.data_raft orelse return 0;
         var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
         _ = client.withInternalServiceAuth(
-            self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
-            self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
+            self.api_server_cfg.internal_service_secret,
+            self.api_server_cfg.internal_service_issuer,
         );
         const version = client.fetchDataRaftBatchProtocolVersion(
             raft_url,
@@ -7830,8 +7832,8 @@ pub const DataServer = struct {
                                 defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
                                 _ = client.withInternalServiceAuth(
-                                    self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
-                                    self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
+                                    self.api_server_cfg.internal_service_secret,
+                                    self.api_server_cfg.internal_service_issuer,
                                 );
                                 const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
@@ -8025,8 +8027,8 @@ pub const DataServer = struct {
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(
-            self.api_server_cfg.internal_service_secret orelse self.api_server_cfg.trusted_principal_secret,
-            self.api_server_cfg.internal_service_issuer orelse self.api_server_cfg.trusted_principal_issuer,
+            self.api_server_cfg.internal_service_secret,
+            self.api_server_cfg.internal_service_issuer,
         );
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
@@ -17672,6 +17674,44 @@ pub fn runFromIterator(
         internal_service_issuer_key,
     );
     defer if (internal_service_issuer) |value| alloc.free(value);
+    const internal_service_rollout_mode_raw = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_rollout_mode_key,
+    );
+    defer if (internal_service_rollout_mode_raw) |value| alloc.free(value);
+    const internal_service_rollout_mode = internal_service_auth.parseRolloutMode(
+        internal_service_rollout_mode_raw,
+    ) catch |err| {
+        std.log.err("invalid {s}; expected enforce or migration", .{internal_service_rollout_mode_key});
+        return err;
+    };
+    internal_service_auth.validateRuntimeConfig(
+        internal_service_secret,
+        internal_service_issuer,
+    ) catch |err| {
+        std.log.err(
+            "data startup requires a dedicated internal service credential: configure {s} with at least {d} bytes and a printable {s}; err={s}",
+            .{ internal_service_secret_key, internal_service_auth.minimum_secret_bytes, internal_service_issuer_key, @errorName(err) },
+        );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err(
+            "data startup rejected reused signing material: {s} must differ from {s}",
+            .{ internal_service_secret_key, trusted_principal_secret_key },
+        );
+        return err;
+    };
+    if (internal_service_rollout_mode == .migration) {
+        std.log.warn(
+            "SECURITY: internal RPC legacy migration mode is active; unsigned old-peer requests are temporarily accepted. Upgrade every peer, verify X-Antfly-Internal-Auth=legacy-migration disappears, then set {s}=enforce",
+            .{internal_service_rollout_mode_key},
+        );
+    }
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -17747,6 +17787,7 @@ pub fn runFromIterator(
             .trusted_principal_issuer = trusted_principal_issuer,
             .internal_service_secret = internal_service_secret,
             .internal_service_issuer = internal_service_issuer,
+            .internal_service_accept_legacy_unauthenticated = internal_service_rollout_mode == .migration,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
