@@ -4417,6 +4417,7 @@ pub const Node = struct {
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
+        try validateTextEntityExtractionManifest(&model.manifest);
 
         if (model.isGlinerModel()) {
             var pipeline = model.glinerPipeline(allocator);
@@ -8999,6 +9000,16 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        validateTextEntityExtractionManifest(&model.manifest) catch |err| switch (err) {
+            error.InvalidModelForExtraction => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support entity extraction",
+            }),
+            error.UnsupportedInput => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "model does not support text extraction",
+            }),
+        };
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -10968,6 +10979,20 @@ fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !Canoni
     return .entities_relations;
 }
 
+/// Entity extraction has two supported loaded-model layouts: GLiNER models
+/// with an extraction-capable head and standard BIO token recognizers. Reject
+/// other model families before constructing a pipeline or running inference.
+fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.model_type != .recognizer) return error.InvalidModelForExtraction;
+    if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
+    if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
+        @tagName(manifest.model_type),
+        manifest.gliner_model_type,
+        manifest.capabilities,
+        "extraction",
+    )) return error.InvalidModelForExtraction;
+}
+
 fn entityExtractionResponseJsonAlloc(
     allocator: std.mem.Allocator,
     request: Node.EntityExtractionRequest,
@@ -11432,6 +11457,7 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.InvalidExtractionConfig,
         error.InvalidClassificationSchema,
         error.InvalidEntitySchema,
+        error.InvalidModelForExtraction,
         error.InvalidRelationSchema,
         error.InvalidStructureField,
         error.InvalidTopK,
@@ -14538,6 +14564,39 @@ test "canonical extraction operation routes every documented schema family" {
         defer parsed.deinit();
         try std.testing.expectEqual(case.expected, try canonicalExtractionOperation(parsed.value));
     }
+}
+
+test "entity extraction model preflight rejects incompatible families and modalities" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+    };
+    try validateTextEntityExtractionManifest(&manifest);
+
+    manifest.model_type = .classifier;
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var image_inputs = [_][]const u8{"image"};
+    manifest.model_type = .recognizer;
+    manifest.inputs = &image_inputs;
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    manifest.inputs = &.{};
+    manifest.gliner_model_type = "uniencoder";
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var extraction_capabilities = [_][]const u8{"extraction"};
+    manifest.capabilities = &extraction_capabilities;
+    try validateTextEntityExtractionManifest(&manifest);
 }
 
 test "canonical extraction operation repeatedly rejects empty and mixed schemas without leaking" {

@@ -439,17 +439,28 @@ fn tripletsToRecognizeOutput(
         const subject_idx = try getOrCreateEntity(allocator, text, triplet.subject, triplet.score, &entities);
         const object_idx = try getOrCreateEntity(allocator, text, triplet.object, triplet.score, &entities);
 
-        try relations.append(allocator, .{
-            .head = try cloneEntity(allocator, entities.items[subject_idx]),
-            .tail = try cloneEntity(allocator, entities.items[object_idx]),
-            .label = try allocator.dupe(u8, triplet.relation),
-            .score = triplet.score,
-        });
+        var relation = try cloneRelation(
+            allocator,
+            entities.items[subject_idx],
+            entities.items[object_idx],
+            triplet.relation,
+            triplet.score,
+        );
+        relations.append(allocator, relation) catch |err| {
+            relation.deinit(allocator);
+            return err;
+        };
     }
 
+    const owned_entities = try entities.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_entities) |entity| allocator.free(entity.text);
+        allocator.free(owned_entities);
+    }
+    const owned_relations = try relations.toOwnedSlice(allocator);
     return .{
-        .entities = try entities.toOwnedSlice(allocator),
-        .relations = try relations.toOwnedSlice(allocator),
+        .entities = owned_entities,
+        .relations = owned_relations,
     };
 }
 
@@ -465,14 +476,38 @@ fn getOrCreateEntity(
     }
 
     const span = findSpan(full_text, entity_text);
-    try entities.append(allocator, .{
-        .text = try allocator.dupe(u8, entity_text),
+    const owned_text = try allocator.dupe(u8, entity_text);
+    entities.append(allocator, .{
+        .text = owned_text,
         .label = "ENTITY",
         .start = span.start,
         .end = span.end,
         .score = score,
-    });
+    }) catch |err| {
+        allocator.free(owned_text);
+        return err;
+    };
     return entities.items.len - 1;
+}
+
+fn cloneRelation(
+    allocator: std.mem.Allocator,
+    head_entity: Entity,
+    tail_entity: Entity,
+    label: []const u8,
+    score: f32,
+) !Relation {
+    const head = try cloneEntity(allocator, head_entity);
+    errdefer allocator.free(head.text);
+    const tail = try cloneEntity(allocator, tail_entity);
+    errdefer allocator.free(tail.text);
+    const owned_label = try allocator.dupe(u8, label);
+    return .{
+        .head = head,
+        .tail = tail,
+        .label = owned_label,
+        .score = score,
+    };
 }
 
 fn cloneEntity(allocator: std.mem.Allocator, entity: Entity) !Entity {
@@ -655,4 +690,41 @@ test "tripletsToRecognizeOutput deduplicates entities and preserves spans" {
     try std.testing.expectEqual(@as(usize, 2), extracted.relations.len);
     try std.testing.expectEqualStrings("ENTITY", extracted.entities[0].label);
     try std.testing.expect(extracted.entities[0].end > extracted.entities[0].start);
+}
+
+test "tripletsToRecognizeOutput releases every partial allocation" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const triplets = [_]Triplet{
+                .{
+                    .subject = "Grace Hopper",
+                    .object = "Navy",
+                    .relation = "served in",
+                    .score = 0.9,
+                },
+                .{
+                    .subject = "Grace Hopper",
+                    .object = "COBOL",
+                    .relation = "created",
+                    .score = 0.8,
+                },
+            };
+            const extracted = try tripletsToRecognizeOutput(
+                allocator,
+                "Grace Hopper served in the Navy and helped create COBOL.",
+                &triplets,
+                null,
+            );
+            defer {
+                for (extracted.entities) |entity| allocator.free(entity.text);
+                allocator.free(extracted.entities);
+                for (extracted.relations) |*relation| relation.deinit(allocator);
+                allocator.free(extracted.relations);
+            }
+            try std.testing.expectEqual(@as(usize, 3), extracted.entities.len);
+            try std.testing.expectEqual(@as(usize, 2), extracted.relations.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
