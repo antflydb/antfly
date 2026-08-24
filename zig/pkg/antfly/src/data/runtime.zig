@@ -9229,6 +9229,24 @@ pub const DataServer = struct {
             }
         }
 
+        if (comptime control_only_storage_sources) {
+            if (try self.snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id)) |status| {
+                var owned_status = status;
+                defer owned_status.deinit(alloc);
+                if (runtime_status.statusHasRuntimeFacts(owned_status)) {
+                    return try antfly.metadata.shard_db_adapter.dbStatsSchemaIndexReady(
+                        alloc,
+                        owned_status.stats,
+                        schema_version,
+                        read_schema_version,
+                    );
+                }
+            }
+            // Absence is a retryable observation: schema cutover must remain
+            // pending until the storage owner can prove target-index readiness.
+            return false;
+        }
+
         var fallback = antfly.metadata.FallbackLocalShardDbAdapter{
             .replica_root_dir = self.write_source.replica_root_dir,
             .backend_runtime = try self.ensureBackendRuntime(),
@@ -14944,10 +14962,7 @@ pub const DataServer = struct {
         ranges: []const antfly.metadata.table_manager.RangeRecord,
     ) !void {
         const remote_metadata = self.remote_metadata orelse return;
-        var shard_db = antfly.metadata.FallbackLocalShardDbAdapter{
-            .replica_root_dir = self.write_source.replica_root_dir,
-            .backend_runtime = try self.ensureBackendRuntime(),
-        };
+        const backend_runtime = try self.ensureBackendRuntime();
         const local_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
             self.alloc,
             self.write_source.replica_root_dir,
@@ -14957,8 +14972,8 @@ pub const DataServer = struct {
             tables,
             ranges,
             .{
-                .backend_runtime = shard_db.backend_runtime,
-                .shard_db_adapter = shard_db.adapter(),
+                .backend_runtime = backend_runtime,
+                .shard_db_adapter = self.localShardDbAdapter(),
             },
         );
         defer self.alloc.free(local_progress);

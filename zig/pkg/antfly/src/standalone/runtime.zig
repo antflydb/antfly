@@ -48,6 +48,7 @@ const LocalInferenceConnectionContext = struct {
 
 const LocalSchemaProgressProvider = struct {
     ptr: *anyopaque,
+    shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null,
     collect: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1439,14 +1440,23 @@ const LocalStandaloneMetadata = struct {
         defer if (runtime_progress) |*progress| progress.deinit(self.alloc);
         var filesystem_progress: ?[]antfly.metadata.SchemaProgressRecord = null;
         defer if (filesystem_progress) |progress| self.alloc.free(progress);
+        var shard_db_adapter: ?antfly.metadata.ShardDbAdapter = null;
         const progress: []const antfly.metadata.SchemaProgressRecord = progress: {
             if (self.local_schema_progress_provider) |provider| {
+                shard_db_adapter = provider.shard_db_adapter;
                 runtime_progress = try provider.collect(provider.ptr, self.alloc, snapshot.tables, snapshot.ranges);
                 if (runtime_progress.?.records.len != 0) break :progress runtime_progress.?.records;
                 // A complete runtime observation is authoritative even while
                 // not ready. Do not contend with its live writer by reopening
                 // the same root through the filesystem fallback.
                 if (runtime_progress.?.runtime_coverage_complete) return;
+            }
+            // A control-only process has no legal filesystem fallback. If its
+            // live data-server adapter is not installed yet, retain the
+            // migration and retry on the next metadata round instead of
+            // terminating the standalone runtime.
+            if (comptime storage_kernel_experiment) {
+                if (shard_db_adapter == null) return;
             }
             filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
                 self.alloc,
@@ -1458,6 +1468,7 @@ const LocalStandaloneMetadata = struct {
                 snapshot.ranges,
                 .{
                     .backend_runtime = self.backend_runtime,
+                    .shard_db_adapter = shard_db_adapter,
                 },
             );
             break :progress filesystem_progress.?;
@@ -3438,6 +3449,7 @@ fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) a
 fn localSchemaProgressProvider(data_server: *antfly.data.runtime.DataServer) LocalSchemaProgressProvider {
     return .{
         .ptr = data_server,
+        .shard_db_adapter = data_server.localShardDbAdapter(),
         .collect = collectLocalSchemaProgress,
     };
 }
@@ -7692,6 +7704,100 @@ test "standalone metadata finalizes schema migration from resident runtime evide
     };
 
     try metadata.finalizeReadySchemaMigrations();
+    const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
+}
+
+test "standalone metadata finalizes schema migration through split shard adapter fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    });
+    try metadata.manager.upsertRange(.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+    });
+
+    const Provider = struct {
+        fn collect(
+            _: *anyopaque,
+            provider_alloc: std.mem.Allocator,
+            _: []const antfly.metadata.TableRecord,
+            _: []const antfly.metadata.RangeRecord,
+        ) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            return .{
+                .records = try provider_alloc.alloc(antfly.metadata.SchemaProgressRecord, 0),
+                .runtime_coverage_complete = false,
+            };
+        }
+    };
+    const Adapter = struct {
+        calls: usize = 0,
+
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            schema_version: u32,
+            read_schema_version: u32,
+        ) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 70), group_id);
+            try std.testing.expectEqual(@as(u32, 1), schema_version);
+            try std.testing.expectEqual(@as(u32, 0), read_schema_version);
+            return true;
+        }
+    };
+    var adapter = Adapter{};
+    metadata.local_schema_progress_provider = .{
+        .ptr = undefined,
+        .collect = Provider.collect,
+        .shard_db_adapter = .{
+            .ptr = &adapter,
+            .vtable = &.{
+                .fetch_median_key = Adapter.fetchMedianKey,
+                .schema_index_ready = Adapter.schemaIndexReady,
+            },
+        },
+    };
+
+    try metadata.finalizeReadySchemaMigrations();
+
+    try std.testing.expectEqual(@as(usize, 1), adapter.calls);
     const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("", table.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);

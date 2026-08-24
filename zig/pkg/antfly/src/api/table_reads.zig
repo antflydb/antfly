@@ -12866,14 +12866,40 @@ fn computeAggregationResultsThroughKernel(
         .hit_count = @intCast(hits.len),
     });
     defer response.deinit();
+    return parseAggregationResultsFromKernel(alloc, response.bytes());
+}
+
+fn parseAggregationResultsFromKernel(
+    alloc: std.mem.Allocator,
+    response_json: []const u8,
+) ![]db_mod.aggregations.SearchAggregationResult {
     const results = std.json.parseFromSliceLeaky(
         []db_mod.aggregations.SearchAggregationResult,
         alloc,
-        response.bytes(),
-        .{},
+        response_json,
+        .{ .allocate = .alloc_always },
     ) catch return error.StorageKernelFailure;
     for (results) |*aggregation| markAggregationLabelsOwned(aggregation);
     return results;
+}
+
+test "kernel aggregation response owns every decoded allocation after ABI buffer release" {
+    const alloc = std.testing.allocator;
+    const response_alloc = std.heap.c_allocator;
+    const response_json = try response_alloc.dupe(
+        u8,
+        "[{\"name\":\"by_status\",\"field\":\"status\",\"type\":\"terms\",\"metadata_json\":\"{\\\"source\\\":\\\"algebraic\\\"}\",\"buckets\":[{\"key_json\":\"\\\"active\\\"\",\"count\":2,\"aggregations\":[{\"name\":\"sum_score\",\"field\":\"score\",\"type\":\"sum\",\"value_json\":\"3\"}]}]}]",
+    );
+    const results = try parseAggregationResultsFromKernel(alloc, response_json);
+    response_alloc.free(response_json);
+    defer db_mod.aggregations.deinitResults(alloc, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("by_status", results[0].name);
+    try std.testing.expectEqualStrings("{\"source\":\"algebraic\"}", results[0].metadata_json.?);
+    try std.testing.expectEqualStrings("\"active\"", results[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("sum_score", results[0].buckets[0].aggregations[0].name);
+    try std.testing.expectEqualStrings("3", results[0].buckets[0].aggregations[0].value_json.?);
 }
 
 fn markAggregationLabelsOwned(result: *db_mod.aggregations.SearchAggregationResult) void {
