@@ -595,6 +595,7 @@ pub const HttpHandler = struct {
             .enrichment_fallback_documents = runtime_stats.enrichment_fallback_documents,
             .enrichment_failed_documents = runtime_stats.enrichment_failed_documents,
             .enrichment_stage_failures = runtime_stats.enrichment_stage_failures,
+            .enrichment_conflicts = runtime_stats.enrichment_conflicts,
             .cache_hits = cache_stats.hits,
             .cache_misses = cache_stats.misses,
             .cache_writes = cache_stats.writes,

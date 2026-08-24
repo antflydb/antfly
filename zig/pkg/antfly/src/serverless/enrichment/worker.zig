@@ -32,6 +32,7 @@ const artifacts_object_store = @import("../artifacts/object_store.zig");
 const manifest_object_store = @import("../manifest/object_store.zig");
 const progress_object_store = @import("../catalog/object_progress_store.zig");
 const wal_object_store = @import("../wal/object_store.zig");
+const operation_identity = @import("operation_id.zig");
 
 pub const EnrichmentRunStats = struct {
     enriched_namespaces: usize = 0,
@@ -368,12 +369,7 @@ fn enrichmentOperationId(
     doc_index: usize,
     pipeline_version: u32,
 ) ![]const u8 {
-    return try std.fmt.bufPrint(buf, "enrich-v1/{d}/{d}/{d}/{d}", .{
-        head,
-        @intFromEnum(stage),
-        doc_index,
-        pipeline_version,
-    });
+    return try operation_identity.format(buf, head, @intFromEnum(stage), doc_index, pipeline_version);
 }
 
 fn findArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) ?usize {
