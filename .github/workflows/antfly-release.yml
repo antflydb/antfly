@@ -279,7 +279,7 @@ jobs:
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
     needs: package-cli-artifacts
-    runs-on: arc-antfly-standard
+    runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/antfly-cli
@@ -297,7 +297,7 @@ jobs:
   publish-cli-npm:
     name: Publish @antfly/cli to npm
     needs: package-cli-artifacts
-    runs-on: arc-antfly-standard
+    runs-on: ubuntu-latest
     environment: npm
     permissions:
       id-token: write
