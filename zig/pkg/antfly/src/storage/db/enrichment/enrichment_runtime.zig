@@ -5582,7 +5582,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
                 const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
-                    if (!isOcrPageRenderFailure(err) and shouldYieldRequestError(runtime, err)) return err;
+                    if (!shouldIsolateOcrPageRenderFailure(err)) return err;
                     try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
                     try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
                     continue;
@@ -5995,16 +5995,13 @@ fn isDocumentWideOcrFailure(err: anyerror) bool {
     };
 }
 
-fn isOcrPageRenderFailure(err: anyerror) bool {
-    return switch (err) {
-        error.RenderedPageTooLarge,
-        error.MissingCcittEol,
-        error.JpegDecodeFailed,
-        error.UnsupportedPdfRendering,
-        error.InvalidPageBox,
-        => true,
-        else => false,
-    };
+fn shouldIsolateOcrPageRenderFailure(err: anyerror) bool {
+    // Rendering is local to one page and performs no remote I/O, so decoder,
+    // validation, and platform-renderer failures are deterministic for that
+    // page. Keep the allowlist on the errors that must escape instead: worker
+    // control flow and fatal process/runtime failures such as OutOfMemory.
+    return !isEnrichmentControlError(err) and
+        enrichmentErrorDisposition(err) != .fatal_worker;
 }
 
 fn markPendingGeneratedUnitTextFailures(
@@ -13202,10 +13199,15 @@ test "document-wide OCR resource failure preserves units and marks pending pages
 
     try std.testing.expect(isDocumentWideOcrFailure(error.DocumentExtractionWorkingSetTooLarge));
     try std.testing.expect(!isDocumentWideOcrFailure(error.OutOfMemory));
-    try std.testing.expect(isOcrPageRenderFailure(error.RenderedPageTooLarge));
-    try std.testing.expect(isOcrPageRenderFailure(error.MissingCcittEol));
-    try std.testing.expect(isOcrPageRenderFailure(error.JpegDecodeFailed));
-    try std.testing.expect(!isOcrPageRenderFailure(error.OutOfMemory));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.RenderedPageTooLarge));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.MissingCcittEol));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.JpegDecodeFailed));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.InvalidPageRotation));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.InvalidFlateStream));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.MalformedLzw));
+    try std.testing.expect(shouldIsolateOcrPageRenderFailure(error.MalformedPredictorData));
+    try std.testing.expect(!shouldIsolateOcrPageRenderFailure(error.OutOfMemory));
+    try std.testing.expect(!shouldIsolateOcrPageRenderFailure(error.EnrichmentRetryAborted));
 }
 
 test "document extraction rejects and records Florence prompt echoes" {
