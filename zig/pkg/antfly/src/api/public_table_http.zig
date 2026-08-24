@@ -927,6 +927,18 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
                 .mode = mode,
                 .reason = "pattern_required",
             };
+            for (pattern.?.array.items) |step| {
+                if (step != .object) continue;
+                const edge = step.object.get("edge") orelse continue;
+                if (edge != .object) continue;
+                if (jsonString(edge.object, "direction")) |direction| {
+                    if (!std.mem.eql(u8, direction, "out")) return .{
+                        .operation = operation_name,
+                        .mode = mode,
+                        .reason = "direction_must_be_out",
+                    };
+                }
+            }
         }
     }
     return fallback orelse .{};
@@ -3650,6 +3662,12 @@ test "unsupported graph mode diagnostics identify the rejected operation constra
             .operation = "match",
             .mode = "pattern",
             .reason = "pattern_required",
+        },
+        .{
+            .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\",\"pattern\":[{\"alias\":\"a\"},{\"alias\":\"b\",\"edge\":{\"direction\":\"both\"}}]}}}",
+            .operation = "match",
+            .mode = "pattern",
+            .reason = "direction_must_be_out",
         },
     };
 

@@ -26299,6 +26299,31 @@ test "unsupported graph query modes fail closed" {
             .authorize_table = Authorizer.authorize,
         },
     }));
+
+    const legacy_pattern = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "entity" },
+        .{ .alias = "memory", .edge = .{ .direction = .in } },
+    };
+    const legacy_pattern_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "mentions",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"entity:ada"} },
+            .legacy_response = true,
+            .pattern = &legacy_pattern,
+        },
+    }};
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, .{
+        .graph_queries = &legacy_pattern_queries,
+    }));
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
+        .graph_queries = &legacy_pattern_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    }));
     try rejectUnsupportedGraphQueryMode(2, .{});
 }
 

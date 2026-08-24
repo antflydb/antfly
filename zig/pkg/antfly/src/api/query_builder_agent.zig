@@ -2126,7 +2126,7 @@ pub fn buildQueryBuilderResponseWithContext(
     const explanation = try buildQueryBuilderExplanation(alloc, effective_fields, built_query);
     const confidence = queryBuilderConfidence(effective_fields, built_query);
     const selectable_fields = try queryBuilderSelectableFields(alloc, request.constraints, effective_fields);
-    const query_request = try buildQueryBuilderQueryRequest(alloc, request, built_query, selectable_fields, graph_indexes);
+    const query_request = try buildQueryBuilderQueryRequest(alloc, request, built_query, selectable_fields, graph_indexes, &warnings);
     const retrieval_query_request = try buildQueryBuilderRetrievalQueryRequest(alloc, request, query_request, graph_indexes);
     const artifact = if (retrieval_query_request != null) "retrieval_query_request" else "query_request";
     const specialist = pickQueryBuilderSpecialist(request.mode, built_query, query_request, retrieval_query_request != null);
@@ -4270,6 +4270,7 @@ fn buildQueryBuilderQueryRequest(
     built: BuiltQueryBuilderQuery,
     fields: []const []const u8,
     graph_indexes: []const []const u8,
+    warnings: *std.ArrayListUnmanaged([]const u8),
 ) !metadata_openapi.QueryRequest {
     var out = metadata_openapi.QueryRequest{
         .table = queryBuilderEffectiveTable(request),
@@ -4287,7 +4288,12 @@ fn buildQueryBuilderQueryRequest(
     out.filter_prefix = queryBuilderConstraintString(request.constraints, "filter_prefix");
     out.exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
     out.graph_queries = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
-    out.expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
+    const expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
+    if (out.graph_queries != null and expand_strategy != null) {
+        try warnings.append(alloc, "Ignored deprecated constraints.expand_strategy because canonical graph_queries return independently typed graph results; consume response.graph_results explicitly.");
+    } else {
+        out.expand_strategy = expand_strategy;
+    }
 
     switch (built.query_kind) {
         .status_only => {
@@ -9600,7 +9606,7 @@ test "query builder applies search cursor only when sort is present" {
     try std.testing.expectEqualStrings("doc-9", query_request.search_after.?[1].string);
 }
 
-test "query builder maps graph searches from constraints" {
+test "query builder maps canonical graph queries and ignores legacy expansion" {
     var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"keys":["doc-1"]},"edge_types":["references"],"max_depth":1}}},"expand_strategy":"union"}
     , .{});
@@ -9616,13 +9622,15 @@ test "query builder maps graph searches from constraints" {
     }, null);
 
     const query_request = result.query_request.?;
-    try std.testing.expectEqualStrings("union", query_request.expand_strategy.?);
+    try std.testing.expect(query_request.expand_strategy == null);
     try std.testing.expect(query_request.graph_queries != null);
     try std.testing.expectEqual(@as(usize, 1), query_request.graph_queries.?.map.count());
     const graph_query = query_request.graph_queries.?.map.get("related").?;
     try std.testing.expectEqualStrings("doc_graph", graph_query.graph_traverse_query.index);
     try std.testing.expectEqualStrings("doc-1", graph_query.graph_traverse_query.traverse.start.graph_key_node_selector.keys[0]);
     try std.testing.expectEqualStrings("references", graph_query.graph_traverse_query.traverse.edge_types.?[0]);
+    try std.testing.expect(result.warnings != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Ignored deprecated constraints.expand_strategy") != null);
 }
 
 test "query builder infers graph search from table context" {

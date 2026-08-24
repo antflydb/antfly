@@ -117,6 +117,24 @@ func mockQueryHit(id string, source map[string]any) []byte {
 	return b
 }
 
+func mockGraphQueryNodes(name string, hits []rawHit, nodes []client.GraphResultNode) []byte {
+	var graphResult client.GraphQueryResult
+	if err := graphResult.FromGraphNodesResult(client.GraphNodesResult{
+		Kind:  client.GraphNodesResultKindNodes,
+		Nodes: nodes,
+		Paths: []client.GraphPath{},
+		Stats: client.GraphQueryStats{ReturnedItems: uint64(len(nodes))},
+	}); err != nil {
+		panic(err)
+	}
+	resp := queryResponse{Responses: []queryResult{{
+		Hits:         queryHits{Hits: hits, Total: exactQueryHitsTotal(uint64(len(hits)))},
+		GraphResults: map[string]client.GraphQueryResult{name: graphResult},
+	}}}
+	b, _ := json.Marshal(resp)
+	return b
+}
+
 // --- Tests ---
 
 func TestStoreMemory(t *testing.T) {
@@ -191,9 +209,22 @@ func TestStoreMemory_WithExtractor(t *testing.T) {
 	h.Close()
 
 	mc.mu.Lock()
-	// 1 batch for the memory insert + 2 for entity extraction (nodes + edges).
-	if len(mc.batches) != 3 {
-		t.Errorf("expected 3 batches (insert + entity nodes + edges), got %d", len(mc.batches))
+	// 1 batch for the memory insert + 1 atomic entity/edge materialization batch.
+	if len(mc.batches) != 2 {
+		t.Errorf("expected 2 batches (insert + symmetric entity graph), got %d", len(mc.batches))
+	}
+	if len(mc.batches) >= 2 {
+		for _, transform := range mc.batches[1].Transforms {
+			var foundReverseMention bool
+			for _, operation := range transform.Operations {
+				if operation.Op == client.TransformOpTypeAddToSet && operation.Path == "$._edges.memory_graph.mentions" {
+					foundReverseMention = true
+				}
+			}
+			if !foundReverseMention {
+				t.Errorf("entity transform %q did not materialize reverse mention edge", transform.Key)
+			}
+		}
 	}
 	mc.mu.Unlock()
 }
@@ -394,6 +425,114 @@ func TestSearchMemories_IncludesVisibilityFilter(t *testing.T) {
 	body := string(mc.queryBodies[len(mc.queryBodies)-1])
 	if !strings.Contains(body, VisibilityPrivate) {
 		t.Fatalf("expected visibility filter in query body, got %s", body)
+	}
+}
+
+func TestSearchMemories_UsesCanonicalGraphResults(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatal(err)
+		}
+		if req["graph_searches"] != nil || req["expand_strategy"] != nil {
+			t.Fatalf("legacy graph fields leaked into request: %s", body)
+		}
+		queries := req["graph_queries"].(map[string]any)
+		traverse := queries["entity_expansion"].(map[string]any)["traverse"].(map[string]any)
+		if traverse["direction"] != nil || traverse["include_documents"] != true || traverse["filter"] == nil {
+			t.Fatalf("unexpected canonical traversal: %#v", traverse)
+		}
+		return mockGraphQueryNodes("entity_expansion", []rawHit{{
+			ID: "mem:ranked", Score: 0.9, Source: map[string]any{"content": "ranked"},
+		}}, []client.GraphResultNode{{
+			Key: "mem:connected", Document: map[string]any{"content": "connected"},
+		}}), nil
+	}
+	ext := &mockExtractor{extractFn: func(context.Context, []string, ExtractOptions) ([]Extraction, error) {
+		return []Extraction{{Entities: []ExtractedEntity{{Text: "Go", Label: "technology", Score: 0.9}}}}, nil
+	}}
+	h := newTestHandler(mc, ext)
+
+	results, err := h.SearchMemories(context.Background(), SearchMemoriesArgs{
+		Query: "Go concurrency", ExpandGraph: true, Limit: 5,
+	}, defaultUctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Memory.ID != "ranked" || results[1].Memory.ID != "connected" {
+		t.Fatalf("unexpected canonical graph union: %#v", results)
+	}
+}
+
+func TestGraphLookupMethodsUseCanonicalOutgoingTraversal(t *testing.T) {
+	tests := []struct {
+		name       string
+		resultName string
+		invoke     func(*Handler) ([]SearchResult, error)
+	}{
+		{
+			name: "find related", resultName: "related",
+			invoke: func(h *Handler) ([]SearchResult, error) {
+				return h.FindRelated(context.Background(), FindRelatedArgs{ID: "root", Limit: 5}, defaultUctx())
+			},
+		},
+		{
+			name: "entity memories", resultName: "mentions",
+			invoke: func(h *Handler) ([]SearchResult, error) {
+				return h.GetEntityMemories(context.Background(), EntityMemoriesArgs{EntityLabel: "technology", EntityText: "Go", Limit: 5}, defaultUctx())
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := newMockClient()
+			mc.queryFn = func(body []byte) ([]byte, error) {
+				var req map[string]any
+				if err := json.Unmarshal(body, &req); err != nil {
+					t.Fatal(err)
+				}
+				if req["full_text_search"] != nil || req["graph_searches"] != nil || req["expand_strategy"] != nil {
+					t.Fatalf("graph-only canonical request contains legacy retrieval fields: %s", body)
+				}
+				queries := req["graph_queries"].(map[string]any)
+				traverse := queries[tt.resultName].(map[string]any)["traverse"].(map[string]any)
+				if traverse["direction"] != nil || traverse["include_documents"] != true || traverse["filter"] == nil {
+					t.Fatalf("unexpected canonical traversal: %#v", traverse)
+				}
+				return mockGraphQueryNodes(tt.resultName, nil, []client.GraphResultNode{{
+					Key: "mem:connected", Document: map[string]any{"content": "connected"},
+				}}), nil
+			}
+			h := newTestHandler(mc, nil)
+			results, err := tt.invoke(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(results) != 1 || results[0].Memory.ID != "connected" {
+				t.Fatalf("unexpected graph lookup result: %#v", results)
+			}
+		})
+	}
+}
+
+func TestCanonicalGraphResultIsRequiredAndTableExact(t *testing.T) {
+	empty, _ := json.Marshal(queryResponse{Responses: []queryResult{{Hits: queryHits{Total: exactQueryHitsTotal(0)}}}})
+	if _, err := hitsWithRequiredGraphNodesFromResponse(empty, "related"); err == nil || !strings.Contains(err.Error(), "missing graph result") {
+		t.Fatalf("expected missing graph result error, got %v", err)
+	}
+
+	response := mockGraphQueryNodes("related", nil, []client.GraphResultNode{
+		{Key: "mem:local", Document: map[string]any{"content": "local"}},
+		{Table: "foreign", Key: "mem:local", Document: map[string]any{"content": "foreign"}},
+		{Key: "mem:deleted"},
+	})
+	hits, err := hitsWithRequiredGraphNodesFromResponse(response, "related")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Source["content"] != "local" {
+		t.Fatalf("qualified graph identity collapsed into local results: %#v", hits)
 	}
 }
 

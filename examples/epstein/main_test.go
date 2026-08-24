@@ -284,7 +284,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	if !ok || startNodes["result_ref"] != "$query_results" || startNodes["limit"] != 8 {
 		t.Fatalf("unexpected start nodes: %#v", traverse["start"])
 	}
-	if traverse["direction"] != "both" || traverse["max_depth"] != 1 {
+	if _, present := traverse["direction"]; present || traverse["max_depth"] != 1 {
 		t.Fatalf("unexpected traversal: %#v", traverse)
 	}
 	if traverse["include_documents"] != true {
@@ -319,18 +319,21 @@ func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
 				Document: map[string]any{
 					"title": "Beta page",
 				},
-				PathEdges: []antfly.PathEdge{
-					{Source: "doc-a", Target: "doc-b", Type: "mentioned in", Weight: 0.75},
+				PathEdges: []antfly.GraphPathEdge{
+					{From: antfly.GraphPathEndpoint{Key: "doc-a"}, To: antfly.GraphPathEndpoint{Key: "doc-b"}, Type: "mentioned in", Weight: 0.75},
 				},
 			},
 			{
 				Key:      "Jeffrey Epstein",
 				Depth:    1,
 				Distance: 0.5,
-				Path:     []string{"doc-a", "Jeffrey Epstein"},
+				Path: []antfly.GraphPathEndpoint{
+					{Key: "doc-a"},
+					{Key: "Jeffrey Epstein"},
+				},
 			},
 		},
-		Paths: []antfly.Path{},
+		Paths: []antfly.GraphPath{},
 		Stats: antfly.GraphQueryStats{ReturnedItems: 3, Truncated: false},
 	})
 	if err != nil {

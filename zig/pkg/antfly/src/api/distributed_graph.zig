@@ -724,6 +724,13 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
             },
             .pattern => {
                 if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
+                // Legacy linear patterns carry direction on each edge step,
+                // independently of the request-level traversal parameters.
+                // Incoming adjacency is source-shard-local, so accepting one
+                // here would silently omit edges owned by other shards.
+                for (graph_query.query.pattern) |step| {
+                    if (step.edge.direction != .out) return false;
+                }
             },
         }
     }
@@ -9087,6 +9094,38 @@ test "distributed graph supports cross-range traverse target selectors" {
         .identity_read_generation = 9,
     };
     try std.testing.expect(!supportsCrossRange(unsupported_weight_mode));
+}
+
+test "distributed graph rejects legacy pattern step reverse directions" {
+    const outgoing_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .out } },
+    };
+    const incoming_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .in } },
+    };
+    const both_steps = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "a" },
+        .{ .alias = "b", .edge = .{ .direction = .both } },
+    };
+
+    var query = graph_query_mod.GraphQuery{
+        .query_type = .pattern,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .pattern = &outgoing_steps,
+    };
+    var named = [_]db_mod.types.NamedGraphQuery{.{ .name = "walk", .query = query }};
+    try std.testing.expect(supportsCrossRange(.{ .graph_queries = &named }));
+
+    query.pattern = &incoming_steps;
+    named[0].query = query;
+    try std.testing.expect(!supportsCrossRange(.{ .graph_queries = &named }));
+
+    query.pattern = &both_steps;
+    named[0].query = query;
+    try std.testing.expect(!supportsCrossRange(.{ .graph_queries = &named }));
 }
 
 test "distributed graph rejects doc identity rebuild before cross-range fanout" {

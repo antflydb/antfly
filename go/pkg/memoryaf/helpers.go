@@ -30,9 +30,10 @@ type queryResponse struct {
 }
 
 type queryResult struct {
-	Hits         queryHits                    `json:"hits"`
-	Aggregations map[string]aggregationResult `json:"aggregations"`
-	Error        string                       `json:"error"`
+	Hits         queryHits                          `json:"hits"`
+	Aggregations map[string]aggregationResult       `json:"aggregations"`
+	GraphResults map[string]client.GraphQueryResult `json:"graph_results"`
+	Error        string                             `json:"error"`
 }
 
 type queryHits struct {
@@ -96,6 +97,60 @@ func hitsFromResponse(data []byte) ([]hit, error) {
 	var hits []hit
 	for _, h := range resp.Responses[0].Hits.Hits {
 		hits = append(hits, hit{ID: h.ID, Source: h.Source, Score: h.Score})
+	}
+	return hits, nil
+}
+
+// hitsWithRequiredGraphNodesFromResponse preserves the legacy union ordering—ranked
+// retrieval hits first, followed by graph-only nodes—while consuming canonical
+// typed graph results. Exact key deduplication prevents a graph result from
+// replacing a ranked hit and remains linear in the bounded response size.
+func hitsWithRequiredGraphNodesFromResponse(data []byte, graphResultName string) ([]hit, error) {
+	resp, err := parseResponse(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Responses) == 0 {
+		return nil, nil
+	}
+
+	result := resp.Responses[0]
+	hits := make([]hit, 0, len(result.Hits.Hits))
+	seen := make(map[string]struct{}, len(result.Hits.Hits))
+	for _, h := range result.Hits.Hits {
+		hits = append(hits, hit{ID: h.ID, Source: h.Source, Score: h.Score})
+		seen[h.ID] = struct{}{}
+	}
+
+	graphResult, ok := result.GraphResults[graphResultName]
+	if !ok {
+		return nil, fmt.Errorf("query response is missing graph result %q", graphResultName)
+	}
+	decoded, err := client.DecodeGraphQueryResult(graphResult)
+	if err != nil {
+		return nil, fmt.Errorf("decode graph result %q: %w", graphResultName, err)
+	}
+	nodes, ok := decoded.(client.GraphNodesResult)
+	if !ok {
+		return nil, fmt.Errorf("graph result %q has type %T, want nodes", graphResultName, decoded)
+	}
+	for _, node := range nodes.Nodes {
+		// MemoryAF graph indexes are table-local. Never collapse a qualified
+		// foreign identity into a local memory key.
+		if node.Table != "" {
+			continue
+		}
+		// Every MemoryAF traversal requests hydration. A missing document means
+		// the edge points at a deleted or otherwise unavailable node; returning
+		// it as an empty Memory would expose stale denormalized graph state.
+		if node.Document == nil {
+			continue
+		}
+		if _, exists := seen[node.Key]; exists {
+			continue
+		}
+		seen[node.Key] = struct{}{}
+		hits = append(hits, hit{ID: node.Key, Source: node.Document})
 	}
 	return hits, nil
 }

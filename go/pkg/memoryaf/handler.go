@@ -27,6 +27,29 @@ const (
 	embedderProvider  = "antfly"
 )
 
+func canonicalGraphTraversal(startKeys, edgeTypes []string, maxDepth, limit int, memoryFilter *query.Query) map[string]any {
+	traverse := map[string]any{
+		"start":             map[string]any{"keys": startKeys},
+		"edge_types":        edgeTypes,
+		"max_depth":         maxDepth,
+		"limit":             limit,
+		"include_documents": true,
+	}
+	if memoryFilter != nil {
+		// Entity nodes are structural intermediates. Keep them traversable while
+		// applying the caller's complete memory scope to every hydrated memory.
+		graphFilter := query.NewDisjunction([]query.Query{
+			query.NewTerm(entityDocType, "entity_type"),
+			*memoryFilter,
+		}).ToQuery()
+		traverse["filter"] = json.RawMessage(mustMarshal(graphFilter))
+	}
+	return map[string]any{
+		"index":    graphIndex,
+		"traverse": traverse,
+	}
+}
+
 // Handler implements all memoryaf operations against an Antfly instance.
 type Handler struct {
 	client    Client
@@ -684,6 +707,7 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 		reqMap["filter_query"] = json.RawMessage(mustMarshal(filter))
 	}
 
+	graphExpansion := false
 	if args.ExpandGraph && h.extractor != nil {
 		queryEntities := h.extractEntities(ctx, args.Query)
 		if len(queryEntities) > 0 {
@@ -691,21 +715,10 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 			for _, e := range queryEntities {
 				entityKeys = append(entityKeys, entityKey(e.Label, e.Text))
 			}
-			// Incoming expansion is retained through the deprecated local graph
-			// contract until the exact public coordinator supports reverse edges.
-			reqMap["graph_searches"] = map[string]any{
-				"entity_expansion": map[string]any{
-					"type":        "traverse",
-					"index_name":  graphIndex,
-					"start_nodes": map[string]any{"keys": entityKeys},
-					"params": map[string]any{
-						"edge_types": []string{"mentions"},
-						"direction":  "in",
-						"max_depth":  1,
-					},
-				},
+			reqMap["graph_queries"] = map[string]any{
+				"entity_expansion": canonicalGraphTraversal(entityKeys, []string{"mentions"}, 1, limit, filter),
 			}
-			reqMap["expand_strategy"] = "union"
+			graphExpansion = true
 		}
 	}
 
@@ -714,7 +727,12 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 		return nil, fmt.Errorf("search memories: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	var hits []hit
+	if graphExpansion {
+		hits, err = hitsWithRequiredGraphNodesFromResponse(resp, "entity_expansion")
+	} else {
+		hits, err = hitsFromResponse(resp)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -750,25 +768,13 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		depth = 2
 	}
 	mKey := memoryKey(args.ID)
+	memoryFilter := buildFilterQuery(filterOpts{}, &uctx)
 
 	reqMap := map[string]any{
-		"table":            table,
-		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
-		"limit":            limit,
-		"graph_searches": map[string]any{
-			"related": map[string]any{
-				"type":        "traverse",
-				"index_name":  graphIndex,
-				"start_nodes": map[string]any{"keys": []string{mKey}},
-				"params": map[string]any{
-					"edge_types":  []string{"mentions", "related_to"},
-					"direction":   "both",
-					"max_depth":   depth,
-					"max_results": limit,
-				},
-			},
+		"table": table,
+		"graph_queries": map[string]any{
+			"related": canonicalGraphTraversal([]string{mKey}, []string{"mentions", "related_to"}, depth, limit, memoryFilter),
 		},
-		"expand_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -776,7 +782,7 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		return nil, fmt.Errorf("find related: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	hits, err := hitsWithRequiredGraphNodesFromResponse(resp, "related")
 	if err != nil {
 		return nil, err
 	}
@@ -808,24 +814,13 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		limit = 20
 	}
 	eKey := entityKey(args.EntityLabel, args.EntityText)
+	memoryFilter := buildFilterQuery(filterOpts{}, &uctx)
 
 	reqMap := map[string]any{
-		"table":            table,
-		"full_text_search": json.RawMessage(mustMarshal(query.NewMatchAll())),
-		"limit":            limit,
-		"graph_searches": map[string]any{
-			"mentions": map[string]any{
-				"type":        "traverse",
-				"index_name":  graphIndex,
-				"start_nodes": map[string]any{"keys": []string{eKey}},
-				"params": map[string]any{
-					"edge_types": []string{"mentions"},
-					"direction":  "in",
-					"max_depth":  1,
-				},
-			},
+		"table": table,
+		"graph_queries": map[string]any{
+			"mentions": canonicalGraphTraversal([]string{eKey}, []string{"mentions"}, 1, limit, memoryFilter),
 		},
-		"expand_strategy": "union",
 	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
@@ -833,7 +828,7 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		return nil, fmt.Errorf("entity memories: %w", err)
 	}
 
-	hits, err := hitsFromResponse(resp)
+	hits, err := hitsWithRequiredGraphNodesFromResponse(resp, "mentions")
 	if err != nil {
 		return nil, err
 	}
@@ -1151,25 +1146,27 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 				{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: 1},
 				{Op: client.TransformOpTypeMin, Path: "$.first_seen", Value: now},
 				{Op: client.TransformOpTypeSet, Path: "$.last_seen", Value: now},
+				// Canonical distributed graph queries are outgoing-only. Materialize
+				// the reverse mention as an outgoing entity->memory edge in the same
+				// batch that updates the entity, so hosted traversal remains exact.
+				{Op: client.TransformOpTypeAddToSet, Path: "$._edges." + graphIndex + ".mentions", Value: map[string]any{
+					"target": mKey,
+					"weight": entity.Score,
+				}},
 			},
 		})
 	}
 
-	// Batch 1: entity node upserts + mention count transforms.
-	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: inserts, Transforms: transforms}); err != nil {
-		h.logger.Warn("entity node batch failed", zap.Error(err))
-	}
-
-	// Batch 2: graph edges from memory to entity nodes (separate key structure).
-	edgeInserts := map[string]any{
-		mKey: map[string]any{
-			"_edges": map[string]any{
-				graphIndex: edgesByType,
-			},
+	// Submit both directions together. The server can route one bounded table
+	// batch across key ranges without exposing a half-materialized relationship
+	// between separate client round trips.
+	inserts[mKey] = map[string]any{
+		"_edges": map[string]any{
+			graphIndex: edgesByType,
 		},
 	}
-	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: edgeInserts}); err != nil {
-		h.logger.Warn("edge creation failed", zap.Error(err))
+	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: inserts, Transforms: transforms}); err != nil {
+		h.logger.Warn("entity graph batch failed", zap.Error(err))
 	}
 
 	return filtered
