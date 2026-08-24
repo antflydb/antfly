@@ -66,7 +66,7 @@ const Paths = struct {
     }
 
     fn deinit(self: Paths, allocator: std.mem.Allocator) void {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = std.Io.Threaded.init(allocator, .{}); // vopr-audit: allow(native_thread_or_io) real HA storage remains an explicit native differential backend
         defer io_impl.deinit();
         inline for (.{ self.primary_log, self.primary_slots, self.standby_log, self.standby_progress, self.fence_wal }) |item| {
             std.Io.Dir.cwd().deleteTree(io_impl.io(), item) catch {};
@@ -404,7 +404,7 @@ pub fn replay(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !
 fn path(allocator: std.mem.Allocator, nonce: u64, part: []const u8) ![:0]u8 {
     // The process-local address prevents a prior aborted test process from
     // colliding with a fresh replay whose nonce starts at zero again.
-    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/ha-vopr-{x}-{d}-{s}", .{ @intFromPtr(&path_nonce), nonce, part }, 0);
+    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/ha-vopr-{x}-{d}-{s}", .{ @intFromPtr(&path_nonce), nonce, part }, 0); // vopr-audit: allow(unstable_identity) pointer value isolates native differential scratch paths and never enters trace semantics
 }
 
 fn partitionSpec() vopr.fault.Spec {

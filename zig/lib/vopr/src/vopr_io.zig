@@ -338,6 +338,10 @@ pub const VoprIo = struct {
         self.first_violation = null;
     }
 
+    pub fn entropyCallCount(self: *const VoprIo) u64 {
+        return self.random_calls;
+    }
+
     pub fn ensureNoCapabilityViolation(self: *const VoprIo) !void {
         if (self.first_violation != null) return error.VoprIoCapabilityViolation;
     }

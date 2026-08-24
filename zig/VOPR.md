@@ -67,6 +67,7 @@ An executable unit test alone is not called fully implemented.
 | Integrated per-history and aggregate run/results API; executable health foundation | `report.zig`, `health.zig`, `vopr-results`; parallel campaigns write stable `vopr-run-results-v1` JSON and static HTML with progress, replay, and harness health. Leak/exhaustion/cleanup checks are reported when a caller supplies a snapshot and are not yet automatically derivable for every scenario | `zig build vopr-engine-test vopr-meta-test vopr-results` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
 | Integrated fault composition and structured-choice auditing; executable search benchmark foundation | `fault.zig`, `fault_vopr_io.zig`, `choice.zig`, `benchmark.zig`; precedence drives real `VoprIo` effects in the Parquet-cache suite. The benchmark corpus currently contains one injected starvation bug | `zig build vopr-engine-test parquet-cache-vopr-test vopr-benchmark` |
+| Integrated command-template composition and fail-closed entropy/source audit | `command.zig` implements first/parallel/serial/singleton/anytime/eventually/finally roles with compatibility, exclusion, fault, and quiescence policies; `determinism.zig` combines immediate-choice and borrowed-I/O entropy evidence; Antfly `vopr/determinism_audit.zig` covers every exported VOPR source and both legacy metadata replay regions | `zig build vopr-engine-test vopr-determinism-audit` |
 | Replay-before-retention campaigns, deterministic workers, bounded counterfactual graphs, and quarantine manifests/raw artifacts | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
 | Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-engine-test vopr-meta-test` |
 | TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
@@ -80,6 +81,7 @@ An executable unit test alone is not called fully implemented.
 | Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, repair, DataServer warmup/catch-up/root/status refresh, and auto-bulk finish work on borrowed `std.Io`/shared owners; `vopr/admission.zig` | `zig build storage-vopr-runtime-test vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 | P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
+| Cold configuration and extension lifecycle | Antfly `vopr/config_extension_lifecycle.zig`; production secret store, remote-content publisher, extension administration/catalog, package scanner, and Wasmtime artifact loader all borrow the same `std.Io` | `zig build config-extension-lifecycle-vopr-test` |
 | Provider and composed-query boundaries | Antfly `vopr/provider_boundaries.zig`, `composed_query.zig`; real ManagedEmbedder, PostgreSQL Source, distributed merge, and graph-union seams | `zig build provider-boundary-vopr-test composed-query-vopr-test` |
 | Parquet cache, provisioning/startup, external lake, and media runtime | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/range/registry paths, injected I/O faults, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
 
@@ -693,6 +695,13 @@ VOPR work has found concrete production and harness defects:
   time zero therefore rescanned an empty cache immediately. Borrowed-I/O clock
   sampling now preserves a nonzero sentinel while keeping throttle decisions
   replayable.
+- Portable directory creation, absolute file creation, and directory fsync
+  escaped a borrowed `std.Io` through raw POSIX calls. A virtual descriptor
+  could therefore reach the host kernel during secret publication and other
+  durable rename protocols. These operations now dispatch through `std.Io`;
+  `VoprIo` treats a directory-file sync as the namespace durability boundary,
+  and the cold-start campaign proves secret crash/reopen persistence through
+  the production atomic writer.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep
@@ -1145,6 +1154,22 @@ ownership is released.
   one-shot virtual network/storage effects, and the Parquet-cache suite uses
   it outside the algebra unit tests. The runner audits every choice record for typed, immediate
   scenario-level selection instead of delayed seed interpretation.
+- The reusable command composer executes `first`, `parallel`, `serial`,
+  `singleton`, `anytime`, `eventually`, and `finally` roles. Commands declare
+  symmetric allow/deny compatibility, exclusion groups, active-fault policy,
+  and before/after quiescence requirements. Quiet-suffix entry snapshots
+  eventual obligations, waits for them and all active actors, then runs final
+  obligations before completion; a focused scenario exact-replays the entire
+  phase sequence.
+- The determinism source gate rejects direct host entropy, delayed private
+  PRNGs, host clocks, native threads/`Threaded` I/O, host filesystem access,
+  native libraries, unordered map iteration, and pointer-derived identities in
+  replayable adapters. Narrow native differential boundaries require a
+  line-local category allowance with a non-empty rationale. The checked
+  manifest must cover every exported Antfly VOPR source and explicitly audits
+  the two replay regions in the mixed legacy metadata harness. Runtime evidence
+  reports immediate structured choices and deterministic `std.Io` entropy
+  calls separately.
 - Default report health defines no progress/deadlock, task and descriptor leaks,
   allocator/storage exhaustion, cleanup, replay divergence, and harness errors.
   Campaign aggregates always populate progress, replay, and harness status;
@@ -1199,7 +1224,7 @@ integrated rows above.
 | --- | --- | --- |
 | P0 integrated | Generation publication and cleanup | `generation-lifecycle-vopr-test` drives the production transition manager with one borrowed `std.Io` through clean publication, prepared rollback, rename retry, uncertain directory sync and reconciliation, prepared crash recovery, shared-reader/exclusive-publisher locking, canonical aliases, and stale-generation cleanup. Restore and HA materialization now propagate the same I/O through transition locks and publication cleanup. |
 | P0 integrated | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test` drives the production scanner and cache on borrowed filesystem and monotonic-clock capabilities through absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, disappearance/rescan, and read-fault/restart histories. Metadata service and HTTP rounds use their backend runtime I/O for scans and rechecks. |
-| P0 next | Configuration, secrets, remote content, and extensions | Start from cold configuration through production administration paths. Exercise malformed and partial configuration, secret rotation during use, crash between secret and configuration publication, remote-content refresh and rollback, and extension/Wasm installation, replacement, activation, and failed startup. |
+| P0 integrated | Configuration, secrets, remote content, and extensions | `config-extension-lifecycle-vopr-test` exact-replays valid, malformed, and incomplete cold starts; secret rotation with retained readers; crash between durable secret and configuration publication; remote-content replacement, rejected-candidate rollback, and recovery; extension administrative install/dry-run, replacement, disable/enable, and configuration; malformed package recovery; and failed Wasm startup. The production secret store, remote-content runtime, extension lifecycle timestamping, package scanner, and Wasmtime artifact loader borrow `std.Io`; portable directory durability no longer escapes through POSIX. |
 | P1 next | Embedded, C API, and Lite lifecycle | Compose concurrent open/close, callback lifetime, cancellation, restore staging, generation activation, crash/reopen, and native-versus-`VoprIo` differential behavior across the in-process ownership boundary. |
 | P1 next | Cross-service resource pressure | Share descriptor, memory, storage, task, and admission budgets across HTTP, DB readers/writers, background jobs, Parquet cache, and provider calls. Verify bounded overload, cancellation, cleanup, progress after pressure clears, and exact replay. |
 | P1 next | Full external-lake composition | Extend the existing boundary suite through catalog discovery, manifest and schema evolution, Parquet metadata, row-group cache, and query assembly. Include stale object versions, deletion, ambiguous downloads, cache eviction, and restart. |
@@ -1244,8 +1269,8 @@ do not require an Antithesis account or hosted runtime.
 
 | Priority | Capability | Required work |
 | --- | --- | --- |
-| P0 next | Reusable command-template composer | Add Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles to `lib/vopr`. Commands must declare compatibility, exclusivity, fault policy, and quiescence requirements so small production operations can compose across domains without another monolithic scenario. |
-| P0 next | Complete entropy interception and audit | Route behavior-affecting entropy through immediate structured choices or `std.Io` entropy, reject host RNG and delayed private-PRNG seeding in replayable worlds, and audit platform clocks, native libraries, map iteration, IDs, and temporary-path generation. Treat any uncontrolled source as a capability violation rather than silently recording its result. |
+| P0 integrated | Reusable command-template composer | `lib/vopr/command.zig` implements Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles. Commands declare symmetric compatibility/deny lists, exclusion groups, fault policy, and before/after quiescence requirements. The composer tracks stable active invocation identities, enforces singleton and serial admission, snapshots quiet-suffix obligations, and exact-replays eventual/final completion. |
+| P0 integrated | Complete entropy interception and audit | `lib/vopr/determinism.zig` admits only immediate structured choices and borrowed-`std.Io` entropy as runtime evidence. `vopr-determinism-audit` fail-closes on host RNG, delayed private PRNGs, host clocks, native threads/I/O, filesystem escapes, native libraries, unordered iteration, and pointer-derived identity in replayable adapters; reviewed differential boundaries require line-local categorized rationale. Its manifest is checked against every exported VOPR source and includes both legacy metadata replay regions. |
 | P1 next | Continuous and quiescent validation phases | Standardize invariant checks during work, eventual recovery after faults stop, and final consistency and cleanup after quiescence. Automatically populate no-progress, crash, task, descriptor, allocator, storage, and cleanup health evidence from scenario/runtime adapters. |
 | P1 next | Richer retroactive logging | Add configurable field and text filters, preserve verbose structured details for custom metadata/domain drivers, and let debugger recipes recover selected before/after windows without changing canonical replay bytes. |
 | P1 next | Local run index and usage API | Index stable results across revisions by run, property, fingerprint, corpus entry, quarantine state, artifact, and budget usage. Expose deterministic JSON and CLI queries plus a static local summary; do not require a hosted service. |
@@ -1275,12 +1300,13 @@ Wait for a real product or toolchain requirement before adding:
 2. Maintain the integrated generation-lifecycle and metadata backfill-marker
    suites, including their borrowed-I/O lock, cleanup, rescan, and logical-time
    contracts as production formats evolve.
-3. Add the cold-start configuration, secrets, remote-content, and extension
-   lifecycle suite, followed by embedded/C API/Lite and cross-service pressure
-   compositions.
-4. Build the reusable command-template composer and complete entropy audit so
-   new suites expose small compatible operations, controlled concurrency, and
-   no silent host nondeterminism.
+3. Maintain the integrated cold-start configuration, secrets, remote-content,
+   and extension lifecycle suite; next add embedded/C API/Lite and
+   cross-service pressure compositions.
+4. Maintain the integrated command-template composer and determinism audit as
+   new suites add small compatible operations; every new exported replay
+   source must enter the checked manifest and remain free of silent host
+   nondeterminism.
 5. Add continuous, eventual-after-faults, and final-after-quiescence validation
    adapters to mature scenarios, including automatic task, descriptor,
    allocator, storage, crash, progress, and cleanup health evidence.

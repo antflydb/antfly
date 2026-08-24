@@ -677,6 +677,14 @@ pub const FileSystem = struct {
             self.faults.drop_next_sync = false;
             return;
         }
+        if (handle.directory) {
+            // A directory fsync is the durable namespace-publication boundary.
+            // The model currently persists the bounded virtual namespace as a
+            // unit, which is conservative and matches the existing explicit
+            // `syncNamespace` crash contract.
+            self.syncNamespace() catch return error.AccessDenied;
+            return;
+        }
         if (self.faults.torn_next_sync_limit) |limit| {
             self.faults.torn_next_sync_limit = null;
             const persisted_len = @min(limit, handle.node.data.items.len);

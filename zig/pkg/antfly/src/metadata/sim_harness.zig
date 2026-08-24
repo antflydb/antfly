@@ -62,7 +62,6 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
 const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
 const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
@@ -1776,7 +1775,7 @@ fn verifyComposedMergePublicTraffic(
 }
 
 fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenario) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) modeled distributed-data scheduling retains a native storage differential root
     defer tmp.cleanup();
 
     const initial_group_id = cfg.table_id * 10 + 1;
@@ -7443,12 +7442,12 @@ const MetadataVoprScratch = struct {
     sub_path: []u8,
 
     fn init(alloc: std.mem.Allocator) !MetadataVoprScratch {
-        const io_impl = try alloc.create(std.Io.Threaded);
+        const io_impl = try alloc.create(std.Io.Threaded); // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
         errdefer alloc.destroy(io_impl);
         io_impl.* = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         var random_bytes: [12]u8 = undefined;
-        io_impl.io().random(&random_bytes);
+        io_impl.io().random(&random_bytes); // vopr-audit: allow(host_entropy) random bytes isolate a normalized scratch path and never enter choices observations or events
         var encoded: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
         _ = std.base64.url_safe.Encoder.encode(&encoded, &random_bytes);
         const sub_path = try alloc.dupe(u8, &encoded);

@@ -133,8 +133,8 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
 
 test "HA seed backup restore VOPR retries ambiguous publication and canceled download" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = std.testing.io; // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
+    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
     defer tmp.cleanup();
     try tmp.dir.makePath(io, "source");
     try tmp.dir.writeFile(io, .{ .sub_path = "source/table.sst", .data = "durable-table-state" });

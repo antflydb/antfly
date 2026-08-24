@@ -33,37 +33,16 @@ fn logPathDebug(comptime event: []const u8, path: []const u8) void {
 
 pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
     if (path.len == 0) return;
-    if (!std.fs.path.isAbsolute(path)) {
-        try std.Io.Dir.cwd().createDirPath(io, path);
-        return;
-    }
-
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
-        try createAbsoluteDirPathPosix(path);
-        return;
-    }
-
-    var idx: usize = 1;
-    while (idx < path.len) : (idx += 1) {
-        if (path[idx] != std.fs.path.sep) continue;
-        if (idx == 1) continue;
-        try createDirAbsolutePortable(path[0..idx]);
-    }
-    try createDirAbsolutePortable(path);
+    // `Dir.createDirPath` accepts relative and absolute paths. Keeping this on
+    // the borrowed interface is essential: a VoprIo directory handle is not a
+    // kernel descriptor and must never escape into a raw POSIX mkdir path.
+    try std.Io.Dir.cwd().createDirPath(io, path);
 }
 
 pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
-    const base_name = std.fs.path.basename(path);
-    if (!std.fs.path.isAbsolute(path)) {
-        if (std.fs.path.dirname(path)) |parent_path| {
-            var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
-            defer parent.close(io);
-            return try parent.createFile(io, base_name, flags);
-        }
-        return try std.Io.Dir.cwd().createFile(io, base_name, flags);
-    }
-
-    return try createAbsoluteFilePortable(io, path, flags);
+    // `Dir.createFile` likewise accepts both path forms and dispatches through
+    // std.Io, preserving virtual filesystem identity and fault injection.
+    return try std.Io.Dir.cwd().createFile(io, path, flags);
 }
 
 pub fn syncDirPortable(io: anytype, path: []const u8) !void {
@@ -75,7 +54,7 @@ pub fn syncDirPortable(io: anytype, path: []const u8) !void {
     else
         try std.Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer dir.close(io);
-    try syncDirectoryFdPortable(dir.handle);
+    try syncDirectoryWithIo(io, dir);
 }
 
 pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
@@ -122,7 +101,18 @@ pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) !void {
         .follow_symlinks = false,
     });
     defer sync_dir.close(io);
-    try syncDirectoryFdPortable(sync_dir.handle);
+    try syncDirectoryWithIo(io, sync_dir);
+}
+
+fn syncDirectoryWithIo(io: anytype, dir: std.Io.Dir) !void {
+    // std.Io exposes sync on File rather than Dir. Directory and file handles
+    // share the same backend handle type, so this remains a normal vtable call
+    // for both Threaded and VoprIo runtimes.
+    const file = std.Io.File{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try file.sync(io);
 }
 
 pub fn syncFilePortable(io: anytype, path: []const u8) !void {

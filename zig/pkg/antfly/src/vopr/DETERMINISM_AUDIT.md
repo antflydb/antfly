@@ -27,3 +27,14 @@ Debug and ReleaseSafe each pass the dedicated 100-consecutive exact-replay
 gate. Wall-clock delay executors, real listeners, and physical filesystem
 behavior remain confined to explicitly identified integration tests; they are
 not silently admitted into the in-process metadata replay kernel.
+
+The preserved table is now backed by the executable
+`vopr-determinism-audit` gate. It checks every exported Antfly VOPR source and
+the `DistributedDataVoprScenario` and `MetadataVoprScenario` regions in the
+mixed legacy metadata harness. Direct host entropy, delayed private PRNGs,
+platform clocks, native threads or I/O, native libraries, unordered iteration,
+and pointer-derived identity fail the gate. The remaining physical-storage
+differential boundaries are line-local allowances with mandatory rationale;
+they are not permitted to contribute choices, observations, events, or stable
+IDs. Runtime evidence independently catalogs immediate structured choices and
+borrowed-`std.Io` entropy calls.

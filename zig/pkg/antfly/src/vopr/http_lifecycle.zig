@@ -302,7 +302,7 @@ test "production HTTP lifecycle observes VoprIo hard disconnect behind pipelined
 }
 
 test "production HTTP TLS termination boundary fails closed before bind" {
-    var server = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var server = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{ // vopr-audit: allow(host_filesystem) TLS fails closed during construction before host I/O starts
         .host = "127.0.0.1",
         .port = 0,
         .h1_disconnect_cancellation = .disabled,
@@ -312,7 +312,7 @@ test "production HTTP TLS termination boundary fails closed before bind" {
     defer server.deinit();
     try std.testing.expectError(error.ServerTlsUnsupported, server.bind());
 
-    var incomplete = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var incomplete = httpx.Server.initWithConfig(std.testing.allocator, std.testing.io, .{ // vopr-audit: allow(host_filesystem) TLS fails closed during construction before host I/O starts
         .host = "127.0.0.1",
         .port = 0,
         .h1_disconnect_cancellation = .disabled,

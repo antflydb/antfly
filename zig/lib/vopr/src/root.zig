@@ -16,6 +16,7 @@ pub const event_query = @import("event_query.zig");
 pub const flight_recorder = @import("flight_recorder.zig");
 pub const debugger = @import("debugger.zig");
 pub const debug_recipe = @import("debug_recipe.zig");
+pub const determinism = @import("determinism.zig");
 pub const explorer = @import("explorer.zig");
 pub const fault = @import("fault.zig");
 pub const fault_vopr_io = @import("fault_vopr_io.zig");

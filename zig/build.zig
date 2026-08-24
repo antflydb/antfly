@@ -7014,6 +7014,31 @@ pub fn build(b: *std.Build) void {
     );
     backfill_marker_discovery_vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
 
+    const config_extension_lifecycle_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"config extension lifecycle VOPR exact replays"},
+    });
+    const run_config_extension_lifecycle_vopr_tests = b.addRunArtifact(config_extension_lifecycle_vopr_tests);
+    const config_extension_lifecycle_vopr_test_step = b.step(
+        "config-extension-lifecycle-vopr-test",
+        "Run cold config, secret rotation, refresh rollback, and extension activation histories on VoprIo",
+    );
+    config_extension_lifecycle_vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
+
+    const vopr_determinism_audit_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "replayable Antfly VOPR sources pass the fail-closed determinism audit",
+            "determinism manifest covers every exported Antfly VOPR source",
+        },
+    });
+    const run_vopr_determinism_audit_tests = b.addRunArtifact(vopr_determinism_audit_tests);
+    const vopr_determinism_audit_step = b.step(
+        "vopr-determinism-audit",
+        "Reject uncontrolled entropy, clocks, host I/O, iteration, native libraries, and unstable identities in replayable VOPR adapters",
+    );
+    vopr_determinism_audit_step.dependOn(&run_vopr_determinism_audit_tests.step);
+
     const external_lake_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"external lake VOPR exact replays"},
@@ -7203,6 +7228,8 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
+    vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_vopr_determinism_audit_tests.step);
     vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
     vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);

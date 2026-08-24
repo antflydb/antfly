@@ -29,9 +29,9 @@ const Fixture = struct {
     db: db_mod.DB,
 
     fn init(allocator: std.mem.Allocator) !Fixture {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
         errdefer tmp.cleanup();
-        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
         errdefer allocator.free(root);
         const sim = try allocator.create(vopr.vopr_io.VoprIo);
         errdefer allocator.destroy(sim);
@@ -69,7 +69,7 @@ const Fixture = struct {
         // The campaign controls request scheduling, catalog atomics, and
         // admission waits. Physical index bytes remain the real-backend
         // differential boundary and therefore use the host test I/O.
-        db.core.index_manager.setIo(std.testing.io);
+        db.core.index_manager.setIo(std.testing.io); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
         return .{
             .allocator = allocator,
             .tmp = tmp,
