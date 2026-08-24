@@ -7526,6 +7526,7 @@ pub fn build(b: *std.Build) void {
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone metadata conditional drop preserves a replacement identity",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",

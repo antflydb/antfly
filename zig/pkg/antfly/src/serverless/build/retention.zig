@@ -163,6 +163,12 @@ pub const Pruner = struct {
         for (versions) |version| {
             if (version > published_head or kept_versions.contains(version)) continue;
             try maintenance_cancellation.check(cancellation);
+            // Remove per-head enrichment progress before its manifest. A
+            // worker for this obsolete head can no longer recreate the key:
+            // its compare-and-swap expects the deleted prior offset.
+            inline for (std.meta.tags(catalog_mod.EnrichmentStage)) |stage| {
+                try self.progress.deleteEnrichmentStageHeadDocOffset(namespace, stage, version);
+            }
             try self.manifests.deleteVersion(namespace, version);
             deleted_versions += 1;
         }
@@ -343,6 +349,8 @@ test "serverless retention follows publication lineage around lower orphan" {
     try putTestManifestWithLineage(&manifests, 2, 2, orphan_artifact, true, 1);
     try putTestManifestWithLineage(&manifests, 3, 3, head_artifact, true, 1);
     try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+    try std.testing.expect(try progress.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1, null, 1));
+    try std.testing.expect(try progress.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2, null, 1));
 
     var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
     var result = try pruner.pruneNamespace("docs", 2);
@@ -352,6 +360,8 @@ test "serverless retention follows publication lineage around lower orphan" {
     const versions = try manifests.listVersionsAlloc("docs");
     defer alloc.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 3 }, versions);
+    try std.testing.expectEqual(@as(?u64, 1), try progress.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1));
+    try std.testing.expectEqual(@as(?u64, null), try progress.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2));
     try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(orphan_artifact.artifact_id));
     const first = try artifacts.getAlloc(first_artifact.artifact_id);
     defer alloc.free(first);

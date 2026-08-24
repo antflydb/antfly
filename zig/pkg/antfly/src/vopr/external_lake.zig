@@ -460,8 +460,8 @@ pub const Scenario = struct {
             .progress_expected = true,
             .progress_units = world.state.progress,
             .active_tasks = resources.active_tasks,
-            .open_descriptors = resources.live_file_handles + resources.live_sockets,
-            .cleanup_complete = world.state.complete and resources.active_tasks == 0 and resources.live_file_handles == 0,
+            .open_descriptors = resources.open_file_handles + resources.open_sockets,
+            .cleanup_complete = world.state.complete and resources.active_tasks == 0 and resources.open_file_handles == 0,
         };
     }
     pub fn done(world: *World) bool {

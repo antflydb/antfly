@@ -215,6 +215,53 @@ pub const FsProgressStore = struct {
         return true;
     }
 
+    pub fn getEnrichmentStageHeadDocOffset(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+    ) !?u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.readOptionalStageHeadU64Unlocked(namespace, stage, head_version) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn compareAndSwapEnrichmentStageHeadDocOffset(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+        expected: ?u64,
+        doc_offset: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current = self.readOptionalStageHeadU64Unlocked(namespace, stage, head_version) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (current != expected) return false;
+        try self.writeStageHeadU64Unlocked(namespace, stage, head_version, doc_offset);
+        return true;
+    }
+
+    pub fn deleteEnrichmentStageHeadDocOffset(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const path = try stageHeadOffsetPathAlloc(self.alloc, self.root_dir, namespace, stage, head_version);
+        defer self.alloc.free(path);
+        try deleteFileIfExists(path);
+    }
+
     const Kind = enum {
         head,
         gc_watermark,
@@ -257,6 +304,34 @@ pub const FsProgressStore = struct {
         try writeFileAtomically(path, payload);
     }
 
+    fn readOptionalStageHeadU64Unlocked(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+    ) !u64 {
+        const path = try stageHeadOffsetPathAlloc(self.alloc, self.root_dir, namespace, stage, head_version);
+        defer self.alloc.free(path);
+        const raw = try readFileAlloc(self.alloc, path);
+        defer self.alloc.free(raw);
+        return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+    }
+
+    fn writeStageHeadU64Unlocked(
+        self: *FsProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+        value: u64,
+    ) !void {
+        const path = try stageHeadOffsetPathAlloc(self.alloc, self.root_dir, namespace, stage, head_version);
+        defer self.alloc.free(path);
+        try ensureParentDir(path);
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{value});
+        defer self.alloc.free(payload);
+        try writeFileAtomically(path, payload);
+    }
+
     const vtable: progress_store.ProgressStore.VTable = .{
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
@@ -274,6 +349,9 @@ pub const FsProgressStore = struct {
         .compare_and_swap_enrichment_stage_head_version = erasedCompareAndSwapEnrichmentStageHeadVersion,
         .get_enrichment_stage_doc_offset = erasedGetEnrichmentStageDocOffset,
         .compare_and_swap_enrichment_stage_doc_offset = erasedCompareAndSwapEnrichmentStageDocOffset,
+        .get_enrichment_stage_head_doc_offset = erasedGetEnrichmentStageHeadDocOffset,
+        .compare_and_swap_enrichment_stage_head_doc_offset = erasedCompareAndSwapEnrichmentStageHeadDocOffset,
+        .delete_enrichment_stage_head_doc_offset = erasedDeleteEnrichmentStageHeadDocOffset,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -372,6 +450,44 @@ pub const FsProgressStore = struct {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapEnrichmentStageDocOffset(namespace, @enumFromInt(stage_id), expected, doc_offset);
     }
+
+    fn erasedGetEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+    ) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+    }
+
+    fn erasedCompareAndSwapEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+        expected: ?u64,
+        doc_offset: u64,
+    ) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapEnrichmentStageHeadDocOffset(
+            namespace,
+            @enumFromInt(stage_id),
+            head_version,
+            expected,
+            doc_offset,
+        );
+    }
+
+    fn erasedDeleteEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+    ) !void {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.deleteEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+    }
 };
 
 fn threadedIo() std.Io.Threaded {
@@ -426,6 +542,23 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
     }
 }
 
+fn deleteFileIfExists(path: []const u8) !void {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.deleteFileAbsolute(io, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    } else {
+        std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+}
+
 fn pathForAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, kind: FsProgressStore.Kind) ![]u8 {
     return switch (kind) {
         .head => try headPathAlloc(alloc, root_dir, namespace),
@@ -447,6 +580,18 @@ fn stageLeaf(stage: catalog_types.EnrichmentStage) []const u8 {
 
 fn stagePathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, stage: catalog_types.EnrichmentStage, leaf: []const u8) ![]u8 {
     return try std.fs.path.join(alloc, &.{ root_dir, namespace, "ENRICHMENT", stageLeaf(stage), leaf });
+}
+
+fn stageHeadOffsetPathAlloc(
+    alloc: Allocator,
+    root_dir: []const u8,
+    namespace: []const u8,
+    stage: catalog_types.EnrichmentStage,
+    head_version: u64,
+) ![]u8 {
+    const head_leaf = try std.fmt.allocPrint(alloc, "{d}", .{head_version});
+    defer alloc.free(head_leaf);
+    return try std.fs.path.join(alloc, &.{ root_dir, namespace, "ENRICHMENT", stageLeaf(stage), "DOC_OFFSETS", head_leaf });
 }
 
 fn headPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8) ![]u8 {
@@ -511,6 +656,33 @@ test "fs progress store manages head and gc watermark with CAS" {
     try std.testing.expectEqual(@as(?u64, 7), try fs.getEnrichmentStageHeadVersion("docs", .chunk_embeddings));
     try std.testing.expect(try fs.compareAndSwapEnrichmentStageDocOffset("docs", .chunk_embeddings, null, 99));
     try std.testing.expectEqual(@as(?u64, 99), try fs.getEnrichmentStageDocOffset("docs", .chunk_embeddings));
+    try std.testing.expect(try fs.compareAndSwapEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 7, null, 5));
+    try std.testing.expectEqual(@as(?u64, 5), try fs.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 7));
+    try std.testing.expectEqual(@as(?u64, null), try fs.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 8));
+}
+
+test "serverless enrichment progress isolates overlapping published head offsets" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "enrichment-head-offsets");
+    defer cleanupTmp(path);
+
+    var fs = try FsProgressStore.init(std.testing.allocator, std.mem.span(path));
+    // Seed the legacy layout to prove migration preserves current progress.
+    try std.testing.expect(try fs.compareAndSwapEnrichmentStageDocOffset("docs", .lexical_sparse, null, 4));
+    var store = fs.progressStore();
+    defer store.deinit();
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .lexical_sparse, null, 1));
+    try std.testing.expectEqual(@as(?u64, 4), try store.getEnrichmentStageDocOffset("docs", .lexical_sparse));
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageDocOffset("docs", .lexical_sparse, 4, 5));
+
+    // Initialize the future head before publication. An old worker may still
+    // advance head 1 after the head CAS, but it cannot alter head 2's offset.
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 2, null, 0));
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .lexical_sparse, 1, 2));
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1, 5, 6));
+    try std.testing.expectEqual(@as(?u64, 0), try store.getEnrichmentStageDocOffset("docs", .lexical_sparse));
+    try store.deleteEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1);
+    try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .lexical_sparse, 1));
 }
 
 test "fs progress store allows exactly one concurrent head CAS winner" {
