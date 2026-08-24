@@ -3961,7 +3961,9 @@ export interface components {
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for Pebble KV write
          *     - "full_text": Wait for full-text index WAL write
-         *     - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
+         *     - "enrichments": Wait for synchronous enrichment generation after the document commit.
+         *       A terminal producer failure retains the committed document and returns
+         *       `committed_repair_required`.
          *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
          * @default propose
          * @enum {string}

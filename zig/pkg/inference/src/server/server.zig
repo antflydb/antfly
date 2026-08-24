@@ -4403,9 +4403,17 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
         defer allocator.free(model_path);
-        // REBEL still uses the encoder-decoder HTTP response adapter. Keep the
-        // direct contract explicit instead of returning a partial response.
-        if (rebel_mod.isRebelModel(allocator, model_path)) return error.UnsupportedDirectExtractionModel;
+        if (rebel_mod.isRebelModel(allocator, model_path)) {
+            var failure_stage: RebelExtractionFailureStage = .model_layout;
+            return self.extractRebelJsonAlloc(
+                allocator,
+                model_path,
+                request,
+                texts,
+                want_relations,
+                &failure_stage,
+            );
+        }
 
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
@@ -9030,109 +9038,143 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        var failure_stage: RebelExtractionFailureStage = .model_layout;
+        const json = self.extractRebelJsonAlloc(
+            ctx.allocator,
+            model_path,
+            body,
+            texts,
+            want_relations,
+            &failure_stage,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return switch (failure_stage) {
+                .model_layout => ctx.status(400).json(.{
+                    .@"error" = "INVALID_MODEL",
+                    .message = "model is not a supported encoder-decoder recognizer",
+                }),
+                .tokenizer => ctx.status(500).json(.{
+                    .@"error" = "TOKENIZER_LOAD_FAILED",
+                    .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err),
+                }),
+                .model_load => modelLoadFailureResponse(ctx, err),
+                .inference => inferenceFailureResponse(ctx, err),
+                .response => switch (err) {
+                    error.InvalidExtractionResponse => ctx.status(500).json(.{
+                        .@"error" = "INVALID_EXTRACTION_RESULT",
+                        .message = "model returned an invalid entity or relation response",
+                    }),
+                    else => return err,
+                },
+            };
+        };
+        defer ctx.allocator.free(json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json);
+        return ctx.response.build();
+    }
+
+    const RebelExtractionFailureStage = enum {
+        model_layout,
+        tokenizer,
+        model_load,
+        inference,
+        response,
+    };
+
+    fn extractRebelJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        request: EntityExtractionRequest,
+        texts: []const []const u8,
+        want_relations: bool,
+        failure_stage: *RebelExtractionFailureStage,
+    ) ![]u8 {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const hf_tokenizer = @import("inference_hf_tokenizer");
 
-        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
-            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model is not a supported encoder-decoder recognizer" });
-        defer ctx.allocator.free(paths.encoder);
-        defer ctx.allocator.free(paths.decoder);
+        failure_stage.* = .model_layout;
+        const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
+        defer allocator.free(paths.encoder);
+        defer allocator.free(paths.decoder);
 
-        const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_path);
+        failure_stage.* = .tokenizer;
+        const tokenizer_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
+        defer allocator.free(tokenizer_path);
+        const tokenizer_bytes = try c_file.readFile(allocator, tokenizer_path);
+        defer allocator.free(tokenizer_bytes);
+        var tokenizer = try hf_tokenizer_mod.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+        defer tokenizer.deinitSelf();
 
-        const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_bytes);
+        failure_stage.* = .model_load;
+        var config = try rebel_mod.loadConfig(allocator, model_path);
+        var config_owned = true;
+        errdefer if (config_owned) config.deinit();
+        const decoder_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        if (decoder_config.max_length > 0) config.max_length = decoder_config.max_length;
 
-        var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer hf_tok.deinitSelf();
-
-        var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-        if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
-
-        var component_loader = self.model_manager.componentLoaderForPaths(
+        var component_loader = try self.model_manager.componentLoaderForPaths(
             model_path,
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
-        ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.load(paths.encoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        );
+        var encoder_managed = try component_loader.load(paths.encoder);
         defer encoder_managed.deinit();
-        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
+        var decoder_managed = try strict_loader.load(paths.decoder);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.disownSession();
         const decoder_session = decoder_managed.disownSession();
 
         var pipeline = rebel_mod.RebelPipeline{
-            .allocator = ctx.allocator,
+            .allocator = allocator,
             .enc_dec = .{
-                .allocator = ctx.allocator,
+                .allocator = allocator,
                 .encoder = encoder_session,
                 .decoder = decoder_session,
-                .config = dec_config,
+                .config = decoder_config,
             },
-            .tokenizer = hf_tok.tokenizer(),
+            .tokenizer = tokenizer.tokenizer(),
             .config = config,
         };
+        config_owned = false;
         defer pipeline.deinit();
 
+        failure_stage.* = .inference;
         if (want_relations) {
-            const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, body.labels, relation_labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
+            const relation_labels = request.relation_labels orelse return error.InvalidRelationSchema;
+            const extracted = try pipeline.extractRelationsBatch(texts, request.labels, relation_labels);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |entity| ctx.allocator.free(entity.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
-
+                freeEntityBatches(allocator, extracted.entities);
                 for (extracted.relations) |relations| {
-                    for (relations) |*relation| relation.deinit(ctx.allocator);
-                    ctx.allocator.free(relations);
+                    for (relations) |*relation| relation.deinit(allocator);
+                    allocator.free(relations);
                 }
-                ctx.allocator.free(extracted.relations);
+                allocator.free(extracted.relations);
             }
 
-            if (body.resolver) |resolver_cfg| {
-                var resolved = try resolveExtractedOutput(ctx.allocator, extracted.entities, extracted.relations, resolver_cfg);
-                defer resolved.deinit(ctx.allocator);
-                return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+            failure_stage.* = .response;
+            if (request.resolver) |resolver_config| {
+                var resolved = try resolveExtractedOutput(allocator, extracted.entities, extracted.relations, resolver_config);
+                defer resolved.deinit(allocator);
+                return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
             }
-
-            return self.buildEntityExtractionResponse(ctx, body, extracted.entities, extracted.relations, texts);
+            return entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
         }
 
-        const all_entities = pipeline.recognizeBatch(texts) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |entity| ctx.allocator.free(entity.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
-
-        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, null, texts, all_entities);
-        defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer freeEntityBatches(allocator, all_entities);
+        failure_stage.* = .response;
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, null, texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
 
-        if (body.resolver) |resolver_cfg| {
-            var resolved = try resolveExtractedOutput(ctx.allocator, entities_for_response, null, resolver_cfg);
-            defer resolved.deinit(ctx.allocator);
-            return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+        if (request.resolver) |resolver_config| {
+            var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_config);
+            defer resolved.deinit(allocator);
+            return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
         }
-
-        return self.buildEntityExtractionResponse(ctx, body, entities_for_response, null, texts);
+        return entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
     }
 
     fn extractGliner(
@@ -11365,7 +11407,6 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.MissingStructureSchema,
         error.MixedExtractionOperations,
         error.UnsupportedClassificationExtraction,
-        error.UnsupportedDirectExtractionModel,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
         error.InvalidMaxTokens,
