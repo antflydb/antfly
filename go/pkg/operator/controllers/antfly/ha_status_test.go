@@ -4352,7 +4352,7 @@ func TestPhysicalIsolationReceiptPreservesLeaseAcquireTimePrecision(t *testing.T
 	if !persisted.LeaseTransferTime.Time.Equal(transfer) {
 		t.Fatalf(
 			"Lease acquireTime precision changed across status persistence: got %s want %s JSON=%s",
-			persisted.LeaseTransferTime.Time.Format(time.RFC3339Nano),
+			persisted.LeaseTransferTime.Format(time.RFC3339Nano),
 			transfer.Format(time.RFC3339Nano),
 			encoded,
 		)

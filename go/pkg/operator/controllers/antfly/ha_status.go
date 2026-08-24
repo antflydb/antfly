@@ -676,7 +676,7 @@ func (r *AntflyClusterReconciler) haCurrentPrimaryRuntimeWatchdogReady(
 	}
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != holder ||
 		strings.TrimSpace(cluster.Spec.HighAvailability.Runtime.NodeID) != holder ||
-		proof.ObservedAt.IsZero() || !proof.ObservedAt.Time.After(leaseRenewTime) || now.Before(proof.ObservedAt.Time) ||
+		proof.ObservedAt.IsZero() || !proof.ObservedAt.After(leaseRenewTime) || now.Before(proof.ObservedAt.Time) ||
 		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
 		proof.CapabilityVersion != 1 || !proof.Active || !authorityReady ||
 		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
