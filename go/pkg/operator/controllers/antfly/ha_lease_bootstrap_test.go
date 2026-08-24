@@ -388,6 +388,205 @@ func TestProcessIncarnationFenceBoundaryRestartsOnOldProcessRenewal(t *testing.T
 	}
 }
 
+func TestCommittedTransferBindsExactSuccessorProcessAndScope(t *testing.T) {
+	leaseTime := time.Date(2026, 8, 24, 4, 50, 31, 0, time.UTC)
+	parent := haClusterWithAutomaticKubernetesLeaseFailover()
+	parent.Spec.HighAvailability.Identity.ShardID = 10
+	parent.Spec.HighAvailability.Identity.TableID = 20
+	parent.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 711}
+	lease := haFenceLease(parent, leaseTime, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(parent.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+
+	successor := parent.DeepCopy()
+	successor.Name = "antfly-standby-a"
+	successor.UID = "cluster-standby-a-uid"
+	successor.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	successor.Spec.HighAvailability.Identity.TimelineID++
+	successor.Spec.HighAvailability.Identity.Epoch++
+	successor.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	proofTime := leaseTime.Add(time.Second)
+	successor.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
+		PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
+	}
+	pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
+	reconciler := testHAReconciler(t, lease, pod)
+	now := leaseTime.Add(2 * time.Second)
+	reconciler.Now = func() time.Time { return now }
+	monotonicNow := time.Now()
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("start committed-successor process fence boundary: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if !observed.Spec.RenewTime.Equal(lease.Spec.RenewTime) {
+		t.Fatalf("successor process renewed before the old process fence boundary: %#v", observed)
+	}
+
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("bind committed-successor process after fence boundary: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	wantProcess := successor.Status.HAStatus.PrimaryWatchdogProof.ProcessBootID
+	wantReceipt := haFencingLeaseBootstrapReceipt("standby-a", 2, wantProcess)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) ||
+		observed.Annotations[haFencingLeaseAnnotationClusterID] != "100" ||
+		observed.Annotations[haFencingLeaseAnnotationShardID] != "10" ||
+		observed.Annotations[haFencingLeaseAnnotationTableID] != "20" ||
+		observed.Annotations[haFencingLeaseAnnotationTimelineID] != "5" ||
+		observed.Annotations[haFencingLeaseAnnotationEpoch] != "7" ||
+		observed.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "standby-a" ||
+		observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "711" ||
+		observed.Annotations[haFencingLeaseAnnotationProcessBootID] != wantProcess ||
+		observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReceipt ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatalf("committed successor was not atomically rebound on its exact next scope: %#v", observed)
+	}
+
+	// A full-authority proof after the one-shot binding resumes ordinary owner
+	// renewal, advances the observed positive boundary, and closes the former
+	// controller's transfer bridge.
+	now = leaseTime.Add(13 * time.Second)
+	proof := successor.Status.HAStatus.PrimaryWatchdogProof
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 9_000
+	proof.ObservedAt = metav1.NewTime(now.Add(-time.Second))
+	successor.Status.HAStatus.PrimaryAdminReachable = true
+	successor.Status.HAStatus.PrimaryAdminLastError = ""
+	successor.Status.HAStatus.PrimaryLSN = 711
+	ready, err := reconciler.haCurrentPrimaryRuntimeWatchdogReady(
+		context.Background(), successor, "standby-a", 2, observed.Spec.RenewTime.Time, true,
+	)
+	if err != nil || !ready {
+		t.Fatalf("bound successor full-authority proof is not ready: ready=%t err=%v proof=%#v lease=%#v", ready, err, proof, observed)
+	}
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("renew exact successor with full authority: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "711" ||
+		observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationFormerHolder] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationTransferOriginUID] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationCommittedTransition] != "" {
+		t.Fatalf("full successor authority did not close the transfer bridge: %#v", observed)
+	}
+
+	// Subsequent authoritative observations can advance the positive boundary
+	// through the ordinary owner-renewal path.
+	now = leaseTime.Add(15 * time.Second)
+	proof.ObservedAt = metav1.NewTime(now.Add(-time.Second))
+	successor.Status.HAStatus.PrimaryLSN = 712
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("advance exact successor positive boundary: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" {
+		t.Fatalf("ordinary successor renewal did not advance the positive boundary: %#v", observed)
+	}
+}
+
+func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*antflyv1.AntflyCluster, *coordinationv1.Lease)
+	}{
+		{name: "skipped timeline", mutate: func(cluster *antflyv1.AntflyCluster, _ *coordinationv1.Lease) {
+			cluster.Spec.HighAvailability.Identity.TimelineID++
+		}},
+		{name: "same transfer origin", mutate: func(cluster *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+		}},
+		{name: "former holder mismatch", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "other-primary"
+		}},
+		{name: "former holder equals successor", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "standby-a"
+			lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] = "standby-a"
+		}},
+		{name: "missing parent process binding", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			delete(lease.Annotations, haFencingLeaseAnnotationProcessBootID)
+		}},
+		{name: "committed transition mismatch", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "3"
+		}},
+		{name: "topology scope mismatch", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			lease.Annotations[haFencingLeaseAnnotationTableID] = "999"
+		}},
+		{name: "missing committed transfer", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
+			delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leaseTime := time.Date(2026, 8, 24, 4, 50, 31, 0, time.UTC)
+			parent := haClusterWithAutomaticKubernetesLeaseFailover()
+			parent.Spec.HighAvailability.Identity.ShardID = 10
+			parent.Spec.HighAvailability.Identity.TableID = 20
+			parent.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 711}
+			lease := haFenceLease(parent, leaseTime, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(parent.UID)
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+			lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+
+			successor := parent.DeepCopy()
+			successor.Name = "antfly-standby-a"
+			successor.UID = "cluster-standby-a-uid"
+			successor.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+			successor.Spec.HighAvailability.Identity.TimelineID++
+			successor.Spec.HighAvailability.Identity.Epoch++
+			successor.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+			proofTime := leaseTime.Add(time.Second)
+			successor.Status.HAStatus = &antflyv1.HAStatus{
+				PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
+				PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
+			}
+			tt.mutate(successor, lease)
+			wantProcess := lease.Annotations[haFencingLeaseAnnotationProcessBootID]
+			pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
+			reconciler := testHAReconciler(t, lease, pod)
+			now := time.Now()
+			reconciler.Now = func() time.Time { return proofTime.Add(time.Second) }
+			reconciler.MonotonicNow = func() time.Time { return now }
+
+			if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+				t.Fatalf("start rejected successor boundary: %v", err)
+			}
+			now = now.Add(10 * time.Second)
+			if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+				t.Fatalf("repeat rejected successor boundary: %v", err)
+			}
+			observed := &coordinationv1.Lease{}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+				t.Fatal(err)
+			}
+			if !observed.Spec.RenewTime.Equal(lease.Spec.RenewTime) ||
+				observed.Annotations[haFencingLeaseAnnotationProcessBootID] != wantProcess {
+				t.Fatalf("non-exact successor rebound the committed Lease: %#v", observed)
+			}
+		})
+	}
+}
+
 func TestInitialPrimaryLeaseBootstrapRejectsDifferentHolderOrScope(t *testing.T) {
 	leaseTime := time.Date(2026, 7, 16, 4, 21, 14, 680204000, time.UTC)
 	tests := []struct {

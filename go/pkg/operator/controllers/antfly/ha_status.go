@@ -389,7 +389,8 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		if persistedBoundary > 0 {
 			scope.primaryLSN = persistedBoundary
 		}
-		if !haLeaseFenceScopeMatches(lease, scope) {
+		if !haLeaseFenceScopeMatches(lease, scope) &&
+			(!pendingWatchdogAuthority || !haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)) {
 			return nil
 		}
 	}
@@ -402,9 +403,11 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
+		committedSuccessor := bootstrapUnknownBoundary &&
+			haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
-			lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) ||
+			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||
 			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) == currentReceipt {
 			return nil
 		}
@@ -425,6 +428,16 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		}
 		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = currentReceipt
 		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+		if committedSuccessor {
+			// The holder transfer is committed on the parent timeline before Colony
+			// publishes the promoted CR's successor identity. Advance the durable
+			// Lease scope and bind the already fail-closed successor process in one
+			// write; publishing either half alone would let the runtime and Lease
+			// controller wait indefinitely for each other.
+			for key, value := range scope.annotations() {
+				lease.Annotations[key] = value
+			}
+		}
 		lease.Spec.RenewTime = &now
 		if err := r.Update(ctx, lease); err != nil {
 			return err
@@ -1081,6 +1094,60 @@ func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseS
 		}
 	}
 	return true
+}
+
+// haCommittedTransferSuccessorScopeMatches recognizes the one safe scope
+// mismatch that exists between a committed Lease handoff and the promoted
+// runtime's first authoritative observation. The transfer is committed on the
+// parent identity; Colony then publishes the exact next timeline/epoch on a
+// different AntflyCluster CR. Until the new process is bound, that runtime must
+// remain fail-closed and therefore cannot report an authoritative positive LSN.
+//
+// Every durable transfer dimension must agree, the identity may advance by
+// exactly one timeline and one epoch, and the positive promotion boundary may
+// not change. This deliberately rejects arbitrary identity edits, same-CR
+// renewal, skipped generations, and incomplete transfer receipts.
+func haCommittedTransferSuccessorScopeMatches(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	successor haFencingLeaseScope,
+	holder string,
+	transition int32,
+) bool {
+	if cluster == nil || cluster.UID == "" || lease == nil || lease.Annotations == nil ||
+		transition <= 1 || successor.primaryLSN == 0 || strings.TrimSpace(holder) == "" ||
+		strings.TrimSpace(holder) != strings.TrimSpace(successor.currentPrimaryID) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) == strings.TrimSpace(holder) ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) !=
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID]) ||
+		!haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == string(cluster.UID) ||
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] != strconv.FormatInt(int64(transition), 10) {
+		return false
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(holder) ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != transition {
+		return false
+	}
+
+	parse := func(key string) (uint64, bool) {
+		value, err := strconv.ParseUint(strings.TrimSpace(lease.Annotations[key]), 10, 64)
+		return value, err == nil
+	}
+	clusterID, clusterOK := parse(haFencingLeaseAnnotationClusterID)
+	shardID, shardOK := parse(haFencingLeaseAnnotationShardID)
+	tableID, tableOK := parse(haFencingLeaseAnnotationTableID)
+	parentTimelineID, timelineOK := parse(haFencingLeaseAnnotationTimelineID)
+	parentEpoch, epochOK := parse(haFencingLeaseAnnotationEpoch)
+	boundary, boundaryOK := parse(haFencingLeaseAnnotationPrimaryLSN)
+	return clusterOK && shardOK && tableOK && timelineOK && epochOK && boundaryOK &&
+		clusterID == successor.clusterID && shardID == successor.shardID && tableID == successor.tableID &&
+		successor.timelineID > 0 && parentTimelineID == successor.timelineID-1 &&
+		successor.epoch > 0 && parentEpoch == successor.epoch-1 &&
+		boundary == successor.primaryLSN
 }
 
 func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
