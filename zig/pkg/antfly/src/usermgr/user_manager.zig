@@ -1119,22 +1119,40 @@ pub const UserManager = struct {
             for (owner_row_filter) |*entry| entry.deinit(self.alloc);
             self.alloc.free(owner_row_filter);
         }
+        const effective_permissions = try self.effectiveApiKeyPermissions(key_id);
+        errdefer {
+            for (effective_permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(effective_permissions);
+        }
+
+        return .{
+            .username = try self.alloc.dupe(u8, record.key.username),
+            .permissions = effective_permissions,
+            .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
+            .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
+            .roles = try self.getRolesForUser(record.key.username),
+        };
+    }
+
+    /// Resolve the current authority of an existing API-key identity without
+    /// requiring its bearer secret. Durable background grants use this only
+    /// after admission has authenticated the secret and bound the key id into
+    /// catalog metadata. Deletion, expiry, and owner revocation all fail
+    /// closed on the next worker authorization check.
+    pub fn effectiveApiKeyPermissions(self: *const UserManager, key_id: []const u8) ![]Permission {
+        const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+        if (record.key.expires_at_ns) |expires_at_ns| {
+            if (nowNs() > expires_at_ns) return error.ApiKeyExpired;
+        }
         const owner_permissions = try self.getPermissionsForUser(record.key.username);
         defer {
             for (owner_permissions) |*permission| permission.deinit(self.alloc);
             self.alloc.free(owner_permissions);
         }
-
-        return .{
-            .username = try self.alloc.dupe(u8, record.key.username),
-            .permissions = if (record.key.permissions.len > 0)
-                try intersectPermissions(self.alloc, record.key.permissions, owner_permissions)
-            else
-                try clonePermissions(self.alloc, owner_permissions),
-            .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
-            .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
-            .roles = try self.getRolesForUser(record.key.username),
-        };
+        return if (record.key.permissions.len > 0)
+            try intersectPermissions(self.alloc, record.key.permissions, owner_permissions)
+        else
+            try clonePermissions(self.alloc, owner_permissions);
     }
 
     pub fn listApiKeys(self: *const UserManager, username: []const u8) ![]ApiKey {

@@ -5342,6 +5342,7 @@ pub fn build(b: *std.Build) void {
         "stored destination admission requires write permission on every eventual sink",
         "query builder runtime preflight injects mandatory row filter",
         "stored destination envelopes cannot be forged and validate on resume",
+        "api http client forwards bounded raft batch routing context without allocation",
     };
     const authorization_sink_tests = b.addTest(.{
         .root_module = lib_test_mod,

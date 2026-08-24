@@ -133,6 +133,9 @@ fn injectRowFilterIntoScanRequest(
 
 fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
     const authenticated = identity orelse return true;
+    if (!authenticated.is_internal_service and
+        !std.mem.startsWith(u8, authenticated.credential_principal, "basic:") and
+        !std.mem.startsWith(u8, authenticated.credential_principal, "api-key:")) return false;
     return http_server_mod.permissionsAllow(authenticated.permissions, .table, table_name, .write);
 }
 
@@ -659,6 +662,7 @@ pub const AntflyApiHandler = struct {
             .method = method,
             .target = ctx.request.uri.raw,
             .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             .content_type = ctx.header("content-type"),
             .body = body,
         })) orelse return null;
@@ -884,13 +888,16 @@ pub const AntflyApiHandler = struct {
         ctx: *httpx.Context,
         identity: *?AuthenticatedIdentity,
     ) !?httpx.Response {
-        if (self.api_server.cfg.trusted_principal_secret == null)
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null)
+            return null;
+        if (self.api_server.cfg.trusted_principal_secret == null or
+            self.api_server.cfg.trusted_principal_secret.?.len == 0)
             return try jsonErrorResponse(ctx, 403, "internal service authentication is not configured");
         const token = ctx.header(http_server_mod.trusted_principal_header) orelse
             return try unauthorizedResponse(ctx);
         identity.* = self.api_server.authenticateRequest(.{ .trusted_principal = token }) catch
             return try unauthorizedResponse(ctx);
-        if (!std.mem.startsWith(u8, identity.*.?.credential_principal, "trusted:"))
+        if (!identity.*.?.is_internal_service)
             return try jsonErrorResponse(ctx, 403, "forbidden");
         return null;
     }
@@ -911,6 +918,7 @@ pub const AntflyApiHandler = struct {
                 .kind = .user,
                 .subject = authenticated.username,
             } else null,
+            .destination_authorization_principal = http_server_mod.storedDestinationPrincipal(identity),
         };
     }
 
@@ -2281,6 +2289,11 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         const authenticated = identity.*.?;
+        if (authenticated.is_internal_service and
+            !std.mem.startsWith(u8, path, "/internal/v1/"))
+        {
+            return try jsonErrorResponse(ctx, 403, "internal service credential is not valid on public routes");
+        }
 
         if (http_server_mod.requiresAdminPermission(path) and !http_server_mod.permissionsAllow(authenticated.permissions, .@"*", "*", .admin)) {
             return try jsonErrorResponse(ctx, 403, "forbidden");
@@ -4036,15 +4049,18 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid graph resolver destination configuration");
         });
         if (!destinations_allowed) return jsonErrorResponse(ctx, 403, "forbidden");
-        const sealed_replication_sources_json = try stored_destination_authorization.sealReplicationSourcesJsonAlloc(
+        const destination_principal = http_server_mod.storedDestinationPrincipal(authenticated_identity);
+        const sealed_replication_sources_json = try stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
             alloc,
             create_req.replication_sources_json orelse "[]",
+            destination_principal,
         );
         if (create_req.replication_sources_json) |old| alloc.free(old);
         create_req.replication_sources_json = sealed_replication_sources_json;
-        const sealed_indexes_json = try stored_destination_authorization.sealIndexesJsonAlloc(
+        const sealed_indexes_json = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
+            destination_principal,
         );
         if (create_req.indexes_json) |old| alloc.free(old);
         create_req.indexes_json = sealed_indexes_json;
@@ -7976,6 +7992,7 @@ test "stored destination admission requires write permission on every eventual s
     defer decoy_permission[0].deinit(alloc);
     const decoy_identity = AuthenticatedIdentity{
         .username = @constCast("attacker"),
+        .credential_principal = @constCast("basic:attacker"),
         .permissions = &decoy_permission,
     };
 
@@ -7999,6 +8016,7 @@ test "stored destination admission requires write permission on every eventual s
     defer sink_permission[0].deinit(alloc);
     const sink_identity = AuthenticatedIdentity{
         .username = @constCast("operator"),
+        .credential_principal = @constCast("basic:operator"),
         .permissions = &sink_permission,
     };
     try std.testing.expect(try replicationDestinationsAllowed(alloc, sink_identity, cdc_config));

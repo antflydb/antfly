@@ -13,8 +13,56 @@
 //! grant by including it in its request.
 
 const std = @import("std");
+const usermgr = @import("../usermgr/mod.zig");
 
 pub const grant_field = "_antfly_destination_authorization_v1";
+pub const catalog_service_principal = "service:catalog";
+pub const auth_disabled_principal = "service:auth-disabled";
+
+pub const Authorizer = struct {
+    manager: ?*const usermgr.UserManager = null,
+    auth_enabled: bool = false,
+
+    pub fn authorize(self: Authorizer, principal: []const u8, destinations: []const []const u8) !void {
+        if (std.mem.eql(u8, principal, catalog_service_principal)) return;
+        if (std.mem.eql(u8, principal, auth_disabled_principal)) {
+            if (!self.auth_enabled) return;
+            return error.StoredDestinationAuthorizationRevoked;
+        }
+        const manager = self.manager orelse return error.StoredDestinationAuthorizationRevoked;
+        const permissions = if (std.mem.startsWith(u8, principal, "basic:"))
+            manager.getPermissionsForUser(principal["basic:".len..]) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.StoredDestinationAuthorizationRevoked,
+            }
+        else if (std.mem.startsWith(u8, principal, "api-key:"))
+            manager.effectiveApiKeyPermissions(principal["api-key:".len..]) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.StoredDestinationAuthorizationRevoked,
+            }
+        else
+            return error.StoredDestinationAuthorizationRevoked;
+        defer {
+            for (permissions) |*permission| permission.deinit(manager.alloc);
+            manager.alloc.free(permissions);
+        }
+        for (destinations) |destination| {
+            if (!permissionsAllowWrite(permissions, destination))
+                return error.StoredDestinationAuthorizationRevoked;
+        }
+    }
+};
+
+fn permissionsAllowWrite(permissions: []const usermgr.Permission, table_name: []const u8) bool {
+    for (permissions) |permission| {
+        const type_match = permission.resource_type == .@"*" or permission.resource_type == .table;
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or
+            std.mem.eql(u8, permission.resource, table_name);
+        if (type_match and resource_match and (permission.type == .write or permission.type == .admin))
+            return true;
+    }
+    return false;
+}
 
 pub fn destinationConfigFingerprintAlloc(
     alloc: std.mem.Allocator,
@@ -56,6 +104,15 @@ pub fn destinationConfigFingerprintMatches(
 }
 
 pub fn sealReplicationSourcesJsonAlloc(alloc: std.mem.Allocator, json: []const u8) ![]u8 {
+    return try sealReplicationSourcesJsonForPrincipalAlloc(alloc, json, catalog_service_principal);
+}
+
+pub fn sealReplicationSourcesJsonForPrincipalAlloc(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    principal: []const u8,
+) ![]u8 {
+    if (principal.len == 0) return error.InvalidStoredDestinationConfig;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return error.InvalidStoredDestinationConfig;
@@ -69,49 +126,96 @@ pub fn sealReplicationSourcesJsonAlloc(alloc: std.mem.Allocator, json: []const u
         var destinations = std.ArrayListUnmanaged([]const u8).empty;
         defer destinations.deinit(alloc);
         try collectRouteDestinations(alloc, source, &destinations);
-        try appendSealedObject(alloc, &out, source.object, destinations.items);
+        try appendSealedObject(alloc, &out, source.object, destinations.items, principal);
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn sealIndexesJsonAlloc(alloc: std.mem.Allocator, json: []const u8) ![]u8 {
+    return try sealIndexesJsonForPrincipalAlloc(alloc, json, catalog_service_principal);
+}
+
+pub fn sealIndexesJsonForPrincipalAlloc(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    principal: []const u8,
+) ![]u8 {
+    if (principal.len == 0) return error.InvalidStoredDestinationConfig;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidStoredDestinationConfig;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendValueSealingResolvers(alloc, &out, parsed.value);
+    try appendValueSealingResolvers(alloc, &out, parsed.value, principal);
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn sealIndexJsonAlloc(alloc: std.mem.Allocator, json: []const u8) ![]u8 {
+    return try sealIndexJsonForPrincipalAlloc(alloc, json, catalog_service_principal);
+}
+
+pub fn sealIndexJsonForPrincipalAlloc(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    principal: []const u8,
+) ![]u8 {
+    if (principal.len == 0) return error.InvalidStoredDestinationConfig;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidStoredDestinationConfig;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendValueSealingResolvers(alloc, &out, parsed.value);
+    try appendValueSealingResolvers(alloc, &out, parsed.value, principal);
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn validateReplicationSourceValue(alloc: std.mem.Allocator, source: std.json.Value) !void {
+    return try authorizeReplicationSourceValue(alloc, source, null);
+}
+
+pub fn authorizeReplicationSourcesJson(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    authorizer: ?Authorizer,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidStoredDestinationConfig;
+    for (parsed.value.array.items) |source|
+        try authorizeReplicationSourceValue(alloc, source, authorizer);
+}
+
+pub fn authorizeReplicationSourceValue(
+    alloc: std.mem.Allocator,
+    source: std.json.Value,
+    authorizer: ?Authorizer,
+) !void {
     if (source != .object) return error.InvalidStoredDestinationConfig;
     var destinations = std.ArrayListUnmanaged([]const u8).empty;
     defer destinations.deinit(alloc);
     try collectRouteDestinations(alloc, source, &destinations);
-    try validateGrant(source.object, destinations.items);
+    const principal = try validateGrant(source.object, destinations.items);
+    if (authorizer) |live| try live.authorize(principal, destinations.items);
 }
 
 pub fn validateIndexesJson(alloc: std.mem.Allocator, json: []const u8) !void {
+    return try authorizeIndexesJson(alloc, json, null);
+}
+
+pub fn authorizeIndexesJson(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    authorizer: ?Authorizer,
+) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidStoredDestinationConfig;
-    try validateResolverGrants(alloc, parsed.value);
+    try validateResolverGrants(alloc, parsed.value, authorizer);
 }
 
-fn validateResolverGrants(alloc: std.mem.Allocator, value: std.json.Value) !void {
+fn validateResolverGrants(alloc: std.mem.Allocator, value: std.json.Value, authorizer: ?Authorizer) !void {
     switch (value) {
         .object => |object| {
             if (object.get("resolvers")) |resolvers| {
@@ -121,31 +225,38 @@ fn validateResolverGrants(alloc: std.mem.Allocator, value: std.json.Value) !void
                     if (resolver != .object) return error.InvalidStoredDestinationConfig;
                     const table = resolver.object.get("table") orelse return error.InvalidStoredDestinationConfig;
                     if (table != .string or table.string.len == 0) return error.InvalidStoredDestinationConfig;
-                    try validateGrant(resolver.object, &.{table.string});
+                    const destinations = &.{table.string};
+                    const principal = try validateGrant(resolver.object, destinations);
+                    if (authorizer) |live| try live.authorize(principal, destinations);
                 }
             }
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
                     std.mem.eql(u8, entry.key_ptr.*, grant_field)) continue;
-                try validateResolverGrants(alloc, entry.value_ptr.*);
+                try validateResolverGrants(alloc, entry.value_ptr.*, authorizer);
             }
         },
-        .array => |array| for (array.items) |item| try validateResolverGrants(alloc, item),
+        .array => |array| for (array.items) |item| try validateResolverGrants(alloc, item, authorizer),
         else => {},
     }
 }
 
-fn validateGrant(object: std.json.ObjectMap, destinations: []const []const u8) !void {
-    if (destinations.len == 0) return;
+fn validateGrant(object: std.json.ObjectMap, destinations: []const []const u8) ![]const u8 {
+    if (destinations.len == 0) return catalog_service_principal;
     const grant = object.get(grant_field) orelse return error.StoredDestinationAuthorizationMissing;
-    if (grant != .array) return error.StoredDestinationAuthorizationInvalid;
-    if (grant.array.items.len != destinations.len) return error.StoredDestinationAuthorizationInvalid;
-    for (grant.array.items) |item| if (item != .string)
+    if (grant != .object) return error.StoredDestinationAuthorizationInvalid;
+    const principal_value = grant.object.get("principal") orelse return error.StoredDestinationAuthorizationInvalid;
+    if (principal_value != .string or principal_value.string.len == 0)
+        return error.StoredDestinationAuthorizationInvalid;
+    const granted_destinations = grant.object.get("destinations") orelse return error.StoredDestinationAuthorizationInvalid;
+    if (granted_destinations != .array or granted_destinations.array.items.len != destinations.len)
+        return error.StoredDestinationAuthorizationInvalid;
+    for (granted_destinations.array.items) |item| if (item != .string)
         return error.StoredDestinationAuthorizationInvalid;
     for (destinations) |destination| {
         var found = false;
-        for (grant.array.items) |item| {
+        for (granted_destinations.array.items) |item| {
             if (item == .string and std.mem.eql(u8, item.string, destination)) {
                 found = true;
                 break;
@@ -153,6 +264,7 @@ fn validateGrant(object: std.json.ObjectMap, destinations: []const []const u8) !
         }
         if (!found) return error.StoredDestinationAuthorizationInvalid;
     }
+    return principal_value.string;
 }
 
 fn collectRouteDestinations(
@@ -175,6 +287,7 @@ fn appendValueSealingResolvers(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     value: std.json.Value,
+    principal: []const u8,
 ) !void {
     switch (value) {
         .object => |object| {
@@ -200,11 +313,11 @@ fn appendValueSealingResolvers(
                         if (resolver != .object) return error.InvalidStoredDestinationConfig;
                         const table = resolver.object.get("table") orelse return error.InvalidStoredDestinationConfig;
                         if (table != .string or table.string.len == 0) return error.InvalidStoredDestinationConfig;
-                        try appendSealedObject(alloc, out, resolver.object, &.{table.string});
+                        try appendSealedObject(alloc, out, resolver.object, &.{table.string}, principal);
                     }
                     try out.append(alloc, ']');
                 } else {
-                    try appendValueSealingResolvers(alloc, out, entry.value_ptr.*);
+                    try appendValueSealingResolvers(alloc, out, entry.value_ptr.*, principal);
                 }
             }
             try out.append(alloc, '}');
@@ -213,7 +326,7 @@ fn appendValueSealingResolvers(
             try out.append(alloc, '[');
             for (array.items, 0..) |item, index| {
                 if (index > 0) try out.append(alloc, ',');
-                try appendValueSealingResolvers(alloc, out, item);
+                try appendValueSealingResolvers(alloc, out, item, principal);
             }
             try out.append(alloc, ']');
         },
@@ -235,6 +348,7 @@ fn appendSealedObject(
     out: *std.ArrayListUnmanaged(u8),
     object: std.json.ObjectMap,
     destinations: []const []const u8,
+    principal: []const u8,
 ) !void {
     try out.append(alloc, '{');
     var first = true;
@@ -250,12 +364,14 @@ fn appendSealedObject(
     if (destinations.len > 0) {
         if (!first) try out.append(alloc, ',');
         try appendJsonValue(alloc, out, .{ .string = grant_field });
-        try out.appendSlice(alloc, ":[");
+        try out.appendSlice(alloc, ":{\"principal\":");
+        try appendJsonValue(alloc, out, .{ .string = principal });
+        try out.appendSlice(alloc, ",\"destinations\":[");
         for (destinations, 0..) |destination, index| {
             if (index > 0) try out.append(alloc, ',');
             try appendJsonValue(alloc, out, .{ .string = destination });
         }
-        try out.append(alloc, ']');
+        try out.appendSlice(alloc, "]}");
     }
     try out.append(alloc, '}');
 }
@@ -274,6 +390,7 @@ test "stored destination envelopes cannot be forged and validate on resume" {
     const sealed = try sealReplicationSourcesJsonAlloc(alloc, raw);
     defer alloc.free(sealed);
     try std.testing.expect(std.mem.indexOf(u8, sealed, "protected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed, catalog_service_principal) != null);
     try std.testing.expect(std.mem.indexOf(u8, sealed, "decoy") == null);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sealed, .{});
     defer parsed.deinit();
@@ -297,6 +414,20 @@ test "stored destination envelopes cannot be forged and validate on resume" {
         alloc,
         "{\"graph\":{\"type\":\"graph\"},\"resolvers\":[{\"table\":\"protected\",\"_antfly_destination_authorization_v1\":[\"decoy\"]}]}",
     ));
+
+    const user_sealed = try sealReplicationSourcesJsonForPrincipalAlloc(alloc, raw, "trusted:issuer:user");
+    defer alloc.free(user_sealed);
+    try std.testing.expectError(
+        error.StoredDestinationAuthorizationRevoked,
+        authorizeReplicationSourcesJson(alloc, user_sealed, .{ .auth_enabled = true }),
+    );
+    const unauthenticated_sealed = try sealReplicationSourcesJsonForPrincipalAlloc(alloc, raw, auth_disabled_principal);
+    defer alloc.free(unauthenticated_sealed);
+    try authorizeReplicationSourcesJson(alloc, unauthenticated_sealed, .{ .auth_enabled = false });
+    try std.testing.expectError(
+        error.StoredDestinationAuthorizationRevoked,
+        authorizeReplicationSourcesJson(alloc, unauthenticated_sealed, .{ .auth_enabled = true }),
+    );
 
     const fingerprint = try destinationConfigFingerprintAlloc(alloc, raw, raw_indexes);
     defer alloc.free(fingerprint);

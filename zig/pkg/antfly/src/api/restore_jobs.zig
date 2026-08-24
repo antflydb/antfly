@@ -72,6 +72,7 @@ pub const JobState = struct {
     idempotency_explicit: bool = false,
     request_fingerprint: []const u8,
     destination_authorization_fingerprint: []const u8 = "",
+    destination_authorization_principal: []const u8 = "",
     result_json: ?[]const u8 = null,
     last_error: ?[]const u8 = null,
     created_at_ms: u64,
@@ -90,6 +91,7 @@ pub const StartRequest = struct {
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
     destination_authorization_fingerprint: []const u8 = "",
+    destination_authorization_principal: []const u8 = "",
 };
 
 pub const ListBatch = struct {
@@ -461,6 +463,7 @@ pub const Store = struct {
                         .idempotency_explicit = parsed.value.idempotency_explicit,
                         .request_fingerprint = parsed.value.request_fingerprint,
                         .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
+                        .destination_authorization_principal = parsed.value.destination_authorization_principal,
                         .last_error = "resuming_after_restart",
                         .created_at_ms = parsed.value.created_at_ms,
                         .updated_at_ms = nowMillis(),
@@ -722,6 +725,7 @@ pub const Store = struct {
                 .idempotency_explicit = parsed.value.idempotency_explicit,
                 .request_fingerprint = parsed.value.request_fingerprint,
                 .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
+                .destination_authorization_principal = parsed.value.destination_authorization_principal,
                 .last_error = "resuming_after_restart",
                 .created_at_ms = parsed.value.created_at_ms,
                 .updated_at_ms = nowMillis(),
@@ -829,6 +833,7 @@ pub const Store = struct {
             .idempotency_explicit = explicit_idempotency_key != null,
             .request_fingerprint = fingerprint,
             .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
+            .destination_authorization_principal = req.destination_authorization_principal,
             .created_at_ms = now,
             .updated_at_ms = now,
             .expires_at_ms = std.math.maxInt(i64),
@@ -1370,6 +1375,7 @@ pub const Store = struct {
             .idempotency_explicit = current.idempotency_explicit,
             .request_fingerprint = current.request_fingerprint,
             .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
+            .destination_authorization_principal = current.destination_authorization_principal,
             .result_json = update.result_json orelse current.result_json,
             .last_error = update.last_error,
             .created_at_ms = current.created_at_ms,
@@ -1633,6 +1639,7 @@ fn validateStartRequest(req: StartRequest) !void {
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
         req.idempotency_namespace.len == 0 or req.idempotency_namespace.len > 256 or
         req.destination_authorization_fingerprint.len > 64 or
+        req.destination_authorization_principal.len > 256 or
         (req.table_name != null and req.table_name.?.len > max_restore_string_bytes))
         return error.RestoreJobRecordTooLarge;
     switch (req.scope) {
@@ -1906,6 +1913,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
         .restore_mode = req.restore_mode,
         .table_names = req.table_names,
         .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
+        .destination_authorization_principal = req.destination_authorization_principal,
     }, .{});
     defer alloc.free(canonical);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;

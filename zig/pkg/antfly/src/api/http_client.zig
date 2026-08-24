@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -33,6 +34,7 @@ const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const query_response = @import("query_response.zig");
 const backup_contract = @import("backup_contract.zig");
+const internal_service_auth = @import("internal_service_auth.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
 
@@ -245,12 +247,28 @@ pub const EmptyResponse = struct {
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
+    internal_service: ?internal_service_auth.Config = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
             .alloc = alloc,
             .executor = executor,
         };
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *ApiHttpClient,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *ApiHttpClient {
+        self.internal_service = if (secret) |value|
+            if (value.len > 0) .{
+                .secret = value,
+                .issuer = issuer orelse "antfly-node",
+            } else null
+        else
+            null;
+        return self;
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding
@@ -1864,24 +1882,39 @@ pub const ApiHttpClient = struct {
 
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
-        var forwarding_headers: [3]http_common.RequestHeader = undefined;
-        const headers: []const http_common.RequestHeader = if (forwarding) |context| headers: {
-            forwarding_headers = .{
-                .{
-                    .name = internal_batch_forwarding.remaining_ms_header,
-                    .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
-                },
-                .{
-                    .name = internal_batch_forwarding.forwards_remaining_header,
-                    .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
-                },
-                .{
-                    .name = internal_batch_forwarding.campaign_allowed_header,
-                    .value = if (context.campaign_allowed) "true" else "false",
-                },
+        const service_token = if (self.internal_service) |config|
+            try internal_service_auth.tokenAlloc(
+                self.alloc,
+                config,
+                @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+            )
+        else
+            null;
+        defer if (service_token) |token| self.alloc.free(token);
+        var request_headers: [4]http_common.RequestHeader = undefined;
+        var header_count: usize = 0;
+        if (forwarding) |context| {
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.remaining_ms_header,
+                .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
             };
-            break :headers &forwarding_headers;
-        } else &.{};
+            header_count += 1;
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.forwards_remaining_header,
+                .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
+            };
+            header_count += 1;
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.campaign_allowed_header,
+                .value = if (context.campaign_allowed) "true" else "false",
+            };
+            header_count += 1;
+        }
+        if (service_token) |token| {
+            request_headers[header_count] = .{ .name = "X-Antfly-Trusted-Principal", .value = token };
+            header_count += 1;
+        }
+        const headers = request_headers[0..header_count];
 
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
         var resp = self.executor.execute(self.alloc, .{
@@ -3476,6 +3509,7 @@ test "api http client preserves group doc identity conflicts" {
 test "api http client forwards bounded raft batch routing context without allocation" {
     const ForwardingExecutor = struct {
         response_body_address: usize = 0,
+        saw_service_token: bool = false,
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{
@@ -3493,6 +3527,11 @@ test "api http client forwards bounded raft batch routing context without alloca
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
             try std.testing.expect(!forwarding.campaign_allowed);
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                self.saw_service_token = true;
+            }
             const response_body = try alloc.dupe(u8, "{}");
             self.response_body_address = @intFromPtr(response_body.ptr);
             return .{ .status = 201, .body = response_body };
@@ -3502,6 +3541,7 @@ test "api http client forwards bounded raft batch routing context without alloca
     var executor = ForwardingExecutor{};
     var cancellation = http_common.RequestCancellation{};
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    _ = client.withInternalServiceAuth("cluster-secret", "cluster-a");
     var response = try client.fetchGroupBatchWithForwarding(
         "http://127.0.0.1:1",
         7,
@@ -3512,6 +3552,7 @@ test "api http client forwards bounded raft batch routing context without alloca
         &cancellation,
     );
     try std.testing.expectEqual(executor.response_body_address, @intFromPtr(response.body.ptr));
+    try std.testing.expect(executor.saw_service_token);
     response.deinit(std.testing.allocator);
 }
 

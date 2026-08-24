@@ -74,6 +74,9 @@ pub const RequestContext = struct {
     /// Durable hash of an externally sourced table definition that was
     /// authorized before asynchronous restore admission.
     destination_authorization_fingerprint: []const u8 = "",
+    /// Credential identity that authorized durable background destinations.
+    /// Workers re-resolve this principal against the live user/key store.
+    destination_authorization_principal: []const u8 = "",
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;

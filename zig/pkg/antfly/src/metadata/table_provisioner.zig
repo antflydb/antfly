@@ -76,6 +76,7 @@ pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -237,7 +238,9 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
+        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .destination_authorizer = options.destination_authorizer,
+        });
         summary.merge(index_summary);
     }
     return summary;
@@ -260,6 +263,7 @@ pub fn reconcileDbIndexes(
 
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -290,6 +294,7 @@ pub fn reconcileDbIndexesWithOptions(
     const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,
+        .destination_authorizer = options.destination_authorizer,
     });
     const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
     const index_summary = try ensureIndexes(alloc, db, indexes_json);
@@ -1292,6 +1297,7 @@ pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: [
 
 pub const EnsureResolverOptions = struct {
     drain_backfill: bool = true,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 pub fn ensureResolversWithOptions(
@@ -1300,7 +1306,7 @@ pub fn ensureResolversWithOptions(
     indexes_json: []const u8,
     options: EnsureResolverOptions,
 ) !ResolverReconcileSummary {
-    try stored_destination_authorization.validateIndexesJson(alloc, indexes_json);
+    try stored_destination_authorization.authorizeIndexesJson(alloc, indexes_json, options.destination_authorizer);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
