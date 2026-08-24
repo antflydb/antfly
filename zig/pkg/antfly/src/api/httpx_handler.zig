@@ -2598,10 +2598,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.txn_sessions.listStatusesForPrincipal(
-            alloc,
-            if (authenticated_identity) |identity| identity.username else null,
-        );
+        const sessions = try self.api_server.listAuthorizedTransactionSessions(authenticated_identity);
         defer alloc.free(sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -2643,7 +2640,7 @@ pub const AntflyApiHandler = struct {
             alloc,
             begin_req,
             self.api_server.localSessionNodeId(),
-            if (authenticated_identity) |identity| identity.username else null,
+            http_server_mod.transactionPrincipal(authenticated_identity),
         );
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -4330,6 +4327,10 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
+        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
+        if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
+
         if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
         defer self.releasePublicOperation("scanKeys");
         const source = self.api_server.table_reads orelse {
@@ -4370,15 +4371,6 @@ pub const AntflyApiHandler = struct {
         };
         defer result.deinit(alloc);
 
-        const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
-        defer if (row_filter_json) |value| alloc.free(value);
-        if (row_filter_json) |value| {
-            const filtered = try self.api_server.filterScanResultByRowFilter(alloc, source, decoded_table_name, result.ndjson, value);
-            defer alloc.free(filtered);
-            try ctx.setHeader("content-type", "application/x-ndjson");
-            _ = ctx.response.body(filtered);
-            return ctx.response.build();
-        }
         try ctx.setHeader("content-type", "application/x-ndjson");
         _ = ctx.response.body(result.ndjson);
         return ctx.response.build();
