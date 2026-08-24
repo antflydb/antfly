@@ -16,7 +16,11 @@ maintenance services expose production-safe scheduler boundaries. Campaigns
 export unified reduction/causal/counterfactual debug recipes, bounded flight
 recordings, stable JSON/static reports, and explicit quarantine manifests; the
 virtual filesystem models persistent sector corruption and torn
-synchronization.
+synchronization. Distributed VOPR is already first-class across metadata,
+Raft, HA, transactions, and the data plane. The remaining distributed-testing
+gap is one deployment-shaped history that composes a metadata quorum, multiple
+DataServers, serverless workers, and multiple clients through all relevant
+production transports and node-local ownership domains.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -38,7 +42,11 @@ narrow interfaces, primarily `std.Io`; they never import the explorer.
 The goal is not to reproduce a general-purpose hypervisor. VOPR virtualizes the
 nondeterminism Antfly and registered in-process dependencies actually use. A
 native process or real-network run remains a differential compatibility layer,
-not a prerequisite for deterministic search.
+not a prerequisite for deterministic search. This differs deliberately from
+Antithesis's ability to run arbitrary containerized services inside a
+deterministic machine: VOPR obtains deeper application scheduling and durable-
+state visibility by requiring production code to cross explicit `std.Io` and
+ownership seams.
 
 ## Conformance Status
 
@@ -116,10 +124,36 @@ References:
 - [Deterministic simulation testing](https://antithesis.com/docs/resources/deterministic_simulation_testing/)
 - [Assertions](https://antithesis.com/docs/product/writing_tests/assertions/)
 - [Controlling faults](https://antithesis.com/docs/product/writing_tests/controlling_faults/)
+- [Fault types and node scope](https://antithesis.com/docs/product/fault_injection/fault_types/)
+- [Multi-container test templates](https://antithesis.com/docs/product/writing_tests/test_templates/first_test/)
 - [Debugging](https://antithesis.com/docs/product/debugging/)
 
 These are influences, not a claim of hypervisor equivalence or identical search
 algorithms.
+
+### Distributed-System Correspondence
+
+Antithesis treats containers or Kubernetes pods as distributed fault domains:
+separate nodes can experience asymmetric network disruption, pause, kill,
+restart, throttling, and independently placed workload commands. VOPR provides
+the corresponding deterministic application-level mechanisms—logical nodes,
+packet scheduling, directional partitions, process and node lifecycle,
+node-scoped durable state, resource budgets, and multi-actor workloads—but
+runs registered production entrypoints in one virtual `std.Io` world.
+
+| Dimension | Antithesis | VOPR status |
+| --- | --- | --- |
+| Multiple logical nodes and clients | Multiple containers or pods | Integrated in metadata, distributed-data, distributed-transaction, Raft, HA, and data-plane suites |
+| Link and packet faults | Asymmetric latency, loss, clogs, partitions, and recovery | Integrated drop, duplicate, reorder, delay, jam, outage, directional partition, and healing |
+| Node lifecycle and pressure | Pause, stop/kill, restart, and throttling | Integrated pause, crash/restart, CPU work, descriptor, socket, allocator, and storage limits |
+| Deterministic replay and branching | Deterministic hypervisor execution | Exact choice/transition/observation replay plus reduction and multiverse branching |
+| Whole unmodified deployment | Arbitrary containerized binaries and sidecars | Deliberate non-goal; only registered in-process entrypoints are deterministic |
+| One full Antfly deployment history | Can run the supplied container topology | P1 next: compose the existing production-safe seams into one full-cluster campaign |
+
+Distributed support is therefore not a missing VOPR foundation. The concrete
+gap is composition breadth and deployment fidelity inside the existing virtual
+OS. Native multi-process, container, Kubernetes, DNS, init-system, and cross-
+language behavior remains a focused differential/integration tier.
 
 ## Goals and Non-Goals
 
@@ -129,6 +163,8 @@ algorithms.
   seed.
 - Put workload, message, task, timer, storage, node, and fault interleavings
   under one scheduler.
+- Compose multiple independently owned Antfly nodes and clients in one history,
+  with node-local lifecycle, storage, resource, and transport identities.
 - Run production components unchanged on `std.Io.Threaded` or deterministic
   `VoprIo` where their capability requirements are supported.
 - Express correctness as stable named properties and distinguish product
@@ -144,6 +180,8 @@ algorithms.
 ### Non-Goals
 
 - A machine-code VM capable of running arbitrary binaries or operating systems.
+- A Docker, Kubernetes, DNS, init-system, or general multi-process clone for
+  unmodified cross-language deployments.
 - Raw heap, thread-stack, socket, or process snapshots as replay truth.
 - Silent fallback to host threads, clocks, entropy, files, sockets, or
   processes.
@@ -587,6 +625,35 @@ sockets and durable modeled files. Its focused gate also composes the real
 metadata distributed-data and per-group Raft suites.
 
 Focused gate: `data-plane-vopr-test`.
+
+### Distributed Coverage Boundary
+
+The suites above prove distributed semantics at complementary production
+boundaries; they are not merely single-node unit models. They already exercise
+multiple logical nodes, clients, stores, transports, consensus participants,
+failure domains, and recovery owners under one exact-replay scheduler.
+
+They do not yet form one deployment-shaped campaign containing all of the
+following at once:
+
+- a metadata quorum and multiple independently restartable DataServers;
+- multiple public API clients with concurrent write, read, query, and topology
+  workloads;
+- serverless build, enrichment, publication, and catalog workers;
+- node-local storage roots, process identity, lifecycle, admission, and
+  resource envelopes;
+- production HTTP and Raft transports across every cross-node boundary; and
+- cluster-wide oracles spanning acknowledged durability, quorum and fencing
+  safety, route/topology consistency, publication visibility, eventual
+  convergence, and cleanup.
+
+The next distributed milestone is to compose these existing seams into one
+`full-cluster` scenario and focused gate. It must reuse production owners and
+the current `VoprIo` network, process, storage, clock, and fault models. It must
+not introduce simulation-only business logic, bypass a production lease, or
+expand into a container/hypervisor implementation. Routed write/read, Raft,
+split/merge, and worker internals should become finer scheduler-visible
+transitions only where production exposes safe suspension points.
 
 ### Derived Workflows
 
@@ -1275,6 +1342,7 @@ ownership is released.
 | P0 integrated | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
 | P1 integrated | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, and exact replay through production orchestration. |
 | P1 integrated | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
+| P1 next | Full-cluster distributed composition | Add one `full-cluster-vopr-test` history composing a metadata quorum, multiple DataServers, serverless workers, and multiple public clients with independent node lifecycle, durable roots, resource envelopes, real HTTP/Raft transports, link faults, storage crashes, topology changes, and quiet recovery. Reuse the existing metadata, distributed-data, Raft, HA, data-plane, supervision, workflow, and `VoprIo` seams; require cluster-wide acknowledged-durability, quorum/fencing, routing, publication-visibility, convergence, and cleanup properties. This is composition breadth, not a new scheduler, network model, or hypervisor. |
 | P2 integrated | Provider boundaries | `provider-boundary-vopr-test` uses the real ManagedEmbedder and PostgreSQL Source boundaries for timeout, partial response, cancellation, retry, malformed data, SQL construction, and admission ownership. Actual models, GPU kernels, and libpq internals remain differential/integration concerns. |
 | P2 integrated | Composed query lifecycle | `composed-query-vopr-test` exact-replays vector, text, graph, and global-query completion under partial failure/retry, cancellation, resource pressure, and every result-assembly ordering through production merge and graph-union code. |
 | P1 integrated | Persistent Parquet cache | `parquet-cache-vopr-test` runs the real borrowed-I/O worker, bounded queue, duplicate-write coalescing, read/write faults, durable sync, crash, reopen, and checksum-protected reads. It is the first production consumer of the reusable fault-to-`VoprIo` adapter. |
@@ -1288,10 +1356,10 @@ targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now integrated. The complete
 serverless workflow and DB/index request-race compositions are also
 integrated, as are the P2 provider, query, media, and compatibility suites.
-Future test work is targeted
-composition, richer retained diagnostics, multi-bug search benchmarks,
-and newly exposed safe suspension points rather than missing scheduler or
-replay foundations.
+The principal new P1 composition is a full-cluster history across those
+already integrated domains. Other future test work is targeted composition and
+newly exposed safe suspension points rather than missing scheduler or replay
+foundations.
 
 ### Integrated Targeted Suites
 
@@ -1374,37 +1442,43 @@ Wait for a real product or toolchain requirement before adding:
 
 ### Ongoing Roadmap
 
-1. Maintain the integrated replication-backfill, supervisor, authentication,
+1. Implement `full-cluster-vopr-test` by composing the existing metadata,
+   distributed-data, Raft, HA, data-plane, supervision, serverless-workflow,
+   public HTTP, and `VoprIo` seams into one deployment-shaped history. Keep
+   node ownership and fault domains explicit, exact-replay every retained
+   history, and add cluster-wide durability, fencing, routing, convergence,
+   publication-visibility, and cleanup properties.
+2. Maintain the integrated replication-backfill, supervisor, authentication,
    serverless-workflow, DB/index, provider-boundary, and composed-query suites
    plus the Parquet-cache, provisioning/startup, external-lake, and
    media-runtime suites as production seams evolve.
-2. Maintain the integrated generation-lifecycle and metadata backfill-marker
+3. Maintain the integrated generation-lifecycle and metadata backfill-marker
    suites, including their borrowed-I/O lock, cleanup, rescan, and logical-time
    contracts as production formats evolve.
-3. Maintain the integrated cold-start configuration, secrets, remote-content,
+4. Maintain the integrated cold-start configuration, secrets, remote-content,
    extension, Embedded/C API/Lite lifecycle, and cross-service resource
    pressure suites.
-4. Maintain the integrated command-template composer and determinism audit as
+5. Maintain the integrated command-template composer and determinism audit as
    new suites add small compatible operations; every new exported replay
    source must enter the checked manifest and remain free of silent host
    nondeterminism.
-5. Maintain continuous, eventual-after-faults, and final-after-quiescence
+6. Maintain continuous, eventual-after-faults, and final-after-quiescence
    validation adapters as scenarios gain new resources; every mature suite
    should expose domain recovery/consistency while `VoprIo` continues to supply
    task, descriptor, and storage evidence automatically.
-6. Maintain full Iceberg/Parquet discovery-to-row materialization,
+7. Maintain full Iceberg/Parquet discovery-to-row materialization,
    media-provider cancellation/retry, and upgrade/compatibility campaigns at
    production-safe adapter and ownership boundaries; add golden versions when
    a durable format changes.
-7. Wire the integrated deterministic corpus merging, stable results, local
+8. Wire the integrated deterministic corpus merging, stable results, local
    run/usage index, and artifact retention into nightly CI policy.
-8. Maintain and grow the integrated injected-bug corpus as new search
+9. Maintain and grow the integrated injected-bug corpus as new search
    strategies land; publish recurrence, rarity, confidence, time-to-discovery,
    logical-cost, and simplest-reproduction regressions in nightly CI.
-9. Maintain direct recorder hooks and field/text filter schemas as custom
+10. Maintain direct recorder hooks and field/text filter schemas as custom
    metadata/domain events evolve; retained failures must keep verbose
    structured evidence outside replay truth.
-10. Continuously audit new production loops so they borrow `std.Io` and
+11. Continuously audit new production loops so they borrow `std.Io` and
     `VoprIo` instead of creating native-only runtime paths; add datagram, TLS,
     or compiler-guided campaigns only when the conditional prerequisites above
     become real.
@@ -1422,6 +1496,9 @@ the remaining orchestration boundaries is likely to pay off. See
   unsupported `std.Io` capability.
 - **Simulator drift:** run the same component on Threaded and VoprIo where
   possible and retain focused real-backend differential tests.
+- **False cluster fidelity:** keep logical node identity, storage roots,
+  lifecycle, resource ownership, and link direction explicit; do not label a
+  shared-owner composition full-cluster coverage.
 - **Coarse atomicity:** document atomic boundaries and add only production-safe
   suspension points.
 - **Invalid histories:** use typed preconditions, fault budgets, minimum quorum
@@ -1473,8 +1550,12 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The identified P0, P1, and non-conditional P2 orchestration, media, and
-upgrade/compatibility suites are integrated. The hard
+The previously identified P0, P1, and non-conditional P2 orchestration, media,
+and upgrade/compatibility suites are integrated. Distributed VOPR is also
+integrated across metadata, transactions, Raft, HA, and the data plane. The
+remaining P1 product-shape gap is to compose those independent domains into one
+deployment-shaped full-cluster campaign; it does not require a new scheduler,
+virtual network, replay format, or container hypervisor. The hard
 Antithesis-class local tooling is integrated; the persistent local cross-run
 index, filtered retroactive debug
 pipeline, and multi-bug search-quality regression corpus are integrated. The
