@@ -115,9 +115,20 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
 }
 
 fn requiresInternalServicePrincipal(path: []const u8) bool {
-    return std.mem.eql(u8, path, routes.internal_capabilities) or
-        std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
-        std.mem.startsWith(u8, path, routes.internal_tables_prefix);
+    const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
+        std.mem.startsWith(u8, path, internal_routes.base ++ "/");
+    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
+        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
+    return in_internal_namespace and !ha_exempt;
+}
+
+test "internal namespace requires a service principal except HA" {
+    try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
+    try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
+    try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/future-operation"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha/replication/start"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/tables/internal/v1"));
 }
 
 fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
@@ -3538,7 +3549,7 @@ pub const AntflyApiHandler = struct {
         var resp = try self.api_server.handlePublicClusterRestore(
             body_data,
             ctx.header("idempotency-key"),
-            if (authenticated_identity) |identity| identity.username else null,
+            authenticated_identity,
         );
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
@@ -4359,6 +4370,20 @@ pub const AntflyApiHandler = struct {
             decoded_table_name,
             body_data,
             ctx.header("idempotency-key"),
+            authenticated_identity,
+        );
+        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn reauthorizeTableDestinations(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse
+            return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        var resp = try self.api_server.handlePublicReauthorizeTableDestinations(
+            decoded_table_name,
             authenticated_identity,
         );
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);

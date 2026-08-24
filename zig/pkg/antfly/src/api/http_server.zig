@@ -7368,6 +7368,62 @@ pub const ApiHttpServer = struct {
         return principal;
     }
 
+    fn authorizeClusterRestoreManifestDestinations(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        principal: []const u8,
+    ) !void {
+        var manifest = try backups_api.readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            location,
+            backup_id,
+            artifact_backup_id,
+        );
+        defer manifest.deinit(alloc);
+        const fingerprint = try stored_destination_authorization.destinationConfigFingerprintAlloc(
+            alloc,
+            manifest.replication_sources_json,
+            manifest.indexes_json,
+        );
+        defer alloc.free(fingerprint);
+        const effective_principal = try restoreDestinationPrincipal(
+            alloc,
+            manifest.replication_sources_json,
+            manifest.indexes_json,
+            if (principal.len > 0) fingerprint else "",
+            principal,
+        );
+        const sealed_replication_sources = try stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
+            alloc,
+            manifest.replication_sources_json,
+            effective_principal,
+        );
+        defer alloc.free(sealed_replication_sources);
+        const sealed_indexes = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
+            alloc,
+            manifest.indexes_json,
+            effective_principal,
+        );
+        defer alloc.free(sealed_indexes);
+        const authorizer: stored_destination_authorization.Authorizer = .{
+            .manager = self.cfg.user_manager,
+            .auth_enabled = self.cfg.auth_enabled,
+        };
+        try stored_destination_authorization.authorizeReplicationSourcesJson(
+            alloc,
+            sealed_replication_sources,
+            authorizer,
+        );
+        try stored_destination_authorization.authorizeIndexesJson(
+            alloc,
+            sealed_indexes,
+            authorizer,
+        );
+    }
+
     test "legacy restore jobs resume only when backed-up definitions are sink free" {
         const alloc = std.testing.allocator;
         try std.testing.expectEqualStrings(
@@ -10926,10 +10982,22 @@ pub const ApiHttpServer = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
+        request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError!cluster_api_http.ClusterApi.RestoreExecution {
         return .{
             .status = 200,
-            .body = try executePublicClusterRestoreWithCancellation(ptr, alloc, req, location, restore_mode, null, null, &.{}, &.{}),
+            .body = try executePublicClusterRestoreWithCancellation(
+                ptr,
+                alloc,
+                req,
+                location,
+                restore_mode,
+                request.destination_authorization_principal,
+                null,
+                null,
+                &.{},
+                &.{},
+            ),
         };
     }
 
@@ -10959,6 +11027,7 @@ pub const ApiHttpServer = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
+        destination_authorization_principal: []const u8,
         cancellation: ?RestoreCancellation,
         active_table_index: ?u16,
         durability_pending_table_ranges: []const restore_jobs.TableIndexRange,
@@ -11072,6 +11141,18 @@ pub const ApiHttpServer = struct {
             // because it now exists; wait for the already-published replica
             // restore intent to drain instead.
             if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
+                self.authorizeClusterRestoreManifestDestinations(
+                    op_alloc,
+                    location,
+                    table_backup_id,
+                    artifact_backup_id,
+                    destination_authorization_principal,
+                ) catch |err| switch (err) {
+                    error.RestoreDestinationReauthorizationRequired,
+                    error.StoredDestinationAuthorizationRevoked,
+                    => return error.RestoreDestinationReauthorizationRequired,
+                    else => return error.InvalidRequest,
+                };
                 if (!self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation) catch |err| switch (err) {
                         error.NotLeader => return error.NotLeader,
@@ -11158,18 +11239,56 @@ pub const ApiHttpServer = struct {
                     }
                 };
 
-                const sealed_replication_sources_json = stored_destination_authorization.sealReplicationSourcesJsonAlloc(
+                const destination_authorization_fingerprint = stored_destination_authorization.destinationConfigFingerprintAlloc(
                     op_alloc,
                     table_manifest.replication_sources_json,
+                    table_manifest.indexes_json,
+                ) catch return error.InternalFailure;
+                defer op_alloc.free(destination_authorization_fingerprint);
+                const effective_destination_principal = restoreDestinationPrincipal(
+                    op_alloc,
+                    table_manifest.replication_sources_json,
+                    table_manifest.indexes_json,
+                    if (destination_authorization_principal.len > 0) destination_authorization_fingerprint else "",
+                    destination_authorization_principal,
+                ) catch |err| switch (err) {
+                    error.RestoreDestinationReauthorizationRequired => return error.RestoreDestinationReauthorizationRequired,
+                    else => return error.InvalidRequest,
+                };
+                const sealed_replication_sources_json = stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
+                    op_alloc,
+                    table_manifest.replication_sources_json,
+                    effective_destination_principal,
                 ) catch return error.InvalidRequest;
                 op_alloc.free(table_manifest.replication_sources_json);
                 table_manifest.replication_sources_json = sealed_replication_sources_json;
-                const sealed_indexes_json = stored_destination_authorization.sealIndexesJsonAlloc(
+                const sealed_indexes_json = stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
                     op_alloc,
                     table_manifest.indexes_json,
+                    effective_destination_principal,
                 ) catch return error.InvalidRequest;
                 op_alloc.free(table_manifest.indexes_json);
                 table_manifest.indexes_json = sealed_indexes_json;
+                const destination_authorizer: stored_destination_authorization.Authorizer = .{
+                    .manager = self.cfg.user_manager,
+                    .auth_enabled = self.cfg.auth_enabled,
+                };
+                stored_destination_authorization.authorizeReplicationSourcesJson(
+                    op_alloc,
+                    table_manifest.replication_sources_json,
+                    destination_authorizer,
+                ) catch |err| switch (err) {
+                    error.StoredDestinationAuthorizationRevoked => return error.RestoreDestinationReauthorizationRequired,
+                    else => return error.InvalidRequest,
+                };
+                stored_destination_authorization.authorizeIndexesJson(
+                    op_alloc,
+                    table_manifest.indexes_json,
+                    destination_authorizer,
+                ) catch |err| switch (err) {
+                    error.StoredDestinationAuthorizationRevoked => return error.RestoreDestinationReauthorizationRequired,
+                    else => return error.InvalidRequest,
+                };
 
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
                     alloc,
@@ -11249,10 +11368,16 @@ pub const ApiHttpServer = struct {
                 false,
                 replace_existing,
                 &verification_cache,
-                destination_authorization_fingerprint,
-                stored_destination_authorization.catalog_service_principal,
+                if (destination_authorization_principal.len > 0)
+                    destination_authorization_fingerprint
+                else
+                    "",
+                destination_authorization_principal,
             ) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                if (err == error.RestoreDestinationReauthorizationRequired or
+                    err == error.StoredDestinationAuthorizationRevoked)
+                    return error.RestoreDestinationReauthorizationRequired;
                 std.log.err("cluster restore failed phase=materialization class={s}", .{@errorName(err)});
                 statuses[i].@"error" = switch (err) {
                     error.UnsupportedOperation => "method not allowed",
@@ -12601,6 +12726,86 @@ pub const ApiHttpServer = struct {
         return try publicOperationJsonResponse(self.alloc, 202, updated);
     }
 
+    pub fn handlePublicReauthorizeTableDestinations(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const current = (self.loadOwnedTableRecord(self.alloc, table_name) catch |err| {
+            if (metadata_authority.isRetryableError(err))
+                return try contextualRetryableJsonErrorResponse(self.alloc, 503, "metadata leader unavailable");
+            return err;
+        }) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+        defer metadata_table_manager.freeTable(self.alloc, current);
+
+        const destinations_allowed = (replicationDestinationsAllowedForIdentity(
+            self.alloc,
+            authenticated_identity,
+            current.replication_sources_json,
+        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid replication destination configuration")) and
+            (graphResolverDestinationsAllowedForIdentity(
+                self.alloc,
+                authenticated_identity,
+                current.indexes_json,
+                false,
+            ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid graph resolver destination configuration"));
+        if (!destinations_allowed)
+            return try contextualJsonErrorResponse(self.alloc, 403, "forbidden");
+
+        const principal = storedDestinationPrincipal(authenticated_identity);
+        const sealed_replication_sources = stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
+            self.alloc,
+            current.replication_sources_json,
+            principal,
+        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid replication destination configuration");
+        defer self.alloc.free(sealed_replication_sources);
+        const sealed_indexes = stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
+            self.alloc,
+            current.indexes_json,
+            principal,
+        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid graph resolver destination configuration");
+        defer self.alloc.free(sealed_indexes);
+
+        if (!std.mem.eql(u8, current.replication_sources_json, sealed_replication_sources) or
+            !std.mem.eql(u8, current.indexes_json, sealed_indexes))
+        {
+            var replacement = try metadata_table_manager.cloneTable(self.alloc, current);
+            defer metadata_table_manager.freeTable(self.alloc, replacement);
+            const replacement_replication_sources = try self.alloc.dupe(u8, sealed_replication_sources);
+            self.alloc.free(replacement.replication_sources_json);
+            replacement.replication_sources_json = replacement_replication_sources;
+            const replacement_indexes = try self.alloc.dupe(u8, sealed_indexes);
+            self.alloc.free(replacement.indexes_json);
+            replacement.indexes_json = replacement_indexes;
+            self.source.replaceTableDefinition(current, replacement) catch |err| switch (err) {
+                error.TableNotFound => return try contextualJsonErrorResponse(self.alloc, 404, "not found"),
+                error.TableGenerationChanged, error.TableTransitionActive => return try contextualJsonErrorResponse(self.alloc, 409, "table definition changed; retry authorization"),
+                error.ExtensionOwnedObject, error.UnsupportedOperation => return try contextualJsonErrorResponse(self.alloc, 405, "method not allowed"),
+                else => {
+                    if (metadata_authority.isRetryableError(err))
+                        return try contextualRetryableJsonErrorResponse(self.alloc, 503, "metadata leader unavailable");
+                    return err;
+                },
+            };
+            self.waitForMetadataProjection(table_name, null, sealed_indexes) catch |err| {
+                if (metadata_authority.isRetryableError(err) or err == error.TableVisibilityTimeout)
+                    return try contextualRetryableJsonErrorResponse(self.alloc, 503, "destination authorization projection is pending");
+                return err;
+            };
+            if (self.table_writes) |writes| {
+                _ = writes.requestTableStructuralReconcile(self.alloc, table_name) catch |err| {
+                    std.log.warn("destination authorization reconcile deferred table={s} class={s}", .{ table_name, @errorName(err) });
+                };
+            }
+        }
+
+        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .table = table_name,
+            .status = "authorized",
+        }, .{});
+        return contextual_operations.json(body, false);
+    }
+
     pub fn handlePublicTableRestore(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -12676,7 +12881,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         body: []const u8,
         idempotency_key: ?[]const u8,
-        principal: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         var req = backups_api.parseClusterRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
         defer backups_api.freeClusterRestoreRequest(self.alloc, &req);
@@ -12691,7 +12896,12 @@ pub const ApiHttpServer = struct {
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         location.deinit(self.alloc);
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
-        const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(self.alloc, principal, .cluster, null);
+        const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(
+            self.alloc,
+            transactionPrincipal(authenticated_identity),
+            .cluster,
+            null,
+        );
         defer self.alloc.free(idempotency_namespace);
         const encoded = self.restore_job_store.start(self.alloc, .{
             .scope = .cluster,
@@ -12702,6 +12912,7 @@ pub const ApiHttpServer = struct {
             .table_names = req.table_names,
             .idempotency_namespace = idempotency_namespace,
             .idempotency_key = idempotency_key,
+            .destination_authorization_principal = storedDestinationPrincipal(authenticated_identity),
         }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         defer self.alloc.free(encoded);
         var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
@@ -12990,7 +13201,7 @@ pub const ApiHttpServer = struct {
                 .connection = state.connection,
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
-            }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
+            }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (err == error.BackupRepositoryBusy) {
                     const retry_delay_ns = restoreRepositoryRetryDelayNs(
                         state.job_id,
@@ -15163,6 +15374,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST, .PUT, .DELETE => null,
     };
     if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
+    if (routes.Routes.matchTableDestinationAuthorization(path)) |adoption| return try tablePermission(alloc, adoption.table_name, .admin);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
     if (routes.Routes.matchTableScan(path)) |scan| return try tablePermission(alloc, scan.table_name, .read);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
@@ -15253,6 +15465,128 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
+}
+
+test "destination authorization adoption requires source table admin" {
+    const required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .POST,
+        "/tables/source%20table/destination-authorization",
+    )).?;
+    defer required.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("source table", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    const get_required = (try requiredPermissionForRequest(
+        std.testing.allocator,
+        .GET,
+        "/tables/source/destination-authorization",
+    )).?;
+    defer get_required.deinit(std.testing.allocator);
+}
+
+test "legacy stored destinations can be adopted idempotently" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        alloc: std.mem.Allocator,
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 1,
+            .name = "source",
+            .indexes_json = "{\"graph\":{\"resolvers\":[{\"table\":\"protected\"}]}}",
+            .replication_sources_json = "[{\"type\":\"snapshot\",\"routes\":[{\"target_table\":\"protected\"}]}]",
+        },
+        owned_indexes: ?[]u8 = null,
+        owned_replication_sources: ?[]u8 = null,
+        replace_count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            if (self.owned_indexes) |value| self.alloc.free(value);
+            if (self.owned_replication_sources) |value| self.alloc.free(value);
+        }
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .replace_table_definition = replaceTableDefinition,
+                .wait_table_projection = waitTableProjection,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn replaceTableDefinition(
+            ptr: *anyopaque,
+            expected: metadata_table_manager.TableRecord,
+            replacement: metadata_table_manager.TableRecord,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!metadata_table_manager.tableDefinitionsEqual(self.table, expected))
+                return error.TableGenerationChanged;
+            const indexes = try self.alloc.dupe(u8, replacement.indexes_json);
+            errdefer self.alloc.free(indexes);
+            const replication_sources = try self.alloc.dupe(u8, replacement.replication_sources_json);
+            if (self.owned_indexes) |value| self.alloc.free(value);
+            if (self.owned_replication_sources) |value| self.alloc.free(value);
+            self.owned_indexes = indexes;
+            self.owned_replication_sources = replication_sources;
+            self.table.indexes_json = indexes;
+            self.table.replication_sources_json = replication_sources;
+            self.replace_count += 1;
+        }
+
+        fn waitTableProjection(_: *anyopaque, _: []const u8, _: ?[]const u8, _: ?[]const u8) !void {}
+    };
+
+    var source = FakeSource{ .alloc = alloc };
+    defer source.deinit();
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var first = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/source/destination-authorization",
+    });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expectEqual(@as(usize, 1), source.replace_count);
+    const authorizer: stored_destination_authorization.Authorizer = .{ .auth_enabled = false };
+    try stored_destination_authorization.authorizeReplicationSourcesJson(
+        alloc,
+        source.table.replication_sources_json,
+        authorizer,
+    );
+    try stored_destination_authorization.authorizeIndexesJson(
+        alloc,
+        source.table.indexes_json,
+        authorizer,
+    );
+
+    var second = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/source/destination-authorization",
+    });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+    try std.testing.expectEqual(@as(usize, 1), source.replace_count);
 }
 
 test "inference connection invocation requires inference write permission" {

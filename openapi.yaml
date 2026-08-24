@@ -4179,6 +4179,67 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/destination-authorization:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table whose stored destinations should be adopted
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Adopt stored write destinations with the current credential
+      description: >
+        Reauthorizes the table's existing CDC routes and graph resolver destinations
+
+        using the caller's current permissions. This idempotent operation is intended
+
+        for upgrading tables created before durable destination authorization was
+
+        introduced, and for explicitly transferring destination ownership after a
+
+        credential is rotated. The caller needs admin permission on the source table
+
+        and write permission on every eventual destination table.
+      tags:
+        - table_management
+      operationId: reauthorizeTableDestinations
+      responses:
+        '200':
+          description: Destination authorization was durably adopted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - table
+                  - status
+                properties:
+                  table:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - authorized
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Caller lacks authority on the source or a destination table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/schema:
     parameters:
       - name: tableName
