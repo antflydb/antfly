@@ -7091,7 +7091,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"external lake VOPR exact replays"},
     });
     const run_external_lake_vopr_tests = b.addRunArtifact(external_lake_vopr_tests);
-    const external_lake_vopr_test_step = b.step("external-lake-vopr-test", "Run external-lake range, cache, version, timeout, and malformed-response histories");
+    const external_lake_vopr_test_step = b.step("external-lake-vopr-test", "Run composed Iceberg discovery, Parquet query, cache, version, deletion, retry, eviction, and restart histories");
     external_lake_vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
 
     const media_runtime_vopr_tests = b.addTest(.{

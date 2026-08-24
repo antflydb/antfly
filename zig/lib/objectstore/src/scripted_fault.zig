@@ -16,7 +16,7 @@ pub const Client = struct {
     allocator: Allocator,
     backing: client_mod.Client,
     next_put: PutFault = .none,
-    next_get_error: ?anyerror = null,
+    next_get: GetFault = .none,
     hidden_bucket: ?[]u8 = null,
     hidden_key: ?[]u8 = null,
     hidden_reads_remaining: usize = 0,
@@ -33,6 +33,15 @@ pub const Client = struct {
         },
         duplicate,
         hide_after_success: usize,
+    };
+
+    pub const GetFault = union(enum) {
+        none,
+        fail_before: anyerror,
+        /// The provider completed and allocated a response, but the caller
+        /// observed only the terminal error. Reads are side-effect free, so a
+        /// retry must discard the ambiguous response and fetch it again.
+        complete_then_fail: anyerror,
     };
 
     pub fn init(allocator: Allocator, backing: client_mod.Client) Client {
@@ -69,19 +78,29 @@ pub const Client = struct {
     }
 
     pub fn failNextGet(self: *Client, err: anyerror) void {
-        self.next_get_error = err;
+        self.next_get = .{ .fail_before = err };
+    }
+
+    pub fn completeNextGetThenFail(self: *Client, err: anyerror) void {
+        self.next_get = .{ .complete_then_fail = err };
     }
 
     /// Models a client/process crash: pending call-local faults disappear,
     /// while committed backing data and provider-side visibility state remain.
     pub fn resetClientAfterCrash(self: *Client) void {
         self.next_put = .none;
-        self.next_get_error = null;
+        self.next_get = .none;
     }
 
     fn takePutFault(self: *Client) PutFault {
         const fault = self.next_put;
         self.next_put = .none;
+        return fault;
+    }
+
+    fn takeGetFault(self: *Client) GetFault {
+        const fault = self.next_get;
+        self.next_get = .none;
         return fault;
     }
 
@@ -175,12 +194,16 @@ pub const Client = struct {
     fn getObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: types.GetOptions) !types.GetResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.get_attempts +|= 1;
-        if (self.next_get_error) |err| {
-            self.next_get_error = null;
-            return err;
-        }
         if (self.consumeHiddenRead(bucket, key)) return error.FileNotFound;
-        return self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
+        return switch (self.takeGetFault()) {
+            .none => self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options),
+            .fail_before => |err| err,
+            .complete_then_fail => |err| blk: {
+                var result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
+                result.deinit(alloc);
+                break :blk err;
+            },
+        };
     }
 
     fn getObjectAttributes(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !types.ObjectAttributes {
@@ -244,4 +267,10 @@ test "scripted object store faults preserve committed state across retry and cra
     var visible = try client.getObject("bucket", "visible-later", .{});
     defer visible.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("value", visible.body);
+
+    faults.completeNextGetThenFail(error.Timeout);
+    try std.testing.expectError(error.Timeout, client.getObject("bucket", "key", .{}));
+    var retried = try client.getObject("bucket", "key", .{});
+    defer retried.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("complete", retried.body);
 }
