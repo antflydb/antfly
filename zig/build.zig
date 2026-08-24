@@ -7795,7 +7795,11 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast engine artifact reaches about 9.1 GiB
+        // on current macOS Zig 0.16 builds. Reserve the measured envelope so
+        // the scheduler can keep independent artifacts parallel without
+        // rejecting this compiler after it crosses the stale 8 GiB estimate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
     });
     unit_storage_engine_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_engine_tests = b.addRunArtifact(unit_storage_engine_tests);

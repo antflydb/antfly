@@ -600,6 +600,11 @@ const HbcSharedClockEntry = struct {
     referenced: std.atomic.Value(bool) = .init(false),
 };
 
+// Bound second-chance work performed while holding the shared-cache write
+// lock. A full CLOCK revolution is amortized O(1), but charging the complete
+// revolution to one foreground miss creates cache-size latency spikes.
+const hbc_shared_clock_max_scan_steps: usize = 64;
+
 const HbcSharedAdmission = struct {
     bytes: u64 = 0,
     reserved: bool = false,
@@ -1505,11 +1510,13 @@ pub const Cache = struct {
     fn nextVictim(clock: *std.ArrayListUnmanaged(HbcSharedClockEntry), hand: *usize, protected: HbcSharedCacheKey) ?HbcSharedCacheKey {
         if (clock.items.len == 0) return null;
         var scanned: usize = 0;
-        const limit = clock.items.len * 2;
+        const limit = @min(clock.items.len, hbc_shared_clock_max_scan_steps);
+        var fallback: ?HbcSharedCacheKey = null;
         while (scanned < limit) : (scanned += 1) {
             const slot = hand.* % clock.items.len;
             const entry = &clock.items[slot];
             if (entry.key.namespace != 0 and !(entry.key.namespace == protected.namespace and entry.key.id == protected.id)) {
+                if (fallback == null) fallback = entry.key;
                 if (!entry.referenced.swap(false, .acq_rel)) {
                     hand.* = (slot + 1) % clock.items.len;
                     return entry.key;
@@ -1517,7 +1524,10 @@ pub const Cache = struct {
             }
             hand.* = (slot + 1) % clock.items.len;
         }
-        return null;
+        // All sampled entries recently participated in useful reads. Evict
+        // the first eligible sample rather than serializing this request on a
+        // complete cache revolution; the advanced hand preserves fairness.
+        return fallback;
     }
 
     fn evictOneLocked(self: *Cache, protected: HbcSharedCacheKey) bool {
@@ -10696,6 +10706,24 @@ test "hbc shared cache keeps CLOCK slots compact across churn" {
             try std.testing.expectEqual(slot, cache.vector_slots.get(entry.key).?);
         }
     }
+}
+
+test "hbc shared cache bounds one CLOCK victim search" {
+    var clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty;
+    defer clock.deinit(std.testing.allocator);
+    for (1..101) |id| {
+        try clock.append(std.testing.allocator, .{
+            .key = .{ .namespace = 1, .id = id },
+            .referenced = .init(true),
+        });
+    }
+    var hand: usize = 0;
+
+    const victim = Cache.nextVictim(&clock, &hand, .{ .namespace = 0, .id = 0 }).?;
+    try std.testing.expectEqual(@as(u64, 1), victim.id);
+    try std.testing.expectEqual(hbc_shared_clock_max_scan_steps, hand);
+    try std.testing.expect(!clock.items[hbc_shared_clock_max_scan_steps - 1].referenced.load(.acquire));
+    try std.testing.expect(clock.items[hbc_shared_clock_max_scan_steps].referenced.load(.acquire));
 }
 
 test "hbc shared cache CLOCK refreshes recency on borrowed vector hits" {
