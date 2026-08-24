@@ -5896,6 +5896,7 @@ pub const HBCIndex = struct {
         key_views_storage: [][]const u8,
         values_storage: []?[]const u8,
         batch_scratch: []f32,
+        miss_distance_storage: []f32,
         profile: ?*SearchProfile,
     ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
@@ -5903,15 +5904,43 @@ pub const HBCIndex = struct {
         if (distances.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (metadata_storage.len < rerank_positions.len) return error.InvalidArgument;
+        if (miss_distance_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (rerank_positions.len == 0) return true;
 
-        const vector_ids = vector_id_storage[0..rerank_positions.len];
+        // Probe governed decoded residency before loading vector-to-document
+        // metadata. External storage only needs that metadata to construct an
+        // artifact key for a true vector miss; reading it for a warm decoded
+        // hit defeats the retained representation and doubles random storage
+        // work at large corpus sizes.
+        var miss_count: usize = 0;
         for (rerank_positions, 0..) |index, slot| {
-            vector_ids[slot] = ranked_items[index].vector_id;
+            const vector_id = ranked_items[index].vector_id;
             distances[slot] = std.math.inf(f32);
+            if (self.borrowCachedVector(vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const distance_start = platform_time.monotonicNs();
+                distances[slot] = vectorindex_search_runtime.exactDistanceToStoredVector(
+                    self.config,
+                    query,
+                    query_measure,
+                    handle.view(),
+                );
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.vector_cache_hits += 1;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+                continue;
+            }
+            vector_id_storage[miss_count] = vector_id;
+            miss_count += 1;
         }
+        if (miss_count == 0) return true;
 
-        const metadata = metadata_storage[0..rerank_positions.len];
+        const vector_ids = vector_id_storage[0..miss_count];
+        const metadata = metadata_storage[0..miss_count];
         const metadata_start = platform_time.monotonicNs();
         try self.getMetadataManySortedInTxnWithScratch(
             txn,
@@ -5922,6 +5951,7 @@ pub const HBCIndex = struct {
             values_storage,
         );
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
+        const miss_distances = miss_distance_storage[0..miss_count];
         loader(
             ctx,
             vector_ids,
@@ -5929,7 +5959,7 @@ pub const HBCIndex = struct {
             query,
             query_measure,
             self.config.metric,
-            distances[0..rerank_positions.len],
+            miss_distances,
             batch_scratch,
             @intCast(self.config.dims),
             .{
@@ -5941,6 +5971,18 @@ pub const HBCIndex = struct {
             error.Unsupported => return false,
             else => return err,
         };
+
+        // The bounded batch is small (at most 128 entries) and ApproxSearch
+        // results contain unique vector ids. Re-deriving each output slot here
+        // avoids another request-sized positions allocation while preserving
+        // the approximate-distance ordering used by the early-stop proof.
+        for (vector_ids, miss_distances) |vector_id, distance| {
+            for (rerank_positions, 0..) |index, slot| {
+                if (ranked_items[index].vector_id != vector_id) continue;
+                distances[slot] = distance;
+                break;
+            }
+        }
         return true;
     }
 
@@ -8270,6 +8312,92 @@ test "hbc shared vector cache warms during concurrent search" {
     try std.testing.expect(@intFromPtr(input[0..].ptr) != @intFromPtr(borrowed.view().ptr));
     try std.testing.expectEqualSlices(f32, &input, borrowed.view());
     try std.testing.expect(idx.hbcCacheStats().vector.used_bytes > 0);
+}
+
+test "hbc external rerank loads metadata only for decoded vector misses" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .max_cached_vectors = 8,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1, 0 }, "doc:cached");
+    try idx.insertWithMetadata(2, &.{ 0, 1 }, "doc:miss");
+    idx.setRetainedVectorCacheEnabled(true);
+    _ = try idx.cacheVector(1, &.{ 1, 0 });
+
+    const Loader = struct {
+        calls: usize = 0,
+        ids: [2]u64 = .{ 0, 0 },
+        count: usize = 0,
+
+        fn score(
+            context: *anyopaque,
+            vector_ids: []const u64,
+            metadata: []const ?[]const u8,
+            _: []const f32,
+            _: f32,
+            _: vec.DistanceMetric,
+            distances: []f32,
+            _: []f32,
+            _: usize,
+            _: HBCIndex.ExternalVectorBatchDistanceScratch,
+            _: ?*SearchProfile,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
+            try std.testing.expectEqual(@as(u64, 2), vector_ids[0]);
+            try std.testing.expectEqualStrings("doc:miss", metadata[0] orelse return error.TestUnexpectedResult);
+            self.ids[self.count] = vector_ids[0];
+            self.count += 1;
+            distances[0] = 7;
+        }
+    };
+    var loader = Loader{};
+    idx.setExternalVectorBatchDistanceLoader(&loader, Loader.score);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const ranked = [_]ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 0.1 },
+        .{ .vector_id = 2, .distance = 0.2 },
+    };
+    var distances: [2]f32 = undefined;
+    var vector_ids: [2]u64 = undefined;
+    var metadata: [2]?[]const u8 = undefined;
+    var lookups: [2]FixedKeyLookup = undefined;
+    var key_views: [2][]const u8 = undefined;
+    var values: [2]?[]const u8 = undefined;
+    var batch_scratch: [4]f32 = undefined;
+    var miss_distances: [2]f32 = undefined;
+    var profile: SearchProfile = .{};
+    try std.testing.expect(try idx.scoreExternalRerankVectorsSortedWithScratch(
+        &txn,
+        &ranked,
+        &.{ 0, 1 },
+        &.{ 1, 0 },
+        1,
+        &distances,
+        &vector_ids,
+        &metadata,
+        &lookups,
+        &key_views,
+        &values,
+        &batch_scratch,
+        &miss_distances,
+        &profile,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.count);
+    try std.testing.expectEqual(@as(f32, 0), distances[0]);
+    try std.testing.expectEqual(@as(f32, 7), distances[1]);
+    try std.testing.expectEqual(@as(u64, 1), profile.vector_cache_hits);
 }
 
 test "hbc shared vector publication coalesces concurrent duplicate fills" {
