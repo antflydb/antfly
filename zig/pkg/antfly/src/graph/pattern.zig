@@ -29,6 +29,8 @@ pub const max_optional_patterns: usize = 64;
 pub const max_match_predicates: usize = 64;
 pub const max_match_predicate_depth: usize = 16;
 pub const max_count_aggregates: usize = 64;
+pub const max_identifier_codepoints: usize = 128;
+pub const max_identifier_bytes: usize = max_identifier_codepoints * 4;
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
@@ -234,6 +236,12 @@ pub const WorkBudget = struct {
         self.remaining_edges -= count;
     }
 };
+
+pub fn isValidIdentifier(value: []const u8) bool {
+    if (value.len == 0 or value.len > max_identifier_bytes) return false;
+    const codepoints = std.unicode.utf8CountCodepoints(value) catch return false;
+    return codepoints >= 1 and codepoints <= max_identifier_codepoints;
+}
 
 pub const DistinctBudget = struct {
     remaining_identities: usize,
@@ -1242,8 +1250,10 @@ pub fn matchConjunctivePatternWithEdgeReader(
         for (results[0..initialized]) |*result| result.deinit(alloc);
         if (results.len > 0) alloc.free(results);
     }
+    var projection = try AliasProjection.init(alloc, opts.return_aliases);
+    defer projection.deinit(alloc);
     for (current.items[0..result_len], 0..) |state, i| {
-        results[i] = try projectConjunctiveState(alloc, state, opts.return_aliases);
+        results[i] = try projectConjunctiveState(alloc, state, &projection);
         initialized += 1;
     }
     return results;
@@ -1275,11 +1285,8 @@ fn matchConjunctivePatternLimitedWithEdgeReader(
     } else null;
     defer if (filtered_starts) |mask| alloc.free(mask);
 
-    var sink = ConjunctiveBindingSink{
-        .return_aliases = opts.return_aliases,
-        .max_results = opts.max_results,
-    };
-    errdefer sink.deinit(alloc);
+    var sink = try ConjunctiveBindingSink.init(alloc, opts.return_aliases, opts.max_results);
+    defer sink.deinit(alloc);
     const processed = try alloc.alloc(bool, pattern.edges.len);
     defer alloc.free(processed);
 
@@ -1503,6 +1510,9 @@ pub const CountAggregateResult = struct {
 
 fn validateCountAggregateSpecs(specs: []const CountAggregateSpec) !void {
     if (specs.len == 0 or specs.len > max_count_aggregates) return error.InvalidArgument;
+    for (specs) |spec| if (spec.alias) |alias| {
+        if (!isValidIdentifier(alias)) return error.InvalidArgument;
+    };
 }
 
 /// Request-scoped exact aggregate state. Callers that enumerate an anchor
@@ -1721,9 +1731,20 @@ const ConjunctiveAggregateSink = struct {
 };
 
 const ConjunctiveBindingSink = struct {
-    return_aliases: []const []const u8,
+    projection: AliasProjection,
     max_results: u32,
     matches: std.ArrayListUnmanaged(PatternMatch) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        return_aliases: []const []const u8,
+        max_results: u32,
+    ) !@This() {
+        return .{
+            .projection = try AliasProjection.init(alloc, return_aliases),
+            .max_results = max_results,
+        };
+    }
 
     fn full(self: *@This()) bool {
         return self.matches.items.len >= self.max_results;
@@ -1731,7 +1752,7 @@ const ConjunctiveBindingSink = struct {
 
     fn observe(self: *@This(), alloc: Allocator, state: ConjunctiveState) !void {
         if (self.full()) return;
-        var projected = try projectConjunctiveState(alloc, state, self.return_aliases);
+        var projected = try projectConjunctiveState(alloc, state, &self.projection);
         errdefer projected.deinit(alloc);
         try self.matches.append(alloc, projected);
     }
@@ -1745,6 +1766,7 @@ const ConjunctiveBindingSink = struct {
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.matches.items) |*match| match.deinit(alloc);
         self.matches.deinit(alloc);
+        self.projection.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1943,18 +1965,19 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     }
 
     for (pattern.nodes, 0..) |node, i| {
-        if (node.alias.len == 0) return error.InvalidArgument;
+        if (!isValidIdentifier(node.alias)) return error.InvalidArgument;
         for (pattern.nodes[0..i]) |prior| if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
     }
     if (pattern.anchor_alias) |anchor_alias| {
-        if (findMatchNode(pattern.nodes, anchor_alias) == null) return error.InvalidArgument;
+        if (!isValidIdentifier(anchor_alias) or findMatchNode(pattern.nodes, anchor_alias) == null)
+            return error.InvalidArgument;
     }
     for (pattern.edges) |edge| try validateMatchEdge(pattern.nodes, edge);
     try validateRequiredPatternConnected(pattern.nodes, pattern.edges);
     for (pattern.predicates) |predicate| try validateMatchPredicate(pattern.nodes, predicate);
     for (pattern.optional, 0..) |optional_pattern, optional_index| {
         for (optional_pattern.nodes, 0..) |node, node_index| {
-            if (node.alias.len == 0 or findMatchNode(pattern.nodes, node.alias) != null)
+            if (!isValidIdentifier(node.alias) or findMatchNode(pattern.nodes, node.alias) != null)
                 return error.InvalidArgument;
             for (optional_pattern.nodes[0..node_index]) |prior| {
                 if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
@@ -2079,7 +2102,10 @@ fn optionalAliasVisible(pattern: ConjunctivePattern, optional_index: usize, alia
 }
 
 fn validateMatchEdge(nodes: []const MatchNode, edge: MatchEdge) !void {
-    if (findMatchNode(nodes, edge.from) == null or findMatchNode(nodes, edge.to) == null) return error.InvalidArgument;
+    if (!isValidIdentifier(edge.from) or
+        !isValidIdentifier(edge.to) or
+        findMatchNode(nodes, edge.from) == null or
+        findMatchNode(nodes, edge.to) == null) return error.InvalidArgument;
     try validateEdgeHops(edge);
 }
 
@@ -2091,7 +2117,10 @@ fn validateEdgeHops(edge: MatchEdge) !void {
 
 fn validateMatchPredicate(nodes: []const MatchNode, predicate: MatchPredicate) !void {
     switch (predicate) {
-        .not_equal => |neq| if (findMatchNode(nodes, neq.left) == null or findMatchNode(nodes, neq.right) == null) return error.InvalidArgument,
+        .not_equal => |neq| if (!isValidIdentifier(neq.left) or
+            !isValidIdentifier(neq.right) or
+            findMatchNode(nodes, neq.left) == null or
+            findMatchNode(nodes, neq.right) == null) return error.InvalidArgument,
         .not_exists => |edges| for (edges) |edge| try validateMatchEdge(nodes, edge),
     }
 }
@@ -2296,14 +2325,38 @@ fn appendNullAlias(alloc: Allocator, state: *ConjunctiveState, alias: []const u8
     state.null_aliases = expanded;
 }
 
-fn projectConjunctiveState(alloc: Allocator, state: ConjunctiveState, aliases: []const []const u8) !PatternMatch {
+const AliasProjection = struct {
+    all: bool,
+    selected: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(alloc: Allocator, aliases: []const []const u8) !AliasProjection {
+        var projection = AliasProjection{ .all = aliases.len == 0 };
+        errdefer projection.deinit(alloc);
+        if (!projection.all) {
+            try projection.selected.ensureTotalCapacity(alloc, @intCast(aliases.len));
+            for (aliases) |alias| projection.selected.putAssumeCapacity(alias, {});
+        }
+        return projection;
+    }
+
+    fn contains(self: *const AliasProjection, alias: []const u8) bool {
+        return self.all or self.selected.contains(alias);
+    }
+
+    fn deinit(self: *AliasProjection, alloc: Allocator) void {
+        self.selected.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn projectConjunctiveState(alloc: Allocator, state: ConjunctiveState, projection: *const AliasProjection) !PatternMatch {
     var bindings = std.ArrayListUnmanaged(PatternBinding).empty;
     errdefer {
         for (bindings.items) |*binding| binding.deinit(alloc);
         bindings.deinit(alloc);
     }
     for (state.bindings) |binding| {
-        if (aliases.len > 0 and !containsString(aliases, binding.alias)) continue;
+        if (!projection.contains(binding.alias)) continue;
         try bindings.append(alloc, try initPatternBinding(
             alloc,
             binding.alias,
@@ -2318,7 +2371,7 @@ fn projectConjunctiveState(alloc: Allocator, state: ConjunctiveState, aliases: [
         null_aliases.deinit(alloc);
     }
     for (state.null_aliases) |alias| {
-        if (aliases.len > 0 and !containsString(aliases, alias)) continue;
+        if (!projection.contains(alias)) continue;
         try null_aliases.append(alloc, try alloc.dupe(u8, alias));
     }
     return .{
@@ -2774,6 +2827,14 @@ test "conjunctive validation rejects disconnected and unused aliases" {
         .nodes = &base_nodes,
         .edges = &.{},
         .optional = &optional,
+    }));
+
+    const oversized_alias = "a" ** (max_identifier_bytes + 1);
+    const oversized_nodes = [_]MatchNode{.{ .alias = oversized_alias }};
+    try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
+        .anchor_alias = oversized_alias,
+        .nodes = &oversized_nodes,
+        .edges = &.{},
     }));
 }
 

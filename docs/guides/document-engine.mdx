@@ -270,6 +270,10 @@ identities are read in stable snapshot-pinned pages, independently for each
 named graph operation. A request may contain at most eight named `match`
 operations. Put multiple counts over one pattern in a single `match` return
 object so they share one complete anchor scan and one set of bindings.
+Aliases and aggregate names are limited to 128 Unicode code points. A binding
+projection contains at most 64 unique aliases; omit the projection only when all
+declared aliases are required. These bounds keep admission predictable and let
+the matcher compile projection membership once per operation.
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached

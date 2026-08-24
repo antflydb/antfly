@@ -1791,6 +1791,27 @@ pub const ContentPart = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -4359,6 +4380,7 @@ pub const GraphAggregatesResult = struct {
 };
 
 pub const GraphAggregatesReturn = struct {
+    /// Aggregate names are limited to 128 Unicode code points.
     aggregates: std.json.ArrayHashMap(GraphCountAggregate),
 };
 
@@ -4879,6 +4901,7 @@ pub const GraphKeyNodeSelector = struct {
 pub const GraphMatch = struct {
     /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
     anchor: []const u8,
+    /// Aliases are limited to 128 Unicode code points.
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
@@ -4898,6 +4921,7 @@ pub const GraphMatchEdge = struct {
     max_weight: ?f64 = null,
 };
 
+/// Declared under an alias of at most 128 Unicode code points.
 pub const GraphMatchNode = struct {
     /// Non-scoring structured stored-document predicate evaluated for this alias.
     filter: ?GraphDocumentFilter = null,
@@ -5004,6 +5028,7 @@ pub const GraphNotExistsPattern = struct {
 };
 
 pub const GraphOptionalMatch = struct {
+    /// Aliases are limited to 128 Unicode code points.
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
@@ -5132,6 +5157,28 @@ pub const GraphQueryResult = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { kind: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.kind) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -6090,6 +6137,26 @@ pub const InferenceChunkContentPart = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {

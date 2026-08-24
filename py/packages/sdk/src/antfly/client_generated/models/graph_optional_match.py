@@ -23,7 +23,7 @@ class GraphOptionalMatch:
     """
     Attributes:
         edges (list[GraphMatchEdge]):
-        nodes (GraphOptionalMatchNodes | Unset):
+        nodes (GraphOptionalMatchNodes | Unset): Aliases are limited to 128 Unicode code points.
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
     """
 

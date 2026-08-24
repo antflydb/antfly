@@ -30,7 +30,8 @@ T = TypeVar("T", bound="GraphMatchNode")
 
 @_attrs_define
 class GraphMatchNode:
-    """
+    """Declared under an alias of at most 128 Unicode code points.
+
     Attributes:
         filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
             GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |

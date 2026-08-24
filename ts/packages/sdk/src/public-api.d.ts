@@ -11907,6 +11907,7 @@ export interface components {
         };
         /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers. Alias-to-alias predicates belong in GraphMatch.where. */
         GraphDocumentFilter: components["schemas"]["GraphDocumentFuzzyFilter"] | components["schemas"]["GraphDocumentTermFilter"] | components["schemas"]["GraphDocumentPrefixFilter"] | components["schemas"]["GraphDocumentRegexpFilter"] | components["schemas"]["GraphDocumentWildcardFilter"] | components["schemas"]["GraphDocumentNumericRangeFilter"] | components["schemas"]["GraphDocumentTermRangeFilter"] | components["schemas"]["GraphDocumentDateRangeFilter"] | components["schemas"]["GraphDocumentMatchAllFilter"] | components["schemas"]["GraphDocumentMatchNoneFilter"] | components["schemas"]["GraphDocumentIdsFilter"] | components["schemas"]["GraphDocumentBoolFieldFilter"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
+        /** @description Declared under an alias of at most 128 Unicode code points. */
         GraphMatchNode: {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
             filter?: components["schemas"]["GraphDocumentFilter"];
@@ -11949,6 +11950,7 @@ export interface components {
         };
         GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
         GraphOptionalMatch: {
+            /** @description Aliases are limited to 128 Unicode code points. */
             nodes?: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -11958,6 +11960,7 @@ export interface components {
         GraphMatch: {
             /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
             anchor: string;
+            /** @description Aliases are limited to 128 Unicode code points. */
             nodes: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -11987,6 +11990,7 @@ export interface components {
             distinct?: boolean;
         };
         GraphAggregatesReturn: {
+            /** @description Aggregate names are limited to 128 Unicode code points. */
             aggregates: {
                 [key: string]: components["schemas"]["GraphCountAggregate"];
             };

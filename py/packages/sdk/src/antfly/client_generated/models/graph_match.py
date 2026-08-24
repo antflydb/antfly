@@ -27,7 +27,7 @@ class GraphMatch:
             graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level
             authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id`
             order; otherwise the request fails with `graph_anchor_filter_requires_index`.
-        nodes (GraphMatchNodes):
+        nodes (GraphMatchNodes): Aliases are limited to 128 Unicode code points.
         edges (list[GraphMatchEdge]):
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
         optional (list[GraphOptionalMatch] | Unset):

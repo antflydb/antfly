@@ -1487,6 +1487,25 @@ pub const ChatCompletionRequestSystemMessageContentPart = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1537,6 +1556,25 @@ pub const ChatCompletionRequestToolMessageContentPart = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1593,6 +1631,28 @@ pub const ChatCompletionRequestUserMessageContentPart = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "input_audio")) return .{ .chat_completion_request_message_content_part_audio = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartAudio, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "file")) return .{ .chat_completion_request_message_content_part_file = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartFile, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "image_url")) return .{ .chat_completion_request_message_content_part_image = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartImage, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3143,6 +3203,25 @@ pub const CreateEvalItem = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "message")) return .{ .eval_item = try parseStructuralVariantFromSlice(EvalItem, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return .{ .eval_item = try parseStructuralVariantFromSlice(EvalItem, allocator, input, options) };
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11999,6 +12078,27 @@ pub const TextResponseFormatConfiguration = union(enum) {
             if (object.contains(key)) return true;
         }
         return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { type: ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        if (probe.type) |disc_str| {
+            if (std.mem.eql(u8, disc_str, "json_schema")) return .{ .text_response_format_json_schema = try parseStructuralVariantFromSlice(TextResponseFormatJsonSchema, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "json_object")) return .{ .response_format_json_object = try parseStructuralVariantFromSlice(ResponseFormatJsonObject, allocator, input, options) };
+            if (std.mem.eql(u8, disc_str, "text")) return .{ .response_format_text = try parseStructuralVariantFromSlice(ResponseFormatText, allocator, input, options) };
+            return error.UnexpectedToken;
+        }
+        return error.MissingField;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {

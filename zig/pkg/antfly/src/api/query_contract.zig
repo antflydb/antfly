@@ -9279,9 +9279,14 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
     };
     if (bindings_return) |return_value| {
         const items = return_value.bindings;
-        if (items.len == 0) return error.InvalidQueryRequest;
-        for (items) |alias| {
+        if (items.len == 0 or items.len > graph_pattern_mod.max_conjunctive_nodes)
+            return error.InvalidQueryRequest;
+        for (items, 0..) |alias, i| {
+            if (!graph_query_mod.isValidIdentifier(alias)) return error.InvalidQueryRequest;
             if (!graphAliasIsDeclared(nodes, optional, alias)) return error.InvalidQueryRequest;
+            for (items[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, alias)) return error.InvalidQueryRequest;
+            }
         }
     }
     if (aggregates_return) |return_value| {
@@ -9373,6 +9378,7 @@ fn parseGraphMatchNodes(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(i
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*)) return error.InvalidQueryRequest;
         const alias = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(alias);
         const filter = try parseGraphFilterValue(alloc, entry.value_ptr.filter);
@@ -9399,6 +9405,9 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         alloc.free(edges);
     }
     for (value, 0..) |edge, i| {
+        if (!graph_query_mod.isValidIdentifier(edge.from) or
+            !graph_query_mod.isValidIdentifier(edge.to))
+            return error.InvalidQueryRequest;
         const from = try alloc.dupe(u8, edge.from);
         errdefer alloc.free(from);
         const to = try alloc.dupe(u8, edge.to);
@@ -9452,6 +9461,9 @@ fn appendGraphWherePredicates(
             for (where_and.@"and") |child| try appendGraphWherePredicates(alloc, out, child, depth + 1);
         },
         .graph_where_not_equal => |where_neq| {
+            if (!graph_query_mod.isValidIdentifier(where_neq.not_equal.left.alias) or
+                !graph_query_mod.isValidIdentifier(where_neq.not_equal.right.alias))
+                return error.InvalidQueryRequest;
             const left = try alloc.dupe(u8, where_neq.not_equal.left.alias);
             errdefer alloc.free(left);
             const right = try alloc.dupe(u8, where_neq.not_equal.right.alias);
@@ -9509,6 +9521,10 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*) or
+            (!std.mem.eql(u8, entry.value_ptr.count, "*") and
+                !graph_query_mod.isValidIdentifier(entry.value_ptr.count)))
+            return error.InvalidQueryRequest;
         const name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(name);
         const of = try alloc.dupe(u8, entry.value_ptr.count);
@@ -9608,7 +9624,8 @@ fn parseGraphNodeSelector(
             try validateGraphResultRef(value.result_ref);
             if (value.binding != null and !std.mem.startsWith(u8, value.result_ref, "$graph_results."))
                 return error.InvalidQueryRequest;
-            if (value.binding) |binding| if (binding.len == 0) return error.InvalidQueryRequest;
+            if (value.binding) |binding| if (!graph_query_mod.isValidIdentifier(binding))
+                return error.InvalidQueryRequest;
             const owned_ref = try alloc.dupe(u8, value.result_ref);
             errdefer alloc.free(owned_ref);
             const owned_binding = if (value.binding) |binding| try alloc.dupe(u8, binding) else null;
@@ -13933,6 +13950,24 @@ test "api query contract preflight summarizes query lanes and result refs" {
     try std.testing.expect(summary.profile_requested);
     try std.testing.expect(summary.include_stored);
     try std.testing.expectEqual(@as(u32, 2), summary.aggregation_count);
+}
+
+test "api query contract rejects duplicate graph binding projections" {
+    const body =
+        \\{
+        \\  "graph_queries": {
+        \\    "matched": {
+        \\      "index": "graph_idx",
+        \\      "match": {"anchor":"node","nodes":{"node":{}},"edges":[]},
+        \\      "return": {"bindings":["node","node"]}
+        \\    }
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
+    );
 }
 
 test "api query contract preflight rejects count with reranker" {

@@ -41,6 +41,8 @@ pub const max_named_queries: usize = 64;
 /// one MATCH return object and share its scan.
 pub const max_match_queries_per_request: usize = 8;
 pub const max_query_name_codepoints: usize = 128;
+pub const max_identifier_codepoints: usize = pattern_mod.max_identifier_codepoints;
+pub const max_identifier_bytes: usize = pattern_mod.max_identifier_bytes;
 pub const max_edge_types: usize = 64;
 pub const max_edge_type_bytes: usize = 64 * 1024;
 
@@ -76,13 +78,19 @@ pub fn validateRequestOperationBudget(queries: anytype) !void {
 }
 
 pub fn isValidQueryName(name: []const u8) bool {
-    if (name.len == 0 or name.len > max_query_name_codepoints * 4) return false;
+    if (!isValidIdentifier(name)) return false;
     // `$...` is reserved for typed result namespaces such as
     // `$query_results` and `$graph_results.<name>`. Keeping operation names
     // out of that namespace makes resolution identical in every executor.
     if (name[0] == '$') return false;
-    const codepoints = std.unicode.utf8CountCodepoints(name) catch return false;
-    return codepoints >= 1 and codepoints <= max_query_name_codepoints;
+    return true;
+}
+
+/// Public graph identifiers are copied into execution plans and result rows.
+/// Bound both their wire size and Unicode length before any fan-out so a small
+/// pattern cannot amplify an oversized alias across intermediate bindings.
+pub fn isValidIdentifier(value: []const u8) bool {
+    return pattern_mod.isValidIdentifier(value);
 }
 
 pub fn validateEdgeTypes(edge_types: []const []const u8) !void {
@@ -114,6 +122,9 @@ test "graph public operation names and edge filters stay unambiguous and bounded
     try std.testing.expect(isValidQueryName("walk"));
     try std.testing.expect(!isValidQueryName("$query_results"));
     try std.testing.expect(!isValidQueryName("$graph_results.walk"));
+    try std.testing.expect(isValidIdentifier("author"));
+    try std.testing.expect(!isValidIdentifier(""));
+    try std.testing.expect(!isValidIdentifier("a" ** (max_identifier_bytes + 1)));
 
     try validateEdgeTypes(&.{ "cites", "related" });
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{""}));

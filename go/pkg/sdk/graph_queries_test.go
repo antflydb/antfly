@@ -10,6 +10,7 @@ package sdk
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -164,6 +165,16 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphBindingsReturn([]string{"a"}, GraphBindingsOptions{Fields: []string{"title"}}); err == nil {
 		t.Fatal("expected projection hydration error")
 	}
+	if _, err := NewGraphBindingsReturn([]string{"a", "a"}, GraphBindingsOptions{}); err == nil {
+		t.Fatal("expected duplicate binding projection error")
+	}
+	tooManyBindings := make([]string, maxGraphMatchNodes+1)
+	for i := range tooManyBindings {
+		tooManyBindings[i] = fmt.Sprintf("alias_%d", i)
+	}
+	if _, err := NewGraphBindingsReturn(tooManyBindings, GraphBindingsOptions{}); err == nil {
+		t.Fatal("expected binding projection complexity error")
+	}
 	graphReturn, err := NewGraphBindingsReturn([]string{"missing"}, GraphBindingsOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -198,6 +209,20 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		Return: validReturn,
 	}); err == nil {
 		t.Fatal("expected graph edge complexity budget error")
+	}
+	oversizedAlias := strings.Repeat("a", maxGraphIdentifierBytes+1)
+	if _, err := NewGraphBindingsReturn([]string{oversizedAlias}, GraphBindingsOptions{}); err == nil {
+		t.Fatal("expected oversized binding projection error")
+	}
+	if _, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Anchor: oversizedAlias,
+			Nodes:  map[string]GraphMatchNode{oversizedAlias: {}},
+		},
+		Return: validReturn,
+	}); err == nil {
+		t.Fatal("expected oversized graph alias error")
 	}
 }
 

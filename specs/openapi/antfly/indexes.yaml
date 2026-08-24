@@ -2514,6 +2514,7 @@ components:
         binding:
           type: string
           minLength: 1
+          maxLength: 128
           description: >-
             Binding alias to select from a prior MATCH result. Valid only with
             `$graph_results.<query-name>` when that query returns MATCH rows.
@@ -3019,6 +3020,7 @@ components:
     GraphMatchNode:
       type: object
       additionalProperties: false
+      description: Declared under an alias of at most 128 Unicode code points.
       properties:
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -3033,8 +3035,8 @@ components:
         within one expanded edge path, except when closing onto an already bound
         target alias for an explicit cycle.
       properties:
-        from: { type: string }
-        to: { type: string }
+        from: { type: string, minLength: 1, maxLength: 128 }
+        to: { type: string, minLength: 1, maxLength: 128 }
         types:
           type: array
           maxItems: 64
@@ -3059,7 +3061,7 @@ components:
       additionalProperties: false
       required: [alias]
       properties:
-        alias: { type: string }
+        alias: { type: string, minLength: 1, maxLength: 128 }
     GraphNotEqualPredicate:
       type: object
       additionalProperties: false
@@ -3116,6 +3118,7 @@ components:
           type: object
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
+          description: Aliases are limited to 128 Unicode code points.
         edges:
           type: array
           minItems: 1
@@ -3129,6 +3132,8 @@ components:
       properties:
         anchor:
           type: string
+          minLength: 1
+          maxLength: 128
           description: >-
             Alias enumerated from the query table as the source relation. Every
             other alias is reached through graph edges and may resolve to a
@@ -3141,6 +3146,7 @@ components:
           minProperties: 1
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
+          description: Aliases are limited to 128 Unicode code points.
         edges:
           type: array
           maxItems: 64
@@ -3157,6 +3163,8 @@ components:
       properties:
         count:
           type: string
+          minLength: 1
+          maxLength: 128
           description: Use `*` to count rows, or an alias to count non-null bindings.
         distinct:
           type: boolean
@@ -3173,8 +3181,9 @@ components:
         bindings:
           type: array
           minItems: 1
+          maxItems: 64
           uniqueItems: true
-          items: { type: string }
+          items: { type: string, minLength: 1, maxLength: 128 }
         limit:
           type: integer
           minimum: 1
@@ -3203,6 +3212,7 @@ components:
           minProperties: 1
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphCountAggregate' }
+          description: Aggregate names are limited to 128 Unicode code points.
     GraphReturn:
       oneOf:
         - $ref: '#/components/schemas/GraphBindingsReturn'

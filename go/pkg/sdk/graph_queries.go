@@ -11,6 +11,7 @@ package sdk
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
@@ -31,6 +32,8 @@ const (
 	maxGraphMatchPredicates     = 64
 	maxGraphMatchPredicateDepth = 16
 	maxGraphCountAggregates     = 64
+	maxGraphIdentifierRunes     = 128
+	maxGraphIdentifierBytes     = maxGraphIdentifierRunes * utf8.UTFMax
 )
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
@@ -347,6 +350,9 @@ func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphN
 	if queryName == "" || binding == "" {
 		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result query name and binding must not be empty")
 	}
+	if !validGraphIdentifier(binding) {
+		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result binding must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+	}
 	if limit < 0 || limit > 10_000 {
 		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result reference limit must be 0 or between 1 and 10000")
 	}
@@ -361,8 +367,16 @@ func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphN
 
 // NewGraphBindingsReturn selects projected aliases and optional stored fields.
 func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (GraphReturn, error) {
+	if len(bindings) > maxGraphMatchNodes {
+		return GraphReturn{}, fmt.Errorf("antfly: graph bindings exceed the maximum of %d aliases", maxGraphMatchNodes)
+	}
 	if err := validateNonEmptyUnique("graph binding", bindings); err != nil {
 		return GraphReturn{}, err
+	}
+	for _, binding := range bindings {
+		if !validGraphIdentifier(binding) {
+			return GraphReturn{}, fmt.Errorf("antfly: graph binding %q must contain at most %d Unicode code points", binding, maxGraphIdentifierRunes)
+		}
 	}
 	if err := validateGraphLimit(options.Limit); err != nil {
 		return GraphReturn{}, err
@@ -394,14 +408,17 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
 	}
 	for name, aggregate := range aggregates {
-		if strings.TrimSpace(name) == "" {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate name must not be empty")
+		if strings.TrimSpace(name) == "" || !validGraphIdentifier(name) {
+			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate name must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 		}
 		if strings.TrimSpace(aggregate.Count) == "" {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q must name an alias or *", name)
 		}
 		if aggregate.Count == "*" && aggregate.Distinct {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q cannot use distinct count(*)", name)
+		}
+		if aggregate.Count != "*" && !validGraphIdentifier(aggregate.Count) {
+			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q references an invalid alias", name)
 		}
 	}
 	var result GraphReturn
@@ -423,8 +440,9 @@ func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
 // NewGraphNotEqual rejects rows where two aliases resolve to the same exact
 // (table, key) node identity.
 func NewGraphNotEqual(left, right string) (GraphWhereExpression, error) {
-	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
-		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must not be empty")
+	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" ||
+		!validGraphIdentifier(left) || !validGraphIdentifier(right) {
+		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 	}
 	if left == right {
 		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must differ")
@@ -445,8 +463,9 @@ func NewGraphNotExists(edges []GraphMatchEdge) (GraphWhereExpression, error) {
 		return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edges must contain between 1 and %d entries", maxGraphMatchEdges)
 	}
 	for _, edge := range edges {
-		if strings.TrimSpace(edge.From) == "" || strings.TrimSpace(edge.To) == "" {
-			return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edge aliases must not be empty")
+		if strings.TrimSpace(edge.From) == "" || strings.TrimSpace(edge.To) == "" ||
+			!validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
+			return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edge aliases must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 		}
 	}
 	var result GraphWhereExpression
@@ -481,16 +500,16 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	}
 	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
 	for alias := range query.Match.Nodes {
-		if strings.TrimSpace(alias) == "" {
-			return fmt.Errorf("antfly: graph alias must not be empty")
+		if strings.TrimSpace(alias) == "" || !validGraphIdentifier(alias) {
+			return fmt.Errorf("antfly: graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 		}
 	}
 	visible := make(map[string]struct{}, len(query.Match.Nodes))
 	for alias := range query.Match.Nodes {
 		visible[alias] = struct{}{}
 	}
-	if strings.TrimSpace(query.Match.Anchor) == "" {
-		return fmt.Errorf("antfly: graph match anchor must not be empty")
+	if strings.TrimSpace(query.Match.Anchor) == "" || !validGraphIdentifier(query.Match.Anchor) {
+		return fmt.Errorf("antfly: graph match anchor must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 	}
 	if _, ok := visible[query.Match.Anchor]; !ok {
 		return fmt.Errorf("antfly: graph match anchor %q is not declared in nodes", query.Match.Anchor)
@@ -543,8 +562,8 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		}
 		introduced := make(map[string]struct{}, len(optional.Nodes))
 		for alias := range optional.Nodes {
-			if strings.TrimSpace(alias) == "" {
-				return fmt.Errorf("antfly: optional graph alias must not be empty")
+			if strings.TrimSpace(alias) == "" || !validGraphIdentifier(alias) {
+				return fmt.Errorf("antfly: optional graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 			}
 			if _, exists := visible[alias]; exists {
 				return fmt.Errorf("antfly: duplicate optional graph alias %q", alias)
@@ -630,6 +649,9 @@ func (c *graphMatchComplexity) addPredicate() error {
 }
 
 func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) error {
+	if !validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
+		return fmt.Errorf("antfly: graph edge aliases must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+	}
 	if _, ok := aliases[edge.From]; !ok {
 		return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.From)
 	}
@@ -739,12 +761,23 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 	if len(value.Bindings) == 0 && len(value.Aggregates) == 0 {
 		return fmt.Errorf("antfly: graph return must contain bindings or aggregates")
 	}
+	if len(value.Bindings) > maxGraphMatchNodes {
+		return fmt.Errorf("antfly: graph bindings exceed the maximum of %d aliases", maxGraphMatchNodes)
+	}
+	if len(value.Bindings) > 0 {
+		if err := validateNonEmptyUnique("graph binding", value.Bindings); err != nil {
+			return err
+		}
+	}
 	for _, binding := range value.Bindings {
 		if _, ok := known[binding]; !ok {
 			return fmt.Errorf("antfly: graph return references unknown alias %q", binding)
 		}
 	}
 	for name, aggregate := range value.Aggregates {
+		if !validGraphIdentifier(name) {
+			return fmt.Errorf("antfly: graph aggregate name %q is invalid", name)
+		}
 		if aggregate.Count == "*" {
 			continue
 		}
@@ -842,6 +875,9 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		if value.Binding != "" && !strings.HasPrefix(value.ResultRef, "$graph_results.") {
 			return fmt.Errorf("antfly: graph result binding requires a prior graph result reference")
 		}
+		if value.Binding != "" && !validGraphIdentifier(value.Binding) {
+			return fmt.Errorf("antfly: graph result binding is invalid")
+		}
 	}
 	if forms != 1 {
 		return fmt.Errorf("antfly: graph selector must contain exactly one selector form")
@@ -900,4 +936,12 @@ func validateNonEmptyUnique(kind string, values []string) error {
 		seen[value] = struct{}{}
 	}
 	return nil
+}
+
+func validGraphIdentifier(value string) bool {
+	if value == "" || len(value) > maxGraphIdentifierBytes || !utf8.ValidString(value) {
+		return false
+	}
+	count := utf8.RuneCountInString(value)
+	return count >= 1 && count <= maxGraphIdentifierRunes
 }

@@ -15,7 +15,7 @@ T = TypeVar("T", bound="GraphAggregatesReturnAggregates")
 
 @_attrs_define
 class GraphAggregatesReturnAggregates:
-    """ """
+    """Aggregate names are limited to 128 Unicode code points."""
 
     additional_properties: dict[str, GraphCountAggregate] = _attrs_field(init=False, factory=dict)
 
