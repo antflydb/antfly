@@ -1430,6 +1430,33 @@ an extra query-to-centroid pass. Faster routing therefore requires better
 partition geometry, controlled boundary replication, or a tighter second-level
 posting directory—not another benchmark-specific effort constant.
 
+An exact-vector cache-ownership A/B also rejected unconditional transient
+primary reads for public search. On the preserved 50K generation, serving the
+first 100 query batches without admitting source physical blocks held those
+block inserts essentially flat (126 to 127) and reduced the shared LSM cache
+from the 313.6 MB control to 26.4 MB while the governed HBC cache retained
+115.7 MB. Recall remained 0.985, but cold client latency regressed from the
+53.6 ms control mean to 200.3 ms, with p50/p95 rising from 38.8/124.1 ms to
+184.3/351.8 ms. The decoded cache removed artifact IO on the repeat pass, but
+discarding every source block lost useful spatial reuse while that cache was
+being populated. Public search must therefore retain source blocks under the
+shared resource envelope; transient admission remains appropriate only for
+paths that materialize and retain the complete useful representation. Run
+qualifications with an explicit process memory envelope to compare memory and
+latency on equal terms instead of inheriting an 8 GiB LSM cache ceiling from a
+large development host.
+
+The follow-up retained-cache run under an explicit 1 GiB process envelope
+preserved that reuse without preserving the large-host footprint. After the
+same first 100 queries, the ResourceManager held LSM residency at 234.9 MB
+(224 MiB soft, 256 MiB hard), retained 115.7 MB of decoded HBC vectors, and the
+process RSS was 454.8 MB. Low-priority block eviction made progress while every
+run-table index stayed resident. Recall remained 0.985; cold mean/p50/p95 were
+44.8/35.5/91.9 ms and the identical warm repeat reached 5.64/4.57/10.85 ms
+with no artifact reads. On this contended host those absolute times are
+diagnostic, but the controlled result supports normal cache admission plus an
+explicit resource envelope over benchmark-specific transient reads.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

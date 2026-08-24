@@ -14633,6 +14633,59 @@ test "lsm backend getManySorted materializes sparse large prefix values without 
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
+test "lsm backend erased probe honors transient block cache admission" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-probe-transient-block-admission";
+    const count = 24;
+    var keys: [count][64]u8 = undefined;
+    var key_views: [count][]const u8 = undefined;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (&keys, &key_views, 0..) |*key_buf, *key_view, i| {
+            key_view.* = try std.fmt.bufPrint(
+                key_buf,
+                "artifact:shared-prefix:{d:0>8}:dense",
+                .{i},
+            );
+            try txn.put(.{ .name = "docs" }, key_view.*, "vector-payload");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySortedWithBlockCacheAdmission(&key_views, &values, .transient);
+    for (values) |value| try std.testing.expectEqualStrings("vector-payload", value.?);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_physical_block.inserts);
+}
+
 test "lsm backend probe getManySorted uses point path for large sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();

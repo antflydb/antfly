@@ -16124,11 +16124,11 @@ pub const IndexManager = struct {
         if (load_session) |session| {
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
-            var runtime_store = try initRuntimeStore(manager.alloc, store);
-            defer runtime_store.deinit();
-            var txn = try runtime_store.store.beginRead();
+            // The transformed matrix retains the useful representation. Do
+            // not also retain the source blocks in the shared primary cache.
+            var txn = try store.beginProbeTxn();
             defer txn.abort();
-            try txn.getManySorted(artifact_keys, raw_values);
+            try txn.getManySortedTransient(artifact_keys, raw_values);
 
             for (raw_values, 0..) |maybe_raw, key_index| {
                 const slot = artifact_reads[key_index].position;
@@ -16284,7 +16284,10 @@ pub const IndexManager = struct {
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             // This is a sorted point-read workload; avoid a broad primary LSM
-            // snapshot and its mutable-state clone/rotation machinery.
+            // snapshot and its mutable-state clone/rotation machinery. Keep
+            // normal block admission here: C API fast paths can reach this
+            // branch without a manager-owned query session, and cold query
+            // latency depends on spatial reuse between nearby artifacts.
             var txn = try store.beginProbeTxn();
             defer txn.abort();
             try txn.getManySorted(artifact_keys, raw_values);

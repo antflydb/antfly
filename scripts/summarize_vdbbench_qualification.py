@@ -29,7 +29,11 @@ def result_rows(run_root: Path) -> list[dict[str, Any]]:
                     "insert_seconds": metrics.get("insert_duration"),
                     "ready_seconds": metrics.get("load_duration"),
                     "serial_latency_ms": {
-                        percentile: round(float(metrics.get(f"serial_latency_{percentile}", 0)) * 1000, 3)
+                        percentile: round(
+                            float(metrics.get(f"serial_latency_{percentile}", 0))
+                            * 1000,
+                            3,
+                        )
                         for percentile in ("p50", "p95", "p99")
                     },
                     "recall": metrics.get("recall"),
@@ -37,7 +41,10 @@ def result_rows(run_root: Path) -> list[dict[str, Any]]:
                     "concurrency": metrics.get("conc_num_list", []),
                     "concurrent_qps": metrics.get("conc_qps_list", []),
                     "concurrent_latency_ms": {
-                        percentile: [round(float(value) * 1000, 3) for value in metrics.get(field, [])]
+                        percentile: [
+                            round(float(value) * 1000, 3)
+                            for value in metrics.get(field, [])
+                        ]
                         for percentile, field in (
                             ("avg", "conc_latency_avg_list"),
                             ("p95", "conc_latency_p95_list"),
@@ -52,10 +59,10 @@ def result_rows(run_root: Path) -> list[dict[str, Any]]:
 
 def summarize(run_root: Path) -> dict[str, Any]:
     summary: dict[str, Any] = {"runs": result_rows(run_root)}
-    footprint_path = run_root / "footprint.json"
-    if footprint_path.exists():
+    memory_profiles: dict[str, Any] = {}
+    for footprint_path in sorted(run_root.glob("footprint*.json")):
         footprint = load_json(footprint_path)
-        summary["memory"] = {
+        memory = {
             key: footprint.get(key)
             for key in (
                 "demand_peak_bytes",
@@ -66,6 +73,34 @@ def summarize(run_root: Path) -> dict[str, Any]:
             )
             if key in footprint
         }
+        memory_profiles[footprint_path.stem] = memory
+        if footprint_path.name == "footprint.json":
+            summary["memory"] = memory
+    if memory_profiles:
+        summary["memory_profiles"] = memory_profiles
+
+    public_profiles: dict[str, Any] = {}
+    for profile_path in sorted(run_root.glob("public-query-profile*.json")):
+        profile = load_json(profile_path)
+        public_profiles[profile_path.stem] = {
+            key: profile.get(key)
+            for key in (
+                "count",
+                "recall",
+                "mean_ms",
+                "p50_ms",
+                "p95_ms",
+                "p99_ms",
+                "max_ms",
+                "leaves_mean",
+                "approximate_vectors_mean",
+                "exact_vectors_mean",
+                "server_timings",
+            )
+            if key in profile
+        }
+    if public_profiles:
+        summary["public_query_profiles"] = public_profiles
     return summary
 
 
@@ -76,7 +111,9 @@ def main() -> int:
     run_root = Path(sys.argv[1]).resolve()
     summary = summarize(run_root)
     output = run_root / "qualification-summary.json"
-    output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

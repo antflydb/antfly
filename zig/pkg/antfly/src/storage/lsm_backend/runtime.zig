@@ -3095,6 +3095,21 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             }
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
+
+        /// Apply a per-read block-cache policy without changing namespace
+        /// identity. Probe transactions are request-local, so temporarily
+        /// changing this hint cannot affect concurrent readers or writes.
+        pub fn getManySortedWithBlockCacheAdmission(
+            self: *@This(),
+            keys: []const []const u8,
+            values: []?[]const u8,
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) !void {
+            const previous = self.namespace.block_cache_admission;
+            self.namespace.block_cache_admission = admission;
+            defer self.namespace.block_cache_admission = previous;
+            return try self.getManySorted(keys, values);
+        }
     };
 }
 

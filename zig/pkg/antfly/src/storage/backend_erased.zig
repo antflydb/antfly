@@ -256,6 +256,7 @@ pub const ProbeTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
     };
 
     pub fn abort(self: *ProbeTxn) void {
@@ -279,6 +280,20 @@ pub const ProbeTxn = struct {
                 return err;
             };
         }
+    }
+
+    pub fn getManySortedWithBlockCacheAdmission(
+        self: *ProbeTxn,
+        keys: []const []const u8,
+        values: []?[]const u8,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        if (self.vtable.get_many_sorted_with_block_cache_admission) |get_many_sorted| {
+            @memset(values, null);
+            return try get_many_sorted(self.ptr, keys, values, admission);
+        }
+        return try self.getManySorted(keys, values);
     }
 };
 
@@ -1044,6 +1059,18 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
                 };
             }
         }
+
+        fn getManySortedWithBlockCacheAdmission(
+            ptr: *anyopaque,
+            keys: []const []const u8,
+            values: []?[]const u8,
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) anyerror!void {
+            if (@hasDecl(Handle, "getManySortedWithBlockCacheAdmission")) {
+                return try unbox(ptr).handle.getManySortedWithBlockCacheAdmission(keys, values, admission);
+            }
+            return try getManySorted(ptr, keys, values);
+        }
     };
 
     return .{
@@ -1053,6 +1080,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .get_many_sorted_with_block_cache_admission = vt.getManySortedWithBlockCacheAdmission,
         },
     };
 }

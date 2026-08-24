@@ -502,6 +502,16 @@ pub const DocStore = struct {
             return try self.read.?.getManySorted(keys, values);
         }
 
+        /// Fetch values without admitting their source data blocks to the LSM
+        /// cache. Callers should use this only when they retain a decoded or
+        /// otherwise more useful representation of every returned value.
+        pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            if (self.probe) |*probe| {
+                return try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+            }
+            return try self.getManySorted(keys, values);
+        }
+
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
