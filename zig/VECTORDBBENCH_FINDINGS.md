@@ -1534,6 +1534,42 @@ profile after the official warm pass measured 48.52 ms mean, 86.08 ms p95,
 1.22 GB demand, 1.20 GB physical-footprint ledger peak, and 1.57 GB RSS under
 the same explicit 2 GiB process envelope.
 
+Widening only the primary-store point pipeline from four to eight was rejected.
+Although eight 32 KiB buffers look inexpensive in isolation, the preserved 1M
+public profile made no bounded progress and one request exceeded the profiler's
+120-second timeout. The server eventually unwound the in-flight request and
+exited cleanly, but this is a hard tail failure, not a noisy benchmark sample.
+Per-query read fanout composes with concurrent public queries, shared cache
+admission, and the bounded service I/O lane; a local buffer calculation alone
+is therefore not a safe concurrency policy. Keep four as the default until a
+global admission controller can allocate read slots across queries.
+
+The first fresh 50K qualification after the four-wide change recovered the
+load target (31.20 seconds ready) but exposed an aggregate-cache deadlock at
+five concurrent queries. An LSM cache admission held its accounting lock while
+waiting for the resource-manager reclaimer gate, whose HBC callback waited for
+the HBC cache owner. Making only the HBC callback nonblocking exposed the
+complementary cycle on the next run: an HBC admission held the callback gate
+while its LSM callback waited for LSM accounting. The production invariant is
+therefore symmetric: resource-manager cache callbacks are opportunistic and
+must never wait for an owner lock. HBC now try-locks its cache; LSM try-locks
+accounting and individual shards, evicts only unpinned entries, and publishes
+the exact released bytes. A contended callback returns zero, causing the
+requesting cache allocation to use its bounded transient path without relaxing
+the aggregate hard limit.
+
+The fresh post-fix 50K public-API gate completed the full load/query/restart
+lifecycle. It inserted in 29.17 seconds and was fully ready in 31.19 seconds;
+the five-client 10-second phase completed at 214.01 aggregate QPS with 23.29 ms
+mean, 37.04 ms p95, and 46.05 ms p99 concurrent latency. Live serial recall was
+0.9853, and cold/warm reopened recall was 0.9841. Warm restart serial latency
+was 3.0 ms p50, 3.6 ms p95, and 15.1 ms p99. A separate 100-query profiled pass
+measured 3.63 ms mean, 4.09 ms p95, 4.58 ms p99, and 0.9826 recall (the smaller
+sample explains the recall variance). Primary mutable snapshot copies totaled
+106.27 MB, HBC cache demand was 16.42 MB, the data root occupied 409 MiB, live
+demand/RSS peaked at 508.6 MB/1.25 GB, and reopened demand/RSS at 597.8 MB/
+931.3 MB under the explicit 1 GiB envelope.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

@@ -318,9 +318,16 @@ pub const Cache = struct {
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
         if (target_bytes == 0) return 0;
+        // Reclaimers run while ResourceManager serializes its callback list.
+        // Admission already holding this accounting lock may itself be
+        // waiting for that callback gate, so reclamation must be strictly
+        // opportunistic. A zero result makes the requester use its bounded
+        // non-retained path instead of creating a cross-cache lock cycle.
+        if (!self.resource_accounting_mutex.tryLock()) return 0;
+        defer self.resource_accounting_mutex.unlock();
         const before = self.currentBytes();
         while (before -| self.currentBytes() < target_bytes) {
-            if (!self.evictOne()) break;
+            if (!self.tryEvictOneAccountingLocked()) break;
         }
         return @intCast(before -| self.currentBytes());
     }
@@ -749,7 +756,35 @@ pub const Cache = struct {
         return false;
     }
 
+    fn tryEvictOneAccountingLocked(self: *Cache) bool {
+        const start = self.evict_cursor.fetchAdd(1, .monotonic);
+        for (0..priority_count) |priority| {
+            for (0..self.shards.len) |offset| {
+                const shard = &self.shards[(start + offset) % self.shards.len];
+                if (!shard.mutex.tryLock()) continue;
+
+                var current = shard.lru_heads[priority];
+                while (current) |entry| {
+                    if (entry.ref_count == 0) {
+                        const byte_cost = self.detachEntryLocked(shard, entry);
+                        shard.mutex.unlock();
+                        self.releaseResourceBytesAccountingLocked(byte_cost);
+                        return true;
+                    }
+                    current = entry.lru_next;
+                }
+                shard.mutex.unlock();
+            }
+        }
+        return false;
+    }
+
     fn removeEntryLocked(self: *Cache, shard: *Shard, entry: *Entry) void {
+        const byte_cost = self.detachEntryLocked(shard, entry);
+        self.releaseResourceBytes(byte_cost);
+    }
+
+    fn detachEntryLocked(self: *Cache, shard: *Shard, entry: *Entry) usize {
         _ = shard.entries.fetchRemoveAdapted(entry.key(), KeyContext{}) orelse unreachable;
         std.debug.assert(entry.ref_count == 0);
         self.unlinkEntryLocked(shard, entry);
@@ -760,7 +795,7 @@ pub const Cache = struct {
         const byte_cost = entry.byte_cost;
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
-        self.releaseResourceBytes(byte_cost);
+        return byte_cost;
     }
 
     fn nextAccess(self: *Cache) u64 {
@@ -796,6 +831,10 @@ pub const Cache = struct {
         if (bytes == 0) return;
         const locked = lockAtomic(&self.resource_accounting_mutex);
         defer if (locked) self.resource_accounting_mutex.unlock();
+        self.releaseResourceBytesAccountingLocked(bytes);
+    }
+
+    fn releaseResourceBytesAccountingLocked(self: *Cache, bytes: usize) void {
         const manager = self.resource_manager orelse return;
         const amount: u64 = @intCast(bytes);
         if (amount > self.resource_accounted_bytes) {
@@ -1346,6 +1385,31 @@ test "shared LSM cache yields to foreground aggregate admission" {
     defer foreground.release();
     try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
     try std.testing.expectEqual(@as(u64, 1000), resource_manager.snapshot().memory.used_bytes);
+}
+
+test "shared LSM resource reclaimer never waits for active accounting" {
+    const allocator = std.testing.allocator;
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(std.testing.allocator);
+    var cache = Cache.init(allocator, 1024 * 1024);
+    cache.attachResourceManager(&resource_manager);
+    defer cache.deinit();
+
+    var state: State = .{};
+    try state.upsert(allocator, .{ .name = "ns" }, "key", "value", false);
+    var inserted = try cache.putRunState("run-nonblocking-reclaim", 1, 1, state);
+    inserted.release();
+    const bytes: u64 = @intCast(cache.currentBytes());
+    try std.testing.expect(bytes > 0);
+
+    try std.testing.expect(cache.resource_accounting_mutex.tryLock());
+    {
+        defer cache.resource_accounting_mutex.unlock();
+        try std.testing.expectEqual(@as(u64, 0), Cache.reclaimForResourceManager(&cache, bytes));
+    }
+
+    try std.testing.expectEqual(bytes, Cache.reclaimForResourceManager(&cache, bytes));
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.lsm_block_table_cache).used_bytes);
 }
 
 test "cache shrinks against resource manager pressure target" {

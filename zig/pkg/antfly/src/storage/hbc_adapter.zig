@@ -875,7 +875,12 @@ pub const Cache = struct {
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
         if (target_bytes == 0) return 0;
-        self.mutex.lockExclusive();
+        // Reclaimers run while ResourceManager serializes its callback list.
+        // Never wait for the cache owner here: cache admission may already
+        // hold this lock while asking the same manager to reclaim a different
+        // slice. Returning zero makes that allocation fall back to its
+        // non-retained path and breaks the cross-cache lock cycle.
+        if (!self.mutex.tryLockExclusive()) return 0;
         defer self.mutex.unlockExclusive();
         const before = self.physical_accounting.current();
         while (before -| self.physical_accounting.current() < target_bytes) {
@@ -10922,6 +10927,29 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     defer foreground.release();
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
     try std.testing.expectEqual(@as(u64, 2), resource_manager.snapshot().memory.used_bytes);
+}
+
+test "hbc resource reclaimer never waits for an active cache owner" {
+    const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const bytes = estimateVectorCacheBytes(&vector);
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = bytes },
+    });
+    defer resource_manager.deinit(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    const namespace = hbcCacheNamespace("/tmp/hbc-nonblocking-reclaimer");
+    _ = try cache.cacheVector(namespace, 1, &vector);
+
+    cache.mutex.lockExclusive();
+    {
+        defer cache.mutex.unlockExclusive();
+        try std.testing.expectEqual(@as(u64, 0), Cache.reclaimForResourceManager(&cache, bytes));
+    }
+
+    try std.testing.expectEqual(bytes, Cache.reclaimForResourceManager(&cache, bytes));
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 }
 
 test "hbc concurrent vector admission samples at a full steady target" {
