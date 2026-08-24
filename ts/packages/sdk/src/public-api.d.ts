@@ -6837,7 +6837,12 @@ export interface components {
                 [key: string]: components["schemas"]["LegacyGraphQuery"];
             };
             /**
-             * @description Strategy for merging graph results with search results:
+             * @deprecated
+             * @description Deprecated compatibility behavior for `graph_searches`. Canonical
+             *     `graph_queries` return independently typed, potentially table-qualified
+             *     identities and cannot be combined with this field.
+             *
+             *     Strategy for merging legacy graph results with search results:
              *     - union: Include nodes from both search and graph results
              *     - intersection: Only include nodes appearing in both
              * @enum {string}

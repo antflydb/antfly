@@ -13911,6 +13911,11 @@ components:
             required:
               - graph_queries
               - graph_searches
+          - description: Canonical graph_queries return typed results and cannot use the legacy hit expansion
+              adapter.
+            required:
+              - graph_queries
+              - expand_strategy
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -14631,12 +14636,20 @@ components:
 
             Names beginning with `$` are reserved for result namespaces.
         expand_strategy:
+          deprecated: true
           type: string
           enum:
             - union
             - intersection
           description: >
-            Strategy for merging graph results with search results:
+            Deprecated compatibility behavior for `graph_searches`. Canonical
+
+            `graph_queries` return independently typed, potentially table-qualified
+
+            identities and cannot be combined with this field.
+
+
+            Strategy for merging legacy graph results with search results:
 
             - union: Include nodes from both search and graph results
 
@@ -22767,6 +22780,7 @@ components:
           uniqueItems: true
           items:
             type: string
+            minLength: 1
           description: Exact keys in the table being queried.
     GraphPathEndpoint:
       type: object

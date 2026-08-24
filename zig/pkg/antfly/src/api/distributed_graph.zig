@@ -4667,6 +4667,26 @@ test "distributed graph MATCH binding refs preserve table identity and deduplica
     try std.testing.expectEqualStrings("post:1", nodes[0].key);
 }
 
+test "distributed graph node refs deduplicate typed identities before limit" {
+    const alloc = std.testing.allocator;
+    const result_nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "shared", .table = "docs", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+        .{ .key = "shared", .table = "docs", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "shared", .table = "people", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "other", .table = "docs", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+    };
+    const nodes = try resolveUniqueGraphResultNodes(alloc, "docs", &result_nodes, 3);
+    defer freeNodeIdentities(alloc, nodes);
+
+    try std.testing.expectEqual(@as(usize, 3), nodes.len);
+    try std.testing.expect(nodes[0].table == null);
+    try std.testing.expectEqualStrings("shared", nodes[0].key);
+    try std.testing.expectEqualStrings("people", nodes[1].table.?);
+    try std.testing.expectEqualStrings("shared", nodes[1].key);
+    try std.testing.expect(nodes[2].table == null);
+    try std.testing.expectEqualStrings("other", nodes[2].key);
+}
+
 test "distributed graph complete anchors require the source snapshot" {
     const source_tokens = [_]db_mod.types.ShardIdentityReadGeneration{
         .{ .group_id = 11, .generation = 101 },
@@ -5379,25 +5399,12 @@ fn resolveResultRefNodes(
             {
                 return error.UnsupportedQueryRequest;
             }
-            const count: usize = if (result_ref.limit == 0)
-                graph_result.nodes.len
-            else
-                @min(graph_result.nodes.len, result_ref.limit);
-            const out = try alloc.alloc(GraphNodeIdentity, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (out[0..initialized]) |*node| node.deinit(alloc);
-                alloc.free(out);
-            }
-            for (graph_result.nodes[0..count], 0..) |node, i| {
-                out[i] = try cloneGraphNodeIdentityParts(
-                    alloc,
-                    node.key,
-                    canonicalGraphNodeTable(source_table, node.table),
-                );
-                initialized += 1;
-            }
-            return out;
+            return try resolveUniqueGraphResultNodes(
+                alloc,
+                source_table,
+                graph_result.nodes,
+                result_ref.limit,
+            );
         }
         return error.GraphResultRefNotImplemented;
     }
@@ -5408,25 +5415,66 @@ fn resolveResultRefNodes(
 
     if (result_ref.limit == 0 and baseResultRefMayBeIncomplete(req, base_result))
         return error.UnsupportedQueryRequest;
-    const count: usize = if (result_ref.limit == 0)
-        base_result.hits.len
-    else
-        @min(base_result.hits.len, result_ref.limit);
-    const out = try alloc.alloc(GraphNodeIdentity, count);
-    var initialized: usize = 0;
+    return try resolveUniqueSearchHitNodes(
+        alloc,
+        source_table,
+        base_result.hits,
+        result_ref.limit,
+    );
+}
+
+fn resolveUniqueGraphResultNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    result_nodes: []const graph_query_mod.GraphResultNode,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
     errdefer {
-        for (out[0..initialized]) |*node| node.deinit(alloc);
-        alloc.free(out);
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
     }
-    for (base_result.hits[0..count], 0..) |hit, i| {
-        out[i] = try cloneGraphNodeIdentityParts(
-            alloc,
-            hit.id,
-            canonicalGraphNodeTable(source_table, hit.source_table),
-        );
-        initialized += 1;
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (result_nodes) |result_node| {
+        const table = canonicalGraphNodeTable(source_table, result_node.table);
+        const ref = graph_node_identity.Ref{ .table = table, .key = result_node.key };
+        if (seen.contains(ref)) continue;
+        var node = try cloneGraphNodeIdentityParts(alloc, result_node.key, table);
+        errdefer node.deinit(alloc);
+        _ = try seen.putIfAbsent(alloc, node.ref(), {});
+        try nodes.append(alloc, node);
+        if (limit > 0 and nodes.items.len >= limit) break;
     }
-    return out;
+    return try nodes.toOwnedSlice(alloc);
+}
+
+fn resolveUniqueSearchHitNodes(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    hits: []const db_mod.types.SearchHit,
+    limit: u32,
+) ![]GraphNodeIdentity {
+    var nodes = std.ArrayListUnmanaged(GraphNodeIdentity).empty;
+    errdefer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    var seen = graph_node_identity.Map(void){};
+    defer seen.deinit(alloc);
+
+    for (hits) |hit| {
+        const table = canonicalGraphNodeTable(source_table, hit.source_table);
+        const ref = graph_node_identity.Ref{ .table = table, .key = hit.id };
+        if (seen.contains(ref)) continue;
+        var node = try cloneGraphNodeIdentityParts(alloc, hit.id, table);
+        errdefer node.deinit(alloc);
+        _ = try seen.putIfAbsent(alloc, node.ref(), {});
+        try nodes.append(alloc, node);
+        if (limit > 0 and nodes.items.len >= limit) break;
+    }
+    return try nodes.toOwnedSlice(alloc);
 }
 
 fn resolveMatchBindingNodes(

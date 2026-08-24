@@ -8923,6 +8923,8 @@ fn buildGraphQueries(
 ) ![]const db_mod.types.NamedGraphQuery {
     if (request.graph_queries != null and request.graph_searches != null)
         return error.InvalidQueryRequest;
+    if (request.graph_queries != null and request.expand_strategy != null)
+        return error.InvalidQueryRequest;
     if (request.graph_queries) |queries| {
         if (queries.map.count() > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
     }

@@ -40,6 +40,10 @@ def _graph_result(result: dict, name: str) -> dict | None:
     return responses[0].get("graph_results", {}).get(name)
 
 
+def _graph_identity_keys(identities: list[dict]) -> list[str]:
+    return [identity["key"] for identity in identities]
+
+
 def _query_graph_result(api, table_name: str, payload: dict, name: str) -> dict | None:
     return _graph_result(api.query_table(table_name, payload), name)
 
@@ -269,7 +273,7 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     assert public_traverse_result is not None
     assert len(public_traverse_result["nodes"]) == 2
     assert [node["key"] for node in public_traverse_result["nodes"]] == ["bob", "carol"]
-    assert public_traverse_result["nodes"][1]["path"] == ["alice", "bob", "carol"]
+    assert _graph_identity_keys(public_traverse_result["nodes"][1]["path"]) == ["alice", "bob", "carol"]
 
     shortest = serverless_api.graph_shortest_path(
         "graph",
@@ -295,9 +299,9 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     )
     assert public_shortest_result is not None
     assert len(public_shortest_result["paths"]) == 1
-    assert public_shortest_result["nodes"] == []
+    assert _graph_identity_keys(public_shortest_result["nodes"]) == ["carol"]
     assert len(public_shortest_result["paths"]) == 1
-    assert public_shortest_result["paths"][0]["nodes"] == ["alice", "bob", "carol"]
+    assert _graph_identity_keys(public_shortest_result["paths"][0]["nodes"]) == ["alice", "bob", "carol"]
 
     chained = wait_until(
         lambda: (
@@ -530,7 +534,7 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     assert len(traverse_result["nodes"]) == 2
     assert [node["key"] for node in traverse_result["nodes"]] == ["doc-b", "doc-c"]
     assert traverse_result["nodes"][1]["depth"] == 2
-    assert traverse_result["nodes"][1]["path"] == ["doc-a", "doc-b", "doc-c"]
+    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == ["doc-a", "doc-b", "doc-c"]
 
     shortest_result = _wait_for_graph_result(
         backup_api,
@@ -543,9 +547,9 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     )
     assert shortest_result is not None
     assert len(shortest_result["paths"]) == 1
-    assert shortest_result["nodes"] == []
+    assert _graph_identity_keys(shortest_result["nodes"]) == ["doc-c"]
     assert len(shortest_result["paths"]) == 1
-    assert shortest_result["paths"][0]["nodes"] == ["doc-a", "doc-b", "doc-c"]
+    assert _graph_identity_keys(shortest_result["paths"][0]["nodes"]) == ["doc-a", "doc-b", "doc-c"]
     assert shortest_result["paths"][0]["length"] == 2
 
     chained = wait_until(
@@ -843,7 +847,7 @@ def test_stateful_graph_field_edges_extract_and_update(backup_api):
     assert traverse_result is not None
     assert len(traverse_result["nodes"]) == 2
     assert [node["key"] for node in traverse_result["nodes"]] == ["child", "root-a"]
-    assert traverse_result["nodes"][1]["path"] == ["grandchild", "child", "root-a"]
+    assert _graph_identity_keys(traverse_result["nodes"][1]["path"]) == ["grandchild", "child", "root-a"]
 
     update = backup_api.batch_write(
         table_name,
@@ -1613,11 +1617,20 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         ),
     }
     expected = {"q1": "1", "q2": "1", "q3": "6", "q4": "1", "q5": "2", "q6": "1", "q7": "2", "q8": "1", "q9": "1"}
+    query_names = list(expected)
+    # Keep each request within the public eight-MATCH admission budget while retaining named
+    # multi-operation coverage. Raising the server budget here would weaken the production guard.
+    query_batches = [
+        {name: queries[name] for name in query_names[:8]},
+        {name: queries[name] for name in query_names[8:]},
+    ]
 
     def exact_counts() -> dict | None:
-        response = backup_api.query_table(table_name, {"graph_queries": queries, "limit": 10})
-        graph_results = response.get("responses", [{}])[0].get("graph_results", {})
-        actual = {name: result.get("aggregates", {}).get("count") for name, result in graph_results.items()}
+        actual = {}
+        for query_batch in query_batches:
+            response = backup_api.query_table(table_name, {"graph_queries": query_batch, "limit": 10})
+            graph_results = response.get("responses", [{}])[0].get("graph_results", {})
+            actual.update({name: result.get("aggregates", {}).get("count") for name, result in graph_results.items()})
         if all(actual.get(name) == {"value": count, "exact": True} for name, count in expected.items()):
             return actual
         return None

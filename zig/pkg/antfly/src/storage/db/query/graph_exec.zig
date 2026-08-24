@@ -472,7 +472,12 @@ pub fn executeGraphQueriesWithSets(
         initialized += 1;
         var resolved_doc_set: ?*const doc_set.ResolvedDocSet = null;
         var resolved_doc_set_complete = false;
-        if (executor.resolve_hits_to_doc_set) |resolve| {
+        // A source-table doc set cannot represent a qualified graph identity.
+        // Canonical dependencies resolve directly from the typed graph result;
+        // do not manufacture a key-only compatibility set that can reinterpret
+        // `other_table/shared` as `source_table/shared`.
+        if (!graphResultHasQualifiedIdentity(results[i]) and executor.resolve_hits_to_doc_set != null) {
+            const resolve = executor.resolve_hits_to_doc_set.?;
             if (results[i].nodes.len == results[i].total_hits) {
                 if (executor.resolve_nodes_to_doc_set) |resolve_nodes| {
                     resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, results[i].nodes);
@@ -501,6 +506,18 @@ pub fn executeGraphQueriesWithSets(
     }
 
     return results;
+}
+
+fn graphResultHasQualifiedIdentity(result: types.GraphSearchResult) bool {
+    for (result.nodes) |node| if (node.table != null) return true;
+    for (result.matches) |match| {
+        for (match.bindings) |binding| if (binding.node.table != null) return true;
+    }
+    for (result.aggregates) |aggregate| {
+        for (aggregate.distinct_values) |identity| if (identity.table != null) return true;
+    }
+    for (result.hits) |hit| if (hit.source_table != null) return true;
+    return false;
 }
 
 fn visitGraphQuery(
@@ -563,6 +580,7 @@ fn graphQueryDependencyIndex(
 }
 
 pub fn applyGraphUnion(alloc: Allocator, result: *types.SearchResult) !void {
+    try requireTableLocalGraphExpandHits(result.graph_results);
     var ordinal_complete = true;
     for (result.hits) |hit| {
         if (hit.doc_ordinal == null) {
@@ -647,6 +665,7 @@ fn applyGraphUnionByOrdinal(alloc: Allocator, result: *types.SearchResult) !void
 }
 
 pub fn applyGraphIntersection(alloc: Allocator, result: *types.SearchResult) !void {
+    try requireTableLocalGraphExpandHits(result.graph_results);
     var ordinal_complete = true;
     for (result.hits) |hit| {
         if (hit.doc_ordinal == null) {
@@ -699,6 +718,14 @@ pub fn applyGraphIntersection(alloc: Allocator, result: *types.SearchResult) !vo
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
     result.total_hits = @intCast(result.hits.len);
+}
+
+fn requireTableLocalGraphExpandHits(graph_results: []const types.GraphSearchResult) !void {
+    for (graph_results) |graph_result| {
+        for (graph_result.hits) |hit| {
+            if (hit.source_table != null) return error.UnsupportedQueryRequest;
+        }
+    }
 }
 
 fn applyGraphIntersectionWithOrdinalSet(
@@ -814,6 +841,29 @@ test "applyGraphIntersection uses ordinals when hit pages are complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[0].doc_ordinal);
 }
 
+test "legacy expand rejects table-qualified graph hits" {
+    const alloc = std.testing.allocator;
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 0),
+        .total_hits = 0,
+        .graph_results = try alloc.alloc(types.GraphSearchResult, 1),
+    };
+    defer result.deinit();
+    result.graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .hits = try alloc.alloc(types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    result.graph_results[0].hits[0] = .{
+        .id = try alloc.dupe(u8, "shared"),
+        .source_table = try alloc.dupe(u8, "people"),
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, applyGraphUnion(alloc, &result));
+    try std.testing.expectError(error.UnsupportedQueryRequest, applyGraphIntersection(alloc, &result));
+}
+
 pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stored: bool) !types.SearchResult {
     var hits = try alloc.alloc(types.SearchHit, set.hits.len);
     var initialized: usize = 0;
@@ -823,16 +873,19 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
     }
 
     for (set.hits, 0..) |hit, i| {
-        hits[i] = .{
+        var cloned = types.SearchHit{
             .id = try alloc.dupe(u8, hit.id),
             .doc_ordinal = hit.doc_ordinal,
             .score = hit.score,
             .distance = hit.distance,
-            .stored_data = if (include_stored and hit.stored_data != null)
-                try alloc.dupe(u8, hit.stored_data.?)
-            else
-                null,
         };
+        errdefer cloned.deinit(alloc);
+        cloned.source_table = if (hit.source_table) |table| try alloc.dupe(u8, table) else null;
+        cloned.stored_data = if (include_stored and hit.stored_data != null)
+            try alloc.dupe(u8, hit.stored_data.?)
+        else
+            null;
+        hits[i] = cloned;
         initialized += 1;
     }
 
@@ -1817,15 +1870,21 @@ fn buildGraphNodeHits(
         errdefer if (stored_data) |stored| alloc.free(stored);
         const id = try alloc.dupe(u8, node.key);
         errdefer alloc.free(id);
-        const doc_ordinal = try lookupDocOrdinalForGraphHit(
-            alloc,
-            executor.ctx,
-            executor.lookup_doc_ordinal,
-            node.key,
-            req.identity_read_generation,
-        );
+        const source_table = if (node.table) |table| try alloc.dupe(u8, table) else null;
+        errdefer if (source_table) |table| alloc.free(table);
+        const doc_ordinal = if (node.table == null)
+            try lookupDocOrdinalForGraphHit(
+                alloc,
+                executor.ctx,
+                executor.lookup_doc_ordinal,
+                node.key,
+                req.identity_read_generation,
+            )
+        else
+            null;
         hits[i] = .{
             .id = id,
+            .source_table = source_table,
             .doc_ordinal = doc_ordinal,
             .score = @floatCast(node.distance),
             .stored_data = stored_data,
@@ -4240,6 +4299,22 @@ pub fn resolveGraphSelectorFromSets(
                     return error.UnsupportedQueryRequest;
                 break :blk try resolveMatchBindingKeys(alloc, graph_result.matches, binding, result_ref.limit);
             }
+            if (set.graph_result) |graph_result| {
+                if (graph_result.aggregates.len > 0) return error.InvalidQueryRequest;
+                // Non-pattern graph operations expose their composable output
+                // through typed nodes. Resolve those directly so hydration and
+                // source-table doc-set projections cannot erase provenance.
+                if (graph_result.matches.len == 0) {
+                    if (result_ref.limit == 0 and
+                        (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.nodes.len))
+                        return error.UnsupportedQueryRequest;
+                    break :blk try resolveTableLocalGraphNodeKeys(
+                        alloc,
+                        graph_result.nodes,
+                        result_ref.limit,
+                    );
+                }
+            }
             if (result_ref.limit == 0) {
                 if (set.resolved_doc_set_complete) if (set.resolved_doc_set) |resolved_doc_set| {
                     const resolve = doc_set_resolver.func orelse return error.UnsupportedQueryRequest;
@@ -4285,7 +4360,9 @@ fn resolveMatchBindingKeys(
 
     for (matches) |match| {
         for (match.bindings) |binding| {
-            if (!std.mem.eql(u8, binding.alias, alias) or seen.contains(binding.node.key)) continue;
+            if (!std.mem.eql(u8, binding.alias, alias)) continue;
+            if (binding.node.table != null) return error.UnsupportedQueryRequest;
+            if (seen.contains(binding.node.key)) continue;
             const key = try alloc.dupe(u8, binding.node.key);
             errdefer alloc.free(key);
             try seen.put(alloc, key, {});
@@ -4293,6 +4370,31 @@ fn resolveMatchBindingKeys(
             if (limit > 0 and keys.items.len >= limit) return try keys.toOwnedSlice(alloc);
             break;
         }
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn resolveTableLocalGraphNodeKeys(
+    alloc: Allocator,
+    nodes: []const graph_query_mod.GraphResultNode,
+    limit: u32,
+) ![][]u8 {
+    var keys = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (nodes) |node| {
+        if (node.table != null) return error.UnsupportedQueryRequest;
+        if (seen.contains(node.key)) continue;
+        const key = try alloc.dupe(u8, node.key);
+        errdefer alloc.free(key);
+        try seen.put(alloc, key, {});
+        try keys.append(alloc, key);
+        if (limit > 0 and keys.items.len >= limit) break;
     }
     return try keys.toOwnedSlice(alloc);
 }
@@ -4359,6 +4461,24 @@ test "graph result refs select one MATCH binding without duplicate seeds" {
     }
     try std.testing.expectEqual(@as(usize, 1), keys.len);
     try std.testing.expectEqualStrings("post:1", keys[0]);
+}
+
+test "graph node result refs deduplicate before applying limit" {
+    const alloc = std.testing.allocator;
+    const nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "doc:a", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+        .{ .key = "doc:a", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "doc:b", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+    };
+    const keys = try resolveTableLocalGraphNodeKeys(alloc, &nodes, 2);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("doc:a", keys[0]);
+    try std.testing.expectEqualStrings("doc:b", keys[1]);
 }
 
 test "jsonDocMatchesPatternFilter supports stored structured filters" {
@@ -5227,10 +5347,13 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
 
     const hit_id = try alloc.dupe(u8, "doc:a");
     defer alloc.free(hit_id);
+    const hit_source_table = try alloc.dupe(u8, "people");
+    defer alloc.free(hit_source_table);
     const hit_stored = try alloc.dupe(u8, "{\"title\":\"A\"}");
     defer alloc.free(hit_stored);
     const source_hits = [_]types.SearchHit{.{
         .id = hit_id,
+        .source_table = hit_source_table,
         .doc_ordinal = 11,
         .score = 0.5,
         .stored_data = hit_stored,
@@ -5246,6 +5369,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     defer without_stored.deinit();
     try std.testing.expectEqual(@as(usize, 1), without_stored.hits.len);
     try std.testing.expectEqualStrings("doc:a", without_stored.hits[0].id);
+    try std.testing.expectEqualStrings("people", without_stored.hits[0].source_table.?);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), without_stored.hits[0].doc_ordinal);
     try std.testing.expect(without_stored.hits[0].stored_data == null);
     try std.testing.expectEqual(types.TotalHitsRelation.gte, without_stored.total_hits_relation);

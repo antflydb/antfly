@@ -2484,7 +2484,7 @@ components:
           minItems: 1
           maxItems: 10000
           uniqueItems: true
-          items: { type: string }
+          items: { type: string, minLength: 1 }
           description: Exact keys in the table being queried.
     GraphIdentityNodeSelector:
       type: object

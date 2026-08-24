@@ -25230,7 +25230,11 @@ pub const DB = struct {
         var missing_ids = std.ArrayListUnmanaged([]const u8).empty;
         defer missing_ids.deinit(alloc);
         for (hits) |hit| {
-            if (hit.doc_ordinal == null) try missing_ids.append(alloc, hit.id);
+            // Ordinals belong to this DB's identity namespace. A qualified
+            // graph hit may use the same key in another table and must retain
+            // its typed identity instead of acquiring a local ordinal.
+            if (hit.doc_ordinal == null and hit.source_table == null)
+                try missing_ids.append(alloc, hit.id);
         }
         if (missing_ids.items.len == 0) return;
 
@@ -25243,7 +25247,7 @@ pub const DB = struct {
 
         var ordinal_index: usize = 0;
         for (hits) |*hit| {
-            if (hit.doc_ordinal != null) continue;
+            if (hit.doc_ordinal != null or hit.source_table != null) continue;
             hit.doc_ordinal = ordinals[ordinal_index];
             ordinal_index += 1;
         }
@@ -25275,7 +25279,10 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         var doc_ids = try alloc.alloc([]const u8, nodes.len);
         defer alloc.free(doc_ids);
-        for (nodes, 0..) |node, i| doc_ids[i] = node.key;
+        for (nodes, 0..) |node, i| {
+            if (node.table != null) return error.UnsupportedQueryRequest;
+            doc_ids[i] = node.key;
+        }
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
     }
 

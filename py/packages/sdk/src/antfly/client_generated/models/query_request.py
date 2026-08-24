@@ -292,7 +292,12 @@ class QueryRequest:
             contract.
             Use `graph_queries`; requests containing both fields are rejected.
             Names beginning with `$` are reserved for result namespaces.
-        expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
+        expand_strategy (QueryRequestExpandStrategy | Unset): Deprecated compatibility behavior for `graph_searches`.
+            Canonical
+            `graph_queries` return independently typed, potentially table-qualified
+            identities and cannot be combined with this field.
+
+            Strategy for merging legacy graph results with search results:
             - union: Include nodes from both search and graph results
             - intersection: Only include nodes appearing in both
         document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG

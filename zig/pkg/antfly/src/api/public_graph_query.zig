@@ -52,6 +52,11 @@ pub fn parseSupportedGraphQueriesAlloc(
 ) ![]const db_mod.types.NamedGraphQuery {
     if (request.graph_queries != null and request.graph_searches != null)
         return error.InvalidQueryRequest;
+    // Canonical graph results may contain table-qualified identities, while
+    // the retrieval hit envelope is scoped to the queried table. Keep the
+    // legacy merge adapter from erasing that provenance.
+    if (request.graph_queries != null and request.expand_strategy != null)
+        return error.InvalidQueryRequest;
     const query_count = if (request.graph_queries) |queries|
         queries.map.count()
     else if (request.graph_searches) |queries|
@@ -93,6 +98,23 @@ pub fn parseSupportedGraphQueriesAlloc(
         }
     }
     return try items.toOwnedSlice(alloc);
+}
+
+test "canonical graph queries reject the legacy expand strategy" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        \\{"graph_queries":{"walk":{"index":"graph","traverse":{"start":{"keys":["doc:a"]}}}},"expand_strategy":"union"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+    );
 }
 
 pub fn freeNamedGraphQueries(
@@ -190,25 +212,11 @@ pub fn resolveGraphSelectorAlloc(
                     if (result_ref.limit == 0 and
                         (graph_result.truncated or @as(u64, graph_result.total_hits) > graph_result.nodes.len))
                         return error.UnsupportedQueryRequest;
-                    const count: usize = if (result_ref.limit == 0)
-                        graph_result.nodes.len
-                    else
-                        @min(graph_result.nodes.len, result_ref.limit);
-                    const duped = try alloc.alloc([]u8, count);
-                    var initialized: usize = 0;
-                    errdefer {
-                        for (duped[0..initialized]) |key| alloc.free(key);
-                        if (duped.len > 0) alloc.free(duped);
-                    }
-                    for (graph_result.nodes[0..count], 0..) |node, i| {
-                        // The serverless snapshot resolver is table-local. A
-                        // qualified result must never be reinterpreted as a
-                        // source-table key by a downstream query.
-                        if (node.table != null) return error.UnsupportedQueryRequest;
-                        duped[i] = try alloc.dupe(u8, node.key);
-                        initialized += 1;
-                    }
-                    break :blk duped;
+                    break :blk try resolveTableLocalGraphNodeKeysAlloc(
+                        alloc,
+                        graph_result.nodes,
+                        result_ref.limit,
+                    );
                 }
             }
             if (result_ref.limit == 0 and resultSetMayBeIncompleteForUnboundedRef(set)) return error.UnsupportedQueryRequest;
@@ -226,6 +234,34 @@ pub fn resolveGraphSelectorAlloc(
             break :blk duped;
         },
     };
+}
+
+fn resolveTableLocalGraphNodeKeysAlloc(
+    alloc: std.mem.Allocator,
+    nodes: []const graph_query_mod.GraphResultNode,
+    limit: u32,
+) ![][]u8 {
+    var keys = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (nodes) |node| {
+        // The serverless snapshot resolver is table-local. Validate identity
+        // provenance before key-only deduplication so a qualified candidate
+        // cannot hide behind a local key with the same spelling.
+        if (node.table != null) return error.UnsupportedQueryRequest;
+        if (seen.contains(node.key)) continue;
+        const key = try alloc.dupe(u8, node.key);
+        errdefer alloc.free(key);
+        try seen.put(alloc, key, {});
+        try keys.append(alloc, key);
+        if (limit > 0 and keys.items.len >= limit) break;
+    }
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn resolveMatchBindingKeysAlloc(
@@ -764,6 +800,39 @@ test "parse supported graph queries accepts ranked query refs for vector retriev
 
 test "resolve graph selector fails closed for unbounded paged result refs" {
     try testResolveGraphSelectorFailClosedGuard(std.testing.allocator);
+}
+
+test "table-local graph result refs deduplicate nodes before applying limit" {
+    const alloc = std.testing.allocator;
+    const nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "doc:a", .depth = 0, .distance = 0, .path = null, .path_edges = null },
+        .{ .key = "doc:a", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+        .{ .key = "doc:b", .depth = 1, .distance = 1, .path = null, .path_edges = null },
+    };
+    const keys = try resolveTableLocalGraphNodeKeysAlloc(alloc, &nodes, 2);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("doc:a", keys[0]);
+    try std.testing.expectEqualStrings("doc:b", keys[1]);
+}
+
+test "table-local graph result refs reject qualified nodes" {
+    const nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "shared",
+        .table = "people",
+        .depth = 0,
+        .distance = 0,
+        .path = null,
+        .path_edges = null,
+    }};
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        resolveTableLocalGraphNodeKeysAlloc(std.testing.allocator, &nodes, 0),
+    );
 }
 
 test "parse supported graph queries accepts pattern requests" {

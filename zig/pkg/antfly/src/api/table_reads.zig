@@ -6788,7 +6788,8 @@ fn requiresDistributedGraphCoordinator(
         (group_count > 1 or
             req.graph_table_read_authorizer != null or
             distributed_graph.requiresCompleteMatchAnchors(req) or
-            graphRequestHasQualifiedIdentity(req));
+            graphRequestHasQualifiedIdentity(req) or
+            graphRequestHasResultRef(req));
 }
 
 /// Remove graph operations before shard fanout. Graph-only public requests do
@@ -6839,6 +6840,23 @@ fn graphRequestHasQualifiedIdentity(req: db_mod.types.SearchRequest) bool {
         }
     }
     return false;
+}
+
+fn graphRequestHasResultRef(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (selectorIsResultRef(graph_query.query.start_nodes)) return true;
+        if (graph_query.query.target_nodes) |selector| {
+            if (selectorIsResultRef(selector)) return true;
+        }
+    }
+    return false;
+}
+
+fn selectorIsResultRef(selector: graph_query_mod.NodeSelector) bool {
+    return switch (selector) {
+        .result_ref => true,
+        .keys, .identities => false,
+    };
 }
 
 fn selectorHasQualifiedIdentity(selector: graph_query_mod.NodeSelector) bool {
@@ -26093,6 +26111,31 @@ test "qualified graph endpoint requires coordination for a single source group" 
             .target_nodes = .{ .identities = &targets },
         },
     }};
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
+}
+
+test "graph result dependencies require coordination for a single source group" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{
+        .{
+            .name = "first",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_v1",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .params = .{},
+            },
+        },
+        .{
+            .name = "second",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_v1",
+                .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.first", .limit = 10 } },
+                .params = .{},
+            },
+        },
+    };
 
     try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
 }
