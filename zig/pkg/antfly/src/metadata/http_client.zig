@@ -424,6 +424,24 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableTransitionActive);
     }
 
+    /// Conditional form used across a transport boundary. Replaying this
+    /// request can never delete a table that reused the same name with a new
+    /// identity.
+    pub fn dropTableExpected(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        expected_table_id: u64,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}?expected_table_id={d}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            expected_table_id,
+        });
+        defer self.alloc.free(path);
+        try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableGenerationChanged);
+    }
+
     pub fn updateSchema(
         self: *MetadataHttpClient,
         base_uri: []const u8,

@@ -279,10 +279,14 @@ pub const ManagedRuntime = struct {
                             lease.guard()
                         else
                             null;
+                        const compaction_cancellation = if (held_lease) |*lease|
+                            lease.cancellation(self.cancellationToken())
+                        else
+                            self.cancellationToken();
                         var compacted = compactor.compactHeadGuardedUntil(
                             namespace.name,
                             publication_guard,
-                            self.cancellationToken(),
+                            compaction_cancellation,
                         ) catch |err| switch (err) {
                             error.HeadChanged => {
                                 stats.compact_head_conflicts += 1;

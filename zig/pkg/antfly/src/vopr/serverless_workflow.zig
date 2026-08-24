@@ -24,6 +24,7 @@ const query_mod = @import("../serverless/query/mod.zig");
 const document_segment = @import("../serverless/document_segment/mod.zig");
 const runtime_manager = @import("../serverless/runtime/manager.zig");
 const head_coordination = @import("../serverless/head_coordination.zig");
+const maintenance_cancellation = @import("../serverless/maintenance_cancellation.zig");
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
@@ -338,6 +339,14 @@ pub const Scenario = struct {
                         "worker-incumbent",
                         100,
                     )).?;
+                    // Cross the original expiry while the incumbent is in a
+                    // CPU checkpoint. The attached heartbeat must extend the
+                    // bootstrap claim before a duplicate worker can start.
+                    try self.sim.jumpRealtime(60);
+                    try incumbent.cancellation(maintenance_cancellation.Token{
+                        .io = self.sim.io(),
+                    }).check();
+                    try self.sim.jumpRealtime(60);
                     const contender = try self.runtime.runOnce();
                     self.duplicate_blocked = contender.work_lease_conflicts == 1 and
                         (self.progress.getHead("docs") catch 0) == 0;

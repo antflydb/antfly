@@ -2531,14 +2531,36 @@ pub const MetadataService = struct {
     }
 
     pub fn runRound(self: *MetadataService) !void {
+        try self.runRoundInternal(true);
+    }
+
+    /// Advances only metadata Raft. Embedded runtimes use the same dedicated
+    /// ticker boundary as the production HTTP metadata service so projection
+    /// and storage work cannot starve consensus progress.
+    pub fn runRaftRoundOnly(self: *MetadataService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try self.raft.runRaftRoundOnly();
+    }
+
+    /// Runs projection and reconciliation without advancing Raft. Callers
+    /// must concurrently drive `runRaftRoundOnly` at the configured cadence.
+    pub fn runControlRoundOnly(self: *MetadataService) !void {
+        try self.runRoundInternal(false);
+    }
+
+    fn runRoundInternal(self: *MetadataService, advance_raft: bool) !void {
         self.control_round_mutex.lockUncancelable(std.Options.debug_io);
         defer self.control_round_mutex.unlock(std.Options.debug_io);
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            try self.raft.runRaftRoundOnly();
+        if (advance_raft) {
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                try self.raft.runRaftRoundOnly();
+            }
         }
         if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;

@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const vector_quantizer = @import("antfly_vector").quantizer;
 const vector_types = @import("antfly_vector").vector;
 const vector_segment_mod = @import("../vector_segment/mod.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const BuildPolicy = struct {
     target_cluster_count: ?usize = null,
@@ -30,7 +31,7 @@ pub fn buildClusteredSegmentAlloc(
     dims: u32,
     entries: []vector_segment_mod.Entry,
 ) !vector_segment_mod.Segment {
-    return try buildClusteredSegmentWithPolicyAlloc(alloc, metric, dims, entries, .{});
+    return try buildClusteredSegmentWithPolicyAllocUntil(alloc, metric, dims, entries, .{}, null);
 }
 
 pub fn buildClusteredSegmentWithPolicyAlloc(
@@ -40,14 +41,27 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
     entries: []vector_segment_mod.Entry,
     policy: BuildPolicy,
 ) !vector_segment_mod.Segment {
-    const dim_count: usize = @intCast(dims);
+    return try buildClusteredSegmentWithPolicyAllocUntil(alloc, metric, dims, entries, policy, null);
+}
+
+pub fn buildClusteredSegmentWithPolicyAllocUntil(
+    alloc: Allocator,
+    metric: vector_types.DistanceMetric,
+    dims: u32,
+    entries: []vector_segment_mod.Entry,
+    policy: BuildPolicy,
+    cancellation: ?maintenance_cancellation.Token,
+) !vector_segment_mod.Segment {
     defer {
         for (entries) |*entry| entry.deinit(alloc);
         alloc.free(entries);
     }
+    try maintenance_cancellation.check(cancellation);
+    const dim_count: usize = @intCast(dims);
 
     if (metric == .cosine) {
-        for (entries) |entry| {
+        for (entries, 0..) |entry, idx| {
+            if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
             _ = vector_types.normalize(entry.vector);
         }
     }
@@ -59,7 +73,7 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
         alloc.free(centroids);
     }
 
-    try initializeCentroids(alloc, metric, centroids, entries);
+    try initializeCentroids(alloc, metric, centroids, entries, cancellation);
 
     const cluster_ids = try alloc.alloc(u32, entries.len);
     defer alloc.free(cluster_ids);
@@ -70,12 +84,12 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
     defer alloc.free(scratch_sums);
 
     for (0..3) |_| {
-        assignClusters(metric, entries, centroids, cluster_ids);
-        try recomputeCentroids(alloc, metric, centroids, entries, cluster_ids, scratch_counts, scratch_sums);
+        try assignClusters(metric, entries, centroids, cluster_ids, cancellation);
+        try recomputeCentroids(alloc, metric, centroids, entries, cluster_ids, scratch_counts, scratch_sums, cancellation);
     }
-    assignClusters(metric, entries, centroids, cluster_ids);
-    try rebalanceClusters(alloc, metric, entries, centroids, cluster_ids);
-    try recomputeCentroids(alloc, metric, centroids, entries, cluster_ids, scratch_counts, scratch_sums);
+    try assignClusters(metric, entries, centroids, cluster_ids, cancellation);
+    try rebalanceClusters(alloc, metric, entries, centroids, cluster_ids, cancellation);
+    try recomputeCentroids(alloc, metric, centroids, entries, cluster_ids, scratch_counts, scratch_sums, cancellation);
 
     const counts = try alloc.alloc(u32, cluster_count);
     defer alloc.free(counts);
@@ -91,6 +105,7 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
 
     var offset: u32 = 0;
     for (0..cluster_count) |cluster_idx| {
+        try maintenance_cancellation.check(cancellation);
         const centroid = try alloc.dupe(f32, centroids[cluster_idx]);
         clusters[cluster_idx] = .{
             .centroid = centroid,
@@ -118,6 +133,7 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
     for (clusters, 0..) |cluster, idx| write_offsets[idx] = cluster.start_index;
 
     for (entries, 0..) |entry, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         const cluster_idx: usize = cluster_ids[idx];
         const dst = write_offsets[cluster_idx];
         write_offsets[cluster_idx] += 1;
@@ -131,6 +147,7 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, dim_count, 42, metric);
     defer quantizer.deinit();
     for (clusters) |*cluster| {
+        try maintenance_cancellation.check(cancellation);
         const start: usize = cluster.start_index;
         const end: usize = start + cluster.entry_count;
         alloc.free(cluster.quantized_set);
@@ -178,6 +195,8 @@ pub fn buildClusteredSegmentWithPolicyAlloc(
         cluster.quantized_set = encoded_quantized;
     }
 
+    try maintenance_cancellation.check(cancellation);
+
     return .{
         .dims = dims,
         .metric = metric,
@@ -219,6 +238,7 @@ fn rebalanceClusters(
     entries: []const vector_segment_mod.Entry,
     centroids: []const []f32,
     cluster_ids: []u32,
+    cancellation: ?maintenance_cancellation.Token,
 ) !void {
     if (centroids.len <= 1 or entries.len <= centroids.len) return;
 
@@ -232,6 +252,7 @@ fn rebalanceClusters(
     for (cluster_ids) |cluster_id| counts[cluster_id] += 1;
 
     for (entries, 0..) |entry, entry_idx| {
+        if (entry_idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         const current_cluster: usize = cluster_ids[entry_idx];
         if (counts[current_cluster] <= max_size) continue;
 
@@ -261,11 +282,13 @@ fn initializeCentroids(
     metric: vector_types.DistanceMetric,
     centroids: [][]f32,
     entries: []const vector_segment_mod.Entry,
+    cancellation: ?maintenance_cancellation.Token,
 ) !void {
     if (centroids.len == 0) return;
     centroids[0] = try centroidCopyAlloc(alloc, metric, entries[0].vector);
     for (1..centroids.len) |idx| {
-        const selected = selectFarthestEntryIndex(metric, entries, centroids[0..idx]);
+        try maintenance_cancellation.check(cancellation);
+        const selected = try selectFarthestEntryIndex(metric, entries, centroids[0..idx], cancellation);
         centroids[idx] = try centroidCopyAlloc(alloc, metric, entries[selected].vector);
     }
 }
@@ -274,10 +297,12 @@ fn selectFarthestEntryIndex(
     metric: vector_types.DistanceMetric,
     entries: []const vector_segment_mod.Entry,
     centroids: []const []f32,
-) usize {
+    cancellation: ?maintenance_cancellation.Token,
+) !usize {
     var best_index: usize = 0;
     var best_distance: f32 = -std.math.inf(f32);
     for (entries, 0..) |entry, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         var closest_distance: f32 = std.math.inf(f32);
         for (centroids) |centroid| {
             const distance = routingDistance(entry.vector, centroid, metric);
@@ -296,8 +321,10 @@ fn assignClusters(
     entries: []const vector_segment_mod.Entry,
     centroids: []const []f32,
     cluster_ids: []u32,
-) void {
+    cancellation: ?maintenance_cancellation.Token,
+) !void {
     for (entries, 0..) |entry, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         var best_cluster: usize = 0;
         var best_score: f32 = -std.math.inf(f32);
         for (centroids, 0..) |centroid, cluster_idx| {
@@ -319,12 +346,14 @@ fn recomputeCentroids(
     cluster_ids: []const u32,
     counts: []u32,
     sums: []f32,
+    cancellation: ?maintenance_cancellation.Token,
 ) !void {
     const dim_count = centroids[0].len;
     @memset(counts, 0);
     @memset(sums, 0);
 
     for (entries, 0..) |entry, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         const cluster_idx: usize = cluster_ids[idx];
         counts[cluster_idx] += 1;
         const sum_slice = sums[cluster_idx * dim_count ..][0..dim_count];
@@ -332,8 +361,9 @@ fn recomputeCentroids(
     }
 
     for (centroids, 0..) |centroid, cluster_idx| {
+        try maintenance_cancellation.check(cancellation);
         if (counts[cluster_idx] == 0) {
-            const replacement = selectFarthestEntryIndex(metric, entries, centroids);
+            const replacement = try selectFarthestEntryIndex(metric, entries, centroids, cancellation);
             @memcpy(centroid, entries[replacement].vector);
             finalizeCentroid(metric, centroid);
             continue;
@@ -386,6 +416,56 @@ fn lessEntryForCluster(ctx: ClusterSortContext, lhs: vector_segment_mod.Entry, r
         return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
     }
     return lhs_distance < rhs_distance;
+}
+
+test "serverless vector builder observes cancellation inside clustering loops" {
+    const alloc = std.testing.allocator;
+    const entries = try alloc.alloc(vector_segment_mod.Entry, 256);
+    var initialized: usize = 0;
+    var entries_owned = true;
+    errdefer if (entries_owned) {
+        for (entries[0..initialized]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    };
+    for (entries, 0..) |*entry, idx| {
+        entry.* = .{
+            .doc_id = try std.fmt.allocPrint(alloc, "doc-{d}", .{idx}),
+            .vector = try alloc.dupe(f32, &.{
+                @as(f32, @floatFromInt(idx + 1)),
+                @as(f32, @floatFromInt((idx % 7) + 1)),
+                0.5,
+                1.0,
+            }),
+        };
+        initialized += 1;
+    }
+
+    var requested = std.atomic.Value(bool).init(false);
+    const CancelAfterTwoChecks = struct {
+        requested: *std.atomic.Value(bool),
+        checks: usize = 0,
+
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.checks += 1;
+            if (self.checks == 2) self.requested.store(true, .release);
+        }
+    };
+    var cancel_state = CancelAfterTwoChecks{ .requested = &requested };
+    const cancellation = (maintenance_cancellation.Token{
+        .io = std.testing.io,
+        .requested = &requested,
+    }).withCheckpoint(&cancel_state, CancelAfterTwoChecks.checkpoint);
+    const result = buildClusteredSegmentWithPolicyAllocUntil(
+        alloc,
+        .cosine,
+        4,
+        entries,
+        .{},
+        cancellation,
+    );
+    entries_owned = false;
+    try std.testing.expectError(error.Canceled, result);
 }
 
 test "vector builder scales cluster count beyond four for larger corpora" {

@@ -334,7 +334,7 @@ const backup_maintenance_target_retention_ns: u64 = 7 * std.time.ns_per_day;
 const restore_repository_retry_min_ms: u64 = 100;
 const restore_repository_retry_max_ms: u64 = 5_000;
 
-fn restoreRepositoryRetryDelayNs(job_id: u64, attempt_id: u64) u64 {
+fn restoreJobRetryDelayNs(job_id: u64, attempt_id: u64) u64 {
     const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
     const exponential_ms: u64 = @min(
         restore_repository_retry_min_ms << exponent,
@@ -535,10 +535,10 @@ const ClusterBackupMaintenanceQueue = struct {
     }
 };
 
-test "restore repository contention backoff is bounded and increasing" {
-    const first = restoreRepositoryRetryDelayNs(42, 1);
-    const second = restoreRepositoryRetryDelayNs(42, 2);
-    const capped = restoreRepositoryRetryDelayNs(42, 64);
+test "restore job retry backoff is bounded and increasing" {
+    const first = restoreJobRetryDelayNs(42, 1);
+    const second = restoreJobRetryDelayNs(42, 2);
+    const capped = restoreJobRetryDelayNs(42, 64);
     try std.testing.expect(first >= 75 * std.time.ns_per_ms);
     try std.testing.expect(second > first);
     try std.testing.expect(capped >= 3 * std.time.ns_per_s);
@@ -937,6 +937,7 @@ pub const StatusSource = struct {
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_table_expected: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -1012,6 +1013,18 @@ pub const StatusSource = struct {
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+    }
+
+    pub fn supportsExpectedTableDrop(self: StatusSource) bool {
+        return self.vtable.drop_table_expected != null;
+    }
+
+    /// Deletes only the table generation observed by the caller. This makes a
+    /// replay after an ambiguous transport failure safe even if the name has
+    /// since been reused by a newly created table.
+    pub fn dropTableExpected(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+        const fn_ptr = self.vtable.drop_table_expected orelse return error.UnsupportedOperation;
+        return try BoundaryAbi.call("drop_table_expected", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, expected_table_id });
     }
 
     /// Returns the generation committed by an authoritative backend when the
@@ -1171,6 +1184,10 @@ pub const StatusSource = struct {
                 return try dropTableOnService(cast(ptr), alloc, table_name);
             }
 
+            fn dropTableExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) anyerror!void {
+                return try dropTableOnServiceExpected(cast(ptr), alloc, table_name, expected_table_id);
+            }
+
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
                 _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
             }
@@ -1270,6 +1287,7 @@ pub const StatusSource = struct {
             .replace_table_definition = Gen.replaceTableDefinition,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
+            .drop_table_expected = Gen.dropTableExpected,
             .update_schema = Gen.updateSchema,
             .update_schema_versioned = Gen.updateSchemaVersioned,
             .create_index = Gen.createIndex,
@@ -1388,6 +1406,19 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, table.table_id);
+    try svc.runRound();
+}
+
+fn dropTableOnServiceExpected(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
+    if (table.table_id != expected_table_id) return error.TableGenerationChanged;
+    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    _ = try workflow.dropTable(svc, expected_table_id);
     try svc.runRound();
 }
 
@@ -3406,8 +3437,22 @@ pub const ApiHttpServer = struct {
         owned.items = &.{};
     }
 
-    fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
+    pub fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
         return (try self.source.cachedAdminSnapshot()) orelse try self.source.adminSnapshot();
+    }
+
+    /// Prefer an authority-fenced identity for destructive name-based
+    /// mutations. A coherent cached view is a progress fallback when the
+    /// authority read itself is transiently unavailable; the conditional
+    /// table ID still prevents that fallback from deleting a newer identity.
+    pub fn tableDropSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
+        const request: api_operation.RequestContext = .{};
+        if (self.source.linearizableSnapshot(request)) |snapshot| {
+            if (snapshot) |value| return value;
+        } else |err| {
+            if (!isTransientMetadataObservationError(err)) return err;
+        }
+        return try self.statusAdminSnapshot();
     }
 
     fn appendRemoteRuntimeStatusesFromSnapshot(
@@ -6229,6 +6274,54 @@ pub const ApiHttpServer = struct {
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             sleepNs(poll_interval_ns);
         }
+    }
+
+    pub const TableIdentityRetirement = enum {
+        absent,
+        replaced,
+    };
+
+    /// Observes retirement of one exact table identity. A same-name table
+    /// with a different ID is success for the original delete and must never
+    /// be treated as a reason to replay against the new object.
+    pub fn waitForTableIdentityRetirement(self: *ApiHttpServer, table_name: []const u8, expected_table_id: u64) !TableIdentityRetirement {
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            var maybe_snapshot = self.source.adminSnapshot() catch |err| {
+                if (!isTransientMetadataObservationError(err)) return err;
+                if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
+                    return error.MetadataMutationOutcomeUnknown;
+                sleepNs(poll_interval_ns);
+                continue;
+            };
+            if (maybe_snapshot) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                const table = tables_api.findTableByName(snapshot, table_name) orelse return .absent;
+                if (table.table_id != expected_table_id) return .replaced;
+            } else {
+                return error.UnsupportedOperation;
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
+                return error.MetadataMutationOutcomeUnknown;
+            sleepNs(poll_interval_ns);
+        }
+    }
+
+    pub fn dropTableMetadata(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: ?u64) !TableIdentityRetirement {
+        if (expected_table_id) |table_id| {
+            if (self.source.supportsExpectedTableDrop()) {
+                self.source.dropTableExpected(alloc, table_name, table_id) catch |err| {
+                    if (err != error.TableGenerationChanged and !isAmbiguousMetadataMutationError(err)) return err;
+                };
+                return try self.waitForTableIdentityRetirement(table_name, table_id);
+            }
+        }
+
+        try self.source.dropTable(alloc, table_name);
+        try self.waitForTableVisibility(table_name, .absent);
+        return .absent;
     }
 
     pub fn waitForProjectedTablePresence(self: *ApiHttpServer, table_name: []const u8) !void {
@@ -9282,7 +9375,11 @@ pub const ApiHttpServer = struct {
                 },
                 else => {
                     if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                    return mapExecuteRestoreError(err);
+                    const mapped = mapExecuteRestoreError(err);
+                    if (mapped == error.InternalFailure) {
+                        std.log.err("table restore failed phase=metadata table={s} class={s}", .{ table_name, @errorName(err) });
+                    }
+                    return mapped;
                 },
             }) {
                 return;
@@ -9298,7 +9395,11 @@ pub const ApiHttpServer = struct {
             },
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                return mapExecuteRestoreError(err);
+                const mapped = mapExecuteRestoreError(err);
+                if (mapped == error.InternalFailure) {
+                    std.log.err("table restore failed phase=local table={s} class={s}", .{ table_name, @errorName(err) });
+                }
+                return mapped;
             },
         };
         if (outcome == .committed_durable) return error.RestoreDurabilityConfirmed;
@@ -11238,17 +11339,23 @@ pub const ApiHttpServer = struct {
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
         var group_ids: ?[]u64 = null;
         defer if (group_ids) |values| self.alloc.free(values);
-        if (self.table_writes != null) {
-            if (try self.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.source.freeAdminSnapshot(&snapshot);
+        var expected_table_id: ?u64 = null;
+        if (try self.tableDropSnapshot()) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            if (tables_api.findTableByName(&snapshot, table_name)) |table| {
+                expected_table_id = table.table_id;
+            }
+            if (self.table_writes != null) {
                 group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
             }
         }
-        self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+        _ = self.dropTableMetadata(self.alloc, table_name, expected_table_id) catch |err| return switch (err) {
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table changed; retry delete"),
             error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
             error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            error.MetadataMutationOutcomeUnknown => try contextual_operations.textAlloc(self.alloc, 503, "table delete outcome unknown"),
             else => return err,
         };
         if (self.table_writes) |writes| {
@@ -11257,10 +11364,6 @@ pub const ApiHttpServer = struct {
                 else => return err,
             };
         }
-        self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table delete did not converge"),
-            else => return err,
-        };
         return try contextual_operations.textAlloc(self.alloc, 204, "");
     }
 
@@ -12437,6 +12540,22 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
     }
 
+    fn retryRunningRestoreJob(
+        self: *ApiHttpServer,
+        state: restore_jobs.JobState,
+        err: anyerror,
+    ) !void {
+        const retried = try self.restore_job_store.retryRunning(
+            self.alloc,
+            state,
+            @errorName(err),
+            restoreJobRetryDelayNs(state.job_id, state.attempt_id),
+        );
+        self.alloc.free(retried);
+        self.signalRestoreRetryWakeup();
+        try self.ensureRestoreRetryWakeup();
+    }
+
     fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
         if (!self.restoreExecutionPermitted()) {
             try self.restore_job_store.requeuePending(job_id);
@@ -12468,7 +12587,8 @@ pub const ApiHttpServer = struct {
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
                         self.checkpointRestoreTableStarted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                            if (err == error.RestoreJobFenced) return error.RestoreJobFenced;
+                            if (metadata_authority.isRetryableError(err)) return try self.retryRunningRestoreJob(state, err);
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -12491,9 +12611,11 @@ pub const ApiHttpServer = struct {
                         // return came through metadata reconciliation and owns a
                         // distributed restore intent to wait on below.
                         error.RestoreDurabilityConfirmed => restored_via_metadata = false,
+                        error.NotLeader => return try self.retryRunningRestoreJob(state, err),
                         error.RestoreDurabilityPending => {
                             self.checkpointRestoreTableDurabilityPending(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |checkpoint_err| {
-                                if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.RestoreJobFenced;
+                                if (checkpoint_err == error.RestoreJobFenced) return error.RestoreJobFenced;
+                                if (metadata_authority.isRetryableError(checkpoint_err)) return try self.retryRunningRestoreJob(state, checkpoint_err);
                                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(checkpoint_err));
                                 self.alloc.free(failed);
                                 return;
@@ -12511,7 +12633,8 @@ pub const ApiHttpServer = struct {
                         },
                     };
                     self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (err == error.RestoreJobFenced) return error.RestoreJobFenced;
+                        if (metadata_authority.isRetryableError(err)) return try self.retryRunningRestoreJob(state, err);
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -12520,7 +12643,11 @@ pub const ApiHttpServer = struct {
                     // A resumed job may already have crossed publication. Infer
                     // which completion protocol owns it from durable metadata;
                     // local fallback restores intentionally have no such intent.
-                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id, state.backup_id)) {
+                    const intent_state = self.distributedRestoreIntentState(table_name, state.location, state.backup_id, state.backup_id) catch |err| {
+                        if (metadata_authority.isRetryableError(err)) return try self.retryRunningRestoreJob(state, err);
+                        return err;
+                    };
+                    restored_via_metadata = switch (intent_state) {
                         .pending, .completed => true,
                         .missing => false,
                         .conflicting => {
@@ -12532,14 +12659,15 @@ pub const ApiHttpServer = struct {
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
-                        if (metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (metadata_authority.isRetryableError(err)) return try self.retryRunningRestoreJob(state, err);
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
                     };
                 }
                 self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                    if (err == error.RestoreJobFenced) return error.RestoreJobFenced;
+                    if (metadata_authority.isRetryableError(err)) return try self.retryRunningRestoreJob(state, err);
                     const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                     self.alloc.free(failed);
                     return;
@@ -12555,24 +12683,10 @@ pub const ApiHttpServer = struct {
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (err == error.BackupRepositoryBusy) {
-                    const retry_delay_ns = restoreRepositoryRetryDelayNs(
-                        state.job_id,
-                        state.attempt_id,
-                    );
-                    const retried = try self.restore_job_store.retryRunning(
-                        self.alloc,
-                        state,
-                        @errorName(err),
-                        retry_delay_ns,
-                    );
-                    self.alloc.free(retried);
-                    self.signalRestoreRetryWakeup();
-                    try self.ensureRestoreRetryWakeup();
-                    return;
+                    return try self.retryRunningRestoreJob(state, err);
                 }
-                if (err == error.NotLeader or err == error.RestoreJobFenced) {
-                    return error.RestoreJobFenced;
-                }
+                if (err == error.NotLeader) return try self.retryRunningRestoreJob(state, err);
+                if (err == error.RestoreJobFenced) return error.RestoreJobFenced;
                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                 self.alloc.free(failed);
                 return;
@@ -17213,6 +17327,36 @@ fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
 pub fn shouldRetryMetadataMutation(err: anyerror, elapsed_ns: u64, timeout_ns: u64) bool {
     return elapsed_ns < timeout_ns and
         (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err));
+}
+
+fn isTransientMetadataObservationError(err: anyerror) bool {
+    if (metadata_authority.isRetryableError(err)) return true;
+    return switch (err) {
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        => true,
+        else => false,
+    };
+}
+
+fn isAmbiguousMetadataMutationError(err: anyerror) bool {
+    return switch (err) {
+        error.MetadataMutationOutcomeUnknown,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        => true,
+        else => false,
+    };
 }
 
 test "public metadata mutation retries transient authority loss only within its deadline" {
@@ -32999,12 +33143,14 @@ test "api index status reports missing remote shard as not ready" {
     try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
 }
 
-test "api http server drop table waits for metadata lifecycle absence" {
+test "api http server drop table resolves ambiguous completion without deleting replacement identity" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
         created: bool = true,
-        lifecycle_wait_calls: std.atomic.Value(u32) = .init(0),
+        table_id: u64 = 1,
+        expected_drop_calls: std.atomic.Value(u32) = .init(0),
+        admin_snapshot_calls: std.atomic.Value(u32) = .init(0),
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -33012,9 +33158,10 @@ test "api http server drop table waits for metadata lifecycle absence" {
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .cached_admin_snapshot = cachedAdminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .drop_table = dropTable,
-                    .wait_table_lifecycle = waitTableLifecycle,
+                    .drop_table_expected = dropTableExpected,
                 },
             };
         }
@@ -33023,13 +33170,12 @@ test "api http server drop table waits for metadata lifecycle absence" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
+        fn snapshot(self: *@This()) metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = if (self.created)
                     @constCast((&[_]metadata_table_manager.TableRecord{.{
-                        .table_id = 1,
+                        .table_id = self.table_id,
                         .name = "docs",
                         .placement_role = "data",
                     }})[0..])
@@ -33038,7 +33184,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
                 .ranges = if (self.created)
                     @constCast((&[_]metadata_table_manager.RangeRecord{.{
                         .group_id = 10,
-                        .table_id = 1,
+                        .table_id = self.table_id,
                         .start_key = "",
                         .end_key = null,
                     }})[0..])
@@ -33051,19 +33197,32 @@ test "api http server drop table waits for metadata lifecycle absence" {
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            self.created = false;
+            _ = self.admin_snapshot_calls.fetchAdd(1, .monotonic);
+            return self.snapshot();
         }
 
-        fn waitTableLifecycle(ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) !void {
+        fn cachedAdminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot();
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn dropTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn dropTableExpected(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqual(TableVisibility.absent, expected);
-            _ = self.lifecycle_wait_calls.fetchAdd(1, .monotonic);
+            try std.testing.expectEqual(@as(u64, 1), expected_table_id);
+            _ = self.expected_drop_calls.fetchAdd(1, .monotonic);
+            // The old identity committed its delete, but the response was
+            // lost and another creator immediately reused the name.
+            self.table_id = 2;
+            return error.Timeout;
         }
     };
 
@@ -33097,7 +33256,9 @@ test "api http server drop table waits for metadata lifecycle absence" {
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
-    try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), source.table_id);
+    try std.testing.expectEqual(@as(u32, 1), source.expected_drop_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), source.admin_snapshot_calls.load(.monotonic));
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {

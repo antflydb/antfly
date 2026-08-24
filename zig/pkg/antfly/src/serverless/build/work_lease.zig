@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const head_coordination = @import("../head_coordination.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const Acquisition = struct {
     fencing_token: u64,
@@ -63,6 +64,14 @@ pub const Provider = struct {
             []const u8,
             u64,
         ) anyerror!bool,
+        renew_bootstrap: *const fn (
+            *anyopaque,
+            []const u8,
+            []const u8,
+            u64,
+            u64,
+            u64,
+        ) anyerror!u64,
     };
 
     pub fn acquire(
@@ -165,12 +174,31 @@ pub const Provider = struct {
             fencing_token,
         );
     }
+
+    pub fn renewBootstrap(
+        self: Provider,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !u64 {
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        return try self.vtable.renew_bootstrap(
+            self.ptr,
+            namespace,
+            owner_id,
+            fencing_token,
+            now_unix_ns,
+            ttl_ns,
+        );
+    }
 };
 
 pub const PublicationGuard = struct {
     ptr: *anyopaque,
     check_fn: *const fn (*anyopaque, []const u8) anyerror!void,
-    prepare_fn: *const fn (*anyopaque, []const u8) anyerror!head_coordination.Fence,
+    prepare_fn: *const fn (*anyopaque, []const u8) anyerror!?head_coordination.Fence,
 
     pub fn check(self: PublicationGuard, namespace: []const u8) !void {
         try self.check_fn(self.ptr, namespace);
@@ -178,7 +206,7 @@ pub const PublicationGuard = struct {
 
     /// Renews ownership and returns the proof that the progress backend must
     /// compare atomically with the visible-head update.
-    pub fn preparePublication(self: PublicationGuard, namespace: []const u8) !head_coordination.Fence {
+    pub fn preparePublication(self: PublicationGuard, namespace: []const u8) !?head_coordination.Fence {
         return try self.prepare_fn(self.ptr, namespace);
     }
 };
@@ -201,6 +229,10 @@ pub const HeldLease = struct {
             .check_fn = checkPublication,
             .prepare_fn = preparePublication,
         };
+    }
+
+    pub fn cancellation(self: *HeldLease, token: maintenance_cancellation.Token) maintenance_cancellation.Token {
+        return token.withCheckpoint(self, erasedMaintenanceCheckpoint);
     }
 
     pub fn validate(self: *HeldLease) !void {
@@ -239,10 +271,27 @@ pub const HeldLease = struct {
     }
 
     fn checkPublication(ptr: *anyopaque, namespace: []const u8) !void {
-        _ = try preparePublication(ptr, namespace);
+        const self: *HeldLease = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, namespace, self.namespace)) {
+            return error.WorkLeaseNamespaceMismatch;
+        }
+        try self.renewIfNeeded();
     }
 
-    fn preparePublication(ptr: *anyopaque, namespace: []const u8) !head_coordination.Fence {
+    fn renewIfNeeded(self: *HeldLease) !void {
+        const now = nowUnixNs(self.io);
+        const renew_margin = @max(@as(u64, 1), self.ttl_ns / 2);
+        if (self.acquisition.expires_at_unix_ns > now and
+            self.acquisition.expires_at_unix_ns - now > renew_margin) return;
+        try self.renew(self.ttl_ns);
+    }
+
+    fn erasedMaintenanceCheckpoint(ptr: *anyopaque) !void {
+        const self: *HeldLease = @ptrCast(@alignCast(ptr));
+        try self.renewIfNeeded();
+    }
+
+    fn preparePublication(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {
         const self: *HeldLease = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, namespace, self.namespace)) {
             return error.WorkLeaseNamespaceMismatch;
@@ -262,10 +311,35 @@ pub const HeldLease = struct {
 /// Publication remains fenced by the absent-to-present HEAD CAS.
 pub const HeldBootstrapLease = struct {
     provider: Provider,
+    io: std.Io,
     namespace: []const u8,
     owner_id: []const u8,
     acquisition: Acquisition,
+    ttl_ns: u64,
     released: bool = false,
+
+    pub fn guard(self: *HeldBootstrapLease) PublicationGuard {
+        return .{
+            .ptr = self,
+            .check_fn = checkPublication,
+            .prepare_fn = preparePublication,
+        };
+    }
+
+    pub fn cancellation(self: *HeldBootstrapLease, token: maintenance_cancellation.Token) maintenance_cancellation.Token {
+        return token.withCheckpoint(self, erasedMaintenanceCheckpoint);
+    }
+
+    pub fn renew(self: *HeldBootstrapLease) !void {
+        if (self.released) return error.WorkLeaseLost;
+        self.acquisition.expires_at_unix_ns = try self.provider.renewBootstrap(
+            self.namespace,
+            self.owner_id,
+            self.acquisition.fencing_token,
+            nowUnixNs(self.io),
+            self.ttl_ns,
+        );
+    }
 
     pub fn release(self: *HeldBootstrapLease) !bool {
         if (self.released) return false;
@@ -276,6 +350,39 @@ pub const HeldBootstrapLease = struct {
         );
         self.released = released;
         return released;
+    }
+
+    fn checkPublication(ptr: *anyopaque, namespace: []const u8) !void {
+        const self: *HeldBootstrapLease = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, namespace, self.namespace)) {
+            return error.WorkLeaseNamespaceMismatch;
+        }
+        try self.renewIfNeeded();
+    }
+
+    fn preparePublication(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {
+        const self: *HeldBootstrapLease = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, namespace, self.namespace)) {
+            return error.WorkLeaseNamespaceMismatch;
+        }
+        // A fresh TTL closes the expensive-build takeover window around the
+        // short absent-to-present HEAD CAS. The CAS remains rollback-safe and
+        // intentionally carries no HEAD fencing metadata.
+        try self.renew();
+        return null;
+    }
+
+    fn renewIfNeeded(self: *HeldBootstrapLease) !void {
+        const now = nowUnixNs(self.io);
+        const renew_margin = @max(@as(u64, 1), self.ttl_ns / 2);
+        if (self.acquisition.expires_at_unix_ns > now and
+            self.acquisition.expires_at_unix_ns - now > renew_margin) return;
+        try self.renew();
+    }
+
+    fn erasedMaintenanceCheckpoint(ptr: *anyopaque) !void {
+        const self: *HeldBootstrapLease = @ptrCast(@alignCast(ptr));
+        try self.renewIfNeeded();
     }
 };
 
@@ -317,9 +424,11 @@ pub fn acquireBootstrapHeld(
     )) orelse return null;
     return .{
         .provider = provider,
+        .io = io,
         .namespace = namespace,
         .owner_id = owner_id,
         .acquisition = acquisition,
+        .ttl_ns = ttl_ns,
     };
 }
 
