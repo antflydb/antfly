@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
     from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
     from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+    from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -29,6 +30,7 @@ class EmbeddingsIndexStats:
 
     Attributes:
         index_type (EmbeddingsIndexStatsIndexType): Discriminator for the index stats variant.
+        readiness (IndexReadinessStatus | Unset):
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of vectors/documents in the index
         disk_usage (int | Unset): Size of the index in bytes
@@ -103,6 +105,7 @@ class EmbeddingsIndexStats:
     """
 
     index_type: EmbeddingsIndexStatsIndexType
+    readiness: IndexReadinessStatus | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -165,6 +168,10 @@ class EmbeddingsIndexStats:
 
     def to_dict(self) -> dict[str, Any]:
         index_type = self.index_type.value
+
+        readiness: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.readiness, Unset):
+            readiness = self.readiness.to_dict()
 
         error = self.error
 
@@ -305,6 +312,8 @@ class EmbeddingsIndexStats:
                 "index_type": index_type,
             }
         )
+        if readiness is not UNSET:
+            field_dict["readiness"] = readiness
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -433,10 +442,18 @@ class EmbeddingsIndexStats:
         from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
         from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
         from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+        from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = EmbeddingsIndexStatsIndexType(d.pop("index_type"))
+
+        _readiness = d.pop("readiness", UNSET)
+        readiness: IndexReadinessStatus | Unset
+        if isinstance(_readiness, Unset):
+            readiness = UNSET
+        else:
+            readiness = IndexReadinessStatus.from_dict(_readiness)
 
         error = d.pop("error", UNSET)
 
@@ -596,6 +613,7 @@ class EmbeddingsIndexStats:
 
         embeddings_index_stats = cls(
             index_type=index_type,
+            readiness=readiness,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

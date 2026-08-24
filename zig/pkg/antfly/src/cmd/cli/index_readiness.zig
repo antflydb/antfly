@@ -32,6 +32,7 @@ pub fn coverageReady(status: antfly_client.types.DerivedCoverageStatus) bool {
 }
 
 pub fn embeddingIndexReady(stats: antfly_client.types.EmbeddingsIndexStats) bool {
+    if (stats.readiness) |readiness| return readiness.state == .ready;
     if (stats.@"error" != null) return false;
     if (stats.backfill_state) |state| {
         if (!std.mem.eql(u8, state, "ready")) return false;
@@ -58,7 +59,9 @@ fn printEmbeddingReadinessWarning(
     };
     if (embeddingIndexReady(stats)) return;
 
-    const state = if (stats.coverage) |coverage|
+    const state = if (stats.readiness) |readiness|
+        @tagName(readiness.state)
+    else if (stats.coverage) |coverage|
         if (coverage.config_mismatch_group_count > 0) "config_mismatch" else stats.backfill_state orelse "not_ready"
     else if (stats.backfill_state != null and std.mem.eql(u8, stats.backfill_state.?, "ready"))
         "coverage_unavailable"

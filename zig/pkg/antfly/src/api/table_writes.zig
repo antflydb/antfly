@@ -721,7 +721,10 @@ fn moveDroppedGroupPathToTrash(
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), trash_dir_path);
     std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io_impl.io()) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => {
+            alloc.free(trash_path);
+            return null;
+        },
         else => return err,
     };
     return trash_path;
@@ -5404,6 +5407,7 @@ pub const ProvisionedTableWriteSource = struct {
         complete,
         busy,
         repair_pending,
+        publication_pending,
     };
 
     const StructuralRuntimeObservation = struct {
@@ -5533,6 +5537,11 @@ pub const ProvisionedTableWriteSource = struct {
         // repaired generation publishes its final visibility boundary.
         repair_handoff_status_pending: usize = 0,
         repair_handoff_clear_observed: bool = false,
+        // Managed index creation can synchronously append durable replay work
+        // while leaving its execution to the resident asynchronous owner. Keep
+        // status fail-closed across that handoff until the owner publishes a
+        // consistent post-append observation carrying the real replay target.
+        publication_handoffs: std.ArrayListUnmanaged(PublicationHandoff) = .empty,
         restore_preparations: usize = 0,
         generation_preparation_active: bool = false,
 
@@ -5541,6 +5550,34 @@ pub const ProvisionedTableWriteSource = struct {
                 self.structural_reconcile_queued > 0 or
                 self.structural_reconcile_waiters > 0;
         }
+
+        fn deinit(self: *TableActivity) void {
+            for (self.publication_handoffs.items) |*handoff| handoff.deinit();
+            self.publication_handoffs.deinit(std.heap.page_allocator);
+            std.heap.page_allocator.free(self.table_name);
+            self.* = undefined;
+        }
+    };
+
+    const PublicationHandoff = struct {
+        index_name: []u8,
+        coverage_generation: u64,
+        coverage_config_hash: u64,
+        producer_target_sequence: u64,
+        requires_blocking: bool,
+
+        fn deinit(self: *PublicationHandoff) void {
+            std.heap.page_allocator.free(self.index_name);
+            self.* = undefined;
+        }
+    };
+
+    const PublicationHandoffTarget = struct {
+        index_name: []const u8,
+        coverage_generation: u64,
+        coverage_config_hash: u64,
+        producer_target_sequence: u64,
+        requires_blocking: bool,
     };
 
     const StatusRequestAdmission = enum {
@@ -6131,9 +6168,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.startup_catch_up_backoffs = .empty;
         self.startup_catch_up_backoff_mutex.unlock();
         self.table_activity_mutex.lockUncancelable(io);
-        for (self.active_table_activities.items) |entry| {
-            std.heap.page_allocator.free(entry.table_name);
-        }
+        for (self.active_table_activities.items) |*entry| entry.deinit();
         self.active_table_activities.deinit(std.heap.page_allocator);
         self.active_table_activities = .empty;
         self.table_activity_mutex.unlock(io);
@@ -6322,9 +6357,9 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.status_request_active > 0 or entry.structural_waiters > 0 or entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.structural_reconcile_status_pending > 0 or entry.repair_handoff_status_pending > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
-        const removed = self.active_table_activities.swapRemove(index);
-        std.heap.page_allocator.free(removed.table_name);
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.status_request_active > 0 or entry.structural_waiters > 0 or entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.structural_reconcile_status_pending > 0 or entry.repair_handoff_status_pending > 0 or entry.publication_handoffs.items.len > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
+        var removed = self.active_table_activities.swapRemove(index);
+        removed.deinit();
         if (self.active_table_activities.items.len == 0) {
             self.active_table_activities.deinit(std.heap.page_allocator);
             self.active_table_activities = .empty;
@@ -6494,6 +6529,154 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn ensureStructuralPublicationHandoffStatus(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        target: PublicationHandoffTarget,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const table_index = self.findTableActivityLocked(table_name, null) orelse return;
+        std.debug.assert(self.active_table_activities.items[table_index].structural_reconcile_status_pending > 0);
+        const entry = self.activityEntryLocked(table_name, group_id);
+        for (entry.publication_handoffs.items) |*handoff| {
+            if (!std.mem.eql(u8, handoff.index_name, target.index_name)) continue;
+            if (handoff.coverage_generation == target.coverage_generation and
+                handoff.coverage_config_hash == target.coverage_config_hash)
+            {
+                handoff.producer_target_sequence = @max(handoff.producer_target_sequence, target.producer_target_sequence);
+                handoff.requires_blocking = handoff.requires_blocking or target.requires_blocking;
+                return;
+            }
+            // A later incarnation for the same public name supersedes the old
+            // create. Its own handoff protects the only status users can now
+            // observe, so retaining the obsolete target would strand polling.
+            handoff.deinit();
+            handoff.* = .{
+                .index_name = std.heap.page_allocator.dupe(u8, target.index_name) catch @panic("failed to allocate publication handoff index name"),
+                .coverage_generation = target.coverage_generation,
+                .coverage_config_hash = target.coverage_config_hash,
+                .producer_target_sequence = target.producer_target_sequence,
+                .requires_blocking = target.requires_blocking,
+            };
+            return;
+        }
+        const owned_name = std.heap.page_allocator.dupe(u8, target.index_name) catch @panic("failed to allocate publication handoff index name");
+        entry.publication_handoffs.append(std.heap.page_allocator, .{
+            .index_name = owned_name,
+            .coverage_generation = target.coverage_generation,
+            .coverage_config_hash = target.coverage_config_hash,
+            .producer_target_sequence = target.producer_target_sequence,
+            .requires_blocking = target.requires_blocking,
+        }) catch {
+            std.heap.page_allocator.free(owned_name);
+            @panic("failed to allocate publication handoff");
+        };
+    }
+
+    fn retireDroppedTablePublicationAuthority(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+
+        // The successful drop owns the table-wide structural fence, so no new
+        // reconcile can install publication authority while this allocation-free
+        // cleanup retires every old group incarnation. Those deleted DBs can no
+        // longer publish the edge that would otherwise release status polling.
+        const table_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+        std.debug.assert(self.active_table_activities.items[table_index].structural_active);
+        var index: usize = 0;
+        while (index < self.active_table_activities.items.len) {
+            const entry = &self.active_table_activities.items[index];
+            if (!std.mem.eql(u8, entry.table_name, table_name) or
+                (entry.repair_handoff_status_pending == 0 and entry.publication_handoffs.items.len == 0))
+            {
+                index += 1;
+                continue;
+            }
+
+            const group_id = entry.group_id;
+            entry.repair_handoff_status_pending = 0;
+            entry.repair_handoff_clear_observed = false;
+            for (entry.publication_handoffs.items) |*handoff| handoff.deinit();
+            entry.publication_handoffs.deinit(std.heap.page_allocator);
+            entry.publication_handoffs = .empty;
+
+            const previous_len = self.active_table_activities.items.len;
+            self.pruneTableActivityLocked(table_name, group_id);
+            // swapRemove puts an unvisited entry at this index. Revisit it when
+            // pruning succeeded; otherwise advance past the still-active entry.
+            if (self.active_table_activities.items.len == previous_len) index += 1;
+        }
+    }
+
+    fn settlePublicationHandoffStatusBestEffort(
+        self: *ProvisionedTableWriteSource,
+        snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+        table_name: []const u8,
+        group_id: u64,
+        blocking: bool,
+    ) bool {
+        // This runs after ordinary status publications too. Preserve the hot
+        // path's allocation profile by cloning a cached status only when an
+        // actual create handoff is waiting for that observation.
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        const pending = if (self.findTableActivityLocked(table_name, group_id)) |index|
+            self.active_table_activities.items[index].publication_handoffs.items.len != 0
+        else
+            false;
+        self.table_activity_mutex.unlock(io);
+        if (!pending) return false;
+
+        var status = (snapshot_cache.snapshotGroupStatus(snapshot_cache.alloc, table_name, group_id) catch return false) orelse return false;
+        defer status.deinit(snapshot_cache.alloc);
+
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        const entry = &self.active_table_activities.items[index];
+        var settled = false;
+        var handoff_index: usize = 0;
+        while (handoff_index < entry.publication_handoffs.items.len) {
+            const handoff = entry.publication_handoffs.items[handoff_index];
+            const current = for (status.stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, handoff.index_name)) break item;
+            } else null;
+            const complete = if (current) |item| blk: {
+                // Absence or replacement settles the obsolete target on any
+                // authoritative publication: its old dense worker may already
+                // be gone and therefore cannot emit another blocking edge.
+                if (item.coverage_generation != handoff.coverage_generation or
+                    item.coverage_config_hash != handoff.coverage_config_hash)
+                {
+                    break :blk true;
+                }
+                // Only the same dense incarnation needs the stronger
+                // post-watermark publication boundary.
+                if (handoff.requires_blocking and !blocking) break :blk false;
+                break :blk status.stats.enrichment.applied_sequence >= handoff.producer_target_sequence and
+                    item.replay_applied_sequence >= item.replay_target_sequence and
+                    !item.replay_catch_up_required and
+                    !item.catch_up_active and
+                    !item.backfill_active;
+            } else true;
+            if (!complete) {
+                handoff_index += 1;
+                continue;
+            }
+            var removed = entry.publication_handoffs.swapRemove(handoff_index);
+            removed.deinit();
+            settled = true;
+        }
+        if (!settled) return false;
+        self.pruneTableActivityLocked(table_name, group_id);
+        self.table_activity_ready.broadcast(io);
+        return true;
+    }
+
     fn settleRepairHandoffStatusBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -6643,7 +6826,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.repair_handoff_status_pending > 0) return true;
+            if (entry.repair_handoff_status_pending > 0 or entry.publication_handoffs.items.len > 0) return true;
         }
         return self.hasAnyReadBlockingGroupOperationLocked(table_name);
     }
@@ -8559,7 +8742,9 @@ pub const ProvisionedTableWriteSource = struct {
                 if (self.deferManagedRuntimeStatusPublication(table_name, true)) return;
                 if (db) |managed_db| {
                     if (self.runtime_status_cache) |snapshot_cache| {
+                        var published = true;
                         publishRuntimeStatusSnapshotConsistentIfAvailable(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
+                            published = false;
                             if (err != error.WriterLocked) {
                                 std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
                                     table_name,
@@ -8568,6 +8753,7 @@ pub const ProvisionedTableWriteSource = struct {
                                 });
                             }
                         };
+                        if (published) _ = self.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
                         self.invalidateReadCache(table_name);
                         self.markWriteCacheDirty(table_name);
                         self.notifyLocalChange(table_name, .data);
@@ -8592,6 +8778,7 @@ pub const ProvisionedTableWriteSource = struct {
                             self.notifyLocalChange(table_name, .data);
                             return;
                         };
+                        _ = self.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, true);
                         self.invalidateReadCache(table_name);
                         self.clearDirtyWriteTable(table_name);
                         self.notifyLocalChange(table_name, .data);
@@ -12289,6 +12476,14 @@ pub const ProvisionedTableWriteSource = struct {
                     lifecycle_transition = true;
                     plan.markCurrentComplete();
                 },
+                .publication_pending => {
+                    // The durable replay append is complete, but its resident
+                    // owner has not yet published the post-append target. The
+                    // shard-local handoff fence bridges that scheduler edge
+                    // without retaining table write admission.
+                    made_progress = true;
+                    plan.markCurrentComplete();
+                },
                 .complete => {
                     made_progress = true;
                     plan.markCurrentComplete();
@@ -12594,6 +12789,33 @@ pub const ProvisionedTableWriteSource = struct {
                     switch (catch_up) {
                         .complete => {},
                         .retry => return .busy,
+                        .asynchronous => |producer_target_sequence| {
+                            appendStructuralRuntimeStatusObservation(
+                                self,
+                                alloc,
+                                table_name,
+                                group_id,
+                                cached.db,
+                                lsm_root_generation,
+                                .artifact_rebuild,
+                                observations,
+                            ) catch |err| {
+                                lockAtomic(&self.local_db_mutex);
+                                defer self.local_db_mutex.unlock();
+                                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                                cached_active = false;
+                                return err;
+                            };
+                            if (markLatestStructuralIndexPublicationPending(
+                                observations,
+                                item.name,
+                                producer_target_sequence,
+                                item.kind == .dense_vector,
+                            )) |target| {
+                                self.ensureStructuralPublicationHandoffStatus(table_name, group_id, target);
+                                return .publication_pending;
+                            }
+                        },
                         .delegated => {
                             appendStructuralRuntimeStatusObservation(
                                 self,
@@ -12737,6 +12959,27 @@ pub const ProvisionedTableWriteSource = struct {
                 )) {
                     .complete => {},
                     .retry => return .busy,
+                    .asynchronous => |producer_target_sequence| {
+                        try appendStructuralRuntimeStatusObservation(
+                            self,
+                            alloc,
+                            table_name,
+                            group_id,
+                            &db,
+                            lsm_root_generation,
+                            .artifact_rebuild,
+                            observations,
+                        );
+                        if (markLatestStructuralIndexPublicationPending(
+                            observations,
+                            item.name,
+                            producer_target_sequence,
+                            item.kind == .dense_vector,
+                        )) |target| {
+                            self.ensureStructuralPublicationHandoffStatus(table_name, group_id, target);
+                            return .publication_pending;
+                        }
+                    },
                     .delegated => {
                         try appendStructuralRuntimeStatusObservation(
                             self,
@@ -13616,6 +13859,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
             }
         }
+        self.retireDroppedTablePublicationAuthority(table_name);
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
@@ -19740,10 +19984,11 @@ fn replayManagedIndexForTableIfNeeded(
     return managed_visibility_changed;
 }
 
-const ManagedIndexCreateCatchUp = enum {
+const ManagedIndexCreateCatchUp = union(enum) {
     complete,
     retry,
     delegated,
+    asynchronous: u64,
 };
 
 fn catchUpManagedIndexCreate(
@@ -19773,7 +20018,18 @@ fn catchUpManagedIndexCreate(
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
     if (requires_enrichment_replay) {
         if (db.enrichment_runtime != null) {
-            _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(alloc, managedIndexEmbeddingArtifactName(db, index_name));
+            const appended = try db.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
+                alloc,
+                managedIndexEmbeddingArtifactName(db, index_name),
+            );
+            // No durable producer record means there is no future output edge
+            // to publish. Treat empty and already-covered tables as complete
+            // instead of installing a handoff that no worker can settle.
+            if (delegate_background_repair) {
+                if (appended.generated_ref_count == 0) return .complete;
+                std.debug.assert(appended.target_sequence != 0);
+                return .{ .asynchronous = appended.target_sequence };
+            }
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
@@ -19782,7 +20038,6 @@ fn catchUpManagedIndexCreate(
         // must release group admission instead of synchronously draining a
         // provider that may be rate limited or unavailable. Direct/embedded
         // sources keep the synchronous readiness barrier below.
-        if (delegate_background_repair) return .complete;
     }
 
     try db.runUntilIdle();
@@ -19921,13 +20176,73 @@ test "managed structural catch-up leaves pending enrichment with the asynchronou
     }
     try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
 
+    const target_sequence = switch (try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true)) {
+        .asynchronous => |target_sequence| target_sequence,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(target_sequence > 0);
+
+    // An uncached source still has a valid resident asynchronous owner, but it
+    // has no cached status authority to bridge. Its direct status reads are
+    // serialized with structural work and observe the resident DB instead.
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
+    defer observations.deinit(alloc);
+    try appendStructuralRuntimeStatusObservation(
+        &source,
+        alloc,
+        "docs",
+        7001,
+        &db,
+        db.core.index_manager.lsm_root_generation,
+        .artifact_rebuild,
+        &observations,
+    );
+    try std.testing.expectEqual(@as(usize, 0), observations.items.len);
+    try std.testing.expect(markLatestStructuralIndexPublicationPending(
+        &observations,
+        "semantic_idx",
+        target_sequence,
+        true,
+    ) == null);
+
+    const enrichment = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
+    const stats = enrichment.stats();
+    try std.testing.expect(stats.applied_sequence < stats.target_sequence);
+}
+
+test "managed structural catch-up does not delegate an empty producer handoff" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-empty-create-handoff",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"test-embed","url":"http://127.0.0.1:1"}}}
+    ;
+
+    var db = try openManagedDbWithIndexesJsonAndCacheMode(
+        alloc,
+        path,
+        indexes_json,
+        null,
+        null,
+        0,
+        null,
+        .default,
+    );
+    defer db.close();
+
     try std.testing.expectEqual(
         ManagedIndexCreateCatchUp.complete,
         try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true),
     );
-    const enrichment = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
-    const stats = enrichment.stats();
-    try std.testing.expect(stats.applied_sequence < stats.target_sequence);
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -21337,6 +21652,39 @@ fn appendStructuralRuntimeStatusObservation(
     });
 }
 
+fn markLatestStructuralIndexPublicationPending(
+    observations: *std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation),
+    index_name: []const u8,
+    producer_target_sequence: u64,
+    requires_blocking: bool,
+) ?ProvisionedTableWriteSource.PublicationHandoffTarget {
+    // Uncached sources publish no snapshot authority and therefore need no
+    // handoff fence: their direct status reads are serialized with structural
+    // reconciliation and inspect the resident DB. The asynchronous producer
+    // remains authoritative without manufacturing a cached observation.
+    if (observations.items.len == 0) return null;
+    const observation = &observations.items[observations.items.len - 1];
+    for (observation.status.stats.indexes) |*item| {
+        if (!std.mem.eql(u8, item.name, index_name)) continue;
+        const target = ProvisionedTableWriteSource.PublicationHandoffTarget{
+            .index_name = item.name,
+            .coverage_generation = item.coverage_generation,
+            .coverage_config_hash = item.coverage_config_hash,
+            .producer_target_sequence = producer_target_sequence,
+            .requires_blocking = requires_blocking,
+        };
+        // This snapshot becomes the fail-closed status authority while the
+        // resident producer takes ownership. Preserve that handoff explicitly
+        // even when the first replay window happens to be caught up at the
+        // instant structural reconciliation samples it.
+        item.backfill_active = true;
+        item.replay_catch_up_required = true;
+        item.catch_up_active = true;
+        return target;
+    }
+    return null;
+}
+
 fn publishStructuralRuntimeObservations(
     source: *ProvisionedTableWriteSource,
     table_name: []const u8,
@@ -21457,6 +21805,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     // or enrichment work remains visible as ordinary catch-up diagnostics and
     // cannot indefinitely hold another index's status fence.
     _ = source.settleRepairHandoffStatusBestEffort(table_name, group_id);
+    _ = source.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
 }
 
 fn publishTerminalStartupRuntimeStatusSnapshot(
@@ -33744,6 +34093,171 @@ test "repair handoff status settles after authoritative cached publication" {
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
 }
 
+test "managed create publication handoff releases on converged owner publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-create-publication-handoff",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var visible_generation = db.core.index_manager.lsm_root_generation;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralPublicationHandoffStatus("docs", 7001, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .producer_target_sequence = 1,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("docs");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        &db,
+        .publish_blocking,
+    );
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
+test "managed dense publication handoff releases when its incarnation is superseded" {
+    const alloc = std.testing.allocator;
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-superseded-publication-handoff", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+
+    for ([_]u64{ 7001, 7002, 7003 }) |group_id| {
+        source.reserveStructuralReconcileStatus("docs");
+        source.ensureStructuralPublicationHandoffStatus("docs", group_id, .{
+            .index_name = "semantic_idx",
+            .coverage_generation = 42,
+            .coverage_config_hash = 84,
+            .producer_target_sequence = 10,
+            .requires_blocking = true,
+        });
+        source.releaseStructuralReconcileStatus("docs");
+    }
+
+    // Group 7001 observes a completed drop, group 7002 observes a replacement,
+    // and group 7003 still observes the exact dense incarnation. Only that last
+    // handoff must retain the blocking publication requirement.
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .stats = .{},
+    });
+    const replacement_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 43,
+        .coverage_config_hash = 85,
+    }};
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7002,
+        .stats = .{
+            .index_count = replacement_indexes.len,
+            .indexes = @constCast(&replacement_indexes),
+        },
+    });
+    const exact_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .replay_applied_sequence = 10,
+        .replay_target_sequence = 10,
+    }};
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7003,
+        .stats = .{
+            .index_count = exact_indexes.len,
+            .indexes = @constCast(&exact_indexes),
+            .enrichment = .{ .applied_sequence = 10, .target_sequence = 10 },
+        },
+    });
+
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7001, false));
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7002, false));
+    try std.testing.expect(!source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7003, false));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7003, true));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
+test "managed create publication handoff ignores unrelated index debt" {
+    const alloc = std.testing.allocator;
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-targeted-publication-handoff", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralPublicationHandoffStatus("docs", 7001, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .producer_target_sequence = 10,
+        .requires_blocking = false,
+    });
+    source.releaseStructuralReconcileStatus("docs");
+
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 2);
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .replay_applied_sequence = 12,
+        .replay_target_sequence = 12,
+    };
+    indexes[1] = .{
+        .name = try alloc.dupe(u8, "unrelated_idx"),
+        .kind = .dense_vector,
+        .coverage_generation = 43,
+        .coverage_config_hash = 85,
+        .backfill_active = true,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 99,
+        .replay_catch_up_required = true,
+        .catch_up_active = true,
+    };
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = .{
+            .index_count = 2,
+            .indexes = indexes,
+            // Later unrelated producer work may keep the global target ahead;
+            // only the captured enqueue boundary is causal for this handoff.
+            .enrichment = .{
+                .applied_sequence = 10,
+                .target_sequence = 100,
+            },
+        },
+    };
+    defer status.deinit(alloc);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", status);
+
+    try std.testing.expect(source.settlePublicationHandoffStatusBestEffort(&snapshot_cache, "docs", 7001, false));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+}
+
 test "index reconciliation request enqueues a catalog-deleted target without create admission" {
     var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
     var source = ProvisionedTableWriteSource.init(
@@ -40115,6 +40629,56 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(probe.remove_seen.isSet());
     try std.testing.expect(probe.clear_seen.isSet());
     try std.testing.expect(!probe.invalid_sequence.isSet());
+}
+
+test "provisioned table write source drop table retires old publication authority" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-publication-authority", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    // Model both publication fences that can outlive structural reconciliation.
+    // Include an old group absent from the drop request: table deletion ends the
+    // incarnation as a whole, not merely the catalog's current group list.
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.ensureStructuralPublicationHandoffStatus("docs", 7002, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 42,
+        .coverage_config_hash = 84,
+        .producer_target_sequence = 10,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("docs");
+
+    // Cleanup is scoped by table name and must not release another table's
+    // valid handoff while retiring the deleted incarnation.
+    source.reserveStructuralReconcileStatus("other");
+    source.ensureStructuralPublicationHandoffStatus("other", 9001, .{
+        .index_name = "semantic_idx",
+        .coverage_generation = 7,
+        .coverage_config_hash = 8,
+        .producer_target_sequence = 9,
+        .requires_blocking = true,
+    });
+    source.releaseStructuralReconcileStatus("other");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
+
+    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+
+    // A same-name table with a different group incarnation must immediately be
+    // eligible for live status; no deleted group can publish another release.
+    const recreated_admission = source.beginStatusRequest("docs");
+    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, recreated_admission);
+    source.endStatusRequest("docs", recreated_admission);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 }
 
 test "provisioned table write source drop table does not hold local db mutex during background delete" {

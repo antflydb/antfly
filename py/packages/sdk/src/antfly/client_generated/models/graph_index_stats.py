@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+    from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -29,6 +30,7 @@ class GraphIndexStats:
 
     Attributes:
         index_type (GraphIndexStatsIndexType): Discriminator for the index stats variant.
+        readiness (IndexReadinessStatus | Unset):
         error (str | Unset): Error message if stats could not be retrieved
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
@@ -85,6 +87,7 @@ class GraphIndexStats:
     """
 
     index_type: GraphIndexStatsIndexType
+    readiness: IndexReadinessStatus | Unset = UNSET
     error: str | Unset = UNSET
     total_edges: int | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
@@ -135,6 +138,10 @@ class GraphIndexStats:
 
     def to_dict(self) -> dict[str, Any]:
         index_type = self.index_type.value
+
+        readiness: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.readiness, Unset):
+            readiness = self.readiness.to_dict()
 
         error = self.error
 
@@ -251,6 +258,8 @@ class GraphIndexStats:
                 "index_type": index_type,
             }
         )
+        if readiness is not UNSET:
+            field_dict["readiness"] = readiness
         if error is not UNSET:
             field_dict["error"] = error
         if total_edges is not UNSET:
@@ -355,10 +364,18 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+        from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
+
+        _readiness = d.pop("readiness", UNSET)
+        readiness: IndexReadinessStatus | Unset
+        if isinstance(_readiness, Unset):
+            readiness = UNSET
+        else:
+            readiness = IndexReadinessStatus.from_dict(_readiness)
 
         error = d.pop("error", UNSET)
 
@@ -494,6 +511,7 @@ class GraphIndexStats:
 
         graph_index_stats = cls(
             index_type=index_type,
+            readiness=readiness,
             error=error,
             total_edges=total_edges,
             edge_types=edge_types,
