@@ -36,6 +36,22 @@ pub const Sink = struct {
         try self.evaluations.append(allocator, .{ .property_id = property_id, .condition = condition });
     }
 
+    /// Details are borrowed until the runner consumes the sink immediately
+    /// after evaluation; the canonical trace takes its own owned copy.
+    pub fn checkDetailed(
+        self: *Sink,
+        allocator: std.mem.Allocator,
+        property_id: ids.StableId,
+        condition: bool,
+        details: []const u8,
+    ) !void {
+        try self.evaluations.append(allocator, .{
+            .property_id = property_id,
+            .condition = condition,
+            .details = details,
+        });
+    }
+
     pub fn canonicalize(self: *Sink) !void {
         std.mem.sort(Evaluation, self.evaluations.items, {}, struct {
             fn lessThan(_: void, lhs: Evaluation, rhs: Evaluation) bool {

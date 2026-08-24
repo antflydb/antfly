@@ -1075,6 +1075,7 @@ fn runWithChoices(
     allocator: Allocator,
     artifact: *const vopr.trace.Trace,
     source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
     return vopr.runner.run(Scenario, allocator, source, .{
         .system = artifact.header.system,
@@ -1088,16 +1089,26 @@ fn runWithChoices(
         .source_revision = artifact.header.source_revision,
         .target = artifact.header.target,
         .optimize = artifact.header.optimize,
+        .flight_recorder = recorder,
     });
 }
 
 pub fn runKnownWithChoices(allocator: Allocator, artifact: *const vopr.trace.Trace, source: vopr.choice.Source) !vopr.trace.Trace {
+    return runKnownWithChoicesAndRecorder(allocator, artifact, source, null);
+}
+
+pub fn runKnownWithChoicesAndRecorder(
+    allocator: Allocator,
+    artifact: *const vopr.trace.Trace,
+    source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
     return switch (kindFromArtifact(artifact) orelse return error.UnsupportedDomainScenario) {
-        .distributed_transaction => runWithChoices(DistributedTransactionScenario, allocator, artifact, source),
-        .data_plane => runWithChoices(DataPlaneScenario, allocator, artifact, source),
-        .derived_workflow => runWithChoices(DerivedWorkflowScenario, allocator, artifact, source),
-        .backup_restore => runWithChoices(BackupRestoreScenario, allocator, artifact, source),
-        .clock_fault => runWithChoices(ClockLeaseTtlScenario, allocator, artifact, source),
+        .distributed_transaction => runWithChoices(DistributedTransactionScenario, allocator, artifact, source, recorder),
+        .data_plane => runWithChoices(DataPlaneScenario, allocator, artifact, source, recorder),
+        .derived_workflow => runWithChoices(DerivedWorkflowScenario, allocator, artifact, source, recorder),
+        .backup_restore => runWithChoices(BackupRestoreScenario, allocator, artifact, source, recorder),
+        .clock_fault => runWithChoices(ClockLeaseTtlScenario, allocator, artifact, source, recorder),
     };
 }
 

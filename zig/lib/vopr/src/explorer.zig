@@ -74,6 +74,7 @@ pub const Report = struct {
     flight_recordings: u64 = 0,
     flight_records: u64 = 0,
     flight_records_dropped: u64 = 0,
+    retained_trace_bytes: u64 = 0,
 };
 
 pub const PropertyCatalogStatus = struct {
@@ -96,10 +97,14 @@ pub const PropertyCatalogStatus = struct {
 
 pub const FailureExample = struct {
     fingerprint: u64,
+    occurrences: u64,
     first_history: u64,
     first_trace_digest: u64,
+    first_logical_work_units: u64,
     smallest_transitions: u64,
     smallest_trace_digest: u64,
+    smallest_retained_output_bytes: u64,
+    smallest_output_trace_digest: u64,
 };
 
 pub fn Campaign(comptime Scenario: type) type {
@@ -241,15 +246,9 @@ pub fn Campaign(comptime Scenario: type) type {
                 },
             };
             defer artifact.deinit();
-            var replayed = replay.exact(Scenario, self.allocator, &artifact) catch |err| {
-                self.report.replay_divergences += 1;
-                return err;
-            };
-            replayed.deinit();
-            self.report.exact_replay_checks += 1;
-            self.report.transition_work_units +|= artifact.summary.?.transitions *| 2;
+            self.report.transition_work_units +|= artifact.summary.?.transitions;
             self.report.spliced += 1;
-            try self.retainFlight(&flight, try self.consider(&artifact, left_index, false));
+            try self.retainFlight(&flight, try self.consider(&artifact, left_index, true));
             return true;
         }
 
@@ -269,7 +268,7 @@ pub fn Campaign(comptime Scenario: type) type {
             defer artifact.deinit();
             self.report.generated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
-            try self.retainFlight(&flight, try self.consider(&artifact, null, false));
+            try self.retainFlight(&flight, try self.consider(&artifact, null, true));
         }
 
         fn runMutation(self: *Self, parent_index: usize) !bool {
@@ -339,7 +338,7 @@ pub fn Campaign(comptime Scenario: type) type {
             defer artifact.deinit();
             self.report.mutated += 1;
             self.report.transition_work_units +|= artifact.summary.?.transitions;
-            try self.retainFlight(&flight, try self.consider(&artifact, parent_index, false));
+            try self.retainFlight(&flight, try self.consider(&artifact, parent_index, true));
             return true;
         }
 
@@ -391,7 +390,10 @@ pub fn Campaign(comptime Scenario: type) type {
                 status.ever_true = status.ever_true or record.condition;
                 status.ever_false = status.ever_false or !record.condition;
             }
-            const artifact_digest = try traceDigest(self.allocator, artifact);
+            const artifact_bytes = try artifact.renderAlloc(self.allocator);
+            defer self.allocator.free(artifact_bytes);
+            const artifact_digest = ids.digest(artifact_bytes);
+            const artifact_output_bytes: u64 = @intCast(artifact_bytes.len);
             for (artifact.failures.items) |failure| {
                 if (failure.property_id) |property_id| {
                     const status = self.propertyStatus(property_id) orelse return error.UnknownCampaignProperty;
@@ -401,16 +403,29 @@ pub fn Campaign(comptime Scenario: type) type {
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .{
                         .fingerprint = failure.fingerprint,
+                        .occurrences = 1,
                         .first_history = self.report.histories,
                         .first_trace_digest = artifact_digest,
+                        .first_logical_work_units = self.report.transition_work_units,
                         .smallest_transitions = artifact.summary.?.transitions,
                         .smallest_trace_digest = artifact_digest,
+                        .smallest_retained_output_bytes = artifact_output_bytes,
+                        .smallest_output_trace_digest = artifact_digest,
                     };
-                } else if (artifact.summary.?.transitions < gop.value_ptr.smallest_transitions or
-                    (artifact.summary.?.transitions == gop.value_ptr.smallest_transitions and artifact_digest < gop.value_ptr.smallest_trace_digest))
-                {
-                    gop.value_ptr.smallest_transitions = artifact.summary.?.transitions;
-                    gop.value_ptr.smallest_trace_digest = artifact_digest;
+                } else {
+                    gop.value_ptr.occurrences +|= 1;
+                    if (artifact.summary.?.transitions < gop.value_ptr.smallest_transitions or
+                        (artifact.summary.?.transitions == gop.value_ptr.smallest_transitions and artifact_digest < gop.value_ptr.smallest_trace_digest))
+                    {
+                        gop.value_ptr.smallest_transitions = artifact.summary.?.transitions;
+                        gop.value_ptr.smallest_trace_digest = artifact_digest;
+                    }
+                    if (artifact_output_bytes < gop.value_ptr.smallest_retained_output_bytes or
+                        (artifact_output_bytes == gop.value_ptr.smallest_retained_output_bytes and artifact_digest < gop.value_ptr.smallest_output_trace_digest))
+                    {
+                        gop.value_ptr.smallest_retained_output_bytes = artifact_output_bytes;
+                        gop.value_ptr.smallest_output_trace_digest = artifact_digest;
+                    }
                 }
             }
             var novelty = if (exact_replay_before_retention)
@@ -455,6 +470,7 @@ pub fn Campaign(comptime Scenario: type) type {
             const added = try self.corpus.add(artifact, novelty);
             if (added.inserted) {
                 self.report.retained += 1;
+                self.report.retained_trace_bytes +|= @intCast(self.corpus.entries.items[added.index].bytes.len);
                 if (parent_index) |index| try self.corpus.markProductive(index);
             }
             return flight_retention;
@@ -479,12 +495,6 @@ pub fn Campaign(comptime Scenario: type) type {
             return null;
         }
     };
-}
-
-fn traceDigest(allocator: std.mem.Allocator, artifact: *const trace.Trace) !u64 {
-    const bytes = try artifact.renderAlloc(allocator);
-    defer allocator.free(bytes);
-    return ids.digest(bytes);
 }
 
 fn recordPrefix(recorder: *flight_recorder.Recorder, artifact: *const trace.Trace, choice_count: usize) !void {
@@ -528,11 +538,13 @@ test "campaign generates, mutates, and retains semantic histories" {
     try std.testing.expectEqual(campaign.report.histories, campaign.report.clean_histories + campaign.report.property_failure_histories + campaign.report.non_property_failure_histories);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.harness_errors);
     try std.testing.expectEqual(@as(u64, 0), campaign.report.replay_divergences);
+    try std.testing.expect(campaign.report.exact_replay_checks >= campaign.report.retained);
+    try std.testing.expect(campaign.report.retained_trace_bytes > 0);
     try std.testing.expect(campaign.report.flight_recordings > 0);
     try std.testing.expectEqual(campaign.report.flight_recordings, campaign.flight_recordings.items.len);
 }
 
-test "campaign exact-replays compatible splices before retention" {
+test "campaign exact-replays every compatible policy before retention" {
     const ToyScenario = @import("toy_scenario.zig").ToyScenario;
     var campaign = try Campaign(ToyScenario).init(std.testing.allocator, .{
         .system = "vopr-test",
@@ -546,6 +558,7 @@ test "campaign exact-replays compatible splices before retention" {
     try campaign.run();
     try std.testing.expect(campaign.report.splice_attempts > 0);
     try std.testing.expect(campaign.report.spliced > 0);
+    try std.testing.expect(campaign.report.exact_replay_checks >= campaign.report.retained);
     for (campaign.corpus.entries.items) |entry| {
         var artifact = try trace.parseAlloc(std.testing.allocator, entry.bytes);
         defer artifact.deinit();

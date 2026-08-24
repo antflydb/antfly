@@ -30,6 +30,7 @@ pub const outcome = @import("outcome.zig");
 pub const property = @import("property.zig");
 pub const replay = @import("replay.zig");
 pub const report = @import("report.zig");
+pub const run_index = @import("run_index.zig");
 pub const reducer = @import("reducer.zig");
 pub const runtime = @import("runtime.zig");
 pub const scheduler = @import("scheduler.zig");
@@ -305,6 +306,7 @@ test {
     _ = property;
     _ = replay;
     _ = report;
+    _ = run_index;
     _ = reducer;
     _ = runtime;
     _ = scheduler;

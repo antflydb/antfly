@@ -7251,6 +7251,12 @@ pub fn build(b: *std.Build) void {
     const vopr_recipe_step = b.step("vopr-recipe", "Build a reduction, causal, counterfactual, query, and collector debug package");
     vopr_recipe_step.dependOn(&recipe_vopr_cli.step);
 
+    const index_vopr_cli = b.addRunArtifact(vopr_cli);
+    index_vopr_cli.addArg("index");
+    if (b.args) |args| index_vopr_cli.addArgs(args);
+    const vopr_index_step = b.step("vopr-index", "Update and query the deterministic local VOPR run/results index");
+    vopr_index_step.dependOn(&index_vopr_cli.step);
+
     const corpus_merge_vopr_cli = b.addRunArtifact(vopr_cli);
     corpus_merge_vopr_cli.addArg("corpus-merge");
     if (b.args) |args| corpus_merge_vopr_cli.addArgs(args);

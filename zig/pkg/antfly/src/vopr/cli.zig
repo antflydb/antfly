@@ -29,6 +29,7 @@ pub fn dispatch(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) 
     if (std.mem.eql(u8, argv[1], "results")) return resultsCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "events")) return eventsCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "recipe")) return recipeCommand(alloc, io, argv[2..]);
+    if (std.mem.eql(u8, argv[1], "index")) return indexCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "corpus-merge")) return corpusMergeCommand(alloc, io, argv[2..]);
     return usage();
 }
@@ -277,6 +278,8 @@ fn recipeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var reduced_path: ?[]const u8 = null;
     var failure_ordinal: usize = 0;
     var attempts: u64 = 1_024;
+    var flight_filter_path: ?[]const u8 = null;
+    var flight_config: vopr.debug_recipe.FlightConfig = .{};
     var index: usize = 0;
     while (index < args.len) {
         if (std.mem.eql(u8, args[index], "--trace")) {
@@ -289,6 +292,18 @@ fn recipeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             failure_ordinal = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, args[index], "--attempts")) {
             attempts = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--flight-filter")) {
+            flight_filter_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--flight-before")) {
+            flight_config.before_records = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--flight-after")) {
+            flight_config.after_records = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--flight-limit")) {
+            flight_config.max_records = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--flight-capacity")) {
+            flight_config.capacity = try std.fmt.parseInt(usize, try nextValue(args, &index), 10);
+        } else if (std.mem.eql(u8, args[index], "--flight-anywhere")) {
+            flight_config.anchor_failure_transition = false;
         } else return error.UnknownArgument;
         index += 1;
     }
@@ -299,7 +314,19 @@ fn recipeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     defer alloc.free(encoded);
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
-    var package = try runDebugRecipeKnown(alloc, &recorded, failure_ordinal, attempts);
+    var filter_arena = std.heap.ArenaAllocator.init(alloc);
+    defer filter_arena.deinit();
+    if (flight_filter_path) |path| {
+        const filter_bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024 * 1024));
+        defer alloc.free(filter_bytes);
+        flight_config.filter = try std.json.parseFromSliceLeaky(
+            vopr.flight_recorder.Filter,
+            filter_arena.allocator(),
+            filter_bytes,
+            .{},
+        );
+    }
+    var package = try runDebugRecipeKnown(alloc, &recorded, failure_ordinal, attempts, flight_config);
     defer package.deinit();
     const package_bytes = try package.renderAlloc(alloc);
     defer alloc.free(package_bytes);
@@ -456,6 +483,111 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
     });
 }
 
+fn indexCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var index_path: ?[]const u8 = null;
+    var json_path: ?[]const u8 = null;
+    var html_path: ?[]const u8 = null;
+    var additions: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer additions.deinit(alloc);
+    var query: vopr.run_index.Query = .{};
+    var arg_index: usize = 0;
+    while (arg_index < args.len) {
+        const arg = args[arg_index];
+        if (std.mem.eql(u8, arg, "--index")) {
+            index_path = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--add")) {
+            try additions.append(alloc, try nextValue(args, &arg_index));
+        } else if (std.mem.eql(u8, arg, "--json-out")) {
+            json_path = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--html-out")) {
+            html_path = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--run-id")) {
+            query.run_id = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--revision")) {
+            query.source_revision = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--scenario")) {
+            query.scenario = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--property")) {
+            query.property_id = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 0);
+        } else if (std.mem.eql(u8, arg, "--property-name")) {
+            query.property_name = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--fingerprint")) {
+            query.fingerprint = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 0);
+        } else if (std.mem.eql(u8, arg, "--corpus")) {
+            const value = try nextValue(args, &arg_index);
+            query.corpus_state = if (std.mem.eql(u8, value, "retained"))
+                .retained
+            else if (std.mem.eql(u8, value, "quarantined"))
+                .quarantined
+            else
+                return error.InvalidCorpusState;
+        } else if (std.mem.eql(u8, arg, "--artifact-contains")) {
+            query.artifact_contains = try nextValue(args, &arg_index);
+        } else if (std.mem.eql(u8, arg, "--min-transitions")) {
+            query.min_transitions_consumed = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 10);
+        } else if (std.mem.eql(u8, arg, "--max-transitions")) {
+            query.max_transitions_consumed = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 10);
+        } else if (std.mem.eql(u8, arg, "--min-resources")) {
+            query.min_resources_consumed = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 10);
+        } else if (std.mem.eql(u8, arg, "--max-resources")) {
+            query.max_resources_consumed = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 10);
+        } else if (std.mem.eql(u8, arg, "--min-histories")) {
+            query.min_histories_consumed = try std.fmt.parseInt(u64, try nextValue(args, &arg_index), 10);
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            query.limit = try std.fmt.parseInt(usize, try nextValue(args, &arg_index), 10);
+        } else return error.UnknownArgument;
+        arg_index += 1;
+    }
+    const persistent_path = index_path orelse return error.RunIndexPathRequired;
+    if (additions.items.len == 0 and json_path == null and html_path == null)
+        return error.RunIndexActionRequired;
+    try query.validate();
+    var index = vopr.run_index.Index.init(alloc);
+    defer index.deinit();
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, persistent_path, alloc, .limited(max_trace_bytes)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing) |bytes| {
+        defer alloc.free(bytes);
+        _ = try index.ingestJson(bytes);
+    }
+    var added: u64 = 0;
+    for (additions.items) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_trace_bytes));
+        defer alloc.free(bytes);
+        added +|= try index.ingestJson(bytes);
+    }
+    if (additions.items.len > 0) {
+        const bytes = try index.renderJsonAlloc(alloc);
+        defer alloc.free(bytes);
+        try writeAtomicArtifact(alloc, io, persistent_path, bytes);
+    }
+    if (json_path) |path| {
+        const bytes = try index.renderQueryJsonAlloc(alloc, query);
+        defer alloc.free(bytes);
+        try writeDebugArtifact(io, path, bytes);
+    }
+    if (html_path) |path| {
+        const bytes = try index.renderQueryHtmlAlloc(alloc, query);
+        defer alloc.free(bytes);
+        try writeDebugArtifact(io, path, bytes);
+    }
+    std.debug.print(
+        "VOPR run index runs={d} added={d} properties={d} fingerprints={d} artifacts={d} index={s} json={s} html={s}\n",
+        .{
+            index.runs.items.len,
+            added,
+            index.properties.items.len,
+            index.fingerprints.items.len,
+            index.artifacts.items.len,
+            persistent_path,
+            json_path orelse "-",
+            html_path orelse "-",
+        },
+    );
+}
+
 fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
         return antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, recorded);
@@ -532,17 +664,11 @@ fn runKnownScenarioWithChoicesAndRecorder(
 ) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
         const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(recorded);
-        var result = try antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoices(alloc, cfg, source);
-        errdefer result.deinit();
-        if (recorder) |flight| try recordTraceEvents(flight, &result);
-        return result;
+        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoicesAndRecorder(alloc, cfg, source, recorder);
     }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
         const cfg = try antfly.metadata_sim_harness.DistributedDataVoprCampaignConfig.fromTrace(recorded);
-        var result = try antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source);
-        errdefer result.deinit();
-        if (recorder) |flight| try recordTraceEvents(flight, &result);
-        return result;
+        return antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source, recorder);
     }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.transaction_vopr.Scenario, alloc, recorded, source, recorder);
@@ -563,25 +689,9 @@ fn runKnownScenarioWithChoicesAndRecorder(
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.ha_vopr.CliScenario, alloc, recorded, source, recorder);
     if (antfly.domain_vopr.kindFromArtifact(recorded) != null) {
-        var result = try antfly.domain_vopr.runKnownWithChoices(alloc, recorded, source);
-        errdefer result.deinit();
-        if (recorder) |flight| try recordTraceEvents(flight, &result);
-        return result;
+        return antfly.domain_vopr.runKnownWithChoicesAndRecorder(alloc, recorded, source, recorder);
     }
     return error.UnsupportedScenario;
-}
-
-fn recordTraceEvents(recorder: *vopr.flight_recorder.Recorder, artifact: *const vopr.trace.Trace) !void {
-    for (artifact.events.items) |record| try recorder.record(.{
-        .index = record.index,
-        .ordinal = record.ordinal,
-        .id = record.id,
-        .name = record.name,
-        .kind = record.kind,
-        .actor_id = record.actor_id,
-        .resource_id = record.resource_id,
-        .payload_digest = record.payload_digest,
-    });
 }
 
 fn replayKnownScenarioWithRecorder(
@@ -598,6 +708,15 @@ fn replayKnownScenarioWithRecorder(
     defer alloc.free(actual);
     if (!std.mem.eql(u8, expected, actual)) return error.VoprReplayArtifactDiverged;
     return replayed;
+}
+
+fn recipeFlightReplayKnown(
+    _: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    recorder: *vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    return replayKnownScenarioWithRecorder(alloc, recorded, recorder);
 }
 
 fn counterfactualRunKnown(
@@ -631,6 +750,7 @@ fn runDebugRecipeKnown(
     recorded: *const vopr.trace.Trace,
     failure_ordinal: usize,
     attempts: u64,
+    flight_config: vopr.debug_recipe.FlightConfig,
 ) !vopr.debug_recipe.Package {
     const queries = [_]vopr.debug_recipe.QuerySpec{
         .{ .name = "injected-errors", .query = .{ .selector = .{ .kind = .injected_error } } },
@@ -652,12 +772,14 @@ fn runDebugRecipeKnown(
         },
         .event_queries = &queries,
         .collect_failure_window = antfly.domain_vopr.kindFromArtifact(recorded) != null,
+        .flight = flight_config,
     }, .{
         .execution = execution,
         .collectors = if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
             .{ .collect_fn = recipeCollectKnown }
         else
             null,
+        .flight_replay_fn = recipeFlightReplayKnown,
     });
 }
 
@@ -910,6 +1032,15 @@ fn collectKnownAt(
 fn writeDebugArtifact(io: std.Io, path: []const u8, bytes: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| try ensureDir(io, parent);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+fn writeAtomicArtifact(alloc: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try ensureDir(io, parent);
+    const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp-vopr-index", .{path});
+    defer alloc.free(temporary);
+    errdefer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = bytes });
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), path, io);
 }
 
 const DebugSession = struct {
@@ -1626,6 +1757,7 @@ const CampaignContext = struct {
     flight_recordings: u64 = 0,
     flight_records: u64 = 0,
     flight_records_dropped: u64 = 0,
+    retained_artifacts: std.ArrayListUnmanaged([]u8) = .empty,
     first_error: ?anyerror = null,
 
     fn deinitReport(self: *@This()) void {
@@ -1643,6 +1775,8 @@ const CampaignContext = struct {
         self.transition_ids.deinit(alloc);
         self.fault_ids.deinit(alloc);
         self.workload_ids.deinit(alloc);
+        for (self.retained_artifacts.items) |path| alloc.free(path);
+        self.retained_artifacts.deinit(alloc);
     }
 
     fn worker(self: *@This()) void {
@@ -1718,6 +1852,17 @@ const CampaignContext = struct {
         const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        try self.mutex.lock(self.io);
+        const retained_path = alloc.dupe(u8, path) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.retained_artifacts.append(alloc, retained_path) catch |err| {
+            alloc.free(retained_path);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
         var flight = try recorder.materialize(alloc, if (failed) .failure else .novelty);
         defer flight.deinit();
         const flight_bytes = try flight.renderJsonAlloc(alloc);
@@ -1825,7 +1970,7 @@ const CampaignContext = struct {
     ) !void {
         const alloc = std.heap.smp_allocator;
         const failure = artifact.failures.items[failure_ordinal];
-        var package = try runDebugRecipeKnown(alloc, artifact, failure_ordinal, 256);
+        var package = try runDebugRecipeKnown(alloc, artifact, failure_ordinal, 256, .{});
         defer package.deinit();
         const recipe_bytes = try package.renderAlloc(alloc);
         defer alloc.free(recipe_bytes);
@@ -1940,9 +2085,49 @@ const CampaignContext = struct {
                 .smallest_artifact = summary.smallest_path,
             };
         }
-        const artifact_names = [_][]const u8{ "results.json", "results.html" };
+        std.mem.sort([]u8, self.retained_artifacts.items, {}, struct {
+            fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+        var artifact_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer artifact_names.deinit(alloc);
+        try artifact_names.appendSlice(alloc, &.{ "results.json", "results.html" });
+        for (self.retained_artifacts.items) |path| try artifact_names.append(alloc, path);
+        const quarantine_manifest = if (self.corpus.quarantined.items.len > 0)
+            try std.fmt.allocPrint(alloc, "{s}/quarantine/index.json", .{self.artifact_dir})
+        else
+            null;
+        defer if (quarantine_manifest) |path| alloc.free(path);
+        if (quarantine_manifest) |path| try artifact_names.append(alloc, path);
+        std.mem.sort([]const u8, artifact_names.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+        var source_revision: []const u8 = "unknown";
+        var target: []const u8 = "native";
+        var optimize: []const u8 = "unknown";
+        var representative: ?vopr.trace.Trace = null;
+        defer if (representative) |*artifact| artifact.deinit();
+        if (self.corpus.entries.items.len > 0) {
+            representative = try vopr.trace.parseAlloc(alloc, self.corpus.entries.items[0].bytes);
+            source_revision = representative.?.header.source_revision;
+            target = representative.?.header.target;
+            optimize = representative.?.header.optimize;
+        }
+        const run_id = try std.fmt.allocPrint(
+            alloc,
+            "campaign-{s}-{x:0>16}-{d}-{d}",
+            .{ self.scenario, self.base_seed, self.histories, self.transitions },
+        );
+        defer alloc.free(run_id);
         const aggregate = vopr.report.Aggregate{
+            .run_id = run_id,
             .scenario = self.scenario,
+            .source_revision = source_revision,
+            .target = target,
+            .optimize = optimize,
             .base_seed = self.base_seed,
             .histories_limit = self.histories,
             .histories_consumed = self.clean_histories + self.failures + self.replay_divergences + self.harness_errors,
@@ -1965,7 +2150,7 @@ const CampaignContext = struct {
             .flight_records_dropped = self.flight_records_dropped,
             .properties = aggregate_properties,
             .failures = aggregate_failures,
-            .artifacts = &artifact_names,
+            .artifacts = artifact_names.items,
         };
         const json = try aggregate.renderJsonAlloc(alloc);
         defer alloc.free(json);
@@ -2280,7 +2465,8 @@ fn usage() error{InvalidUsage} {
         \\  vopr debug --trace <path> [--prefix <choice-index>] [--out <path.json>] [--commands <path>] [--interactive]
         \\  vopr results --trace <path> [--run-id <id>] [--history-id <id>] [--json-out <path>] [--html-out <path>]
         \\  vopr events --trace <path> --query <query.json> --out <matches.json>
-        \\  vopr recipe --trace <path> [--failure <ordinal>] [--attempts <n>] --out <recipe.json> --reduced-out <reduced.voprtrace>
+        \\  vopr recipe --trace <path> [--failure <ordinal>] [--attempts <n>] [--flight-filter <filter.json>] [--flight-before <n>] [--flight-after <n>] [--flight-limit <n>] [--flight-capacity <n>] [--flight-anywhere] --out <recipe.json> --reduced-out <reduced.voprtrace>
+        \\  vopr index --index <index.json> [--add <results.json> ...] [--run-id <id>] [--revision <revision>] [--scenario <name>] [--property <id>] [--property-name <name>] [--fingerprint <id>] [--corpus retained|quarantined] [--artifact-contains <text>] [--min-transitions <n>] [--max-transitions <n>] [--min-resources <n>] [--max-resources <n>] [--min-histories <n>] [--limit <n>] [--json-out <query.json>] [--html-out <summary.html>]
         \\  vopr corpus-merge --base <trace> [--trace <trace> ...] --out-dir <directory> [--force]
         \\
     , .{});
@@ -2359,6 +2545,34 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     defer alloc.free(results_html);
     try std.testing.expect(std.mem.startsWith(u8, results_html, "<!doctype html>"));
 
+    const local_index_path = try std.fmt.allocPrint(alloc, "{s}/run-index.json", .{corpus_path});
+    defer alloc.free(local_index_path);
+    const local_query_path = try std.fmt.allocPrint(alloc, "{s}/run-query.json", .{corpus_path});
+    defer alloc.free(local_query_path);
+    const local_summary_path = try std.fmt.allocPrint(alloc, "{s}/run-summary.html", .{corpus_path});
+    defer alloc.free(local_summary_path);
+    const local_fingerprint = try std.fmt.allocPrint(alloc, "0x{x}", .{promoted.failures.items[0].fingerprint});
+    defer alloc.free(local_fingerprint);
+    try indexCommand(alloc, io, &.{
+        "--index",       local_index_path,
+        "--add",         results_json_path,
+        "--run-id",      "meta-test-run",
+        "--revision",    promoted.header.source_revision,
+        "--fingerprint", local_fingerprint,
+        "--json-out",    local_query_path,
+        "--html-out",    local_summary_path,
+    });
+    const local_index = try std.Io.Dir.cwd().readFileAlloc(io, local_index_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(local_index);
+    try std.testing.expect(std.mem.indexOf(u8, local_index, vopr.run_index.format) != null);
+    const local_query = try std.Io.Dir.cwd().readFileAlloc(io, local_query_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(local_query);
+    try std.testing.expect(std.mem.indexOf(u8, local_query, vopr.run_index.query_format) != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_query, "meta-test-run") != null);
+    const local_summary = try std.Io.Dir.cwd().readFileAlloc(io, local_summary_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(local_summary);
+    try std.testing.expect(std.mem.startsWith(u8, local_summary, "<!doctype html>"));
+
     const query_path = try std.fmt.allocPrint(alloc, "{s}/query.json", .{corpus_path});
     defer alloc.free(query_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = query_path, .data =
@@ -2428,6 +2642,9 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "failure_identity") != null);
     try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "counterfactual") != null);
     try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "event_queries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, vopr.flight_recorder.format) != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "metadata.action_applied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recipe_artifact, "transition_kind") != null);
     const reduced_artifact_path = try std.fmt.allocPrint(
         alloc,
         "{s}/failure-{x}.reduced.voprtrace",
@@ -2551,6 +2768,12 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"progress\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"exact_replay\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, aggregate_results, "\"harness\": true") != null);
+    try indexCommand(alloc, io, &.{ "--index", local_index_path, "--add", aggregate_results_path });
+    const combined_index = try std.Io.Dir.cwd().readFileAlloc(io, local_index_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(combined_index);
+    var parsed_combined = try std.json.parseFromSlice(std.json.Value, alloc, combined_index, .{});
+    defer parsed_combined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_combined.value.object.get("runs").?.array.items.len);
 }
 
 test "VOPR scenario registry records and exactly replays every context-free domain" {
