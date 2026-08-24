@@ -608,6 +608,7 @@ const hbc_shared_clock_max_scan_steps: usize = 64;
 const HbcSharedAdmission = struct {
     bytes: u64 = 0,
     reserved: bool = false,
+    precharged: bool = false,
     overcommitted: bool = false,
 };
 
@@ -883,7 +884,7 @@ pub const Cache = struct {
         self.concurrent_vector_admission_stride.store(policy.concurrent_vector_admission_stride, .release);
     }
 
-    pub fn shouldAdmitConcurrentVector(self: *Cache, namespace: u64) bool {
+    fn concurrentVectorAdmissionStride(self: *Cache) u32 {
         var stride = self.concurrent_vector_admission_stride.load(.acquire);
         const target = self.admission_target_bytes.load(.acquire);
         // At a steady full target, pressure may read as "normal" immediately
@@ -891,6 +892,10 @@ pub const Cache = struct {
         // fullness itself so unique misses cannot serialize every query on
         // clone/insert/evict churn.
         if (target > 0 and self.physical_accounting.current() >= target) stride = @max(stride, 8);
+        return stride;
+    }
+
+    fn admitConcurrentVectorTicket(self: *Cache, namespace: u64, stride: u32) bool {
         if (stride == 0) return false;
         if (stride == 1) return true;
         const ticket = self.concurrent_vector_admission_counter.fetchAdd(1, .monotonic);
@@ -902,44 +907,77 @@ pub const Cache = struct {
         return true;
     }
 
-    fn tryReserveDecodedQuery(self: *Cache, namespace: u64, requested_bytes: u64) ?DecodedVectorResidencyLease {
-        if (self.resource_manager) |manager| self.refreshAdmissionPolicy(manager);
-        if (self.concurrent_vector_admission_stride.load(.acquire) != 1) return null;
-        const target = self.admission_target_bytes.load(.acquire);
-        if (target == 0) {
-            return .{
-                .cache = self,
-                .namespace = namespace,
-                .reserved_bytes = requested_bytes,
-                .tracked_reservation = false,
-            };
-        }
-
-        // Serialize the physical-usage snapshot with cache insertion and
-        // reclamation. Lease release remains atomic and may safely lower the
-        // reserved total while this admission check is in progress.
-        self.mutex.lockExclusive();
-        defer self.mutex.unlockExclusive();
-        var reserved = self.decoded_query_reserved_bytes.load(.acquire);
-        while (true) {
-            const current = self.physical_accounting.current();
-            if (current >= target) return null;
-            const available = target - current;
-            if (reserved > available or requested_bytes > available - reserved) return null;
-            reserved = self.decoded_query_reserved_bytes.cmpxchgWeak(
-                reserved,
-                reserved + requested_bytes,
-                .acq_rel,
-                .acquire,
-            ) orelse return .{
-                .cache = self,
-                .namespace = namespace,
-                .reserved_bytes = requested_bytes,
-            };
-        }
+    pub fn shouldAdmitConcurrentVector(self: *Cache, namespace: u64) bool {
+        return self.admitConcurrentVectorTicket(namespace, self.concurrentVectorAdmissionStride());
     }
 
-    fn releaseDecodedQuery(self: *Cache, bytes: u64) void {
+    fn tryReserveDecodedQuery(
+        self: *Cache,
+        namespace: u64,
+        requested_bytes: u64,
+        vector_bytes: u64,
+    ) ?DecodedVectorResidencyLease {
+        if (self.resource_manager) |manager| self.refreshAdmissionPolicy(manager);
+        if (requested_bytes == 0 or vector_bytes == 0) return null;
+        const target = self.admission_target_bytes.load(.acquire);
+        var stride = self.concurrentVectorAdmissionStride();
+        if (target > 0 and stride != 0) {
+            const current = self.physical_accounting.current();
+            const free_bytes = target -| current;
+            if (requested_bytes > free_bytes) stride = @max(stride, 8);
+        }
+        if (!self.admitConcurrentVectorTicket(namespace, stride)) return null;
+
+        // Under saturation, admit a bounded replacement window for one sampled
+        // request instead of freezing the decoded resident set or letting one
+        // large exact request rotate the entire cache. The session hands off to
+        // retained LSM ownership at a batch boundary when this entitlement is
+        // exhausted.
+        const capacity_bytes = if (target > 0 and stride > 1)
+            @min(requested_bytes, @max(vector_bytes, target / 8))
+        else
+            requested_bytes;
+        return .{
+            .cache = self,
+            .namespace = namespace,
+            .capacity_bytes = capacity_bytes,
+        };
+    }
+
+    fn reserveDecodedQueryCapacity(self: *Cache, lease: *DecodedVectorResidencyLease, requested_bytes: u64) bool {
+        if (requested_bytes == 0) return true;
+        if (!lease.active or lease.cache != self) return false;
+        if (lease.reserved_bytes >= requested_bytes) return true;
+        const additional_bytes = requested_bytes - lease.reserved_bytes;
+        const committed_bytes = lease.published_bytes +| lease.reserved_bytes;
+        if (committed_bytes > lease.capacity_bytes or additional_bytes > lease.capacity_bytes - committed_bytes) return false;
+
+        // Capacity is charged before the primary-store read. Consequently all
+        // ordinary cache admissions and other ResourceManager users see these
+        // bytes as unavailable, and publication can atomically transfer the
+        // charge to the retained entry without a second reservation.
+        self.mutex.lockExclusive();
+        defer self.mutex.unlockExclusive();
+        const target = self.admission_target_bytes.load(.acquire);
+        if (target > 0) {
+            while (self.physical_accounting.current() > target -| @min(target, additional_bytes)) {
+                if (!self.evictOneLocked(.{ .namespace = 0, .id = 0 })) return false;
+            }
+        }
+        if (!self.physical_accounting.reserve(additional_bytes)) return false;
+        _ = self.decoded_query_reserved_bytes.fetchAdd(additional_bytes, .acq_rel);
+        lease.reserved_bytes += additional_bytes;
+        return true;
+    }
+
+    fn releaseDecodedQueryReservation(self: *Cache, bytes: u64) void {
+        if (bytes == 0) return;
+        const previous = self.decoded_query_reserved_bytes.fetchSub(bytes, .acq_rel);
+        std.debug.assert(previous >= bytes);
+        self.physical_accounting.release(bytes, false);
+    }
+
+    fn consumeDecodedQueryReservation(self: *Cache, bytes: u64) void {
         if (bytes == 0) return;
         const previous = self.decoded_query_reserved_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
@@ -1242,7 +1280,7 @@ pub const Cache = struct {
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = node.id };
         _ = self.removeNodeLocked(key, false);
         const bytes = estimateNodeCacheBytes(node);
-        const admission = self.admitLocked(.node, namespace, key, bytes, false) orelse {
+        const admission = self.admitLocked(.node, namespace, key, bytes, false, false) orelse {
             self.noteAdmissionSkipLocked(.node, namespace);
             return false;
         };
@@ -1272,7 +1310,7 @@ pub const Cache = struct {
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = node_id };
         _ = self.removeQuantizedLocked(key, false);
         const bytes = estimateQuantizedCacheBytes(qs);
-        const admission = self.admitLocked(.quantized, namespace, key, bytes, false) orelse {
+        const admission = self.admitLocked(.quantized, namespace, key, bytes, false, false) orelse {
             self.noteAdmissionSkipLocked(.quantized, namespace);
             return false;
         };
@@ -1302,7 +1340,7 @@ pub const Cache = struct {
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = node_id };
         _ = self.removeQuantizedLocked(key, false);
         const bytes = estimateQuantizedCacheBytes(&owned);
-        const admission = self.admitLocked(.quantized, namespace, key, bytes, true) orelse unreachable;
+        const admission = self.admitLocked(.quantized, namespace, key, bytes, true, false) orelse unreachable;
         errdefer self.rollbackAdmissionLocked(admission);
         const entry = try self.alloc.create(QuantizedCacheEntry);
         entry.* = .{ .quantized = owned };
@@ -1320,7 +1358,7 @@ pub const Cache = struct {
     }
 
     pub fn cacheVector(self: *Cache, namespace: u64, vector_id: u64, vector_data: []const f32) ![]const f32 {
-        return try self.cacheVectorGuarded(namespace, vector_id, vector_data, null, 0, false);
+        return try self.cacheVectorGuarded(namespace, vector_id, vector_data, null, 0, false, false, null);
     }
 
     fn cacheVectorGuarded(
@@ -1331,7 +1369,10 @@ pub const Cache = struct {
         fill_epoch: ?*const std.atomic.Value(u64),
         expected_epoch: u64,
         must_cache: bool,
+        precharged: bool,
+        inserted_out: ?*bool,
     ) ![]const f32 {
+        if (inserted_out) |inserted| inserted.* = false;
         const fill_stripe = sharedVectorFillStripe(namespace, vector_id);
         lockAtomic(&self.vector_fill_mutexes[fill_stripe]);
         defer self.vector_fill_mutexes[fill_stripe].unlock();
@@ -1379,7 +1420,7 @@ pub const Cache = struct {
             _ = self.removeVectorLocked(key, false);
         }
         const bytes = estimateVectorCacheBytes(vector_data);
-        const admission = self.admitLocked(.vector, namespace, key, bytes, must_cache) orelse {
+        const admission = self.admitLocked(.vector, namespace, key, bytes, must_cache, precharged) orelse {
             self.noteAdmissionSkipLocked(.vector, namespace);
             return vector_data;
         };
@@ -1394,6 +1435,7 @@ pub const Cache = struct {
         entry.namespace = namespace;
         entry.accounted_bytes = bytes;
         self.finishInsertLocked(.vector, key, bytes, admission);
+        if (inserted_out) |inserted| inserted.* = true;
         if (replaced) {
             noteHbcKindReplacement(&self.global_stats, .vector);
             if (self.namespace_stats.getPtr(namespace)) |stats| noteHbcKindReplacement(stats, .vector);
@@ -1434,7 +1476,7 @@ pub const Cache = struct {
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
         _ = self.removeMetadataLocked(key, false);
         const bytes = estimateMetadataCacheBytes(metadata);
-        const admission = self.admitLocked(.metadata, namespace, key, bytes, false) orelse {
+        const admission = self.admitLocked(.metadata, namespace, key, bytes, false, false) orelse {
             self.noteAdmissionSkipLocked(.metadata, namespace);
             return metadata;
         };
@@ -1501,8 +1543,17 @@ pub const Cache = struct {
         _ = self;
     }
 
-    fn admitLocked(self: *Cache, kind: HbcCacheKind, namespace: u64, protected: HbcSharedCacheKey, bytes: u64, must_cache: bool) ?HbcSharedAdmission {
+    fn admitLocked(
+        self: *Cache,
+        kind: HbcCacheKind,
+        namespace: u64,
+        protected: HbcSharedCacheKey,
+        bytes: u64,
+        must_cache: bool,
+        precharged: bool,
+    ) ?HbcSharedAdmission {
         if (bytes == 0) return .{};
+        if (precharged) return .{ .bytes = bytes, .precharged = true };
         if (self.reserveLocked(bytes)) return .{ .bytes = bytes, .reserved = true };
         _ = kind;
         _ = namespace;
@@ -1514,6 +1565,7 @@ pub const Cache = struct {
     }
 
     fn rollbackAdmissionLocked(self: *Cache, admission: HbcSharedAdmission) void {
+        if (admission.precharged) return;
         if (admission.reserved) self.releaseLocked(admission.bytes);
     }
 
@@ -1901,13 +1953,14 @@ pub const Cache = struct {
 pub const DecodedVectorResidencyLease = struct {
     cache: *Cache,
     namespace: u64,
-    reserved_bytes: u64,
-    tracked_reservation: bool = true,
+    capacity_bytes: u64,
+    reserved_bytes: u64 = 0,
+    published_bytes: u64 = 0,
     active: bool = true,
 
     pub fn deinit(self: *@This()) void {
         if (!self.active) return;
-        if (self.tracked_reservation) self.cache.releaseDecodedQuery(self.reserved_bytes);
+        self.cache.releaseDecodedQueryReservation(self.reserved_bytes);
         self.active = false;
     }
 
@@ -1915,11 +1968,18 @@ pub const DecodedVectorResidencyLease = struct {
         return if (self.active) self.reserved_bytes else 0;
     }
 
+    pub fn ensureCapacity(self: *@This(), bytes: u64) bool {
+        if (!self.active) return false;
+        return self.cache.reserveDecodedQueryCapacity(self, bytes);
+    }
+
     fn consume(self: *@This(), bytes: u64) void {
         if (!self.active or self.reserved_bytes == 0) return;
+        std.debug.assert(bytes <= self.reserved_bytes);
         const consumed = @min(bytes, self.reserved_bytes);
-        if (self.tracked_reservation) self.cache.releaseDecodedQuery(consumed);
+        self.cache.consumeDecodedQueryReservation(consumed);
         self.reserved_bytes -= consumed;
+        self.published_bytes +|= consumed;
     }
 
     fn belongsTo(self: *const @This(), cache: *const Cache, namespace: u64) bool {
@@ -6615,9 +6675,6 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache or self.lsmSessionBatchingActive()) return false;
         if (self.config.max_cached_vectors == 0) return false;
         _ = self.shared_cache orelse return false;
-        if (self.resource_manager) |manager| {
-            if (manager.hbcCachePolicy().concurrent_vector_admission_stride != 1) return false;
-        }
         return true;
     }
 
@@ -6627,9 +6684,9 @@ pub const HBCIndex = struct {
     pub fn acquireDecodedVectorResidency(self: *HBCIndex, expected_vectors: usize) ?DecodedVectorResidencyLease {
         if (!self.canOwnDecodedVectorResidency() or expected_vectors == 0) return null;
         const shared = self.shared_cache.?;
-        const requested_bytes = @as(u64, @intCast(expected_vectors)) *|
-            estimateDecodedVectorResidencyBytes(@intCast(self.config.dims));
-        return shared.tryReserveDecodedQuery(self.cache_namespace, requested_bytes);
+        const vector_bytes = estimateDecodedVectorResidencyBytes(@intCast(self.config.dims));
+        const requested_bytes = @as(u64, @intCast(expected_vectors)) *| vector_bytes;
+        return shared.tryReserveDecodedQuery(self.cache_namespace, requested_bytes, vector_bytes);
     }
 
     pub fn acquireDecodedVectorResidencyForSearch(self: *HBCIndex, req: SearchRequest) ?DecodedVectorResidencyLease {
@@ -7573,7 +7630,7 @@ pub const HBCIndex = struct {
         if (self.lsmSessionBatchingActive()) return vector_data;
         if (!self.shouldAdmitConcurrentVectorCache()) return vector_data;
         const fill_epoch = self.beginVectorCacheFill(vector_id) orelse return vector_data;
-        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false);
+        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false, false, null);
     }
 
     /// Publish a decoded miss for a request that already reserved decoded
@@ -7589,9 +7646,12 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache or self.lsmSessionBatchingActive()) return vector_data;
         const shared = self.shared_cache orelse return vector_data;
         if (!lease.belongsTo(shared, self.cache_namespace)) return vector_data;
+        const bytes = estimateVectorCacheBytes(vector_data);
+        if (!lease.ensureCapacity(bytes)) return vector_data;
         const fill_epoch = self.beginVectorCacheFill(vector_id) orelse return vector_data;
-        const retained = try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, true);
-        lease.consume(estimateVectorCacheBytes(vector_data));
+        var inserted = false;
+        const retained = try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false, true, &inserted);
+        if (inserted) lease.consume(bytes);
         return retained;
     }
 
@@ -7604,7 +7664,7 @@ pub const HBCIndex = struct {
         if (!self.cache_enabled or !self.retained_vector_cache_enabled) return vector_data;
         if (self.bypass_external_vector_cache or self.lsmSessionBatchingActive()) return vector_data;
         if (!self.shouldAdmitConcurrentVectorCache()) return vector_data;
-        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false);
+        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false, false, null);
     }
 
     pub fn vectorCacheEpoch(self: *const HBCIndex) u64 {
@@ -7655,16 +7715,34 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache) return vector_data;
         if (!self.shouldAdmitConcurrentVectorCache()) return vector_data;
         const fill_epoch = self.beginVectorCacheFill(vector_id) orelse return vector_data;
-        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false);
+        return try self.cacheVectorRetained(vector_id, vector_data, fill_epoch, false, false, null);
     }
 
-    fn cacheVectorRetained(self: *HBCIndex, vector_id: u64, vector_data: []const f32, fill_epoch: u64, must_cache: bool) ![]const f32 {
+    fn cacheVectorRetained(
+        self: *HBCIndex,
+        vector_id: u64,
+        vector_data: []const f32,
+        fill_epoch: u64,
+        must_cache: bool,
+        precharged: bool,
+        inserted_out: ?*bool,
+    ) ![]const f32 {
         const stripe = vectorCacheFillStripe(vector_id);
         const epoch = &self.vector_cache_fill_epochs[stripe];
         if (self.shared_cache) |cache| {
             if (self.config.max_cached_vectors == 0) return vector_data;
-            return try cache.cacheVectorGuarded(self.cache_namespace, vector_id, vector_data, epoch, fill_epoch, must_cache);
+            return try cache.cacheVectorGuarded(
+                self.cache_namespace,
+                vector_id,
+                vector_data,
+                epoch,
+                fill_epoch,
+                must_cache,
+                precharged,
+                inserted_out,
+            );
         }
+        if (precharged) return vector_data;
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
         if (fill_epoch & 1 != 0 or epoch.load(.acquire) != fill_epoch) return vector_data;
@@ -11169,16 +11247,107 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
     idx.attachResourceManager(&resource_manager);
     idx.attachSharedCache(&cache);
 
+    var abandoned = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(abandoned.ensureCapacity(vector_bytes));
+    abandoned.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+
     var lease = idx.acquireDecodedVectorResidency(2) orelse return error.TestUnexpectedResult;
     defer lease.deinit();
-    try std.testing.expect(idx.acquireDecodedVectorResidency(1) == null);
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
+    try std.testing.expect(lease.ensureCapacity(vector_bytes * 2));
+    try std.testing.expectEqual(vector_bytes * 2, cache.decoded_query_reserved_bytes.load(.acquire));
+
+    // The precharge is authoritative ResourceManager usage. An unrelated
+    // optional insertion cannot consume the promised bytes before publication.
+    _ = try cache.cacheMetadata(idx.cache_namespace, 99, "not admitted");
+    try std.testing.expectEqual(@as(u64, 0), cache.namespaceStats(idx.cache_namespace).metadata.used_bytes);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+
     _ = try idx.cacheVectorForResidencyLease(&lease, 1, &first);
     _ = try idx.cacheVectorForResidencyLease(&lease, 2, &second);
 
     try expectVectorCached(&idx, 1);
     try expectVectorCached(&idx, 2);
     try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
-    try std.testing.expect(idx.acquireDecodedVectorResidency(1) == null);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "hbc sampled decoded residency evolves a full resident set within its byte target" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const first = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const second = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
+    const replacement = [_]f32{ 9.0, 10.0, 11.0, 12.0 };
+    const vector_bytes = estimateVectorCacheBytes(&first);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes * 2,
+        .hard_limit_bytes = vector_bytes * 2,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+
+    _ = try idx.cacheVector(1, &first);
+    _ = try idx.cacheVector(2, &second);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+
+    // The first saturation ticket is the sampled request. It precharges one
+    // bounded replacement, evicts before the read, and transfers that charge
+    // to the new retained vector without exceeding the hard target.
+    var lease = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer lease.deinit();
+    try std.testing.expect(lease.ensureCapacity(vector_bytes));
+    _ = try idx.cacheVectorForResidencyLease(&lease, 3, &replacement);
+
+    try expectVectorCached(&idx, 3);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(idx.cache_namespace).vector.sampled_admissions);
+}
+
+test "hbc decoded residency fails closed when pinned entries prevent precharge" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const vector_bytes = estimateVectorCacheBytes(&vector);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes,
+        .hard_limit_bytes = vector_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resource_manager);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer idx.close();
+    idx.attachResourceManager(&resource_manager);
+    idx.attachSharedCache(&cache);
+
+    _ = try idx.cacheVector(1, &vector);
+    var pinned = idx.borrowCachedVector(1) orelse return error.TestUnexpectedResult;
+    defer pinned.deinit();
+    var lease = idx.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    defer lease.deinit();
+
+    try std.testing.expect(!lease.ensureCapacity(vector_bytes));
+    try std.testing.expectEqual(@as(u64, 0), cache.decoded_query_reserved_bytes.load(.acquire));
+    try std.testing.expectEqual(vector_bytes, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes <= vector_bytes);
 }
 
 test "hbc route observation counts external distance timing once" {
