@@ -1704,16 +1704,15 @@ fn extractPdfTextRegionsFromRunsAlloc(
 
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
-    var search_from: usize = 0;
     for (runs) |run| {
         if (run.text.len == 0) continue;
-        const start, const end = if (run.output_span) |span| blk: {
-            if (span.start >= span.end or span.end > page_text.len) continue;
-            break :blk .{ span.start, span.end };
-        } else blk: {
-            const start = std.mem.indexOfPos(u8, page_text, search_from, run.text) orelse continue;
-            break :blk .{ start, start + run.text.len };
-        };
+        // A null span means reconstruction could not align this positioned run
+        // with the canonical page text. Substring matching is unsafe here: a
+        // degraded run can match unrelated text and receive the wrong bounds.
+        const output_span = run.output_span orelse continue;
+        if (output_span.start >= output_span.end or output_span.end > page_text.len) continue;
+        const start = output_span.start;
+        const end = output_span.end;
         const span_start = std.math.cast(u32, start) orelse continue;
         const span_end = std.math.cast(u32, end) orelse continue;
         const bounds = pdf.render.textRunBounds(run);
@@ -1721,7 +1720,6 @@ fn extractPdfTextRegionsFromRunsAlloc(
             .span = .{ span_start, span_end },
             .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
         });
-        search_from = end;
     }
     return try regions.toOwnedSlice(alloc);
 }
@@ -1761,6 +1759,23 @@ test "PDF text regions use reconstructed output spans" {
     try std.testing.expectEqual([4]f64{ first_bounds.min_x, first_bounds.min_y, first_bounds.max_x, first_bounds.max_y }, regions[0].bbox);
     try std.testing.expectEqual([4]f64{ second_bounds.min_x, second_bounds.min_y, second_bounds.max_x, second_bounds.max_y }, regions[1].bbox);
     try std.testing.expect(!std.mem.eql(f64, &regions[0].bbox, &regions[1].bbox));
+
+    const unaligned_runs = [_]pdf.reader.TextRun{.{
+        .text = "FR",
+        .x = 100,
+        .y = 200,
+        .font_size = 12,
+        .advance_width = 80,
+        .ascent = 9,
+        .descent = 3,
+        .output_span = null,
+    }};
+
+    // "FR" occurs in the canonical text, but this run has no validated
+    // alignment and must not borrow that unrelated span.
+    const unaligned_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &unaligned_runs, "FOURTH EDITION FR");
+    defer if (unaligned_regions.len > 0) alloc.free(unaligned_regions);
+    try std.testing.expectEqual(@as(usize, 0), unaligned_regions.len);
 }
 
 fn extractSingleTextUnitAlloc(
