@@ -6927,6 +6927,17 @@ pub fn build(b: *std.Build) void {
     );
     serverless_workflow_vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
 
+    const db_index_race_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"DB index request races VOPR exact replays"},
+    });
+    const run_db_index_race_vopr_tests = b.addRunArtifact(db_index_race_vopr_tests);
+    const db_index_race_vopr_test_step = b.step(
+        "db-index-race-vopr-test",
+        "Run DB/index delete, materialization, capture, admission, cancellation, and shutdown races",
+    );
+    db_index_race_vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);
+
     const admission_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"resource admission VOPR"},
@@ -7079,6 +7090,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
+    vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);

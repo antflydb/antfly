@@ -974,6 +974,27 @@ compaction publication. Every history restarts the production runtime from
 durable state and proves both documents are visible from the compacted catalog
 head.
 
+#### DB and Index Request Races
+
+The `db-index-race-vopr-test` gate replaces thread-timing regressions with
+production-safe operation boundaries and nonblocking protocol microsteps. It
+exact-replays both durable managed-admission linearizations (materialize then
+delete, and delete then materialize) and proves they converge without an
+orphaned repair intent. The dense published-reader/catalog-writer campaign
+drives the real lock-free admission word one transition at a time: a reader
+registered before closure keeps the writer undrained until release, while a
+reader arriving after closure is fenced to the locked path before catalog
+deletion.
+
+The same gate runs the production text-merge admission queue on borrowed
+`VoprIo`. It proves that an index-local segment waiter does not block an
+independent index, older same-index work retains weighted FIFO priority,
+cancellation removes its waiter without poisoning later admission, and runtime
+shutdown wakes a blocked producer with the shutdown outcome. These histories
+exercise the real queue, permits, futex wakeups, catalog admission atomics, DB
+deletion, and durable repair cleanup; they do not mechanically reproduce the
+old native test threads or suspend while holding an apply/structural mutex.
+
 #### Admission and Resource Pressure
 
 The production resource manager now runs under replayable contention schedules
@@ -1017,15 +1038,16 @@ request microsteps as those seams are added.
 | P0 implemented | Standalone and serverless supervision | `supervision-vopr-test` covers partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, virtual watchdog expiry, and restart through the production supervisor. The serverless manager now owns a borrowed-`std.Io` Future instead of a native run-loop thread. |
 | P0 implemented | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
 | P1 implemented | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, and exact replay through production orchestration. |
-| P1 | DB and index request races | Elevate meaningful native-thread regressions such as cross-index admission, reader/writer fairness, delete/materialize, capture, shutdown, and cancellation into VOPR transitions through production-safe seams. Do not mechanically port test threads. |
+| P1 implemented | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
 | P2 | Provider boundaries | Add deterministic response adapters for inference providers and PostgreSQL/libpq covering timeout, partial response, cancellation, retry, malformed data, and admission ownership. Keep actual model execution, GPU kernels, and libpq internals in differential and integration tests. |
 | P2 | Composed query lifecycle | Exercise vector, text, graph, and global-query execution under partial failure, cancellation, resource pressure, and result-assembly races. |
 
 Replication backfill and the standalone/serverless supervisor were the first
 targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now implemented. The complete
-serverless workflow is also implemented, leaving DB and index request races as
-the next P1 target.
+serverless workflow and DB/index request-race compositions are also
+implemented. The remaining rows are P2 expansion work rather than unfinished
+P0/P1 foundations.
 
 ### Antithesis-Class Features Still Worth Porting
 
@@ -1102,10 +1124,11 @@ Wait for a real product or toolchain requirement before adding:
 1. Maintain the implemented replication-backfill, supervisor, and
    authentication VOPR suites, plus the complete-serverless-workflow suite, as
    their production seams evolve.
-2. Add DB and index request-race compositions.
+2. Maintain the DB and index request-race compositions as new index kinds and
+   admission dimensions are added.
 3. Build retroactive logging, event queries, and automatic debug recipes.
 4. Standardize local run/results artifacts and nightly corpus merging.
-5. Add DB/index/query compositions and provider model adapters.
+5. Add broader query compositions and provider model adapters.
 6. Continuously audit new production loops so they borrow `std.Io` and
    `VoprIo` instead of creating native-only runtime paths.
 

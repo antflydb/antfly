@@ -16427,6 +16427,16 @@ pub const DB = struct {
         return try self.admitManagedIndex(cfg);
     }
 
+    /// VOPR-only preparation seam for a committed managed catalog admission
+    /// whose durable outbox has not yet been materialized. This exposes the
+    /// same crash boundary used by production recovery without pausing while
+    /// an apply or structural lock is held.
+    pub fn prepareManagedIndexAdmissionForVopr(self: *DB, cfg: types.IndexConfig) !void {
+        if (!builtin.is_test) return error.VoprTestSeamUnavailable;
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg, .managed);
+        if (!installed.managed_admission_pending) return error.InvalidManagedIndexAdmission;
+    }
+
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
@@ -24740,6 +24750,41 @@ pub const DB = struct {
             }
         }
         return true;
+    }
+
+    /// Nonblocking production-protocol microsteps used by VOPR. They expose
+    /// the lock-free reader/catalog-writer admission state machine without
+    /// copying the protocol into a test model or parking a deterministic
+    /// executor on native atomic waits.
+    pub fn beginPublishedDenseCaptureForVopr(self: *DB, index_name: []const u8) bool {
+        if (!builtin.is_test) return false;
+        if (!self.beginPublishedDenseSearch()) return false;
+        if (self.core.denseIndex(index_name) == null) {
+            self.endPublishedDenseSearch();
+            return false;
+        }
+        return true;
+    }
+
+    pub fn endPublishedDenseCaptureForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endPublishedDenseSearch();
+    }
+
+    pub fn beginIndexCatalogBarrierForVopr(self: *DB) bool {
+        if (!builtin.is_test) return false;
+        const previous = self.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+        return previous & published_dense_catalog_closed == 0;
+    }
+
+    pub fn indexCatalogBarrierDrainedForVopr(self: *const DB) bool {
+        if (!builtin.is_test) return false;
+        return self.indexCatalogBarrierActive() and self.publishedDenseSearchCount() == 0;
+    }
+
+    pub fn endIndexCatalogBarrierForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endIndexCatalogBarrier();
     }
 
     fn endIndexCatalogBarrier(self: *DB) void {
