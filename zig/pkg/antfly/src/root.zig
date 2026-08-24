@@ -115,6 +115,7 @@ pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifec
 pub const vopr_determinism_audit = @import("vopr/determinism_audit.zig");
 pub const external_lake_vopr = @import("vopr/external_lake.zig");
 pub const media_runtime_vopr = @import("vopr/media_runtime.zig");
+pub const upgrade_compatibility_vopr = @import("vopr/upgrade_compatibility.zig");
 pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
 pub const http_lifecycle_vopr = @import("vopr/http_lifecycle.zig");
 pub const http_disconnect_vopr = @import("vopr/http_disconnect.zig");

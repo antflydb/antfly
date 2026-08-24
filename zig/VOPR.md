@@ -1,6 +1,6 @@
 # VOPR: Deterministic Autonomous Testing for Antfly
 
-Status (2026-08-23): the common VOPR engine and deterministic `std.Io` runtime
+Status (2026-08-24): the common VOPR engine and deterministic `std.Io` runtime
 are integrated with independent metadata, transaction, Raft, storage, HA,
 data-plane, derived-workflow, backup/restore, and clock-fault scenarios. The
 production DataServer now serves public HTTP on
@@ -10,7 +10,8 @@ scriptable/interactive debugger are executable. Replication backfill,
 supervision, authentication, complete serverless orchestration, DB/index races,
 provider boundaries, and composed query assembly have focused exact-replay
 suites, as do persistent Parquet cache, provisioning/startup, external-lake,
-and media-runtime boundaries. Routed data, Raft, split/merge, query assembly, and DataServer-owned
+media-provider, and upgrade/compatibility boundaries. Routed data, Raft,
+split/merge, query assembly, and DataServer-owned
 maintenance services expose production-safe scheduler boundaries. Campaigns
 export unified reduction/causal/counterfactual debug recipes, bounded flight
 recordings, stable JSON/static reports, and explicit quarantine manifests; the
@@ -86,7 +87,8 @@ An executable unit test alone is not called fully implemented.
 | Embedded, C API, and Lite lifecycle | Antfly `vopr/embedded_lite_lifecycle.zig` and `vopr/capi_lite_lifecycle.zig`; native Lite, docstore/index storage, Embedded DB, opaque C API handles, and portable restore borrow one caller-owned `std.Io` and `BackendRuntime` across open, close, callback, cancellation, activation, crash, and reopen boundaries | `zig build embedded-lite-lifecycle-vopr-test` |
 | Cross-service resource pressure | Antfly `vopr/resource_pressure.zig`; one ResourceManager and VoprIo envelope spans production request leases, a real Lite-backed DB write/read, durable-job ownership, ManagedEmbedder provider cancellation, persistent lake-cache queue memory and disk growth, plus task/file/socket quotas | `zig build admission-vopr-test resource-budget-test` |
 | Provider and composed-query boundaries | Antfly `vopr/provider_boundaries.zig`, `composed_query.zig`; real ManagedEmbedder, PostgreSQL Source, distributed merge, and graph-union seams | `zig build provider-boundary-vopr-test composed-query-vopr-test` |
-| Parquet cache, provisioning/startup, external lake, and media runtime | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/Iceberg-manifest/Parquet-query/registry paths, injected I/O and object-store faults, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
+| Parquet cache, provisioning/startup, external lake, and media providers | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/Iceberg-manifest/Parquet-query/provider-HTTP paths, injected I/O and object-store faults, provider retry/timeout/cancellation and active-request drain, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
+| Upgrade and compatibility campaign | Antfly `vopr/upgrade_compatibility.zig`; current production readers open v1 HA golden records, v12 manifests, v14 external inventories, legacy serverless heads, and v1 VOPR traces; fixture migration requires source and target exact replay plus semantic equivalence; incompatible traces, checkpoints, data directories, and future serverless artifacts fail closed; atomic data-directory publication recovers after a crash-before-rename | `zig build upgrade-compatibility-vopr-test` |
 
 The real DataServer listener, httpx client/server transport, request lifecycle,
 deadline, shutdown, and partial writes now execute as deterministic `VoprIo`
@@ -640,6 +642,16 @@ VOPR work has found concrete production and harness defects:
 - httpx listener shutdown used a hidden global `std.Io.Threaded` loopback
   connection to wake `accept`. On `VoprIo` that mixed unrelated handle spaces
   and failed with `BADF`; the wake connection now uses the listener's own I/O.
+- Shared httpx clients admitted requests while provider-runtime teardown was
+  freeing their transports and provider configuration. `Client.shutdown` now
+  closes admission, optionally cancels active I/O, and drains every committed
+  request lease before destroying shared state; the media campaign exact-
+  replays cancellation and replacement with an accepted request in flight.
+- Media-runtime startup published provider globals as each provider loaded.
+  When a later provider failed to initialize, the earlier thread-local global
+  could outlive its rolled-back allocation. Startup now loads every provider
+  before publishing any global, and the media campaign preserves this partial-
+  startup rollback contract.
 - `HttpRuntime` unconditionally created three hidden Threaded executors and a
   native descriptor observer. It now supports caller-owned backend-neutral
   lanes, preserves bounded admission, and fails closed when native disconnect
@@ -1268,18 +1280,20 @@ ownership is released.
 | P1 integrated | Persistent Parquet cache | `parquet-cache-vopr-test` runs the real borrowed-I/O worker, bounded queue, duplicate-write coalescing, read/write faults, durable sync, crash, reopen, and checksum-protected reads. It is the first production consumer of the reusable fault-to-`VoprIo` adapter. |
 | P1 integrated | Provisioning and startup | `provisioning-startup-vopr-test` runs real format admission and replica-root reconciliation through a manual `BackendRuntime` borrowing `VoprIo`, including repeat startup, partial markers, legacy-store rejection, failed atomic-write retry, and crash/restart. |
 | P1 integrated | External lake | `external-lake-vopr-test` retains the focused range/cache histories and composes catalog binding, object-backed Iceberg metadata discovery, production Avro manifest decoding, schema evolution, pinned inventory, Parquet footer metadata, row-group cache, and query assembly. Twelve exact-replayed modes cover cache reuse, short responses, timeout/admission, stale object versions, deletion, ambiguous completed downloads with retry, bounded eviction, and durable persistent-cache crash/reopen without an object re-download. |
-| P2 integrated | Media runtime | `media-runtime-vopr-test` drives production transcribing and text-to-speech registry activation, nested replacement, restoration, and cleanup on borrowed `VoprIo`. Provider execution remains a boundary/integration concern. |
+| P2 integrated | Media-provider execution and runtime | `media-runtime-vopr-test` exact-replays production Antfly STT and OpenAI-compatible TTS HTTP success, malformed JSON, truncated bodies, logical timeout, POST retry, partial-startup rollback, nested and in-flight runtime replacement, and shutdown cancellation/drain on borrowed `VoprIo`. `httpx.Client` closes admission and drains committed requests before shared provider state is destroyed. Real codecs, models, and GPU execution remain differential/integration concerns. |
+| P2 integrated | Upgrade and compatibility campaigns | `upgrade-compatibility-vopr-test` exact-replays eighteen histories covering v1 HA golden replication/checkpoint/backup bytes, legacy and future data-directory admission, crash-before-rename recovery, v1 trace roundtrip and incompatible format/scenario versions, replay-proven v1-to-v2 fixture migration and semantic-change rejection, logical checkpoint restore/version/corruption, and legacy/future serverless head, v14 inventory, and v12 manifest artifacts. Outcomes are explicit forward completion, rollback/retry, or safe rejection. |
 
 Replication backfill and the standalone/serverless supervisor were the first
 targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now integrated. The complete
 serverless workflow and DB/index request-race compositions are also
-integrated, as are the two P2 boundary suites. Future test work is targeted
+integrated, as are the P2 provider, query, media, and compatibility suites.
+Future test work is targeted
 composition, richer retained diagnostics, multi-bug search benchmarks,
 and newly exposed safe suspension points rather than missing scheduler or
 replay foundations.
 
-### Next Targeted Suites
+### Integrated Targeted Suites
 
 These are new suites or compositions, not retroactive dependencies of the
 integrated rows above.
@@ -1292,8 +1306,6 @@ integrated rows above.
 | P1 integrated | Embedded, C API, and Lite lifecycle | `embedded-lite-lifecycle-vopr-test` exact-replays native Lite crash/reopen, overlapping Embedded writer/reader lifetimes, C API readable-lease callback install/remove, canceled restore, atomic replacement with a pinned old reader, and current-generation visibility. Native Lite, Embedded DB, opaque C API handles, and restore staging share caller-owned `std.Io`/`BackendRuntime`; a physical-versus-`VoprIo` differential compares logical values and checkpoint sequences. |
 | P1 integrated | Cross-service resource pressure | `admission-vopr-test` composes one production `ResourceManager`, request-admission controllers, and `VoprIo` envelope across query/write request ownership, a real Lite-backed DB write and lookup, the durable-job lane, a cancelable ManagedEmbedder provider call, and the persistent Parquet range cache. Eight schedules exact-replay aggregate and slice-memory denial, cache queue denial, capacity-domain denial before disk I/O, task/file/socket exhaustion, cancellation cleanup, and progress after pressure clears. `resource-budget-test` guards the named lake-queue default mapping. |
 | P1 integrated | Full external-lake composition | `external-lake-vopr-test` now traverses catalog binding, object-backed Iceberg metadata and manifest discovery, schema evolution, Parquet footer discovery, row-group caching, and production query assembly. It fails closed on stale versions and deleted objects, retries an ambiguous completed download through the reusable object-store fault adapter, proves bounded cache eviction, and reopens a durable cache after a `VoprIo` filesystem crash without downloading cached objects again. |
-| P2 next | Media-provider execution | Extend registry coverage through scripted provider HTTP for timeout, partial or malformed output, retry, cancellation, runtime replacement, and shutdown with an active request. Keep real codecs, models, and GPU execution differential. |
-| P2 next | Upgrade and compatibility campaigns | Differentially open older data formats, trace versions, fixtures, checkpoints, and serverless artifacts; crash during migration; and prove safe rejection, rollback, or forward completion without weakening replay compatibility. |
 
 ### Ported Antithesis-Class Features
 
@@ -1304,7 +1316,7 @@ starvation, causal and counterfactual analysis, and multiverse navigation. The
 documented [Antithesis assertion
 model](https://antithesis.com/docs/product/writing_tests/assertions/) is
 therefore substantially covered. The hard, high-value features identified for
-local replacement are integrated or have an executable local foundation:
+local replacement are integrated:
 
 1. bounded retroactive flight recording with structured field/text selection
    and diagnostic before/after windows;
@@ -1334,13 +1346,13 @@ local replacement are integrated or have an executable local foundation:
 These capabilities are local libraries, commands, reports, and CI gates. They
 do not require an Antithesis account or hosted runtime.
 
-### Remaining Self-Contained Platform Work
+### Integrated Self-Contained Platform Work
 
 | Priority | Capability | Required work |
 | --- | --- | --- |
 | P0 integrated | Reusable command-template composer | `lib/vopr/command.zig` implements Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles. Commands declare symmetric compatibility/deny lists, exclusion groups, fault policy, and before/after quiescence requirements. The composer tracks stable active invocation identities, enforces singleton and serial admission, snapshots quiet-suffix obligations, and exact-replays eventual/final completion. |
 | P0 integrated | Complete entropy interception and audit | `lib/vopr/determinism.zig` admits only immediate structured choices and borrowed-`std.Io` entropy as runtime evidence. `vopr-determinism-audit` fail-closes on host RNG, delayed private PRNGs, host clocks, native threads/I/O, filesystem escapes, native libraries, unordered iteration, and pointer-derived identity in replayable adapters; reviewed differential boundaries require line-local categorized rationale. Its manifest is checked against every exported VOPR source and includes both legacy metadata replay regions. |
-| P1 integrated | Continuous and quiescent validation phases | The runner automatically samples every history in continuous, recovery/quiescent, and final phases, aggregates bounded no-progress and recovery evidence, classifies allocator and unexpected process/panic failures, and retains the pointer-free diagnostic outside canonical replay bytes. `VoprIo.healthSnapshot` automatically populates task, descriptor, and optional physical-storage evidence; the replication, supervision, auth, serverless-workflow, DB/index, provider, composed-query, resource-pressure, cache, startup, generation, configuration, Embedded/Lite, external-lake, and media suites add domain progress, consistency, exhaustion, and cleanup semantics. `vopr-results` uses exact-replayed evidence automatically. |
+| P1 integrated | Continuous and quiescent validation phases | The runner automatically samples every history in continuous, recovery/quiescent, and final phases, aggregates bounded no-progress and recovery evidence, classifies allocator and unexpected process/panic failures, and retains the pointer-free diagnostic outside canonical replay bytes. `VoprIo.healthSnapshot` automatically populates task, descriptor, and optional physical-storage evidence; the replication, supervision, auth, serverless-workflow, DB/index, provider, composed-query, resource-pressure, cache, startup, generation, configuration, Embedded/Lite, external-lake, media, and upgrade/compatibility suites add domain progress, consistency, exhaustion, and cleanup semantics. `vopr-results` uses exact-replayed evidence automatically. |
 | P1 integrated | Richer retroactive logging | `event.Event` and the bounded `flight_recorder` own diagnostic name/value fields and text independently of canonical replay fields. Filters combine event identity, kind, actor/resource, logical index, exact or substring field predicates, and text search; materialization adds bounded before/after context. Generic, domain, distributed-data, and custom metadata replays feed the recorder directly, and every automatic debug recipe exact-replays its reduced artifact into a configurable flight window. `vopr-recipe` exposes filter, window, capacity, and limit controls. |
 | P1 integrated | Local run index and usage API | `lib/vopr/run_index.zig` transactionally ingests per-history, aggregate, legacy aggregate, and existing index JSON; validates referential integrity; deduplicates stable run/history keys; and canonically indexes source revision, properties, fingerprints, corpus/quarantine counts, typed artifacts, and transition/resource/history budgets. `vopr-index` atomically persists the index and exposes run/revision/scenario/property/fingerprint/corpus/artifact/budget predicates as deterministic JSON or a static local HTML summary. Parallel campaign results now carry stable run identity, source/target/optimize metadata, and retained/quarantine artifact references. |
 | P1 integrated | Search recurrence and rarity reporting | `benchmark.zig` owns three reviewable injected defects representing scheduler starvation, publication after unstable durability, and cancellation/admission leakage. Each runs under random, guided, spliced, starvation, and checkpoint-assisted policies. `vopr-search-quality-v2` reports repeated occurrences, discovery probability and complement rarity in ppm, Wilson 95% confidence bounds, total and per-occurrence executed transitions and logical work, first-discovery work, retained bytes, and independently minimal witnesses by transition count and canonical retained-output bytes. Explorer failure examples track these stable digests, and all retained paths now exact-replay before insertion. |
@@ -1380,9 +1392,10 @@ Wait for a real product or toolchain requirement before adding:
    validation adapters as scenarios gain new resources; every mature suite
    should expose domain recovery/consistency while `VoprIo` continues to supply
    task, descriptor, and storage evidence automatically.
-6. Compose full Iceberg/Parquet discovery-to-row materialization, media-provider
-   cancellation/retry, and upgrade/compatibility campaigns only at
-   production-safe adapter and ownership boundaries.
+6. Maintain full Iceberg/Parquet discovery-to-row materialization,
+   media-provider cancellation/retry, and upgrade/compatibility campaigns at
+   production-safe adapter and ownership boundaries; add golden versions when
+   a durable format changes.
 7. Wire the integrated deterministic corpus merging, stable results, local
    run/usage index, and artifact retention into nightly CI policy.
 8. Maintain and grow the integrated injected-bug corpus as new search
@@ -1396,11 +1409,12 @@ Wait for a real product or toolchain requirement before adding:
     or compiler-guided campaigns only when the conditional prerequisites above
     become real.
 
-The defects already found—lifetime errors, listener shutdown races, hidden
-Threaded I/O, virtual socket accounting, FIN ordering, teardown deadlocks, TLS
-fail-open behavior, and ReleaseSafe fiber identity corruption—demonstrate that
-extending VOPR across the remaining orchestration boundaries is likely to pay
-off. See [Defects Found](#defects-found) for the complete inventory.
+The defects already found—lifetime errors, listener shutdown races, provider
+publication and teardown races, hidden Threaded I/O, virtual socket
+accounting, FIN ordering, teardown deadlocks, TLS fail-open behavior, and
+ReleaseSafe fiber identity corruption—demonstrate that extending VOPR across
+the remaining orchestration boundaries is likely to pay off. See
+[Defects Found](#defects-found) for the complete inventory.
 
 ## Risks and Required Safeguards
 
@@ -1459,10 +1473,10 @@ choices, one-transition scheduling, virtual tasks, files, sockets, processes,
 clocks and durability, guided exploration, exact replay, reduction, formal
 export, counterfactual analysis, and independent production-shaped scenarios.
 
-The identified P0 and P1 orchestration suites are integrated; the P2 media and
-upgrade work remains explicitly conditional or next. The hard
-Antithesis-class local tooling has campaign integration or an executable
-foundation; the persistent local cross-run index, filtered retroactive debug
+The identified P0, P1, and non-conditional P2 orchestration, media, and
+upgrade/compatibility suites are integrated. The hard
+Antithesis-class local tooling is integrated; the persistent local cross-run
+index, filtered retroactive debug
 pipeline, and multi-bug search-quality regression corpus are integrated. The
 next operational work is to retain and merge nightly corpora, publish the
 existing search-quality measurements, and extend scenarios when new

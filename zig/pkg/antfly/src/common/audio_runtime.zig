@@ -20,6 +20,10 @@ const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
 
 pub const ActiveRuntime = struct {
+    pub const Options = struct {
+        client: httpx.ClientConfig = .{},
+    };
+
     client: ?httpx.Client = null,
     transcribing_runtime: ?transcribing.Runtime = null,
     readers_runtime: ?readers.Runtime = null,
@@ -33,6 +37,15 @@ pub const ActiveRuntime = struct {
         io: std.Io,
         cfg: ?*const config_mod.Config,
     ) !ActiveRuntime {
+        return initWithOptions(alloc, io, cfg, .{});
+    }
+
+    pub fn initWithOptions(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        cfg: ?*const config_mod.Config,
+        options: Options,
+    ) !ActiveRuntime {
         var out = ActiveRuntime{};
         const loaded = cfg orelse return out;
         const has_transcribing = loaded.transcribers.defaultProviderName() != null;
@@ -40,29 +53,44 @@ pub const ActiveRuntime = struct {
         const has_synthesizing = loaded.text_to_speech.defaultProviderName() != null;
         if (!has_transcribing and !has_readers and !has_synthesizing) return out;
 
-        out.client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        var client_config = options.client;
+        client_config.keep_alive = false;
+        // Provider implementations and their shared client are one lifetime.
+        // Teardown must interrupt and drain requests before freeing either.
+        client_config.cancel_in_flight_on_shutdown = true;
+        out.client = httpx.Client.initWithConfig(alloc, io, client_config);
         errdefer if (out.client) |*client| client.deinit();
 
         if (has_transcribing) {
             out.transcribing_runtime = transcribing.Runtime.init(alloc);
             errdefer if (out.transcribing_runtime) |*runtime| runtime.deinit();
             try out.transcribing_runtime.?.loadFromRegistry(&out.client.?, &loaded.transcribers);
-            out.previous_transcribing_runtime = transcribing.getActiveRuntime();
-            transcribing.setActiveRuntime(&out.transcribing_runtime.?);
         }
 
         if (has_readers) {
             out.readers_runtime = readers.Runtime.init(alloc);
             errdefer if (out.readers_runtime) |*runtime| runtime.deinit();
             try out.readers_runtime.?.loadFromRegistry(&out.client.?, &loaded.readers);
-            out.previous_readers_runtime = readers.getActiveRuntime();
-            readers.setActiveRuntime(&out.readers_runtime.?);
         }
 
         if (has_synthesizing) {
             out.synthesizing_runtime = synthesizing.Runtime.init(alloc);
             errdefer if (out.synthesizing_runtime) |*runtime| runtime.deinit();
             try out.synthesizing_runtime.?.loadFromRegistry(&out.client.?, &loaded.text_to_speech);
+        }
+
+        // Publish the new registry set as one final, non-failing phase. A
+        // failure while loading any provider therefore leaves every previous
+        // active runtime untouched.
+        if (out.transcribing_runtime != null) {
+            out.previous_transcribing_runtime = transcribing.getActiveRuntime();
+            transcribing.setActiveRuntime(&out.transcribing_runtime.?);
+        }
+        if (out.readers_runtime != null) {
+            out.previous_readers_runtime = readers.getActiveRuntime();
+            readers.setActiveRuntime(&out.readers_runtime.?);
+        }
+        if (out.synthesizing_runtime != null) {
             out.previous_synthesizing_runtime = synthesizing.getActiveRuntime();
             synthesizing.setActiveRuntime(&out.synthesizing_runtime.?);
         }
@@ -71,18 +99,16 @@ pub const ActiveRuntime = struct {
     }
 
     pub fn deinit(self: *ActiveRuntime) void {
-        if (self.synthesizing_runtime) |*runtime| {
-            synthesizing.setActiveRuntime(self.previous_synthesizing_runtime);
-            runtime.deinit();
-        }
-        if (self.readers_runtime) |*runtime| {
-            readers.setActiveRuntime(self.previous_readers_runtime);
-            runtime.deinit();
-        }
-        if (self.transcribing_runtime) |*runtime| {
-            transcribing.setActiveRuntime(self.previous_transcribing_runtime);
-            runtime.deinit();
-        }
+        // Close global admission first. Existing calls retain their provider
+        // state until the shared client has cancelled and drained them.
+        if (self.synthesizing_runtime != null) synthesizing.setActiveRuntime(self.previous_synthesizing_runtime);
+        if (self.readers_runtime != null) readers.setActiveRuntime(self.previous_readers_runtime);
+        if (self.transcribing_runtime != null) transcribing.setActiveRuntime(self.previous_transcribing_runtime);
+
+        if (self.client) |*client| client.shutdown();
+        if (self.synthesizing_runtime) |*runtime| runtime.deinit();
+        if (self.readers_runtime) |*runtime| runtime.deinit();
+        if (self.transcribing_runtime) |*runtime| runtime.deinit();
         if (self.client) |*client| client.deinit();
         self.* = undefined;
     }
@@ -127,4 +153,34 @@ test "audio runtime activates configured transcribing and synthesizing providers
     try std.testing.expect(synthesizing.getActiveRuntime() != null);
     try std.testing.expect(transcribing.getActiveRuntime() != prev_stt or prev_stt == null);
     try std.testing.expect(synthesizing.getActiveRuntime() != prev_tts or prev_tts == null);
+}
+
+test "audio runtime rolls back globals when a later provider fails to load" {
+    const alloc = std.testing.allocator;
+    var io = std.Io.Threaded.init(alloc, .{});
+    defer io.deinit();
+
+    var cfg = config_mod.Config{
+        .registry = @import("provider_registry.zig").Registry.init(alloc),
+        .transcribers = transcribing.Registry.init(alloc),
+        .readers = readers.Registry.init(alloc),
+        .text_to_speech = synthesizing.Registry.init(alloc),
+    };
+    defer cfg.deinit();
+
+    try cfg.transcribers.registerConfig("valid-first", .{
+        .provider = .antfly,
+        .api_url = "http://127.0.0.1:9090",
+        .model = "vopr-stt",
+    });
+    try cfg.text_to_speech.registerConfig("unsupported-later", .{
+        .provider = .elevenlabs,
+        .voice_id = "vopr-voice",
+    });
+
+    const previous_stt = transcribing.getActiveRuntime();
+    const previous_tts = synthesizing.getActiveRuntime();
+    try std.testing.expectError(error.UnsupportedSynthesizingProvider, ActiveRuntime.init(alloc, io.io(), &cfg));
+    try std.testing.expect(transcribing.getActiveRuntime() == previous_stt);
+    try std.testing.expect(synthesizing.getActiveRuntime() == previous_tts);
 }

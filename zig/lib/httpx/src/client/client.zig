@@ -90,6 +90,12 @@ pub const ClientConfig = struct {
     /// cached address is evicted before the next DNS lookup. Ignored when an
     /// explicit address filter is installed.
     cache_resolved_addresses: bool = false,
+    /// Cancel requests already admitted when `shutdown` or `deinit` closes the
+    /// client. Admission is always closed and drained before transport state is
+    /// destroyed; this option additionally interrupts blocked network I/O.
+    /// Runtime owners should enable it when provider state and the client share
+    /// a coordinated lifetime.
+    cancel_in_flight_on_shutdown: bool = false,
     /// Optional connection-time address policy. When set, pooled HTTP/1
     /// connections and the resolved-address cache are bypassed so every new
     /// connection uses a freshly vetted result.
@@ -528,6 +534,83 @@ fn sleepAfterEmptyRead(io: Io) void {
     io.sleep(Io.Duration.zero, .awake) catch {};
 }
 
+/// One atomic word closes request admission and counts committed borrowers, so
+/// teardown cannot race between an "is closing" check and the lease increment.
+const RequestGate = struct {
+    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const count_mask: usize = closed_bit - 1;
+
+    state: std.atomic.Value(usize) = .init(0),
+    drain_mutex: Io.Mutex = .init,
+    drained: Io.Condition = .init,
+
+    fn tryAcquire(self: *RequestGate, io: Io) !RequestLease {
+        var observed = self.state.load(.acquire);
+        while (true) {
+            if (observed & closed_bit != 0) return error.ClientShuttingDown;
+            const count = observed & count_mask;
+            if (count == count_mask) return error.TooManyConcurrentRequests;
+            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return .{ .gate = self, .io = io };
+        }
+    }
+
+    fn release(self: *RequestGate, io: Io) void {
+        const previous = self.state.fetchSub(1, .acq_rel);
+        std.debug.assert(previous & count_mask != 0);
+        if (previous & closed_bit != 0 and previous & count_mask == 1) {
+            self.drain_mutex.lockUncancelable(io);
+            self.drained.broadcast(io);
+            self.drain_mutex.unlock(io);
+        }
+    }
+
+    fn closeAndDrain(self: *RequestGate, io: Io) void {
+        _ = self.state.fetchOr(closed_bit, .acq_rel);
+        self.drain_mutex.lockUncancelable(io);
+        defer self.drain_mutex.unlock(io);
+        while (self.active() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
+    }
+
+    fn active(self: *const RequestGate) usize {
+        return self.state.load(.acquire) & count_mask;
+    }
+
+    fn isClosed(self: *const RequestGate) bool {
+        return self.state.load(.acquire) & closed_bit != 0;
+    }
+};
+
+const RequestLease = struct {
+    gate: *RequestGate,
+    io: Io,
+
+    fn deinit(self: *RequestLease) void {
+        self.gate.release(self.io);
+        self.* = undefined;
+    }
+};
+
+const CombinedCancellation = struct {
+    gate: *const RequestGate,
+    external: ?CancellationToken,
+
+    fn token(self: *const CombinedCancellation) CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = isCancelled,
+        };
+    }
+
+    fn isCancelled(raw: *const anyopaque) bool {
+        const self: *const CombinedCancellation = @ptrCast(@alignCast(raw));
+        return self.gate.isClosed() or if (self.external) |external| external.isCancelled() else false;
+    }
+};
+
 /// HTTP Client.
 pub const Client = struct {
     allocator: Allocator,
@@ -545,6 +628,7 @@ pub const Client = struct {
     h2_mutex: Io.Mutex = Io.Mutex.init,
     resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
     resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
+    request_gate: RequestGate = .{},
 
     const Self = @This();
 
@@ -587,6 +671,7 @@ pub const Client = struct {
 
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
+        self.shutdown();
         self.interceptors.deinit(self.allocator);
         var it = self.cookies.iterator();
         while (it.next()) |entry| {
@@ -621,6 +706,12 @@ pub const Client = struct {
         self.h2_conns.deinit(self.allocator);
     }
 
+    /// Closes request admission and waits until all admitted requests return.
+    /// Safe to call before provider state that borrows this client is destroyed.
+    pub fn shutdown(self: *Self) void {
+        self.request_gate.closeAndDrain(self.io);
+    }
+
     /// Adds an interceptor to the client.
     pub fn addInterceptor(self: *Self, interceptor: Interceptor) !void {
         try self.interceptors.append(self.allocator, interceptor);
@@ -628,7 +719,14 @@ pub const Client = struct {
 
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.requestInternal(method, url, reqOpts, 0);
+        var lease = try self.request_gate.tryAcquire(self.io);
+        defer lease.deinit();
+        if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0);
+
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var coordinated = reqOpts;
+        coordinated.cancellation = cancellation.token();
+        return self.requestInternal(method, url, coordinated, 0);
     }
 
     /// Makes an HTTP request and streams the response body to `writer`.
@@ -642,7 +740,14 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0);
+        var lease = try self.request_gate.tryAcquire(self.io);
+        defer lease.deinit();
+        if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0);
+
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var coordinated = reqOpts;
+        coordinated.cancellation = cancellation.token();
+        return self.requestToWriterInternal(method, url, coordinated, writer, progress_cb, progress_ctx, 0);
     }
 
     pub fn getToWriter(
@@ -4647,3 +4752,27 @@ test "HTTPS HEAD returns after headers on a keep-alive connection" {
 
 // Tests for decompressBody and responseFromParser were removed — these methods
 // were replaced by the streaming decompression pipeline in buildStreamingResponse.
+
+test "request gate closes admission and drains a committed borrower" {
+    const io = std.testing.io;
+    var gate: RequestGate = .{};
+    var lease = try gate.tryAcquire(io);
+    var shutdown_done = std.atomic.Value(bool).init(false);
+
+    const Task = struct {
+        fn shutdown(request_gate: *RequestGate, done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            request_gate.closeAndDrain(std.testing.io);
+            done.store(true, .release);
+        }
+    };
+
+    var group = std.Io.Group.init;
+    try group.concurrent(io, Task.shutdown, .{ &gate, &shutdown_done });
+    while (!gate.isClosed()) try io.sleep(.fromMilliseconds(1), .awake);
+
+    try std.testing.expectError(error.ClientShuttingDown, gate.tryAcquire(io));
+    try std.testing.expect(!shutdown_done.load(.acquire));
+    lease.deinit();
+    try group.await(io);
+    try std.testing.expect(shutdown_done.load(.acquire));
+}

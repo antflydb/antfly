@@ -7098,11 +7098,19 @@ pub fn build(b: *std.Build) void {
 
     const media_runtime_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"media runtime VOPR exact replays"},
+        .filters = &.{"media provider VOPR exact replays"},
     });
     const run_media_runtime_vopr_tests = b.addRunArtifact(media_runtime_vopr_tests);
-    const media_runtime_vopr_test_step = b.step("media-runtime-vopr-test", "Run media registry activation, nesting, and cleanup histories on VoprIo");
+    const media_runtime_vopr_test_step = b.step("media-runtime-vopr-test", "Run production media HTTP, retry, timeout, cancellation, replacement, and cleanup histories on VoprIo");
     media_runtime_vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
+
+    const upgrade_compatibility_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"upgrade compatibility VOPR exact replays"},
+    });
+    const run_upgrade_compatibility_vopr_tests = b.addRunArtifact(upgrade_compatibility_vopr_tests);
+    const upgrade_compatibility_vopr_test_step = b.step("upgrade-compatibility-vopr-test", "Run storage, trace, fixture, checkpoint, and serverless artifact compatibility histories");
+    upgrade_compatibility_vopr_test_step.dependOn(&run_upgrade_compatibility_vopr_tests.step);
 
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -7289,6 +7297,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_vopr_determinism_audit_tests.step);
     vopr_test_step.dependOn(&run_external_lake_vopr_tests.step);
     vopr_test_step.dependOn(&run_media_runtime_vopr_tests.step);
+    vopr_test_step.dependOn(&run_upgrade_compatibility_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
