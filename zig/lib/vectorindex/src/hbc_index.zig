@@ -853,7 +853,13 @@ pub fn getVecLeaf(self: anytype, txn: anytype, vector_id: u64) !u64 {
 }
 
 pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
-    if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    const Index = comptime childType(@TypeOf(self));
+    // Retained-cache implementations cannot return a raw cached slice: a
+    // concurrent reclaimer may evict it immediately after the lookup lock is
+    // released. Scalar callers receive the transaction-owned storage view.
+    if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+        if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    }
     var key_buf: [10]u8 = undefined;
     const data = self.getNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&key_buf, vector_id)) catch |err| {
         if (is_not_found(err)) return null;
@@ -1777,11 +1783,18 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     if (vector_ids.len == 0) return;
 
     var lookup_count: usize = 0;
+    const Index = comptime childType(@TypeOf(self));
     for (vector_ids, 0..) |vector_id, index| {
-        if (self.getCachedMetadata(vector_id)) |cached| {
-            if (profile) |p| p.metadata_cache_hits += 1;
-            out_metadata[index] = cached;
-            continue;
+        // See loadMetadataRaw: this API returns views that remain live after
+        // the function returns, so retained-cache adapters must use the
+        // transaction-owned ordered read. Result population uses borrowed
+        // handles where the lifetime is naturally bounded.
+        if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+            if (self.getCachedMetadata(vector_id)) |cached| {
+                if (profile) |p| p.metadata_cache_hits += 1;
+                out_metadata[index] = cached;
+                continue;
+            }
         }
         if (profile) |p| p.metadata_cache_misses += 1;
         var key: [10]u8 = undefined;
@@ -3983,9 +3996,12 @@ fn populateMetadataBatchedWithScratch(
             results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
             continue;
         }
-        if (self.getCachedMetadata(item.vector_id)) |cached| {
-            results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
-            continue;
+        const Index = comptime childType(@TypeOf(self));
+        if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+            if (self.getCachedMetadata(item.vector_id)) |cached| {
+                results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
+                continue;
+            }
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, item.vector_id);
