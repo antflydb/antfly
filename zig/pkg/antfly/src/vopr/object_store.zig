@@ -385,14 +385,31 @@ test "serverless object store VOPR consumes stale enrichment generation without 
         ),
     );
 
-    var consumed = try builder.publishNamespace("docs");
+    var consumed = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, .{
+        .targets = .{
+            .published_search_sources = generation_two.stats.published_search_sources,
+            .include_graph = true,
+        },
+        .policy = .{ .keep_latest_versions = 9 },
+        .metadata_republish = .{ .artifact_families_changed = true },
+        .artifact_actions = .{
+            .document_segment = .reuse,
+            .full_text = .reuse,
+            .dense_vector = .reuse,
+            .sparse_vector = .reuse,
+            .graph = .reuse,
+        },
+    });
     defer consumed.deinit(alloc);
     try std.testing.expect(consumed.published);
     try std.testing.expectEqual(@as(u64, 3), consumed.version);
+    try std.testing.expectEqual(@as(u64, 2), consumed.wal_start_lsn);
     try std.testing.expectEqual(@as(u64, 2), consumed.wal_end_lsn);
 
     var visible = try manifests.getAlloc("docs", 3);
     defer visible.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 9), visible.stats.policy.keep_latest_versions);
+    try std.testing.expectEqual(@as(u64, 2), visible.wal_start_lsn);
     const document_ref = for (visible.artifacts) |artifact| {
         if (artifact.kind == .document_segment) break artifact;
     } else return error.DocumentSegmentNotFound;
@@ -402,6 +419,45 @@ test "serverless object store VOPR consumes stale enrichment generation without 
     defer document_segment.freeEntries(alloc, entries);
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualStrings("{\"text\":\"authoritative\"}", entries[0].body);
+
+    // Exercise the cheap unchanged-plan path as well. The stale source head 2
+    // record is consumed by a clone of head 3, and that clone must carry the
+    // tighter retention boundary without losing the plan applied above.
+    try std.testing.expectEqual(
+        @as(?u64, 3),
+        try wal.appendIdempotentIfLatest(
+            "docs",
+            102,
+            stale_mutation,
+            "enrich-v1/2/1/0/1",
+            2,
+        ),
+    );
+    var cloned = try builder.publishNamespace("docs");
+    defer cloned.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4), cloned.version);
+    try std.testing.expectEqual(@as(u64, 3), cloned.wal_start_lsn);
+    try std.testing.expectEqual(@as(u64, 3), cloned.wal_end_lsn);
+    var cloned_manifest = try manifests.getAlloc("docs", 4);
+    defer cloned_manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 9), cloned_manifest.stats.policy.keep_latest_versions);
+    const cloned_document_ref = for (cloned_manifest.artifacts) |artifact| {
+        if (artifact.kind == .document_segment) break artifact;
+    } else return error.DocumentSegmentNotFound;
+    try std.testing.expectEqualStrings(
+        document_ref.artifact_id,
+        cloned_document_ref.artifact_id,
+    );
+
+    var pruner = builder_mod.Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var pruning = try pruner.pruneNamespace("docs", 1);
+    defer pruning.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), pruning.wal_keep_from_lsn);
+    try std.testing.expectEqual(@as(u64, 2), pruning.wal_records_removed);
+    const retained_wal = try wal.readFromAlloc("docs", 1);
+    defer wal_mod.freeRecords(alloc, retained_wal);
+    try std.testing.expectEqual(@as(usize, 1), retained_wal.len);
+    try std.testing.expectEqual(@as(u64, 3), retained_wal[0].lsn);
 }
 
 test "serverless object store VOPR enrichment conflict preserves pruning progress" {

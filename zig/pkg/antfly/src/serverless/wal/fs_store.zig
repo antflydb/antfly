@@ -576,16 +576,22 @@ test "serverless fs WAL conditional append is atomic across store instances" {
     try std.testing.expectEqual(@as(u64, 1), try store_a.append("docs", 100, "seed"));
 
     const Race = struct {
+        io: std.Io,
         stores: [2]*FsStore,
-        ready: std.atomic.Value(u32) = .init(0),
-        go: std.atomic.Value(bool) = .init(false),
+        ready_count: std.atomic.Value(u32) = .init(0),
+        ready: std.Io.Event = .unset,
+        start: std.Io.Event = .unset,
         winners: std.atomic.Value(u32) = .init(0),
+        errors: std.atomic.Value(u32) = .init(0),
 
         fn run(self: *@This(), index: usize) void {
-            _ = self.ready.fetchAdd(1, .release);
-            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            if (self.ready_count.fetchAdd(1, .release) == 1) self.ready.set(self.io);
+            self.start.waitUncancelable(self.io);
             var operation_buf: [32]u8 = undefined;
-            const operation_id = std.fmt.bufPrint(&operation_buf, "enrich-v1/1/1/{d}/1", .{index}) catch return;
+            const operation_id = std.fmt.bufPrint(&operation_buf, "enrich-v1/1/1/{d}/1", .{index}) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                return;
+            };
             const payload = if (index == 0) "derived-a" else "derived-b";
             const appended = self.stores[index].appendIdempotentIfLatest(
                 "docs",
@@ -593,19 +599,27 @@ test "serverless fs WAL conditional append is atomic across store instances" {
                 payload,
                 operation_id,
                 1,
-            ) catch return;
+            ) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                return;
+            };
             if (appended != null) _ = self.winners.fetchAdd(1, .monotonic);
         }
     };
 
-    var race = Race{ .stores = .{ &store_a, &store_b } };
-    const thread_a = try std.Thread.spawn(.{}, Race.run, .{ &race, 0 });
-    const thread_b = try std.Thread.spawn(.{}, Race.run, .{ &race, 1 });
-    while (race.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
-    race.go.store(true, .release);
-    thread_a.join();
-    thread_b.join();
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var race = Race{ .io = io, .stores = .{ &store_a, &store_b } };
+    var group: std.Io.Group = .init;
+    errdefer group.cancel(io);
+    group.async(io, Race.run, .{ &race, 0 });
+    group.async(io, Race.run, .{ &race, 1 });
+    race.ready.waitUncancelable(io);
+    race.start.set(io);
+    try group.await(io);
 
+    try std.testing.expectEqual(@as(u32, 0), race.errors.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), race.winners.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), try store_a.latestLsn("docs"));
     const records = try store_a.readFromAlloc(std.testing.allocator, "docs", 1);

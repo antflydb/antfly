@@ -300,6 +300,7 @@ pub const Builder = struct {
                         plan,
                         publication_guard,
                         cancellation,
+                        null,
                     );
                 }
             } else if (current_head == 0 and plan.table_definition.base_source != null) {
@@ -311,6 +312,7 @@ pub const Builder = struct {
                     plan,
                     publication_guard,
                     cancellation,
+                    null,
                 );
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
@@ -321,6 +323,7 @@ pub const Builder = struct {
                     plan,
                     publication_guard,
                     cancellation,
+                    null,
                 );
             }
             return .{
@@ -341,11 +344,37 @@ pub const Builder = struct {
         // wedge an external/read-only table or overwrite a newer generation.
         if (applicable_records.len == 0) {
             const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
+            const last_record = records[records.len - 1];
+            if (plan.external_source_plan) |external_plan| {
+                if (!externalSourcePlanMatchesManifest(external_plan, current)) {
+                    return try self.publishExternalManifestWithoutWal(
+                        namespace,
+                        current_head,
+                        next_version,
+                        start_lsn,
+                        plan,
+                        publication_guard,
+                        cancellation,
+                        last_record,
+                    );
+                }
+            }
+            if (plan.forceRepublishFromHead()) {
+                return try self.republishHeadWithPlan(
+                    namespace,
+                    current_head,
+                    vector_metric,
+                    plan,
+                    publication_guard,
+                    cancellation,
+                    last_record,
+                );
+            }
             return try self.publishHeadConsumingIgnoredWal(
                 namespace,
                 current_head,
                 current,
-                records[records.len - 1],
+                last_record,
                 publication_guard,
                 cancellation,
             );
@@ -554,6 +583,11 @@ pub const Builder = struct {
         defer manifest.deinit(self.alloc);
         manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
         manifest.built_at_ns = last_record.timestamp_ns;
+        // The cloned artifacts are already a complete published snapshot and
+        // do not depend on any of the ignored mutations. Advance the retained
+        // WAL boundary with the consumed tail so repeated stale work cannot
+        // pin the namespace's entire historical log.
+        manifest.wal_start_lsn = last_record.lsn;
         manifest.wal_end_lsn = last_record.lsn;
 
         const published_version = try putManifestForPublication(self.manifests, &manifest, current_head);
@@ -584,10 +618,16 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| {
+            manifest.built_at_ns = record.timestamp_ns;
+            manifest.wal_start_lsn = record.lsn;
+            manifest.wal_end_lsn = record.lsn;
+        }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
@@ -609,8 +649,8 @@ pub const Builder = struct {
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
             .version = published_version,
-            .wal_start_lsn = start_lsn,
-            .wal_end_lsn = start_lsn - 1,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -625,7 +665,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        }, null, null);
+        }, null, null, null);
     }
 
     fn republishHeadWithPlan(
@@ -636,6 +676,7 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
@@ -782,11 +823,12 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
 
         const next_version = current_head + 1;
+        const wal_end_lsn = if (consumed_record) |record| record.lsn else current.wal_end_lsn;
         var manifest = try buildCompactedManifestFromRefsAlloc(
             self.alloc,
             namespace,
             next_version,
-            current.wal_end_lsn,
+            wal_end_lsn,
             @intCast(current.stats.document_count),
             if (plan.artifact_actions.document_segment == .reuse)
                 if (current.stats.document_base_version != 0) current.stats.document_base_version else current.version
@@ -803,6 +845,7 @@ pub const Builder = struct {
             plan.table_definition,
         );
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| manifest.built_at_ns = record.timestamp_ns;
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
@@ -824,8 +867,8 @@ pub const Builder = struct {
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
             .version = published_version,
-            .wal_start_lsn = current.wal_end_lsn,
-            .wal_end_lsn = current.wal_end_lsn,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
