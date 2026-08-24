@@ -388,7 +388,7 @@ func TestProcessIncarnationFenceBoundaryRestartsOnOldProcessRenewal(t *testing.T
 	}
 }
 
-func TestCommittedTransferBindsExactSuccessorProcessAndScope(t *testing.T) {
+func TestCommittedTransferBindsSuccessorProcessAtCommittedBoundary(t *testing.T) {
 	leaseTime := time.Date(2026, 8, 24, 4, 50, 31, 0, time.UTC)
 	parent := haClusterWithAutomaticKubernetesLeaseFailover()
 	parent.Spec.HighAvailability.Identity.ShardID = 10
@@ -412,7 +412,7 @@ func TestCommittedTransferBindsExactSuccessorProcessAndScope(t *testing.T) {
 	successor.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
 		PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
-		PrimaryLSN:            711,
+		PrimaryLSN:            687,
 	}
 	pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
 	reconciler := testHAReconciler(t, lease, pod)
@@ -547,6 +547,9 @@ func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
 		}},
 		{name: "missing committed transfer", mutate: func(_ *antflyv1.AntflyCluster, lease *coordinationv1.Lease) {
 			delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+		}},
+		{name: "successor status above committed boundary", mutate: func(cluster *antflyv1.AntflyCluster, _ *coordinationv1.Lease) {
+			cluster.Status.HAStatus.PrimaryLSN = 712
 		}},
 	}
 

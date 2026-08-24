@@ -403,7 +403,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
-		committedSuccessor := haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)
+		committedBoundary, committedSuccessor := haCommittedTransferSuccessorBoundary(cluster, lease, scope, currentHolder, transitions)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
 			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||
@@ -433,6 +433,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 			// Lease scope and bind the already fail-closed successor process in one
 			// write; publishing either half alone would let the runtime and Lease
 			// controller wait indefinitely for each other.
+			scope.primaryLSN = committedBoundary
 			for key, value := range scope.annotations() {
 				lease.Annotations[key] = value
 			}
@@ -1130,7 +1131,9 @@ func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseS
 // runtime's first authoritative observation. The transfer is committed on the
 // parent identity; Colony then publishes the exact next timeline/epoch on a
 // different AntflyCluster CR. Until the new process is bound, that runtime must
-// remain fail-closed and therefore cannot report an authoritative positive LSN.
+// remain fail-closed and can retain a lower standby-era LSN. The committed
+// Lease boundary is authoritative; the successor may adopt it but may neither
+// replace it with the lower cached value nor claim a value above it.
 //
 // Every durable transfer dimension must agree, the identity may advance by
 // exactly one timeline and one epoch, and the positive promotion boundary may
@@ -1143,6 +1146,17 @@ func haCommittedTransferSuccessorScopeMatches(
 	holder string,
 	transition int32,
 ) bool {
+	_, ok := haCommittedTransferSuccessorBoundary(cluster, lease, successor, holder, transition)
+	return ok
+}
+
+func haCommittedTransferSuccessorBoundary(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	successor haFencingLeaseScope,
+	holder string,
+	transition int32,
+) (uint64, bool) {
 	if cluster == nil || cluster.UID == "" || lease == nil || lease.Annotations == nil ||
 		transition <= 1 || successor.primaryLSN == 0 || strings.TrimSpace(holder) == "" ||
 		strings.TrimSpace(holder) != strings.TrimSpace(successor.currentPrimaryID) ||
@@ -1155,11 +1169,11 @@ func haCommittedTransferSuccessorScopeMatches(
 		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == "" ||
 		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == string(cluster.UID) ||
 		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] != strconv.FormatInt(int64(transition), 10) {
-		return false
+		return 0, false
 	}
 	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(holder) ||
 		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != transition {
-		return false
+		return 0, false
 	}
 
 	parse := func(key string) (uint64, bool) {
@@ -1172,11 +1186,15 @@ func haCommittedTransferSuccessorScopeMatches(
 	parentTimelineID, timelineOK := parse(haFencingLeaseAnnotationTimelineID)
 	parentEpoch, epochOK := parse(haFencingLeaseAnnotationEpoch)
 	boundary, boundaryOK := parse(haFencingLeaseAnnotationPrimaryLSN)
-	return clusterOK && shardOK && tableOK && timelineOK && epochOK && boundaryOK &&
+	ok := clusterOK && shardOK && tableOK && timelineOK && epochOK && boundaryOK && boundary > 0 &&
 		clusterID == successor.clusterID && shardID == successor.shardID && tableID == successor.tableID &&
 		successor.timelineID > 0 && parentTimelineID == successor.timelineID-1 &&
 		successor.epoch > 0 && parentEpoch == successor.epoch-1 &&
-		boundary == successor.primaryLSN
+		successor.primaryLSN <= boundary
+	if !ok {
+		return 0, false
+	}
+	return boundary, true
 }
 
 func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
