@@ -373,16 +373,12 @@ pub const Scanner = struct {
         const data_offset = self.base_offset + data_start;
         const actual_length = if (streamLength(owned)) |direct_length| blk: {
             if (self.pos + direct_length > self.bytes.len) {
-                for (owned) |*entry| entry.deinit(self.alloc);
-                self.alloc.free(owned);
                 return error.UnexpectedEof;
             }
             self.pos += direct_length;
             break :blk direct_length;
         } else blk: {
             const data_end = findEndStreamDataEnd(self.bytes, self.pos) orelse {
-                for (owned) |*entry| entry.deinit(self.alloc);
-                self.alloc.free(owned);
                 return error.MissingEndStream;
             };
             self.pos = data_end;
@@ -392,8 +388,6 @@ pub const Scanner = struct {
         var end_tok = try self.readToken();
         defer end_tok.deinit(self.alloc);
         if (end_tok != .keyword or !std.mem.eql(u8, end_tok.keyword, "endstream")) {
-            for (owned) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(owned);
             return error.MissingEndStream;
         }
 
@@ -1025,4 +1019,30 @@ test "scanner parses stream object with indirect length" {
     try std.testing.expect(def.obj_def.value.* == .stream);
     try std.testing.expectEqual(@as(usize, 5), def.obj_def.value.stream.data_length);
     try std.testing.expectEqual(expected_offset, def.obj_def.value.stream.data_offset);
+}
+
+test "scanner cleans stream dictionaries on malformed stream endings" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: anyerror,
+    }{
+        .{
+            .input = "<< /Length 100 >> stream\nx",
+            .expected = error.UnexpectedEof,
+        },
+        .{
+            .input = "<< /Type /Example >> stream\nunterminated",
+            .expected = error.MissingEndStream,
+        },
+        .{
+            .input = "<< /Length 3 >> stream\nabc nope",
+            .expected = error.MissingEndStream,
+        },
+    };
+
+    for (cases) |case| {
+        var scanner = Scanner.init(std.testing.allocator, case.input);
+        defer scanner.deinit();
+        try std.testing.expectError(case.expected, scanner.readObject());
+    }
 }
