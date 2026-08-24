@@ -271,6 +271,55 @@ run_public_profile() {
   mark_phase "public_profile${suffix}_end"
 }
 
+capture_footprint_once() {
+  local out=$1
+  local timeline=$2
+  local log=$3
+  local baseline=$4
+  local capture_out="${out}.capture.$$"
+  local capture_timeline="${timeline}.capture.$$"
+  local sampled=0
+
+  # macOS vmmap can suspend or heavily contend with the target. The kernel's
+  # phys_footprint ledger already retains the process high-water mark, so one
+  # post-phase sample captures the timed phase without manufacturing periodic
+  # latency or load stalls inside it.
+  python3 "$sampler" \
+    --pid-file "$run_root/antfly.pid" \
+    --wired-baseline-file "$baseline" \
+    --out "$capture_out" \
+    --timeline "$capture_timeline" \
+    --interval 0.2 \
+    >"$log" 2>&1 &
+  sampler_pid=$!
+  for _ in $(seq 1 1200); do
+    if python3 - "$capture_out" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    if int(json.load(handle).get("samples", 0)) < 1:
+        raise SystemExit(1)
+PY
+    then
+      sampled=1
+      break
+    fi
+    sleep 0.05
+  done
+  kill "$sampler_pid" 2>/dev/null || true
+  wait "$sampler_pid" 2>/dev/null || true
+  sampler_pid=
+  if [[ "$sampled" != "1" ]]; then
+    echo "footprint sampler did not produce a valid post-phase sample: $log" >&2
+    exit 1
+  fi
+  mv "$capture_out" "$out"
+  if [[ -f "$capture_timeline" ]]; then
+    mv "$capture_timeline" "$timeline"
+  fi
+}
+
 run_vdbbench() {
   local label=$1
   shift
@@ -354,15 +403,6 @@ if [[ "$resume_after_live" == "1" ]]; then
   mark_phase restart_begin
   start_server "antfly-reopened${label_suffix}.log"
   mark_phase restart_ready
-  python3 "$sampler" \
-    --pid-file "$run_root/antfly.pid" \
-    --wired-baseline-file "$run_root/wired-baseline${label_suffix}.json" \
-    --out "$run_root/footprint-restart${label_suffix}.json" \
-    --timeline "$run_root/footprint-restart${label_suffix}.jsonl" \
-    --interval 0.2 \
-    >"$run_root/footprint-restart${label_suffix}.log" 2>&1 &
-  sampler_pid=$!
-
   run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
     >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
   validate_vdbbench_result "$cold_label" 0 1
@@ -374,25 +414,17 @@ if [[ "$resume_after_live" == "1" ]]; then
   run_public_profile "$label_suffix"
   curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart${label_suffix}.txt"
   curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart${label_suffix}.json"
-
-  kill "$sampler_pid" 2>/dev/null || true
-  wait "$sampler_pid" 2>/dev/null || true
-  sampler_pid=
+  capture_footprint_once \
+    "$run_root/footprint-restart${label_suffix}.json" \
+    "$run_root/footprint-restart${label_suffix}.jsonl" \
+    "$run_root/footprint-restart${label_suffix}.log" \
+    "$run_root/wired-baseline${label_suffix}.json"
   python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
   exit 0
 fi
 
 mark_phase server_start
 start_server antfly-initial.log
-python3 "$sampler" \
-  --pid-file "$run_root/antfly.pid" \
-  --wired-baseline-file "$run_root/wired-baseline.json" \
-  --out "$run_root/footprint.json" \
-  --timeline "$run_root/footprint.jsonl" \
-  --interval 0.2 \
-  >"$run_root/footprint.log" 2>&1 &
-sampler_pid=$!
-
 mark_phase live_load_and_query_start
 run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
@@ -401,6 +433,11 @@ mark_phase live_load_and_query_end
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-before-restart.txt"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench" >"$run_root/table-before-restart.json"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-before-restart.json"
+capture_footprint_once \
+  "$run_root/footprint.json" \
+  "$run_root/footprint.jsonl" \
+  "$run_root/footprint.log" \
+  "$run_root/wired-baseline.json"
 
 mark_phase restart_begin
 stop_server
@@ -419,9 +456,10 @@ mark_phase reopened_warm_query_end
 run_public_profile ""
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart.txt"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart.json"
-
-kill "$sampler_pid" 2>/dev/null || true
-wait "$sampler_pid" 2>/dev/null || true
-sampler_pid=
+capture_footprint_once \
+  "$run_root/footprint-restart.json" \
+  "$run_root/footprint-restart.jsonl" \
+  "$run_root/footprint-restart.log" \
+  "$run_root/wired-baseline.json"
 
 python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
