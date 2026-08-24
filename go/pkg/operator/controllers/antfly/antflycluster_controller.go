@@ -5521,7 +5521,10 @@ func (r *AntflyClusterReconciler) requirePersistedHADirectActionPlan(ctx context
 	}
 	latest := &antflyv1.AntflyCluster{}
 	key := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, latest); err != nil {
+	// Direct-action execution is a read-after-write protocol. The controller
+	// cache is allowed to lag a just-persisted reservation, so use the uncached
+	// boundary reader before deciding which exact attempt may execute.
+	if err := r.haBoundaryReader().Get(ctx, key, latest); err != nil {
 		return fmt.Errorf("read persisted HA action plan: %w", err)
 	}
 	if latest.Generation != cluster.Generation {
@@ -5783,7 +5786,12 @@ func (r *AntflyClusterReconciler) mutatePersistedHADirectAction(
 	checkpointed := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &antflyv1.AntflyCluster{}
-		if err := r.Get(ctx, key, latest); err != nil {
+		// Reservations and results are consecutive durable checkpoints around an
+		// external side effect. Bypass the informer cache to guarantee read-your-
+		// writes semantics; otherwise a fast Admin API response can arrive before
+		// the reservation is visible through the cache and be replayed after the
+		// reservation expires.
+		if err := r.haBoundaryReader().Get(ctx, key, latest); err != nil {
 			return fmt.Errorf("get latest AntflyCluster: %w", err)
 		}
 		statusBase := latest.DeepCopy()

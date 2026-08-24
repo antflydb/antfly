@@ -1712,6 +1712,28 @@ type conflictOnceHAResultClient struct {
 	conflicts int
 }
 
+// staleHAClusterReadClient models the normal informer-cache window after a
+// successful status write: writes reach the API server immediately while the
+// cached AntflyCluster still exposes the preceding resource version.
+type staleHAClusterReadClient struct {
+	client.Client
+	stale *antflyv1.AntflyCluster
+}
+
+func (c *staleHAClusterReadClient) Get(
+	ctx context.Context,
+	key client.ObjectKey,
+	object client.Object,
+	opts ...client.GetOption,
+) error {
+	cluster, ok := object.(*antflyv1.AntflyCluster)
+	if ok && c.stale != nil && key == client.ObjectKeyFromObject(c.stale) {
+		c.stale.DeepCopyInto(cluster)
+		return nil
+	}
+	return c.Client.Get(ctx, key, object, opts...)
+}
+
 type concurrentHAReservationClient struct {
 	client.Client
 	conflicts int
@@ -3527,6 +3549,51 @@ func TestHADirectActionCheckpointsReservationBeforeDispatchAndStopsAfterOneSideE
 	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
 	g.Expect(requests).To(Equal(2))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+}
+
+func TestHADirectActionResultBypassesStaleCacheAfterReservation(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+	cluster := durableHACreateSlotCluster("standby-a", 5)
+	apiClient := newHAControllerTestClient(t, s, cluster)
+	stale := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), stale)).To(Succeed())
+	cachedClient := &staleHAClusterReadClient{Client: apiClient, stale: stale}
+	requests := 0
+	reconciler := &AntflyClusterReconciler{
+		Client:         cachedClient,
+		BoundaryReader: apiClient,
+		Scheme:         s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			persisted := &antflyv1.AntflyCluster{}
+			g.Expect(apiClient.Get(req.Context(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+			reserved := persisted.Status.HAStatus.PlannedActions[0]
+			g.Expect(reserved.InFlightAttempt).To(Equal(int32(1)))
+			g.Expect(reserved.AttemptID).NotTo(BeEmpty())
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"),
+				)),
+			}, nil
+		})},
+	}
+
+	err := reconciler.reconcileHAAdminJobs(context.Background(), cluster)
+	g.Expect(err).To(MatchError(errHAStatusCheckpointed))
+	g.Expect(requests).To(Equal(1))
+	persisted := &antflyv1.AntflyCluster{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), persisted)).To(Succeed())
+	completed := persisted.Status.HAStatus.PlannedActions[0]
+	g.Expect(completed.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(completed.InFlightAttempt).To(BeZero())
+	g.Expect(completed.AttemptID).To(BeEmpty())
+	g.Expect(completed.AdminResult).NotTo(BeNil())
+	g.Expect(completed.AdminResult.ActionState).To(Equal("applied"))
 }
 
 func TestHADirectActionReservationConflictNeverDispatchesUsingAnotherOwnersLease(t *testing.T) {
