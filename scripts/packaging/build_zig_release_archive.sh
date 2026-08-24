@@ -239,7 +239,7 @@ run_zig_build_steps_with_retry() {
 (
   cd "$repo_root/zig"
   # Physical storage and distributed control form the initial bounded-memory
-  # group. The storage-kernel experiment gives physical codegen its own archive
+  # group. The split storage kernel gives physical codegen its own archive
   # and an 18 GiB Darwin scheduler claim, so the 20 GiB release budget cannot
   # admit another compiler unit beside it. Downstream units retain overlap once
   # the storage claim is released.
