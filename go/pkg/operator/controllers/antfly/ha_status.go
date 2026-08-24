@@ -411,6 +411,11 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
+		// A replacement successor process can observe a lower cached runtime LSN
+		// than the already-authoritative child Lease. Normalize only an unchanged
+		// identity before the exact comparison so process rebinding preserves that
+		// durable boundary instead of deadlocking until the Lease expires.
+		scope = haFencingLeaseScopeWithMonotonicBoundary(lease, scope)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
 			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||

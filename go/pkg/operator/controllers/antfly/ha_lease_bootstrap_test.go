@@ -575,6 +575,64 @@ func TestCommittedTransferAlreadyAuthoritativeSuccessorAdoptsBoundary(t *testing
 	}
 }
 
+func TestSuccessorReplacementProcessRebindsAtPersistedChildBoundary(t *testing.T) {
+	leaseTime := time.Date(2026, 8, 24, 17, 24, 7, 0, time.UTC)
+	successor := haClusterWithAutomaticKubernetesLeaseFailover()
+	successor.Name = "antfly-standby-a"
+	successor.UID = "cluster-standby-a-uid"
+	successor.Spec.HighAvailability.Identity.ShardID = 10
+	successor.Spec.HighAvailability.Identity.TableID = 20
+	successor.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	successor.Spec.HighAvailability.Identity.TimelineID++
+	successor.Spec.HighAvailability.Identity.Epoch++
+	successor.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	successor.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 695}
+	lease := haFenceLease(successor, leaseTime, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+
+	proofTime := leaseTime.Add(time.Second)
+	successor.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node standby-a",
+		PrimaryWatchdogProof:  candidateLeaseProof(proofTime, "standby-a", "standby-a", 2),
+		PrimaryLSN:            674,
+	}
+	pod := candidateLeasePod(proofTime, "standby-a-pod-uid")
+	reconciler := testHAReconciler(t, lease, pod)
+	now := leaseTime.Add(2 * time.Second)
+	reconciler.Now = func() time.Time { return now }
+	monotonicNow := time.Now()
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("start successor replacement process fence boundary: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if !observed.Spec.RenewTime.Equal(lease.Spec.RenewTime) {
+		t.Fatalf("replacement process renewed before the old process fence boundary: %#v", observed)
+	}
+
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("bind successor replacement process at persisted boundary: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	wantProcess := successor.Status.HAStatus.PrimaryWatchdogProof.ProcessBootID
+	wantReceipt := haFencingLeaseBootstrapReceipt("standby-a", 2, wantProcess)
+	if observed.Annotations[haFencingLeaseAnnotationTimelineID] != "5" ||
+		observed.Annotations[haFencingLeaseAnnotationEpoch] != "7" ||
+		observed.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "standby-a" ||
+		observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "695" ||
+		observed.Annotations[haFencingLeaseAnnotationProcessBootID] != wantProcess ||
+		observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReceipt {
+		t.Fatalf("replacement process did not preserve and bind the child boundary: %#v", observed.Annotations)
+	}
+}
+
 func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
 	tests := []struct {
 		name   string
