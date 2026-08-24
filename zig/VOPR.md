@@ -1180,6 +1180,22 @@ composition, automatic scenario health snapshots, multi-bug search benchmarks,
 and newly exposed safe suspension points rather than missing scheduler or
 replay foundations.
 
+### Next Targeted Suites
+
+These are new suites or compositions, not retroactive dependencies of the
+integrated rows above.
+
+| Priority | Area | What to exercise |
+| --- | --- | --- |
+| P0 next | Generation publication and cleanup | Move native path locking, canonicalization, reconciliation fallback, and lock closure in `storage/db/generation_lifecycle.zig` onto caller-owned `std.Io`. Exact-replay prepare/commit publication markers, rename versus directory-sync failure, read/exclusive lock downgrade, concurrent readers and publishers, abandoned temporary generations, canonical-path aliases, and retired-generation cleanup. |
+| P0 next | Metadata backfill-marker discovery | Move marker scanning and rechecks in `metadata/service.zig` onto the metadata runtime's borrowed I/O. Cover absent, legacy, and corrupt state; marker appearance or disappearance between scans; rescan throttling; ownership changes; concurrent repair completion; cancellation; and restart. |
+| P0 next | Configuration, secrets, remote content, and extensions | Start from cold configuration through production administration paths. Exercise malformed and partial configuration, secret rotation during use, crash between secret and configuration publication, remote-content refresh and rollback, and extension/Wasm installation, replacement, activation, and failed startup. |
+| P1 next | Embedded, C API, and Lite lifecycle | Compose concurrent open/close, callback lifetime, cancellation, restore staging, generation activation, crash/reopen, and native-versus-`VoprIo` differential behavior across the in-process ownership boundary. |
+| P1 next | Cross-service resource pressure | Share descriptor, memory, storage, task, and admission budgets across HTTP, DB readers/writers, background jobs, Parquet cache, and provider calls. Verify bounded overload, cancellation, cleanup, progress after pressure clears, and exact replay. |
+| P1 next | Full external-lake composition | Extend the existing boundary suite through catalog discovery, manifest and schema evolution, Parquet metadata, row-group cache, and query assembly. Include stale object versions, deletion, ambiguous downloads, cache eviction, and restart. |
+| P2 next | Media-provider execution | Extend registry coverage through scripted provider HTTP for timeout, partial or malformed output, retry, cancellation, runtime replacement, and shutdown with an active request. Keep real codecs, models, and GPU execution differential. |
+| P2 next | Upgrade and compatibility campaigns | Differentially open older data formats, trace versions, fixtures, checkpoints, and serverless artifacts; crash during migration; and prove safe rejection, rollback, or forward completion without weakening replay compatibility. |
+
 ### Ported Antithesis-Class Features
 
 VOPR already has the important core: structured controlled choices, the major
@@ -1214,6 +1230,17 @@ local replacement are integrated or have an executable local foundation:
 These capabilities are local libraries, commands, reports, and CI gates. They
 do not require an Antithesis account or hosted runtime.
 
+### Remaining Self-Contained Platform Work
+
+| Priority | Capability | Required work |
+| --- | --- | --- |
+| P0 next | Reusable command-template composer | Add Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles to `lib/vopr`. Commands must declare compatibility, exclusivity, fault policy, and quiescence requirements so small production operations can compose across domains without another monolithic scenario. |
+| P0 next | Complete entropy interception and audit | Route behavior-affecting entropy through immediate structured choices or `std.Io` entropy, reject host RNG and delayed private-PRNG seeding in replayable worlds, and audit platform clocks, native libraries, map iteration, IDs, and temporary-path generation. Treat any uncontrolled source as a capability violation rather than silently recording its result. |
+| P1 next | Continuous and quiescent validation phases | Standardize invariant checks during work, eventual recovery after faults stop, and final consistency and cleanup after quiescence. Automatically populate no-progress, crash, task, descriptor, allocator, storage, and cleanup health evidence from scenario/runtime adapters. |
+| P1 next | Richer retroactive logging | Add configurable field and text filters, preserve verbose structured details for custom metadata/domain drivers, and let debugger recipes recover selected before/after windows without changing canonical replay bytes. |
+| P1 next | Local run index and usage API | Index stable results across revisions by run, property, fingerprint, corpus entry, quarantine state, artifact, and budget usage. Expose deterministic JSON and CLI queries plus a static local summary; do not require a hosted service. |
+| P1 next | Search recurrence and rarity reporting | Grow a representative injected-bug corpus and report discovery probability, transitions and logical cost to failure, repeated occurrences, confidence intervals, and the simplest examples by transitions and retained output volume across search strategies. |
+
 ### Conditional Work
 
 Wait for a real product or toolchain requirement before adding:
@@ -1235,23 +1262,33 @@ Wait for a real product or toolchain requirement before adding:
    serverless-workflow, DB/index, provider-boundary, and composed-query suites
    plus the Parquet-cache, provisioning/startup, external-lake, and
    media-runtime suites as production seams evolve.
-2. Wire deterministic corpus merging and stable results reports into nightly
-   CI retention policy; the local commands and formats are already complete.
-3. Extend provider adapters only when a new production provider boundary is
-   added, retaining real model/GPU/libpq execution as differential coverage.
-4. Add deeper query and DataServer compositions only at production-safe
-   suspension and ownership boundaries.
-5. Grow the injected-bug benchmark corpus and track search-quality regressions
-   across releases.
-6. Add automatic health-snapshot adapters to mature scenarios so task,
-   descriptor, allocator, storage, and cleanup checks are populated without a
-   command-specific caller.
-7. Route custom metadata/domain drivers through the recorder hook directly so
-   their flight artifacts retain verbose details, not only canonical fields.
-8. Compose full Iceberg/Parquet discovery-to-row materialization and media
-   provider cancellation/retry only at production-safe adapter boundaries.
-9. Continuously audit new production loops so they borrow `std.Io` and
-   `VoprIo` instead of creating native-only runtime paths.
+2. Implement the P0 generation-lifecycle and metadata backfill-marker suites,
+   removing their known private leaf executors while preserving native file
+   locking and single-writer ownership.
+3. Add the cold-start configuration, secrets, remote-content, and extension
+   lifecycle suite, followed by embedded/C API/Lite and cross-service pressure
+   compositions.
+4. Build the reusable command-template composer and complete entropy audit so
+   new suites expose small compatible operations, controlled concurrency, and
+   no silent host nondeterminism.
+5. Add continuous, eventual-after-faults, and final-after-quiescence validation
+   adapters to mature scenarios, including automatic task, descriptor,
+   allocator, storage, crash, progress, and cleanup health evidence.
+6. Compose full Iceberg/Parquet discovery-to-row materialization, media-provider
+   cancellation/retry, and upgrade/compatibility campaigns only at
+   production-safe adapter and ownership boundaries.
+7. Wire deterministic corpus merging, stable results, the local run/usage
+   index, and artifact retention into nightly CI policy.
+8. Grow the injected-bug corpus and publish recurrence, rarity,
+   time-to-discovery, logical-cost, and simplest-reproduction regressions across
+   random, guided, spliced, starvation, and checkpoint-assisted search.
+9. Route custom metadata/domain drivers through the recorder hook and add
+   configurable retroactive-log filters so retained failures contain verbose
+   structured evidence without changing replay truth.
+10. Continuously audit new production loops so they borrow `std.Io` and
+    `VoprIo` instead of creating native-only runtime paths; add datagram, TLS,
+    or compiler-guided campaigns only when the conditional prerequisites above
+    become real.
 
 The defects already found—lifetime errors, listener shutdown races, hidden
 Threaded I/O, virtual socket accounting, FIN ordering, teardown deadlocks, TLS
