@@ -25392,7 +25392,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     try manager.addAllNoBackfill(&store, &.{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true,\"rerank_policy\":\"always\"}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
     }});
 
     const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, candidate_count);
@@ -25423,7 +25423,8 @@ test "production external scorers use bounded cache-first artifact batches" {
     try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "semantic_idx", writes, .{ .mode = .bulk_ingest });
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
-    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(hbc_mod.HBCConfig.RerankPolicy.boundary, entry.index.config.rerank_policy);
+    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.ResidencyProbeUnavailable;
     residency_probe.deinit();
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
@@ -25515,49 +25516,87 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expectEqual(@as(usize, 10), outcome.results.getHits().len);
     try std.testing.expectEqual(candidate_ids[candidate_count - 1], outcome.results.getHits()[0].vector_id);
 
-    // Drive the complete production HBC search path through more than one
-    // 128-entry external rerank batch. This catches regressions in batching,
-    // output-slot restoration, profile composition, and loader wiring that a
-    // direct two-candidate adapter call cannot observe.
+    // Drive the complete production HBC search path with the default boundary
+    // policy. An ambiguous distance threshold selects the full >128 candidate
+    // set, after which exact sorted batches evaluate the stop proof. This
+    // fixture keeps the second batch's lower bounds overlapping the retained
+    // frontier, so skipping it would be a recall bug.
     for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
     entry.index.abortVectorCacheMutations();
-    var first_sorted_idx: usize = 0;
-    for (candidate_ids, 0..) |vector_id, i| {
-        if (vector_id < candidate_ids[first_sorted_idx]) first_sorted_idx = i;
-    }
-    var preload_lease = entry.index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
-    defer preload_lease.deinit();
-    _ = try entry.index.cacheVectorForResidencyLease(
-        &preload_lease,
-        candidate_ids[first_sorted_idx],
-        vectors[first_sorted_idx * dims ..][0..dims],
-    );
-    var preloaded = entry.index.borrowCachedVector(candidate_ids[first_sorted_idx]) orelse return error.TestUnexpectedResult;
-    preloaded.deinit();
-    var full_profiled = try entry.index.searchProfiledRequest(.{
+    var boundary_probe = try entry.index.searchProfiledRequest(.{
         .query = vectors[(candidate_count - 1) * dims ..][0..dims],
-        .k = candidate_count,
-        .rerank_k = candidate_count,
+        .k = 128,
         .search_width = @intCast(candidate_count),
         .load_metadata = false,
         .filter_ids = candidate_ids,
     });
-    defer full_profiled.results.deinit();
+    defer boundary_probe.results.deinit();
+    try std.testing.expect(boundary_probe.profile.approx_top_count > 0);
+    const approximate_top = boundary_probe.profile.approx_top[0];
+    try std.testing.expect(approximate_top.error_bound > 0);
+    const ambiguous_distance_over = approximate_top.distance - approximate_top.error_bound / 2;
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
 
+    var full_profiled = try entry.index.searchProfiledRequest(.{
+        .query = vectors[(candidate_count - 1) * dims ..][0..dims],
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        // Equality with a retained approximate distance is ambiguous under
+        // the default boundary policy and therefore selects the complete
+        // candidate shell before progressive exact batches evaluate the stop.
+        .distance_over = ambiguous_distance_over,
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer full_profiled.results.deinit();
     try std.testing.expect(full_profiled.profile.approx_candidate_count > 128);
     try std.testing.expect(full_profiled.profile.rerank_candidate_count > 128);
-    try std.testing.expect(full_profiled.profile.rerank_batches >= 2);
+    try std.testing.expect(full_profiled.profile.full_rerank_due_to_threshold);
+    try std.testing.expect(full_profiled.profile.ambiguous_distance_over_hits > 0);
+    try std.testing.expect(full_profiled.profile.rerank_batches > 0);
     try std.testing.expectEqual(@as(u64, 128), full_profiled.profile.rerank_max_batch_size);
-    try std.testing.expect(full_profiled.profile.rerank_artifact_cache_hits > 0);
-    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 128);
+    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 0);
     try std.testing.expectEqual(
         full_profiled.profile.rerank_artifact_vectors_loaded,
         full_profiled.profile.rerank_metadata_vectors_loaded,
     );
-    // The approximate result shell retains the candidate-local missing entry
-    // at infinite distance when k spans the entire corpus.
-    try std.testing.expectEqual(candidate_count, full_profiled.results.getHits().len);
-    try std.testing.expectEqual(candidate_ids[candidate_count - 1], full_profiled.results.getHits()[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 0), full_profiled.profile.rerank_candidates_skipped_by_bound);
+    try std.testing.expectEqual(
+        std.math.divCeil(u64, full_profiled.profile.rerank_candidate_count, 128) catch unreachable,
+        full_profiled.profile.rerank_batches,
+    );
+
+    const ExpectedHit = struct {
+        vector_id: u64,
+        distance: f32,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+            return lhs.vector_id < rhs.vector_id;
+        }
+    };
+    // Size for the complete shell: the fixture currently excludes the
+    // deleted artifact and the query vector by threshold, but correctness of
+    // this oracle must not depend on that threshold calibration.
+    const expected_storage = try alloc.alloc(ExpectedHit, candidate_count);
+    defer alloc.free(expected_storage);
+    var expected_count: usize = 0;
+    const query = vectors[(candidate_count - 1) * dims ..][0..dims];
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (i == 2) continue; // Candidate-local artifact deleted above.
+        const distance = vector_mod.distance(query, vectors[i * dims ..][0..dims], .l2_squared);
+        if (distance <= ambiguous_distance_over) continue; // distance_over is strict.
+        expected_storage[expected_count] = .{ .vector_id = vector_id, .distance = distance };
+        expected_count += 1;
+    }
+    std.mem.sort(ExpectedHit, expected_storage[0..expected_count], {}, ExpectedHit.lessThan);
+    const hits = full_profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 128), hits.len);
+    for (hits, expected_storage[0..hits.len]) |hit, expected| {
+        try std.testing.expectEqual(expected.vector_id, hit.vector_id);
+        try std.testing.expectApproxEqAbs(expected.distance, hit.distance, 0.0001);
+    }
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {

@@ -429,6 +429,7 @@ const QueryBenchStats = struct {
     dense_exact_recall_hits: u64 = 0,
     dense_exact_recall_expected: u64 = 0,
     dense_exact_recall_samples: u64 = 0,
+    dense_exact_recall_strata: u64 = 0,
     response_filter_match_count: u64 = 0,
     response_sort_tuple_count: u64 = 0,
     response_sort_tuple_valid_count: u64 = 0,
@@ -620,6 +621,24 @@ const ConcurrentStats = struct {
     fn avgRequestNs(self: ConcurrentStats) u64 {
         if (self.queries == 0) return 0;
         return self.request_ns / self.queries;
+    }
+};
+
+const ExactRecallCapturedResponse = struct {
+    query_idx: usize,
+    hit_doc_indices: []usize,
+    hit_count: usize = 0,
+};
+
+const ConcurrentStartGate = struct {
+    ready: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    start: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn await(self: *ConcurrentStartGate) bool {
+        _ = self.ready.fetchAdd(1, .acq_rel);
+        while (!self.start.load(.acquire)) platform_time.yieldBriefly();
+        return !self.aborted.load(.acquire);
     }
 };
 
@@ -1055,6 +1074,8 @@ const HttpWorkerContext = struct {
     base_uri: []const u8,
     query_bodies: []const []const u8,
     repeats: usize,
+    start_gate: *ConcurrentStartGate,
+    exact_recall_responses: []ExactRecallCapturedResponse = &.{},
     stats: ConcurrentStats = .{},
     err: ?anyerror = null,
 
@@ -1062,12 +1083,14 @@ const HttpWorkerContext = struct {
         var executor = std_http_executor.StdHttpExecutor.init(self.alloc, .{});
         defer executor.deinit();
         var client = api.ApiHttpClient.init(self.alloc, executor.executor());
+        if (!self.start_gate.await()) return;
         const started = nowNs();
         var local_queries: u64 = 0;
         var local_request_ns: u64 = 0;
         var local_max_request_ns: u64 = 0;
-        for (0..self.repeats) |_| {
-            for (self.query_bodies) |body| {
+        for (0..self.repeats) |repeat_idx| {
+            var exact_recall_cursor: usize = 0;
+            for (self.query_bodies, 0..) |body, query_idx| {
                 const request_started = nowNs();
                 var resp = client.fetchQuery(self.base_uri, table_name, body) catch |err| retry: {
                     if (isRetryableQueryConnectionError(err)) {
@@ -1097,6 +1120,19 @@ const HttpWorkerContext = struct {
                     self.stats.total_ns = elapsedSince(started);
                     return;
                 };
+                if (repeat_idx == 0 and exact_recall_cursor < self.exact_recall_responses.len and
+                    self.exact_recall_responses[exact_recall_cursor].query_idx == query_idx)
+                {
+                    const captured = &self.exact_recall_responses[exact_recall_cursor];
+                    const hits = parsed.value.responses[0].hits.hits orelse &.{};
+                    for (hits) |hit| {
+                        const doc_idx = benchmarkDocIndexFromKey(hit._id) orelse continue;
+                        if (captured.hit_count == captured.hit_doc_indices.len) break;
+                        captured.hit_doc_indices[captured.hit_count] = doc_idx;
+                        captured.hit_count += 1;
+                    }
+                    exact_recall_cursor += 1;
+                }
                 const request_elapsed = elapsedSince(request_started);
                 local_request_ns += request_elapsed;
                 local_max_request_ns = @max(local_max_request_ns, request_elapsed);
@@ -1179,7 +1215,7 @@ pub fn main(init: std.process.Init) !void {
         try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
     } else {
         switch (cfg.mode) {
-            .handler => try runHandlerBench(alloc, cfg, dataset, queries, query_bodies),
+            .handler => try runHandlerBench(alloc, init.io, cfg, dataset, queries, query_bodies),
             .local => try runLocalBench(alloc, init.io, cfg, dataset, queries, query_bodies),
             .standalone => {
                 const cwd = try std.process.currentPathAlloc(init.io, alloc);
@@ -1192,6 +1228,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn runHandlerBench(
     alloc: std.mem.Allocator,
+    io: std.Io,
     cfg: Config,
     dataset: []const f32,
     queries: []const f32,
@@ -1200,7 +1237,7 @@ fn runHandlerBench(
     _ = queries;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    defer cleanupTempDir(io, path);
 
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
@@ -1380,7 +1417,7 @@ fn runLocalBench(
     _ = queries;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    defer cleanupTempDir(io, path);
 
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
@@ -1466,10 +1503,11 @@ fn runLocalBench(
         try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
+    defer concurrent.deinit(alloc);
 
     try enforceGuardrails(cfg, concurrent.polls);
+    try validateSampledExactDenseRecall(alloc, dataset, concurrent.exact_recall_responses, cfg, &http_stats);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
-    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -1597,6 +1635,12 @@ const ConcurrentRun = struct {
     http: ConcurrentStats,
     polls: PollStats,
     rss_peak_bytes: usize = 0,
+    exact_recall_responses: []ExactRecallCapturedResponse = &.{},
+
+    fn deinit(self: *const ConcurrentRun, alloc: std.mem.Allocator) void {
+        for (self.exact_recall_responses) |captured| alloc.free(captured.hit_doc_indices);
+        alloc.free(self.exact_recall_responses);
+    }
 };
 
 const LoadRun = struct {
@@ -1626,6 +1670,9 @@ fn maybeRunHttpSearchThreadSweep(
         const threads = @min(next_threads, cfg.search_threads);
         var run_cfg = cfg;
         run_cfg.search_threads = threads;
+        // The primary concurrent lane owns matched-recall sampling. A sweep
+        // measures scaling only and must not allocate or overwrite captures.
+        run_cfg.exact_recall_samples = 0;
         const run = try benchConcurrentHttpWithPolling(
             alloc,
             io,
@@ -1637,6 +1684,7 @@ fn maybeRunHttpSearchThreadSweep(
             run_cfg,
             rss_pid,
         );
+        defer run.deinit(alloc);
         try enforceGuardrails(run_cfg, run.polls);
         std.debug.print(
             "public_query_thread_sweep threads={d} qps={d:.2} avg={d:.3}us max={d:.3}us rss_peak_mb={d:.2} health_max_ms={d:.2} metrics_max_ms={d:.2} status_max_ms={d:.2} failures={{health={d},metrics={d},status={d}}}\n",
@@ -2248,6 +2296,11 @@ fn benchConcurrentHttpWithPolling(
     cfg: Config,
     rss_pid: ?std.process.Child.Id,
 ) !ConcurrentRun {
+    const exact_recall_responses = try makeExactRecallCapturedResponses(alloc, cfg);
+    errdefer {
+        for (exact_recall_responses) |captured| alloc.free(captured.hit_doc_indices);
+        alloc.free(exact_recall_responses);
+    }
     var stop = std.atomic.Value(bool).init(false);
     var health_poller = EndpointPollerContext{
         .alloc = alloc,
@@ -2295,15 +2348,32 @@ fn benchConcurrentHttpWithPolling(
     const threads = try alloc.alloc(std.Thread, cfg.search_threads);
     defer alloc.free(threads);
 
+    var start_gate = ConcurrentStartGate{};
+    var spawned_threads: usize = 0;
+    errdefer {
+        // A partial spawn must release and join workers already waiting at
+        // the gate; otherwise an allocation/thread-limit failure leaks them.
+        start_gate.aborted.store(true, .release);
+        start_gate.start.store(true, .release);
+        for (threads[0..spawned_threads]) |thread| thread.join();
+    }
     for (workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
             .base_uri = base_uri,
             .query_bodies = query_bodies,
             .repeats = cfg.repeats,
+            .start_gate = &start_gate,
+            // One worker captures each selected query exactly once while all
+            // workers are active. The response therefore shares the QPS
+            // lane's routing and cache pressure without duplicate ownership.
+            .exact_recall_responses = if (i == 0) exact_recall_responses else &.{},
         };
         threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, HttpWorkerContext.run, .{worker});
+        spawned_threads += 1;
     }
+    while (start_gate.ready.load(.acquire) != cfg.search_threads) platform_time.yieldBriefly();
+    start_gate.start.store(true, .release);
 
     var combined: ConcurrentStats = .{};
     for (threads, workers) |thread, *worker| {
@@ -2335,6 +2405,7 @@ fn benchConcurrentHttpWithPolling(
         .http = combined,
         .polls = polls,
         .rss_peak_bytes = if (rss_poller) |ctx| ctx.peak_rss_bytes else 0,
+        .exact_recall_responses = exact_recall_responses,
     };
 }
 
@@ -2994,6 +3065,73 @@ fn exactDenseRecallCandidateEligible(cfg: Config, source_doc_idx: usize, candida
     return true;
 }
 
+fn exactRecallQueryCluster(query_idx: usize, cfg: Config) usize {
+    return querySourceDocIndex(query_idx, cfg) % 8;
+}
+
+fn makeExactRecallCapturedResponses(alloc: std.mem.Allocator, cfg: Config) ![]ExactRecallCapturedResponse {
+    if (!supportsExactDenseRecall(cfg) or cfg.exact_recall_samples == 0) {
+        return try alloc.alloc(ExactRecallCapturedResponse, 0);
+    }
+
+    const sample_count = @min(cfg.exact_recall_samples, cfg.queries);
+    const query_indices = try alloc.alloc(usize, sample_count);
+    defer alloc.free(query_indices);
+    const selected = try alloc.alloc(bool, cfg.queries);
+    defer alloc.free(selected);
+    @memset(selected, false);
+
+    // Visit every synthetic cluster before taking a second sample from any
+    // cluster. Within each pass, choose the unused query nearest that pass's
+    // midpoint so repeated samples remain spread across the complete corpus.
+    const pass_count = (sample_count + 7) / 8;
+    for (0..sample_count) |sample_idx| {
+        const target_cluster = sample_idx % 8;
+        const pass = sample_idx / 8;
+        const target_query_idx = @min(
+            cfg.queries - 1,
+            ((pass * 2 + 1) * cfg.queries) / (pass_count * 2),
+        );
+        var best_query_idx: ?usize = null;
+        var best_distance: usize = std.math.maxInt(usize);
+        for (0..cfg.queries) |query_idx| {
+            if (selected[query_idx] or exactRecallQueryCluster(query_idx, cfg) != target_cluster) continue;
+            const distance = if (query_idx > target_query_idx) query_idx - target_query_idx else target_query_idx - query_idx;
+            if (distance >= best_distance) continue;
+            best_query_idx = query_idx;
+            best_distance = distance;
+        }
+        // Tiny smoke configurations may not contain every cluster. Preserve
+        // the requested sample count by filling from the nearest unused query.
+        if (best_query_idx == null) {
+            for (0..cfg.queries) |query_idx| {
+                if (selected[query_idx]) continue;
+                const distance = if (query_idx > target_query_idx) query_idx - target_query_idx else target_query_idx - query_idx;
+                if (distance >= best_distance) continue;
+                best_query_idx = query_idx;
+                best_distance = distance;
+            }
+        }
+        const query_idx = best_query_idx orelse return error.InvalidRecallSampleSelection;
+        selected[query_idx] = true;
+        query_indices[sample_idx] = query_idx;
+    }
+    std.mem.sort(usize, query_indices, {}, std.sort.asc(usize));
+
+    const responses = try alloc.alloc(ExactRecallCapturedResponse, sample_count);
+    errdefer alloc.free(responses);
+    var initialized: usize = 0;
+    errdefer for (responses[0..initialized]) |captured| alloc.free(captured.hit_doc_indices);
+    for (responses, query_indices) |*captured, query_idx| {
+        captured.* = .{
+            .query_idx = query_idx,
+            .hit_doc_indices = try alloc.alloc(usize, cfg.k),
+        };
+        initialized += 1;
+    }
+    return responses;
+}
+
 fn calculateExactDenseRecallTruth(
     alloc: std.mem.Allocator,
     dataset: []const f32,
@@ -3036,53 +3174,42 @@ fn calculateExactDenseRecallTruth(
 
 fn validateSampledExactDenseRecall(
     alloc: std.mem.Allocator,
-    base_uri: []const u8,
     dataset: []const f32,
-    query_bodies: []const []const u8,
+    captured_responses: []const ExactRecallCapturedResponse,
     cfg: Config,
     stats: *QueryBenchStats,
 ) !void {
     if (!supportsExactDenseRecall(cfg) or cfg.exact_recall_samples == 0) return;
-    const sample_count = @min(cfg.exact_recall_samples, cfg.queries);
-    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
-    defer executor.deinit();
-    var client = api.ApiHttpClient.init(alloc, executor.executor());
+    const expected_samples = @min(cfg.exact_recall_samples, cfg.queries);
+    if (captured_responses.len != expected_samples) return error.InvalidRecallSampleCount;
+    var cluster_mask: u8 = 0;
 
-    for (0..sample_count) |sample_idx| {
-        // Use the midpoint of deterministic query strata instead of sampling
-        // only query zero. This remains reproducible across memory envelopes.
-        const query_idx = @min(
-            cfg.queries - 1,
-            ((sample_idx * 2 + 1) * cfg.queries) / (sample_count * 2),
-        );
+    for (captured_responses) |captured| {
+        const query_idx = captured.query_idx;
         const truth = try calculateExactDenseRecallTruth(alloc, dataset, query_idx, cfg);
         defer alloc.free(truth);
         if (truth.len == 0) return error.InvalidRecallGroundTruth;
-
-        var resp = try client.fetchQuery(base_uri, table_name, query_bodies[query_idx]);
-        defer resp.deinit(alloc);
-        var parsed = try std.json.parseFromSlice(QueryResponseWire, alloc, resp.body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        if (parsed.value.responses.len == 0) return error.InvalidQueryResponse;
-        const hits = parsed.value.responses[0].hits.hits orelse return error.InvalidQueryResponse;
+        if (captured.hit_count == 0) return error.InvalidQueryResponse;
 
         var matched: u64 = 0;
         for (truth) |truth_doc_idx| {
-            for (hits) |hit| {
-                const returned_doc_idx = benchmarkDocIndexFromKey(hit._id) orelse continue;
+            for (captured.hit_doc_indices[0..captured.hit_count]) |returned_doc_idx| {
                 if (returned_doc_idx != truth_doc_idx) continue;
                 matched += 1;
                 break;
             }
         }
+        cluster_mask |= @as(u8, 1) << @intCast(exactRecallQueryCluster(query_idx, cfg));
         stats.dense_exact_recall_hits += matched;
         stats.dense_exact_recall_expected += @intCast(truth.len);
         stats.dense_exact_recall_samples += 1;
     }
+    stats.dense_exact_recall_strata = @popCount(cluster_mask);
     std.debug.print(
-        "public_query_exact_recall samples={d} hits={d} expected={d} recall_at_k={d:.6}\n",
+        "public_query_exact_recall lane=concurrent samples={d} strata={d} hits={d} expected={d} recall_at_k={d:.6}\n",
         .{
             stats.dense_exact_recall_samples,
+            stats.dense_exact_recall_strata,
             stats.dense_exact_recall_hits,
             stats.dense_exact_recall_expected,
             rate(stats.dense_exact_recall_hits, stats.dense_exact_recall_expected),
@@ -3117,7 +3244,7 @@ fn runStandaloneBench(
     var completed = false;
     defer {
         if (completed) {
-            cleanupTempDir(root_path);
+            cleanupTempDir(io, root_path);
         } else {
             std.debug.print("public-query guardrail preserved failed standalone root={s}\n", .{root_path});
         }
@@ -3169,15 +3296,16 @@ fn runStandaloneBench(
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
+    defer concurrent.deinit(alloc);
+    try validateSampledExactDenseRecall(alloc, dataset, concurrent.exact_recall_responses, cfg, &http_stats);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
 
     const search_memory = fetchMemoryBreakdown(alloc, base_uri, metrics_uri) catch |err| blk: {
         std.debug.print("public-query guardrail memory_breakdown_err phase=post_search err={s}\n", .{@errorName(err)});
         break :blk MemoryBreakdown{};
     };
-    // Keep exact ground-truth work and validation requests outside every
-    // latency, QPS, cache-residency, and process-RSS measurement above.
-    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
+    // Exact ground-truth work stays outside the timed lane; the compared hits
+    // were captured from that lane rather than issued as new requests.
 
     const avg_http_ns = http_stats.avgNs();
     const avg_profile_ns = http_stats.avgProfileNs();
@@ -4558,7 +4686,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_recall_strata\":{d},\"exact_recall_lane\":\"{s}\",\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
         .{
             nsToMs(load.polls.health_max_latency_ns),
             nsToMs(load.polls.metrics_max_latency_ns),
@@ -4570,6 +4698,8 @@ fn printPublicQueryGuardrailSummaryJson(
             rate(http_stats.dense_source_top1_count, http_stats.dense_recall_queries),
             rate(http_stats.dense_exact_recall_hits, http_stats.dense_exact_recall_expected),
             http_stats.dense_exact_recall_samples,
+            http_stats.dense_exact_recall_strata,
+            if (http_stats.dense_exact_recall_samples > 0) "concurrent" else "disabled",
             avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_cache_hits),
             avgPerQuery(profile_stats, profile_stats.profile_exact_artifact_vectors_loaded),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
@@ -4883,10 +5013,8 @@ fn sampleRssBytes(alloc: std.mem.Allocator, io: std.Io, pid: std.process.Child.I
     return rss_kib * 1024;
 }
 
-fn cleanupTempDir(path: [:0]u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path[0..path.len]) catch {};
+fn cleanupTempDir(io: std.Io, path: [:0]u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path[0..path.len]) catch {};
 }
 
 fn nowNs() u64 {
@@ -4898,15 +5026,7 @@ fn elapsedSince(started: u64) u64 {
 }
 
 fn sleepMs(ms: u64) void {
-    var req = std.posix.timespec{
-        .sec = @intCast(ms / std.time.ms_per_s),
-        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
+    platform_time.sleepNs(ms *| std.time.ns_per_ms);
 }
 
 fn nsToUs(ns: u64) f64 {

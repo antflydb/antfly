@@ -30,7 +30,7 @@ if [[ "$SMOKE" == "1" ]]; then
   ENDPOINT_SIZES="${RESOURCE_CACHE_MATRIX_ENDPOINT_SIZES:-256}"
   MEMORY_BUDGETS_MB="${RESOURCE_CACHE_MATRIX_MEMORY_BUDGETS_MB:-512}"
   DIMS="${RESOURCE_CACHE_MATRIX_DIMS:-32}"
-  QUERIES="${RESOURCE_CACHE_MATRIX_QUERIES:-4}"
+  QUERIES="${RESOURCE_CACHE_MATRIX_QUERIES:-8}"
   REPEATS="${RESOURCE_CACHE_MATRIX_REPEATS:-2}"
   K="${RESOURCE_CACHE_MATRIX_K:-10}"
   BATCH_SIZE="${RESOURCE_CACHE_MATRIX_BATCH_SIZE:-128}"
@@ -69,7 +69,14 @@ MAX_RSS_TO_BUDGET_RATIO="${RESOURCE_CACHE_MATRIX_MAX_RSS_TO_BUDGET_RATIO:-1.25}"
 MAX_SEARCH_HEALTH_LATENCY_MS="${RESOURCE_CACHE_MATRIX_MAX_SEARCH_HEALTH_LATENCY_MS:-20}"
 MIN_SOURCE_RECALL_AT_K="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_RECALL_AT_K:-1.0}"
 MIN_SOURCE_TOP1_RECALL="${RESOURCE_CACHE_MATRIX_MIN_SOURCE_TOP1_RECALL:-0.95}"
-EXACT_RECALL_SAMPLES="${RESOURCE_CACHE_MATRIX_EXACT_RECALL_SAMPLES:-1}"
+if [[ "$SMOKE" == "1" ]]; then
+  EXACT_RECALL_SAMPLES="${RESOURCE_CACHE_MATRIX_EXACT_RECALL_SAMPLES:-8}"
+else
+  # One sample per generated-vector cluster is the minimum production
+  # evidence. Additional samples revisit clusters at distinct corpus strata.
+  EXACT_RECALL_SAMPLES="${RESOURCE_CACHE_MATRIX_EXACT_RECALL_SAMPLES:-8}"
+fi
+EXPECTED_EXACT_RECALL_STRATA="${RESOURCE_CACHE_MATRIX_EXPECTED_EXACT_RECALL_STRATA:-8}"
 MIN_EXACT_RECALL_AT_K="${RESOURCE_CACHE_MATRIX_MIN_EXACT_RECALL_AT_K:-0.90}"
 
 mkdir -p "$OUT"
@@ -95,8 +102,8 @@ fi
   printf 'run_endpoints=%s\nrun_maintenance=%s\n' "$RUN_ENDPOINTS" "$RUN_MAINTENANCE"
   printf 'optimize=%s\n' "$OPTIMIZE"
   printf 'resume=%s\n' "$RESUME"
-  printf 'dims=%s\nqueries=%s\nrepeats=%s\nk=%s\nbatch_size=%s\nsearch_threads=%s\nexact_recall_samples=%s\nmin_exact_recall_at_k=%s\n' \
-    "$DIMS" "$QUERIES" "$REPEATS" "$K" "$BATCH_SIZE" "$SEARCH_THREADS" "$EXACT_RECALL_SAMPLES" "$MIN_EXACT_RECALL_AT_K"
+  printf 'dims=%s\nqueries=%s\nrepeats=%s\nk=%s\nbatch_size=%s\nsearch_threads=%s\nexact_recall_samples=%s\nexpected_exact_recall_strata=%s\nmin_exact_recall_at_k=%s\n' \
+    "$DIMS" "$QUERIES" "$REPEATS" "$K" "$BATCH_SIZE" "$SEARCH_THREADS" "$EXACT_RECALL_SAMPLES" "$EXPECTED_EXACT_RECALL_STRATA" "$MIN_EXACT_RECALL_AT_K"
   git -C "$ROOT" rev-parse HEAD
   git -C "$ROOT" status --short
   uname -a
@@ -151,7 +158,12 @@ run_case() {
   if [[ "$shape" == "dense-filter" ]]; then
     cmd+=(--filter-selectivity-percent "$filter_selectivity")
   fi
-  if [[ "$docs" == "1000000" ]] && [[ "$shape" == "dense" || "$shape" == "dense-filter" ]]; then
+  # Tie recall evidence to the cases used to explain the 50K elbow and the
+  # 1M dense/selectivity comparisons without adding full scans to every
+  # intermediate-scale diagnostic.
+  if [[ "$SMOKE" == "1" && ("$shape" == "dense" || "$shape" == "dense-filter") ]] ||
+    [[ "$docs" == "1000000" && ("$shape" == "dense" || "$shape" == "dense-filter") ]] ||
+    [[ "$docs" == "50000" && "$shape" == "dense-filter" && "$filter_selectivity" == "1" ]]; then
     cmd+=(--exact-recall-samples "$EXACT_RECALL_SAMPLES")
   fi
   if [[ "$shape" == "graph-expand" ]]; then
@@ -275,10 +287,6 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
       dense_1m_top1_recall="$(summary_value "dense-1000000-m${budget_mb}" source_top1_recall)"
       filtered_1m_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_recall_at_k)"
       filtered_1m_top1_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" source_top1_recall)"
-      dense_1m_exact_recall="$(summary_value "dense-1000000-m${budget_mb}" exact_recall_at_k)"
-      filtered_1m_exact_recall="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" exact_recall_at_k)"
-      dense_1m_exact_recall_samples="$(summary_value "dense-1000000-m${budget_mb}" exact_recall_samples)"
-      filtered_1m_exact_recall_samples="$(summary_value "dense-filter-p1-1000000-m${budget_mb}" exact_recall_samples)"
       load_rss_bytes="$(summary_budget_max "$budget_mb" load_rss_peak_bytes)"
       search_rss_bytes="$(summary_budget_max "$budget_mb" search_rss_peak_bytes)"
       hbc_accounted_bytes="$(summary_budget_max "$budget_mb" hbc_accounted_bytes)"
@@ -332,15 +340,27 @@ if [[ "$ENFORCE_GATES" == "1" ]]; then
           "$MIN_SOURCE_RECALL_AT_K" "$MIN_SOURCE_TOP1_RECALL" "$budget_mb" >&2
         FAILURES=$((FAILURES + 1))
       fi
-      if ! gate_float_ge "$dense_1m_exact_recall_samples" "$EXACT_RECALL_SAMPLES" ||
-        ! gate_float_ge "$filtered_1m_exact_recall_samples" "$EXACT_RECALL_SAMPLES" ||
-        ! gate_float_ge "$dense_1m_exact_recall" "$MIN_EXACT_RECALL_AT_K" ||
-        ! gate_float_ge "$filtered_1m_exact_recall" "$MIN_EXACT_RECALL_AT_K"; then
-        printf 'gate failed: exact ground-truth recall dense_at_k=%s filtered_at_k=%s dense_samples=%s filtered_samples=%s minimum_at_k=%s required_samples=%s budget_mb=%s\n' \
-          "$dense_1m_exact_recall" "$filtered_1m_exact_recall" "$dense_1m_exact_recall_samples" "$filtered_1m_exact_recall_samples" \
-          "$MIN_EXACT_RECALL_AT_K" "$EXACT_RECALL_SAMPLES" "$budget_mb" >&2
-        FAILURES=$((FAILURES + 1))
-      fi
+      exact_recall_cases=(
+        "dense-filter-p1-50000-m${budget_mb}"
+        "dense-1000000-m${budget_mb}"
+        "dense-filter-p1-1000000-m${budget_mb}"
+        "dense-filter-p10-1000000-m${budget_mb}"
+      )
+      for exact_recall_case in "${exact_recall_cases[@]}"; do
+        exact_recall="$(summary_value "$exact_recall_case" exact_recall_at_k)"
+        exact_recall_samples="$(summary_value "$exact_recall_case" exact_recall_samples)"
+        exact_recall_strata="$(summary_value "$exact_recall_case" exact_recall_strata)"
+        exact_recall_lane="$(summary_value "$exact_recall_case" exact_recall_lane)"
+        if ! gate_float_ge "$exact_recall_samples" "$EXACT_RECALL_SAMPLES" ||
+          ! gate_float_ge "$exact_recall_strata" "$EXPECTED_EXACT_RECALL_STRATA" ||
+          ! gate_float_ge "$exact_recall" "$MIN_EXACT_RECALL_AT_K" ||
+          [[ "$exact_recall_lane" != "concurrent" ]]; then
+          printf 'gate failed: matched-lane exact ground-truth recall case=%s recall_at_k=%s samples=%s strata=%s lane=%s minimum_at_k=%s required_samples=%s required_strata=%s budget_mb=%s\n' \
+            "$exact_recall_case" "$exact_recall" "$exact_recall_samples" "$exact_recall_strata" "$exact_recall_lane" \
+            "$MIN_EXACT_RECALL_AT_K" "$EXACT_RECALL_SAMPLES" "$EXPECTED_EXACT_RECALL_STRATA" "$budget_mb" >&2
+          FAILURES=$((FAILURES + 1))
+        fi
+      done
       if ! gate_float_le "$load_rss_bytes" "$allowed_rss_bytes"; then
         printf 'gate failed: maximum load rss bytes=%s allowed=%s budget_mb=%s ratio=%s\n' \
           "$load_rss_bytes" "$allowed_rss_bytes" "$budget_mb" "$MAX_RSS_TO_BUDGET_RATIO" >&2
