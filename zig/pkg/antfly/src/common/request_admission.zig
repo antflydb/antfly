@@ -45,6 +45,24 @@ pub const RequestAdmission = struct {
         return false;
     }
 
+    /// An admitted request whose ownership is explicit and single-release.
+    /// Prefer this at callback and provider boundaries so every error path
+    /// returns capacity to the shared admission controller.
+    pub const Lease = struct {
+        admission: ?*RequestAdmission,
+
+        pub fn release(self: *Lease) void {
+            const admission = self.admission orelse return;
+            self.admission = null;
+            admission.release();
+        }
+    };
+
+    pub fn tryAcquireLease(self: *RequestAdmission) ?Lease {
+        if (!self.tryAcquire()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn release(self: *RequestAdmission) void {
         _ = self.in_flight.fetchSub(1, .acq_rel);
     }
@@ -124,6 +142,17 @@ test "request admission bounds positive capacity and preserves unlimited mode" {
     unlimited.release();
     unlimited.release();
     try std.testing.expectEqual(@as(usize, 2), unlimited.stats().peak_in_flight);
+}
+
+test "request admission lease releases exactly once" {
+    var admission = RequestAdmission.init(1);
+    var lease = admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(admission.tryAcquireLease() == null);
+    lease.release();
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    var second = admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
+    second.release();
 }
 
 test "request admission metrics use the shared admission namespace" {

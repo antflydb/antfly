@@ -6949,6 +6949,28 @@ pub fn build(b: *std.Build) void {
     );
     admission_vopr_test_step.dependOn(&run_admission_vopr_tests.step);
 
+    const provider_boundary_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"provider boundary VOPR exact replays"},
+    });
+    const run_provider_boundary_vopr_tests = b.addRunArtifact(provider_boundary_vopr_tests);
+    const provider_boundary_vopr_test_step = b.step(
+        "provider-boundary-vopr-test",
+        "Run inference and PostgreSQL response-boundary fault campaigns",
+    );
+    provider_boundary_vopr_test_step.dependOn(&run_provider_boundary_vopr_tests.step);
+
+    const composed_query_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"composed query lifecycle VOPR exact replays"},
+    });
+    const run_composed_query_vopr_tests = b.addRunArtifact(composed_query_vopr_tests);
+    const composed_query_vopr_test_step = b.step(
+        "composed-query-vopr-test",
+        "Run vector, text, graph, and global-query assembly fault campaigns",
+    );
+    composed_query_vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
+
     const derived_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"derived workflow VOPR records and exact replays"},
@@ -7116,6 +7138,8 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
+    vopr_test_step.dependOn(&run_provider_boundary_vopr_tests.step);
+    vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_derived_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
