@@ -17,6 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const catalog_service = @import("../catalog/service.zig");
 const work_lease = @import("work_lease.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const PublishRunStats = struct {
     published_namespaces: usize = 0,
@@ -117,15 +118,16 @@ pub const BackgroundPublisher = struct {
         self: *BackgroundPublisher,
         cancel_requested: ?*const std.atomic.Value(bool),
     ) !PublishRunStats {
+        const cancellation = maintenance_cancellation.Token{
+            .io = self.io,
+            .requested = cancel_requested,
+        };
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         for (namespaces) |namespace| {
-            if (cancel_requested) |requested| {
-                if (requested.load(.acquire)) return error.Canceled;
-            }
-            try self.io.checkCancel();
+            try cancellation.check();
             var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
@@ -140,12 +142,26 @@ pub const BackgroundPublisher = struct {
             }
 
             var held_lease: ?work_lease.HeldLease = null;
+            var held_bootstrap_lease: ?work_lease.HeldBootstrapLease = null;
             // The absent-to-first-HEAD CAS is already the atomic publication
             // fence. Avoid materializing a HEAD=0 lease placeholder, which
             // older publishers interpret as an existing head and cannot
             // replace during a rolling rollback.
-            if (status.head_version != 0) {
-                if (self.lease_provider) |provider| {
+            if (self.lease_provider) |provider| {
+                if (status.head_version == 0) {
+                    held_bootstrap_lease = try work_lease.acquireBootstrapHeld(
+                        provider,
+                        self.io,
+                        namespace.name,
+                        self.lease_owner_id orelse return error.MissingLeaseOwner,
+                        self.lease_ttl_ns,
+                    );
+                    if (held_bootstrap_lease == null) {
+                        stats.lease_conflicts += 1;
+                        continue;
+                    }
+                    if (held_bootstrap_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
+                } else {
                     held_lease = try work_lease.acquireHeld(
                         provider,
                         self.io,
@@ -160,14 +176,18 @@ pub const BackgroundPublisher = struct {
                     if (held_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
                 }
             }
+            defer if (held_bootstrap_lease) |*lease| {
+                _ = lease.release() catch {};
+            };
             defer if (held_lease) |*lease| {
                 _ = lease.release() catch {};
             };
 
             const publication_guard = if (held_lease) |*lease| lease.guard() else null;
-            var result = self.catalog.buildNamespaceGuarded(
+            var result = self.catalog.buildNamespaceGuardedUntil(
                 namespace.name,
                 publication_guard,
+                cancellation,
             ) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;

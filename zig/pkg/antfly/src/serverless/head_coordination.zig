@@ -11,6 +11,7 @@ const std = @import("std");
 
 pub const format_version: u32 = 1;
 pub const metadata_content_type_prefix = "application/vnd.antfly.serverless-head.v1;base64url=";
+pub const payload_fingerprint_suffix_len = 1 + std.crypto.hash.sha2.Sha256.digest_length * 4;
 
 pub const Record = struct {
     format_version: u32 = format_version,
@@ -30,10 +31,41 @@ pub const Fence = struct {
     fencing_token: u64,
 };
 
-/// Keep the HEAD body as a decimal integer so binaries from before durable
-/// fencing can continue to read it during a rolling upgrade. The lease record
-/// lives in Content-Type, which is replaced by the same conditional PUT as the
-/// body and is therefore fenced by the same ETag.
+/// Preserve the legacy decimal HEAD value while making every coordination
+/// state produce a distinct object body. Legacy readers trim ASCII whitespace
+/// before parsing the integer, while body-derived ETags now advance when only
+/// the lease owner, token, expiry, or release state changes.
+pub fn payloadAlloc(alloc: std.mem.Allocator, record: Record) ![]u8 {
+    const head = try std.fmt.allocPrint(alloc, "{d}", .{record.head_version});
+    defer alloc.free(head);
+    const json = try std.json.Stringify.valueAlloc(alloc, record, .{});
+    defer alloc.free(json);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
+    const payload = try alloc.alloc(u8, head.len + payload_fingerprint_suffix_len);
+    @memcpy(payload[0..head.len], head);
+    payload[head.len] = '\n';
+    var offset = head.len + 1;
+    const whitespace = " \t\r\n";
+    for (digest) |byte| {
+        for (0..4) |part| {
+            const shift: u3 = @intCast(part * 2);
+            payload[offset] = whitespace[(byte >> shift) & 0b11];
+            offset += 1;
+        }
+    }
+    return payload;
+}
+
+pub fn hasPayloadFingerprint(body: []const u8) bool {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    return body.len == trimmed.len + payload_fingerprint_suffix_len;
+}
+
+/// Keep the complete lease record in Content-Type for new readers. The body's
+/// whitespace fingerprint mirrors this state so stores whose ETag is derived
+/// only from body bytes still fence metadata-only coordination changes.
 pub fn contentTypeAlloc(alloc: std.mem.Allocator, record: Record) ![]u8 {
     const json = try std.json.Stringify.valueAlloc(alloc, record, .{});
     defer alloc.free(json);

@@ -26,6 +26,7 @@ const query_reader = @import("../query/indexed_reader.zig");
 const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const embedder_mod = @import("../../storage/db/enrichment/embedder.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const EnrichmentRunStats = struct {
     enriched_namespaces: usize = 0,
@@ -136,6 +137,16 @@ pub const SparseEnricher = struct {
     }
 
     pub fn runNamespaceWithConfig(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig) !EnrichmentRunStats {
+        return try self.runNamespaceWithConfigUntil(namespace, cfg, null);
+    }
+
+    pub fn runNamespaceWithConfigUntil(
+        self: *SparseEnricher,
+        namespace: []const u8,
+        cfg: SparseEnricherConfig,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !EnrichmentRunStats {
+        try maintenance_cancellation.check(cancellation);
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => return .{ .idle_namespaces = 1 },
             else => return err,
@@ -149,6 +160,7 @@ pub const SparseEnricher = struct {
 
         const docs = try self.loadPublishedDocsAlloc(manifest);
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
+        try maintenance_cancellation.check(cancellation);
 
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
         if (stored_head != head) {
@@ -168,6 +180,7 @@ pub const SparseEnricher = struct {
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
+            try maintenance_cancellation.check(cancellation);
             next_offset = doc_index + 1;
             const derived = buildDerivedBodyAlloc(self, cfg.stage, doc.body, cfg.pipeline_version, cfg.model_preference) catch |err| {
                 if (isRecoverableEnrichmentError(err)) {
@@ -181,6 +194,7 @@ pub const SparseEnricher = struct {
                 return err;
             };
             defer if (derived.body) |body| self.alloc.free(body);
+            try maintenance_cancellation.check(cancellation);
             const body = derived.body orelse continue;
             const mutation = api_types.DocumentMutation{
                 .kind = .upsert,
@@ -197,6 +211,7 @@ pub const SparseEnricher = struct {
             if (stats.wal_appends >= cfg.batch_size) break;
         }
 
+        try maintenance_cancellation.check(cancellation);
         const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
         _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, @intCast(next_offset));
         if (stats.enriched_documents == 0) {
@@ -811,6 +826,32 @@ const FailingSparseEmbedder = struct {
     }
 };
 
+const CancelingSparseEmbedder = struct {
+    requested: *std.atomic.Value(bool),
+
+    fn embedSparse(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) !embedder_mod.SparseEmbedding {
+        const self: *CancelingSparseEmbedder = @ptrCast(@alignCast(ptr));
+        const indices = try alloc.dupe(u32, &.{1});
+        errdefer alloc.free(indices);
+        const values = try alloc.dupe(f32, &.{1.0});
+        self.requested.store(true, .release);
+        return .{ .indices = indices, .values = values };
+    }
+
+    fn interface(self: *CancelingSparseEmbedder) embedder_mod.SparseEmbedder {
+        return .{
+            .ptr = self,
+            .sparse_embed_fn = embedSparse,
+            .deinit_fn = null,
+        };
+    }
+};
+
 fn buildDeterministicEmbeddingAlloc(alloc: Allocator, text: []const u8, dims: usize) ![]f32 {
     const embedding = try alloc.alloc(f32, dims);
     @memset(embedding, 0);
@@ -1382,7 +1423,7 @@ test "sparse enricher skips docs already enriched at current version" {
     try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn("docs"));
 }
 
-test "sparse enricher can use model-backed dense and sparse embedders" {
+test "serverless sparse enricher can use model-backed dense and sparse embedders" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1459,6 +1500,36 @@ test "sparse enricher can use model-backed dense and sparse embedders" {
     defer mutation.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"chunk_embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"f") != null);
+
+    const second_batch = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"text\":\"juliet kilo lima\"}" },
+    };
+    var second_ingest = try api.ingestBatch(.{
+        .namespace = "docs",
+        .timestamp_ns = 200,
+        .mutations = &second_batch,
+    });
+    defer second_ingest.deinit(alloc);
+    var second_build = try builder.publishNamespace("docs");
+    defer second_build.deinit(alloc);
+
+    var requested: std.atomic.Value(bool) = .init(false);
+    var canceling_sparse = CancelingSparseEmbedder{ .requested = &requested };
+    try enricher.setSparseEmbedder(canceling_sparse.interface(), "serverless_sparse");
+    const before_cancel_lsn = try wal_store.latestLsn("docs");
+    try std.testing.expectError(
+        error.Canceled,
+        enricher.runNamespaceWithConfigUntil("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+            .stage = .lexical_sparse,
+            .model_preference = .prefer_model,
+        }, .{
+            .io = std.Options.debug_io,
+            .requested = &requested,
+        }),
+    );
+    try std.testing.expectEqual(before_cancel_lsn, try wal_store.latestLsn("docs"));
 }
 
 test "sparse enricher prefers model but falls back deterministically when sparse model fails" {

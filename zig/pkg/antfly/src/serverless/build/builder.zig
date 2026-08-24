@@ -33,6 +33,7 @@ const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
 const work_lease = @import("work_lease.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
@@ -247,6 +248,24 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
     ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanGuardedUntil(
+            namespace,
+            vector_metric,
+            plan,
+            publication_guard,
+            null,
+        );
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanGuardedUntil(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -258,6 +277,7 @@ pub const Builder = struct {
 
         const records = try self.wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
+        try maintenance_cancellation.check(cancellation);
 
         if (records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
             return error.ExternalTableReadOnly;
@@ -273,6 +293,7 @@ pub const Builder = struct {
                         start_lsn,
                         plan,
                         publication_guard,
+                        cancellation,
                     );
                 }
             } else if (current_head == 0 and plan.table_definition.base_source != null) {
@@ -283,6 +304,7 @@ pub const Builder = struct {
                     start_lsn,
                     plan,
                     publication_guard,
+                    cancellation,
                 );
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
@@ -292,6 +314,7 @@ pub const Builder = struct {
                     vector_metric,
                     plan,
                     publication_guard,
+                    cancellation,
                 );
             }
             return .{
@@ -316,6 +339,7 @@ pub const Builder = struct {
         else
             try allocMutationEntriesFromRecords(self.alloc, records);
         defer segment_mod.freeEntries(self.alloc, mutation_entries);
+        try maintenance_cancellation.check(cancellation);
 
         const mutation_artifact = if (inline_document_rebase)
             null
@@ -330,11 +354,13 @@ pub const Builder = struct {
             var owned = artifact;
             owned.deinit(self.alloc);
         };
+        try maintenance_cancellation.check(cancellation);
 
         const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, records, targets.include_graph);
         defer freeMaterializerMutations(self.alloc, materialized.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
+        try maintenance_cancellation.check(cancellation);
 
         const document_ref = blk: {
             const entries = try allocDocumentSegmentEntries(self.alloc, materialized.documents);
@@ -346,6 +372,7 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
+        try maintenance_cancellation.check(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
         const text_refs = try buildTextArtifactRefsForMaterializedDocsAlloc(
@@ -358,6 +385,7 @@ pub const Builder = struct {
             text_index_specs,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
+        try maintenance_cancellation.check(cancellation);
         const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAlloc(
             self.alloc,
             self.artifacts,
@@ -368,6 +396,7 @@ pub const Builder = struct {
             targets.published_search_sources,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
+        try maintenance_cancellation.check(cancellation);
         const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAlloc(
             self.alloc,
             self.artifacts,
@@ -381,6 +410,7 @@ pub const Builder = struct {
             targets.published_search_sources,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
+        try maintenance_cancellation.check(cancellation);
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
         const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAlloc(
@@ -394,6 +424,7 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const wal_end_lsn = records[records.len - 1].lsn;
         const built_at_ns = records[records.len - 1].timestamp_ns;
@@ -404,6 +435,7 @@ pub const Builder = struct {
             .{},
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
+        try maintenance_cancellation.check(cancellation);
         const document_base_version = if (!inline_document_rebase) blk: {
             if (current_manifest) |current| {
                 if (findArtifactIndex(current, .document_segment) != null) {
@@ -454,11 +486,13 @@ pub const Builder = struct {
             );
         defer manifest.deinit(self.alloc);
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
+        try maintenance_cancellation.check(cancellation);
 
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        try maintenance_cancellation.check(cancellation);
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
@@ -486,15 +520,19 @@ pub const Builder = struct {
         start_lsn: u64,
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
         defer manifest.deinit(self.alloc);
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
+        try maintenance_cancellation.check(cancellation);
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        try maintenance_cancellation.check(cancellation);
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
@@ -524,7 +562,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        }, null);
+        }, null, null);
     }
 
     fn republishHeadWithPlan(
@@ -534,7 +572,9 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -565,6 +605,7 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, document_artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
+        try maintenance_cancellation.check(cancellation);
 
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
@@ -596,6 +637,7 @@ pub const Builder = struct {
             );
         };
         defer freeArtifactRefs(self.alloc, text_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const republish_docs = if (plan.artifact_actions.sparse_vector == .drop and plan.artifact_actions.dense_vector == .drop)
             &.{}
@@ -611,6 +653,7 @@ pub const Builder = struct {
             plan.artifact_actions.sparse_vector,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const vector_refs = try buildVectorArtifactRefsForRepublishAlloc(
             self.alloc,
@@ -623,6 +666,7 @@ pub const Builder = struct {
             plan.artifact_actions.dense_vector,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
@@ -640,6 +684,7 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        try maintenance_cancellation.check(cancellation);
 
         var scanned_derived_outputs: ?search_sources.MaterializedDerivedOutputs = null;
         defer if (scanned_derived_outputs) |*outputs| search_sources.deinitMaterializedDerivedOutputs(self.alloc, outputs);
@@ -667,6 +712,7 @@ pub const Builder = struct {
             plan.derived_output_actions,
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
+        try maintenance_cancellation.check(cancellation);
 
         const next_version = current_head + 1;
         var manifest = try buildCompactedManifestFromRefsAlloc(
@@ -692,10 +738,12 @@ pub const Builder = struct {
         defer manifest.deinit(self.alloc);
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
+        try maintenance_cancellation.check(cancellation);
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
             else => return err,
         };
+        try maintenance_cancellation.check(cancellation);
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,

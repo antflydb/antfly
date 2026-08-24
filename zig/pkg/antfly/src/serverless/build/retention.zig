@@ -18,6 +18,7 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const PruneResult = struct {
     namespace: []u8,
@@ -52,6 +53,16 @@ pub const Pruner = struct {
     }
 
     pub fn pruneNamespace(self: *Pruner, namespace: []const u8, keep_latest_versions: usize) !PruneResult {
+        return try self.pruneNamespaceUntil(namespace, keep_latest_versions, null);
+    }
+
+    pub fn pruneNamespaceUntil(
+        self: *Pruner,
+        namespace: []const u8,
+        keep_latest_versions: usize,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !PruneResult {
+        try maintenance_cancellation.check(cancellation);
         const versions = try self.manifests.listVersionsAlloc(namespace);
         defer self.alloc.free(versions);
 
@@ -86,6 +97,7 @@ pub const Pruner = struct {
         var retained_artifacts = std.StringHashMapUnmanaged(void).empty;
         defer freeOwnedKeys(self.alloc, &retained_artifacts);
         for (kept_versions) |version| {
+            try maintenance_cancellation.check(cancellation);
             var manifest = try self.manifests.getAlloc(namespace, version);
             defer manifest.deinit(self.alloc);
             try collectArtifactIds(self.alloc, &retained_artifacts, manifest.artifacts);
@@ -95,6 +107,7 @@ pub const Pruner = struct {
         defer freeOwnedKeys(self.alloc, &pruned_artifacts);
         var deleted_versions: usize = 0;
         for (versions[0..keep_start]) |version| {
+            try maintenance_cancellation.check(cancellation);
             var manifest = try self.manifests.getAlloc(namespace, version);
             defer manifest.deinit(self.alloc);
             try collectUnretainedArtifactIds(self.alloc, &pruned_artifacts, retained_artifacts, manifest.artifacts);
@@ -108,6 +121,7 @@ pub const Pruner = struct {
         var deleted_artifacts: usize = 0;
         var artifact_it = pruned_artifacts.iterator();
         while (artifact_it.next()) |entry| {
+            try maintenance_cancellation.check(cancellation);
             self.artifacts.delete(entry.key_ptr.*) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -115,6 +129,7 @@ pub const Pruner = struct {
             deleted_artifacts += 1;
         }
 
+        try maintenance_cancellation.check(cancellation);
         const wal_records_removed = try self.wal.truncatePrefix(namespace, effective_keep_from);
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),

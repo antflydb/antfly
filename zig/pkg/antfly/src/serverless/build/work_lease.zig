@@ -50,6 +50,19 @@ pub const Provider = struct {
             []const u8,
             u64,
         ) anyerror!bool,
+        acquire_bootstrap: *const fn (
+            *anyopaque,
+            []const u8,
+            []const u8,
+            u64,
+            u64,
+        ) anyerror!?Acquisition,
+        release_bootstrap: *const fn (
+            *anyopaque,
+            []const u8,
+            []const u8,
+            u64,
+        ) anyerror!bool,
     };
 
     pub fn acquire(
@@ -117,6 +130,39 @@ pub const Provider = struct {
             fencing_token,
             now_unix_ns,
             ttl_ns,
+        );
+    }
+
+    pub fn acquireBootstrap(
+        self: Provider,
+        namespace: []const u8,
+        owner_id: []const u8,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !?Acquisition {
+        if (namespace.len == 0) return error.InvalidLeaseNamespace;
+        if (owner_id.len == 0) return error.InvalidLeaseOwner;
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        return try self.vtable.acquire_bootstrap(
+            self.ptr,
+            namespace,
+            owner_id,
+            now_unix_ns,
+            ttl_ns,
+        );
+    }
+
+    pub fn releaseBootstrap(
+        self: Provider,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+    ) !bool {
+        return try self.vtable.release_bootstrap(
+            self.ptr,
+            namespace,
+            owner_id,
+            fencing_token,
         );
     }
 };
@@ -212,6 +258,27 @@ pub const HeldLease = struct {
     }
 };
 
+/// A rollback-invisible optimization lease for the expensive first build.
+/// Publication remains fenced by the absent-to-present HEAD CAS.
+pub const HeldBootstrapLease = struct {
+    provider: Provider,
+    namespace: []const u8,
+    owner_id: []const u8,
+    acquisition: Acquisition,
+    released: bool = false,
+
+    pub fn release(self: *HeldBootstrapLease) !bool {
+        if (self.released) return false;
+        const released = try self.provider.releaseBootstrap(
+            self.namespace,
+            self.owner_id,
+            self.acquisition.fencing_token,
+        );
+        self.released = released;
+        return released;
+    }
+};
+
 pub fn acquireHeld(
     provider: Provider,
     io: std.Io,
@@ -232,6 +299,27 @@ pub fn acquireHeld(
         .owner_id = owner_id,
         .acquisition = acquisition,
         .ttl_ns = ttl_ns,
+    };
+}
+
+pub fn acquireBootstrapHeld(
+    provider: Provider,
+    io: std.Io,
+    namespace: []const u8,
+    owner_id: []const u8,
+    ttl_ns: u64,
+) !?HeldBootstrapLease {
+    const acquisition = (try provider.acquireBootstrap(
+        namespace,
+        owner_id,
+        nowUnixNs(io),
+        ttl_ns,
+    )) orelse return null;
+    return .{
+        .provider = provider,
+        .namespace = namespace,
+        .owner_id = owner_id,
+        .acquisition = acquisition,
     };
 }
 

@@ -32,6 +32,7 @@ const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
@@ -711,14 +712,24 @@ pub const CatalogService = struct {
         namespace: []const u8,
         publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
     ) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuardedUntil(namespace, publication_guard, null);
+    }
+
+    pub fn buildNamespaceGuardedUntil(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlanGuarded(
+        return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
             publication_guard,
+            cancellation,
         );
     }
 
