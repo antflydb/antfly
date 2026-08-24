@@ -237,6 +237,10 @@ pub const ObjectStore = struct {
                     return error.WalIdempotencyConflict;
                 return existing.lsn;
             }
+            // An update without an ETag would turn the promised conditional
+            // append into an unconditional whole-log replacement. Fail closed
+            // on providers that omit the version token.
+            if (value.etag == null) return error.MissingObjectEtag;
         }
 
         const next_lsn: u64 = if (current) |value| (try lastLsn(value.body)) + 1 else 1;

@@ -42,6 +42,9 @@ pub const Client = struct {
         /// observed only the terminal error. Reads are side-effect free, so a
         /// retry must discard the ambiguous response and fetch it again.
         complete_then_fail: anyerror,
+        /// Models an otherwise successful provider response that omits the
+        /// object version token required by a caller's read-modify-write CAS.
+        omit_etag,
     };
 
     pub fn init(allocator: Allocator, backing: client_mod.Client) Client {
@@ -83,6 +86,10 @@ pub const Client = struct {
 
     pub fn completeNextGetThenFail(self: *Client, err: anyerror) void {
         self.next_get = .{ .complete_then_fail = err };
+    }
+
+    pub fn omitEtagFromNextGet(self: *Client) void {
+        self.next_get = .omit_etag;
     }
 
     /// Models a client/process crash: pending call-local faults disappear,
@@ -202,6 +209,12 @@ pub const Client = struct {
                 var result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
                 result.deinit(alloc);
                 break :blk err;
+            },
+            .omit_etag => blk: {
+                var result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
+                if (result.metadata.etag) |etag| alloc.free(etag);
+                result.metadata.etag = null;
+                break :blk result;
             },
         };
     }

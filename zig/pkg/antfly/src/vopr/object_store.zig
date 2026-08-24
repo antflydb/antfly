@@ -13,8 +13,68 @@ const manifest_types = @import("../serverless/manifest/types.zig");
 const wal_object_store = @import("../serverless/wal/object_store.zig");
 const wal_types = @import("../serverless/wal/types.zig");
 const progress_object_store = @import("../serverless/catalog/object_progress_store.zig");
+const progress_store = @import("../serverless/catalog/progress_store.zig");
+const artifacts_mod = @import("../serverless/artifacts/mod.zig");
+const manifest_mod = @import("../serverless/manifest/mod.zig");
+const wal_mod = @import("../serverless/wal/mod.zig");
+const catalog_mod = @import("../serverless/catalog/mod.zig");
+const builder_mod = @import("../serverless/build/mod.zig");
+const api_mod = @import("../serverless/api/mod.zig");
+const api_codec = @import("../serverless/api/codec.zig");
+const document_segment = @import("../serverless/document_segment/mod.zig");
+const runtime_manager = @import("../serverless/runtime/manager.zig");
 const backup_manifest = @import("../storage/ha/backup_manifest.zig");
 const seed_artifact = @import("../storage/ha/seed_artifact.zig");
+
+const RejectConditionalAppendWal = struct {
+    inner: *wal_mod.WalStore,
+
+    fn walStore(self: *@This()) wal_mod.WalStore {
+        return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: wal_mod.WalStore.VTable = .{
+        .deinit = deinit,
+        .append = append,
+        .append_idempotent_if_latest = appendIdempotentIfLatest,
+        .read_from_alloc = readFromAlloc,
+        .latest_lsn = latestLsn,
+        .truncate_prefix = truncatePrefix,
+    };
+
+    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+
+    fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.append(namespace, timestamp_ns, payload);
+    }
+
+    fn appendIdempotentIfLatest(
+        _: *anyopaque,
+        _: []const u8,
+        _: u64,
+        _: []const u8,
+        _: []const u8,
+        _: u64,
+    ) !?u64 {
+        return null;
+    }
+
+    fn readFromAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, start_lsn: u64) ![]wal_mod.Record {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.vtable.read_from_alloc(self.inner.ptr, alloc, namespace, start_lsn);
+    }
+
+    fn latestLsn(ptr: *anyopaque, namespace: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.latestLsn(namespace);
+    }
+
+    fn truncatePrefix(ptr: *anyopaque, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.truncatePrefix(namespace, keep_from_lsn);
+    }
+};
 
 test "serverless object store VOPR composes real artifact manifest WAL and progress protocols" {
     const alloc = std.testing.allocator;
@@ -112,6 +172,15 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     try std.testing.expectEqualStrings("mutation", records[0].payload);
     try std.testing.expectEqualStrings("request-1", records[0].operation_id.?);
 
+    // A provider that omits an ETag must not turn the conditional append into
+    // an unconditional whole-log replacement.
+    faults.omitEtagFromNextGet();
+    try std.testing.expectError(
+        error.MissingObjectEtag,
+        wal.appendIdempotentIfLatest("docs", 21, "derived", "enrich-v1/1/1/0/1", 1),
+    );
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+
     var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(
         alloc,
         faults.client(),
@@ -124,6 +193,30 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     try std.testing.expectError(error.Timeout, progress.compareAndSwapHead("docs", null, 1));
     try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
     try std.testing.expect(!(try progress.compareAndSwapHead("docs", null, 1)));
+    const first_progress = progress_store.EnrichmentStageProgress{
+        .head_version = 1,
+        .doc_offset = 1,
+    };
+    try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
+        "docs",
+        .lexical_sparse,
+        null,
+        first_progress,
+    ));
+    faults.omitEtagFromNextGet();
+    try std.testing.expectError(
+        error.MissingObjectEtag,
+        progress.compareAndSwapEnrichmentStageProgress(
+            "docs",
+            .lexical_sparse,
+            first_progress,
+            .{ .head_version = 1, .doc_offset = 2 },
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?progress_store.EnrichmentStageProgress, first_progress),
+        try progress.getEnrichmentStageProgress("docs", .lexical_sparse),
+    );
 
     faults.resetClientAfterCrash();
     try std.testing.expectEqual(@as(u64, 1), try manifests.getHead("docs"));
@@ -235,4 +328,150 @@ test "HA seed backup restore VOPR retries ambiguous publication and canceled dow
     const restored_bytes = try tmp.dir.readFileAlloc(io, "staging/table.sst", alloc, .limited(1024));
     defer alloc.free(restored_bytes);
     try std.testing.expectEqualStrings(contents, restored_bytes);
+}
+
+test "serverless object store VOPR consumes stale enrichment generation without overwriting documents" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "generation-artifacts", "tenant");
+    var artifacts: artifacts_mod.ArtifactStore = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "generation-manifests", "tenant");
+    var manifests: manifest_mod.ManifestStore = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "generation-wal", "tenant");
+    var wal: wal_mod.WalStore = wal_impl.walStore();
+    defer wal.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "generation-progress", "tenant");
+    var progress: catalog_mod.ProgressStore = progress_impl.progressStore();
+    defer progress.deinit();
+
+    var builder = builder_mod.Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var api = api_mod.Service.init(alloc, &wal, &builder);
+    const initial = [_]api_mod.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"authoritative\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &initial });
+    defer ingest.deinit(alloc);
+    var first = try builder.publishNamespace("docs");
+    defer first.deinit(alloc);
+
+    // Model a WAL-free metadata/external cutover after the enricher captured
+    // head 1 but before it appended its full-body derived mutation.
+    var generation_two = try manifests.getAlloc("docs", 1);
+    defer generation_two.deinit(alloc);
+    generation_two.version = 2;
+    try manifests.put(generation_two);
+    try std.testing.expect(try progress.compareAndSwapHead("docs", 1, 2));
+
+    const stale_mutation = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"stale-derived-overwrite\"}",
+    });
+    defer alloc.free(stale_mutation);
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try wal.appendIdempotentIfLatest(
+            "docs",
+            101,
+            stale_mutation,
+            "enrich-v1/1/1/0/1",
+            1,
+        ),
+    );
+
+    var consumed = try builder.publishNamespace("docs");
+    defer consumed.deinit(alloc);
+    try std.testing.expect(consumed.published);
+    try std.testing.expectEqual(@as(u64, 3), consumed.version);
+    try std.testing.expectEqual(@as(u64, 2), consumed.wal_end_lsn);
+
+    var visible = try manifests.getAlloc("docs", 3);
+    defer visible.deinit(alloc);
+    const document_ref = for (visible.artifacts) |artifact| {
+        if (artifact.kind == .document_segment) break artifact;
+    } else return error.DocumentSegmentNotFound;
+    const payload = try artifacts.getAlloc(document_ref.artifact_id);
+    defer alloc.free(payload);
+    const entries = try document_segment.decodeAlloc(alloc, payload);
+    defer document_segment.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("{\"text\":\"authoritative\"}", entries[0].body);
+}
+
+test "serverless object store VOPR enrichment conflict preserves pruning progress" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "maintenance-artifacts", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "maintenance-manifests", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "maintenance-wal", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "maintenance-progress", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var catalog_impl = try @import("../serverless/catalog/object_store.zig").ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "maintenance-catalog",
+        "tenant",
+    );
+    var catalog_store = catalog_impl.catalogStore();
+    defer catalog_store.deinit();
+
+    var builder = builder_mod.Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifacts, &manifests, &progress, &wal, &builder, &catalog_store);
+    defer catalog.deinit();
+    try std.testing.expect(try catalog.ensureNamespaceWithPolicy("docs", 100, .{
+        .enrichment_enabled = true,
+        .keep_latest_versions = 1,
+    }));
+    var api = api_mod.Service.init(alloc, &wal, &builder);
+    const first_batch = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"text\":\"alpha\"}" }};
+    var first_ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &first_batch });
+    defer first_ingest.deinit(alloc);
+    var first_build = try builder.publishNamespace("docs");
+    defer first_build.deinit(alloc);
+    const second_batch = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"text\":\"beta\"}" }};
+    var second_ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 200, .mutations = &second_batch });
+    defer second_ingest.deinit(alloc);
+    var second_build = try builder.publishNamespace("docs");
+    defer second_build.deinit(alloc);
+
+    var rejecting_impl = RejectConditionalAppendWal{ .inner = &wal };
+    var rejecting_wal = rejecting_impl.walStore();
+    defer rejecting_wal.deinit();
+    var runtime = runtime_manager.ManagedRuntime.init(alloc, .{
+        .publish_enabled = false,
+        .compaction_enabled = false,
+        .prune_enabled = true,
+        .enrichment_enabled = true,
+    }, &catalog, builder_mod.Pruner.init(alloc, &artifacts, &manifests, &progress, &wal));
+    runtime.setEnricher(@import("../serverless/enrichment/worker.zig").SparseEnricher.init(
+        alloc,
+        &artifacts,
+        &manifests,
+        &progress,
+        &rejecting_wal,
+    ));
+    defer runtime.deinit();
+
+    const stats = try runtime.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), stats.enrichment_conflicts);
+    try std.testing.expectEqual(@as(usize, 1), stats.pruned_namespaces);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_versions);
+    const versions = try manifests.listVersionsAlloc("docs");
+    defer alloc.free(versions);
+    try std.testing.expectEqualSlices(u64, &.{2}, versions);
 }

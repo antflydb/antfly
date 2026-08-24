@@ -407,6 +407,12 @@ pub const ObjectProgressStore = struct {
             if (desired.head_version < value.head_version) return false;
             if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
         }
+        // The provider version token is the cross-process CAS primitive. Do
+        // not silently degrade an existing-object update to an unconditional
+        // PUT when a backend omits it.
+        if (current) |entry| {
+            if (entry.etag == null) return error.MissingObjectEtag;
+        }
 
         const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ desired.head_version, desired.doc_offset });
         defer self.alloc.free(payload);

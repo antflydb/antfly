@@ -51,6 +51,13 @@ pub const FsStore = struct {
     pub fn append(self: *FsStore, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
 
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
@@ -113,6 +120,13 @@ pub const FsStore = struct {
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
         const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
@@ -159,6 +173,13 @@ pub const FsStore = struct {
     pub fn latestLsn(self: *FsStore, namespace: []const u8) !u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
         const next_path = try nextLsnPathAlloc(self.alloc, self.root_dir, namespace);
@@ -180,6 +201,13 @@ pub const FsStore = struct {
     pub fn truncatePrefix(self: *FsStore, namespace: []const u8, keep_from_lsn: u64) !u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
 
         const log_path = try logPathAlloc(self.alloc, self.root_dir, namespace);
         defer self.alloc.free(log_path);
@@ -374,6 +402,18 @@ fn nextLsnPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u
     return try std.fs.path.join(alloc, &.{ root_dir, namespace, "NEXT_LSN" });
 }
 
+fn openNamespaceLock(
+    alloc: Allocator,
+    root_dir: []const u8,
+    namespace: []const u8,
+    io: std.Io,
+) !std.Io.File {
+    const path = try std.fs.path.join(alloc, &.{ root_dir, namespace, ".wal.lock" });
+    defer alloc.free(path);
+    try ensureParentDir(path);
+    return try fs_paths.createFilePortable(io, path, .{ .truncate = false, .read = true });
+}
+
 const NextState = struct {
     next_lsn: u64,
     log_byte_len: ?u64,
@@ -522,6 +562,55 @@ test "serverless fs WAL conditional idempotent append fences a changed latest LS
         try store.appendIdempotentIfLatest("docs", 103, "stale-derived-two", "enrich/2", 2),
     );
     try std.testing.expectEqual(@as(u64, 3), try store.latestLsn("docs"));
+}
+
+test "serverless fs WAL conditional append is atomic across store instances" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "cross-instance-conditional");
+    defer cleanupTmp(path);
+
+    var store_a = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer store_a.deinit();
+    var store_b = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer store_b.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try store_a.append("docs", 100, "seed"));
+
+    const Race = struct {
+        stores: [2]*FsStore,
+        ready: std.atomic.Value(u32) = .init(0),
+        go: std.atomic.Value(bool) = .init(false),
+        winners: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This(), index: usize) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            var operation_buf: [32]u8 = undefined;
+            const operation_id = std.fmt.bufPrint(&operation_buf, "enrich-v1/1/1/{d}/1", .{index}) catch return;
+            const payload = if (index == 0) "derived-a" else "derived-b";
+            const appended = self.stores[index].appendIdempotentIfLatest(
+                "docs",
+                101 + @as(u64, @intCast(index)),
+                payload,
+                operation_id,
+                1,
+            ) catch return;
+            if (appended != null) _ = self.winners.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var race = Race{ .stores = .{ &store_a, &store_b } };
+    const thread_a = try std.Thread.spawn(.{}, Race.run, .{ &race, 0 });
+    const thread_b = try std.Thread.spawn(.{}, Race.run, .{ &race, 1 });
+    while (race.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    race.go.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expectEqual(@as(u32, 1), race.winners.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), try store_a.latestLsn("docs"));
+    const records = try store_a.readFromAlloc(std.testing.allocator, "docs", 1);
+    defer wal_types.freeRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
 }
 
 test "fs wal store erased interface works" {

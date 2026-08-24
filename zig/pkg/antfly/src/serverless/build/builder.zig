@@ -37,6 +37,7 @@ const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
+const enrichment_operation_id = @import("../enrichment/operation_id.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
@@ -281,7 +282,10 @@ pub const Builder = struct {
         defer wal_mod.freeRecords(self.alloc, records);
         try maintenance_cancellation.check(cancellation);
 
-        if (records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
+        const applicable_records = try applicableWalRecordsForHeadAlloc(self.alloc, records, current_head);
+        defer self.alloc.free(applicable_records);
+
+        if (applicable_records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
             return error.ExternalTableReadOnly;
         }
 
@@ -329,6 +333,24 @@ pub const Builder = struct {
             };
         }
 
+        // A derived mutation is scoped to the immutable HEAD from which its
+        // full document body was produced. Normal publishers and enrichers
+        // share a namespace lease, but this durable check also covers a crash,
+        // an administrative HEAD publication, or a mixed-version edge. Consume
+        // stale records without rebuilding unchanged artifacts so they cannot
+        // wedge an external/read-only table or overwrite a newer generation.
+        if (applicable_records.len == 0) {
+            const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
+            return try self.publishHeadConsumingIgnoredWal(
+                namespace,
+                current_head,
+                current,
+                records[records.len - 1],
+                publication_guard,
+                cancellation,
+            );
+        }
+
         const inline_document_rebase = if (current_manifest) |current|
             shouldInlineDocumentRebase(current, next_version, plan.policy)
         else
@@ -337,9 +359,9 @@ pub const Builder = struct {
         const mutation_entries = if (inline_document_rebase)
             try self.alloc.alloc(segment_mod.Entry, 0)
         else if (current_manifest) |current|
-            try mergeManifestMutationEntriesWithRecordsAlloc(self.alloc, self.artifacts, current, records)
+            try mergeManifestMutationEntriesWithRecordsAlloc(self.alloc, self.artifacts, current, applicable_records)
         else
-            try allocMutationEntriesFromRecords(self.alloc, records);
+            try allocMutationEntriesFromRecords(self.alloc, applicable_records);
         defer segment_mod.freeEntries(self.alloc, mutation_entries);
         try maintenance_cancellation.check(cancellation);
 
@@ -358,7 +380,7 @@ pub const Builder = struct {
         };
         try maintenance_cancellation.check(cancellation);
 
-        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, records, targets.include_graph);
+        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, applicable_records, targets.include_graph);
         defer freeMaterializerMutations(self.alloc, materialized.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
@@ -514,6 +536,41 @@ pub const Builder = struct {
             .version = published_version,
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
+            .artifact_count = manifest.artifacts.len,
+        };
+    }
+
+    fn publishHeadConsumingIgnoredWal(
+        self: *Builder,
+        namespace: []const u8,
+        current_head: u64,
+        current: manifest_mod.Manifest,
+        last_record: wal_mod.Record,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
+        var manifest = try manifest_mod.cloneManifest(self.alloc, current);
+        defer manifest.deinit(self.alloc);
+        manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
+        manifest.built_at_ns = last_record.timestamp_ns;
+        manifest.wal_end_lsn = last_record.lsn;
+
+        const published_version = try putManifestForPublication(self.manifests, &manifest, current_head);
+        const published = try compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            current_head,
+            published_version,
+            publication_guard,
+        );
+        if (!published) return error.HeadChanged;
+        return .{
+            .namespace = try self.alloc.dupe(u8, namespace),
+            .published = true,
+            .version = published_version,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -971,6 +1028,23 @@ pub fn compareAndSwapHeadGuarded(
         }
     }
     return try progress.compareAndSwapHead(namespace, expected, version);
+}
+
+fn applicableWalRecordsForHeadAlloc(
+    alloc: Allocator,
+    records: []const wal_mod.Record,
+    current_head: u64,
+) ![]wal_mod.Record {
+    const applicable = try alloc.alloc(wal_mod.Record, records.len);
+    errdefer alloc.free(applicable);
+    var count: usize = 0;
+    for (records) |record| {
+        const source_head = try enrichment_operation_id.sourceHeadVersion(record.operation_id);
+        if (source_head != null and source_head.? != current_head) continue;
+        applicable[count] = record;
+        count += 1;
+    }
+    return alloc.realloc(applicable, count);
 }
 
 /// Store an immutable manifest without letting an abandoned version wedge all

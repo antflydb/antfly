@@ -292,6 +292,13 @@ pub const FsProgressStore = struct {
     ) !bool {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
 
         const current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -694,6 +701,18 @@ fn headPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8) 
     return try std.fs.path.join(alloc, &.{ root_dir, namespace, "HEAD" });
 }
 
+fn openNamespaceLock(
+    alloc: Allocator,
+    root_dir: []const u8,
+    namespace: []const u8,
+    io: std.Io,
+) !std.Io.File {
+    const path = try std.fs.path.join(alloc, &.{ root_dir, namespace, ".progress.lock" });
+    defer alloc.free(path);
+    try ensureParentDir(path);
+    return try fs_paths.createFilePortable(io, path, .{ .truncate = false, .read = true });
+}
+
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
 fn nowNs() u64 {
@@ -824,4 +843,50 @@ test "fs progress store allows exactly one concurrent head CAS winner" {
 
     try std.testing.expectEqual(@as(u32, 1), state.winner_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), try fs.getHead("docs"));
+}
+
+test "fs enrichment progress CAS is atomic across store instances" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "stage-cas-cross-instance");
+    defer cleanupTmp(path);
+
+    var store_a = try FsProgressStore.init(alloc, std.mem.span(path));
+    defer store_a.deinit();
+    var store_b = try FsProgressStore.init(alloc, std.mem.span(path));
+    defer store_b.deinit();
+    const initial = progress_store.EnrichmentStageProgress{ .head_version = 1, .doc_offset = 1 };
+    try std.testing.expect(try store_a.compareAndSwapEnrichmentStageProgress("docs", .lexical_sparse, null, initial));
+
+    const Race = struct {
+        stores: [2]*FsProgressStore,
+        ready: std.atomic.Value(u32) = .init(0),
+        go: std.atomic.Value(bool) = .init(false),
+        winners: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This(), index: usize) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            const won = self.stores[index].compareAndSwapEnrichmentStageProgress(
+                "docs",
+                .lexical_sparse,
+                initial,
+                .{ .head_version = 1, .doc_offset = 2 + @as(u64, @intCast(index)) },
+            ) catch return;
+            if (won) _ = self.winners.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var race = Race{ .stores = .{ &store_a, &store_b } };
+    const thread_a = try std.Thread.spawn(.{}, Race.run, .{ &race, 0 });
+    const thread_b = try std.Thread.spawn(.{}, Race.run, .{ &race, 1 });
+    while (race.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    race.go.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expectEqual(@as(u32, 1), race.winners.load(.monotonic));
+    const final = (try store_a.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    try std.testing.expectEqual(@as(u64, 1), final.head_version);
+    try std.testing.expect(final.doc_offset == 2 or final.doc_offset == 3);
 }

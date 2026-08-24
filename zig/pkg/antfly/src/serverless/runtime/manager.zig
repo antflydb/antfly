@@ -50,6 +50,7 @@ pub const RuntimeRunStats = struct {
     enrichment_fallback_documents: usize = 0,
     enrichment_failed_documents: usize = 0,
     enrichment_stage_failures: usize = 0,
+    enrichment_conflicts: usize = 0,
     work_lease_conflicts: usize = 0,
     work_lease_takeovers: usize = 0,
 };
@@ -231,23 +232,62 @@ pub const ManagedRuntime = struct {
 
                 if (self.cfg.enrichment_enabled and status.enrichment_active_stage != null) {
                     const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(status.enrichment_active_stage.?) orelse continue;
-                    const enrichment = enricher.runNamespaceWithConfigUntil(namespace.name, .{
-                        .batch_size = policy.enrichment_batch_size,
-                        .pipeline_version = stage_spec.pipeline_version,
-                        .stage = status.enrichment_active_stage.?,
-                        .model_preference = stage_spec.model_preference,
-                        .failure_policy = policy.enrichment_failure_policy,
-                    }, self.cancellationToken()) catch |err| switch (err) {
-                        error.FileNotFound, error.EnrichmentProgressChanged => continue,
-                        else => return err,
+                    var held_enrichment_lease: ?build_mod.work_lease.HeldLease = null;
+                    var can_enrich = true;
+                    if (self.work_lease_provider) |provider| {
+                        held_enrichment_lease = try build_mod.work_lease.acquireHeld(
+                            provider,
+                            self.io,
+                            namespace.name,
+                            self.work_lease_owner_id orelse return error.MissingLeaseOwner,
+                            self.work_lease_ttl_ns,
+                        );
+                        if (held_enrichment_lease == null) {
+                            stats.enrichment_conflicts += 1;
+                            stats.work_lease_conflicts += 1;
+                            can_enrich = false;
+                        } else if (held_enrichment_lease.?.acquisition.took_over) {
+                            stats.work_lease_takeovers += 1;
+                        }
+                    }
+                    defer if (held_enrichment_lease) |*lease| {
+                        _ = lease.release() catch {};
                     };
-                    stats.enriched_namespaces += enrichment.enriched_namespaces;
-                    stats.enriched_documents += enrichment.enriched_documents;
-                    stats.enrichment_wal_appends += enrichment.wal_appends;
-                    stats.enrichment_model_documents += enrichment.model_documents;
-                    stats.enrichment_fallback_documents += enrichment.fallback_documents;
-                    stats.enrichment_failed_documents += enrichment.failed_documents;
-                    stats.enrichment_stage_failures += enrichment.stage_failures;
+
+                    if (can_enrich) {
+                        const enrichment_cancellation = if (held_enrichment_lease) |*lease|
+                            lease.cancellation(self.cancellationToken())
+                        else
+                            self.cancellationToken();
+                        const maybe_enrichment = enricher.runNamespaceWithConfigUntil(namespace.name, .{
+                            .batch_size = policy.enrichment_batch_size,
+                            .pipeline_version = stage_spec.pipeline_version,
+                            .stage = status.enrichment_active_stage.?,
+                            .model_preference = stage_spec.model_preference,
+                            .failure_policy = policy.enrichment_failure_policy,
+                        }, enrichment_cancellation) catch |err| switch (err) {
+                            error.FileNotFound => null,
+                            error.EnrichmentProgressChanged => blk: {
+                                stats.enrichment_conflicts += 1;
+                                break :blk null;
+                            },
+                            error.WorkLeaseLost => blk: {
+                                stats.enrichment_conflicts += 1;
+                                stats.work_lease_conflicts += 1;
+                                break :blk null;
+                            },
+                            else => return err,
+                        };
+                        if (maybe_enrichment) |enrichment| {
+                            stats.enriched_namespaces += enrichment.enriched_namespaces;
+                            stats.enriched_documents += enrichment.enriched_documents;
+                            stats.enrichment_wal_appends += enrichment.wal_appends;
+                            stats.enrichment_model_documents += enrichment.model_documents;
+                            stats.enrichment_fallback_documents += enrichment.fallback_documents;
+                            stats.enrichment_failed_documents += enrichment.failed_documents;
+                            stats.enrichment_stage_failures += enrichment.stage_failures;
+                        }
+                    }
                 }
             }
 
@@ -379,6 +419,7 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.enrichment_fallback_documents += stats.enrichment_fallback_documents;
         self.cumulative_stats.enrichment_failed_documents += stats.enrichment_failed_documents;
         self.cumulative_stats.enrichment_stage_failures += stats.enrichment_stage_failures;
+        self.cumulative_stats.enrichment_conflicts += stats.enrichment_conflicts;
         self.cumulative_stats.work_lease_conflicts += stats.work_lease_conflicts;
         self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
