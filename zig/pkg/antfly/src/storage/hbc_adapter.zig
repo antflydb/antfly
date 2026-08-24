@@ -2870,8 +2870,9 @@ pub const HBCIndex = struct {
         }
     }
 
-    /// Explicit policy control. Production IndexManager defaults this off;
-    /// ResourceManager governs admission and eviction after a caller opts in.
+    /// Explicit policy control. Production IndexManager resolves its adaptive
+    /// default from ResourceManager capacity; admission and eviction remain
+    /// governed after the path is enabled.
     pub fn setRetainedVectorCacheEnabled(self: *HBCIndex, enabled: bool) void {
         if (self.retained_vector_cache_enabled == enabled) return;
         self.retained_vector_cache_enabled = enabled;

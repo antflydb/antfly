@@ -231,10 +231,9 @@ pub const IndexBackendOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
-    /// Full decoded vectors already have an authoritative copy in primary
-    /// storage. Retaining a second copy is an explicit production opt-in until
-    /// the cache governor can prove that reuse outweighs its memory cost.
-    retained_vector_cache_enabled: bool = false,
+    /// null uses ResourceManager-derived capacity and dynamic admission;
+    /// false is a hard operator opt-out and true permits governed retention.
+    retained_vector_cache_enabled: ?bool = null,
     // Binding a caller-owned shared cache requires a manager whose lifetime
     // covers that cache. Per-DB fallback managers govern local work but must
     // not be installed into external caches.
