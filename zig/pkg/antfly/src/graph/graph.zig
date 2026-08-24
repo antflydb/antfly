@@ -1327,6 +1327,19 @@ pub const GraphIndex = struct {
     /// backend multi-get. Results remain aligned with `probes`; null means the
     /// relationship does not exist. Only found edges allocate edge payloads.
     pub fn probeEdgesAlloc(self: *GraphIndex, alloc: Allocator, probes: []const EdgeProbe) ![]?Edge {
+        return try self.probeEdgesAllocBounded(alloc, probes, std.math.maxInt(usize));
+    }
+
+    /// Resolve exact physical relationships without allowing decoded edge
+    /// payloads to exceed the caller's remaining request budget. The limit is
+    /// checked against values borrowed from the read transaction before any
+    /// found edge payload is copied into caller-owned memory.
+    pub fn probeEdgesAllocBounded(
+        self: *GraphIndex,
+        alloc: Allocator,
+        probes: []const EdgeProbe,
+        max_owned_bytes: usize,
+    ) ![]?Edge {
         const ProbeKey = struct {
             encoded: []u8,
             result_index: usize,
@@ -1369,10 +1382,23 @@ pub const GraphIndex = struct {
         errdefer {
             for (results) |maybe_edge| if (maybe_edge) |edge| freeEdge(alloc, edge);
         }
+        var owned_bytes: usize = 0;
         for (keys, values) |item, maybe_value| {
             const value = maybe_value orelse continue;
             const decoded = try decodeEdgeValue(value);
             const probe = probes[item.result_index];
+            var edge_bytes: usize = @sizeOf(Edge);
+            edge_bytes = std.math.add(usize, edge_bytes, probe.source.len) catch
+                return error.QueryCandidateBudgetExceeded;
+            edge_bytes = std.math.add(usize, edge_bytes, probe.target.len) catch
+                return error.QueryCandidateBudgetExceeded;
+            edge_bytes = std.math.add(usize, edge_bytes, probe.edge_type.len) catch
+                return error.QueryCandidateBudgetExceeded;
+            edge_bytes = std.math.add(usize, edge_bytes, decoded.metadata.len) catch
+                return error.QueryCandidateBudgetExceeded;
+            owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch
+                return error.QueryCandidateBudgetExceeded;
+            if (owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
             const source = try alloc.dupe(u8, probe.source);
             errdefer alloc.free(source);
             const target = try alloc.dupe(u8, probe.target);
@@ -2052,6 +2078,22 @@ test "graph exact edge probes stay aligned and preserve payloads" {
     try std.testing.expect(probed[2] == null);
     try std.testing.expect(probed[3] != null);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), probed[3].?.weight, 0.001);
+
+    const bounded_probe = EdgeProbe{ .source = "post:2", .target = "tag", .edge_type = "HAS_TAG" };
+    const bounded_bytes = @sizeOf(Edge) + bounded_probe.source.len + bounded_probe.target.len +
+        bounded_probe.edge_type.len + "{\"rank\":1}".len;
+    const bounded = try graph.probeEdgesAllocBounded(alloc, &.{bounded_probe}, bounded_bytes);
+    defer GraphIndex.freeProbedEdges(alloc, bounded);
+    try std.testing.expect(bounded[0] != null);
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        graph.probeEdgesAllocBounded(alloc, &.{bounded_probe}, bounded_bytes - 1),
+    );
+
+    const missing_probe = EdgeProbe{ .source = "missing", .target = "tag", .edge_type = "HAS_TAG" };
+    const missing = try graph.probeEdgesAllocBounded(alloc, &.{missing_probe}, 0);
+    defer GraphIndex.freeProbedEdges(alloc, missing);
+    try std.testing.expect(missing[0] == null);
 }
 
 test "graph edge keys support arbitrary document ids and edge types" {

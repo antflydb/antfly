@@ -1594,6 +1594,14 @@ const DistributedEdgeReader = struct {
         return canonicalGraphNodeTable(self.source_table, table);
     }
 
+    /// Incoming adjacency is routed by its declared physical source table.
+    /// For a reversed variable-length edge, unnamed intermediate sources have
+    /// no table declaration, so consulting only that endpoint table cannot
+    /// prove a complete result across the catalog.
+    pub fn supportsReverseVariablePaths(_: @This()) bool {
+        return false;
+    }
+
     pub fn getEdges(
         self: @This(),
         a: std.mem.Allocator,

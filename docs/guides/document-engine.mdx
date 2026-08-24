@@ -281,6 +281,10 @@ identities are read in stable snapshot-pinned pages, independently for each
 named graph operation. A request may contain at most eight named `match`
 operations. Put multiple counts over one pattern in a single `match` return
 object so they share one complete anchor scan and one set of bindings.
+For cross-table multi-hop MATCH patterns, declare an alias at each table
+boundary and connect those aliases with single-hop edges. Antfly fails closed
+when exact execution would otherwise need to reverse a variable-length edge
+through unnamed intermediate nodes whose source tables cannot be proven.
 Aliases and aggregate names are limited to 128 Unicode code points. A binding
 projection explicitly lists between one and 64 unique aliases; list every
 declared alias when the complete row is required. These bounds keep admission

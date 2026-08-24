@@ -1738,7 +1738,7 @@ pub const GraphMatch = struct {
     optional: ?[]const GraphOptionalMatch = null,
 };
 
-/// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle.
+/// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     from: []const u8,
     to: []const u8,
@@ -1754,7 +1754,7 @@ pub const GraphMatchEdge = struct {
 pub const GraphMatchNode = struct {
     /// Owning table for this alias. Omit for the queried table.
     table: ?[]const u8 = null,
-    /// Non-scoring structured stored-document predicate evaluated for this alias.
+    /// Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on table-qualified aliases because its published snapshot contains only the queried table; prefix-only alias filters remain supported.
     filter: ?GraphDocumentFilter = null,
 };
 

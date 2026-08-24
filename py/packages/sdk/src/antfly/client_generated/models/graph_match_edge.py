@@ -15,7 +15,10 @@ class GraphMatchEdge:
     """Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those
     aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-
     simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing
-    onto an already bound target alias for an explicit cycle.
+    onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects
+    planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven.
+    Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table
+    boundary.
 
         Attributes:
             from_ (str):

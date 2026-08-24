@@ -91,7 +91,6 @@ describe("GraphIndexExplorer", () => {
               ],
               paths: [],
               stats: { returned_items: 1, truncated: false },
-              took: 1,
             },
           },
         },
@@ -193,7 +192,6 @@ describe("GraphIndexExplorer", () => {
             },
           ],
           stats: { returned_items: 1, truncated: false },
-          took: 1,
         }}
       />
     );
@@ -239,7 +237,6 @@ describe("GraphIndexExplorer", () => {
           ],
           paths: [],
           stats: { returned_items: 1, truncated: false },
-          took: 1,
         }}
       />
     );

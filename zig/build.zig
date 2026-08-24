@@ -3782,6 +3782,7 @@ pub fn build(b: *std.Build) void {
         "variable length conjunctive edge preserves simple path multiplicity",
         "conjunctive cycle closure survives node admission deduplication",
         "conjunctive reverse expansion uses the declared cross-table source alias",
+        "reverse variable expansion fails closed when the reader cannot prove intermediate source tables",
         "complete graph match anchors discard retrieval shaping",
         "complete graph match anchor scan is independent per named operation",
         "complete graph match anchor scan reports native filter coverage failures",

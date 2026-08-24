@@ -267,11 +267,34 @@ pub const WorkBudget = struct {
 fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
     var total: usize = 0;
     for (edges) |edge| {
-        total = try std.math.add(usize, total, @sizeOf(graph_mod.Edge));
-        total = try std.math.add(usize, total, edge.source.len);
-        total = try std.math.add(usize, total, edge.target.len);
-        total = try std.math.add(usize, total, edge.edge_type.len);
-        total = try std.math.add(usize, total, edge.metadata.len);
+        total = std.math.add(usize, total, @sizeOf(graph_mod.Edge)) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.source.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.target.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.edge_type.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.metadata.len) catch
+            return error.QueryCandidateBudgetExceeded;
+    }
+    return total;
+}
+
+fn probedEdgeOwnedBytes(edges: []const ?graph_mod.Edge) !usize {
+    var total: usize = 0;
+    for (edges) |maybe_edge| {
+        const edge = maybe_edge orelse continue;
+        total = std.math.add(usize, total, @sizeOf(graph_mod.Edge)) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.source.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.target.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.edge_type.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        total = std.math.add(usize, total, edge.metadata.len) catch
+            return error.QueryCandidateBudgetExceeded;
     }
     return total;
 }
@@ -430,18 +453,19 @@ pub fn matchPattern(
             graph_mod.GraphIndex.freeEdges(a, edges);
         }
 
-        pub fn probeEdges(
+        pub fn probeEdgesBounded(
             self: @This(),
             a: Allocator,
             table: ?[]const u8,
             probes: []const graph_mod.EdgeProbe,
+            max_owned_bytes: usize,
         ) ![]?graph_mod.Edge {
             if (table != null) {
                 const empty = try a.alloc(?graph_mod.Edge, probes.len);
                 @memset(empty, null);
                 return empty;
             }
-            return try self.graph_index.probeEdgesAlloc(a, probes);
+            return try self.graph_index.probeEdgesAllocBounded(a, probes, max_owned_bytes);
         }
 
         pub fn freeProbedEdges(_: @This(), a: Allocator, edges: []?graph_mod.Edge) void {
@@ -737,7 +761,7 @@ fn matchExactTwoEdgePattern(
     intermediate_limit: usize,
     work_budget: *WorkBudget,
 ) !?[]PatternMatch {
-    if (comptime !@hasDecl(@TypeOf(edge_reader), "probeEdges") or
+    if (comptime !@hasDecl(@TypeOf(edge_reader), "probeEdgesBounded") or
         !@hasDecl(@TypeOf(edge_reader), "freeProbedEdges"))
     {
         return null;
@@ -852,9 +876,15 @@ fn matchExactTwoEdgePattern(
                 .both => unreachable,
             };
         }
-        const probed_edges = try edge_reader.probeEdges(alloc, null, probes);
+        const probed_edges = try edge_reader.probeEdgesBounded(
+            alloc,
+            null,
+            probes,
+            work_budget.edgeByteLimit(),
+        );
         defer edge_reader.freeProbedEdges(alloc, probed_edges);
         if (probed_edges.len != probes.len) return error.InvalidGraphEdgeProbeResult;
+        try work_budget.consumeEdgeBytes(try probedEdgeOwnedBytes(probed_edges));
 
         for (batch_candidates, probed_edges) |candidate, maybe_backward_edge| {
             // Generic expansion never traverses a self-loop. Keep the
@@ -949,6 +979,12 @@ fn findReachableNodes(
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
+    if (edge.reverse_from_declared_alias and max_hops > 1) {
+        if (comptime @hasDecl(@TypeOf(edge_reader), "supportsReverseVariablePaths")) {
+            if (!edge_reader.supportsReverseVariablePaths())
+                return error.UnsupportedQueryRequest;
+        }
+    }
     const result_limit: usize = if (require_complete)
         std.math.maxInt(usize)
     else if (max_results == 0)
@@ -2891,6 +2927,48 @@ test "conjunctive reverse expansion uses the declared cross-table source alias" 
     try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
 }
 
+test "reverse variable expansion fails closed when the reader cannot prove intermediate source tables" {
+    const Reader = struct {
+        pub fn supportsReverseVariablePaths(_: @This()) bool {
+            return false;
+        }
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    var work_budget = WorkBudget.init(default_max_explored_nodes, default_max_explored_edges);
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        findReachableNodes(
+            std.testing.allocator,
+            Reader{},
+            "bound-target",
+            null,
+            .{
+                .types = &.{"LINKS"},
+                .direction = .in,
+                .min_hops = 1,
+                .max_hops = 2,
+                .reverse_from_declared_alias = true,
+                .reverse_source_table = "entities",
+            },
+            .{},
+            &.{},
+            false,
+            0,
+            true,
+            null,
+            null,
+            false,
+            null,
+            &work_budget,
+        ),
+    );
+}
+
 test "conjunctive match supports branches anti joins inequality and optional nulls" {
     const alloc = std.testing.allocator;
     const Reader = struct {
@@ -3527,6 +3605,7 @@ test "exact two-edge pattern uses typed batch probes without paths" {
     const Reader = struct {
         forward_calls: *usize,
         reverse_calls: *usize,
+        max_probe_bytes: *usize,
 
         const forward = [_]graph_mod.Edge{
             .{ .source = "forum", .target = "post:1", .edge_type = "CONTAINER_OF", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
@@ -3563,13 +3642,15 @@ test "exact two-edge pattern uses typed batch probes without paths" {
 
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
-        pub fn probeEdges(
+        pub fn probeEdgesBounded(
             self: @This(),
             alloc: Allocator,
             _: ?[]const u8,
             probes: []const graph_mod.EdgeProbe,
+            max_owned_bytes: usize,
         ) ![]?graph_mod.Edge {
             self.reverse_calls.* += 1;
+            self.max_probe_bytes.* = max_owned_bytes;
             const results = try alloc.alloc(?graph_mod.Edge, probes.len);
             @memset(results, null);
             for (probes, 0..) |probe, i| {
@@ -3590,10 +3671,15 @@ test "exact two-edge pattern uses typed batch probes without paths" {
 
     var forward_calls: usize = 0;
     var reverse_calls: usize = 0;
+    var max_probe_bytes: usize = 0;
     var stats = MatchStats{};
     const matches = try matchPatternWithEdgeReader(
         std.testing.allocator,
-        Reader{ .forward_calls = &forward_calls, .reverse_calls = &reverse_calls },
+        Reader{
+            .forward_calls = &forward_calls,
+            .reverse_calls = &reverse_calls,
+            .max_probe_bytes = &max_probe_bytes,
+        },
         &.{"forum"},
         &.{
             .{ .alias = "forum" },
@@ -3611,6 +3697,10 @@ test "exact two-edge pattern uses typed batch probes without paths" {
 
     try std.testing.expectEqual(@as(usize, 1), forward_calls);
     try std.testing.expectEqual(@as(usize, 1), reverse_calls);
+    try std.testing.expectEqual(
+        default_max_explored_edge_bytes - try edgeOwnedBytes(&Reader.forward),
+        max_probe_bytes,
+    );
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
     try std.testing.expectEqual(@as(usize, 2), stats.exact_edge_probes);
@@ -3649,7 +3739,7 @@ test "exact two-edge probe plan is equivalent to generic expansion" {
 
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
-        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+        pub fn probeEdgesBounded(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
             const results = try alloc.alloc(?graph_mod.Edge, probes.len);
             @memset(results, null);
             for (probes, 0..) |probe, i| {
@@ -3741,7 +3831,7 @@ test "exact two-edge probe honors incoming final direction" {
 
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
-        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+        pub fn probeEdgesBounded(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
             try std.testing.expectEqual(@as(usize, 1), probes.len);
             try std.testing.expectEqualStrings("target", probes[0].source);
             try std.testing.expectEqualStrings("middle", probes[0].target);
@@ -3798,7 +3888,7 @@ test "exact two-edge probe excludes final self loops like generic expansion" {
 
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
-        pub fn probeEdges(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+        pub fn probeEdgesBounded(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
             try std.testing.expectEqual(@as(usize, 1), probes.len);
             const result = try alloc.alloc(?graph_mod.Edge, 1);
             result[0] = self_loop;
@@ -3998,7 +4088,7 @@ test "inapplicable exact plan does not consume generic fallback budget" {
 
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
-        pub fn probeEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const graph_mod.EdgeProbe) ![]?graph_mod.Edge {
+        pub fn probeEdgesBounded(_: @This(), _: Allocator, _: ?[]const u8, _: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
             return error.TestUnexpectedResult;
         }
 

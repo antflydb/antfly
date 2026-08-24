@@ -141,7 +141,6 @@ const traversalResult: GraphQueryResult = {
   ],
   paths: [],
   stats: { returned_items: 4, truncated: false },
-  took: 2,
 };
 
 const shortestPathResult: GraphQueryResult = {
@@ -173,7 +172,6 @@ const shortestPathResult: GraphQueryResult = {
     },
   ],
   stats: { returned_items: 1, truncated: false },
-  took: 1,
 };
 
 function graphResultFor(request: QueryRequest): GraphQueryResult {

@@ -11924,10 +11924,10 @@ export interface components {
         GraphMatchNode: {
             /** @description Owning table for this alias. Omit for the queried table. */
             table?: string;
-            /** @description Non-scoring structured stored-document predicate evaluated for this alias. */
+            /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on table-qualified aliases because its published snapshot contains only the queried table; prefix-only alias filters remain supported. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
-        /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. */
+        /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
             from: string;
             to: string;
