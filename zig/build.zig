@@ -6570,6 +6570,7 @@ pub fn build(b: *std.Build) void {
         "hbc shared cache reclaims exact vectors before protected routing nodes",
         "hbc shared cache reclaims an over-quota namespace for a borrowing peer",
         "hbc shared vector cache warms during concurrent search",
+        "hbc external rerank loads metadata only for decoded vector misses",
         "hbc shared vector publication coalesces concurrent duplicate fills",
         "hbc retained node and quantized handles survive threaded eviction",
         "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors",

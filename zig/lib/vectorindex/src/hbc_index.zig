@@ -2951,6 +2951,7 @@ pub fn rerankResults(
                     scratch.key_views,
                     scratch.values,
                     scratch.vector_batch,
+                    scratch.error_bounds,
                     profile,
                 );
                 const score_elapsed = elapsed_fn_u64(score_start);

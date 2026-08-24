@@ -758,6 +758,15 @@ lower bound of the unscored set. Only a strict separation skips the remaining
 artifact reads. Batch count, maximum batch size, and candidates skipped by the
 proof are public profile fields.
 
+Each external rerank batch probes governed decoded-vector residency before
+resolving HBC vector-to-document metadata. A retained decoded hit is scored
+directly; only the compacted miss set performs the sorted metadata multi-get
+and external artifact read. Output distances are scattered back into the
+original approximate-distance order before the bound proof runs. This order is
+part of the correctness contract, while avoiding metadata I/O on a warm hit is
+part of the representation-ownership contract: a decoded owner must replace,
+not accompany, the serialized lookup path.
+
 Permanent coverage includes generation-crossing stale-fill rejection,
 request-owned miss results, query-bounded decoded-residency leases, pre-read
 handoff to retained LSM ownership when a lease cannot cover degraded work,
