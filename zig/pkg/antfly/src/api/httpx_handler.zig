@@ -6730,7 +6730,8 @@ test "httpx owned response preserves retryable JSON metadata" {
     defer failure_response.deinit();
     try std.testing.expectEqual(@as(u16, 500), failure_response.status.code);
     try std.testing.expectEqualStrings("application/json", failure_response.headers.get("content-type").?);
-    try std.testing.expectEqualStrings(
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
         "{\"error\":\"InferenceProviderFailure\",\"message\":\"batch failed\"}",
         failure_response.body.?,
     );

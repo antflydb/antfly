@@ -27,6 +27,7 @@ const readers_api = @import("antfly_readers");
 const transcribing_api = @import("antfly_transcribing");
 const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
+const ant_json = @import("antfly-json");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
 const hf_tokenizer_mod = @import("inference_hf_tokenizer");
@@ -4246,31 +4247,26 @@ pub const Node = struct {
         self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
         defer self.metrics.decActive();
 
-        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
-        const media_admission = requestMediaAdmission(self, media_shape);
-        try self.growAdmissionUnits(reserved_units, media_admission.units);
-        reserved_units = media_admission.units;
-
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
         defer schema_parsed.deinit();
         const operation = try canonicalExtractionOperation(schema_parsed.value);
-
-        var parsed_inputs = try parseDirectExtractionInputs(
-            self,
-            allocator,
-            request.inputs,
-            null,
-            null,
-            media_admission.byte_cap,
-        );
-        defer parsed_inputs.deinit();
-        try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
+        const media_shape = if (operation == .structures)
+            try directExtractionMediaShape(allocator, request.inputs)
+        else
+            RequestMediaAdmissionShape{};
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.growAdmissionUnits(reserved_units, media_admission.units);
+        reserved_units = media_admission.units;
 
         if (operation != .structures) {
-            if (parsed_inputs.images.items.len > 0) return error.UnsupportedInput;
+            // Entity, relation, and classification models are text-only. Parse
+            // them with a no-I/O path so a request that will be rejected cannot
+            // trigger remote media fetches or decoding work first.
+            var parsed_inputs = try parseDirectTextExtractionInputs(allocator, request.inputs);
+            defer parsed_inputs.deinit();
             var typed_options = try std.json.parseFromSlice(extraction_api.ExtractionOptions, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{
                 .allocate = .alloc_always,
                 .ignore_unknown_fields = true,
@@ -4330,11 +4326,17 @@ pub const Node = struct {
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
 
-        if (options.prompt) |prompt| {
-            if (parsed_inputs.prompt) |prior| allocator.free(prior);
-            parsed_inputs.prompt = try allocator.dupe(u8, prompt);
-        }
-        parsed_inputs.max_tokens = options.max_tokens;
+        // Fetch and decode request media only after resolver preflight succeeds.
+        var parsed_inputs = try parseDirectExtractionInputs(
+            self,
+            allocator,
+            request.inputs,
+            options.prompt,
+            options.max_tokens,
+            media_admission.byte_cap,
+        );
+        defer parsed_inputs.deinit();
+        try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
         if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
         if (parsed_inputs.max_tokens) |max_tokens| {
             if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
@@ -4431,7 +4433,14 @@ pub const Node = struct {
             if (want_relations) {
                 if (!model.supportsRelationExtraction() or !pipeline.supportsRelationExtraction())
                     return error.UnsupportedRelationExtraction;
-                const extracted = try pipeline.extractRelationsBatch(texts, labels, relation_labels);
+                const relation_entity_labels = try relationEntityLabelsAlloc(
+                    allocator,
+                    labels,
+                    pipeline.config.default_labels,
+                    relation_labels,
+                );
+                defer if (relation_entity_labels) |values| allocator.free(values);
+                const extracted = try pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels);
                 defer {
                     for (extracted.entities) |entities| {
                         for (entities) |entity| allocator.free(entity.text);
@@ -9203,7 +9212,14 @@ pub const Node = struct {
             }
 
             const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, labels, relation_labels) catch |err|
+            const relation_entity_labels = try relationEntityLabelsAlloc(
+                ctx.allocator,
+                labels,
+                pipeline.config.default_labels,
+                relation_labels,
+            );
+            defer if (relation_entity_labels) |values| ctx.allocator.free(values);
+            const extracted = pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer {
                 for (extracted.entities) |entities| {
@@ -10151,13 +10167,13 @@ pub const Node = struct {
         }
 
         if (operation == .classifications) {
-            var classification_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+            var classification_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification extraction requires text inputs" });
             defer classification_inputs.deinit();
             return self.extractClassifications(ctx, body, classification_inputs.texts.items);
         }
 
-        var direct_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+        var direct_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity and relation extraction requires text inputs" });
         defer direct_inputs.deinit();
         if (try self.acquireSlot(ctx)) |resp| return resp;
@@ -11332,18 +11348,10 @@ fn freeCanonicalExtractingInputs(allocator: std.mem.Allocator, inputs: []extract
     allocator.free(inputs);
 }
 
-fn parseCanonicalTextInputs(
-    node: *Node,
-    allocator: std.mem.Allocator,
-    inputs: []const extraction_api.ExtractionInput,
-) !DirectExtractionInputs {
+fn parseCanonicalTextInputs(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) !DirectExtractionInputs {
     const direct = try canonicalExtractingInputs(allocator, inputs);
     defer freeCanonicalExtractingInputs(allocator, direct);
-    const media_admission = requestMediaAdmission(node, .{});
-    var parsed = try parseDirectExtractionInputs(node, allocator, direct, null, null, media_admission.byte_cap);
-    errdefer parsed.deinit();
-    if (parsed.images.items.len > 0 or parsed.texts.items.len != inputs.len) return error.UnsupportedInput;
-    return parsed;
+    return parseDirectTextExtractionInputs(allocator, direct);
 }
 
 fn canonicalInputIds(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) ![]?[]const u8 {
@@ -11377,6 +11385,52 @@ fn canonicalRelationLabels(
         initialized += 1;
     }
     return labels;
+}
+
+/// Build the entity-label vocabulary needed by GLiNER relation extraction.
+/// Explicit entity labels remain authoritative; otherwise model defaults are
+/// retained. Canonical relation endpoint constraints are always added so a
+/// legal relations-only schema does not depend on those endpoints happening
+/// to exist in a model's default vocabulary.
+fn relationEntityLabelsAlloc(
+    allocator: std.mem.Allocator,
+    requested: ?[]const []const u8,
+    defaults: []const []const u8,
+    canonical_relation_labels: []const []const u8,
+) !?[]const []const u8 {
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer labels.deinit(allocator);
+
+    const seed = if (requested) |values|
+        if (values.len > 0) values else defaults
+    else
+        defaults;
+    for (seed) |label| try appendUniqueLabel(allocator, &labels, label);
+
+    for (canonical_relation_labels) |label| {
+        const first_separator = std.mem.indexOf(u8, label, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, label[0..first_separator]);
+        const remainder = label[first_separator + 2 ..];
+        const second_separator = std.mem.indexOf(u8, remainder, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, remainder[second_separator + 2 ..]);
+    }
+
+    if (labels.items.len == 0) {
+        labels.deinit(allocator);
+        return null;
+    }
+    return try labels.toOwnedSlice(allocator);
+}
+
+fn appendUniqueLabel(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged([]const u8),
+    candidate: []const u8,
+) !void {
+    for (labels.items) |label| {
+        if (std.ascii.eqlIgnoreCase(label, candidate)) return;
+    }
+    try labels.append(allocator, candidate);
 }
 
 fn isCanonicalLabelSegment(value: []const u8) bool {
@@ -11417,6 +11471,53 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
         else => inferenceFailureResponse(ctx, err),
     };
+}
+
+fn parseDirectTextExtractionInputs(
+    allocator: std.mem.Allocator,
+    inputs: []const extracting_api.Input,
+) !DirectExtractionInputs {
+    var out = DirectExtractionInputs{ .allocator = allocator };
+    errdefer out.deinit();
+    for (inputs) |input| try appendDirectTextExtractionContent(allocator, &out, input.content_json);
+    if (out.texts.items.len != inputs.len or out.texts.items.len == 0) return error.UnsupportedInput;
+    return out;
+}
+
+fn appendDirectTextExtractionContent(
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    content_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+
+    const text = switch (parsed.value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .array => |parts| blk: {
+            var text_buf = std.ArrayListUnmanaged(u8).empty;
+            defer text_buf.deinit(allocator);
+            var saw_text = false;
+            for (parts.items) |part| {
+                if (part != .object) continue;
+                const type_value = part.object.get("type") orelse continue;
+                if (type_value != .string) continue;
+                if (std.mem.eql(u8, type_value.string, "image_url") or
+                    std.mem.eql(u8, type_value.string, "media")) return error.UnsupportedInput;
+                if (!std.mem.eql(u8, type_value.string, "text")) continue;
+                const text_value = part.object.get("text") orelse continue;
+                if (text_value != .string) continue;
+                if (saw_text) try text_buf.append(allocator, '\n');
+                try text_buf.appendSlice(allocator, text_value.string);
+                saw_text = true;
+            }
+            if (!saw_text) return error.UnsupportedInput;
+            break :blk try allocator.dupe(u8, text_buf.items);
+        },
+        else => try std.json.Stringify.valueAlloc(allocator, parsed.value, .{}),
+    };
+    errdefer allocator.free(text);
+    try out.texts.append(allocator, text);
 }
 
 fn parseDirectExtractionInputs(
@@ -14330,6 +14431,47 @@ test "canonical relation schemas preserve endpoint label constraints" {
     );
 }
 
+test "relation entity labels merge defaults and canonical endpoint constraints" {
+    const defaults = [_][]const u8{ "person", "organization", "location" };
+    const canonical_relations = [_][]const u8{
+        "employee::works_at::company",
+        "company::located_in::location",
+        "knows",
+    };
+
+    const inferred = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(inferred);
+    const expected_inferred = [_][]const u8{ "person", "organization", "location", "employee", "company" };
+    try std.testing.expectEqual(expected_inferred.len, inferred.len);
+    for (&expected_inferred, inferred) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    const requested = [_][]const u8{"employee"};
+    const constrained = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        &requested,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(constrained);
+    const expected_constrained = [_][]const u8{ "employee", "company", "location" };
+    try std.testing.expectEqual(expected_constrained.len, constrained.len);
+    for (&expected_constrained, constrained) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    try std.testing.expect((try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &.{},
+        &.{"knows"},
+    )) == null);
+}
+
 test "canonical extraction operation routes every documented schema family" {
     const cases = [_]struct { json: []const u8, expected: CanonicalExtractionOperation }{
         .{ .json = "{\"entities\":[\"person\"]}", .expected = .entities_relations },
@@ -14382,6 +14524,98 @@ test "canonical extraction operation repeatedly rejects empty and mixed schemas 
     }
 }
 
+test "text extraction rejects media before fetch or model resolution" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]
+        ,
+    }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.UnsupportedInput, node.extractDirect(
+        std.testing.allocator,
+        "antflydb/gliner2-base-v1",
+        .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    var canonical_input = try std.json.parseFromSlice(extraction_api.ExtractionInput, std.testing.allocator,
+        \\{"content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}
+    , .{ .allocate = .alloc_always });
+    defer canonical_input.deinit();
+    const canonical_inputs = [_]extraction_api.ExtractionInput{canonical_input.value};
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        parseCanonicalTextInputs(std.testing.allocator, &canonical_inputs),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+}
+
+test "text extraction preserves multipart text as one input" {
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"text","text":"Grace Hopper"},{"type":"text","text":"built compilers."}]
+        ,
+    }};
+    var parsed = try parseDirectTextExtractionInputs(std.testing.allocator, &inputs);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.texts.items.len);
+    try std.testing.expectEqualStrings("Grace Hopper\nbuilt compilers.", parsed.texts.items[0]);
+}
+
+test "valid direct entity failures release admission and partial model state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/broken-gliner");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/config.json",
+        .data = "{\"model_type\":\"gliner2\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/gliner_config.json",
+        .data = "{\"model_type\":\"gliner2\",\"default_labels\":[\"person\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_concurrent_requests = 1,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper built compilers.\"" }};
+
+    resetRequestWorkTestCounters();
+    for (0..64) |_| {
+        var response = node.extractDirect(
+            allocator,
+            "owner/broken-gliner",
+            .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+        ) catch |err| {
+            try std.testing.expect(err != error.MissingExtractionOperation);
+            try std.testing.expect(err != error.MixedExtractionOperations);
+            try std.testing.expect(err != error.UnsupportedInput);
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+            continue;
+        };
+        defer response.deinit();
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 64), request_work_test_counters.model_resolution_attempts);
+}
+
 test "direct entity extraction response populates requested canonical fields" {
     const ner = @import("../pipelines/ner.zig");
     const entities = [_]ner.Entity{.{
@@ -14399,20 +14633,32 @@ test "direct entity extraction response populates requested canonical fields" {
         .include_spans = true,
         .input_ids = &input_ids,
     };
-    const json = try entityExtractionResponseJsonAlloc(
-        std.testing.allocator,
-        request,
-        &batches,
-        null,
-        &.{"Grace Hopper built compilers."},
-    );
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"doc-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"entities\":[{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"Grace Hopper\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"label\":\"person\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"start\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"score\":") != null);
+    for (0..64) |_| {
+        const json = try entityExtractionResponseJsonAlloc(
+            std.testing.allocator,
+            request,
+            &batches,
+            null,
+            &.{"Grace Hopper built compilers."},
+        );
+        defer std.testing.allocator.free(json);
+        try ant_json.testing.expectSubsetJsonText(std.testing.allocator,
+            \\{
+            \\  "object": "extraction",
+            \\  "model": "antflydb/gliner2-base-v1",
+            \\  "data": [{
+            \\    "id": "doc-1",
+            \\    "entities": [{
+            \\      "text": "Grace Hopper",
+            \\      "label": "person",
+            \\      "start": 0,
+            \\      "end": 12,
+            \\      "score": 0.8889999985694885
+            \\    }]
+            \\  }]
+            \\}
+        , json);
+    }
 }
 
 test "canonical structure schemas preserve field types and choices" {

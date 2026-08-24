@@ -289,6 +289,7 @@ pub fn create(config: Config) Graph {
     });
     addInferenceRootImports(inference_mod, .{
         .build_options_mod = build_options_mod,
+        .json_mod = json_mod,
         .httpx_mod = httpx_mod,
         .inference_api_mod = inference_api_mod,
         .inference_audio_mod = inference_audio_mod,
@@ -400,6 +401,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
 
 const InferenceRootImports = struct {
     build_options_mod: *std.Build.Module,
+    json_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
     inference_audio_mod: *std.Build.Module,
@@ -425,6 +427,7 @@ const InferenceRootImports = struct {
 
 pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
     module.addImport("build_options", imports.build_options_mod);
+    module.addImport("antfly-json", imports.json_mod);
     module.addImport("httpx", imports.httpx_mod);
     module.addImport("inference_api", imports.inference_api_mod);
     module.addImport("inference_audio", imports.inference_audio_mod);
