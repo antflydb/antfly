@@ -2090,7 +2090,12 @@ pub fn runFromIterator(
     defer if (kernel_session_backend) |*store| store.deinit();
     defer if (kernel_restore_job_backend) |*store| store.deinit();
     if (comptime storage_kernel_experiment) {
-        restore_job_store = if (kernel_restore_job_backend) |*store| store else null;
+        restore_job_store = if (kernel_restore_job_backend) |*store|
+            store
+        else if (local_restore_job_store) |*store|
+            store
+        else
+            null;
     }
     var lite_session_store = if (comptime storage_kernel_experiment)
         if (kernel_session_backend) |*store|
@@ -2374,6 +2379,8 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
+    if (comptime storage_kernel_experiment)
+        try storage_kernel_context.attachInferenceProvider(antfly_node);
     data_server.setAntflyProvider(inferenceBoundaryProvider(antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.

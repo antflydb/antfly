@@ -205,6 +205,12 @@ fn parseBatchRequestWithOptions(
         break :timestamp try parseInternalU64(value);
     };
 
+    const reject_graph_transform_projections = reject: {
+        const value = root.get("_reject_graph_transform_projections") orelse break :reject false;
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :reject value.bool;
+    };
+
     var checkpoint_start: ?[]u8 = null;
     errdefer if (checkpoint_start) |value| alloc.free(value);
     var checkpoint_end: ?[]u8 = null;
@@ -443,6 +449,7 @@ fn parseBatchRequestWithOptions(
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
+            .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .split_transition = split_transition,
@@ -598,6 +605,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     }
     if (req.timestamp_ns != 0) {
         try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
+    }
+    if (req.reject_graph_transform_projections) {
+        try writer.writeAll(",\"_reject_graph_transform_projections\":true");
     }
     if (req.transaction) |mutation| {
         try writer.writeAll(",\"_transaction\":{");
@@ -800,7 +810,7 @@ fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.ty
     const transforms = try alloc.alloc(db_mod.types.DocumentTransform, values.len);
     var initialized: usize = 0;
     errdefer {
-        freeTransforms(alloc, transforms[0..initialized]);
+        freeTransformElements(alloc, transforms[0..initialized]);
         alloc.free(transforms);
     }
 
@@ -902,6 +912,11 @@ fn freeDeletes(alloc: std.mem.Allocator, deletes: [][]const u8) void {
 }
 
 fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
+    freeTransformElements(alloc, transforms);
+    if (transforms.len > 0) alloc.free(transforms);
+}
+
+fn freeTransformElements(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
     for (transforms) |transform| {
         alloc.free(@constCast(transform.key));
         freeTransformOps(alloc, transform.operations);
@@ -1062,6 +1077,27 @@ test "internal batch codec preserves timestamps and rejects public injection" {
             \\{"inserts":{},"_timestamp_ns":"123"}
         ),
     );
+}
+
+test "internal batch codec preserves graph transform projection rejection" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeBatchRequest(alloc, .{
+        .transforms = &.{.{
+            .key = "doc:a",
+            .operations = &.{.{
+                .op = .push,
+                .path = "$._edges.graph_idx.knows",
+                .value_json = "{\"target\":\"doc:b\"}",
+            }},
+        }},
+        .reject_graph_transform_projections = true,
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var decoded = try parseInternalBatchRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.req.reject_graph_transform_projections);
 }
 
 test "internal batch parser rejects public split replication identity" {

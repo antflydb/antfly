@@ -42,6 +42,7 @@ const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
+const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
@@ -55,6 +56,7 @@ const index_manager_mod = if (control_only_storage_sources) struct {} else @impo
 const text_analysis_config = @import("../storage/db/text_analysis_config.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const reranking_runtime = @import("../reranking/mod.zig");
@@ -3218,7 +3220,10 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         const start_ns = platform_time.monotonicNs();
-        if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
+        if (group_ids.len == 1 and
+            !distributed_graph.supportsCrossRange(req) and
+            !queryRequiresCoordinatorFinalization(req))
+        {
             return self.groupLocalSource().queryGroupLocal(alloc, group_ids[0], table_name, req, self.localReadConsistency(consistency)) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -3308,6 +3313,14 @@ pub const ProvisionedTableReadSource = struct {
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
+    }
+
+    /// These response stages depend on process-runtime capabilities or
+    /// distributed aggregation state and therefore remain coordinator-owned.
+    /// Even a one-shard compiled storage query must return its raw SearchResult
+    /// through the coarse ABI before these stages run.
+    fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
+        return req.reranker != null or req.aggregations_json.len > 0;
     }
 
     fn preflightQuery(
@@ -3942,7 +3955,7 @@ pub const ProvisionedTableReadSource = struct {
     }
 };
 
-fn freeObservedDynamicFieldCapabilitySets(
+pub fn freeObservedDynamicFieldCapabilitySets(
     alloc: std.mem.Allocator,
     sets: []ObservedDynamicFieldCapabilitySet,
 ) void {
@@ -3958,7 +3971,7 @@ fn freeObservedDynamicFieldCapabilitySetsFromList(
     sets.deinit(alloc);
 }
 
-fn mergeObservedDynamicFieldCapabilitySet(
+pub fn mergeObservedDynamicFieldCapabilitySet(
     alloc: std.mem.Allocator,
     merged: *std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet),
     incoming: ObservedDynamicFieldCapabilitySet,
@@ -16894,6 +16907,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var first = true;
+    const has_named_embeddings = req.dense_queries.len > 0 or req.sparse_queries.len > 0;
 
     if (!req.include_all_fields and
         (req.fields.len > 0 or
@@ -16925,10 +16939,17 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
     }
     if (req.index_name) |index_name| {
-        if (req.full_text != null or req.dense != null or req.sparse != null) {
+        if (!has_named_embeddings and (req.full_text != null or req.dense != null or req.sparse != null)) {
             const index_names = [_][]const u8{index_name};
             try appendJsonFieldNames(alloc, &out, &first, "indexes", &index_names);
         }
+    }
+    if (req.primary_text_index_name orelse if (req.full_text != null or req.filter_text != null or req.exclusion_text != null)
+        req.index_name
+    else
+        null) |index_name|
+    {
+        try appendJsonFieldString(alloc, &out, &first, "_primary_text_index_name", index_name);
     }
     if (req.filter_prefix.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "filter_prefix", req.filter_prefix);
@@ -17131,6 +17152,27 @@ pub const StorageKernelPreflightWireRequest = struct {
     query_json: []const u8,
     max_work: u32 = 0,
 };
+
+/// Coarse, JSON-owned representation of the dynamic-field observation
+/// selector. Deadline and cancellation controls travel in the surrounding
+/// compiled-owner ABI request so process-local callback state never enters the
+/// wire document.
+pub const StorageKernelDynamicFieldObservationWireRequest = struct {
+    index_name: ?[]const u8 = null,
+    fields: []const []const u8 = &.{},
+    coverage_read_mode: dynamic_field_capability.CoverageReadMode = .cached_only,
+};
+
+pub fn encodeStorageKernelDynamicFieldObservationRequest(
+    alloc: std.mem.Allocator,
+    observation: DynamicFieldObservationQuery,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelDynamicFieldObservationWireRequest{
+        .index_name = observation.index_name,
+        .fields = observation.fields,
+        .coverage_read_mode = observation.coverage_read_mode,
+    }, .{});
+}
 
 pub fn encodeStorageKernelPreflightRequest(
     alloc: std.mem.Allocator,
@@ -17453,6 +17495,90 @@ fn appendGraphQueryValue(
         try appendGraphNodeSelectorField(alloc, out, &first, "target_nodes", target_nodes);
     }
     try appendGraphQueryParamsField(alloc, out, &first, query.params, query.k);
+    if (query.pattern.len > 0) {
+        try appendGraphPatternField(alloc, out, &first, query.pattern);
+    }
+    if (query.return_aliases.len > 0) {
+        try appendJsonFieldNames(alloc, out, &first, "return_aliases", query.return_aliases);
+    }
+    if (query.include_documents) {
+        try appendJsonFieldBool(alloc, out, &first, "include_documents", true);
+    }
+    if (!query.include_all_fields) {
+        try appendJsonFieldNames(alloc, out, &first, "fields", query.fields);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGraphPatternField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    pattern: []const graph_pattern_mod.PatternStep,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "pattern");
+    try out.append(alloc, '[');
+    for (pattern, 0..) |step, index| {
+        if (index > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var step_first = true;
+        if (step.alias.len > 0) {
+            try appendJsonFieldString(alloc, out, &step_first, "alias", step.alias);
+        }
+        try appendGraphNodeFilterField(alloc, out, &step_first, step.node_filter);
+        // The first pattern step selects the starting node. Every subsequent
+        // step carries the edge used to reach it, including an all-default
+        // edge, which is semantically distinct from omitting the pattern.
+        if (index > 0) {
+            try appendJsonFieldName(alloc, out, &step_first, "edge");
+            try out.append(alloc, '{');
+            var edge_first = true;
+            if (step.edge.types.len > 0) {
+                try appendJsonFieldNames(alloc, out, &edge_first, "types", step.edge.types);
+            }
+            if (step.edge.direction != .out) {
+                try appendJsonFieldString(alloc, out, &edge_first, "direction", switch (step.edge.direction) {
+                    .out => "out",
+                    .in => "in",
+                    .both => "both",
+                });
+            }
+            if (step.edge.min_hops != 1) {
+                try appendJsonFieldU32(alloc, out, &edge_first, "min_hops", step.edge.min_hops);
+            }
+            if (step.edge.max_hops != 1) {
+                try appendJsonFieldU32(alloc, out, &edge_first, "max_hops", step.edge.max_hops);
+            }
+            if (step.edge.min_weight != 0) {
+                try appendJsonFieldF64(alloc, out, &edge_first, "min_weight", step.edge.min_weight);
+            }
+            if (step.edge.max_weight != 0) {
+                try appendJsonFieldF64(alloc, out, &edge_first, "max_weight", step.edge.max_weight);
+            }
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendGraphNodeFilterField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    filter: graph_pattern_mod.NodeFilter,
+) !void {
+    if (filter.filter_prefix.len == 0 and filter.filter_query_json == null) return;
+    try appendJsonFieldName(alloc, out, first, "node_filter");
+    try out.append(alloc, '{');
+    var filter_first = true;
+    if (filter.filter_prefix.len > 0) {
+        try appendJsonFieldString(alloc, out, &filter_first, "filter_prefix", filter.filter_prefix);
+    }
+    if (filter.filter_query_json) |filter_query_json| {
+        try appendJsonFieldName(alloc, out, &filter_first, "filter_query");
+        try out.appendSlice(alloc, filter_query_json);
+    }
     try out.append(alloc, '}');
 }
 
@@ -17511,6 +17637,7 @@ fn appendGraphQueryParamsField(
         .min_weight => "min_weight",
         .max_weight => "max_weight",
     });
+    try appendGraphNodeFilterField(alloc, out, &params_first, params.node_filter);
     if (k > 1) try appendJsonFieldU32(alloc, out, &params_first, "k", k);
     try out.append(alloc, '}');
 }
@@ -20461,6 +20588,20 @@ test "provisioned table read source managed runtime config carries inference url
     try std.testing.expect(runtime_cfg.remote_content == null);
 }
 
+test "provisioned single-group queries retain coordinator-owned finalization" {
+    try std.testing.expect(!ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{}));
+    try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+        .aggregations_json = "{}",
+    }));
+    try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+        .reranker = .{
+            .provider = .antfly,
+            .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            .field = "content",
+        },
+    }));
+}
+
 test "provisioned query delegates single-group physical execution to local read source" {
     const alloc = std.testing.allocator;
 
@@ -22222,6 +22363,38 @@ test "storage-kernel query request encodes singleton vector index identity" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, parsed.req.dense_queries[0].query.vector);
 }
 
+test "storage-kernel query wire round trips graph-only requests" {
+    const alloc = std.testing.allocator;
+    var original = try query_api.parseQueryRequest(alloc, null, "docs",
+        \\{"graph_searches":{"parent":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites","related"],"node_filter":{"filter_prefix":"doc:"}},"pattern":[{"alias":"child"},{"alias":"parent","edge":{"types":["child_of"],"direction":"in","min_hops":1,"max_hops":2}}],"return_aliases":["parent"],"include_documents":true,"fields":["title"]}},"limit":10}
+    );
+    defer original.deinit(alloc);
+    const encoded = try encodeStorageKernelQueryRequest(alloc, original.req);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pattern\"") != null);
+    var round_tripped = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer round_tripped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), round_tripped.req.graph_queries.len);
+    try std.testing.expectEqualStrings("parent", round_tripped.req.graph_queries[0].name);
+    const query = round_tripped.req.graph_queries[0].query;
+    try std.testing.expectEqual(graph_query_mod.QueryType.pattern, query.query_type);
+    try std.testing.expectEqual(@as(usize, 2), query.pattern.len);
+    try std.testing.expectEqualStrings("parent", query.pattern[1].alias);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, query.pattern[1].edge.direction);
+    try std.testing.expectEqual(@as(u32, 2), query.pattern[1].edge.max_hops);
+    try std.testing.expectEqualStrings("child_of", query.pattern[1].edge.types[0]);
+    try std.testing.expectEqualStrings("doc:", query.params.node_filter.filter_prefix);
+    try std.testing.expectEqualStrings("parent", query.return_aliases[0]);
+    try std.testing.expect(query.include_documents);
+    try std.testing.expect(!query.include_all_fields);
+    try std.testing.expectEqualStrings("title", query.fields[0]);
+}
+
+test "provisioned reads advertise owner-backed physical sort evidence" {
+    var source: ProvisionedTableReadSource = undefined;
+    try std.testing.expect(source.source().supportsObservedDynamicFieldCapabilitySets());
+}
+
 test "encode query request round-trips all public phrase geo and ip queries" {
     const alloc = std.testing.allocator;
     const phrase_terms = [_][]const u8{ "quick", "fox" };
@@ -22540,6 +22713,9 @@ test "encode query request includes named vector embeddings for routed semantic 
     const alloc = std.testing.allocator;
 
     const encoded = try encodeQueryRequest(alloc, .{
+        .index_name = "full_text_index_v0",
+        .primary_text_index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "content", .text = "retrieval search" } },
         .dense_queries = &.{
             .{
                 .name = "semantic_idx",
@@ -22567,6 +22743,11 @@ test "encode query request includes named vector embeddings for routed semantic 
 
     var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
     defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("indexes") == null);
+    try std.testing.expectEqualStrings(
+        "full_text_index_v0",
+        parsed.value.object.get("_primary_text_index_name").?.string,
+    );
     const embeddings = parsed.value.object.get("embeddings").?.object;
     const dense = embeddings.get("semantic_idx").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), dense.len);
@@ -22577,6 +22758,15 @@ test "encode query request includes named vector embeddings for routed semantic 
     try std.testing.expectEqual(@as(i64, 7), sparse.get("indices").?.array.items[1].integer);
     try std.testing.expectEqual(@as(f64, 0.4), sparse.get("values").?.array.items[0].float);
     try std.testing.expectEqual(@as(f64, 0.9), sparse.get("values").?.array.items[1].float);
+
+    var round_trip = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer round_trip.deinit(alloc);
+    try std.testing.expectEqualStrings("full_text_index_v0", round_trip.req.primary_text_index_name.?);
+    try std.testing.expect(round_trip.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 1), round_trip.req.dense_queries.len);
+    try std.testing.expectEqualStrings("semantic_idx", round_trip.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(usize, 1), round_trip.req.sparse_queries.len);
+    try std.testing.expectEqualStrings("sparse_idx", round_trip.req.sparse_queries[0].index_name);
 }
 
 test "encode query request includes merge config and pruner but omits reranker" {

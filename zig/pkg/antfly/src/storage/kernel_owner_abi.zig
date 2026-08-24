@@ -55,6 +55,16 @@ pub const VersionedOwnedBytes = extern struct {
     version: u64 = 0,
 };
 
+/// Provider-owned encoded query response plus the exact storage snapshot
+/// generation used to produce it. The generation is transport metadata, not
+/// part of the public JSON representation.
+pub const QueryOwnedResponse = extern struct {
+    buffer: OwnedBytes = .{},
+    identity_read_generation: u64 = 0,
+    has_identity_read_generation: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+};
+
 /// The WAL boundary owns the physical ordered store in the storage archive.
 /// Control units retain only this opaque handle and cross once per logical
 /// durable log operation; backend transactions and LSM records never cross.
@@ -1218,6 +1228,13 @@ pub extern fn antfly_storage_context_create(
 /// is idempotent and succeeds.
 pub extern fn antfly_storage_context_destroy(context: ?*anyopaque) callconv(.c) Status;
 
+/// Attaches the process inference runtime borrowed by storage-owned managed
+/// enrichment workers. Attachment is allowed only before table owners open.
+pub extern fn antfly_storage_context_attach_inference_provider(
+    context: ?*anyopaque,
+    inference_handle: ?*anyopaque,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
     out_result: *ContextMetricsResult,
@@ -1556,7 +1573,7 @@ pub extern fn antfly_storage_snapshot_destroy(snapshot: ?*anyopaque) callconv(.c
 pub extern fn antfly_storage_owner_query_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
-    out_response: *OwnedBytes,
+    out_response: *QueryOwnedResponse,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
@@ -1644,6 +1661,15 @@ pub extern fn antfly_storage_owner_artifact_operation_json(
 pub extern fn antfly_storage_owner_runtime_status_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Returns the owner DB's cached or validated dynamic-field capability sets.
+/// The response is provider-owned JSON and must be released with the normal
+/// owner response destroy operation.
+pub extern fn antfly_storage_owner_observed_dynamic_field_capability_sets_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
@@ -1736,7 +1762,7 @@ pub extern fn antfly_enrichment_buffer_destroy(buffer: *OwnedBytes) callconv(.c)
 
 pub extern fn antfly_local_query_execute(
     request: *const LocalQueryRequest,
-    out_response: *OwnedBytes,
+    out_response: *QueryOwnedResponse,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 

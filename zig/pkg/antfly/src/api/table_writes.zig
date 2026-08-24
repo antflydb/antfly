@@ -24172,9 +24172,21 @@ pub fn configureStorageKernelOwnerDb(
     db: *db_mod.DB,
     schema_json: []const u8,
     indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
 ) !void {
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {
+        if (backend_runtime != null) try reconfigureManagedDbEnrichmentRuntime(
+            alloc,
+            db,
+            indexes_json,
+            backend_runtime,
+            antfly_provider,
+            null,
+            null,
+            null,
+        );
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
         });
@@ -24224,7 +24236,7 @@ pub fn repairStorageKernelRestoreDb(
     schema_json: []const u8,
     indexes_json: []const u8,
 ) !void {
-    try configureStorageKernelOwnerDb(alloc, db, schema_json, indexes_json);
+    try configureStorageKernelOwnerDb(alloc, db, schema_json, indexes_json, null, null);
     const timeout_ns = 30 * std.time.ns_per_s;
     const start_ns = platform_time.monotonicNs();
     var attempts: usize = 0;
@@ -24290,8 +24302,20 @@ pub fn reconcileStorageKernelOwnerDb(
     indexes_json: []const u8,
     target_index_name: ?[]const u8,
     advance_index_repair: bool,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
 ) !StorageKernelReconcileResult {
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    if (indexes_json.len > 0 and backend_runtime != null) try reconfigureManagedDbEnrichmentRuntime(
+        alloc,
+        db,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        null,
+        null,
+        null,
+    );
     const provisioned = if (indexes_json.len > 0)
         try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,

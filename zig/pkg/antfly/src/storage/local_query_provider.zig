@@ -28,7 +28,7 @@ const distributed_graph = @import("../api/distributed_graph.zig");
 
 pub fn execute(
     request: *const abi.LocalQueryRequest,
-    out_response: *abi.OwnedBytes,
+    out_response: *abi.QueryOwnedResponse,
     out_failure: *abi.FailureIdentity,
 ) callconv(.c) abi.Status {
     out_response.* = .{};
@@ -43,12 +43,12 @@ pub fn execute(
 
     return switch (request.kind) {
         .search => executeSearch(request, db, table_name, out_response, out_failure),
-        .graph_expand => executeGraphExpand(request, db, table_name, out_response, out_failure),
-        .graph_hydrate => executeGraphHydrate(request, db, out_response, out_failure),
-        .graph_edges => executeGraphEdges(request, db, out_response, out_failure),
-        .text_stats => executeTextStats(request, db, table_name, out_response, out_failure),
-        .algebraic_partials => executeAlgebraicPartials(request, db, out_response, out_failure),
-        .preflight => executePreflight(request, db, table_name, out_response, out_failure),
+        .graph_expand => executeGraphExpand(request, db, table_name, &out_response.buffer, out_failure),
+        .graph_hydrate => executeGraphHydrate(request, db, &out_response.buffer, out_failure),
+        .graph_edges => executeGraphEdges(request, db, &out_response.buffer, out_failure),
+        .text_stats => executeTextStats(request, db, table_name, &out_response.buffer, out_failure),
+        .algebraic_partials => executeAlgebraicPartials(request, db, &out_response.buffer, out_failure),
+        .preflight => executePreflight(request, db, table_name, &out_response.buffer, out_failure),
     };
 }
 
@@ -56,7 +56,7 @@ fn executeSearch(
     request: *const abi.LocalQueryRequest,
     db: *db_mod.DB,
     table_name: []const u8,
-    out_response: *abi.OwnedBytes,
+    out_response: *abi.QueryOwnedResponse,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     const alloc = std.heap.c_allocator;
@@ -117,7 +117,11 @@ fn executeSearch(
 
     const bytes = alloc.dupe(u8, response.json) catch |err|
         return fail(err, encodeOperation(request.dialect), out_failure);
-    out_response.* = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) };
+    out_response.* = .{
+        .buffer = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) },
+        .identity_read_generation = response.identity_read_generation orelse 0,
+        .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
+    };
     return .ok;
 }
 

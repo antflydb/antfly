@@ -70,6 +70,8 @@ const backups_api = antfly.public_api.backups;
 const backup_restore = antfly.raft.storage.backup_restore;
 const common_config = antfly.common_config;
 const common_secrets = antfly.common_secrets;
+const inference_provider_client = @import("../storage/inference_provider_client.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
 const raft_catalog = antfly.raft_catalog;
 const Allocator = std.mem.Allocator;
 
@@ -78,6 +80,8 @@ const lite_abi_version: u32 = 1;
 const StorageOwnerContext = struct {
     alloc: Allocator,
     resources: antfly.public_api.provisioned_storage.PhysicalStorageResources,
+    backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
+    inference_handle: ?*anyopaque = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -85,10 +89,13 @@ const StorageOwnerContext = struct {
     mutex: std.atomic.Mutex = .unlocked,
     active_owners: usize = 0,
 
-    fn init(alloc: Allocator) StorageOwnerContext {
+    fn init(alloc: Allocator) !StorageOwnerContext {
+        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+        errdefer backend_runtime.deinit();
         return .{
             .alloc = alloc,
             .resources = .init(alloc),
+            .backend_runtime = backend_runtime,
         };
     }
 
@@ -109,6 +116,10 @@ const StorageOwnerContext = struct {
         self.active_owners -= 1;
     }
 
+    fn antflyProvider(self: *StorageOwnerContext) ?managed_embedder.AntflyProvider {
+        return inference_provider_client.provider(self.inference_handle orelse return null);
+    }
+
     fn deinitIfIdle(self: *StorageOwnerContext) bool {
         self.lock();
         if (self.active_owners != 0) {
@@ -120,6 +131,7 @@ const StorageOwnerContext = struct {
         if (self.auth_users_store) |*store| store.deinit();
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
+        self.backend_runtime.deinit();
         self.resources.deinit();
         const alloc = self.alloc;
         self.* = undefined;
@@ -482,7 +494,7 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
         defer handle.alloc.free(request_json);
         var failure: kernel_owner_abi.FailureIdentity = .{};
         var cancellation = req.cancellation;
-        const response_json = try local_query_client.executeJsonAlloc(
+        const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
             @ptrCast(&handle.db),
             "docs",
@@ -506,12 +518,12 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
             if (cancellation != null) cancellationTokenRequested else null,
             &failure,
         );
-        defer handle.alloc.free(response_json);
-        var result = table_reads_api.parseStorageKernelSearchResult(handle.alloc, response_json) catch |err| {
+        defer handle.alloc.free(response.json);
+        var result = table_reads_api.parseStorageKernelSearchResult(handle.alloc, response.json) catch |err| {
             std.log.err("local query returned an invalid response wire error={s}", .{@errorName(err)});
             return error.InvalidBoundaryQueryResponse;
         };
-        result.identity_read_generation = req.identity_read_generation;
+        result.identity_read_generation = response.identity_read_generation;
         return result;
     }
     return try handle.db.search(handle.alloc, req);
@@ -2006,7 +2018,8 @@ pub fn storageOwnerContextCreate(
     const alloc = std.heap.c_allocator;
     const context = alloc.create(StorageOwnerContext) catch return .out_of_memory;
     errdefer alloc.destroy(context);
-    context.* = StorageOwnerContext.init(alloc);
+    context.* = StorageOwnerContext.init(alloc) catch |err| return storageOwnerStatusFromError(err);
+    errdefer context.backend_runtime.deinit();
     errdefer context.resources.deinit();
     context.resources.attachResourceManager();
     switch (request.storage_kind) {
@@ -2043,6 +2056,19 @@ pub fn storageOwnerContextCreate(
 pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     const owner_context = asStorageOwnerContext(context) orelse return .ok;
     return if (owner_context.deinitIfIdle()) .ok else .busy;
+}
+
+pub fn storageContextAttachInferenceProvider(
+    context: ?*anyopaque,
+    inference_handle: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const handle = inference_handle orelse return .invalid_argument;
+    owner_context.lock();
+    defer owner_context.mutex.unlock();
+    if (owner_context.active_owners != 0) return .busy;
+    owner_context.inference_handle = handle;
+    return .ok;
 }
 
 fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.ContextCacheKindStats {
@@ -3723,6 +3749,7 @@ pub fn storageOwnerOpen(
         .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
         .lsm_root_generation = request.lsm_root_generation,
         .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
+        .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
@@ -3737,6 +3764,8 @@ pub fn storageOwnerOpen(
         &db,
         request.schema_json.slice(),
         request.indexes_json.slice(),
+        if (owner_context) |context| context.backend_runtime.ptr() else null,
+        if (owner_context) |context| context.antflyProvider() else null,
     ) catch |err| return storageOwnerStatusFromError(err);
     const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
     errdefer alloc.free(owned_path);
@@ -3773,7 +3802,15 @@ pub fn storageOwnerConfigure(
         &handle.db,
         request.schema_json.slice(),
         request.indexes_json.slice(),
-    ) catch |err| return storageOwnerStatusFromError(err);
+        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+    ) catch |err| {
+        std.log.err("storage owner configure failed table={s} err={s}", .{
+            handle.storage_owner_table_name orelse "",
+            @errorName(err),
+        });
+        return storageOwnerStatusFromError(err);
+    };
     return .ok;
 }
 
@@ -3793,6 +3830,8 @@ pub fn storageOwnerReconcile(
         request.indexes_json.slice(),
         if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
         request.advance_index_repair != 0,
+        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
     ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
         .state = switch (reconciled.state) {
@@ -4544,6 +4583,8 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
         &db,
         request.schema_json.slice(),
         request.indexes_json.slice(),
+        null,
+        null,
     );
 
     var parsed_schema: ?tables_api.ParsedTableSchema = null;
@@ -4705,7 +4746,7 @@ fn replicatedBatchStorageKernelJson(
 pub fn storageOwnerQueryJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
-    out_response: *kernel_owner_abi.OwnedBytes,
+    out_response: *kernel_owner_abi.QueryOwnedResponse,
     out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
@@ -4716,7 +4757,6 @@ pub fn storageOwnerQueryJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerOperationTableName(handle, request) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    var response: capi.Buffer = .{};
     const request_slice: capi.Slice = .{
         .ptr = request.request_json.ptr,
         .len = @intCast(request.request_json.len),
@@ -4725,15 +4765,10 @@ pub fn storageOwnerQueryJson(
         handle,
         table_name,
         request_slice,
-        &response,
+        out_response,
         out_failure,
     );
-    if (status != .ok) return status;
-    out_response.* = .{
-        .ptr = response.ptr,
-        .len = @intCast(response.len),
-    };
-    return .ok;
+    return status;
 }
 
 pub fn storageOwnerLookupJson(
@@ -5329,6 +5364,56 @@ pub fn storageOwnerRuntimeStatusJson(
         .ptr = response.ptr,
         .len = @intCast(response.len),
     };
+    return .ok;
+}
+
+const StorageOwnerObservationCancellation = struct {
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+
+    fn requested(ptr: *const anyopaque) bool {
+        const self: *const StorageOwnerObservationCancellation = @ptrCast(@alignCast(ptr));
+        const callback = self.request.cancellation_fn orelse return false;
+        return callback(self.request.cancellation_ctx) != 0;
+    }
+};
+
+pub fn storageOwnerObservedDynamicFieldCapabilitySetsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDynamicFieldObservationWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var cancellation = StorageOwnerObservationCancellation{ .request = request };
+    const observation: table_reads_api.DynamicFieldObservationQuery = .{
+        .index_name = parsed.value.index_name,
+        .fields = parsed.value.fields,
+        .coverage_read_mode = parsed.value.coverage_read_mode,
+        .execution_deadline_ns = if (request.has_execution_deadline != 0)
+            request.execution_deadline_ns
+        else
+            null,
+        .cancellation = if (request.cancellation_fn != null) .{
+            .ptr = &cancellation,
+            .is_cancelled_fn = StorageOwnerObservationCancellation.requested,
+        } else null,
+    };
+    const sets = handle.db.observedDynamicFieldCapabilitySetsAlloc(handle.alloc, observation) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer table_reads_api.freeObservedDynamicFieldCapabilitySets(handle.alloc, sets);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, sets, .{}) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }
 
@@ -7752,7 +7837,7 @@ fn searchStorageKernelQueryJson(
     handle: *Handle,
     table_name: []const u8,
     request_json: capi.Slice,
-    out_buf: *capi.Buffer,
+    out_response: *kernel_owner_abi.QueryOwnedResponse,
     out_failure: *kernel_owner_abi.FailureIdentity,
 ) kernel_owner_abi.Status {
     out_failure.* = .{};
@@ -7776,7 +7861,11 @@ fn searchStorageKernelQueryJson(
             if (out_failure.status != .ok) return out_failure.status;
             return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
         };
-        out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+        out_response.* = .{
+            .buffer = .{ .ptr = response.json.ptr, .len = @intCast(response.json.len) },
+            .identity_read_generation = response.identity_read_generation orelse 0,
+            .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
+        };
         return .ok;
     }
 
@@ -7809,8 +7898,13 @@ fn searchStorageKernelQueryJson(
     ) catch |err| return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     defer response.deinit(handle.alloc);
 
-    out_buf.* = dupBytes(response.json) catch |err|
+    const buffer = dupBytes(response.json) catch |err|
         return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
+    out_response.* = .{
+        .buffer = .{ .ptr = buffer.ptr, .len = @intCast(buffer.len) },
+        .identity_read_generation = response.identity_read_generation orelse 0,
+        .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
+    };
     return .ok;
 }
 
@@ -7848,7 +7942,7 @@ fn searchPublicQueryJson(
             null,
             &failure,
         ) catch |err| return capi.mapError(err);
-        out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+        out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
         return .ok;
     }
 

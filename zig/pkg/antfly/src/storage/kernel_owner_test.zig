@@ -323,6 +323,16 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer status_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, status_response.bytes(), "\"source_doc_count\":2") != null);
 
+    var observed_response = try owner.observedDynamicFieldCapabilitySetsJson(
+        "docs",
+        "{\"fields\":[],\"coverage_read_mode\":\"cached_only\"}",
+        null,
+        null,
+        null,
+    );
+    defer observed_response.deinit();
+    try std.testing.expectEqualStrings("[]", observed_response.bytes());
+
     const maintenance = try owner.maintenance("docs", .inspect);
     try std.testing.expectEqual(abi.abi_version, maintenance.version);
     try std.testing.expectEqual(@as(u8, 0), maintenance.progressed);
@@ -386,7 +396,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a
     // broad failure after the inner provider unwinds.
-    var invalid_query_response: abi.OwnedBytes = .{};
+    var invalid_query_response: abi.QueryOwnedResponse = .{};
     var invalid_query_failure: abi.FailureIdentity = .{};
     const invalid_query_status = abi.antfly_storage_owner_query_json(
         owner.handle,
@@ -407,9 +417,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
     try std.testing.expect(invalid_query_failure.error_name_hash != 0);
-    try std.testing.expectEqual(@as(usize, 0), invalid_query_response.len);
+    try std.testing.expectEqual(@as(u64, 0), invalid_query_response.buffer.len);
 
-    var invalid_abi_response: abi.OwnedBytes = .{};
+    var invalid_abi_response: abi.QueryOwnedResponse = .{};
     var invalid_abi_failure: abi.FailureIdentity = .{};
     var invalid_abi_request = abi.LocalQueryRequest{};
     invalid_abi_request.version = abi.abi_version - 1;
@@ -510,6 +520,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
 
     var query_response = try owner.queryJson("docs", query_json);
     defer query_response.deinit();
+    try std.testing.expect(query_response.identityReadGeneration() != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
@@ -1063,6 +1074,15 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_context_attach_inference_provider(context, null),
+    );
+    const fake_inference_handle: *anyopaque = @ptrFromInt(@alignOf(usize));
+    try std.testing.expectEqual(
+        abi.Status.ok,
+        abi.antfly_storage_context_attach_inference_provider(context, fake_inference_handle),
+    );
 
     var first = try client.Owner.open(.{
         .context = context,
@@ -1074,6 +1094,10 @@ test "opaque storage context enforces owner lifetime and shares process storage 
         .path = .fromSlice(second_path),
         .table_name = .fromSlice("second"),
     });
+    try std.testing.expectEqual(
+        abi.Status.busy,
+        abi.antfly_storage_context_attach_inference_provider(context, fake_inference_handle),
+    );
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context));
 
     first.deinit();

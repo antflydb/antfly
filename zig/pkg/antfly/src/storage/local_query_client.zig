@@ -18,6 +18,11 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 
+pub const QueryResponse = struct {
+    json: []u8,
+    identity_read_generation: ?u64,
+};
+
 pub fn executeJsonAlloc(
     alloc: std.mem.Allocator,
     db: *anyopaque,
@@ -28,7 +33,7 @@ pub fn executeJsonAlloc(
     cancellation_ctx: ?*anyopaque,
     cancellation_fn: ?abi.CancellationCheckFn,
     out_failure: *abi.FailureIdentity,
-) ![]u8 {
+) !QueryResponse {
     return executeAlloc(alloc, .{
         .dialect = dialect,
         .kind = .search,
@@ -53,7 +58,7 @@ pub fn executeControlledJsonAlloc(
     out_failure: *abi.FailureIdentity,
 ) ![]u8 {
     std.debug.assert(kind != .search);
-    return executeAlloc(alloc, .{
+    const response = try executeAlloc(alloc, .{
         .kind = kind,
         .db = db,
         .table_name = .fromSlice(table_name),
@@ -63,6 +68,7 @@ pub fn executeControlledJsonAlloc(
         .cancellation_ctx = cancellation_ctx,
         .cancellation_fn = cancellation_fn,
     }, validationOperation(kind), out_failure);
+    return response.json;
 }
 
 fn executeAlloc(
@@ -70,10 +76,10 @@ fn executeAlloc(
     request: abi.LocalQueryRequest,
     validation_operation: abi.LocalQueryOperation,
     out_failure: *abi.FailureIdentity,
-) ![]u8 {
+) !QueryResponse {
     out_failure.* = .{};
-    var provider_response: abi.OwnedBytes = .{};
-    defer abi.antfly_local_query_buffer_destroy(&provider_response);
+    var provider_response: abi.QueryOwnedResponse = .{};
+    defer abi.antfly_local_query_buffer_destroy(&provider_response.buffer);
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_local_query_execute(&request, &provider_response, &failure);
     try acceptProviderFailure(status, failure, validation_operation, out_failure);
@@ -81,7 +87,13 @@ fn executeAlloc(
         logProviderFailure("local query", failure);
         return err;
     };
-    return try alloc.dupe(u8, provider_response.slice());
+    return .{
+        .json = try alloc.dupe(u8, provider_response.buffer.slice()),
+        .identity_read_generation = if (provider_response.has_identity_read_generation != 0)
+            provider_response.identity_read_generation
+        else
+            null,
+    };
 }
 
 fn validationOperation(kind: abi.LocalQueryKind) abi.LocalQueryOperation {

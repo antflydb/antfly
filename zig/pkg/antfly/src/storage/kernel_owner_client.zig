@@ -50,6 +50,14 @@ pub const Context = struct {
         self.* = .{};
     }
 
+    pub fn attachInferenceProvider(self: *Context, inference_handle: *anyopaque) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_attach_inference_provider(
+            self.handle,
+            inference_handle,
+        ));
+    }
+
     pub fn metrics(self: *Context) !abi.ContextMetricsResult {
         try self.ensure();
         var result: abi.ContextMetricsResult = .{};
@@ -148,6 +156,26 @@ pub const Response = struct {
 
     pub fn deinit(self: *Response) void {
         abi.antfly_storage_owner_buffer_destroy(&self.buffer);
+        self.* = undefined;
+    }
+};
+
+pub const QueryResponse = struct {
+    response: abi.QueryOwnedResponse = .{},
+
+    pub fn bytes(self: QueryResponse) []const u8 {
+        return self.response.buffer.slice();
+    }
+
+    pub fn identityReadGeneration(self: QueryResponse) ?u64 {
+        return if (self.response.has_identity_read_generation != 0)
+            self.response.identity_read_generation
+        else
+            null;
+    }
+
+    pub fn deinit(self: *QueryResponse) void {
+        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
         self.* = undefined;
     }
 };
@@ -452,8 +480,8 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_restore_repair(self.handle, request));
     }
 
-    pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
-        var response: Response = .{};
+    pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !QueryResponse {
+        var response: QueryResponse = .{};
         var failure: abi.FailureIdentity = .{};
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
@@ -461,7 +489,7 @@ pub const Owner = struct {
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
             },
-            &response.buffer,
+            &response.response,
             &failure,
         );
         error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
@@ -686,6 +714,30 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_runtime_status_json(
             self.handle,
             &request,
+            &response.buffer,
+        ));
+        return response;
+    }
+
+    pub fn observedDynamicFieldCapabilitySetsJson(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        execution_deadline_ns: ?u64,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
+    ) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_observed_dynamic_field_capability_sets_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+                .execution_deadline_ns = execution_deadline_ns orelse 0,
+                .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
+                .cancellation_ctx = cancellation_ctx,
+                .cancellation_fn = cancellation_fn,
+            },
             &response.buffer,
         ));
         return response;

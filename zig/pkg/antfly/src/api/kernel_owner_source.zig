@@ -99,8 +99,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []u8,
         generation: u64,
         identity: Identity,
+        schema_json: []u8,
+        indexes_json: []u8,
         owner: client.Owner,
         active_users: usize = 0,
+        exclusive_active: bool = false,
         retired: bool = false,
         bulk_ingest_active: std.atomic.Value(bool) = .init(false),
     };
@@ -109,6 +112,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         source: *ProvisionedKernelOwnerSource,
         entry: *Entry,
         created: bool,
+        exclusive: bool = false,
         active: bool = true,
 
         fn owner(self: *Lease) *client.Owner {
@@ -117,7 +121,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn deinit(self: *Lease) void {
             if (!self.active) return;
-            self.source.release(self.entry);
+            self.source.release(self.entry, self.exclusive);
             self.active = false;
         }
     };
@@ -193,6 +197,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             std.debug.assert(entry.active_users == 0);
             entry.owner.deinit();
             self.alloc.free(entry.table_name);
+            self.alloc.free(entry.schema_json);
+            self.alloc.free(entry.indexes_json);
             self.alloc.destroy(entry);
         }
         self.entries.deinit(self.alloc);
@@ -217,6 +223,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
             },
@@ -842,7 +849,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptor(
+        var lease = try self.acquireDescriptorExclusive(
             group_id,
             table_name,
             descriptor.path,
@@ -967,15 +974,23 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn destroyEntryAtIndexLocked(self: *ProvisionedKernelOwnerSource, index: usize) void {
         const entry = self.entries.orderedRemove(index);
         std.debug.assert(entry.active_users == 0);
+        std.debug.assert(!entry.exclusive_active);
         entry.owner.deinit();
         self.alloc.free(entry.table_name);
+        self.alloc.free(entry.schema_json);
+        self.alloc.free(entry.indexes_json);
         self.alloc.destroy(entry);
     }
 
-    fn release(self: *ProvisionedKernelOwnerSource, entry: *Entry) void {
+    fn release(self: *ProvisionedKernelOwnerSource, entry: *Entry, exclusive: bool) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         std.debug.assert(entry.active_users > 0);
+        if (exclusive) {
+            std.debug.assert(entry.exclusive_active);
+            std.debug.assert(entry.active_users == 1);
+            entry.exclusive_active = false;
+        }
         entry.active_users -= 1;
         if (!entry.retired or entry.active_users != 0) return;
         for (self.entries.items, 0..) |candidate, index| {
@@ -1000,13 +1015,13 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         var count: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             count += 1;
         }
         const leases = try self.alloc.alloc(Lease, count);
         var initialized: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
             leases[initialized] = .{ .source = self, .entry = entry, .created = false };
             initialized += 1;
@@ -1257,6 +1272,71 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
     ) !Lease {
+        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false);
+    }
+
+    fn acquireDescriptorExclusive(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+    ) !Lease {
+        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true);
+    }
+
+    fn acquireDescriptorWithMode(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        exclusive: bool,
+    ) !Lease {
+        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive) catch |err| switch (err) {
+            error.StorageKernelOwnerTransitionRequired => self.acquireDescriptorAfterTransition(
+                group_id,
+                table_name,
+                path,
+                descriptor,
+                exclusive,
+            ),
+            else => return err,
+        };
+    }
+
+    fn acquireDescriptorAfterTransition(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        exclusive: bool,
+    ) !Lease {
+        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
+        defer wait_io_impl.deinit();
+        const wait_io = wait_io_impl.io();
+        const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        while (true) {
+            try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => {
+                    if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn acquireDescriptorOnce(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        exclusive: bool,
+    ) !Lease {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var stale_index: ?usize = null;
@@ -1270,15 +1350,38 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
+            if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json))
+            {
+                // Catalog definition changes do not necessarily publish a new
+                // physical root generation. An API lease is not the only DB
+                // activity: index reconciliation may have handed durable work
+                // to the owner's background runtime before releasing its
+                // lease. Retire the idle owner so close drains that work, then
+                // reopen with the new exact descriptor. Live configure here
+                // would race the old descriptor's DB-owned maintenance.
+                if (entry.active_users != 0) return error.StorageKernelOwnerTransitionRequired;
+                entry.retired = true;
+                stale_index = index;
+                break;
+            }
+            if (entry.exclusive_active or (exclusive and entry.active_users != 0)) {
+                return error.StorageKernelOwnerTransitionRequired;
+            }
             entry.active_users += 1;
+            if (exclusive) entry.exclusive_active = true;
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
-            return .{ .source = self, .entry = entry, .created = false };
+            return .{ .source = self, .entry = entry, .created = false, .exclusive = exclusive };
         }
         if (stale_index) |index| self.destroyEntryAtIndexLocked(index);
 
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
+        const owned_schema_json = try self.alloc.dupe(u8, descriptor.schema_json);
+        errdefer self.alloc.free(owned_schema_json);
+        const owned_indexes_json = try self.alloc.dupe(u8, descriptor.indexes_json);
+        errdefer self.alloc.free(owned_indexes_json);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         try self.context.ensure();
@@ -1302,12 +1405,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_name = owned_table_name,
             .generation = descriptor.lsm_root_generation,
             .identity = descriptor.identity,
+            .schema_json = owned_schema_json,
+            .indexes_json = owned_indexes_json,
             .owner = owner,
             .active_users = 1,
+            .exclusive_active = exclusive,
         };
         self.entries.appendAssumeCapacity(entry);
         _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
-        return .{ .source = self, .entry = entry, .created = true };
+        return .{ .source = self, .entry = entry, .created = true, .exclusive = exclusive };
     }
 
     fn prepareQueryRead(
@@ -1382,7 +1488,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
-    ) !client.Response {
+    ) !client.QueryResponse {
         try self.prepareQueryRead(group_id, req, consistency);
         const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
         defer alloc.free(request_json);
@@ -2219,6 +2325,71 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .items = items };
     }
 
+    const ObservationCancellationDispatch = struct {
+        token: db_types.CancellationToken,
+
+        fn requested(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *const ObservationCancellationDispatch = @ptrCast(@alignCast(ptr orelse return 0));
+            return @intFromBool(self.token.isCancelled());
+        }
+    };
+
+    fn observedDynamicFieldCapabilitySets(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        observation: table_reads.DynamicFieldObservationQuery,
+    ) !?[]table_reads.ObservedDynamicFieldCapabilitySet {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const request_json = try table_reads.encodeStorageKernelDynamicFieldObservationRequest(alloc, observation);
+        defer alloc.free(request_json);
+        var cancellation = ObservationCancellationDispatch{
+            .token = observation.cancellation orelse .none,
+        };
+        var merged = std.ArrayListUnmanaged(table_reads.ObservedDynamicFieldCapabilitySet).empty;
+        errdefer {
+            for (merged.items) |*set| set.deinit(alloc);
+            merged.deinit(alloc);
+        }
+
+        for (group_ids) |group_id| {
+            var retire_after = false;
+            {
+                var lease = try self.acquire(group_id, table_name);
+                defer lease.deinit();
+                retire_after = lease.created;
+                var response = try lease.owner().observedDynamicFieldCapabilitySetsJson(
+                    table_name,
+                    request_json,
+                    observation.execution_deadline_ns,
+                    if (observation.cancellation != null) @ptrCast(&cancellation) else null,
+                    if (observation.cancellation != null) ObservationCancellationDispatch.requested else null,
+                );
+                defer response.deinit();
+                var parsed = try std.json.parseFromSlice(
+                    []table_reads.ObservedDynamicFieldCapabilitySet,
+                    alloc,
+                    response.bytes(),
+                    .{},
+                );
+                defer parsed.deinit();
+                for (parsed.value) |set| try table_reads.mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
+            }
+            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+        }
+        return try merged.toOwnedSlice(alloc);
+    }
+
     fn textMemoryAttributionStatsBestEffort(
         ptr: *anyopaque,
     ) text_memory.TextMemoryAttributionStats {
@@ -2379,7 +2550,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
         defer response.deinit();
-        return .{ .json = try alloc.dupe(u8, response.bytes()) };
+        return .{
+            .json = try alloc.dupe(u8, response.bytes()),
+            .identity_read_generation = response.identityReadGeneration(),
+        };
     }
 
     fn searchResultGroupLocal(
@@ -2393,6 +2567,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
         defer response.deinit();
-        return try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
+        var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
+        errdefer result.deinit();
+        result.identity_read_generation = response.identityReadGeneration();
+        if (req.identity_read_generation) |expected| {
+            if (result.identity_read_generation != expected)
+                return error.IdentityReadGenerationChanged;
+        }
+        return result;
     }
 };

@@ -94,6 +94,7 @@ const mappings = [_]Mapping{
     .{ .status = .storage_kernel_owner_unavailable, .err = error.StorageKernelOwnerUnavailable },
     .{ .status = .invalid_batch_request, .err = error.InvalidBatchRequest },
     .{ .status = .unsupported_batch_request_encoding, .err = error.UnsupportedBatchRequestEncoding },
+    .{ .status = .unsupported_transform_operation, .err = error.UnsupportedTransformOperation },
     .{ .status = .value_too_long, .err = error.ValueTooLong },
     .{ .status = .invalid_filter_query_request, .err = error.InvalidFilterQueryRequest },
     .{ .status = .invalid_exclusion_query_request, .err = error.InvalidExclusionQueryRequest },

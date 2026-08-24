@@ -1114,7 +1114,7 @@ fn scanJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
 fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     if (comptime antfly.build_options.storage_kernel_experiment) {
         var failure: kernel_owner_abi.FailureIdentity = .{};
-        return try local_query_client.executeJsonAlloc(
+        const response = try local_query_client.executeJsonAlloc(
             allocator,
             @ptrCast(db),
             "docs",
@@ -1125,6 +1125,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
             null,
             &failure,
         );
+        return response.json;
     }
 
     var owned = try query_api.parsePublicQueryRequest(
